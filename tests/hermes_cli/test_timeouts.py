@@ -306,3 +306,29 @@ def test_explicit_non_stream_stale_timeout_is_honored_for_local_endpoints(monkey
     )
 
     assert agent._compute_non_stream_stale_timeout([]) == 300.0
+
+
+def test_codex_responses_input_extends_implicit_non_stream_stale_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+
+    from run_agent import AIAgent
+
+    agent = object.__new__(AIAgent)
+    agent.model = "gpt-5.5"
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent._base_url = agent.base_url
+
+    large_responses_request = {
+        "instructions": "system",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "x" * 240_000}],
+            }
+        ],
+    }
+
+    assert agent._compute_non_stream_stale_timeout(large_responses_request) == 450.0

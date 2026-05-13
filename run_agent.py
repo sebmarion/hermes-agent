@@ -3391,14 +3391,28 @@ class AIAgent:
 
         return 300.0, True
 
-    def _compute_non_stream_stale_timeout(self, messages: list[dict[str, Any]]) -> float:
+    @staticmethod
+    def _estimate_stale_timeout_tokens(payload: Any) -> int:
+        """Estimate request size for stale-timeout scaling across API modes."""
+        if isinstance(payload, dict):
+            parts = []
+            if "messages" in payload:
+                parts.append(payload.get("messages"))
+            if "input" in payload:
+                parts.append(payload.get("input"))
+            if "instructions" in payload:
+                parts.append(payload.get("instructions"))
+            payload = parts
+        return sum(len(str(v)) for v in (payload or [])) // 4
+
+    def _compute_non_stream_stale_timeout(self, payload: Any) -> float:
         """Compute the effective non-stream stale timeout for this request."""
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        est_tokens = sum(len(str(v)) for v in messages) // 4
+        est_tokens = self._estimate_stale_timeout_tokens(payload)
         if est_tokens > 100_000:
             return max(stale_base, 600.0)
         if est_tokens > 50_000:
@@ -3800,7 +3814,7 @@ class AIAgent:
 
         return not self._has_natural_response_ending(visible_text)
 
-    def _looks_like_codex_intermediate_ack(
+    def _looks_like_intermediate_ack(
         self,
         user_message: str,
         assistant_content: str,
@@ -3870,6 +3884,58 @@ class AIAgent:
             marker in assistant_text for marker in workspace_markers
         )
         return (user_targets_workspace or assistant_targets_workspace) and assistant_mentions_action
+
+    def _looks_like_post_tool_progress_update(
+        self,
+        assistant_content: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Detect a non-answer progress update returned after tool results."""
+        if (
+            not messages
+            or not isinstance(messages[-1], dict)
+            or messages[-1].get("role") != "tool"
+        ):
+            return False
+
+        assistant_text = self._strip_think_blocks(assistant_content or "").strip().lower()
+        if not assistant_text:
+            return False
+        if len(assistant_text) > 600:
+            return False
+
+        has_future_progress = bool(
+            re.search(
+                r"\b(let me|i['’]ll|i will|i(?:'|’)m going to|i am going to|i need to|now i['’]ll|next i['’]ll)\b",
+                assistant_text,
+            )
+        )
+        if not has_future_progress:
+            return False
+
+        action_markers = (
+            "look into",
+            "look at",
+            "inspect",
+            "scan",
+            "check",
+            "analyz",
+            "review",
+            "explore",
+            "read",
+            "open",
+            "run",
+            "test",
+            "fix",
+            "debug",
+            "search",
+            "find",
+            "verify",
+            "investigate",
+            "report back",
+            "summarize",
+        )
+        return any(marker in assistant_text for marker in action_markers)
 
 
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
@@ -4447,6 +4513,7 @@ class AIAgent:
             and isinstance(messages[-1], dict)
             and (
                 messages[-1].get("_empty_recovery_synthetic")
+                or messages[-1].get("_post_tool_progress_synthetic")
                 or messages[-1].get("_empty_terminal_sentinel")
             )
         ):
@@ -7393,9 +7460,7 @@ class AIAgent:
         # httpx timeout (default 1800s) with zero feedback.  The stale
         # detector kills the connection early so the main retry loop can
         # apply richer recovery (credential rotation, provider fallback).
-        _stale_timeout = self._compute_non_stream_stale_timeout(
-            api_kwargs.get("messages", [])
-        )
+        _stale_timeout = self._compute_non_stream_stale_timeout(api_kwargs)
 
         _call_start = time.time()
         self._touch_activity("waiting for non-streaming API response")
@@ -7419,7 +7484,7 @@ class AIAgent:
             # arrives within the configured timeout.
             _elapsed = time.time() - _call_start
             if _elapsed > _stale_timeout:
-                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+                _est_ctx = self._estimate_stale_timeout_tokens(api_kwargs)
                 logger.warning(
                     "Non-streaming API call stale for %.0fs (threshold %.0fs). "
                     "model=%s context=~%s tokens. Killing connection.",
@@ -11989,7 +12054,8 @@ class AIAgent:
         api_call_count = 0
         final_response = None
         interrupted = False
-        codex_ack_continuations = 0
+        intermediate_ack_continuations = 0
+        post_tool_progress_continuations = 0
         length_continue_retries = 0
         truncated_tool_call_retries = 0
         truncated_response_prefix = ""
@@ -12212,8 +12278,14 @@ class AIAgent:
                 # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
                 if "finish_reason" in api_msg:
                     api_msg.pop("finish_reason")
-                # Strip internal thinking-prefill marker
-                api_msg.pop("_thinking_prefill", None)
+                # Strip internal retry/recovery markers
+                for internal_field in (
+                    "_thinking_prefill",
+                    "_empty_recovery_synthetic",
+                    "_empty_terminal_sentinel",
+                    "_post_tool_progress_synthetic",
+                ):
+                    api_msg.pop(internal_field, None)
                 # Strip Codex Responses API fields (call_id, response_item_id) for
                 # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
                 # Uses new dicts so the internal messages list retains the fields
@@ -15086,16 +15158,55 @@ class AIAgent:
                     self._thinking_prefill_retries = 0
 
                     if (
-                        self.api_mode == "codex_responses"
-                        and self.valid_tool_names
-                        and codex_ack_continuations < 2
-                        and self._looks_like_codex_intermediate_ack(
+                        self.valid_tool_names
+                        and post_tool_progress_continuations < 2
+                        and self._looks_like_post_tool_progress_update(
+                            assistant_content=final_response,
+                            messages=messages,
+                        )
+                    ):
+                        post_tool_progress_continuations += 1
+                        logger.warning(
+                            "Progress-only response after tool calls; nudging model to continue. "
+                            "model=%s provider=%s",
+                            self.model,
+                            self.provider,
+                        )
+                        self._emit_status(
+                            "↪️ Model paused after tool results; asking it to continue."
+                        )
+
+                        interim_msg = self._build_assistant_message(assistant_message, "incomplete")
+                        interim_msg["_post_tool_progress_synthetic"] = True
+                        messages.append(interim_msg)
+                        self._emit_interim_assistant_message(interim_msg)
+
+                        continue_msg = {
+                            "role": "user",
+                            "content": (
+                                "[System: You just received tool results but replied with a "
+                                "progress update instead of completing the task. Continue from "
+                                "the tool results now. Either execute the next needed tool call "
+                                "or provide the final answer requested by the user.]"
+                            ),
+                            "_post_tool_progress_synthetic": True,
+                        }
+                        messages.append(continue_msg)
+                        self._session_messages = messages
+                        self._save_session_log(messages)
+                        continue
+
+                    if (
+                        self.valid_tool_names
+                        and intermediate_ack_continuations < 2
+                        and self._looks_like_intermediate_ack(
                             user_message=user_message,
                             assistant_content=final_response,
                             messages=messages,
                         )
                     ):
-                        codex_ack_continuations += 1
+                        intermediate_ack_continuations += 1
+                        post_tool_progress_continuations = 0
                         interim_msg = self._build_assistant_message(assistant_message, "incomplete")
                         messages.append(interim_msg)
                         self._emit_interim_assistant_message(interim_msg)
@@ -15112,7 +15223,8 @@ class AIAgent:
                         self._save_session_log(messages)
                         continue
 
-                    codex_ack_continuations = 0
+                    intermediate_ack_continuations = 0
+                    post_tool_progress_continuations = 0
 
                     if truncated_response_prefix:
                         final_response = truncated_response_prefix + final_response
@@ -15133,6 +15245,7 @@ class AIAgent:
                         and (
                             messages[-1].get("_thinking_prefill")
                             or messages[-1].get("_empty_recovery_synthetic")
+                            or messages[-1].get("_post_tool_progress_synthetic")
                             or messages[-1].get("_empty_terminal_sentinel")
                         )
                     ):

@@ -79,6 +79,27 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
     return agent
 
 
+def _build_copilot_acp_chat_agent(monkeypatch, *, model="kimi-for-coding"):
+    _patch_agent_bootstrap(monkeypatch)
+
+    agent = run_agent.AIAgent(
+        model=model,
+        provider="copilot-acp",
+        api_mode="chat_completions",
+        base_url="acp://copilot",
+        api_key="copilot-acp",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    agent._save_session_log = lambda messages: None
+    return agent
+
+
 def _codex_message_response(text: str):
     return SimpleNamespace(
         output=[
@@ -153,6 +174,44 @@ def _codex_ack_message_response(text: str):
         usage=SimpleNamespace(input_tokens=4, output_tokens=2, total_tokens=6),
         status="completed",
         model="gpt-5-codex",
+    )
+
+
+def _chat_message_response(text: str):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=text,
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+        model="kimi-for-coding",
+    )
+
+
+def _chat_tool_call_response():
+    tool_call = SimpleNamespace(
+        id="call_1",
+        function=SimpleNamespace(name="terminal", arguments="{}"),
+    )
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[tool_call],
+                    reasoning_content=None,
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4, total_tokens=16),
+        model="kimi-for-coding",
     )
 
 
@@ -1364,6 +1423,94 @@ def test_run_conversation_codex_continues_after_ack_for_directory_listing_prompt
         for msg in result["messages"]
     )
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
+
+
+def test_run_conversation_chat_completions_continues_after_workspace_ack(monkeypatch):
+    agent = _build_copilot_acp_chat_agent(monkeypatch)
+    responses = [
+        _chat_message_response(
+            "I see the workspace is now QR_menu_v2. Let me explore the codebase to understand the item creation flow and existing photo/image handling."
+        ),
+        _chat_tool_call_response(),
+        _chat_message_response("Camera upload implementation plan complete."),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation(
+        "I need to be able to take a photo directly from my phone of an item in order to add it."
+    )
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Camera upload implementation plan complete."
+    assert any(
+        msg.get("role") == "assistant"
+        and msg.get("finish_reason") == "incomplete"
+        and "QR_menu_v2" in (msg.get("content") or "")
+        for msg in result["messages"]
+    )
+    assert any(
+        msg.get("role") == "user"
+        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
+        for msg in result["messages"]
+    )
+    assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
+
+
+def test_run_conversation_chat_completions_continues_after_post_tool_progress_update(monkeypatch):
+    agent = _build_copilot_acp_chat_agent(monkeypatch)
+    responses = [
+        _chat_tool_call_response(),
+        _chat_message_response(
+            "Let me check what scripts actually exist in the Orchestrero project."
+        ),
+        _chat_message_response("All systems healthy."),
+    ]
+    requests = []
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"total_count":50,"files":["scripts/diagnose-and-fix.ts"]}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("Run the diagnosis script and report the result.")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "All systems healthy."
+    assert len(requests) == 3
+    assert any(
+        msg.get("role") == "user"
+        and "You just received tool results" in (msg.get("content") or "")
+        for msg in requests[2]["messages"]
+    )
+    assert not any(
+        "scripts actually exist" in (msg.get("content") or "")
+        for msg in result["messages"]
+    )
 
 
 def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
