@@ -59,10 +59,8 @@ def derive_pet_state(
     4. ``tool_running``   → ``RUN``     (a tool is executing)
     5. ``reasoning``      → ``REVIEW``  (model is thinking / reading)
     6. ``busy``           → ``RUN``     (turn in flight, unspecified work)
-    7. otherwise          → ``IDLE``    (incl. ``awaiting_input``)
-
-    ``awaiting_input`` is accepted for symmetry with the surfaces but maps to
-    ``IDLE`` — a pet waiting on the user should rest, not run.
+    7. ``awaiting_input`` → ``WAITING`` (the agent is blocked on the user)
+    8. otherwise          → ``IDLE``
     """
     if error:
         return PetState.FAILED
@@ -76,4 +74,6 @@ def derive_pet_state(
         return PetState.REVIEW
     if busy:
         return PetState.RUN
+    if awaiting_input:
+        return PetState.WAITING
     return PetState.IDLE

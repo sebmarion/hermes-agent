@@ -11,7 +11,7 @@ import { $awaitingResponse, $busy } from '@/store/session'
  * `agent/pet/state.py` so the Python and TS surfaces never drift.
  */
 
-export type PetState = 'idle' | 'wave' | 'run' | 'failed' | 'review' | 'jump'
+export type PetState = 'idle' | 'wave' | 'run' | 'failed' | 'review' | 'jump' | 'waiting'
 
 export interface PetInfo {
   enabled: boolean
@@ -45,7 +45,7 @@ export interface PetActivity {
  * Resolve the animation state from coarse activity signals.
  *
  * Priority (highest first) mirrors `agent.pet.state.derive_pet_state`:
- * error → celebrate → justCompleted → toolRunning → reasoning → busy → idle.
+ * error → celebrate → justCompleted → toolRunning → reasoning → busy → awaitingInput → idle.
  */
 export function derivePetState(activity: PetActivity): PetState {
   if (activity.error) {
@@ -72,11 +72,25 @@ export function derivePetState(activity: PetActivity): PetState {
     return 'run'
   }
 
+  if (activity.awaitingInput) {
+    return 'waiting'
+  }
+
   return 'idle'
 }
 
 export const $petInfo = atom<PetInfo>({ enabled: false })
 export const $petActivity = atom<PetActivity>({})
+
+/**
+ * Pet-local "you have a new message" flag, surfaced as the overlay's mail icon.
+ * Deliberately not real unread tracking: it flips on when a turn finishes while
+ * the app isn't focused, and off when the user opens the app via the mail icon
+ * (or returns to the window). No persistence — it's a glance hint, not state.
+ */
+export const $petUnread = atom(false)
+export const markPetUnread = () => $petUnread.set(true)
+export const clearPetUnread = () => $petUnread.set(false)
 
 /** Steady activity flags (toolRunning / reasoning) set + cleared by the stream. */
 export const setPetActivity = (next: Partial<PetActivity>) =>
@@ -85,9 +99,14 @@ export const setPetActivity = (next: Partial<PetActivity>) =>
 let flashTimer: ReturnType<typeof setTimeout> | undefined
 
 /** Fire a transient reaction beat (error / celebrate / justCompleted) that
- *  decays back to the steady state after `ms`. */
+ *  decays back to the steady state after `ms`.
+ *
+ *  Each beat first clears its siblings so a stale one can't win the priority
+ *  race: without this, a completion beat (`celebrate`) would merge on top of a
+ *  lingering `error`, and `derivePetState` checks `error` first — so a clean
+ *  finish would render the sad/failed pose. */
 export const flashPetActivity = (next: Partial<PetActivity>, ms = 1600) => {
-  setPetActivity(next)
+  setPetActivity({ celebrate: false, error: false, justCompleted: false, ...next })
   clearTimeout(flashTimer)
   flashTimer = setTimeout(
     () => setPetActivity({ celebrate: false, error: false, justCompleted: false }),

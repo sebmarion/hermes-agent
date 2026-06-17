@@ -33,7 +33,7 @@ import { $gateway } from '@/store/gateway'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { notify } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { flashPetActivity, setPetActivity } from '@/store/pet'
+import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
 import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import {
   setCurrentBranch,
@@ -50,7 +50,7 @@ import {
 } from '@/store/session'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { clearSessionSubagents, pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
-import { $todosBySession, setSessionTodos, todoListActive } from '@/store/todos'
+import { setSessionTodos } from '@/store/todos'
 import { recordToolDiff } from '@/store/tool-diffs'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -904,11 +904,19 @@ export function useMessageStream({
         if (isActiveEvent) {
           setTurnStartedAt(null)
 
-          // Pet beat: celebrate a finished plan, else a clean-finish wave.
-          const todos = $todosBySession.get()[sessionId] ?? []
-          const done = todos.length > 0 && !todoListActive(todos)
-          setPetActivity({ reasoning: false, toolRunning: false })
-          flashPetActivity(done ? { celebrate: true } : { justCompleted: true })
+          // Pet beat: a finished turn always celebrates — go straight to the
+          // jump, never linger on the run/reason pose. One atom update (clears
+          // toolRunning/reasoning AND sets celebrate together) so no stray "run"
+          // frame leaks to the sprite — including the popped-out overlay, which
+          // mirrors each activity change. The jump runs ~2 loops, then settles.
+          flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+
+          // Light up the pet's mail icon if the user wasn't looking when the turn
+          // finished — a glanceable "new message" hint on the popped-out overlay.
+          // Cleared when they open the app via the mail icon or refocus the window.
+          if (typeof document !== 'undefined' && !document.hasFocus()) {
+            markPetUnread()
+          }
         }
 
         if (payload?.usage) {

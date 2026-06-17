@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { derivePetState } from './pet'
+import { $petActivity, $petState, derivePetState, flashPetActivity, setPetActivity } from './pet'
 
 describe('derivePetState', () => {
-  it('rests at idle by default and while awaiting input', () => {
+  it('rests at idle by default and uses waiting when awaiting input', () => {
     expect(derivePetState({})).toBe('idle')
-    expect(derivePetState({ awaitingInput: true })).toBe('idle')
+    expect(derivePetState({ awaitingInput: true })).toBe('waiting')
   })
 
   it('runs when busy or a tool is executing', () => {
@@ -23,5 +23,20 @@ describe('derivePetState', () => {
     expect(derivePetState({ error: true, celebrate: true, busy: true })).toBe('failed')
     expect(derivePetState({ celebrate: true, justCompleted: true, toolRunning: true })).toBe('jump')
     expect(derivePetState({ justCompleted: true, toolRunning: true })).toBe('wave')
+  })
+})
+
+describe('flashPetActivity', () => {
+  it('clears stale sibling beats so a completion never inherits a prior error', () => {
+    // A turn errors (sad), then the next turn finishes cleanly. The celebrate
+    // beat must win — error is highest priority, so a merge-only flash would
+    // keep the pet on the failed pose.
+    setPetActivity({ error: true })
+    flashPetActivity({ celebrate: true })
+
+    expect($petActivity.get().error).toBe(false)
+    expect($petState.get()).toBe('jump')
+
+    setPetActivity({})
   })
 })

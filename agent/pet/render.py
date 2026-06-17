@@ -155,7 +155,8 @@ def _raw_frames(
     try:
         sheet = _open_sheet(Path(sheet_path))
         cols = max(1, sheet.width // frame_w)
-        row = state_row_index(state_value)
+        rows = max(1, sheet.height // frame_h)
+        row = state_row_index(state_value, rows)
         top = row * frame_h
         # Clamp the row to the sheet (some pets ship fewer rows than the 8 the
         # taxonomy reserves).

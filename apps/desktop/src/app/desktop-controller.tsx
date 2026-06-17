@@ -38,6 +38,7 @@ import {
   unpinSession
 } from '../store/layout'
 import { respondToApprovalAction } from '../store/native-notifications'
+import { setPetOverlayOpenAppHandler, setPetOverlaySubmitHandler } from '../store/pet-overlay'
 import { $filePreviewTarget, $previewTarget, closeActiveRightRailTab } from '../store/preview'
 import {
   $activeGatewayProfile,
@@ -785,6 +786,41 @@ export function DesktopController() {
     sttEnabled,
     updateSessionState
   })
+
+  // The popped-out pet drives two actions back into the app: send a prompt, and
+  // open the most recent thread. Both are registered ONCE through refs that track
+  // the latest callbacks — re-registering on every `submitText`/`resumeSession`
+  // identity change left a brief window where the handler was nulled (cleanup
+  // before re-register), which could drop a submit fired from the overlay (e.g.
+  // creating a session from the new-session screen). The ref form keeps a stable,
+  // always-current handler. Primary window only — it owns the overlay.
+  const submitTextRef = useRef(submitText)
+  submitTextRef.current = submitText
+  const resumeSessionRef = useRef(resumeSession)
+  resumeSessionRef.current = resumeSession
+
+  useEffect(() => {
+    if (isSecondaryWindow()) {
+      return
+    }
+
+    setPetOverlaySubmitHandler(text => void submitTextRef.current(text))
+    // Mail icon: $sessions is ordered most-recent-first; the pet is global (not
+    // per session) so "most recent" is the right target. main.cjs already raised
+    // the window before forwarding this.
+    setPetOverlayOpenAppHandler(() => {
+      const recent = $sessions.get()[0]
+
+      if (recent?.id) {
+        void resumeSessionRef.current(recent.id)
+      }
+    })
+
+    return () => {
+      setPetOverlaySubmitHandler(null)
+      setPetOverlayOpenAppHandler(null)
+    }
+  }, [])
 
   useGatewayBoot({
     handleGatewayEvent: handleDesktopGatewayEvent,

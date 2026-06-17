@@ -2,10 +2,10 @@
 
 Petdex (https://github.com/crafter-station/petdex) is a public gallery of
 animated sprite "pets" for coding agents.  Each pet is a ``pet.json`` plus a
-``spritesheet.{webp,png}`` — an 8-column × 9-row grid of 192×208 px frames
-where each *row* is an animation state (idle, wave, run, failed, review,
-jump, …).  The official desktop only ever renders the idle row; reacting to
-real agent activity is the value Hermes adds here.
+``spritesheet.{webp,png}`` of 192×208 px cells. Current Codex/petdex sheets use
+an 8-column × 9-row atlas; older Hermes/petdex sheets used an 8-row atlas.
+Hermes infers the row taxonomy from the sheet and maps agent activity onto
+idle/run/review/failed/wave/jump.
 
 This package is the **single source of truth** for the feature so the base
 CLI (Python) and TUI (Ink, via ``tui_gateway``) never duplicate the hard

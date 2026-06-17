@@ -1,21 +1,19 @@
 """Pet sprite geometry + animation-state taxonomy.
 
-These values are *constants of the petdex format*, not per-pet data — the
-real ``pet.json`` only carries ``id``/``displayName``/``description``/
-``spritesheetPath``.  The official petdex web app and desktop client both
-hardcode 192×208 frames, 6 frames per state, a 1100ms loop, and a 0.7 render
-scale; we match them so installed pets animate identically.
+These values are the common petdex/Codex pet geometry. The real ``pet.json``
+usually only carries ``id``/``displayName``/``description``/``spritesheetPath``;
+row taxonomy is inferred from the atlas shape so Hermes can render both legacy
+8-row sheets and current 9-row Codex sheets.
 """
 
 from __future__ import annotations
 
 from enum import Enum
 
-# Frame geometry (pixels).  Per the petdex package format a spritesheet is an
-# 8-row × 9-column grid of these frames (1728×1664 px): one state per row (see
-# ``STATE_ROWS``), frames stepping left→right across the 9 columns.  We only
-# read ``FRAMES_PER_STATE`` (6) of each row; renderers derive the real column
-# count from the sheet width, so sheets with a different column count still work.
+# Frame geometry (pixels). Current Codex/petdex spritesheets are 8 columns x 9
+# rows (1536x1872), while older Hermes/petdex sheets used 9 columns x 8 rows
+# (1728x1664). Renderers derive both row taxonomy and real column count from the
+# concrete sheet, so either shape works.
 FRAME_W = 192
 FRAME_H = 208
 
@@ -80,8 +78,9 @@ def resolve_cols(scale: float, unicode_cols: int = 0) -> int:
 class PetState(str, Enum):
     """Animation state a pet can be shown in.
 
-    Values are the petdex spritesheet *row names*.  Membership maps directly
-    onto :data:`STATE_ROWS` (row index = position in that list).
+    These are Hermes' activity state names. They are not always identical to the
+    source atlas row names: Codex-format pets use rows like ``jumping`` /
+    ``running`` while the UI keeps the shorter ``jump`` / ``run`` names.
     """
 
     IDLE = "idle"
@@ -90,13 +89,12 @@ class PetState(str, Enum):
     FAILED = "failed"
     REVIEW = "review"
     JUMP = "jump"
+    WAITING = "waiting"
 
 
-# Row order in the spritesheet (top → bottom).  Index of a state name here is
-# the pixel row it occupies: ``row_y = STATE_ROWS.index(state) * FRAME_H``.
-# ``extra1``/``extra2`` are reserved petdex rows we don't drive yet but keep so
-# row math stays correct for sheets that include them.
-STATE_ROWS: list[str] = [
+# Legacy Hermes/petdex row order (top -> bottom) used by the older 8-row,
+# 9-column atlas shape.
+LEGACY_STATE_ROWS: list[str] = [
     PetState.IDLE.value,
     PetState.WAVE.value,
     PetState.RUN.value,
@@ -107,11 +105,63 @@ STATE_ROWS: list[str] = [
     "extra2",
 ]
 
+# Current Petdex row order (top -> bottom) used by 1536x1872 atlases:
+# 8 columns x 9 rows of 192x208 cells.
+CODEX_STATE_ROWS: list[str] = [
+    PetState.IDLE.value,
+    "running-right",
+    "running-left",
+    "waving",
+    "jumping",
+    PetState.FAILED.value,
+    PetState.WAITING.value,
+    "running",
+    PetState.REVIEW.value,
+]
 
-def state_row_index(state: "PetState | str") -> int:
-    """Return the spritesheet row index for *state* (clamped, never raises)."""
+# Default/fallback for callers without a sheet. Prefer the current 9-row Codex
+# format because generated pets and the public Codex pet contract use it.
+STATE_ROWS: list[str] = CODEX_STATE_ROWS
+
+# Canonical Hermes activity names -> accepted row-name aliases in descending
+# preference. This keeps our internal state names stable (`wave`/`jump`/`run`)
+# while matching Petdex's current `waving`/`jumping`/`running` taxonomy.
+STATE_ALIASES: dict[str, tuple[str, ...]] = {
+    PetState.IDLE.value: (PetState.IDLE.value,),
+    PetState.WAVE.value: (PetState.WAVE.value, "waving"),
+    PetState.JUMP.value: (PetState.JUMP.value, "jumping"),
+    PetState.RUN.value: (PetState.RUN.value, "running"),
+    PetState.FAILED.value: (PetState.FAILED.value,),
+    PetState.REVIEW.value: (PetState.REVIEW.value,),
+    PetState.WAITING.value: (PetState.WAITING.value,),
+}
+
+
+def state_aliases_for(state: "PetState | str") -> tuple[str, ...]:
+    """Return accepted row-name aliases for *state* (always non-empty)."""
     value = state.value if isinstance(state, PetState) else str(state)
+    aliases = STATE_ALIASES.get(value)
+    return aliases if aliases else (value,)
+
+
+def state_rows_for_grid(row_count: int | None) -> list[str]:
+    """Return the row taxonomy for a spritesheet with *row_count* rows."""
     try:
-        return STATE_ROWS.index(value)
-    except ValueError:
-        return 0  # fall back to the idle row
+        rows = int(row_count or 0)
+    except (TypeError, ValueError):
+        rows = 0
+
+    if rows >= len(CODEX_STATE_ROWS):
+        return CODEX_STATE_ROWS
+    return LEGACY_STATE_ROWS
+
+
+def state_row_index(state: "PetState | str", row_count: int | None = None) -> int:
+    """Return the spritesheet row index for *state* (clamped, never raises)."""
+    rows = state_rows_for_grid(row_count)
+    for name in state_aliases_for(state):
+        try:
+            return rows.index(name)
+        except ValueError:
+            continue
+    return 0  # fall back to the idle row

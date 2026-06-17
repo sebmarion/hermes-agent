@@ -3,8 +3,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { persistString, storedString } from '@/lib/storage'
-import { $petInfo, type PetInfo, setPetInfo } from '@/store/pet'
+import { $petInfo, clearPetUnread, type PetInfo, setPetInfo } from '@/store/pet'
+import { $petOverlayActive, initPetOverlayBridge, popOutPet, restorePetOverlay } from '@/store/pet-overlay'
 import { $gatewayState } from '@/store/session'
+import { isSecondaryWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
 
 import { PetSprite } from './pet-sprite'
@@ -71,9 +73,13 @@ export function FloatingPet() {
   const { resolvedMode } = useTheme()
   const gatewayState = useStore($gatewayState)
   const info = useStore($petInfo)
+  const overlayActive = useStore($petOverlayActive)
 
   const [position, setPosition] = useState<Point>(loadPosition)
   const containerRef = useRef<HTMLDivElement | null>(null)
+  // The facing mirror lives on the sprite wrapper, not the container, so the
+  // speech bubble (a container child) never renders flipped/backwards.
+  const spriteWrapRef = useRef<HTMLDivElement | null>(null)
   const petW = (info.frameW ?? 192) * (info.scale ?? 0.33)
   // Soft contact shadow, sized off the pet so every scale/species grounds the
   // same way (cf. lairp's per-actor feet ellipse). Lighter on light backgrounds.
@@ -116,6 +122,42 @@ export function FloatingPet() {
     }
   }, [gatewayState, active, requestGateway])
 
+  // Wire the overlay control channel once, only in the primary window — the
+  // pop-out overlay belongs to it (main.cjs positions it against the main
+  // window and routes control messages back to it).
+  useEffect(() => {
+    if (isSecondaryWindow()) {
+      return
+    }
+
+    return initPetOverlayBridge()
+  }, [])
+
+  // Returning to the app (by any route, not just the mail icon) clears the pet's
+  // "new message" hint — you've seen it now.
+  useEffect(() => {
+    if (isSecondaryWindow()) {
+      return
+    }
+
+    const onFocus = () => clearPetUnread()
+    window.addEventListener('focus', onFocus)
+
+    return () => window.removeEventListener('focus', onFocus)
+  }, [])
+
+  // Restore a popped-out pet on boot, once the pet has loaded (so we never spawn
+  // an empty overlay window). Primary window only; runs at most once.
+  const restoredRef = useRef(false)
+  useEffect(() => {
+    if (isSecondaryWindow() || restoredRef.current || !active) {
+      return
+    }
+
+    restoredRef.current = true
+    restorePetOverlay()
+  }, [active])
+
   // A window resize must never strand the pet off-screen — re-clamp the
   // committed position (and persist it) whenever the viewport shrinks.
   useEffect(() => {
@@ -145,6 +187,17 @@ export function FloatingPet() {
     }
 
     const rect = el.getBoundingClientRect()
+
+    // Shift-click pops the pet out into a free-floating desktop overlay (it can
+    // leave the window and stays visible while Hermes is minimized) instead of
+    // starting an in-window drag. Primary window only — the overlay is anchored
+    // to it.
+    if (e.shiftKey && !isSecondaryWindow()) {
+      popOutPet({ height: rect.height, width: rect.width, x: rect.left, y: rect.top })
+
+      return
+    }
+
     dragRef.current = { dx: e.clientX - rect.left, dy: e.clientY - rect.top, x: rect.left, y: rect.top }
     el.setPointerCapture(e.pointerId)
     el.style.cursor = 'grabbing'
@@ -163,10 +216,14 @@ export function FloatingPet() {
       drag.x = next.x
       drag.y = next.y
       // Mutate the DOM directly — no setState, so no re-render while dragging. The
-      // mirror follows the pointer across the midline for the same reason.
+      // mirror follows the pointer across the midline for the same reason; it
+      // rides the sprite wrapper so the bubble stays upright.
       el.style.left = `${next.x}px`
       el.style.top = `${next.y}px`
-      el.style.transform = facing(next.x, petW)
+
+      if (spriteWrapRef.current) {
+        spriteWrapRef.current.style.transform = facing(next.x, petW)
+      }
     },
     [petW]
   )
@@ -189,7 +246,9 @@ export function FloatingPet() {
     }
   }, [])
 
-  if (!info.enabled || !info.spritesheetBase64) {
+  // While popped out, the desktop overlay window owns the mascot — hide the
+  // in-window one so there aren't two.
+  if (!info.enabled || !info.spritesheetBase64 || overlayActive) {
     return null
   }
 
@@ -206,11 +265,9 @@ export function FloatingPet() {
         position: 'fixed',
         top: position.y,
         touchAction: 'none',
-        transform: facing(position.x, petW),
         userSelect: 'none',
         zIndex: 60
       }}
-      title={info.displayName || 'pet'}
     >
       <div
         aria-hidden
@@ -226,7 +283,7 @@ export function FloatingPet() {
           zIndex: 0
         }}
       />
-      <div style={{ lineHeight: 0, position: 'relative', zIndex: 1 }}>
+      <div ref={spriteWrapRef} style={{ lineHeight: 0, position: 'relative', transform: facing(position.x, petW), zIndex: 1 }}>
         <PetSprite info={info} />
       </div>
     </div>

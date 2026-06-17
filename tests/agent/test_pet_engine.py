@@ -21,8 +21,8 @@ from agent.pet.constants import FRAME_H, FRAME_W, PetState
 
 def test_derive_idle_default():
     assert state.derive_pet_state() is PetState.IDLE
-    # awaiting input rests, doesn't run
-    assert state.derive_pet_state(awaiting_input=True) is PetState.IDLE
+    # awaiting input uses the dedicated waiting row when available.
+    assert state.derive_pet_state(awaiting_input=True) is PetState.WAITING
 
 
 def test_derive_priority_order():
@@ -59,10 +59,31 @@ def test_todos_all_done():
     assert state.todos_all_done([_T("completed"), _T("pending")]) is False
 
 
-def test_state_row_index_maps_to_taxonomy():
-    # row index must equal position in STATE_ROWS for every driveable state
-    for st in PetState:
-        assert constants.STATE_ROWS[constants.state_row_index(st)] == st.value
+def test_state_row_index_maps_to_supported_atlas_taxonomies():
+    # Current Petdex sheets are 8 columns x 9 rows.
+    assert constants.state_row_index(PetState.IDLE, 9) == 0
+    assert constants.state_row_index(PetState.WAVE, 9) == 3
+    assert constants.state_row_index(PetState.JUMP, 9) == 4
+    assert constants.state_row_index(PetState.FAILED, 9) == 5
+    assert constants.state_row_index(PetState.WAITING, 9) == 6
+    assert constants.state_row_index(PetState.RUN, 9) == 7
+    assert constants.state_row_index(PetState.REVIEW, 9) == 8
+
+    # Legacy Hermes/petdex sheets were 8 rows with Hermes state names packed in
+    # order. Keep those readable instead of forcing old installs through the
+    # newer Codex taxonomy.
+    assert constants.state_row_index(PetState.WAVE, 8) == 1
+    assert constants.state_row_index(PetState.RUN, 8) == 2
+    assert constants.state_row_index(PetState.FAILED, 8) == 3
+    assert constants.state_row_index(PetState.REVIEW, 8) == 4
+    assert constants.state_row_index(PetState.JUMP, 8) == 5
+    assert constants.state_row_index(PetState.WAITING, 8) == 0
+
+    # Alias rows resolve as expected.
+    assert constants.state_row_index("wave", 9) == constants.state_row_index("waving", 9) == 3
+    assert constants.state_row_index("jump", 9) == constants.state_row_index("jumping", 9) == 4
+    assert constants.state_row_index("run", 9) == constants.state_row_index("running", 9) == 7
+
     # unknown row names clamp to idle (row 0), never raise
     assert constants.state_row_index("nonsense") == 0
 
@@ -161,8 +182,10 @@ def test_trims_trailing_blank_frames(tmp_path):
 
     cols, rows = 8, 9
     sheet = Image.new("RGBA", (FRAME_W * cols, FRAME_H * rows), (0, 0, 0, 0))
-    # row index → number of real (opaque) frames; the rest stay transparent.
-    real = {0: 6, 1: 8, 2: 8, 3: 4, 4: 5, 5: 8}  # idle wave run failed review jump
+    # row index -> number of real (opaque) frames; the rest stay transparent.
+    # Codex row taxonomy: idle, running-right, running-left, wave, jump, failed,
+    # waiting, run, review.
+    real = {0: 6, 3: 4, 4: 5, 5: 8, 7: 6, 8: 5}
     for r, k in real.items():
         for c in range(k):
             block = Image.new("RGBA", (FRAME_W, FRAME_H), (200, 80, 80, 255))
@@ -174,17 +197,25 @@ def test_trims_trailing_blank_frames(tmp_path):
     # Full rows cap at FRAMES_PER_STATE; ragged rows trim to their real count.
     assert r.frame_count("idle") == constants.FRAMES_PER_STATE
     assert r.frame_count("run") == constants.FRAMES_PER_STATE
-    assert r.frame_count("failed") == 4
+    assert r.frame_count("wave") == 4
+    assert r.frame_count("jump") == 5
+    assert r.frame_count("failed") == constants.FRAMES_PER_STATE
     assert r.frame_count("review") == 5
 
     # Every stepped frame is non-empty — no blank flash for the trimmed states.
-    for state in ("failed", "review"):
+    for state in ("wave", "jump", "review"):
         for i in range(r.frame_count(state)):
             assert r.frame(state, i), f"{state}[{i}] rendered blank"
 
     counts = render.state_frame_counts(str(sprite))
     assert counts == {
-        "idle": 6, "wave": 6, "run": 6, "failed": 4, "review": 5, "jump": 6,
+        "idle": 6,
+        "wave": 4,
+        "run": 6,
+        "failed": 6,
+        "review": 5,
+        "jump": 5,
+        "waiting": 0,
     }
 
 
