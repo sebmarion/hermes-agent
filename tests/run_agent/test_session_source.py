@@ -25,6 +25,7 @@ def test_session_source_context_overrides_platform(monkeypatch):
 
 def test_session_source_falls_back_to_platform(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
 
     assert _session_source_for_agent("tui") == "tui"
 
@@ -33,3 +34,17 @@ def test_session_source_falls_back_to_env(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "webhook")
 
     assert _session_source_for_agent(None) == "webhook"
+
+
+def test_session_source_marks_cron_child_cli_sessions_as_cron(monkeypatch):
+    monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+
+    assert _session_source_for_agent("cli") == "cron"
+
+
+def test_session_source_explicit_source_wins_over_cron_env(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "tool")
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+
+    assert _session_source_for_agent("cli") == "tool"

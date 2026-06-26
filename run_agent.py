@@ -99,6 +99,11 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     source = str(source or "").strip()
     if source:
         return source
+    # One-shot Hermes subprocesses launched from scheduled jobs inherit the
+    # cron marker but normally run through the CLI entrypoint. Keep those child
+    # sessions with cron history instead of flooding human recents as `cli`.
+    if str(os.environ.get("HERMES_CRON_SESSION", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return "cron"
     return platform or "cli"
 
 

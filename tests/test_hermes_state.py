@@ -2262,6 +2262,41 @@ class TestSessionTitleLineage:
         with pytest.raises(ValueError, match="already in use"):
             db.set_session_title("child", "shared")
 
+    def test_nearest_lineage_title_walks_compression_ancestors(self, db):
+        import time as _time
+        t0 = _time.time() - 7200
+        self._make_compression_chain(db, t0, root="root", tip="mid")
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?",
+            (t0 + 300, "mid"),
+        )
+        db.create_session("tip", "cli", parent_session_id="mid")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 400, "tip"))
+        db._conn.commit()
+        db.set_session_title("root", "correct-title")
+
+        assert db.get_nearest_lineage_title("tip") == "correct-title"
+        assert db.get_nearest_lineage_title("tip", include_self=False) == "correct-title"
+        db.set_session_title("tip", "tip-title")
+        assert db.get_nearest_lineage_title("tip") == "tip-title"
+        assert db.get_nearest_lineage_title("tip", include_self=False) == "correct-title"
+
+    def test_nearest_lineage_title_stops_at_non_compression_parent(self, db):
+        import time as _time
+        t0 = _time.time() - 3600
+        db.create_session("parent", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "parent"))
+        db.set_session_title("parent", "not-a-compression-lineage")
+        db.create_session("child", "cli", parent_session_id="parent")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 10, "child"))
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason='user_exit' WHERE id=?",
+            (t0 + 100, "parent"),
+        )
+        db._conn.commit()
+
+        assert db.get_nearest_lineage_title("child") is None
+
 
 class TestSanitizeTitle:
     """Tests for SessionDB.sanitize_title() validation and cleaning."""
@@ -3067,6 +3102,18 @@ class TestListSessionsRich:
         sessions = db.list_sessions_rich()
         # No messages, so last_active falls back to started_at
         assert sessions[0]["last_active"] == sessions[0]["started_at"]
+
+    def test_rich_list_includes_shared_catalog_source_and_workspace(self, db):
+        db.create_session("s1", "tui", cwd="/work/hermes-agent-wt-api")
+        sessions = db.list_sessions_rich()
+        row = sessions[0]
+
+        assert row["raw_source"] == "tui"
+        assert row["session_source"] == "cli"
+        assert row["source_label"] == "TUI"
+        assert row["workspace_kind"] == "worktree"
+        assert row["workspace_parent_id"] == "/work/hermes-agent"
+        assert row["workspace_group_label"] == "api"
 
     def test_order_by_last_active_surfaces_recently_touched_older_session_first(self, db):
         t0 = 1709500000.0

@@ -349,6 +349,24 @@ export interface SessionInfo {
   parent_session_id?: null | string
   preview: null | string
   source: null | string
+  raw_source?: null | string
+  session_source?: null | string
+  source_label?: null | string
+  source_tag?: null | string
+  /** Shared catalog projection from Hermes core. Workspace fields let remote
+   *  session lists group workspaces consistently without probing the local FS. */
+  catalog_projection_version?: number
+  workspace?: null | string
+  workspace_type?: null | string
+  workspace_kind?: null | string
+  workspace_id?: null | string
+  workspace_label?: null | string
+  workspace_path?: null | string
+  workspace_group_id?: null | string
+  workspace_group_label?: null | string
+  workspace_parent_id?: null | string
+  workspace_parent_label?: null | string
+  workspace_parent_path?: null | string
   started_at: number
   title: null | string
   tool_call_count: number

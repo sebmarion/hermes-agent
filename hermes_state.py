@@ -25,6 +25,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
+from session_catalog import normalize_session_catalog_row
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -2100,6 +2101,53 @@ class SessionDB:
             row = cursor.fetchone()
         return row["title"] if row else None
 
+    def get_nearest_lineage_title(
+        self,
+        session_id: str,
+        *,
+        include_self: bool = True,
+    ) -> Optional[str]:
+        """Return the nearest non-empty title in a compression lineage.
+
+        Walks from ``session_id`` toward its compression ancestors and returns
+        the first title encountered. The walk follows the same continuation edge
+        used by list/resume projection: child.parent_session_id points at a
+        parent whose ``end_reason='compression'`` and the child started at/after
+        the parent ended. Branches and delegate/subagent children intentionally
+        stop the walk.
+        """
+        if not session_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                WITH RECURSIVE lineage(id, depth) AS (
+                    SELECT ?, 0
+                    UNION ALL
+                    SELECT parent.id, lineage.depth + 1
+                    FROM lineage
+                    JOIN sessions child ON child.id = lineage.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                      AND child.started_at >= parent.ended_at
+                      AND lineage.depth < 100
+                )
+                SELECT s.title
+                FROM lineage
+                JOIN sessions s ON s.id = lineage.id
+                WHERE (? OR lineage.depth > 0)
+                  AND s.title IS NOT NULL
+                  AND TRIM(s.title) != ''
+                ORDER BY lineage.depth ASC
+                LIMIT 1
+                """,
+                (session_id, 1 if include_self else 0),
+            ).fetchone()
+        if row is None:
+            return None
+        title = row["title"] if hasattr(row, "keys") else row[0]
+        return title if isinstance(title, str) and title.strip() else None
+
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """Archive or unarchive a session.
 
@@ -2557,7 +2605,7 @@ class SessionDB:
                 projected.append(merged)
             sessions = projected
 
-        return sessions
+        return [normalize_session_catalog_row(s) for s in sessions]
 
     def list_cron_job_runs(
         self,
