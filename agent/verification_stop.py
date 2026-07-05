@@ -242,6 +242,33 @@ def _status_detail(status: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _verification_gap_details(
+    *,
+    session_id: str | None,
+    changed_paths: Iterable[str],
+) -> tuple[list[str], dict[str, Any], list[str]] | None:
+    """Return changed paths, status, and commands when edited work lacks proof."""
+    paths = sorted({str(p) for p in _filter_verifiable_paths(changed_paths)})
+    if not paths:
+        return None
+
+    snapshot = _verification_snapshot(session_id=session_id, changed_paths=paths)
+    if snapshot is None:
+        return None
+    status, facts = snapshot
+
+    state = str(status.get("status") or "unverified")
+    if state == "passed":
+        return None
+
+    verify_commands = [
+        str(cmd).strip()
+        for cmd in (facts.get("verifyCommands") or [])
+        if str(cmd).strip()
+    ]
+    return paths, status, verify_commands
+
+
 def build_verify_on_stop_nudge(
     *,
     session_id: str | None,
@@ -253,24 +280,16 @@ def build_verify_on_stop_nudge(
     # Drop documentation/prose paths (markdown, skills, README, LICENSE, ...) —
     # they carry no verifiable behavior, so a turn that touched only those has
     # nothing to verify and must not nudge.
-    paths = sorted({str(p) for p in _filter_verifiable_paths(changed_paths)})
-    if not paths or attempts >= max_attempts:
+    if attempts >= max_attempts:
         return None
 
-    snapshot = _verification_snapshot(session_id=session_id, changed_paths=paths)
-    if snapshot is None:
+    details = _verification_gap_details(
+        session_id=session_id,
+        changed_paths=changed_paths,
+    )
+    if details is None:
         return None
-    status, facts = snapshot
-
-    verify_commands = [
-        str(cmd).strip()
-        for cmd in (facts.get("verifyCommands") or [])
-        if str(cmd).strip()
-    ]
-
-    state = str(status.get("status") or "unverified")
-    if state == "passed":
-        return None
+    paths, status, verify_commands = details
 
     # Optional shipped coding guidance, only paid when this evidence gate fires.
     try:
@@ -310,4 +329,63 @@ def build_verify_on_stop_nudge(
     )
 
 
-__all__ = ["build_verify_on_stop_nudge", "verify_on_stop_enabled"]
+def build_budget_exhausted_verification_response(
+    *,
+    session_id: str | None,
+    changed_paths: Iterable[str],
+    api_call_count: int | None = None,
+    max_iterations: int | None = None,
+) -> str | None:
+    """Return a deterministic INCOMPLETE response for budget exhaustion.
+
+    This is the hard stop counterpart to ``build_verify_on_stop_nudge``. The
+    nudge path spends another model turn while budget remains; once the loop is
+    out of iterations, asking the model for a summary can reintroduce the exact
+    false-success failure this guard is meant to prevent. Use deterministic text
+    instead: pending verification means ``INCOMPLETE``, plus a compact
+    continuation brief a future run can execute.
+    """
+    details = _verification_gap_details(
+        session_id=session_id,
+        changed_paths=changed_paths,
+    )
+    if details is None:
+        return None
+    paths, status, verify_commands = details
+
+    budget = "unknown"
+    if api_call_count is not None and max_iterations is not None:
+        budget = f"{api_call_count}/{max_iterations}"
+
+    if verify_commands:
+        verification_lines = "\n".join(
+            f"- `{cmd}`" for cmd in verify_commands[:5]
+        )
+    else:
+        verification_lines = (
+            "- No canonical command detected; create and run a focused temporary "
+            "`hermes-verify-*` ad-hoc verifier, then report it as ad-hoc evidence."
+        )
+
+    return (
+        "INCOMPLETE: iteration budget was exhausted before fresh verification "
+        "evidence existed for edited code.\n\n"
+        f"Budget: {budget}\n\n"
+        f"Verification status: {_status_detail(status)}\n\n"
+        f"Changed paths:\n{_format_changed_paths(paths)}\n\n"
+        "Continuation brief:\n"
+        "1. Resume in the workspace containing the changed paths above.\n"
+        "2. Inspect current `git status --short` / diff before trusting this brief.\n"
+        "3. Run the pending verification gate:\n"
+        f"{verification_lines}\n"
+        "4. If verification fails, repair and rerun it.\n"
+        "5. Report PASS only with same-run command/read-back evidence; otherwise "
+        "report FAIL or BLOCKED."
+    )
+
+
+__all__ = [
+    "build_budget_exhausted_verification_response",
+    "build_verify_on_stop_nudge",
+    "verify_on_stop_enabled",
+]

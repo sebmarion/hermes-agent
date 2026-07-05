@@ -65,9 +65,36 @@ def finalize_turn(
         if not agent.quiet_mode:
             agent._safe_print(
                 f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— requesting summary..."
+                "— finalizing turn..."
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+        final_response = None
+        try:
+            from agent.verification_stop import build_budget_exhausted_verification_response
+
+            final_response = build_budget_exhausted_verification_response(
+                session_id=getattr(agent, "session_id", None),
+                changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                api_call_count=api_call_count,
+                max_iterations=agent.max_iterations,
+            )
+        except Exception:
+            logger.debug("budget-exhausted verification response failed", exc_info=True)
+            final_response = None
+
+        if final_response is None:
+            final_response = agent._handle_max_iterations(messages, api_call_count)
+
+        # The model-summary path appends its assistant message inside
+        # _handle_max_iterations. The deterministic verification-gap path does
+        # not call the model, so close the in-memory turn here before trajectory
+        # saving/persistence so every sink sees the same final response.
+        if final_response:
+            try:
+                _tail_role = messages[-1].get("role") if messages else None
+            except Exception:
+                _tail_role = None
+            if _tail_role != "assistant":
+                messages.append({"role": "assistant", "content": final_response})
 
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
