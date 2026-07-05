@@ -15,12 +15,27 @@ from tools import async_delegation as ad
 from tools.process_registry import process_registry, format_process_notification
 
 
+def _wait_for_async_idle(timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if ad.active_count() == 0:
+            return
+        time.sleep(0.02)
+
+
 @pytest.fixture(autouse=True)
-def _clean_state():
+def _clean_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        ad,
+        "_persistence_path",
+        lambda: tmp_path / "async_delegations.json",
+    )
+    _wait_for_async_idle()
     ad._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
     yield
+    _wait_for_async_idle()
     ad._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
@@ -60,6 +75,7 @@ def test_dispatch_returns_immediately_without_blocking():
     assert ad.active_count() == 1
     assert elapsed < 4.0, f"dispatch blocked {elapsed:.2f}s (gate is 5s)"
     gate.set()
+    assert _drain_one() is not None
 
 
 def test_async_executor_workers_are_daemon_threads():
@@ -329,6 +345,86 @@ def test_cleanup_size_budget_prunes_oldest_terminal_records_first():
     rows = {r["delegation_id"]: r for r in ad.list_async_delegations()}
     assert "running" in rows
     assert "done0" not in rows
+
+
+def test_completion_is_persisted_before_delivery_ack():
+    def runner():
+        return {"status": "completed", "summary": "persist me", "model": "m"}
+
+    res = ad.dispatch_async_delegation(
+        goal="durable task", context="ctx", toolsets=None, role="leaf", model="m",
+        session_key="sess", runner=runner, max_async_children=1,
+    )
+    evt = _drain_one()
+    assert evt is not None
+
+    data = ad._read_persisted_unlocked()
+    entry = data["records"][res["delegation_id"]]
+    assert entry["delivery_status"] == "queued"
+    assert entry["result"]["summary"] == "persist me"
+    assert entry["event"]["delegation_id"] == res["delegation_id"]
+
+    ad.mark_async_delegation_delivered(evt)
+    data = ad._read_persisted_unlocked()
+    assert data["records"][res["delegation_id"]]["delivery_status"] == "delivered"
+
+
+def test_recovery_replays_unacked_and_marks_prior_running_lost():
+    now = time.time()
+    data = {
+        "version": 1,
+        "records": {
+            "done": {
+                "delegation_id": "done",
+                "status": "completed",
+                "delivery_status": "queued",
+                "record": {
+                    "delegation_id": "done",
+                    "goal": "done goal",
+                    "status": "completed",
+                    "dispatched_at": now - 20,
+                    "completed_at": now - 10,
+                    "session_key": "sess",
+                },
+                "result": {"status": "completed", "summary": "done"},
+                "event": {
+                    "type": "async_delegation",
+                    "delegation_id": "done",
+                    "goal": "done goal",
+                    "session_key": "sess",
+                    "status": "completed",
+                    "summary": "done",
+                },
+            },
+            "running": {
+                "delegation_id": "running",
+                "status": "running",
+                "delivery_status": "running",
+                "record": {
+                    "delegation_id": "running",
+                    "goal": "lost goal",
+                    "status": "running",
+                    "dispatched_at": now - 30,
+                    "last_heartbeat_at": now - 20,
+                    "session_key": "sess",
+                },
+            },
+        },
+    }
+    with ad._persist_lock:
+        ad._write_persisted_unlocked(data)
+    ad._recovery_attempted = False
+
+    report = ad.recover_async_delegations()
+    assert report == {"queued": 2, "lost": 1}
+
+    drained = [_drain_one(), _drain_one()]
+    ids = {evt["delegation_id"] for evt in drained if evt}
+    assert ids == {"done", "running"}
+
+    stored = ad._read_persisted_unlocked()["records"]
+    assert stored["running"]["status"] == "lost"
+    assert stored["running"]["delivery_status"] == "queued"
 
 
 # ---------------------------------------------------------------------------

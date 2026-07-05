@@ -1167,6 +1167,13 @@ class ProcessRegistry:
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))
+                if evt.get("type") == "async_delegation":
+                    try:
+                        from tools.async_delegation import mark_async_delegation_delivered
+
+                        mark_async_delegation_delivered(evt)
+                    except Exception:
+                        logger.debug("Failed to ACK async delegation delivery", exc_info=True)
         return results
 
     def get(self, session_id: str) -> Optional[ProcessSession]:

@@ -8358,6 +8358,13 @@ def _notification_poller_loop(
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
+            if evt.get("type") == "async_delegation":
+                try:
+                    from tools.async_delegation import mark_async_delegation_delivered
+
+                    mark_async_delegation_delivered(evt)
+                except Exception:
+                    pass
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
@@ -8401,6 +8408,13 @@ def _notification_poller_loop(
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
+            if evt.get("type") == "async_delegation":
+                try:
+                    from tools.async_delegation import mark_async_delegation_delivered
+
+                    mark_async_delegation_delivered(evt)
+                except Exception:
+                    pass
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "

@@ -38,10 +38,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -85,6 +87,10 @@ _DEFAULT_MAX_STORE_BYTES = 250 * 1024 * 1024
 # Throttle opportunistic cleanup so status reads stay cheap.
 _CLEANUP_INTERVAL_SECONDS = 15 * 60
 _last_cleanup_at = 0.0
+_persist_lock = threading.Lock()
+_recovery_attempted = False
+_replayed_persisted_ids: set[str] = set()
+_PERSISTENCE_VERSION = 1
 # Lightweight liveness ping for status consumers (/agents, TUI/Desktop
 # delegation.status). Completion delivery still rides the shared process queue;
 # this heartbeat only proves that the async-delegation supervisor in this
@@ -140,6 +146,52 @@ def _prune_completed_locked() -> None:
     completed.sort(key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0)
     for rid, _ in completed[: len(completed) - _MAX_RETAINED_COMPLETED]:
         _records.pop(rid, None)
+
+
+def _persistence_path() -> Path:
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        home = get_hermes_home()
+    except Exception:
+        home = Path(os.path.expanduser("~/.hermes"))
+    return Path(home) / "async_delegations.json"
+
+
+def _read_persisted_unlocked() -> Dict[str, Any]:
+    path = _persistence_path()
+    if not path.exists():
+        return {"version": _PERSISTENCE_VERSION, "records": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"version": _PERSISTENCE_VERSION, "records": {}}
+        if not isinstance(data.get("records"), dict):
+            data["records"] = {}
+        data["version"] = data.get("version") or _PERSISTENCE_VERSION
+        return data
+    except Exception as exc:
+        logger.warning("Failed to read async delegation checkpoint %s: %s", path, exc)
+        return {"version": _PERSISTENCE_VERSION, "records": {}}
+
+
+def _write_persisted_unlocked(data: Dict[str, Any]) -> None:
+    path = _persistence_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def _persistable_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        k: v
+        for k, v in record.items()
+        if k not in {"interrupt_fn", "heartbeat_stop"}
+    }
 
 
 def _load_delegation_config() -> Dict[str, Any]:
@@ -217,6 +269,243 @@ def _record_size_bytes(record: Dict[str, Any]) -> int:
         return 0
 
 
+def _persisted_entry_size(entry: Dict[str, Any]) -> int:
+    try:
+        return len(json.dumps(entry, ensure_ascii=False, default=str).encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _cleanup_persisted_data_locked(data: Dict[str, Any], *, now: float) -> int:
+    policy = _retention_policy_from_config()
+    records = data.setdefault("records", {})
+    if not isinstance(records, dict):
+        data["records"] = {}
+        return 0
+    removed = 0
+    for rid, entry in list(records.items()):
+        if not isinstance(entry, dict):
+            records.pop(rid, None)
+            removed += 1
+            continue
+        record = entry.get("record") if isinstance(entry.get("record"), dict) else entry
+        status = str(entry.get("status") or record.get("status") or "")
+        delivery_status = str(entry.get("delivery_status") or "")
+        if status == "running":
+            continue
+        age = _record_terminal_age(record, now)
+        ttl = _terminal_retention_seconds(status, policy)
+        if delivery_status != "delivered" and status not in {"completed", "interrupted"}:
+            ttl = policy["failed_seconds"]
+        if age > ttl:
+            records.pop(rid, None)
+            removed += 1
+
+    total = sum(_persisted_entry_size(e) for e in records.values() if isinstance(e, dict))
+    max_bytes = policy.get("max_bytes", _DEFAULT_MAX_STORE_BYTES)
+    if total <= max_bytes:
+        return removed
+    terminal = []
+    for rid, entry in records.items():
+        if not isinstance(entry, dict):
+            continue
+        record = entry.get("record") if isinstance(entry.get("record"), dict) else entry
+        if record.get("status") == "running":
+            continue
+        terminal.append((rid, entry, record))
+    terminal.sort(key=lambda item: item[2].get("completed_at") or item[2].get("dispatched_at") or 0)
+    for rid, entry, _record in terminal:
+        if total <= max_bytes:
+            break
+        total -= _persisted_entry_size(entry)
+        records.pop(rid, None)
+        removed += 1
+    return removed
+
+
+def _persist_record(
+    record: Dict[str, Any],
+    *,
+    result: Optional[Dict[str, Any]] = None,
+    event: Optional[Dict[str, Any]] = None,
+    delivery_status: Optional[str] = None,
+) -> None:
+    """Best-effort durable checkpoint for one async delegation record."""
+    delegation_id = str(record.get("delegation_id") or "")
+    if not delegation_id:
+        return
+    now = time.time()
+    entry = {
+        "delegation_id": delegation_id,
+        "record": _persistable_record(record),
+        "status": record.get("status"),
+        "updated_at": now,
+    }
+    if result is not None:
+        entry["result"] = result
+    if event is not None:
+        entry["event"] = event
+    if delivery_status is not None:
+        entry["delivery_status"] = delivery_status
+        if delivery_status == "queued":
+            entry["queued_at"] = now
+        elif delivery_status == "delivered":
+            entry["delivered_at"] = now
+    try:
+        with _persist_lock:
+            data = _read_persisted_unlocked()
+            existing = data.setdefault("records", {}).get(delegation_id, {})
+            merged = dict(existing) if isinstance(existing, dict) else {}
+            merged.update(entry)
+            if result is None and "result" in existing:
+                merged["result"] = existing["result"]
+            if event is None and "event" in existing:
+                merged["event"] = existing["event"]
+            if delivery_status is None and "delivery_status" in existing:
+                merged["delivery_status"] = existing["delivery_status"]
+            data["records"][delegation_id] = merged
+            _cleanup_persisted_data_locked(data, now=now)
+            _write_persisted_unlocked(data)
+    except Exception as exc:
+        logger.warning("Failed to persist async delegation %s: %s", delegation_id, exc)
+
+
+def _mark_persisted_delivery(delegation_id: str, status: str) -> None:
+    if not delegation_id:
+        return
+    now = time.time()
+    try:
+        with _persist_lock:
+            data = _read_persisted_unlocked()
+            entry = data.setdefault("records", {}).get(delegation_id)
+            if not isinstance(entry, dict):
+                return
+            entry["delivery_status"] = status
+            entry["updated_at"] = now
+            if status == "queued":
+                entry["queued_at"] = now
+            elif status == "delivered":
+                entry["delivered_at"] = now
+            _cleanup_persisted_data_locked(data, now=now)
+            _write_persisted_unlocked(data)
+    except Exception as exc:
+        logger.warning("Failed to update async delegation delivery %s: %s", delegation_id, exc)
+
+
+def mark_async_delegation_delivered(evt: Dict[str, Any]) -> None:
+    """ACK that an async-delegation notification was consumed by a driver."""
+    if not isinstance(evt, dict) or evt.get("type") != "async_delegation":
+        return
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not delegation_id:
+        return
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None:
+            record["delivery_status"] = "delivered"
+            record["delivered_at"] = time.time()
+    _mark_persisted_delivery(delegation_id, "delivered")
+
+
+def _event_for_lost_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    delegation_id = str(record.get("delegation_id") or "")
+    result = {
+        "status": "error",
+        "summary": (
+            "Async delegation was still running when the Hermes process stopped; "
+            "the child result cannot be recovered."
+        ),
+        "error": "async delegation lost during process restart",
+        "api_calls": 0,
+        "duration_seconds": 0,
+        "model": record.get("model") or "",
+        "exit_reason": "lost",
+    }
+    return {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": record.get("session_key") or "",
+        "goal": record.get("goal") or "background delegation",
+        "context": record.get("context"),
+        "toolsets": record.get("toolsets"),
+        "role": record.get("role") or "leaf",
+        "model": record.get("model") or "",
+        "result": result,
+        "status": "error",
+        "summary": result["summary"],
+        "error": result["error"],
+    }
+
+
+def recover_async_delegations() -> Dict[str, Any]:
+    """Replay undelivered completions and mark previous-process runners lost."""
+    global _recovery_attempted
+    queued = 0
+    lost = 0
+    now = time.time()
+    try:
+        from tools.process_registry import process_registry
+    except Exception as exc:
+        return {"queued": 0, "lost": 0, "error": str(exc)}
+    with _persist_lock:
+        data = _read_persisted_unlocked()
+        records = data.setdefault("records", {})
+        if not isinstance(records, dict):
+            return {"queued": 0, "lost": 0, "error": "invalid records"}
+        for rid, entry in list(records.items()):
+            if not isinstance(entry, dict):
+                records.pop(rid, None)
+                continue
+            record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
+            if not isinstance(record, dict):
+                continue
+            status = str(entry.get("status") or record.get("status") or "")
+            delivery_status = str(entry.get("delivery_status") or "")
+            event = entry.get("event") if isinstance(entry.get("event"), dict) else None
+            if status == "running":
+                record = dict(record)
+                record["status"] = "lost"
+                record["completed_at"] = now
+                record["last_heartbeat_at"] = record.get("last_heartbeat_at") or record.get("dispatched_at") or now
+                event = _event_for_lost_record(record)
+                entry["record"] = record
+                entry["status"] = "lost"
+                entry["event"] = event
+                entry["result"] = event["result"]
+                entry["delivery_status"] = "pending"
+                entry["updated_at"] = now
+                status = "lost"
+                delivery_status = "pending"
+                lost += 1
+            if status != "running" and delivery_status != "delivered" and event and rid not in _replayed_persisted_ids:
+                process_registry.completion_queue.put(event)
+                _replayed_persisted_ids.add(rid)
+                entry["delivery_status"] = "queued"
+                entry["queued_at"] = now
+                entry["updated_at"] = now
+                queued += 1
+                with _records_lock:
+                    if rid not in _records:
+                        restored = dict(record)
+                        restored["delivery_status"] = "queued"
+                        _records[rid] = restored
+        _cleanup_persisted_data_locked(data, now=now)
+        _write_persisted_unlocked(data)
+    _recovery_attempted = True
+    return {"queued": queued, "lost": lost}
+
+
+def _recover_once() -> None:
+    global _recovery_attempted
+    if _recovery_attempted:
+        return
+    try:
+        recover_async_delegations()
+    except Exception as exc:
+        logger.debug("async delegation recovery failed: %s", exc)
+        _recovery_attempted = True
+
+
 def _cleanup_locked(now: Optional[float] = None, policy: Optional[Dict[str, float]] = None) -> int:
     """Prune terminal async records by age and rough size. Lock must be held."""
     now = time.time() if now is None else now
@@ -268,12 +557,21 @@ def cleanup_async_delegations() -> Dict[str, Any]:
         removed = _cleanup_locked(now=now, policy=policy)
         after = len(_records)
         approx_bytes = sum(_record_size_bytes(r) for r in _records.values())
+    with _persist_lock:
+        data = _read_persisted_unlocked()
+        persisted_before = len(data.get("records", {}) or {})
+        persisted_removed = _cleanup_persisted_data_locked(data, now=now)
+        persisted_after = len(data.get("records", {}) or {})
+        _write_persisted_unlocked(data)
     return {
         "removed": removed,
         "before": before,
         "after": after,
         "approx_bytes": approx_bytes,
         "max_bytes": int(policy["max_bytes"]),
+        "persisted_removed": persisted_removed,
+        "persisted_before": persisted_before,
+        "persisted_after": persisted_after,
     }
 
 
@@ -379,6 +677,8 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    _recover_once()
+
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -394,6 +694,7 @@ def dispatch_async_delegation(
         "completed_at": None,
         "last_heartbeat_at": dispatched_at,
         "heartbeat_count": 0,
+        "delivery_status": "running",
         "interrupt_fn": interrupt_fn,
     }
     # Capacity check and record insert under ONE lock hold — checking
@@ -415,6 +716,7 @@ def dispatch_async_delegation(
                 ),
             }
         _records[delegation_id] = record
+    _persist_record(record, delivery_status="running")
 
     heartbeat_stop = _start_heartbeat_thread(delegation_id)
     with _records_lock:
@@ -474,6 +776,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         record["status"] = status
         record["completed_at"] = time.time()
         record["last_heartbeat_at"] = record["completed_at"]
+        record["delivery_status"] = "pending"
         hb_stop = record.get("heartbeat_stop")
         if hasattr(hb_stop, "set"):
             hb_stop.set()
@@ -532,11 +835,18 @@ def _push_completion_event(
         "exit_reason": result.get("exit_reason"),
     }
     try:
+        _persist_record(record, result=result, event=evt, delivery_status="pending")
         process_registry.completion_queue.put(evt)
+        _mark_persisted_delivery(str(record.get("delegation_id") or ""), "queued")
+        with _records_lock:
+            live = _records.get(str(record.get("delegation_id") or ""))
+            if live is not None:
+                live["delivery_status"] = "queued"
+                live["queued_at"] = time.time()
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "persisted for replay: %s",
             record.get("delegation_id"), exc,
         )
 
@@ -573,6 +883,8 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    _recover_once()
+
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -594,6 +906,7 @@ def dispatch_async_delegation_batch(
         "completed_at": None,
         "last_heartbeat_at": dispatched_at,
         "heartbeat_count": 0,
+        "delivery_status": "running",
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
     }
@@ -612,6 +925,7 @@ def dispatch_async_delegation_batch(
                 ),
             }
         _records[delegation_id] = record
+    _persist_record(record, delivery_status="running")
 
     heartbeat_stop = _start_heartbeat_thread(delegation_id)
     with _records_lock:
@@ -678,6 +992,7 @@ def _finalize_batch(
         record["status"] = status
         record["completed_at"] = time.time()
         record["last_heartbeat_at"] = record["completed_at"]
+        record["delivery_status"] = "pending"
         hb_stop = record.get("heartbeat_stop")
         if hasattr(hb_stop, "set"):
             hb_stop.set()
@@ -719,11 +1034,18 @@ def _finalize_batch(
         "completed_at": completed_at,
     }
     try:
+        _persist_record(event_record, result=combined, event=evt, delivery_status="pending")
         process_registry.completion_queue.put(evt)
+        _mark_persisted_delivery(delegation_id, "queued")
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None:
+                live["delivery_status"] = "queued"
+                live["queued_at"] = time.time()
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "persisted for replay: %s",
             delegation_id, exc,
         )
 
@@ -733,6 +1055,7 @@ def list_async_delegations() -> List[Dict[str, Any]]:
 
     Safe to call from any thread. Excludes the non-serialisable interrupt_fn.
     """
+    _recover_once()
     _maybe_cleanup()
     now = time.time()
     with _records_lock:
@@ -769,7 +1092,7 @@ def interrupt_all(reason: str = "shutdown") -> int:
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor."""
-    global _executor, _executor_max_workers, _last_cleanup_at
+    global _executor, _executor_max_workers, _last_cleanup_at, _recovery_attempted
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
@@ -782,3 +1105,13 @@ def _reset_for_tests() -> None:
                 hb_stop.set()
         _records.clear()
         _last_cleanup_at = 0.0
+    _recovery_attempted = False
+    _replayed_persisted_ids.clear()
+    try:
+        _persistence_path().unlink(missing_ok=True)
+    except TypeError:
+        path = _persistence_path()
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
