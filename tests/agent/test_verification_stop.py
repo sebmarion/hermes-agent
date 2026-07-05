@@ -9,6 +9,7 @@ from agent.verification_evidence import (
     record_terminal_result,
 )
 from agent.verification_stop import (
+    build_budget_exhausted_verification_response,
     build_verify_on_stop_nudge,
     verify_on_stop_enabled,
 )
@@ -307,6 +308,47 @@ def test_nudge_attempts_are_bounded(tmp_path, monkeypatch):
         changed_paths=[changed],
         attempts=2,
         max_attempts=2,
+    ) is None
+
+
+def test_budget_exhaustion_response_is_incomplete_continuation_brief(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    changed = str(tmp_path / "src" / "app.ts")
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[changed])
+
+    response = build_budget_exhausted_verification_response(
+        session_id="s1",
+        changed_paths=[changed],
+        api_call_count=3,
+        max_iterations=3,
+    )
+
+    assert response is not None
+    assert response.startswith("INCOMPLETE:")
+    assert "Budget: 3/3" in response
+    assert changed in response
+    assert "`pnpm run test`" in response
+    assert "Report PASS only with same-run" in response
+
+
+def test_budget_exhaustion_response_suppressed_after_fresh_pass(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    changed = str(tmp_path / "src" / "app.ts")
+    record_terminal_result(
+        command="pnpm test",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="green",
+    )
+
+    assert build_budget_exhausted_verification_response(
+        session_id="s1",
+        changed_paths=[changed],
+        api_call_count=3,
+        max_iterations=3,
     ) is None
 
 

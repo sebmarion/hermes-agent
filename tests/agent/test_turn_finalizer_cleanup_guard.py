@@ -41,6 +41,8 @@ class _StubAgent:
         self._interrupt_message = None
         self._tool_guardrail_halt_decision = None
         self._response_was_previewed = False
+        self._turn_file_mutation_paths = set()
+        self._handle_max_iterations_called = False
         self._skill_nudge_interval = 0
         self._iters_since_skill = 0
         for attr in (
@@ -82,6 +84,7 @@ class _StubAgent:
         pass
 
     def _handle_max_iterations(self, messages, n):
+        self._handle_max_iterations_called = True
         return "PARTIAL SUMMARY FROM MODEL"
 
     def _file_mutation_verifier_enabled(self):
@@ -170,6 +173,32 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
     assert "cleanup_errors" not in result
+
+
+def test_budget_exhaustion_with_unverified_code_returns_incomplete_without_model_summary(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    (tmp_path / "package.json").write_text(
+        '{"scripts":{"test":"vitest"}}', encoding="utf-8"
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("", encoding="utf-8")
+    changed = str(tmp_path / "src" / "app.ts")
+
+    from agent.verification_evidence import mark_workspace_edited
+
+    mark_workspace_edited(session_id="sess-1", cwd=tmp_path, paths=[changed])
+    agent = _StubAgent(raise_in=())
+    agent._turn_file_mutation_paths = {changed}
+
+    result = _run(agent)
+
+    assert result["final_response"].startswith("INCOMPLETE:")
+    assert result["messages"][-1]["role"] == "assistant"
+    assert result["messages"][-1]["content"] == result["final_response"]
+    assert "Budget: 3/3" in result["final_response"]
+    assert changed in result["final_response"]
+    assert "`pnpm run test`" in result["final_response"]
+    assert agent._handle_max_iterations_called is False
 
 
 def test_text_response_on_last_allowed_call_is_completed():
