@@ -41,11 +41,14 @@ def _clean_state(monkeypatch, tmp_path):
         process_registry.completion_queue.get_nowait()
 
 
-def _drain_one(timeout=5.0):
+def _drain_one(timeout=5.0, delegation_id=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not process_registry.completion_queue.empty():
-            return process_registry.completion_queue.get_nowait()
+            evt = process_registry.completion_queue.get_nowait()
+            if delegation_id is None or evt.get("delegation_id") == delegation_id:
+                return evt
+            continue
         time.sleep(0.02)
     return None
 
@@ -75,7 +78,7 @@ def test_dispatch_returns_immediately_without_blocking():
     assert ad.active_count() == 1
     assert elapsed < 4.0, f"dispatch blocked {elapsed:.2f}s (gate is 5s)"
     gate.set()
-    assert _drain_one() is not None
+    assert _drain_one(delegation_id=res["delegation_id"]) is not None
 
 
 def test_async_executor_workers_are_daemon_threads():
@@ -104,7 +107,7 @@ def test_async_executor_workers_are_daemon_threads():
     assert worker is not None
     assert worker.daemon is True
     gate.set()
-    assert _drain_one() is not None
+    assert _drain_one(delegation_id=res["delegation_id"]) is not None
 
 
 def test_running_status_snapshot_includes_liveness_ping():
@@ -137,7 +140,7 @@ def test_running_status_snapshot_includes_liveness_ping():
     assert ad.list_async_delegations()[0]["heartbeat_count"] == before + 1
 
     gate.set()
-    assert _drain_one() is not None
+    assert _drain_one(delegation_id=res["delegation_id"]) is not None
 
 
 def test_completion_event_lands_on_shared_queue_with_session_key():
@@ -152,7 +155,7 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     )
     assert res["status"] == "dispatched"
 
-    evt = _drain_one()
+    evt = _drain_one(delegation_id=res["delegation_id"])
     assert evt is not None
     assert evt["type"] == "async_delegation"
     assert evt["summary"] == "the result"
@@ -165,13 +168,13 @@ def test_rich_reinjection_block_is_self_contained():
         return {"status": "completed", "summary": "The answer is 42.",
                 "api_calls": 7, "duration_seconds": 3.5, "model": "test-model"}
 
-    ad.dispatch_async_delegation(
+    res = ad.dispatch_async_delegation(
         goal="Compute the meaning of life",
         context="User is a philosopher. Respond tersely.",
         toolsets=["web"], role="leaf", model="test-model",
         session_key="", runner=runner, max_async_children=3,
     )
-    evt = _drain_one()
+    evt = _drain_one(delegation_id=res["delegation_id"])
     assert evt is not None
     text = format_process_notification(evt)
     assert text is not None
@@ -219,9 +222,10 @@ def test_crashed_runner_produces_error_completion():
         session_key="", runner=boom, max_async_children=3,
     )
     assert r["status"] == "dispatched"
-    evt = _drain_one()
+    evt = _drain_one(delegation_id=r["delegation_id"])
     assert evt is not None
     assert evt["status"] == "error"
+
     text = format_process_notification(evt)
     assert text is not None
     assert "did not complete successfully" in text
@@ -241,7 +245,7 @@ def test_interrupt_all_signals_running_children():
         interrupted["count"] += 1
         ev.set()
 
-    ad.dispatch_async_delegation(
+    res = ad.dispatch_async_delegation(
         goal="long task", context=None, toolsets=None, role="leaf",
         model="m", session_key="", runner=blocker,
         interrupt_fn=interrupt_fn, max_async_children=3,
@@ -250,7 +254,7 @@ def test_interrupt_all_signals_running_children():
     assert n == 1
     assert interrupted["count"] == 1
     # child still emits a completion event after interrupt
-    evt = _drain_one()
+    evt = _drain_one(delegation_id=res["delegation_id"])
     assert evt is not None
     assert evt["status"] == "interrupted"
 
@@ -483,7 +487,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert ad.active_count() == 1  # one background batch unit, not finished
 
     gate.set()
-    evt = _drain_one()
+    evt = _drain_one(delegation_id=parsed["delegation_id"])
     assert evt is not None
     assert evt["type"] == "async_delegation"
     # Single task rides the batch path → carries a 1-item results list.
@@ -554,7 +558,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
 
     # Release the children; the whole batch joins and emits ONE event.
     gate.set()
-    evt = _drain_one()
+    evt = _drain_one(delegation_id=parsed["delegation_id"])
     assert evt is not None
     assert evt["type"] == "async_delegation"
     assert evt.get("is_batch") is True
@@ -690,11 +694,12 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
         out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
 
     import json
-    assert json.loads(out)["status"] == "dispatched"
+    parsed_bg = json.loads(out)
+    assert parsed_bg["status"] == "dispatched"
     # Child detached immediately at dispatch, while it is still running.
     assert fake_child not in parent._active_children
     gate.set()
-    assert _drain_one() is not None
+    assert _drain_one(delegation_id=parsed_bg["delegation_id"]) is not None
 
 
 def test_concurrent_dispatch_respects_capacity():
