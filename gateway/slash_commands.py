@@ -939,6 +939,7 @@ class GatewaySlashCommandsMixin:
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from tools.async_delegation import list_async_delegations
         from tools.process_registry import format_uptime_short, process_registry
 
         now = time.time()
@@ -977,6 +978,11 @@ class GatewaySlashCommandsMixin:
             t for t in (getattr(self, "_background_tasks", set()) or set())
             if hasattr(t, "done") and not t.done()
         ]
+
+        try:
+            async_delegations = list_async_delegations()
+        except Exception:
+            async_delegations = []
 
         lines = [
             t("gateway.agents.header"),
@@ -1021,7 +1027,27 @@ class GatewaySlashCommandsMixin:
             ]
         )
 
-        if not agent_rows and not running_processes and not background_tasks:
+        lines.extend(["", f"Async delegations ({len(async_delegations)}):"])
+        for delegation in async_delegations[:12]:
+            did = str(delegation.get("delegation_id") or "?")
+            status = str(delegation.get("status") or "unknown")
+            goal = " ".join(str(delegation.get("goal") or "").split())
+            if len(goal) > 90:
+                goal = goal[:87] + "..."
+            age = int(float(delegation.get("age_seconds") or 0))
+            heartbeat_age = delegation.get("heartbeat_age_seconds")
+            heartbeat = ""
+            if heartbeat_age is not None:
+                heartbeat = f" · heartbeat {format_uptime_short(int(float(heartbeat_age)))} ago"
+                if delegation.get("heartbeat_stale"):
+                    heartbeat += " (STALE)"
+            lines.append(
+                f"- `{did}` · {status} · {format_uptime_short(age)}{heartbeat} · {goal}"
+            )
+        if len(async_delegations) > 12:
+            lines.append(t("gateway.agents.more", count=len(async_delegations) - 12))
+
+        if not agent_rows and not running_processes and not background_tasks and not async_delegations:
             lines.append("")
             lines.append(t("gateway.agents.none"))
 

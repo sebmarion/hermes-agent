@@ -2136,6 +2136,13 @@ DEFAULT_CONFIG = {
                                        # delegation units. New async dispatches beyond the cap
                                        # fall back to synchronous execution. Floor of 1, no ceiling.
                                        # (Replaces the deprecated max_async_children.)
+        # Async delegation status-retention guardrails. These currently cap the
+        # in-memory status registry; if async records become durable, the same
+        # policy prevents disk bloat. Running records are never pruned.
+        "async_retention_days": 7,          # completed/interrupted terminal records
+        "async_failed_retention_days": 30,  # failed/error records kept longer for debugging
+        "async_lost_retention_days": 14,    # stale/lost records after restart/recovery flows
+        "async_max_store_mb": 250,          # rough total status/result snapshot budget
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.

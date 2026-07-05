@@ -1391,6 +1391,26 @@ class ContextCompressor(ContextEngine):
             if role == "assistant":
                 if len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+                # Include reasoning from thinking models (DeepSeek thinking,
+                # Kimi thinking, MiniMax, Claude extended thinking) so the
+                # summarizer can preserve the "why" behind decisions — not
+                # just the visible action.  Without this, compression on long
+                # sessions destroys the intermediate reasoning chain that
+                # self-correction and "Key Decisions" in the summary depend on.
+                # Truncated to _CONTENT_MAX independently, then the combined
+                # content+reasoning is re-checked so reasoning can never
+                # push the total past the summarizer's per-message budget.
+                reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+                if reasoning:
+                    reasoning = redact_sensitive_text(reasoning)
+                    if len(reasoning) > self._CONTENT_MAX:
+                        reasoning = reasoning[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + reasoning[-self._CONTENT_TAIL:]
+                    content += f"\n[REASONING]: {reasoning}"
+                    # Re-truncate the combined content+reasoning if it exceeds
+                    # the budget — reasoning should supplement, not displace,
+                    # the rest of the serialized message.
+                    if len(content) > self._CONTENT_MAX:
+                        content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
                 tool_calls = msg.get("tool_calls", [])
                 if tool_calls:
                     tc_parts = []
@@ -1516,6 +1536,15 @@ class ContextCompressor(ContextEngine):
                     )
                 elif text:
                     assistant_actions.append(text)
+                # Preserve reasoning from thinking models in the fallback path
+                # too — otherwise the static fallback loses the "why" behind
+                # decisions when the LLM summarizer is unavailable.
+                reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+                if reasoning:
+                    reasoning = redact_sensitive_text(reasoning)
+                    if len(reasoning) > _FALLBACK_TURN_MAX_CHARS:
+                        reasoning = reasoning[: _FALLBACK_TURN_MAX_CHARS - 15].rstrip() + " ...[truncated]"
+                    assistant_actions.append(f"[reasoning]: {reasoning}")
             elif role == "tool":
                 call_id = str(msg.get("tool_call_id") or "")
                 tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))

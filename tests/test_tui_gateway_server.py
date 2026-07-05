@@ -8339,6 +8339,24 @@ def test_get_usage_safe_when_active_count_raises(monkeypatch):
     assert usage["model"] == "x"
 
 
+def test_delegation_status_includes_async_delegation_snapshots(monkeypatch):
+    import tools.async_delegation as ad_mod
+
+    monkeypatch.setattr(ad_mod, "list_async_delegations", lambda: [
+        {
+            "delegation_id": "deleg_ping",
+            "status": "running",
+            "age_seconds": 12.0,
+            "heartbeat_age_seconds": 1.0,
+            "heartbeat_stale": False,
+        }
+    ])
+
+    result = server._methods["delegation.status"]("r1", {})
+    assert result["result"]["async"][0]["delegation_id"] == "deleg_ping"
+    assert result["result"]["async"][0]["heartbeat_stale"] is False
+
+
 def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch):
     """#48305: switching models from the TUI must NOT destroy sibling keys under
     `model:` (model_slots, model_fallback, etc.). _persist_model_switch now uses

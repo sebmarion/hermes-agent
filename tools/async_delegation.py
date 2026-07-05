@@ -36,6 +36,7 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -72,6 +73,26 @@ _records: Dict[str, Dict[str, Any]] = {}
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
+# Age/size retention defaults for terminal async delegation records. Running
+# records are never pruned by cleanup: if the process still owns the handle,
+# status surfaces should keep showing it. These caps currently protect the
+# in-memory status registry; if/when async records are persisted, the same
+# policy becomes the disk cleanup contract.
+_DEFAULT_COMPLETED_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_DEFAULT_FAILED_RETENTION_SECONDS = 30 * 24 * 60 * 60
+_DEFAULT_LOST_RETENTION_SECONDS = 14 * 24 * 60 * 60
+_DEFAULT_MAX_STORE_BYTES = 250 * 1024 * 1024
+# Throttle opportunistic cleanup so status reads stay cheap.
+_CLEANUP_INTERVAL_SECONDS = 15 * 60
+_last_cleanup_at = 0.0
+# Lightweight liveness ping for status consumers (/agents, TUI/Desktop
+# delegation.status). Completion delivery still rides the shared process queue;
+# this heartbeat only proves that the async-delegation supervisor in this
+# process still owns the handle, so a UI can distinguish "still running" from
+# "no record / likely lost with process restart" without waiting for the final
+# re-entry event.
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
+_HEARTBEAT_STALE_SECONDS = _HEARTBEAT_INTERVAL_SECONDS * 3
 
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -119,6 +140,202 @@ def _prune_completed_locked() -> None:
     completed.sort(key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0)
     for rid, _ in completed[: len(completed) - _MAX_RETAINED_COMPLETED]:
         _records.pop(rid, None)
+
+
+def _load_delegation_config() -> Dict[str, Any]:
+    """Load delegation config defensively without making async status fragile."""
+    try:
+        from hermes_cli.config import load_config
+
+        full = load_config() or {}
+        cfg = full.get("delegation") or {}
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _positive_number(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _retention_policy_from_config() -> Dict[str, float]:
+    cfg = _load_delegation_config()
+    completed_days = _positive_number(
+        cfg.get("async_retention_days"),
+        _DEFAULT_COMPLETED_RETENTION_SECONDS / 86400,
+    )
+    failed_days = _positive_number(
+        cfg.get("async_failed_retention_days"),
+        _DEFAULT_FAILED_RETENTION_SECONDS / 86400,
+    )
+    lost_days = _positive_number(
+        cfg.get("async_lost_retention_days"),
+        _DEFAULT_LOST_RETENTION_SECONDS / 86400,
+    )
+    max_mb = _positive_number(
+        cfg.get("async_max_store_mb"),
+        _DEFAULT_MAX_STORE_BYTES / (1024 * 1024),
+    )
+    return {
+        "completed_seconds": completed_days * 86400,
+        "failed_seconds": failed_days * 86400,
+        "lost_seconds": lost_days * 86400,
+        "max_bytes": max_mb * 1024 * 1024,
+    }
+
+
+def _record_terminal_age(record: Dict[str, Any], now: float) -> float:
+    completed_at = record.get("completed_at") or record.get("last_heartbeat_at") or record.get("dispatched_at") or now
+    try:
+        return max(0.0, now - float(completed_at))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _terminal_retention_seconds(status: str, policy: Dict[str, float]) -> float:
+    if status in {"error", "failed"}:
+        return policy["failed_seconds"]
+    if status in {"stale", "lost"}:
+        return policy["lost_seconds"]
+    return policy["completed_seconds"]
+
+
+def _record_size_bytes(record: Dict[str, Any]) -> int:
+    """Rough JSON size for retention budgeting; excludes live closures/events."""
+    serialisable = {
+        k: v
+        for k, v in record.items()
+        if k not in {"interrupt_fn", "heartbeat_stop"}
+    }
+    try:
+        return len(json.dumps(serialisable, ensure_ascii=False, default=str).encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _cleanup_locked(now: Optional[float] = None, policy: Optional[Dict[str, float]] = None) -> int:
+    """Prune terminal async records by age and rough size. Lock must be held."""
+    now = time.time() if now is None else now
+    policy = policy or _retention_policy_from_config()
+    removed = 0
+
+    # First pass: age-based pruning by terminal status. Running records are
+    # never removed here; a live process should keep surfacing them even if
+    # heartbeat looks stale.
+    for rid, record in list(_records.items()):
+        status = str(record.get("status") or "")
+        if status == "running":
+            continue
+        age = _record_terminal_age(record, now)
+        if age > _terminal_retention_seconds(status, policy):
+            _records.pop(rid, None)
+            removed += 1
+
+    # Second pass: rough size cap. Drop oldest terminal records first. If the
+    # cap is lower than the running set itself, leave running untouched and stop.
+    max_bytes = policy.get("max_bytes", _DEFAULT_MAX_STORE_BYTES)
+    total = sum(_record_size_bytes(r) for r in _records.values())
+    if total <= max_bytes:
+        return removed
+
+    terminal = [
+        (rid, r)
+        for rid, r in _records.items()
+        if r.get("status") != "running"
+    ]
+    terminal.sort(
+        key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0
+    )
+    for rid, record in terminal:
+        if total <= max_bytes:
+            break
+        total -= _record_size_bytes(record)
+        _records.pop(rid, None)
+        removed += 1
+    return removed
+
+
+def cleanup_async_delegations() -> Dict[str, Any]:
+    """Run async delegation retention cleanup now and return a compact report."""
+    now = time.time()
+    policy = _retention_policy_from_config()
+    with _records_lock:
+        before = len(_records)
+        removed = _cleanup_locked(now=now, policy=policy)
+        after = len(_records)
+        approx_bytes = sum(_record_size_bytes(r) for r in _records.values())
+    return {
+        "removed": removed,
+        "before": before,
+        "after": after,
+        "approx_bytes": approx_bytes,
+        "max_bytes": int(policy["max_bytes"]),
+    }
+
+
+def _maybe_cleanup() -> None:
+    """Cheap opportunistic cleanup, throttled to avoid status-read overhead."""
+    global _last_cleanup_at
+    now = time.time()
+    if now - _last_cleanup_at < _CLEANUP_INTERVAL_SECONDS:
+        return
+    with _records_lock:
+        if now - _last_cleanup_at < _CLEANUP_INTERVAL_SECONDS:
+            return
+        _cleanup_locked(now=now)
+        _last_cleanup_at = now
+
+
+def _mark_heartbeat(delegation_id: str) -> None:
+    """Refresh the liveness timestamp for a running async delegation."""
+    now = time.time()
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if not record or record.get("status") != "running":
+            return
+        record["last_heartbeat_at"] = now
+        record["heartbeat_count"] = int(record.get("heartbeat_count") or 0) + 1
+
+
+def _start_heartbeat_thread(delegation_id: str) -> threading.Event:
+    """Start a daemon heartbeat updater for one async delegation record."""
+    stop = threading.Event()
+
+    def _loop() -> None:
+        while not stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
+            _mark_heartbeat(delegation_id)
+
+    thread = threading.Thread(
+        target=_loop,
+        name=f"async-delegate-heartbeat-{delegation_id}",
+        daemon=True,
+    )
+    thread.start()
+    return stop
+
+
+def _serialise_record(record: Dict[str, Any], now: float) -> Dict[str, Any]:
+    """Return a JSON-safe status snapshot with derived liveness fields."""
+    out = {
+        k: v
+        for k, v in record.items()
+        if k not in {"interrupt_fn", "heartbeat_stop"}
+    }
+    dispatched_at = float(record.get("dispatched_at") or now)
+    completed_at = record.get("completed_at")
+    last_heartbeat_at = float(record.get("last_heartbeat_at") or dispatched_at)
+    out["age_seconds"] = round(max(0.0, now - dispatched_at), 2)
+    if completed_at:
+        out["completed_age_seconds"] = round(max(0.0, now - float(completed_at)), 2)
+    else:
+        heartbeat_age = max(0.0, now - last_heartbeat_at)
+        out["heartbeat_age_seconds"] = round(heartbeat_age, 2)
+        out["heartbeat_stale"] = heartbeat_age > _HEARTBEAT_STALE_SECONDS
+    return out
 
 
 def dispatch_async_delegation(
@@ -175,6 +392,8 @@ def dispatch_async_delegation(
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
+        "last_heartbeat_at": dispatched_at,
+        "heartbeat_count": 0,
         "interrupt_fn": interrupt_fn,
     }
     # Capacity check and record insert under ONE lock hold — checking
@@ -196,6 +415,11 @@ def dispatch_async_delegation(
                 ),
             }
         _records[delegation_id] = record
+
+    heartbeat_stop = _start_heartbeat_thread(delegation_id)
+    with _records_lock:
+        if delegation_id in _records:
+            _records[delegation_id]["heartbeat_stop"] = heartbeat_stop
 
     executor = _get_executor(max_async_children)
 
@@ -224,7 +448,11 @@ def dispatch_async_delegation(
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
-            _records.pop(delegation_id, None)
+            failed_record = _records.pop(delegation_id, None)
+        if failed_record:
+            hb_stop = failed_record.get("heartbeat_stop")
+            if hasattr(hb_stop, "set"):
+                hb_stop.set()
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -245,10 +473,15 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
             return
         record["status"] = status
         record["completed_at"] = time.time()
+        record["last_heartbeat_at"] = record["completed_at"]
+        hb_stop = record.get("heartbeat_stop")
+        if hasattr(hb_stop, "set"):
+            hb_stop.set()
         record["interrupt_fn"] = None  # drop the closure; child is done
         # Snapshot fields needed for the event while holding the lock.
         event_record = dict(record)
         _prune_completed_locked()
+        _cleanup_locked(now=record["completed_at"])
 
     _push_completion_event(event_record, result, status)
 
@@ -359,6 +592,8 @@ def dispatch_async_delegation_batch(
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
+        "last_heartbeat_at": dispatched_at,
+        "heartbeat_count": 0,
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
     }
@@ -377,6 +612,11 @@ def dispatch_async_delegation_batch(
                 ),
             }
         _records[delegation_id] = record
+
+    heartbeat_stop = _start_heartbeat_thread(delegation_id)
+    with _records_lock:
+        if delegation_id in _records:
+            _records[delegation_id]["heartbeat_stop"] = heartbeat_stop
 
     executor = _get_executor(max_async_children)
 
@@ -410,7 +650,11 @@ def dispatch_async_delegation_batch(
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
         with _records_lock:
-            _records.pop(delegation_id, None)
+            failed_record = _records.pop(delegation_id, None)
+        if failed_record:
+            hb_stop = failed_record.get("heartbeat_stop")
+            if hasattr(hb_stop, "set"):
+                hb_stop.set()
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -433,9 +677,14 @@ def _finalize_batch(
             return
         record["status"] = status
         record["completed_at"] = time.time()
+        record["last_heartbeat_at"] = record["completed_at"]
+        hb_stop = record.get("heartbeat_stop")
+        if hasattr(hb_stop, "set"):
+            hb_stop.set()
         record["interrupt_fn"] = None
         event_record = dict(record)
         _prune_completed_locked()
+        _cleanup_locked(now=record["completed_at"])
 
     try:
         from tools.process_registry import process_registry
@@ -484,11 +733,10 @@ def list_async_delegations() -> List[Dict[str, Any]]:
 
     Safe to call from any thread. Excludes the non-serialisable interrupt_fn.
     """
+    _maybe_cleanup()
+    now = time.time()
     with _records_lock:
-        return [
-            {k: v for k, v in r.items() if k != "interrupt_fn"}
-            for r in _records.values()
-        ]
+        return [_serialise_record(r, now) for r in _records.values()]
 
 
 def interrupt_all(reason: str = "shutdown") -> int:
@@ -521,11 +769,16 @@ def interrupt_all(reason: str = "shutdown") -> int:
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor."""
-    global _executor, _executor_max_workers
+    global _executor, _executor_max_workers, _last_cleanup_at
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
         _executor = None
         _executor_max_workers = 0
     with _records_lock:
+        for record in _records.values():
+            hb_stop = record.get("heartbeat_stop")
+            if hasattr(hb_stop, "set"):
+                hb_stop.set()
         _records.clear()
+        _last_cleanup_at = 0.0

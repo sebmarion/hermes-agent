@@ -91,6 +91,39 @@ def test_async_executor_workers_are_daemon_threads():
     assert _drain_one() is not None
 
 
+def test_running_status_snapshot_includes_liveness_ping():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    res = ad.dispatch_async_delegation(
+        goal="slow review", context="ctx", toolsets=None, role="leaf", model="m",
+        session_key="sess", runner=runner, max_async_children=1,
+    )
+    assert res["status"] == "dispatched"
+
+    rows = ad.list_async_delegations()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["delegation_id"] == res["delegation_id"]
+    assert row["status"] == "running"
+    assert row["goal"] == "slow review"
+    assert row["age_seconds"] >= 0
+    assert row["heartbeat_age_seconds"] >= 0
+    assert row["heartbeat_stale"] is False
+    assert "interrupt_fn" not in row
+    assert "heartbeat_stop" not in row
+
+    before = row["heartbeat_count"]
+    ad._mark_heartbeat(res["delegation_id"])
+    assert ad.list_async_delegations()[0]["heartbeat_count"] == before + 1
+
+    gate.set()
+    assert _drain_one() is not None
+
+
 def test_completion_event_lands_on_shared_queue_with_session_key():
     def runner():
         return {"status": "completed", "summary": "the result",
@@ -219,6 +252,83 @@ def test_completed_records_pruned_to_cap():
     while time.monotonic() < deadline and ad.active_count() > 0:
         time.sleep(0.05)
     assert len(ad.list_async_delegations()) <= ad._MAX_RETAINED_COMPLETED
+
+
+def test_cleanup_prunes_old_terminal_records_but_keeps_running():
+    now = time.time()
+    with ad._records_lock:
+        ad._records["old_done"] = {
+            "delegation_id": "old_done",
+            "goal": "old",
+            "status": "completed",
+            "dispatched_at": now - 1000,
+            "completed_at": now - 1000,
+        }
+        ad._records["old_error"] = {
+            "delegation_id": "old_error",
+            "goal": "old error",
+            "status": "error",
+            "dispatched_at": now - 1000,
+            "completed_at": now - 1000,
+        }
+        ad._records["running"] = {
+            "delegation_id": "running",
+            "goal": "still working",
+            "status": "running",
+            "dispatched_at": now - 1000,
+            "last_heartbeat_at": now - 1000,
+        }
+        removed = ad._cleanup_locked(
+            now=now,
+            policy={
+                "completed_seconds": 10,
+                "failed_seconds": 10,
+                "lost_seconds": 10,
+                "max_bytes": 1024 * 1024,
+            },
+        )
+
+    assert removed == 2
+    rows = {r["delegation_id"]: r for r in ad.list_async_delegations()}
+    assert set(rows) == {"running"}
+    assert rows["running"]["heartbeat_stale"] is True
+
+
+def test_cleanup_size_budget_prunes_oldest_terminal_records_first():
+    now = time.time()
+    big_summary = "x" * 400
+    with ad._records_lock:
+        for i in range(3):
+            ad._records[f"done{i}"] = {
+                "delegation_id": f"done{i}",
+                "goal": f"done {i}",
+                "summary": big_summary,
+                "status": "completed",
+                "dispatched_at": now - (30 - i),
+                "completed_at": now - (30 - i),
+            }
+        ad._records["running"] = {
+            "delegation_id": "running",
+            "goal": "large but active",
+            "summary": big_summary,
+            "status": "running",
+            "dispatched_at": now - 100,
+            "last_heartbeat_at": now,
+        }
+        removed = ad._cleanup_locked(
+            now=now,
+            policy={
+                "completed_seconds": 3600,
+                "failed_seconds": 3600,
+                "lost_seconds": 3600,
+                "max_bytes": 900,
+            },
+        )
+
+    assert removed >= 1
+    rows = {r["delegation_id"]: r for r in ad.list_async_delegations()}
+    assert "running" in rows
+    assert "done0" not in rows
 
 
 # ---------------------------------------------------------------------------

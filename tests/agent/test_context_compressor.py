@@ -3331,3 +3331,88 @@ class TestDoubleCompactionSummaryRole:
             "summary of earlier turns" in (m.get("content") or "")
             for m in result
         )
+
+
+class TestReasoningPreservation:
+    """Thinking-model reasoning must survive compression serialization.
+
+    Thinking models (DeepSeek thinking, Kimi thinking, MiniMax, Claude
+    extended thinking) store their chain-of-thought in ``msg["reasoning"]``
+    or ``msg["reasoning_content"]``.  When compression fires on a long
+    session, the summarizer needs this reasoning to preserve the "why"
+    behind decisions — not just the visible actions.
+
+    These are invariant tests (AGENTS.md: assert how data must relate, not
+    freeze specific values).  The invariant is: if a message carries a
+    reasoning field, the serialized output MUST include it.
+    """
+
+    def test_serialize_includes_reasoning_field(self, compressor):
+        """Assistant messages with a ``reasoning`` field preserve it."""
+        turns = [
+            {
+                "role": "assistant",
+                "content": "Let me check the config.",
+                "reasoning": "The error could be in the initialization sequence because the config loader runs before env vars are set.",
+            },
+        ]
+        serialized = compressor._serialize_for_summary(turns)
+        assert "[REASONING]:" in serialized
+        assert "initialization sequence" in serialized
+
+    def test_serialize_includes_reasoning_content_field(self, compressor):
+        """The ``reasoning_content`` variant (DeepSeek/Kimi streaming) is also preserved."""
+        turns = [
+            {
+                "role": "assistant",
+                "content": "Checking the logs.",
+                "reasoning_content": "The initialization might fail because env vars are not set yet.",
+            },
+        ]
+        serialized = compressor._serialize_for_summary(turns)
+        assert "[REASONING]:" in serialized
+        assert "env vars are not set" in serialized
+
+    def test_serialize_omits_reasoning_label_when_absent(self, compressor):
+        """Non-thinking models (no reasoning field) are not inflated."""
+        turns = [
+            {
+                "role": "assistant",
+                "content": "I will check the config file now.",
+                "tool_calls": [{"function": {"name": "read_file", "arguments": '{"path": "config.py"}'}}],
+            },
+        ]
+        serialized = compressor._serialize_for_summary(turns)
+        assert "[REASONING]:" not in serialized
+
+    def test_serialize_truncates_combined_content_and_reasoning(self, compressor):
+        """When content + reasoning together exceed _CONTENT_MAX, the combined
+        output is re-truncated so reasoning cannot displace the budget."""
+        long_content = "A" * (compressor._CONTENT_MAX + 500)
+        long_reasoning = "B" * (compressor._CONTENT_MAX + 500)
+        turns = [
+            {
+                "role": "assistant",
+                "content": long_content,
+                "reasoning": long_reasoning,
+            },
+        ]
+        serialized = compressor._serialize_for_summary(turns)
+        # The combined output must not exceed _CONTENT_MAX * 2 (one for content,
+        # one for reasoning) plus the label overhead — but more importantly, it
+        # must contain the truncation marker, proving the re-truncate fired.
+        assert "[truncated]" in serialized
+
+    def test_fallback_summary_includes_reasoning(self, compressor):
+        """The static fallback path (when LLM summarizer is unavailable) also
+        preserves reasoning from thinking models."""
+        turns = [
+            {
+                "role": "assistant",
+                "content": "Working on it.",
+                "reasoning": "I need to check if the env var is set before the config loader runs.",
+            },
+            {"role": "user", "content": "latest ask"},
+        ]
+        summary = compressor._build_static_fallback_summary(turns, reason="provider down")
+        assert "env var is set" in summary

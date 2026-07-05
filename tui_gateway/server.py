@@ -7890,11 +7890,13 @@ def _(rid, params: dict) -> dict:
         _get_max_concurrent_children,
         _get_max_spawn_depth,
     )
+    from tools.async_delegation import list_async_delegations
 
     return _ok(
         rid,
         {
             "active": list_active_subagents(),
+            "async": list_async_delegations(),
             "paused": is_spawn_paused(),
             "max_spawn_depth": _get_max_spawn_depth(),
             "max_concurrent_children": _get_max_concurrent_children(),
