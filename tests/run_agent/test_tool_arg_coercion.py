@@ -178,15 +178,18 @@ class TestCoerceValue:
 class TestCoerceToolArgs:
     """Integration tests for coerce_tool_args using the tool registry."""
 
-    def _mock_schema(self, properties):
+    def _mock_schema(self, properties, required=None):
         """Build a minimal tool schema with the given properties."""
+        params = {
+            "type": "object",
+            "properties": properties,
+        }
+        if required:
+            params["required"] = required
         return {
             "name": "test_tool",
             "description": "test",
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-            },
+            "parameters": params,
         }
 
     def test_coerces_integer_arg(self):
@@ -336,13 +339,72 @@ class TestCoerceToolArgs:
             result = coerce_tool_args("test_tool", args)
             assert result["items"] == [{"a": 1}]
 
-    def test_none_on_array_field_preserved(self):
-        """``None`` is never wrapped — tools with defaults handle it."""
+    def test_none_on_optional_array_field_stripped(self):
+        """``None`` on optional fields is stripped (null-for-omit repair)."""
         schema = self._mock_schema({"items": {"type": "array"}})
         with patch("model_tools.registry.get_schema", return_value=schema):
             args = {"items": None}
             result = coerce_tool_args("test_tool", args)
+            assert "items" not in result
+
+    def test_none_on_required_array_field_preserved(self):
+        """``None`` on required fields is preserved — tools must see the null."""
+        schema = self._mock_schema(
+            {"items": {"type": "array"}},
+            required=["items"],
+        )
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"items": None}
+            result = coerce_tool_args("test_tool", args)
             assert result["items"] is None
+
+    def test_none_on_nullable_field_preserved(self):
+        """``None`` on fields whose schema explicitly allows null is preserved."""
+        schema = self._mock_schema({"flag": {"type": ["string", "null"]}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"flag": None}
+            result = coerce_tool_args("test_tool", args)
+            assert result["flag"] is None
+
+    def test_null_string_on_optional_field_stripped(self):
+        """``"null"`` string on optional fields is also stripped."""
+        schema = self._mock_schema({"limit": {"type": "integer"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"limit": "null"}
+            result = coerce_tool_args("test_tool", args)
+            assert "limit" not in result
+
+    def test_markdown_autolink_unwrapped_in_string(self):
+        """Degenerate markdown auto-links in string values are unwrapped."""
+        schema = self._mock_schema({"path": {"type": "string"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"path": "[notes.md](http://notes.md)"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["path"] == "notes.md"
+
+    def test_markdown_autolink_preserved_when_mismatch(self):
+        """Real markdown links (text != url slug) are left intact."""
+        schema = self._mock_schema({"desc": {"type": "string"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"desc": "[click](https://example.com/clicky)"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["desc"] == "[click](https://example.com/clicky)"
+
+    def test_markdown_autolink_with_https_slug(self):
+        """Auto-links with https URLs and slug matching are unwrapped."""
+        schema = self._mock_schema({"path": {"type": "string"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"path": "[file.py](https://host.com/file.py)"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["path"] == "file.py"
+
+    def test_markdown_autolink_no_bracket_passthrough(self):
+        """Strings without ``[`` are not touched by the auto-link repair."""
+        schema = self._mock_schema({"path": {"type": "string"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"path": "/Users/x/notes.md"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["path"] == "/Users/x/notes.md"
 
     def test_existing_list_passthrough(self):
         """An already-valid list is not touched."""

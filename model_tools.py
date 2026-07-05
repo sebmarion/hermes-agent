@@ -661,6 +661,18 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     sometimes emit ``{"urls": "https://a.com"}`` when the tool expects
     ``{"urls": ["https://a.com"]}``; wrapping here avoids a confusing tool
     failure on what is otherwise a well-formed call.
+
+    Two additional repairs for open-model drift:
+
+    - **Null-for-omit:** strips ``null`` values for optional fields (not in
+      ``required`` and schema doesn't allow null).  Models send ``{"limit": null}``
+      instead of omitting the key; tools see "not provided" rather than
+      "provided as null".
+
+    - **Markdown auto-link unwrap:** unwraps degenerate ``[text](url)``
+      patterns in string values where link text equals the URL slug.
+      Models emit ``"[notes.md](http://notes.md)"`` for file paths because
+      chat post-training leaks through the tool boundary.
     """
     if not args or not isinstance(args, dict):
         return args
@@ -669,9 +681,12 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if not schema:
         return args
 
-    properties = (schema.get("parameters") or {}).get("properties")
+    parameters = schema.get("parameters") or {}
+    properties = parameters.get("properties")
     if not properties:
         return args
+
+    required_fields = set(parameters.get("required") or [])
 
     for key, value in list(args.items()):
         prop_schema = properties.get(key)
@@ -679,13 +694,47 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             continue
         expected = prop_schema.get("type")
 
+        # Strip ``null`` for optional fields.  Open models (DeepSeek, GLM,
+        # Qwen) frequently send ``null`` (or the string ``"null"``) for
+        # optional fields instead of omitting the key entirely.  If the
+        # field is not ``required`` and the schema doesn't explicitly
+        # allow null, drop the key so the tool sees "not provided" rather
+        # than "provided as null".
+        _is_nullish = (
+            value is None
+            or (isinstance(value, str) and value.strip().lower() == "null")
+        )
+        if (
+            _is_nullish
+            and key not in required_fields
+            and not _schema_allows_null(prop_schema)
+        ):
+            del args[key]
+            logger.info(
+                "coerce_tool_args: stripped null for optional field %s.%s",
+                tool_name, key,
+            )
+            continue
+
+        # Unwrap markdown auto-links in string values.  Open models
+        # sometimes emit file paths as ``[notes.md](http://notes.md)``
+        # because chat post-training leaks through the tool boundary.
+        if isinstance(value, str) and '[' in value:
+            cleaned = _strip_markdown_autolink(value)
+            if cleaned is not value:
+                args[key] = cleaned
+                value = cleaned
+                logger.info(
+                    "coerce_tool_args: unwrapped markdown auto-link for %s.%s",
+                    tool_name, key,
+                )
+
         # Wrap bare non-list values when the schema declares ``array``.
         # Strings still go through _coerce_value first so JSON-encoded
         # arrays (``'["a","b"]'``) get parsed and nullable ``"null"``
         # becomes ``None`` rather than ``["null"]``.
-        # ``None`` itself is preserved — we don't know whether the model
-        # meant "omit" or "empty list", and tools with sensible defaults
-        # (e.g. read_file's normalize_read_pagination) already handle it.
+        # ``None`` is now stripped for optional fields above (null-for-omit);
+        # if it reaches here, the field is either required or schema allows null.
         if expected == "array" and value is not None and not isinstance(value, (list, tuple)):
             if isinstance(value, str):
                 coerced = _coerce_value(value, expected, schema=prop_schema)
@@ -755,6 +804,39 @@ def _coerce_value(value: str, expected_type, schema: dict | None = None):
     if expected_type == "null" and value.strip().lower() == "null":
         return None
     return value
+
+
+# ── Markdown auto-link repair ────────────────────────────────────────
+# Open models (DeepSeek, GLM, Qwen) sometimes emit file paths as
+# degenerate markdown auto-links — chat post-training leaking through
+# the tool boundary: ``[notes.md](http://notes.md)`` instead of
+# ``notes.md``.  The pattern is: link text equals the URL's last path
+# segment.  Real markdown links pass through untouched.
+_MARKDOWN_LINK_RE = re.compile(r'\[([^\]]+)\]\(([^\)]+)\)')
+
+
+def _strip_markdown_autolink(value: str) -> str:
+    r"""Unwrap degenerate markdown auto-links where link text = URL slug.
+
+    ``"[notes.md](http://notes.md)"`` → ``"notes.md"``
+    ``"/Users/x/[file.py](https://host/file.py)"`` → ``"/Users/x/file.py"``
+
+    Real markdown links like ``[click](https://example.com/clicky)`` are
+    left intact because ``click ≠ clicky``.
+    """
+    if not isinstance(value, str) or '[' not in value:
+        return value
+
+    def _replace(m):
+        text, url = m.group(1), m.group(2)
+        slug = re.sub(r'^https?://', '', url)
+        slug = slug.rsplit('/', 1)[-1] if '/' in slug else slug
+        slug = slug.split('?')[0].split('#')[0]
+        if text == slug:
+            return text
+        return m.group(0)
+
+    return _MARKDOWN_LINK_RE.sub(_replace, value)
 
 
 def _schema_allows_null(schema: dict | None) -> bool:
