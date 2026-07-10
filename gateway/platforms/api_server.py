@@ -1746,7 +1746,24 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
-        db.create_session(session_id, "api_server", model=str(model) if model else None, system_prompt=system_prompt)
+        from agent.session_workspace import normalize_local_workspace, persist_git_metadata_async
+
+        raw_cwd = body.get("cwd")
+        cwd = normalize_local_workspace(raw_cwd)
+        if raw_cwd is not None and cwd is None:
+            return web.json_response(
+                _openai_error("cwd must be an existing absolute local directory", code="invalid_cwd"),
+                status=400,
+            )
+        db.create_session(
+            session_id,
+            "api_server",
+            model=str(model) if model else None,
+            system_prompt=system_prompt,
+            cwd=cwd,
+        )
+        if cwd:
+            persist_git_metadata_async(db_path=db.db_path, session_id=session_id, cwd=cwd)
         title = body.get("title")
         if title is not None:
             try:

@@ -595,6 +595,7 @@ class AIAgent:
             return
         source = _session_source_for_agent(self.platform)
         try:
+            launch_cwd = _launch_cwd_for_session(source)
             self._session_db.create_session(
                 session_id=self.session_id,
                 source=source,
@@ -603,9 +604,17 @@ class AIAgent:
                 system_prompt=self._cached_system_prompt,
                 user_id=None,
                 parent_session_id=self._parent_session_id,
-                cwd=_launch_cwd_for_session(source),
+                cwd=launch_cwd,
             )
             self._session_db_created = True
+            if launch_cwd:
+                from agent.session_workspace import persist_git_metadata_async
+
+                persist_git_metadata_async(
+                    db_path=self._session_db.db_path,
+                    session_id=self.session_id,
+                    cwd=launch_cwd,
+                )
         except Exception as e:
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.

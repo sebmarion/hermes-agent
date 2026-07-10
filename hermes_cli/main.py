@@ -314,6 +314,7 @@ from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
+from hermes_cli.subcommands.trajectory import build_trajectory_parser
 from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
@@ -12745,6 +12746,101 @@ def cmd_insights(args):
         print(f"Error generating insights: {e}")
 
 
+def cmd_trajectory(args):
+    """Dispatch ``hermes trajectory radar`` and ``hermes trajectory candidates``."""
+    sub = getattr(args, "trajectory_command", None)
+    if sub == "radar":
+        _cmd_trajectory_radar(args)
+    elif sub == "candidates":
+        _cmd_trajectory_candidates(args)
+    else:
+        print(f"Unknown trajectory subcommand: {sub!r}")
+
+
+def _cmd_trajectory_radar(args):
+    try:
+        from hermes_state import SessionDB
+        from agent.trajectory_radar import TrajectoryRadar, write_report
+
+        db = SessionDB()
+        engine = TrajectoryRadar(db)
+        report = engine.generate(
+            days=args.days,
+            source=getattr(args, "source", None),
+            limit=args.limit,
+            include_snippets=getattr(args, "include_snippets", False),
+        )
+
+        # Sync into the local candidate lifecycle store.
+        regressed: list[str] = []
+        if getattr(args, "sync_store", True):
+            from agent.trajectory_radar import CandidateStore
+
+            store = CandidateStore()
+            regressed = store.sync_from_report(report)
+
+        rendered = write_report(report, fmt=args.format, out=args.out)
+        if args.out:
+            print(f"Trajectory radar written to: {args.out}")
+            if regressed:
+                print(f"⚠  {len(regressed)} candidate(s) regressed: {', '.join(regressed)}")
+        else:
+            print(rendered, end="")
+            if regressed:
+                print(f"\n⚠  {len(regressed)} candidate(s) regressed: {', '.join(regressed)}")
+        db.close()
+    except Exception as e:
+        print(f"Error generating trajectory radar: {e}")
+
+
+def _cmd_trajectory_candidates(args):
+    from agent.trajectory_radar import CandidateStore, render_candidates_markdown
+
+    sub = getattr(args, "candidates_command", None)
+    store = CandidateStore()
+
+    if sub in ("list", "ls"):
+        status_filter = getattr(args, "status", None)
+        show_all = getattr(args, "all", False)
+        records = store.list(status=status_filter)
+        if getattr(args, "json", False):
+            import json
+
+            print(json.dumps([r.to_dict() for r in records], indent=2, sort_keys=True))
+        else:
+            print(render_candidates_markdown(records, show_resolved=show_all))
+        return
+
+    fingerprint = getattr(args, "fingerprint", "")
+
+    if sub == "show":
+        rec = store.get(fingerprint)
+        if rec is None:
+            print(f"No candidate found with fingerprint: {fingerprint!r}")
+            return
+        import json
+
+        print(json.dumps(rec.to_dict(), indent=2, sort_keys=True))
+        return
+
+    _status_map = {
+        "accept": "accepted",
+        "defer": "deferred",
+        "resolve": "resolved",
+        "ignore": "ignored",
+    }
+    new_status = _status_map.get(sub)
+    if new_status is None:
+        print(f"Unknown candidates subcommand: {sub!r}")
+        return
+
+    try:
+        rec = store.transition(fingerprint, new_status, note=getattr(args, "note", ""))
+        print(f"Candidate `{fingerprint}` → {rec.status}")
+    except KeyError:
+        print(f"No candidate found with fingerprint: {fingerprint!r}")
+
+
 def cmd_skills(args):
     # Route 'config' action to skills_config module
     if getattr(args, "skills_action", None) == "config":
@@ -14492,6 +14588,11 @@ def main():
     # insights command  (parser built in hermes_cli/subcommands/insights.py)
     # =========================================================================
     build_insights_parser(subparsers, cmd_insights=cmd_insights)
+
+    # =========================================================================
+    # trajectory command  (parser built in hermes_cli/subcommands/trajectory.py)
+    # =========================================================================
+    build_trajectory_parser(subparsers, cmd_trajectory=cmd_trajectory)
 
     # =========================================================================
     # claw command  (parser built in hermes_cli/subcommands/claw.py)
