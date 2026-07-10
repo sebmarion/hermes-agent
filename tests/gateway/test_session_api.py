@@ -170,6 +170,39 @@ async def test_session_crud_and_message_history(adapter, session_db):
 
 
 @pytest.mark.asyncio
+async def test_create_session_persists_explicit_workspace(adapter, session_db, tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_enrich(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("agent.session_workspace.persist_git_metadata_async", fake_enrich)
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/sessions", json={"id": "workspace-session", "cwd": str(tmp_path)})
+        assert resp.status == 201
+
+    row = session_db.get_session("workspace-session")
+    assert row["cwd"] == str(tmp_path.resolve())
+    assert captured == {
+        "db_path": session_db.db_path,
+        "session_id": "workspace-session",
+        "cwd": str(tmp_path.resolve()),
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_session_rejects_untrusted_workspace_values(adapter):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        for invalid in ("unknown", ".", "relative/path", "/definitely/missing/hermes-workspace"):
+            resp = await cli.post("/api/sessions", json={"cwd": invalid})
+            assert resp.status == 400
+            payload = await resp.json()
+            assert payload["error"]["code"] == "invalid_cwd"
+
+
+@pytest.mark.asyncio
 async def test_session_messages_follow_compression_tip(adapter, session_db):
     source_id = session_db.create_session("source-session", "api_server")
     session_db.append_message(source_id, "user", "before compression")
