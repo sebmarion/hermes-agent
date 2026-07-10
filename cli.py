@@ -12099,6 +12099,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return None
 
         turn_route = self._resolve_turn_agent_config(message)
+        try:
+            from agent.autonomy_shadow import submit_shadow_observation
+
+            submit_shadow_observation(
+                message,
+                session_id=str(getattr(self, "session_id", "") or ""),
+                source="cli",
+                workspace=os.getcwd(),
+            )
+        except Exception as _shadow_exc:
+            logging.debug("autonomy shadow ingress failed open: %s", _shadow_exc)
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 

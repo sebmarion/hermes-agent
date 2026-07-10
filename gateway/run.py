@@ -18030,6 +18030,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            try:
+                from agent.autonomy_shadow import submit_shadow_observation
+
+                submit_shadow_observation(
+                    message,
+                    session_id=str(session_entry.session_id or ""),
+                    source=f"gateway:{source.platform}",
+                    workspace=os.getcwd(),
+                )
+            except Exception as _shadow_exc:
+                logger.debug("autonomy shadow ingress failed open: %s", _shadow_exc)
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool

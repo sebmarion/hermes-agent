@@ -2209,6 +2209,15 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
+    # Local-first autonomy control plane. Phase 2 is shadow-only: when enabled,
+    # Hermes proposes and validates plans asynchronously but never changes the
+    # active route or executes the plan. Any mode other than "shadow" is rejected.
+    "autonomy": {
+        "enabled": False,
+        "mode": "shadow",
+        "planner_timeout_seconds": 30,
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
