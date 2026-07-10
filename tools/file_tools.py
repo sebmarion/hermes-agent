@@ -7,6 +7,7 @@ import logging
 import os
 import posixpath
 import sys
+import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 
@@ -666,12 +667,25 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
+    # macOS places each user's private temporary directory below
+    # /private/var/folders. That directory is the supported home for ad-hoc
+    # verification artifacts and is not equivalent to system-owned
+    # /private/var/db, /private/var/log, etc. Compare real paths so the
+    # /var -> /private/var symlink cannot bypass or falsely trigger the guard.
+    try:
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        resolved_real = os.path.realpath(resolved)
+        in_user_temp = os.path.commonpath([resolved_real, temp_root]) == temp_root
+    except (OSError, ValueError):
+        in_user_temp = False
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
+        if not in_user_temp and (
+            resolved.startswith(prefix) or normalized.startswith(prefix)
+        ):
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
