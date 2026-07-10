@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from agent.execution_plan import ExecutionPlan
 from hermes_cli.config import load_config
+from toolsets import get_toolset, resolve_toolset
 
 _READ_ONLY_TOOLS = frozenset({"read_file", "search_files", "web_search", "web_extract"})
 _MAX_EXECUTION_SLICES = 2
@@ -21,7 +22,7 @@ class ExecutionDecision:
     slice_ids: tuple[str, ...] = ()
 
 
-def _normalized_tools(value: Any) -> tuple[str, ...]:
+def _normalized_toolsets(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         return tuple(item.strip() for item in value.split(",") if item.strip())
     if isinstance(value, list):
@@ -60,10 +61,23 @@ def evaluate_execution(
     lane = lanes.get("local_worker") if isinstance(lanes, dict) else None
     if not isinstance(lane, dict):
         return ExecutionDecision(False, "local_worker lane is not configured")
-    tools = _normalized_tools(lane.get("toolsets"))
-    if not tools:
+    toolsets = _normalized_toolsets(lane.get("toolsets"))
+    if not toolsets:
         return ExecutionDecision(False, "local_worker requires an explicit read-only tool allowlist")
-    unsafe = sorted(set(tools) - _READ_ONLY_TOOLS)
+    unknown = sorted(name for name in toolsets if get_toolset(name) is None)
+    if unknown:
+        return ExecutionDecision(
+            False,
+            "local_worker contains unknown toolsets: " + ", ".join(unknown),
+        )
+    expanded_tools = {
+        tool
+        for name in toolsets
+        for tool in resolve_toolset(name)
+    }
+    if not expanded_tools:
+        return ExecutionDecision(False, "local_worker toolsets resolve to no tools")
+    unsafe = sorted(expanded_tools - _READ_ONLY_TOOLS)
     if unsafe:
         return ExecutionDecision(
             False,

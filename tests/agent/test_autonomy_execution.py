@@ -44,7 +44,7 @@ def _config(*, tools=None):
                 "local_worker": {
                     "provider": "custom:zeus",
                     "model": "glm-4.7-flash",
-                    "toolsets": ["read_file", "search_files"] if tools is None else tools,
+                    "toolsets": ["read_only_files"] if tools is None else tools,
                 }
             }
         }
@@ -95,13 +95,18 @@ def test_lane_must_have_explicit_read_only_tool_allowlist():
 
     missing = execution.evaluate_execution(_plan(), policy=policy, config=_config(tools=[]))
     unsafe = execution.evaluate_execution(
-        _plan(), policy=policy, config=_config(tools=["read_file", "terminal"])
+        _plan(), policy=policy, config=_config(tools=["file"])
+    )
+    unknown = execution.evaluate_execution(
+        _plan(), policy=policy, config=_config(tools=["read_file"])
     )
 
     assert missing.eligible is False
     assert "explicit" in missing.reason
     assert unsafe.eligible is False
     assert "read-only" in unsafe.reason
+    assert unknown.eligible is False
+    assert "unknown toolsets" in unknown.reason
 
 
 def test_dispatch_builds_bounded_local_leaf_tasks_and_receipt():
