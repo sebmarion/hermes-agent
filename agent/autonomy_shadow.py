@@ -85,6 +85,7 @@ def submit_shadow_observation(
     session_id: str = "",
     source: str = "",
     workspace: str = "",
+    parent_agent: Any = None,
 ) -> bool:
     """Schedule shadow planning without delaying or changing the active turn."""
     policy = _policy()
@@ -103,6 +104,7 @@ def submit_shadow_observation(
             session_id=session_id,
             source=source,
             workspace=workspace,
+            parent_agent=parent_agent,
         )
         return True
     except Exception as exc:
@@ -158,6 +160,7 @@ def observe_turn(
     source: str = "",
     workspace: str = "",
     policy: dict[str, Any] | None = None,
+    parent_agent: Any = None,
 ) -> dict[str, Any] | None:
     """Plan one turn in shadow mode and append a privacy-minimized receipt."""
     policy = _policy() if policy is None else policy
@@ -166,8 +169,8 @@ def observe_turn(
     config = load_config() or {}
 
     prompt = _prompt_text(message)
-    effective_mode = "shadow"
     configured_mode = str(policy.get("mode") or "shadow").strip().lower()
+    effective_mode = configured_mode if configured_mode in {"shadow", "execute"} else "rejected"
     base: dict[str, Any] = {
         "schema": _OBSERVATION_SCHEMA,
         "observed_at": datetime.now(timezone.utc).isoformat(),
@@ -183,11 +186,11 @@ def observe_turn(
         "effective_mode": effective_mode,
     }
 
-    if configured_mode != "shadow":
+    if configured_mode not in {"shadow", "execute"}:
         result = {
             **base,
             "status": "policy_rejected",
-            "error": "Only shadow mode is implemented; automatic execution is disabled",
+            "error": "Autonomy mode must be shadow or execute",
         }
         _append_observation(result)
         return result
@@ -197,12 +200,25 @@ def observe_turn(
         timeout = max(1, int(policy.get("planner_timeout_seconds") or 30))
         raw = _plan_turn(prompt, workspace=workspace, timeout=timeout)
         plan = compile_execution_plan(raw)
+        execution = None
+        if configured_mode == "execute":
+            from agent.autonomy_execution import dispatch_execution
+
+            execution = dispatch_execution(
+                plan,
+                policy=None,
+                config=config,
+                parent_agent=parent_agent,
+                session_id=session_id,
+            )
         result = {
             **base,
             "status": "accepted",
             "duration_ms": round((time.monotonic() - started) * 1000),
             "plan": _plan_receipt(plan, config),
         }
+        if execution is not None:
+            result["execution"] = execution
     except PlanValidationError as exc:
         result = {
             **base,

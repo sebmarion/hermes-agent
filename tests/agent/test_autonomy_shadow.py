@@ -45,11 +45,11 @@ def test_disabled_shadow_does_no_work(monkeypatch, tmp_path):
     assert not (tmp_path / "autonomy" / "shadow-observations.jsonl").exists()
 
 
-def test_non_shadow_mode_is_fail_closed(monkeypatch, tmp_path):
+def test_unknown_mode_is_fail_closed(monkeypatch, tmp_path):
     monkeypatch.setattr(
         shadow,
         "load_config",
-        lambda: {"autonomy": {"enabled": True, "mode": "execute"}},
+        lambda: {"autonomy": {"enabled": True, "mode": "dangerous"}},
     )
     monkeypatch.setattr(shadow, "get_hermes_home", lambda: tmp_path)
 
@@ -57,7 +57,7 @@ def test_non_shadow_mode_is_fail_closed(monkeypatch, tmp_path):
 
     assert result is not None
     assert result["status"] == "policy_rejected"
-    assert result["effective_mode"] == "shadow"
+    assert result["effective_mode"] == "rejected"
 
 
 def test_enabled_shadow_compiles_and_writes_minimal_observation(monkeypatch, tmp_path):
@@ -89,6 +89,33 @@ def test_enabled_shadow_compiles_and_writes_minimal_observation(monkeypatch, tmp
     assert "secret user request" not in path.read_text()
     assert "prompt" not in row
     assert row["plan"]["slice_count"] == 1
+
+
+def test_execute_mode_records_dispatch_receipt(monkeypatch, tmp_path):
+    from agent import autonomy_execution
+
+    config = {
+        "autonomy": {"enabled": True, "mode": "execute", "execution_enabled": True},
+        "delegation": {"lanes": {"local_worker": {}}},
+    }
+    monkeypatch.setattr(shadow, "load_config", lambda: config)
+    monkeypatch.setattr(shadow, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(shadow, "_plan_turn", lambda *a, **k: _valid_plan())
+    captured = {}
+
+    def dispatch(plan, **kwargs):
+        captured.update(kwargs)
+        return {"status": "dispatched", "slice_count": 1}
+
+    monkeypatch.setattr(autonomy_execution, "dispatch_execution", dispatch)
+    parent = SimpleNamespace()
+
+    result = shadow.observe_turn("do work", session_id="s", parent_agent=parent)
+
+    assert result["effective_mode"] == "execute"
+    assert result["execution"]["status"] == "dispatched"
+    assert captured["parent_agent"] is parent
+    assert captured["policy"] is None
 
 
 def test_invalid_plan_is_observed_without_raising(monkeypatch, tmp_path):
@@ -182,10 +209,10 @@ def test_cli_and_gateway_have_fail_open_shadow_ingress():
 
     assert "submit_shadow_observation(" in cli_source
     assert 'source="cli"' in cli_source
-    assert "autonomy shadow ingress failed open" in cli_source
+    assert "autonomy ingress failed open" in cli_source
     assert "submit_shadow_observation(" in gateway_source
     assert 'source=f"gateway:{source.platform}"' in gateway_source
-    assert "autonomy shadow ingress failed open" in gateway_source
+    assert "autonomy ingress failed open" in gateway_source
 
 
 def test_planner_requests_strict_json_schema(monkeypatch):

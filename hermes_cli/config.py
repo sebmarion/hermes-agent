@@ -2209,12 +2209,13 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
-    # Local-first autonomy control plane. Phase 2 is shadow-only: when enabled,
-    # Hermes proposes and validates plans asynchronously but never changes the
-    # active route or executes the plan. Any mode other than "shadow" is rejected.
+    # Local-first autonomy control plane. Shadow planning is the default. The
+    # execute path additionally requires execution_enabled and then admits only
+    # low-risk, read-only, single-wave local canaries.
     "autonomy": {
         "enabled": False,
         "mode": "shadow",
+        "execution_enabled": False,
         "planner_timeout_seconds": 30,
     },
 
