@@ -1670,6 +1670,17 @@ DEFAULT_CONFIG = {
             "timeout": 180,
             "extra_body": {},
         },
+        # Local-first execution planner — proposes a schema-constrained,
+        # side-effect-free execution graph. Deterministic validation lives in
+        # agent.execution_plan; Phase 1 does not execute accepted plans.
+        "execution_planner": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 180,
+            "extra_body": {},
+        },
         # Profile describer — auto-generates a 1-2 sentence description
         # of what a profile is good at. Invoked by
         # ``hermes profile describe <name> --auto`` and the dashboard's
