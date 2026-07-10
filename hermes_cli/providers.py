@@ -745,6 +745,19 @@ def resolve_provider_full(
         user_pdef = resolve_user_provider(raw, user_providers)
         if user_pdef is not None:
             return user_pdef
+        # 2a. If requested as "custom:<name>", strip the prefix and retry
+        # against the bare ``providers:`` dict key.  The TUI gateway's
+        # session-healing logic and the picker's "custom:*" slug convention
+        # both produce ``custom:<name>`` for providers that live under the
+        # keyed ``providers:`` schema (where the slug is the bare dict key).
+        # Without this fallback, ``custom:zeus`` fails to resolve even though
+        # ``providers.zeus`` is configured. (#fix-custom-prefix-resolution)
+        if raw.startswith("custom:"):
+            bare = raw[len("custom:"):]
+            if bare:
+                user_pdef = resolve_user_provider(bare, user_providers)
+                if user_pdef is not None:
+                    return user_pdef
 
     # 2b. Saved custom providers from config
     custom_pdef = resolve_custom_provider(name, custom_providers)

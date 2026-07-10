@@ -4,23 +4,34 @@ Status command for hermes CLI.
 Shows the status of all Hermes Agent components.
 """
 
+import ipaddress
+import json
 import os
 import sys
 import subprocess  # noqa: F401 — re-exported for tests that monkeypatch status.subprocess to guard against regressions
+import urllib.parse
+import urllib.request
+from collections import defaultdict
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from hermes_cli.auth import AuthError, resolve_provider
 from hermes_cli.colors import Colors, color
-from hermes_cli.config import get_env_path, get_env_value, get_hermes_home, load_config
+from hermes_cli.config import (
+    check_config_version,
+    get_env_path,
+    get_env_value,
+    get_hermes_home,
+    load_config,
+)
 from hermes_cli.models import provider_label
 from hermes_cli.nous_account import (
     format_nous_portal_entitlement_message,
     get_nous_portal_account_info,
 )
 from hermes_cli.nous_subscription import get_nous_subscription_features
-from hermes_cli.runtime_provider import resolve_requested_provider
+from hermes_cli.runtime_provider import resolve_requested_provider, resolve_runtime_provider
 from hermes_constants import OPENROUTER_MODELS_URL
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 
@@ -99,11 +110,343 @@ def _effective_provider_label() -> str:
     return provider_label(effective)
 
 
+def _routing_pair(section, *, default_provider: str = "auto") -> tuple[str, str, str]:
+    """Return configured ``(provider, model, base_url)`` without credentials."""
+    if isinstance(section, str):
+        return default_provider, section.strip(), ""
+    if not isinstance(section, dict):
+        return default_provider, "", ""
+    provider = str(section.get("provider") or default_provider).strip()
+    model = str(
+        section.get("default")
+        or section.get("model")
+        or section.get("name")
+        or ""
+    ).strip()
+    base_url = str(section.get("base_url") or section.get("api") or "").strip()
+    return provider or default_provider, model, base_url
+
+
+def _resolve_routing_entry(provider: str, model: str, base_url: str = "") -> dict:
+    """Resolve one route and discard all credential-bearing fields."""
+    entry = {
+        "provider": provider or "auto",
+        "model": model or "(not set)",
+        "base_url": base_url or "",
+        "api_mode": "",
+        "resolved": False,
+    }
+    try:
+        runtime = resolve_runtime_provider(
+            requested=provider or None,
+            target_model=model or None,
+            explicit_base_url=base_url or None,
+        )
+    except Exception:
+        return entry
+
+    requested = str(runtime.get("requested_provider") or "").strip()
+    resolved_provider = str(runtime.get("provider") or "").strip()
+    entry.update(
+        {
+            # Keep a named custom identity (custom:zeus) instead of collapsing
+            # every custom route to the non-routable billing class "custom".
+            "provider": requested or provider or resolved_provider or "auto",
+            "model": str(runtime.get("model") or model or "(not set)").strip(),
+            "base_url": str(runtime.get("base_url") or base_url or "").strip(),
+            "api_mode": str(runtime.get("api_mode") or "").strip(),
+            "resolved": True,
+        }
+    )
+    return entry
+
+
+def _is_local_endpoint(base_url: str) -> bool:
+    """Return True only for loopback/private/link-local inference endpoints."""
+    try:
+        host = (urllib.parse.urlparse(base_url).hostname or "").strip().lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(address.is_private or address.is_loopback or address.is_link_local)
+
+
+def _slots_url(base_url: str) -> str:
+    parsed = urllib.parse.urlparse(base_url)
+    path = (parsed.path or "").rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3]
+    path = path.rstrip("/") + "/slots"
+    return urllib.parse.urlunparse(
+        parsed._replace(path=path, params="", query="", fragment="")
+    )
+
+
+def _probe_local_capacity(base_url: str, *, timeout: float = 1.5, opener=None) -> dict:
+    """Probe llama.cpp ``/slots`` only for explicitly local/private endpoints."""
+    if not _is_local_endpoint(base_url):
+        return {"status": "skipped_nonlocal"}
+    opener = opener or urllib.request.urlopen
+    request = urllib.request.Request(
+        _slots_url(base_url), headers={"Accept": "application/json"}
+    )
+    try:
+        with opener(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return {"status": "unreachable"}
+    if not isinstance(payload, list):
+        return {"status": "unsupported"}
+    slots = [slot for slot in payload if isinstance(slot, dict)]
+    contexts = sorted(
+        {
+            int(slot.get("n_ctx"))
+            for slot in slots
+            if isinstance(slot.get("n_ctx"), (int, float))
+            and int(slot.get("n_ctx")) > 0
+        }
+    )
+    return {
+        "status": "reachable",
+        "slots_total": len(slots),
+        "slots_busy": sum(bool(slot.get("is_processing")) for slot in slots),
+        "context_lengths": contexts,
+    }
+
+
+def _load_active_runtime_sessions(
+    limit: int = 5, *, session_id: str | None = None
+) -> list[dict]:
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            return db.list_active_runtime_sessions(
+                limit=limit, session_id=session_id
+            )
+        finally:
+            db.close()
+    except Exception:
+        return []
+
+
+def build_routing_report(
+    config: dict | None = None,
+    *,
+    session_limit: int = 5,
+    session_id: str | None = None,
+) -> dict:
+    """Build a credential-free snapshot of configured and observed routing."""
+    config = config if isinstance(config, dict) else load_config()
+    model_cfg = config.get("model", {})
+    main_provider, main_model, main_base_url = _routing_pair(model_cfg)
+    main = _resolve_routing_entry(main_provider, main_model, main_base_url)
+
+    warnings: list[str] = []
+    if isinstance(model_cfg, dict):
+        default_model = str(model_cfg.get("default") or "").strip()
+        legacy_model = str(model_cfg.get("model") or "").strip()
+        if default_model and legacy_model and default_model != legacy_model:
+            warnings.append(
+                f"model.default ({default_model}) conflicts with legacy "
+                f"model.model ({legacy_model})"
+            )
+
+    delegation = config.get("delegation", {})
+    delegation = delegation if isinstance(delegation, dict) else {}
+    fallback_provider, fallback_model, fallback_base_url = _routing_pair(delegation)
+    fallback = _resolve_routing_entry(
+        fallback_provider, fallback_model, fallback_base_url
+    )
+    lanes_cfg = delegation.get("lanes", {})
+    lanes_cfg = lanes_cfg if isinstance(lanes_cfg, dict) else {}
+    lanes: dict[str, dict] = {}
+    for lane_name, lane_cfg in sorted(lanes_cfg.items()):
+        provider, model, base_url = _routing_pair(lane_cfg)
+        lane = _resolve_routing_entry(provider, model, base_url)
+        if isinstance(lane_cfg, dict):
+            toolsets = lane_cfg.get("toolsets")
+            if isinstance(toolsets, str):
+                lane["toolsets"] = [
+                    item.strip() for item in toolsets.split(",") if item.strip()
+                ]
+            elif isinstance(toolsets, (list, tuple, set)):
+                lane["toolsets"] = [
+                    str(item).strip() for item in toolsets if str(item).strip()
+                ]
+            else:
+                lane["toolsets"] = []
+        lanes[str(lane_name)] = lane
+
+    default_lane = str(delegation.get("default_lane") or "").strip()
+    if default_lane and default_lane not in lanes:
+        warnings.append(
+            f"delegation.default_lane references missing lane '{default_lane}'"
+        )
+    tier_routes_cfg = delegation.get("tier_routes", {})
+    tier_routes_cfg = tier_routes_cfg if isinstance(tier_routes_cfg, dict) else {}
+    tier_routes = {
+        str(tier): str(lane) for tier, lane in sorted(tier_routes_cfg.items())
+    }
+    for tier, lane in tier_routes.items():
+        if lane not in lanes:
+            warnings.append(
+                f"delegation.tier_routes.{tier} references missing lane '{lane}'"
+            )
+
+    auxiliary_groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+    auxiliary_cfg = config.get("auxiliary", {})
+    if isinstance(auxiliary_cfg, dict):
+        for task_name, task_cfg in sorted(auxiliary_cfg.items()):
+            provider, model, _base_url = _routing_pair(task_cfg)
+            if model or provider not in ("", "auto"):
+                auxiliary_groups[(provider, model or "(provider default)")].append(
+                    str(task_name)
+                )
+
+    capacity: list[dict] = []
+    seen_endpoints: set[str] = set()
+    capacity_candidates = [("configured main", main)] + list(lanes.items())
+    for label, route in capacity_candidates:
+        base_url = str(route.get("base_url") or "").rstrip("/")
+        if (
+            not base_url
+            or base_url in seen_endpoints
+            or not _is_local_endpoint(base_url)
+        ):
+            continue
+        seen_endpoints.add(base_url)
+        capacity.append(
+            {
+                "label": label,
+                "provider": route.get("provider") or "auto",
+                "base_url": base_url,
+                **_probe_local_capacity(base_url),
+            }
+        )
+
+    current_version, latest_version = check_config_version()
+    return {
+        "config_version": current_version,
+        "latest_config_version": latest_version,
+        "main": main,
+        "sessions": _load_active_runtime_sessions(
+            limit=session_limit, session_id=session_id
+        ),
+        "delegation": {
+            "fallback": fallback,
+            "default_lane": default_lane,
+            "lanes": lanes,
+            "tier_routes": tier_routes,
+        },
+        "auxiliary_groups": [
+            {"provider": provider, "model": model, "tasks": tasks}
+            for (provider, model), tasks in sorted(auxiliary_groups.items())
+        ],
+        "capacity": capacity,
+        "warnings": warnings,
+    }
+
+
+def show_routing_status(*, session_id: str | None = None) -> None:
+    report = build_routing_report(session_id=session_id)
+    main = report["main"]
+
+    print()
+    print(color("◆ Effective Routing", Colors.CYAN, Colors.BOLD))
+    current = report["config_version"]
+    latest = report["latest_config_version"]
+    schema = f"{current} ✓" if current >= latest else f"{current} → {latest}"
+    print(f"  Config schema: {schema}")
+    print(f"  Configured main: {main['provider']} / {main['model']}")
+    if main.get("api_mode"):
+        print(f"  Runtime mode: {main['api_mode']}")
+
+    print()
+    print(color("◆ Active Session Runtimes (persisted)", Colors.CYAN, Colors.BOLD))
+    sessions = report["sessions"]
+    if not sessions:
+        print("  (none recorded)")
+    for session in sessions:
+        provider = str(session.get("billing_provider") or "(unknown)")
+        model = str(session.get("model") or "(unknown)")
+        marker = ""
+        if provider != main["provider"] or model != main["model"]:
+            marker = "  [differs from configured main]"
+        print(
+            f"  {session.get('id')}  {session.get('source') or '?'}  "
+            f"{provider} / {model}{marker}"
+        )
+
+    delegation = report["delegation"]
+    fallback = delegation["fallback"]
+    print()
+    print(color("◆ Delegation", Colors.CYAN, Colors.BOLD))
+    print(f"  Fallback: {fallback['provider']} / {fallback['model']}")
+    print(f"  Default lane: {delegation['default_lane'] or '(none)'}")
+    for lane_name, lane in delegation["lanes"].items():
+        tools = (
+            f"  tools={','.join(lane.get('toolsets') or [])}"
+            if lane.get("toolsets")
+            else ""
+        )
+        print(f"  {lane_name}: {lane['provider']} / {lane['model']}{tools}")
+    if delegation["tier_routes"]:
+        print("  Tier routes:")
+        for tier, lane in delegation["tier_routes"].items():
+            print(f"    {tier} → {lane}")
+
+    print()
+    print(color("◆ Auxiliary Models", Colors.CYAN, Colors.BOLD))
+    if not report["auxiliary_groups"]:
+        print("  (none configured)")
+    for group in report["auxiliary_groups"]:
+        print(
+            f"  {group['provider']} / {group['model']}: "
+            + ", ".join(group["tasks"])
+        )
+
+    print()
+    print(color("◆ Local Capacity", Colors.CYAN, Colors.BOLD))
+    if not report["capacity"]:
+        print("  (no private inference endpoint configured)")
+    for endpoint in report["capacity"]:
+        if endpoint["status"] == "reachable":
+            contexts = endpoint.get("context_lengths") or []
+            context_text = (
+                "/".join(f"{value:,}" for value in contexts) or "unknown"
+            )
+            print(
+                f"  {endpoint['provider']}: {endpoint['slots_total']} slots, "
+                f"{endpoint['slots_busy']} busy, context {context_text}"
+            )
+        else:
+            print(f"  {endpoint['provider']}: {endpoint['status']}")
+
+    if report["warnings"]:
+        print()
+        print(color("◆ Routing Warnings", Colors.YELLOW, Colors.BOLD))
+        for warning in report["warnings"]:
+            print(f"  ⚠ {warning}")
+    print()
+
+
 from hermes_constants import is_termux as _is_termux
 
 
 def show_status(args):
     """Show status of all Hermes Agent components."""
+    if getattr(args, "routing", False):
+        show_routing_status(session_id=getattr(args, "session", None))
+        return
     deep = getattr(args, 'deep', False)
 
     print()

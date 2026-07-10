@@ -2422,10 +2422,12 @@ def delegate_task(
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    #
+    # Per-task lane routing: when delegation.lanes is configured, each task
+    # can resolve its own credentials via _resolve_delegation_credentials_for_task.
+    # Resolve the global fallback lazily so a broken fallback provider does not
+    # block tasks that explicitly route to a valid lane.
+    global_creds = None
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2480,33 +2482,54 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    child_models = []
     try:
         for i, t in enumerate(task_list):
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Resolve per-task credentials: lane routing > global fallback.
+            # When delegation.lanes is configured and the task specifies a
+            # route or model_tier that maps to a lane, use that lane's
+            # credentials. Otherwise lazily resolve and reuse the global
+            # delegation config.
+            try:
+                lane_name = _resolve_lane_for_task(t, cfg)
+                if lane_name is not None:
+                    task_creds = _resolve_delegation_credentials_for_task(cfg, parent_agent, t)
+                else:
+                    if global_creds is None:
+                        global_creds = _resolve_delegation_credentials(cfg, parent_agent)
+                    task_creds = global_creds
+            except ValueError as exc:
+                return tool_error(str(exc))
+            # Lane-level toolsets override the default None (which means
+            # "inherit parent toolsets").
+            lane_toolsets = _normalize_lane_toolsets(task_creds.get("toolsets"))
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
-                model=creds["model"],
+                # When a lane specifies toolsets, pass them so the child
+                # gets a narrow set (e.g. [terminal, file] for local workers).
+                # Otherwise None = inherit parent toolsets.
+                toolsets=lane_toolsets,
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
+            child_models.append(task_creds.get("model"))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
@@ -2854,7 +2877,9 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            # Metadata only: heterogeneous lane batches do not have one model.
+            # Per-child routing is already fixed on each built child.
+            model=_async_batch_model_label(child_models),
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             parent_session_id=_parent_session_id,
@@ -2908,6 +2933,20 @@ def delegate_task(
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+
+
+def _async_batch_model_label(models) -> Optional[str]:
+    """Return truthful compact metadata for a possibly heterogeneous batch."""
+    unique = []
+    for model in models:
+        label = str(model or "").strip()
+        if label and label not in unique:
+            unique.append(label)
+    if not unique:
+        return None
+    if len(unique) == 1:
+        return unique[0]
+    return "mixed:" + ",".join(unique)
 
 
 def _resolve_child_credential_pool(
@@ -3119,6 +3158,104 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
+    """Resolve which lane name a task should use, if lane routing is configured.
+
+    Resolution order:
+    1. task["route"] — explicit lane name (must exist in cfg["lanes"])
+    2. task["model_tier"] → cfg["tier_routes"][tier] → lane name
+    3. cfg["default_lane"]
+
+    Returns None when no lane is resolved (fall back to global delegation config).
+    """
+    lanes = cfg.get("lanes") or {}
+    if not lanes:
+        return None
+
+    # 1. Explicit route
+    route = str(task.get("route") or "").strip()
+    if route:
+        if route not in lanes:
+            raise ValueError(
+                f"Task route '{route}' not found in delegation.lanes "
+                f"(available: {', '.join(sorted(lanes))})."
+            )
+        return route
+
+    # 2. model_tier → tier_routes
+    tier = str(task.get("model_tier") or "").strip()
+    if tier:
+        tier_routes = cfg.get("tier_routes") or {}
+        lane = tier_routes.get(tier)
+        if lane:
+            if lane not in lanes:
+                raise ValueError(
+                    f"Tier '{tier}' maps to lane '{lane}' which is not in "
+                    f"delegation.lanes (available: {', '.join(sorted(lanes))})."
+                )
+            return lane
+        # Tier specified but no mapping — fall through to default_lane
+        logger.debug("model_tier='%s' has no tier_routes mapping, falling back", tier)
+
+    # 3. default_lane
+    default_lane = str(cfg.get("default_lane") or "").strip()
+    if default_lane and default_lane in lanes:
+        return default_lane
+
+    return None
+
+
+def _normalize_lane_toolsets(value) -> Optional[list[str]]:
+    """Normalize optional lane toolsets config to a list of names.
+
+    ``hermes config set`` writes scalar values, so tolerate comma-separated
+    strings instead of turning ``"terminal,file"`` into a character list.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        names = [part.strip() for part in value.split(",")]
+        return [name for name in names if name] or None
+    if isinstance(value, (list, tuple, set)):
+        names = [str(part).strip() for part in value]
+        return [name for name in names if name] or None
+    return None
+
+
+def _resolve_delegation_credentials_for_task(
+    cfg: dict, parent_agent, task: Optional[dict] = None
+) -> dict:
+    """Resolve credentials for a single task, with optional lane routing.
+
+    When ``task`` is provided and lane routing is configured, resolves
+    per-task credentials from the named lane. Falls back to the global
+    ``_resolve_delegation_credentials`` when no lane is resolved.
+
+    Returns the same dict shape as ``_resolve_delegation_credentials``.
+    Additionally, if the lane specifies ``toolsets``, they are returned
+    under the ``toolsets`` key for the child builder to use.
+    """
+    if task is not None:
+        try:
+            lane_name = _resolve_lane_for_task(task, cfg)
+        except ValueError:
+            raise  # re-raise route validation errors
+
+        if lane_name is not None:
+            lane_cfg = cfg["lanes"][lane_name]
+            # Build a sub-config dict in the same shape _resolve_delegation_credentials expects
+            lane_creds = _resolve_delegation_credentials(lane_cfg, parent_agent)
+            # Carry lane-level toolsets if specified
+            lane_toolsets = _normalize_lane_toolsets(lane_cfg.get("toolsets"))
+            if lane_toolsets:
+                lane_creds["toolsets"] = lane_toolsets
+            lane_creds["lane"] = lane_name
+            return lane_creds
+
+    # Fall back to global delegation config
+    return _resolve_delegation_credentials(cfg, parent_agent)
+
+
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
@@ -3260,7 +3397,7 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml. Per-task 'route'/'model_tier' fields are only effective when delegation.lanes is configured.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3388,6 +3525,25 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "route": {
+                            "type": "string",
+                            "description": (
+                                "Explicit lane name for per-task model routing. "
+                                "Must match a key in delegation.lanes in config.yaml. "
+                                "When set, the child uses that lane's provider/model/toolsets "
+                                "instead of the global delegation config. Only effective "
+                                "when delegation.lanes is configured."
+                            ),
+                        },
+                        "model_tier": {
+                            "type": "string",
+                            "description": (
+                                "Model tier hint (e.g. 'micro', 'small', 'medium', 'large', 'security'). "
+                                "Mapped to a lane via delegation.tier_routes in config.yaml. "
+                                "Only effective when both delegation.lanes and "
+                                "delegation.tier_routes are configured. Otherwise ignored."
+                            ),
                         },
                     },
                     "required": ["goal"],
