@@ -76,6 +76,11 @@ class TestIsCodingContext:
         assert cc.is_coding_context(platform="discord", cwd=tmp_path, config=cfg) is False
         assert cc.is_coding_context(platform="tui", cwd=tmp_path, config=cfg) is True
 
+    def test_auto_includes_api_server_webui_surface(self, tmp_path):
+        _git_init(tmp_path)
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="api_server", cwd=tmp_path, config=cfg) is True
+
     def test_default_mode_is_auto(self, tmp_path):
         # Unknown/missing value normalizes to auto.
         _git_init(tmp_path)
