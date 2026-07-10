@@ -1847,6 +1847,73 @@ class SessionDB:
             rows = self._conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
+    def list_active_runtime_sessions(
+        self,
+        *,
+        limit: int = 5,
+        include_children: bool = False,
+        session_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return recent active sessions carrying actual runtime route metadata.
+
+        Unlike :meth:`list_gateway_sessions`, this includes CLI and WebUI rows
+        whose ``session_key`` is intentionally NULL. The status command uses it
+        to distinguish the configured default route from a session-scoped
+        model/provider selection. Delegate/compression/tool/cron runtimes are
+        hidden by default so worker activity cannot crowd out user-facing
+        sessions. Passing ``session_id`` requests one exact row instead.
+        """
+        try:
+            row_limit = max(1, min(int(limit), 50))
+        except (TypeError, ValueError):
+            row_limit = 5
+
+        query = """
+            SELECT sessions.id,
+                   sessions.title,
+                   sessions.source,
+                   sessions.model,
+                   sessions.billing_provider,
+                   sessions.billing_base_url,
+                   sessions.billing_mode,
+                   sessions.started_at,
+                   sessions.parent_session_id,
+                   sessions.message_count,
+                   COALESCE(
+                       (SELECT MAX(m.timestamp) FROM messages m
+                        WHERE m.session_id = sessions.id),
+                       sessions.started_at
+                   ) AS last_active
+            FROM sessions
+        """
+        params: list[Any] = []
+        exact_session_id = str(session_id or "").strip()
+        if exact_session_id:
+            # Exact lookup means persisted truth, including completed or
+            # archived sessions. Operators commonly inspect a route after a
+            # session has ended, and applying the active filters here made
+            # `--session ID` race session finalization.
+            query += " WHERE sessions.id = ?"
+            params.append(exact_session_id)
+        else:
+            query += """
+                WHERE sessions.ended_at IS NULL
+                  AND COALESCE(sessions.archived, 0) = 0
+                  AND COALESCE(TRIM(sessions.model), '') != ''
+            """
+            if not include_children:
+                query += """
+                  AND LOWER(COALESCE(sessions.source, '')) NOT IN (
+                      'subagent', 'compression', 'tool'
+                  )
+                  AND LOWER(COALESCE(sessions.source, '')) NOT LIKE 'cron%'
+                """
+        query += " ORDER BY last_active DESC, sessions.started_at DESC LIMIT ?"
+        params.append(row_limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
     def find_session_by_origin(
         self,
         *,

@@ -8,6 +8,7 @@ only looked at `providers:`.
 import hermes_cli.providers as providers_mod
 from hermes_cli.model_switch import list_authenticated_providers, switch_model
 from hermes_cli.providers import resolve_provider_full
+from hermes_cli.runtime_provider import resolve_runtime_provider
 
 
 _MOCK_VALIDATION = {
@@ -131,6 +132,38 @@ def test_resolve_provider_full_finds_named_custom_provider():
     assert resolved.name == "Local (127.0.0.1:4141)"
     assert resolved.base_url == "http://127.0.0.1:4141/v1"
     assert resolved.source == "user-config"
+
+
+def test_runtime_provider_preserves_target_model_for_named_custom_provider(
+    tmp_path, monkeypatch
+):
+    """Lane routing needs provider credentials plus the lane-requested model.
+
+    Regression: resolving ``custom:zeus`` against a ``providers.zeus`` config
+    returned the provider default model even when the caller supplied a per-lane
+    target_model, so different lanes could not actually carry different model
+    limits.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("ZEUS_TEST_KEY", "sk-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  zeus:\n"
+        "    name: Zeus\n"
+        "    api: http://192.168.1.92:8080/v1\n"
+        "    key_env: ZEUS_TEST_KEY\n"
+        "    default_model: provider-default-model\n"
+    )
+
+    runtime = resolve_runtime_provider(
+        requested="custom:zeus",
+        target_model="lane-selected-model",
+    )
+
+    assert runtime["provider"] == "custom"
+    assert runtime["base_url"] == "http://192.168.1.92:8080/v1"
+    assert runtime["api_key"] == "sk-test"
+    assert runtime["model"] == "lane-selected-model"
 
 
 def test_list_authenticated_providers_includes_active_bare_custom_endpoint(monkeypatch):
