@@ -12287,14 +12287,14 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "fallback", "gateway", "hooks", "import", "insights", "routing",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "tools", "trajectory", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -12755,10 +12755,11 @@ def cmd_trajectory(args):
     elif sub == "candidates":
         _cmd_trajectory_candidates(args)
     else:
-        print(f"Unknown trajectory subcommand: {sub!r}")
+        raise SystemExit(f"Unknown trajectory subcommand: {sub!r}")
 
 
 def _cmd_trajectory_radar(args):
+    db = None
     try:
         from hermes_state import SessionDB
         from agent.trajectory_radar import TrajectoryRadar, write_report
@@ -12789,9 +12790,12 @@ def _cmd_trajectory_radar(args):
             print(rendered, end="")
             if regressed:
                 print(f"\n⚠  {len(regressed)} candidate(s) regressed: {', '.join(regressed)}")
-        db.close()
     except Exception as e:
-        print(f"Error generating trajectory radar: {e}")
+        print(f"Error generating trajectory radar: {e}", file=sys.stderr)
+        raise SystemExit(1) from e
+    finally:
+        if db is not None:
+            db.close()
 
 
 def _cmd_trajectory_candidates(args):
@@ -12817,8 +12821,7 @@ def _cmd_trajectory_candidates(args):
     if sub == "show":
         rec = store.get(fingerprint)
         if rec is None:
-            print(f"No candidate found with fingerprint: {fingerprint!r}")
-            return
+            raise SystemExit(f"No candidate found with fingerprint: {fingerprint!r}")
         import json
 
         print(json.dumps(rec.to_dict(), indent=2, sort_keys=True))
@@ -12832,14 +12835,13 @@ def _cmd_trajectory_candidates(args):
     }
     new_status = _status_map.get(sub)
     if new_status is None:
-        print(f"Unknown candidates subcommand: {sub!r}")
-        return
+        raise SystemExit(f"Unknown candidates subcommand: {sub!r}")
 
     try:
         rec = store.transition(fingerprint, new_status, note=getattr(args, "note", ""))
         print(f"Candidate `{fingerprint}` → {rec.status}")
     except KeyError:
-        print(f"No candidate found with fingerprint: {fingerprint!r}")
+        raise SystemExit(f"No candidate found with fingerprint: {fingerprint!r}")
 
 
 def cmd_skills(args):

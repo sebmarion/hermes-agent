@@ -284,6 +284,52 @@ def test_candidate_regression_on_accepted_with_growing_evidence(tmp_path):
     assert store.get(fp).status == "regressed"
 
 
+def test_candidate_regression_tracks_newest_evidence_after_ref_cap(tmp_path):
+    """Fresh evidence remains visible after a candidate exceeds the 20-ref cap."""
+    store = CandidateStore(path=tmp_path / "radar_candidates.json")
+    db_path = tmp_path / "state.db"
+
+    db = _seed_db(db_path)
+    now = time.time()
+    for index in range(25):
+        db.append_message(
+            "s-verify",
+            "user",
+            f"Did you check capped evidence {index}?",
+            timestamp=now + index,
+        )
+    try:
+        report = TrajectoryRadar(db).generate(days=1, limit=10)
+    finally:
+        db.close()
+
+    candidate = next(
+        item
+        for item in report["candidates"]
+        if item["id"] == "done-means-proven-gatekeeper"
+    )
+    assert candidate["evidence_count"] > 20
+    assert len(candidate["evidence_refs"]) == 20
+
+    store.sync_from_report(report)
+    store.transition(candidate["id"], "resolved")
+
+    db = SessionDB(db_path=db_path)
+    db.append_message(
+        "s-verify",
+        "user",
+        "Did you check the evidence after the cap?",
+        timestamp=time.time() + 100,
+    )
+    try:
+        refreshed = TrajectoryRadar(db).generate(days=1, limit=10)
+    finally:
+        db.close()
+
+    assert store.sync_from_report(refreshed) == [candidate["id"]]
+    assert store.get(candidate["id"]).status == "regressed"
+
+
 def test_candidate_ignored_not_auto_regressed(tmp_path):
     """An ignored candidate is never automatically regressed."""
     store_path = tmp_path / "radar_candidates.json"
@@ -446,3 +492,26 @@ def test_cli_radar_regression_then_defer_ignore(tmp_path):
     result = _run_cli(home, ["candidates", "ignore", fp2], cwd)
     assert result.returncode == 0, result.stderr + result.stdout
     assert "→ ignored" in result.stdout
+
+
+def test_cli_unknown_candidate_exits_nonzero(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = Path(__file__).resolve().parents[2]
+
+    result = _run_cli(home, ["candidates", "show", "missing"], cwd)
+
+    assert result.returncode != 0
+    assert "No candidate found" in result.stderr
+
+
+def test_cli_radar_database_failure_exits_nonzero(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "state.db").mkdir()
+    cwd = Path(__file__).resolve().parents[2]
+
+    result = _run_cli(home, ["radar", "--days", "1"], cwd)
+
+    assert result.returncode != 0
+    assert "Error generating trajectory radar" in result.stderr

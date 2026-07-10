@@ -352,7 +352,10 @@ class TrajectoryRadar:
             confidence=confidence,
             score=round(score, 1),
             evidence_count=len(evidence),
-            evidence_refs=evidence[:20],
+            # CandidateStore hashes this bounded window to detect fresh
+            # evidence. Keeping the oldest 20 would make lifecycle regression
+            # stop working once a candidate accumulated more than 20 refs.
+            evidence_refs=evidence[-20:],
             projects=projects,
             sources=dict(sources.most_common()),
             models=dict(models.most_common(8)),
