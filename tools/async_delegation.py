@@ -121,9 +121,14 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 
 
 def active_count() -> int:
-    """Number of async delegations currently running."""
+    """Number of delegations still running or finishing durable delivery."""
     with _records_lock:
-        return sum(1 for r in _records.values() if r.get("status") == "running")
+        return sum(
+            1
+            for record in _records.values()
+            if record.get("status") == "running"
+            or record.get("delivery_status") == "finalizing"
+        )
 
 
 def _new_delegation_id() -> str:
@@ -785,7 +790,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         record["status"] = status
         record["completed_at"] = time.time()
         record["last_heartbeat_at"] = record["completed_at"]
-        record["delivery_status"] = "pending"
+        record["delivery_status"] = "finalizing"
         hb_stop = record.get("heartbeat_stop")
         if hasattr(hb_stop, "set"):
             hb_stop.set()
@@ -846,15 +851,24 @@ def _push_completion_event(
         "exit_reason": result.get("exit_reason"),
     }
     try:
+        delegation_id = str(record.get("delegation_id") or "")
         _persist_record(record, result=result, event=evt, delivery_status="pending")
-        process_registry.completion_queue.put(evt)
-        _mark_persisted_delivery(str(record.get("delegation_id") or ""), "queued")
+        _mark_persisted_delivery(delegation_id, "queued")
         with _records_lock:
-            live = _records.get(str(record.get("delegation_id") or ""))
+            live = _records.get(delegation_id)
             if live is not None:
                 live["delivery_status"] = "queued"
                 live["queued_at"] = time.time()
+        # Publish only after the durable record says queued, so a fast
+        # consumer cannot ACK a completion whose persistence still says pending.
+        process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
+        delegation_id = str(record.get("delegation_id") or "")
+        _mark_persisted_delivery(delegation_id, "pending")
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None:
+                live["delivery_status"] = "pending"
         logger.error(
             "Async delegation %s: failed to enqueue completion event; "
             "persisted for replay: %s",
@@ -1007,7 +1021,7 @@ def _finalize_batch(
         record["status"] = status
         record["completed_at"] = time.time()
         record["last_heartbeat_at"] = record["completed_at"]
-        record["delivery_status"] = "pending"
+        record["delivery_status"] = "finalizing"
         hb_stop = record.get("heartbeat_stop")
         if hasattr(hb_stop, "set"):
             hb_stop.set()
@@ -1052,14 +1066,19 @@ def _finalize_batch(
     }
     try:
         _persist_record(event_record, result=combined, event=evt, delivery_status="pending")
-        process_registry.completion_queue.put(evt)
         _mark_persisted_delivery(delegation_id, "queued")
         with _records_lock:
             live = _records.get(delegation_id)
             if live is not None:
                 live["delivery_status"] = "queued"
                 live["queued_at"] = time.time()
+        process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
+        _mark_persisted_delivery(delegation_id, "pending")
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None:
+                live["delivery_status"] = "pending"
         logger.error(
             "Async delegation batch %s: failed to enqueue completion event; "
             "persisted for replay: %s",
