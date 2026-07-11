@@ -21,7 +21,7 @@ from typing import Any
 
 from agent.auxiliary_client import get_text_auxiliary_client
 from agent.execution_plan import (
-    EXECUTION_PLAN_JSON_SCHEMA,
+    EXECUTION_PLAN_GENERATION_SCHEMA,
     PlanValidationError,
     compile_execution_plan,
 )
@@ -250,35 +250,68 @@ def _plan_turn(prompt: str, *, workspace: str, timeout: int) -> dict[str, Any]:
         )
     system = (
         "Propose a side-effect-free execution plan for the user request. "
-        "Use capabilities, never provider/model names. Frontier review must only "
-        "appear in explicit high-risk sota mode; local DAGs express escalation "
-        "through escalation_predicates. Acceptance criteria must be observable."
+        "Classify risk by requested side effects, not by uncertainty. A request "
+        "that only reads a named non-secret project file and reports text must be "
+        "low-risk direct work with local_execution and read_only=true. Use high-risk "
+        "sota only when the request itself concerns security, auth, crypto, "
+        "permissions, credentials, production data, or destructive work; its single "
+        "slice must use frontier_review. Never use sota merely because a file could "
+        "be absent or content needs verification. Use capabilities, never provider "
+        "or model names. Local DAGs express conditional escalation through "
+        "escalation_predicates. Acceptance criteria must be observable."
     )
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Workspace: {workspace or '.'}\nRequest:\n{prompt}"},
-        ],
-        temperature=0,
-        max_tokens=3000,
-        timeout=timeout,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "execution_plan",
-                "strict": True,
-                "schema": EXECUTION_PLAN_JSON_SCHEMA,
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"Workspace: {workspace or '.'}\nRequest:\n{prompt}"},
+    ]
+    last_error: PlanValidationError | None = None
+    for attempt in range(2):
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0,
+            max_tokens=3000,
+            timeout=timeout,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "execution_plan",
+                    "strict": True,
+                    "schema": EXECUTION_PLAN_GENERATION_SCHEMA,
+                },
             },
-        },
-    )
-    content = response.choices[0].message.content
-    if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("execution_planner returned empty content")
-    parsed = json.loads(content)
-    if not isinstance(parsed, dict):
-        raise RuntimeError("execution_planner did not return an object")
-    return parsed
+        )
+        content = response.choices[0].message.content
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("execution_planner returned empty content")
+        try:
+            parsed = json.loads(content)
+            if not isinstance(parsed, dict):
+                raise PlanValidationError("execution_planner did not return an object")
+            compile_execution_plan(parsed)
+            return parsed
+        except json.JSONDecodeError as exc:
+            last_error = PlanValidationError(
+                f"execution_planner returned malformed JSON: {exc.msg}"
+            )
+        except PlanValidationError as exc:
+            last_error = exc
+        if attempt == 0:
+            messages.extend(
+                [
+                    {"role": "assistant", "content": content},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Validation failed: {last_error}. Return one corrected "
+                            "complete plan matching the schema and policy."
+                        ),
+                    },
+                ]
+            )
+    assert last_error is not None
+    raise last_error
 
 
 def _append_observation(row: dict[str, Any]) -> None:

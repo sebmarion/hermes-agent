@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.execution_plan import (
+    EXECUTION_PLAN_GENERATION_SCHEMA,
     EXECUTION_PLAN_JSON_SCHEMA,
     PlanValidationError,
     compile_execution_plan,
@@ -61,6 +62,30 @@ def test_schema_is_strict_and_requires_observable_contract_fields():
     assert slice_schema["additionalProperties"] is False
     assert "acceptance" in slice_schema["required"]
     assert "allowed_paths" in slice_schema["required"]
+
+
+def _contains_key(value, target):
+    if isinstance(value, dict):
+        return target in value or any(
+            _contains_key(item, target) for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(_contains_key(item, target) for item in value)
+    return False
+
+
+def test_generation_schema_strips_only_local_grammar_length_bounds():
+    assert _contains_key(EXECUTION_PLAN_JSON_SCHEMA, "minLength")
+    assert _contains_key(EXECUTION_PLAN_JSON_SCHEMA, "maxLength")
+    assert not _contains_key(EXECUTION_PLAN_GENERATION_SCHEMA, "minLength")
+    assert not _contains_key(EXECUTION_PLAN_GENERATION_SCHEMA, "maxLength")
+    assert EXECUTION_PLAN_GENERATION_SCHEMA["additionalProperties"] is False
+    assert EXECUTION_PLAN_GENERATION_SCHEMA["properties"]["slices"]["maxItems"] == 6
+    id_schema = EXECUTION_PLAN_JSON_SCHEMA["properties"]["slices"]["items"][
+        "properties"
+    ]["id"]
+    assert id_schema["minLength"] == 1
+    assert id_schema["maxLength"] == 64
 
 
 def test_compile_valid_plan_orders_dependency_waves():
@@ -221,6 +246,7 @@ def test_generate_uses_strict_schema_and_repairs_one_semantic_failure():
     response_format = calls[0]["response_format"]
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"] is EXECUTION_PLAN_GENERATION_SCHEMA
     assert "Validation failed" in calls[1]["messages"][-1]["content"]
 
 

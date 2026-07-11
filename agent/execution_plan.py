@@ -98,6 +98,29 @@ EXECUTION_PLAN_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
+def _planner_generation_schema(value: Any) -> Any:
+    """Copy validation schema without llama.cpp-incompatible string bounds.
+
+    Local llama.cpp grammar generation rejects nested ``minLength`` and
+    ``maxLength`` constraints. Generation remains structurally constrained;
+    ``compile_execution_plan`` remains authoritative after decoding.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _planner_generation_schema(item)
+            for key, item in value.items()
+            if key not in {"minLength", "maxLength"}
+        }
+    if isinstance(value, list):
+        return [_planner_generation_schema(item) for item in value]
+    return value
+
+
+EXECUTION_PLAN_GENERATION_SCHEMA: dict[str, Any] = _planner_generation_schema(
+    EXECUTION_PLAN_JSON_SCHEMA
+)
+
+
 class PlanValidationError(ValueError):
     """Raised when a proposed plan violates deterministic policy."""
 
@@ -422,7 +445,7 @@ def generate_execution_plan(
                 "json_schema": {
                     "name": "execution_plan",
                     "strict": True,
-                    "schema": EXECUTION_PLAN_JSON_SCHEMA,
+                    "schema": EXECUTION_PLAN_GENERATION_SCHEMA,
                 },
             },
             extra_body=dict(extra_body or {}) or None,

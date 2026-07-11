@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent import autonomy_shadow as shadow
+from agent.execution_plan import EXECUTION_PLAN_GENERATION_SCHEMA
 
 
 def _valid_plan() -> dict:
@@ -234,7 +235,58 @@ def test_planner_requests_strict_json_schema(monkeypatch):
     schema = captured["response_format"]["json_schema"]
     assert schema["strict"] is True
     assert schema["schema"]["additionalProperties"] is False
+    assert schema["schema"] is EXECUTION_PLAN_GENERATION_SCHEMA
+    assert captured["max_tokens"] == 3000
+    assert captured["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
     assert captured["timeout"] == 9
+
+
+def test_planner_repairs_one_semantically_invalid_plan(monkeypatch):
+    invalid = _valid_plan()
+    invalid.update(mode="sota", risk="high")
+    valid = _valid_plan()
+    responses = iter([invalid, valid])
+    calls = []
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            payload = next(responses)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(shadow, "get_text_auxiliary_client", lambda task: (client, "local"))
+
+    result = shadow._plan_turn("inspect", workspace="/repo", timeout=9)
+
+    assert result == valid
+    assert len(calls) == 2
+    assert "Validation failed" in calls[1]["messages"][-1]["content"]
+
+
+def test_planner_repairs_one_malformed_json_response(monkeypatch):
+    responses = iter(["not-json", json.dumps(_valid_plan())])
+    calls = []
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=next(responses)))]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(shadow, "get_text_auxiliary_client", lambda task: (client, "local"))
+
+    result = shadow._plan_turn("inspect", workspace="/repo", timeout=9)
+
+    assert result == _valid_plan()
+    assert len(calls) == 2
+    assert "malformed JSON" in calls[1]["messages"][-1]["content"]
 
 
 def test_planner_rejects_native_adapter_that_drops_strict_schema(monkeypatch):
