@@ -3509,12 +3509,16 @@ def _bestplan_runtime_identity(task: Dict[str, Any], runtime: Dict[str, Any]) ->
 
 
 def _bestplan_sandbox_workspace(workspace: str, plan_id: str) -> Path:
-    """Create/reuse a clean detached Git worktree for one approved plan."""
+    """Create/reuse a detached worktree preserving the approved cwd."""
     canonical = Path(workspace).expanduser().resolve()
     root = Path(subprocess.run(
         ["git", "rev-parse", "--show-toplevel"], cwd=canonical,
         capture_output=True, text=True, timeout=10, check=True,
     ).stdout.strip()).resolve()
+    try:
+        workspace_relative = canonical.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("BestPlan workspace is outside its Git repository root") from exc
     dirty = subprocess.run(
         ["git", "status", "--porcelain=v1", "--untracked-files=all"],
         cwd=root, capture_output=True, text=True, timeout=10, check=True,
@@ -3536,12 +3540,17 @@ def _bestplan_sandbox_workspace(workspace: str, plan_id: str) -> Path:
         )
         if probe.returncode != 0 or probe.stdout.strip() != "true":
             raise ValueError(f"BestPlan sandbox path exists but is not a worktree: {sandbox}")
-        return sandbox.resolve()
-    subprocess.run(
-        ["git", "worktree", "add", "--detach", str(sandbox), "HEAD"],
-        cwd=root, capture_output=True, text=True, timeout=30, check=True,
-    )
-    return sandbox.resolve()
+    else:
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(sandbox), "HEAD"],
+            cwd=root, capture_output=True, text=True, timeout=30, check=True,
+        )
+    sandbox_workspace = (sandbox / workspace_relative).resolve()
+    if not sandbox_workspace.is_dir():
+        raise ValueError(
+            "BestPlan approved workspace subdirectory is absent from the detached worktree"
+        )
+    return sandbox_workspace
 
 
 def _dispatch_bestplan_tasks_async_impl(
