@@ -2173,6 +2173,32 @@ def test_run_conversation_codex_continues_after_ack_for_directory_listing_prompt
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
 
 
+def test_run_conversation_forces_exactly_one_ack_continuation(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_ack_message_response("I'll inspect the repository now."),
+        _codex_ack_message_response("I'll inspect the repository now."),
+    ]
+    calls = []
+
+    def _next(api_kwargs):
+        calls.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _next)
+
+    result = agent.run_conversation("inspect the repository")
+
+    assert len(calls) == 2
+    continuations = [
+        msg
+        for msg in result["messages"]
+        if msg.get("role") == "user"
+        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
+    ]
+    assert len(continuations) == 1
+
+
 def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
     """Debug dumps should show /responses URL when in codex_responses mode."""
     import json

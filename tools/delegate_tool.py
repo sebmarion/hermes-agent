@@ -305,6 +305,7 @@ def _looks_like_error_output(content: Any) -> bool:
     which painted perfectly normal terminal/json output red.  We now only
     mark output as an error when there is stronger evidence:
       - structured JSON with an ``error`` key
+      - structured JSON with ``success: false`` or ``ok: false``
       - structured JSON with ``status`` of error/failed
       - first line starts with a classic error marker
     """
@@ -319,6 +320,9 @@ def _looks_like_error_output(content: Any) -> bool:
             if isinstance(parsed, dict):
                 if parsed.get("error"):
                     return True
+                for flag in ("success", "ok"):
+                    if flag in parsed and parsed[flag] is False:
+                        return True
                 status = str(parsed.get("status") or "").strip().lower()
                 if status in {"error", "failed", "failure", "timeout"}:
                     return True
@@ -1062,6 +1066,9 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Explicit lane routing owns the provider/model boundary. Inheriting the
+    # parent's fallback chain would let a failed lane silently run elsewhere.
+    inherit_parent_fallback: bool = True,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1133,6 +1140,14 @@ def _build_child_agent(
         child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+
+    if toolsets and not child_toolsets:
+        requested = ", ".join(str(name) for name in toolsets)
+        available = ", ".join(sorted(_expand_parent_toolsets(parent_toolsets))) or "none"
+        raise ValueError(
+            "Delegation toolsets resolved to no usable tools "
+            f"(requested: {requested}; available from parent: {available})."
+        )
 
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
@@ -1275,7 +1290,11 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback = (
+        getattr(parent_agent, "_fallback_chain", None) or None
+        if inherit_parent_fallback
+        else None
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1331,6 +1350,13 @@ def _build_child_agent(
         iteration_budget=None,  # fresh budget per subagent
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Delegated agents are execution workers, not ordinary conversational turns.
+    # Force the universal tool-use prompt and intent-ack continuation for every
+    # provider/API mode so a child cannot terminate after saying "I'll inspect..."
+    # without doing the work.  This is deliberately child-local and does not
+    # change the parent's chat behavior.
+    child._tool_use_enforcement = True
+    child._intent_ack_continuation = True
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -2019,6 +2045,12 @@ def _run_single_child(
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "mode": getattr(child, "_delegate_mode", "execute"),
+                "lane": getattr(child, "_delegate_lane", None),
+                "provider": getattr(child, "_delegate_provider", None),
+                "routed_model": getattr(child, "_delegate_model", None),
+                "evidence": {"tool_turn_count": 0, "successful_tool_count": 0},
+                "failure_kind": "provider_error",
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -2045,16 +2077,7 @@ def _run_single_child(
         # ChatCompletion, etc.). Treat it as a failure so the parent surfaces
         # it instead of silently accepting zero-content "success".
         _empty_sentinel = summary.strip() == "(empty)"
-
-        if interrupted:
-            status = "interrupted"
-        elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
-            status = "completed"
-        else:
-            status = "failed"
+        _runtime_error = result.get("error")
 
         # Build tool trace from conversation messages (already in memory).
         # Uses tool_call_id to correctly pair parallel tool calls with results.
@@ -2083,14 +2106,40 @@ def _run_single_child(
                         "result_bytes": len(content),
                         "status": "error" if is_error else "ok",
                     }
-                    # Match by tool_call_id for parallel calls
+                    # Only an exact tool_call_id match is evidence. Orphaned
+                    # results (missing/unknown IDs) must not be attached to the
+                    # latest call, especially when calls ran in parallel.
                     tc_id = msg.get("tool_call_id")
                     target = trace_by_id.get(tc_id) if tc_id else None
                     if target is not None:
                         target.update(result_meta)
-                    elif tool_trace:
-                        # Fallback for messages without tool_call_id
-                        tool_trace[-1].update(result_meta)
+
+        mode = getattr(child, "_delegate_mode", "execute")
+        if mode not in {"execute", "review", "reason"}:
+            mode = "execute"
+        execution_requires_tools = mode in {"execute", "review"}
+        successful_tool_count = sum(
+            1 for entry in tool_trace if entry.get("status") == "ok"
+        )
+        successful_tool_evidence = successful_tool_count > 0
+        zero_tool_execution = execution_requires_tools and not successful_tool_evidence
+
+        if interrupted:
+            status = "interrupted"
+        elif _runtime_error:
+            status = "failed"
+        elif zero_tool_execution:
+            # Execution/review delegates must leave objective successful tool
+            # evidence. An intent statement, rejected call, or all-error trace
+            # is not completion.
+            status = "failed"
+        elif summary and not _empty_sentinel:
+            # A summary means the subagent produced usable output. exit_reason
+            # ("completed" vs "max_iterations") still tells the parent how the
+            # task ended; reasoning-only delegates may legitimately use no tools.
+            status = "completed"
+        else:
+            status = "failed"
 
         # Determine exit reason
         if interrupted:
@@ -2122,6 +2171,14 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
+            "mode": mode,
+            "lane": getattr(child, "_delegate_lane", None),
+            "provider": getattr(child, "_delegate_provider", None),
+            "routed_model": getattr(child, "_delegate_model", None),
+            "evidence": {
+                "tool_turn_count": len(tool_trace),
+                "successful_tool_count": successful_tool_count,
+            },
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
@@ -2141,7 +2198,38 @@ def _run_single_child(
             ),
         }
         if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+            if _runtime_error:
+                entry["error"] = str(_runtime_error)
+                entry["failure_kind"] = "provider_error"
+            elif zero_tool_execution:
+                entry["error"] = (
+                    "Subagent returned execution/review prose without any successful tool evidence; "
+                    "the task was not accepted as completed."
+                )
+                entry["failure_kind"] = (
+                    "tool_execution_failed"
+                    if any(item.get("status") == "error" for item in tool_trace)
+                    else "no_tool_evidence"
+                )
+            else:
+                entry["error"] = "Subagent did not produce a response."
+                entry["failure_kind"] = "provider_error"
+
+        logger.info(
+            "delegate_task child terminal task_index=%d mode=%s lane=%s "
+            "provider=%s model=%s tool_turns=%d successful_tools=%d "
+            "duration_seconds=%.2f status=%s failure_kind=%s",
+            task_index,
+            mode,
+            entry.get("lane"),
+            entry.get("provider"),
+            entry.get("routed_model") or entry.get("model"),
+            len(tool_trace),
+            successful_tool_count,
+            duration,
+            status,
+            entry.get("failure_kind"),
+        )
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
@@ -2261,6 +2349,12 @@ def _run_single_child(
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
+            "mode": getattr(child, "_delegate_mode", "execute"),
+            "lane": getattr(child, "_delegate_lane", None),
+            "provider": getattr(child, "_delegate_provider", None),
+            "routed_model": getattr(child, "_delegate_model", None),
+            "evidence": {"tool_turn_count": 0, "successful_tool_count": 0},
+            "failure_kind": "provider_error",
         }
 
     finally:
@@ -2422,10 +2516,12 @@ def delegate_task(
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    #
+    # Per-task lane routing: when delegation.lanes is configured, each task
+    # can resolve its own credentials via _resolve_delegation_credentials_for_task.
+    # Resolve the global fallback lazily so a broken fallback provider does not
+    # block tasks that explicitly route to a valid lane.
+    global_creds = None
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2444,16 +2540,24 @@ def delegate_task(
                 f"delegate_task calls, or increase "
                 f"delegation.max_concurrent_children in config.yaml."
             )
-        task_list = tasks
+        task_list = list(tasks)
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {
+                "goal": goal,
+                "context": context,
+                "role": top_role,
+                "mode": "execute",
+            }
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    # Validate and normalize each task. Omission is execution-first.
+    normalized_tasks = []
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -2461,6 +2565,15 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        normalized = dict(task)
+        mode = str(normalized.get("mode") or "execute").strip().lower()
+        if mode not in {"execute", "review", "reason"}:
+            return tool_error(
+                f"Task mode '{mode}' is invalid (expected: execute, review, reason)."
+            )
+        normalized["mode"] = mode
+        normalized_tasks.append(normalized)
+    task_list = normalized_tasks
 
     overall_start = time.monotonic()
     results = []
@@ -2476,37 +2589,77 @@ def delegate_task(
 
     _parent_tool_names = list(_model_tools._last_resolved_tool_names)
 
+    # Resolve and validate the complete batch before constructing any child.
+    # This prevents task N's broken lane/toolset from leaving tasks 0..N-1
+    # partially spawned.
+    task_specs = []
+    for t in task_list:
+        try:
+            lane_name = _resolve_lane_for_task(t, cfg)
+            if lane_name is not None:
+                task_creds = _resolve_delegation_credentials_for_task(
+                    cfg, parent_agent, t
+                )
+            else:
+                if global_creds is None:
+                    global_creds = _resolve_delegation_credentials(cfg, parent_agent)
+                task_creds = global_creds
+            lane_toolsets = _normalize_lane_toolsets(task_creds.get("toolsets"))
+            if lane_name is not None:
+                _preflight_lane_toolsets(
+                    parent_agent,
+                    lane_toolsets,
+                    lane=lane_name,
+                    mode=t["mode"],
+                )
+        except ValueError as exc:
+            return tool_error(str(exc))
+        task_specs.append((t, lane_name, task_creds, lane_toolsets))
+
     # Build all child agents on the main thread (thread-safe construction)
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    child_models = []
     try:
-        for i, t in enumerate(task_list):
+        for i, (t, lane_name, task_creds, lane_toolsets) in enumerate(task_specs):
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
-                role=effective_role,
-            )
+            try:
+                child = _build_child_agent(
+                    task_index=i,
+                    goal=t["goal"],
+                    context=t.get("context"),
+                    # When a lane specifies toolsets, pass them so the child
+                    # gets a narrow set (e.g. [terminal, file] for local workers).
+                    # Otherwise None = inherit parent toolsets.
+                    toolsets=lane_toolsets,
+                    model=task_creds["model"],
+                    max_iterations=effective_max_iter,
+                    task_count=n_tasks,
+                    parent_agent=parent_agent,
+                    override_provider=task_creds["provider"],
+                    override_base_url=task_creds["base_url"],
+                    override_api_key=task_creds["api_key"],
+                    override_api_mode=task_creds["api_mode"],
+                    override_acp_command=task_creds.get("command"),
+                    override_acp_args=task_creds.get("args"),
+                    role=effective_role,
+                    inherit_parent_fallback=(lane_name is None),
+                )
+            except ValueError as exc:
+                return tool_error(str(exc))
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
+            child._delegate_mode = t["mode"]
+            child._delegate_lane = lane_name or "global"
+            child._delegate_provider = task_creds.get("provider")
+            child._delegate_model = task_creds.get("model")
+            child._tool_use_enforcement = t["mode"] in {"execute", "review"}
+            child._intent_ack_continuation = t["mode"] in {"execute", "review"}
             children.append((i, t, child))
+            child_models.append(task_creds.get("model"))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
@@ -2575,6 +2728,7 @@ def delegate_task(
                                         "error": str(exc),
                                         "api_calls": 0,
                                         "duration_seconds": 0,
+                                        "failure_kind": "provider_error",
                                         "_child_role": getattr(
                                             _child_by_index.get(idx), "_delegate_role", None
                                         ),
@@ -2587,6 +2741,7 @@ def delegate_task(
                                     "error": "Parent agent interrupted — child did not finish in time",
                                     "api_calls": 0,
                                     "duration_seconds": 0,
+                                    "failure_kind": "provider_error",
                                     "_child_role": getattr(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
@@ -2612,6 +2767,7 @@ def delegate_task(
                                 "error": str(exc),
                                 "api_calls": 0,
                                 "duration_seconds": 0,
+                                "failure_kind": "provider_error",
                                 "_child_role": getattr(
                                     _child_by_index.get(idx), "_delegate_role", None
                                 ),
@@ -2834,7 +2990,9 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            # Metadata only: heterogeneous lane batches do not have one model.
+            # Per-child routing is already fixed on each built child.
+            model=_async_batch_model_label(child_models),
             session_key=_session_key,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
@@ -2886,6 +3044,20 @@ def delegate_task(
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+
+
+def _async_batch_model_label(models) -> Optional[str]:
+    """Return truthful compact metadata for a possibly heterogeneous batch."""
+    unique = []
+    for model in models:
+        label = str(model or "").strip()
+        if label and label not in unique:
+            unique.append(label)
+    if not unique:
+        return None
+    if len(unique) == 1:
+        return unique[0]
+    return "mixed:" + ",".join(unique)
 
 
 def _resolve_child_credential_pool(
@@ -3097,6 +3269,267 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
+    """Resolve which lane name a task should use, if lane routing is configured.
+
+    Resolution order:
+    1. task["route"] — explicit lane name (must exist in cfg["lanes"])
+    2. task["model_tier"] → cfg["tier_routes"][tier] → lane name
+    3. task mode: execute → code_worker, review → smart_reviewer,
+       reason → local_worker
+
+    Returns ``None`` only when lane routing is entirely unconfigured and the
+    task did not request a route or tier. Once lanes or selectors are present,
+    invalid or incomplete routing fails closed.
+    """
+    raw_lanes = cfg.get("lanes")
+    lanes_configured = "lanes" in cfg
+    raw_tier_routes = cfg.get("tier_routes")
+    tier_routes_configured = "tier_routes" in cfg
+    route = str(task.get("route") or "").strip()
+    tier = str(task.get("model_tier") or "").strip()
+    mode = str(task.get("mode") or "execute").strip().lower()
+    mode_routes = {
+        "execute": "code_worker",
+        "review": "smart_reviewer",
+        "reason": "local_worker",
+    }
+    if mode not in mode_routes:
+        raise ValueError(
+            f"Task mode '{mode}' is invalid (expected: execute, review, reason)."
+        )
+
+    if tier_routes_configured and not isinstance(raw_tier_routes, dict):
+        raise ValueError("delegation.tier_routes must be a mapping when configured.")
+    if lanes_configured and not isinstance(raw_lanes, dict):
+        raise ValueError("delegation.lanes must be a non-empty mapping when configured.")
+    lanes = raw_lanes if isinstance(raw_lanes, dict) else {}
+    if not lanes:
+        if lanes_configured:
+            raise ValueError("delegation.lanes must be a non-empty mapping when configured.")
+        if tier_routes_configured:
+            # Validate members too so malformed/dangling routes receive a
+            # precise error rather than being hidden by the missing lanes.
+            for tier_name, lane_name in raw_tier_routes.items():
+                if (
+                    not isinstance(tier_name, str)
+                    or not tier_name.strip()
+                    or tier_name != tier_name.strip()
+                    or not isinstance(lane_name, str)
+                    or not lane_name.strip()
+                    or lane_name != lane_name.strip()
+                ):
+                    raise ValueError(
+                        "delegation.tier_routes keys and values must be non-empty trimmed strings."
+                    )
+            raise ValueError(
+                "delegation.tier_routes was configured but delegation.lanes is not configured."
+            )
+        if route:
+            raise ValueError(
+                f"Task route '{route}' was requested but delegation.lanes is not configured."
+            )
+        if tier:
+            raise ValueError(
+                f"Task model_tier '{tier}' was requested but delegation.lanes is not configured."
+            )
+        # Legacy installs without lane configuration continue through the
+        # single global delegation provider. Once lanes are configured, mode
+        # owns routing and no global/default-lane fallback is allowed.
+        return None
+
+    # Validate every configured lane, not only the selected one. A typo in a
+    # dormant lane should not be allowed to become a latent fail-open route.
+    for lane_name, lane_cfg in lanes.items():
+        if (
+            not isinstance(lane_name, str)
+            or not lane_name.strip()
+            or lane_name != lane_name.strip()
+        ):
+            raise ValueError(
+                "delegation.lanes keys must be non-empty trimmed strings."
+            )
+        if not isinstance(lane_cfg, dict) or not lane_cfg:
+            raise ValueError(
+                f"Delegation lane '{lane_name}' must be a non-empty mapping."
+            )
+        for required_key in ("provider", "model"):
+            value = lane_cfg.get(required_key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"Delegation lane '{lane_name}' requires a non-empty {required_key}."
+                )
+        if "toolsets" in lane_cfg and not _normalize_lane_toolsets(lane_cfg.get("toolsets")):
+            raise ValueError(
+                f"Delegation lane '{lane_name}' has empty, unknown, or invalid toolsets."
+            )
+
+    raw_tier_routes = cfg.get("tier_routes")
+    if "tier_routes" in cfg:
+        if not isinstance(raw_tier_routes, dict):
+            raise ValueError("delegation.tier_routes must be a mapping when configured.")
+        for tier_name, lane_name in raw_tier_routes.items():
+            if (
+                not isinstance(tier_name, str)
+                or not tier_name.strip()
+                or tier_name != tier_name.strip()
+                or not isinstance(lane_name, str)
+                or not lane_name.strip()
+                or lane_name != lane_name.strip()
+            ):
+                raise ValueError(
+                    "delegation.tier_routes keys and values must be non-empty trimmed strings."
+                )
+            if lane_name not in lanes:
+                raise ValueError(
+                    f"Tier '{tier_name}' maps to lane '{lane_name}' which is not in "
+                    f"delegation.lanes (available: {', '.join(sorted(lanes))})."
+                )
+
+    # 1. Explicit route
+    if route:
+        if route not in lanes:
+            raise ValueError(
+                f"Task route '{route}' not found in delegation.lanes "
+                f"(available: {', '.join(sorted(lanes))})."
+            )
+        return route
+
+    # 2. model_tier → tier_routes
+    if tier:
+        tier_routes = cfg.get("tier_routes") or {}
+        lane = tier_routes.get(tier)
+        if lane:
+            if lane not in lanes:
+                raise ValueError(
+                    f"Tier '{tier}' maps to lane '{lane}' which is not in "
+                    f"delegation.lanes (available: {', '.join(sorted(lanes))})."
+                )
+            return lane
+        raise ValueError(
+            f"Task model_tier '{tier}' is not mapped in delegation.tier_routes."
+        )
+
+    # 3. Explicit execution contract. The legacy default_lane is ignored so
+    # an omitted selector can never turn an execution task into reasoning.
+    lane = mode_routes[mode]
+    if lane not in lanes:
+        raise ValueError(
+            f"Task mode '{mode}' requires lane '{lane}', which is not in "
+            f"delegation.lanes (available: {', '.join(sorted(lanes))})."
+        )
+    return lane
+
+
+def _normalize_lane_toolsets(value) -> Optional[list[str]]:
+    """Normalize and validate optional lane toolsets.
+
+    ``hermes config set`` writes scalar values, so tolerate comma-separated
+    strings. Sequence members must already be strings, and every normalized
+    name must resolve through the live toolset registry.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        names = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        if any(not isinstance(part, str) for part in value):
+            return None
+        names = [part.strip() for part in value if part.strip()]
+    else:
+        return None
+    if not names:
+        return None
+    try:
+        from toolsets import validate_toolset
+
+        if any(not validate_toolset(name) for name in names):
+            return None
+    except Exception:
+        # Validation infrastructure being unavailable is not permission to
+        # broaden a lane's capabilities.
+        return None
+    return names
+
+
+def _preflight_lane_toolsets(
+    parent_agent,
+    requested_toolsets: Optional[List[str]],
+    *,
+    lane: str,
+    mode: str,
+) -> None:
+    """Fail before child construction when a selected lane cannot do its job."""
+    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+    if parent_enabled is not None:
+        parent_toolsets = set(parent_enabled)
+    elif hasattr(parent_agent, "valid_tool_names"):
+        import model_tools
+
+        parent_toolsets = {
+            toolset
+            for name in (getattr(parent_agent, "valid_tool_names", None) or [])
+            if (toolset := model_tools.get_toolset_for_tool(name)) is not None
+        }
+    else:
+        parent_toolsets = set(DEFAULT_TOOLSETS)
+
+    expanded_parent = _expand_parent_toolsets(parent_toolsets)
+    selected = (
+        [name for name in requested_toolsets if name in expanded_parent]
+        if requested_toolsets
+        else list(parent_toolsets)
+    )
+    selected = _strip_blocked_tools(selected)
+    if mode in {"execute", "review"} and not selected:
+        requested = ", ".join(requested_toolsets or []) or "inherited"
+        available = ", ".join(sorted(expanded_parent)) or "none"
+        raise ValueError(
+            f"Delegation lane '{lane}' has no usable tools for mode '{mode}' "
+            f"(requested: {requested}; available from parent: {available})."
+        )
+
+
+def _resolve_delegation_credentials_for_task(
+    cfg: dict, parent_agent, task: Optional[dict] = None
+) -> dict:
+    """Resolve credentials for a single task, with optional lane routing.
+
+    When ``task`` is provided and lane routing is configured, resolves
+    per-task credentials from the named lane. Falls back to the global
+    ``_resolve_delegation_credentials`` when no lane is resolved.
+
+    Returns the same dict shape as ``_resolve_delegation_credentials``.
+    Additionally, if the lane specifies ``toolsets``, they are returned
+    under the ``toolsets`` key for the child builder to use.
+    """
+    if task is not None:
+        try:
+            lane_name = _resolve_lane_for_task(task, cfg)
+        except ValueError:
+            raise  # re-raise route validation errors
+
+        if lane_name is not None:
+            lane_cfg = cfg["lanes"][lane_name]
+            # Build a sub-config dict in the same shape _resolve_delegation_credentials expects
+            lane_creds = _resolve_delegation_credentials(lane_cfg, parent_agent)
+            # Carry lane-level toolsets only when explicitly configured. An
+            # empty/blank/malformed value must fail closed rather than becoming
+            # None, which means "inherit every parent toolset" to the builder.
+            if "toolsets" in lane_cfg:
+                lane_toolsets = _normalize_lane_toolsets(lane_cfg.get("toolsets"))
+                if not lane_toolsets:
+                    raise ValueError(
+                        f"Delegation lane '{lane_name}' has empty or invalid toolsets."
+                    )
+                lane_creds["toolsets"] = lane_toolsets
+            lane_creds["lane"] = lane_name
+            return lane_creds
+
+    # Fall back to global delegation config
+    return _resolve_delegation_credentials(cfg, parent_agent)
+
+
 def _load_config() -> dict:
     """Load delegation config from CLI_CONFIG or persistent config.
 
@@ -3224,7 +3657,9 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Routing precedence is explicit route, then model_tier, then mode. "
+        "Mode defaults to execute (code_worker); review uses smart_reviewer; "
+        "reason uses local_worker. Arbitrary provider/model values are not accepted per call.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3352,6 +3787,35 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["execute", "review", "reason"],
+                            "description": (
+                                "Task contract. execute (default) routes to code_worker "
+                                "and requires successful tool evidence; review routes to "
+                                "smart_reviewer and also requires tool evidence; reason "
+                                "routes to local_worker and may finish without tools."
+                            ),
+                        },
+                        "route": {
+                            "type": "string",
+                            "description": (
+                                "Explicit lane name for per-task model routing. "
+                                "Must match a key in delegation.lanes in config.yaml. "
+                                "When set, the child uses that lane's provider/model/toolsets "
+                                "instead of the global delegation config. Only effective "
+                                "when delegation.lanes is configured."
+                            ),
+                        },
+                        "model_tier": {
+                            "type": "string",
+                            "description": (
+                                "Model tier hint (e.g. 'micro', 'small', 'medium', 'large', 'security'). "
+                                "Mapped to a lane via delegation.tier_routes in config.yaml. "
+                                "Only effective when both delegation.lanes and "
+                                "delegation.tier_routes are configured. Otherwise ignored."
+                            ),
                         },
                     },
                     "required": ["goal"],
