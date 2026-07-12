@@ -152,6 +152,11 @@ This host-side execution path is off by default. Enable it with exactly:
 hermes config set autonomy.go_enabled true
 ```
 
+The executable host ingress is currently supported by the classic CLI and the
+coordinated Hermes WebUI integration. The TUI/desktop and messaging gateway do
+not claim this bare-`go` execution contract yet; on those surfaces `/bestplan`
+remains planning-only.
+
 Before enabling it, configure `delegation.lanes.code_worker.provider` and
 `.model` for implementation plans, and
 `delegation.lanes.smart_reviewer.provider` and `.model` for review plans. A

@@ -29,7 +29,7 @@ def _slice(slice_id: str, **overrides):
         "goal": f"Complete {slice_id}",
         "depends_on": [],
         "capability": "fast_fallback",
-        "workspace": "/repo",
+        "workspace": "/tmp/ws",
         "allowed_paths": [f"src/{slice_id}.py"],
         "read_only": False,
         "expected_artifacts": [f"src/{slice_id}.py"],
@@ -96,7 +96,7 @@ def store(tmp_path, monkeypatch):
 
 def test_manifest_digest_is_stable_and_binds_approval(store):
     raw = compile_execution_plan(_plan(_slice("a")))
-    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws")
+    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws", baseline_fingerprint="base")
     assert store.approve_plan(plan_id, approver="test")
     row = store.get_plan(plan_id)
     manifest = json.loads(row["validated_manifest_json"])
@@ -107,9 +107,9 @@ def test_manifest_digest_is_stable_and_binds_approval(store):
 
 def test_atomic_claim_prevents_double_go(store, monkeypatch):
     raw = compile_execution_plan(_plan(_slice("a")))
-    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws")
+    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws", baseline_fingerprint="base")
     store.approve_plan(plan_id)
-    baseline = compute_baseline_fingerprint("/tmp/ws")
+    baseline = "base"
 
     # First claim succeeds.
     assert store.atomic_claim_approved(plan_id, baseline) is not None
@@ -122,6 +122,7 @@ def test_go_resolver_returns_no_plan_when_none_pending(store):
         "go",
         session_id="s1",
         workspace="/tmp/ws",
+        baseline_fingerprint="base",
         parent_agent=None,
         config=_enabled_config(),
         store=store,
@@ -133,12 +134,13 @@ def test_go_resolver_returns_no_plan_when_none_pending(store):
 def test_go_resolver_returns_ambiguous_when_multiple_approved(store):
     for i in range(2):
         raw = compile_execution_plan(_plan(_slice(f"a{i}")))
-        plan_id = store.create_plan(f"do {i}", raw, session_id="s1", workspace="/tmp/ws")
+        plan_id = store.create_plan(f"do {i}", raw, session_id="s1", workspace="/tmp/ws", baseline_fingerprint="base")
         store.approve_plan(plan_id)
     result = try_resolve_go(
         "go",
         session_id="s1",
         workspace="/tmp/ws",
+        baseline_fingerprint="base",
         parent_agent=None,
         config=_enabled_config(),
         store=store,
@@ -149,13 +151,14 @@ def test_go_resolver_returns_ambiguous_when_multiple_approved(store):
 
 def test_go_resolver_rejects_stale_baseline(store, monkeypatch):
     raw = compile_execution_plan(_plan(_slice("a")))
-    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws")
+    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws", baseline_fingerprint="base")
     store.approve_plan(plan_id)
     # Mutate workspace path so baseline fingerprint differs.
     result = try_resolve_go(
         "go",
         session_id="s1",
         workspace="/tmp/other",
+        baseline_fingerprint="base",
         parent_agent=None,
         config=_enabled_config(),
         store=store,
@@ -166,7 +169,7 @@ def test_go_resolver_rejects_stale_baseline(store, monkeypatch):
 
 def test_go_resolver_dispatches_and_persists_delegation_id(store, monkeypatch):
     raw = compile_execution_plan(_sota_plan(_review_slice("b")))
-    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws")
+    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws", baseline_fingerprint="base")
     store.approve_plan(plan_id)
 
     fake_agent = SimpleNamespace()
@@ -189,9 +192,11 @@ def test_go_resolver_dispatches_and_persists_delegation_id(store, monkeypatch):
         "go",
         session_id="s1",
         workspace="/tmp/ws",
+        baseline_fingerprint="base",
         parent_agent=fake_agent,
         config=_enabled_config(),
         store=store,
+        delegate=lambda **kwargs: json.dumps(fake_result),
     )
     assert result.resolved is True
     assert result.status == "waiting"
@@ -231,16 +236,18 @@ def test_missing_lane_rejection(store, monkeypatch):
     raw = compile_execution_plan(
         _plan(_slice("a", capability="local_execution"))
     )
-    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws")
+    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws", baseline_fingerprint="base")
     store.approve_plan(plan_id)
 
     result = try_resolve_go(
         "go",
         session_id="s1",
         workspace="/tmp/ws",
+        baseline_fingerprint="base",
         parent_agent=SimpleNamespace(),
         config=_enabled_config(),
         store=store,
+        delegate=lambda **kwargs: json.dumps({"status": "dispatched", "delegation_id": "d"}),
     )
     assert result.resolved is True
     assert result.status == "invalid_plan"
@@ -258,7 +265,7 @@ def test_go_triggers_match_expected_phrases():
 
 def test_dispatch_result_is_waiting_not_completed(store, monkeypatch):
     raw = compile_execution_plan(_plan(_slice("a")))
-    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws")
+    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws", baseline_fingerprint="base")
     store.approve_plan(plan_id)
 
     monkeypatch.setattr(
@@ -274,9 +281,11 @@ def test_dispatch_result_is_waiting_not_completed(store, monkeypatch):
         "go",
         session_id="s1",
         workspace="/tmp/ws",
+        baseline_fingerprint="base",
         parent_agent=SimpleNamespace(),
         config=_enabled_config(),
         store=store,
+        delegate=lambda **kwargs: json.dumps({"status": "dispatched", "delegation_id": "d"}),
     )
     assert result.status == "waiting"
     row = store.get_plan(plan_id)
@@ -285,7 +294,7 @@ def test_dispatch_result_is_waiting_not_completed(store, monkeypatch):
 
 def test_two_independent_slices_dispatch_once(store, monkeypatch):
     raw = compile_execution_plan(_plan(_slice("a"), _slice("b")))
-    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws")
+    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws", baseline_fingerprint="base")
     store.approve_plan(plan_id)
 
     calls = []
@@ -304,9 +313,11 @@ def test_two_independent_slices_dispatch_once(store, monkeypatch):
         "go",
         session_id="s1",
         workspace="/tmp/ws",
+        baseline_fingerprint="base",
         parent_agent=SimpleNamespace(),
         config=_enabled_config(),
         store=store,
+        delegate=fake_delegate_task,
     )
     assert result.resolved is True
     assert result.delegation_id == "d2"
@@ -317,7 +328,7 @@ def test_two_independent_slices_dispatch_once(store, monkeypatch):
 
 def test_non_dispatched_delegate_result_fails_closed(store, monkeypatch):
     raw = compile_execution_plan(_plan(_slice("a")))
-    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws")
+    plan_id = store.create_plan("do x", raw, session_id="s1", workspace="/tmp/ws", baseline_fingerprint="base")
     store.approve_plan(plan_id)
 
     monkeypatch.setattr(
@@ -333,9 +344,11 @@ def test_non_dispatched_delegate_result_fails_closed(store, monkeypatch):
         "go",
         session_id="s1",
         workspace="/tmp/ws",
+        baseline_fingerprint="base",
         parent_agent=SimpleNamespace(),
         config=_enabled_config(),
         store=store,
+        delegate=lambda **kwargs: json.dumps({"results": [], "total_duration_seconds": 0}),
     )
     assert result.resolved is True
     assert result.status == "dispatch_failed"

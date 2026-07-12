@@ -12380,6 +12380,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         result = _go_result.to_agent_result(
                             conversation_history=self.conversation_history[:-1],
                             user_message=message,
+                            host_agent=self.agent,
                         )
                     else:
                         try:
@@ -12408,6 +12409,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             session_id=str(getattr(self, "session_id", "") or ""),
                             profile=str(os.environ.get("HERMES_PROFILE") or ""),
                             workspace=os.getcwd(),
+                            host_agent=self.agent,
                         )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}

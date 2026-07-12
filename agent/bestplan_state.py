@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import threading
 import time
@@ -58,6 +59,10 @@ class BestplanError(ValueError):
     """Raised when an envelope, state transition, or route is unsafe."""
 
 
+class BaselineFingerprintError(BestplanError):
+    """Raised when the host cannot compute a strong workspace baseline."""
+
+
 @dataclass(frozen=True)
 class PlanCapture:
     executable: bool
@@ -86,6 +91,12 @@ class ResolvedGo:
                 f"{self.delegation_id or '(pending id)'}. Status: waiting for "
                 "independent completion evidence."
             )
+        if self.status in {"possibly_dispatched", "dispatch_in_flight"}:
+            return (
+                f"Plan {self.plan_id} may already be active as delegation "
+                f"{self.delegation_id or '(identity persisted)'}. The dispatch outcome "
+                "is unknown/possibly dispatched; retry is idempotent and will reconcile it."
+            )
         return f"Plan execution was not started ({self.status}): {self.reason or self.error or 'fail-closed'}"
 
     def to_dict(self) -> dict[str, Any]:
@@ -104,11 +115,19 @@ class ResolvedGo:
         *,
         conversation_history: list[dict[str, Any]],
         user_message: str,
+        host_agent: Any = None,
     ) -> dict[str, Any]:
         """Build a terminal host result without entering the model loop."""
         messages = [dict(item) for item in conversation_history]
         messages.append({"role": "user", "content": user_message})
         messages.append({"role": "assistant", "content": self.response})
+        if host_agent is not None:
+            from agent.agent_runtime_helpers import repair_message_sequence
+
+            repair_message_sequence(host_agent, messages)
+            persist = getattr(host_agent, "_persist_session", None)
+            if callable(persist):
+                persist(messages, conversation_history)
         return {
             "final_response": self.response,
             "messages": messages,
@@ -145,6 +164,35 @@ def compute_baseline_fingerprint(workspace: str) -> str:
             ["git", "ls-files", "--others", "--exclude-standard", "-z"],
             cwd=root, capture_output=True, timeout=10, check=True,
         ).stdout
+        # Git intentionally omits sockets/FIFOs/devices from its untracked
+        # listing.  Walk only to reject those unsafe baseline inputs (regular
+        # ignored files remain outside the Git baseline by design).
+        scanned = 0
+        deadline = time.monotonic() + 10
+        for current, dirnames, filenames in os.walk(
+            workspace,
+            topdown=True,
+            followlinks=False,
+            onerror=lambda exc: (_ for _ in ()).throw(exc),
+        ):
+            if time.monotonic() > deadline:
+                raise BaselineFingerprintError("workspace special-file scan timed out")
+            if Path(current).resolve() == Path(root).resolve():
+                dirnames[:] = [name for name in dirnames if name != ".git"]
+            for name in [*dirnames, *filenames]:
+                scanned += 1
+                if scanned > 100_000:
+                    raise BaselineFingerprintError("workspace special-file scan exceeded 100000 entries")
+                candidate = Path(current) / name
+                mode = candidate.lstat().st_mode
+                if not (
+                    stat.S_ISREG(mode)
+                    or stat.S_ISDIR(mode)
+                    or stat.S_ISLNK(mode)
+                ):
+                    raise BaselineFingerprintError(
+                        f"workspace contains special file: {candidate.relative_to(workspace)}"
+                    )
         digest = hashlib.sha256()
         digest.update(f"git:{root}\n{head}\n".encode())
         digest.update(tracked_diff)
@@ -157,11 +205,19 @@ def compute_baseline_fingerprint(workspace: str) -> str:
             if path.is_symlink():
                 digest.update(os.fsencode(os.readlink(path)))
             else:
+                mode = path.lstat().st_mode
+                if not stat.S_ISREG(mode):
+                    raise BaselineFingerprintError(
+                        f"untracked special file cannot be fingerprinted: {relative}"
+                    )
                 digest.update(path.read_bytes())
         return digest.hexdigest()
-    except Exception:
-        payload = f"path:{workspace}"
-    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+    except BaselineFingerprintError:
+        raise
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        raise BaselineFingerprintError(
+            f"strong git baseline unavailable for {workspace}: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _manifest_digest(manifest: dict[str, Any]) -> str:
@@ -193,11 +249,39 @@ def _extract_envelope(response: str) -> tuple[str, ExecutionPlan, dict[str, Any]
     return raw_envelope, plan, plan.to_manifest()
 
 
-def _v1_plan_constraints(plan: ExecutionPlan) -> None:
+def _validated_write_lease(workspace: str, lease: str) -> str:
+    raw = str(lease or "").strip()
+    if not raw:
+        raise BestplanError("V1 implementation requires a nonempty write lease")
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        raise BestplanError(f"write lease must be relative to workspace: {raw}")
+    if any(part == ".." for part in candidate.parts):
+        raise BestplanError(f"write lease traversal is forbidden: {raw}")
+    root = Path(workspace).resolve()
+    resolved = (root / candidate).resolve()
+    if resolved != root and root not in resolved.parents:
+        raise BestplanError(f"write lease escapes workspace: {raw}")
+    return candidate.as_posix()
+
+
+def _v1_plan_constraints(plan: ExecutionPlan, *, workspace: Optional[str] = None) -> None:
     if len(plan.slices) > _MAX_V1_SLICES:
         raise BestplanError(f"V1 supports at most {_MAX_V1_SLICES} slices; got {len(plan.slices)}")
     if len(plan.dependency_waves) != 1:
         raise BestplanError("V1 supports only one independent wave; dependencies are not allowed")
+    canonical_workspace = _canonical_workspace(workspace) if workspace is not None else None
+    kinds = {item.kind for item in plan.slices}
+    if kinds == {"review"}:
+        if plan.mode != "sota":
+            raise BestplanError("V1 review-only manifest requires mode=sota")
+        if plan.risk != "high":
+            raise BestplanError("V1 review-only manifest requires risk=high")
+    elif kinds == {"implement"}:
+        if plan.mode != "delegate":
+            raise BestplanError("V1 implementation manifest requires mode=delegate")
+    else:
+        raise BestplanError("V1 cannot mix implementation and review slices")
     for item in plan.slices:
         if item.depends_on:
             raise BestplanError(f"V1 slice {item.id} has dependencies")
@@ -205,10 +289,28 @@ def _v1_plan_constraints(plan: ExecutionPlan) -> None:
             raise BestplanError(
                 f"V1 cannot route slice {item.id} (kind={item.kind}, capability={item.capability})"
             )
+        if canonical_workspace is not None and _canonical_workspace(item.workspace or "") != canonical_workspace:
+            raise BestplanError(
+                f"V1 slice {item.id} workspace must equal captured workspace {canonical_workspace}"
+            )
+        if item.kind == "implement":
+            if item.read_only:
+                raise BestplanError(f"V1 implementation slice {item.id} requires read_only=false")
+            if not item.allowed_paths:
+                raise BestplanError(f"V1 implementation slice {item.id} requires a nonempty write lease")
+            for lease in item.allowed_paths:
+                _validated_write_lease(canonical_workspace or _canonical_workspace(item.workspace), lease)
+        else:
+            if item.capability != "frontier_review" or not item.read_only:
+                raise BestplanError(
+                    f"V1 review slice {item.id} requires frontier_review/read_only=true"
+                )
 
 
-def _plan_to_delegate_tasks(plan: ExecutionPlan) -> list[dict[str, Any]]:
-    _v1_plan_constraints(plan)
+def _plan_to_delegate_tasks(
+    plan: ExecutionPlan, *, workspace: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    _v1_plan_constraints(plan, workspace=workspace)
     tasks = []
     for item in plan.slices:
         tasks.append({
@@ -222,8 +324,36 @@ def _plan_to_delegate_tasks(plan: ExecutionPlan) -> list[dict[str, Any]]:
             ]),
             "route": _LANE_FOR_SLICE[(item.kind, item.capability)],
             "role": "leaf",
+            "_bestplan_read_only": item.read_only,
+            "_bestplan_leases": list(item.allowed_paths),
         })
     return tasks
+
+
+def _render_authoritative_manifest(
+    plan: ExecutionPlan, *, workspace: str, digest: str,
+) -> str:
+    lines = [
+        "Authoritative executable manifest (host-rendered):",
+        f"- digest={digest}",
+        f"- mode: {plan.mode}",
+        f"- risk: {plan.risk}",
+        f"- workspace: {_canonical_workspace(workspace)}",
+    ]
+    for item in plan.slices:
+        route = _LANE_FOR_SLICE[(item.kind, item.capability)]
+        leases = ", ".join(item.allowed_paths) if item.allowed_paths else "none (read-only)"
+        acceptance = "; ".join(item.acceptance)
+        lines.extend([
+            f"- slice {item.id}:",
+            f"  - route: {route}",
+            f"  - goal: {item.goal}",
+            f"  - kind/capability: {item.kind}/{item.capability}",
+            f"  - read_only: {str(item.read_only).lower()}",
+            f"  - write leases: {leases}",
+            f"  - acceptance: {acceptance}",
+        ])
+    return "\n".join(lines)
 
 
 _TABLE_SQL = """
@@ -247,7 +377,14 @@ CREATE TABLE IF NOT EXISTS bestplan_plans (
     completed_at REAL,
     delegation_ids_json TEXT,
     evidence_json TEXT,
-    error TEXT
+    error TEXT,
+    dispatch_id TEXT,
+    dispatch_state TEXT,
+    resolved_runtime_json TEXT,
+    dispatch_owner TEXT,
+    dispatch_started_at REAL,
+    dispatch_updated_at REAL,
+    sandbox_workspace TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_bestplan_plans_session_state
     ON bestplan_plans(session_id, state);
@@ -272,6 +409,13 @@ class BestplanStore:
             self._owned_connection.execute("PRAGMA synchronous=FULL")
             self._owned_connection.executescript(_TABLE_SQL)
             self._owned_connection.commit()
+        self._ensure_schema()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._owned_connection is not None:
+                self._owned_connection.close()
+                self._owned_connection = None
 
     def _connection(self) -> sqlite3.Connection:
         if self._session_db is not None:
@@ -295,6 +439,31 @@ class BestplanStore:
             except Exception:
                 conn.rollback()
                 raise
+
+    def _ensure_schema(self) -> None:
+        columns = {
+            "dispatch_id": "TEXT",
+            "dispatch_state": "TEXT",
+            "resolved_runtime_json": "TEXT",
+            "dispatch_owner": "TEXT",
+            "dispatch_started_at": "REAL",
+            "dispatch_updated_at": "REAL",
+            "sandbox_workspace": "TEXT",
+        }
+
+        def migrate(conn):
+            conn.executescript(_TABLE_SQL)
+            existing = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(bestplan_plans)")
+            }
+            for name, sql_type in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE bestplan_plans ADD COLUMN {name} {sql_type}")
+
+        self._execute_write(migrate)
+
+    def _read_lock(self):
+        return getattr(self._session_db, "_lock", self._lock)
 
     def create_plan(
         self,
@@ -344,7 +513,7 @@ class BestplanStore:
         return plan_id
 
     def get_plan(self, plan_id: str) -> Optional[dict[str, Any]]:
-        with self._lock:
+        with self._read_lock():
             row = self._connection().execute(
                 "SELECT * FROM bestplan_plans WHERE plan_id = ?", (plan_id,),
             ).fetchone()
@@ -357,7 +526,7 @@ class BestplanStore:
             sql += " AND state IN (?, ?, ?, ?)"
             params.extend(_OPEN_STATES)
         sql += " ORDER BY created_at DESC"
-        with self._lock:
+        with self._read_lock():
             rows = self._connection().execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
@@ -455,11 +624,144 @@ class BestplanStore:
             ).fetchone())
         return self._execute_write(claim)
 
-    def record_dispatch(self, plan_id: str, *, delegation_ids: list[str]) -> bool:
+    def prepare_dispatch_intent(
+        self,
+        plan_id: str,
+        baseline_fingerprint: str,
+        *,
+        resolved_runtimes: list[dict[str, Any]],
+        session_id: str,
+        profile: str,
+        workspace: str,
+    ) -> Optional[dict[str, Any]]:
+        """Atomically approve and persist the deterministic dispatch outbox."""
+        dispatch_id = f"bestplan-{plan_id}"
+        safe_runtimes = [
+            {
+                key: value for key, value in runtime.items()
+                if key not in {"api_key", "credential", "token", "secret"}
+            }
+            for runtime in resolved_runtimes
+        ]
+
+        def prepare(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=?", (plan_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["state"] == PlanState.RUNNING and row["dispatch_state"] in {
+                "intent", "unknown", "dispatching",
+            }:
+                return dict(row)
+            if row["state"] not in (PlanState.PENDING, PlanState.APPROVED):
+                return None
+            if (
+                row["session_id"] != str(session_id)
+                or row["profile"] != str(profile)
+                or row["workspace"] != _canonical_workspace(workspace)
+                or row["baseline_fingerprint"] != baseline_fingerprint
+            ):
+                return None
+            try:
+                _raw, plan, raw_manifest = _extract_envelope(row["raw_plan_json"])
+                _v1_plan_constraints(plan, workspace=workspace)
+                stored_manifest = compile_execution_plan(
+                    json.loads(row["validated_manifest_json"])
+                ).to_manifest()
+            except Exception:
+                return None
+            digest = _manifest_digest(stored_manifest)
+            if raw_manifest != stored_manifest or row["approval_digest"] != digest:
+                return None
+            now = time.time()
+            changed = conn.execute(
+                """UPDATE bestplan_plans SET state=?, approved_at=COALESCE(approved_at, ?),
+                   approved_by=COALESCE(approved_by, 'user:bare-go'), started_at=?,
+                   dispatch_id=?, dispatch_state='intent', resolved_runtime_json=?,
+                   delegation_ids_json=?, dispatch_updated_at=?, error=NULL
+                   WHERE plan_id=? AND state IN (?, ?)""",
+                (
+                    PlanState.RUNNING, now, now, dispatch_id,
+                    json.dumps(safe_runtimes, sort_keys=True),
+                    json.dumps([dispatch_id]), now, plan_id,
+                    PlanState.PENDING, PlanState.APPROVED,
+                ),
+            ).rowcount
+            if changed != 1:
+                return None
+            return dict(conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=?", (plan_id,),
+            ).fetchone())
+
+        return self._execute_write(prepare)
+
+    def begin_dispatch_attempt(self, plan_id: str) -> bool:
+        now = time.time()
         return bool(self._execute_write(lambda conn: conn.execute(
-            "UPDATE bestplan_plans SET state=?, delegation_ids_json=? "
-            "WHERE plan_id=? AND state=?",
-            (PlanState.WAITING, json.dumps(delegation_ids), plan_id, PlanState.RUNNING),
+            """UPDATE bestplan_plans SET dispatch_state='dispatching',
+               dispatch_owner=?, dispatch_started_at=?, dispatch_updated_at=?
+               WHERE plan_id=? AND state=? AND dispatch_state IN ('intent', 'unknown')""",
+            (f"pid:{os.getpid()}", now, now, plan_id, PlanState.RUNNING),
+        ).rowcount))
+
+    def record_dispatch_unknown(self, plan_id: str, error: str) -> bool:
+        return bool(self._execute_write(lambda conn: conn.execute(
+            """UPDATE bestplan_plans SET dispatch_state='unknown', error=?,
+               dispatch_updated_at=? WHERE plan_id=? AND state=?
+               AND dispatch_state='dispatching'""",
+            (str(error), time.time(), plan_id, PlanState.RUNNING),
+        ).rowcount))
+
+    def recover_dead_dispatch_owners(self) -> int:
+        def recover(conn):
+            rows = conn.execute(
+                "SELECT plan_id, dispatch_owner FROM bestplan_plans "
+                "WHERE state=? AND dispatch_state='dispatching'",
+                (PlanState.RUNNING,),
+            ).fetchall()
+            changed = 0
+            for row in rows:
+                owner = str(row["dispatch_owner"] or "")
+                if not owner.startswith("pid:"):
+                    continue
+                try:
+                    pid = int(owner.split(":", 1)[1])
+                    os.kill(pid, 0)
+                    live = True
+                except ProcessLookupError:
+                    live = False
+                except (PermissionError, ValueError):
+                    live = True
+                if live:
+                    continue
+                changed += conn.execute(
+                    """UPDATE bestplan_plans SET dispatch_state='unknown',
+                       dispatch_updated_at=?, error='recovered_dead_dispatch_owner'
+                       WHERE plan_id=? AND dispatch_state='dispatching'
+                       AND dispatch_owner=?""",
+                    (time.time(), row["plan_id"], owner),
+                ).rowcount
+            return changed
+
+        return int(self._execute_write(recover))
+
+    def record_dispatch(
+        self,
+        plan_id: str,
+        *,
+        delegation_ids: list[str],
+        sandbox_workspace: str = "",
+    ) -> bool:
+        return bool(self._execute_write(lambda conn: conn.execute(
+            """UPDATE bestplan_plans SET state=?, delegation_ids_json=?,
+               dispatch_state='dispatched', dispatch_updated_at=?, error=NULL,
+               sandbox_workspace=?
+               WHERE plan_id=? AND state=? AND dispatch_state='dispatching'""",
+            (
+                PlanState.WAITING, json.dumps(delegation_ids), time.time(),
+                str(sandbox_workspace or ""), plan_id, PlanState.RUNNING,
+            ),
         ).rowcount))
 
     def record_dispatch_failure(self, plan_id: str, error: str) -> bool:
@@ -467,6 +769,14 @@ class BestplanStore:
             "UPDATE bestplan_plans SET state=?, error=?, completed_at=? "
             "WHERE plan_id=? AND state=?",
             (PlanState.FAILED, str(error), time.time(), plan_id, PlanState.RUNNING),
+        ).rowcount))
+
+    def record_dispatch_deferred(self, plan_id: str, error: str) -> bool:
+        return bool(self._execute_write(lambda conn: conn.execute(
+            """UPDATE bestplan_plans SET dispatch_state='intent', error=?,
+               dispatch_updated_at=? WHERE plan_id=? AND state=?
+               AND dispatch_state='dispatching'""",
+            (str(error), time.time(), plan_id, PlanState.RUNNING),
         ).rowcount))
 
     def mark_completed_unverified(self, plan_id: str, evidence: dict[str, Any]) -> bool:
@@ -495,24 +805,37 @@ def capture_bestplan_response(
     """Validate and persist the explicit envelope in a /bestplan response."""
     try:
         raw_envelope, plan, manifest = _extract_envelope(response)
-        _v1_plan_constraints(plan)
+        _v1_plan_constraints(plan, workspace=workspace)
     except BestplanError as exc:
         suffix = (
             "\n\n[Bestplan status: non-executable — the response did not contain "
             f"one valid machine envelope ({exc}).]"
         )
         return PlanCapture(False, str(response or "") + suffix, error=str(exc))
-    store = store or BestplanStore()
-    plan_id = store.create_plan(
-        "", plan, session_id=session_id, profile=profile, workspace=workspace,
-        baseline_fingerprint=baseline_fingerprint, raw_envelope=raw_envelope,
-    )
     digest = _manifest_digest(manifest)
-    suffix = (
-        f"\n\n[Bestplan executable receipt: {plan_id}; digest={digest}. "
-        "Reply with bare `go` to approve and dispatch exactly this plan.]"
+    try:
+        store = store or BestplanStore()
+        plan_id = store.create_plan(
+            "", plan, session_id=session_id, profile=profile, workspace=workspace,
+            baseline_fingerprint=baseline_fingerprint, raw_envelope=raw_envelope,
+        )
+    except BaselineFingerprintError as exc:
+        visible = _ENVELOPE_RE.sub("", str(response or "")).strip()
+        suffix = f"\n\n[Bestplan status: non-executable — {exc}.]"
+        return PlanCapture(False, visible + suffix, error=str(exc))
+    advisory = _ENVELOPE_RE.sub("", str(response or "")).strip()
+    authority = _render_authoritative_manifest(
+        plan, workspace=workspace, digest=digest,
     )
-    return PlanCapture(True, str(response or "") + suffix, plan_id=plan_id, digest=digest)
+    parts = []
+    if advisory:
+        parts.append("Model commentary (advisory only):\n" + advisory)
+    parts.append(authority)
+    parts.append(
+        f"Bestplan executable receipt: {plan_id}. "
+        "Reply with bare `go` to approve and dispatch exactly this host-rendered manifest."
+    )
+    return PlanCapture(True, "\n\n".join(parts), plan_id=plan_id, digest=digest)
 
 
 def is_bestplan_invocation(message: Any) -> bool:
@@ -539,6 +862,7 @@ def capture_bestplan_agent_result(
     profile: str = "",
     baseline_fingerprint: Optional[str] = None,
     store: Optional[BestplanStore] = None,
+    host_agent: Any = None,
 ) -> dict[str, Any]:
     """Attach the host-validated executable receipt to a planning result."""
     if not is_bestplan_invocation(invocation_message) or not isinstance(result, dict):
@@ -568,6 +892,12 @@ def capture_bestplan_agent_result(
         "digest": capture.digest,
         "error": capture.error,
     }
+    if host_agent is not None:
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        repair_message_sequence(host_agent, messages)
+        if callable(getattr(host_agent, "_persist_session", None)):
+            host_agent._persist_session(messages, None)
     return updated
 
 
@@ -583,6 +913,11 @@ def _load_config() -> dict[str, Any]:
 def is_go_enabled(config: Optional[dict[str, Any]] = None) -> bool:
     cfg = config if config is not None else _load_config()
     return bool((cfg.get("autonomy") or {}).get("go_enabled"))
+
+
+def recover_bestplan_dispatch_outbox(store: Optional[BestplanStore] = None) -> int:
+    """Reconcile only dispatch attempts proven to belong to a dead process."""
+    return (store or BestplanStore()).recover_dead_dispatch_owners()
 
 
 def _configured_lane_error(tasks: list[dict[str, Any]], config: dict[str, Any]) -> Optional[str]:
@@ -628,6 +963,8 @@ def try_resolve_go(
     config: Optional[dict[str, Any]] = None,
     store: Optional[BestplanStore] = None,
     delegate: Optional[Callable[..., Any]] = None,
+    runtime_resolver: Optional[Callable[[list[dict[str, Any]], Any], list[dict[str, Any]]]] = None,
+    strict_dispatcher: Optional[Callable[..., Any]] = None,
 ) -> ResolvedGo:
     """Resolve bare ``go`` before the model loop, failing closed around a plan."""
     cfg = config if config is not None else _load_config()
@@ -637,6 +974,7 @@ def try_resolve_go(
         return ResolvedGo(False, "not_a_trigger", reason="only bare go is recognized")
 
     store = store or BestplanStore()
+    recover_bestplan_dispatch_outbox(store)
     candidates = store.list_for_session(session_id)
     if not candidates:
         return ResolvedGo(False, "no_plan", reason="no pending plan exists for this session")
@@ -659,7 +997,7 @@ def try_resolve_go(
 
     candidate = exact[0]
     plan_id = candidate["plan_id"]
-    if candidate["state"] in (PlanState.RUNNING, PlanState.WAITING):
+    if candidate["state"] == PlanState.WAITING:
         return ResolvedGo(True, "already_claimed", plan_id=plan_id, reason="plan was already dispatched")
 
     try:
@@ -671,13 +1009,10 @@ def try_resolve_go(
             raise BestplanError("raw envelope and validated manifest differ")
         if candidate["approval_digest"] != _manifest_digest(stored_manifest):
             raise BestplanError("approval digest does not match manifest")
-        tasks = _plan_to_delegate_tasks(plan)
+        tasks = _plan_to_delegate_tasks(plan, workspace=expected_workspace)
     except Exception as exc:
         return ResolvedGo(True, "invalid_plan", plan_id=plan_id, reason=str(exc), error=str(exc))
 
-    lane_error = _configured_lane_error(tasks, cfg)
-    if lane_error:
-        return ResolvedGo(True, "lane_unavailable", plan_id=plan_id, reason=lane_error)
     if parent_agent is None:
         return ResolvedGo(True, "dispatch_unavailable", plan_id=plan_id, reason="live parent agent is required")
     try:
@@ -687,28 +1022,115 @@ def try_resolve_go(
     except Exception:
         return ResolvedGo(True, "async_context_error", plan_id=plan_id, reason="delivery capability could not be verified")
 
-    claimed = store.atomic_claim_approved(
-        plan_id, baseline, session_id=session_id, profile=expected_profile,
-        workspace=expected_workspace,
-    )
-    if claimed is None:
-        return ResolvedGo(True, "already_claimed", plan_id=plan_id, reason="atomic claim lost or validation changed")
+    resolved_runtimes: list[dict[str, Any]]
+    if candidate["state"] == PlanState.RUNNING:
+        dispatch_id = str(candidate.get("dispatch_id") or f"bestplan-{plan_id}")
+        if candidate.get("dispatch_state") == "dispatching":
+            return ResolvedGo(
+                True, "dispatch_in_flight", plan_id=plan_id,
+                delegation_id=dispatch_id,
+                reason="another idempotent dispatch attempt owns the durable intent",
+            )
+        try:
+            stored_runtimes = json.loads(candidate.get("resolved_runtime_json") or "[]")
+        except Exception:
+            stored_runtimes = []
+        if runtime_resolver is None:
+            try:
+                from tools.delegate_tool import resolve_bestplan_runtime_specs
+                resolved_runtimes = resolve_bestplan_runtime_specs(
+                    tasks, parent_agent, expected=stored_runtimes,
+                )
+            except Exception as exc:
+                return ResolvedGo(True, "lane_unavailable", plan_id=plan_id, reason=str(exc))
+        else:
+            resolved_runtimes = runtime_resolver(tasks, parent_agent)
+    else:
+        if runtime_resolver is None and delegate is not None:
+            lane_error = _configured_lane_error(tasks, cfg)
+            if lane_error:
+                return ResolvedGo(True, "lane_unavailable", plan_id=plan_id, reason=lane_error)
+            lanes = ((cfg.get("delegation") or {}).get("lanes") or {})
+            resolved_runtimes = [
+                {
+                    "route": task["route"],
+                    "provider": lanes[task["route"]]["provider"],
+                    "model": lanes[task["route"]]["model"],
+                }
+                for task in tasks
+            ]
+        else:
+            try:
+                if runtime_resolver is None:
+                    from tools.delegate_tool import resolve_bestplan_runtime_specs
+                    resolved_runtimes = resolve_bestplan_runtime_specs(tasks, parent_agent)
+                else:
+                    resolved_runtimes = runtime_resolver(tasks, parent_agent)
+            except Exception as exc:
+                return ResolvedGo(True, "lane_unavailable", plan_id=plan_id, reason=str(exc))
+        claimed = store.prepare_dispatch_intent(
+            plan_id, baseline, resolved_runtimes=resolved_runtimes,
+            session_id=session_id, profile=expected_profile, workspace=expected_workspace,
+        )
+        if claimed is None:
+            return ResolvedGo(True, "already_claimed", plan_id=plan_id, reason="atomic intent claim lost or validation changed")
+        candidate = claimed
 
-    if delegate is None:
-        from tools.delegate_tool import delegate_task
-        delegate = delegate_task
+    dispatch_id = str(candidate.get("dispatch_id") or f"bestplan-{plan_id}")
+    if not store.begin_dispatch_attempt(plan_id):
+        row = store.get_plan(plan_id) or {}
+        if row.get("state") == PlanState.WAITING:
+            return ResolvedGo(True, "already_claimed", plan_id=plan_id, delegation_id=dispatch_id)
+        return ResolvedGo(
+            True, "dispatch_in_flight", plan_id=plan_id, delegation_id=dispatch_id,
+            reason="durable dispatch attempt already owned",
+        )
+
+    if strict_dispatcher is None:
+        if delegate is not None:
+            strict_dispatcher = lambda **kwargs: delegate(
+                tasks=kwargs["tasks"], parent_agent=kwargs["parent_agent"], background=True,
+            )
+        else:
+            from tools.delegate_tool import dispatch_bestplan_tasks_async
+            strict_dispatcher = dispatch_bestplan_tasks_async
     try:
-        raw_result = delegate(tasks=tasks, parent_agent=parent_agent, background=True)
+        raw_result = strict_dispatcher(
+            tasks=tasks,
+            parent_agent=parent_agent,
+            dispatch_id=dispatch_id,
+            plan_id=plan_id,
+            workspace=expected_workspace,
+            resolved_runtimes=resolved_runtimes,
+        )
         result = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
         if not isinstance(result, dict) or result.get("status") != "dispatched":
-            raise BestplanError(str((result or {}).get("error") if isinstance(result, dict) else result))
+            error = str((result or {}).get("error") if isinstance(result, dict) else result)
+            if isinstance(result, dict) and result.get("status") == "rejected":
+                store.record_dispatch_deferred(plan_id, error)
+                return ResolvedGo(
+                    True, "dispatch_deferred", plan_id=plan_id,
+                    delegation_id=dispatch_id, reason=error,
+                )
+            store.record_dispatch_failure(plan_id, error)
+            return ResolvedGo(
+                True, "dispatch_failed", plan_id=plan_id,
+                delegation_id=dispatch_id, reason=error, error=error,
+            )
         delegation_ids = _delegation_ids(result)
         if not delegation_ids:
             raise BestplanError("delegate_task returned no delegation id")
     except Exception as exc:
-        store.record_dispatch_failure(plan_id, str(exc))
-        return ResolvedGo(True, "dispatch_failed", plan_id=plan_id, reason=str(exc), error=str(exc))
+        store.record_dispatch_unknown(plan_id, str(exc))
+        return ResolvedGo(
+            True, "possibly_dispatched", plan_id=plan_id,
+            delegation_id=dispatch_id, reason=str(exc), error=str(exc),
+        )
 
-    if not store.record_dispatch(plan_id, delegation_ids=delegation_ids):
+    if not store.record_dispatch(
+        plan_id,
+        delegation_ids=delegation_ids,
+        sandbox_workspace=str(result.get("sandbox_workspace") or ""),
+    ):
         return ResolvedGo(True, "dispatch_state_error", plan_id=plan_id, reason="delegation id was not persisted")
     return ResolvedGo(True, "waiting", plan_id=plan_id, delegation_id=delegation_ids[0])

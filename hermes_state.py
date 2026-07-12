@@ -829,7 +829,14 @@ CREATE TABLE IF NOT EXISTS bestplan_plans (
     completed_at REAL,
     delegation_ids_json TEXT,
     evidence_json TEXT,
-    error TEXT
+    error TEXT,
+    dispatch_id TEXT,
+    dispatch_state TEXT,
+    resolved_runtime_json TEXT,
+    dispatch_owner TEXT,
+    dispatch_started_at REAL,
+    dispatch_updated_at REAL,
+    sandbox_workspace TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_bestplan_plans_session_state ON bestplan_plans(session_id, state);
