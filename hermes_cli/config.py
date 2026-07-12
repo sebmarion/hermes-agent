@@ -2217,6 +2217,7 @@ DEFAULT_CONFIG = {
         "mode": "shadow",
         "execution_enabled": False,
         "planner_timeout_seconds": 30,
+        "go_enabled": False,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

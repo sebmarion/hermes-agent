@@ -135,6 +135,28 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/<skill-name>` | Load any installed skill as an on-demand command. Example: `/gif-search`, `/github-pr-workflow`, `/excalidraw`. |
 | `/skills ...` | Search, browse, inspect, install, audit, publish, and configure skills from registries and the official optional-skills catalog. |
 
+#### Executing an approved `/bestplan` with `go`
+
+`/bestplan` remains an installed dynamic skill rather than a built-in command. A
+bestplan response is executable only when it contains the validated
+`HERMES_BESTPLAN_V1` machine envelope emitted by that skill. After reviewing
+such a plan, a bare `go` atomically claims the one plan bound to the current
+session, profile, workspace, and Git baseline, then delegates each step through
+the configured `code_worker` or `smart_reviewer` lane. Invalid, changed, or
+ambiguous plans fail closed; ordinary conversational uses of “go” still reach
+the model when no pending plan exists.
+
+This host-side execution path is off by default. Enable it with exactly:
+
+```bash
+hermes config set autonomy.go_enabled true
+```
+
+Before enabling it, configure `delegation.lanes.code_worker.provider` and
+`.model` for implementation plans, and
+`delegation.lanes.smart_reviewer.provider` and `.model` for review plans. A
+missing required lane fails before the plan is claimed or dispatched.
+
 ### Quick Commands
 
 User-defined quick commands map a short slash command to either a shell command or another slash command. Configure them in `~/.hermes/config.yaml`:

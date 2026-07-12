@@ -150,6 +150,32 @@ class ExecutionPlan:
     escalation_predicates: tuple[str, ...]
     dependency_waves: tuple[tuple[str, ...], ...]
 
+    def to_manifest(self) -> dict[str, Any]:
+        """Return a canonical serializable manifest for signing/ persistence."""
+        return {
+            "version": self.version,
+            "mode": self.mode,
+            "risk": self.risk,
+            "slices": [
+                {
+                    "id": s.id,
+                    "kind": s.kind,
+                    "goal": s.goal,
+                    "depends_on": list(s.depends_on),
+                    "capability": s.capability,
+                    "workspace": s.workspace,
+                    "allowed_paths": list(s.allowed_paths),
+                    "read_only": s.read_only,
+                    "expected_artifacts": list(s.expected_artifacts),
+                    "acceptance": list(s.acceptance),
+                }
+                for s in self.slices
+            ],
+            "merge_policy": self.merge_policy,
+            "stop_condition": self.stop_condition,
+            "escalation_predicates": list(self.escalation_predicates),
+        }
+
 
 def _mapping(value: Any, field: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):

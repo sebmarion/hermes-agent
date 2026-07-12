@@ -809,6 +809,33 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS bestplan_plans (
+    plan_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    session_id TEXT,
+    profile TEXT NOT NULL,
+    workspace TEXT NOT NULL,
+    baseline_revision TEXT,
+    baseline_fingerprint TEXT NOT NULL,
+    raw_request TEXT,
+    raw_plan_json TEXT NOT NULL,
+    validated_manifest_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    approved_at REAL,
+    approved_by TEXT,
+    approval_digest TEXT,
+    started_at REAL,
+    completed_at REAL,
+    delegation_ids_json TEXT,
+    evidence_json TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_bestplan_plans_session_state ON bestplan_plans(session_id, state);
+CREATE INDEX IF NOT EXISTS idx_bestplan_plans_profile_workspace_state ON bestplan_plans(profile, workspace, state);
+CREATE INDEX IF NOT EXISTS idx_bestplan_plans_created_at ON bestplan_plans(created_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);

@@ -36,7 +36,7 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Any
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -152,6 +152,42 @@ def set_current_session_id(session_id: str) -> None:
 
     os.environ["HERMES_SESSION_ID"] = session_id
     _SESSION_ID.set(session_id)
+
+
+def bind_delivery_context(
+    *,
+    session_key: str,
+    session_id: str,
+    ui_session_id: str = "",
+    async_delivery: bool,
+) -> tuple[tuple[ContextVar, Token], ...]:
+    """Bind only the context needed to route detached completions.
+
+    Unlike :func:`set_session_vars`, this helper deliberately leaves platform,
+    chat, user, message, profile, and cwd context untouched.  The returned
+    tokens are stack-scoped: pass them to :func:`reset_delivery_context` in a
+    ``finally`` block to restore the exact prior values, including ``_UNSET``.
+    """
+    global _session_context_engaged
+    _session_context_engaged = True
+    return (
+        (_SESSION_KEY, _SESSION_KEY.set(str(session_key or ""))),
+        (_SESSION_ID, _SESSION_ID.set(str(session_id or ""))),
+        (
+            _SESSION_UI_SESSION_ID,
+            _SESSION_UI_SESSION_ID.set(str(ui_session_id or "")),
+        ),
+        (
+            _SESSION_ASYNC_DELIVERY,
+            _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        ),
+    )
+
+
+def reset_delivery_context(tokens: tuple[tuple[ContextVar, Token], ...]) -> None:
+    """Restore a binding returned by :func:`bind_delivery_context`."""
+    for var, token in reversed(tuple(tokens or ())):
+        var.reset(token)
 
 
 def set_session_vars(

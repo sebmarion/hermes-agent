@@ -12346,26 +12346,69 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 if _moa_cfg is None:
                     _moa_cfg = None
                 try:
-                    try:
-                        from agent.autonomy_shadow import submit_shadow_observation
+                    from agent.bestplan_state import (
+                        ResolvedGo,
+                        capture_bestplan_agent_result,
+                        is_go_enabled,
+                        try_resolve_go,
+                    )
 
-                        submit_shadow_observation(
+                    try:
+                        _go_result = try_resolve_go(
                             message,
                             session_id=str(getattr(self, "session_id", "") or ""),
-                            source="cli",
+                            profile=str(os.environ.get("HERMES_PROFILE") or ""),
                             workspace=os.getcwd(),
                             parent_agent=self.agent,
                         )
-                    except Exception as _shadow_exc:
-                        logging.debug("autonomy ingress failed open: %s", _shadow_exc)
-                    result = self.agent.run_conversation(
-                        user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
-                        stream_callback=stream_callback,
-                        task_id=self.session_id,
-                        persist_user_message=message if _voice_prefix else None,
-                        moa_config=_moa_cfg,
-                    )
+                    except Exception as _go_exc:
+                        if (
+                            isinstance(message, str)
+                            and message.strip().casefold() == "go"
+                            and is_go_enabled()
+                        ):
+                            _go_result = ResolvedGo(
+                                True,
+                                "resolver_error",
+                                reason="bestplan host resolver failed closed",
+                                error=str(_go_exc),
+                            )
+                        else:
+                            _go_result = None
+                        logging.exception("bestplan go resolver error")
+                    if _go_result is not None and _go_result.resolved:
+                        result = _go_result.to_agent_result(
+                            conversation_history=self.conversation_history[:-1],
+                            user_message=message,
+                        )
+                    else:
+                        try:
+                            from agent.autonomy_shadow import submit_shadow_observation
+
+                            submit_shadow_observation(
+                                message,
+                                session_id=str(getattr(self, "session_id", "") or ""),
+                                source="cli",
+                                workspace=os.getcwd(),
+                                parent_agent=self.agent,
+                            )
+                        except Exception as _shadow_exc:
+                            logging.debug("autonomy ingress failed open: %s", _shadow_exc)
+                        result = self.agent.run_conversation(
+                            user_message=agent_message,
+                            conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
+                            stream_callback=stream_callback,
+                            task_id=self.session_id,
+                            persist_user_message=message if _voice_prefix else None,
+                            moa_config=_moa_cfg,
+                        )
+                        result = capture_bestplan_agent_result(
+                            result,
+                            invocation_message=message,
+                            session_id=str(getattr(self, "session_id", "") or ""),
+                            profile=str(os.environ.get("HERMES_PROFILE") or ""),
+                            workspace=os.getcwd(),
+                        )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
