@@ -38,6 +38,31 @@ from tools.delegate_tool import (
 )
 
 
+_DEFAULT_DELEGATE_CONFIG = {
+    "provider": "custom:test-worker",
+    "model": "test-worker-model",
+    "base_url": "https://delegate.invalid/v1",
+    "api_key": "test-key",
+    "api_mode": "chat_completions",
+}
+_default_config_patcher = None
+
+
+def setUpModule():
+    """Keep unit tests independent from machine config with an explicit lane."""
+    global _default_config_patcher
+    _default_config_patcher = patch(
+        "tools.delegate_tool._load_config",
+        return_value=dict(_DEFAULT_DELEGATE_CONFIG),
+    )
+    _default_config_patcher.start()
+
+
+def tearDownModule():
+    if _default_config_patcher is not None:
+        _default_config_patcher.stop()
+
+
 def _make_mock_parent(depth=0):
     """Create a mock parent agent with the fields delegate_task expects."""
     parent = MagicMock()
@@ -399,7 +424,7 @@ class TestDelegateTask(unittest.TestCase):
             delegate_task(goal="Test tracking", parent_agent=parent)
             self.assertEqual(len(parent._active_children), 0)
 
-    def test_child_inherits_runtime_credentials(self):
+    def test_child_uses_dedicated_delegate_runtime_not_parent_runtime(self):
         parent = _make_mock_parent(depth=0)
         parent.base_url = "https://chatgpt.com/backend-api/codex"
         parent.api_key="***"
@@ -418,10 +443,10 @@ class TestDelegateTask(unittest.TestCase):
             delegate_task(goal="Test runtime inheritance", parent_agent=parent)
 
             _, kwargs = MockAgent.call_args
-            self.assertEqual(kwargs["base_url"], parent.base_url)
-            self.assertEqual(kwargs["api_key"], parent.api_key)
-            self.assertEqual(kwargs["provider"], parent.provider)
-            self.assertEqual(kwargs["api_mode"], parent.api_mode)
+            self.assertEqual(kwargs["base_url"], _DEFAULT_DELEGATE_CONFIG["base_url"])
+            self.assertEqual(kwargs["api_key"], _DEFAULT_DELEGATE_CONFIG["api_key"])
+            self.assertEqual(kwargs["provider"], "custom")
+            self.assertEqual(kwargs["api_mode"], _DEFAULT_DELEGATE_CONFIG["api_mode"])
 
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
@@ -704,6 +729,48 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["tool_trace"][0]["status"], "error")
 
+    def test_executor_exception_string_is_failed_tool_evidence(self):
+        """Canonical executor failures must never satisfy the evidence gate."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"terminal"}
+        child.run_conversation.return_value = {
+            "final_response": "Command finished.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 2,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-executor-error",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-executor-error",
+                    "content": (
+                        "Error executing tool 'terminal': "
+                        "thread did not return a result"
+                    ),
+                },
+            ],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Run command",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_kind"], "tool_execution_failed")
+        self.assertEqual(result["evidence"]["successful_tool_count"], 0)
+        self.assertEqual(result["tool_trace"][0]["status"], "error")
+
     def test_execution_delegate_with_successful_tool_result_completes(self):
         from tools.delegate_tool import _run_single_child
 
@@ -739,6 +806,70 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["tool_trace"][0]["status"], "ok")
+
+    def test_nonzero_terminal_exit_is_failed_tool_evidence(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"terminal"}
+        child.run_conversation.return_value = {
+            "final_response": "Command finished.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 2,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-failed",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-failed",
+                    "content": '{"output":"nope","exit_code":1,"error":null}',
+                },
+            ],
+        }
+
+        result = _run_single_child(0, "Run command", child, _make_mock_parent())
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_kind"], "tool_execution_failed")
+        self.assertEqual(result["evidence"]["successful_tool_count"], 0)
+
+    def test_iteration_exhaustion_cannot_masquerade_as_completion(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"read_file"}
+        child.run_conversation.return_value = {
+            "final_response": "Partial summary.",
+            "completed": False,
+            "interrupted": False,
+            "api_calls": 50,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-ok",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-ok",
+                    "content": '{"content":"evidence"}',
+                },
+            ],
+        }
+
+        result = _run_single_child(0, "Finish task", child, _make_mock_parent())
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["exit_reason"], "max_iterations")
+        self.assertEqual(result["failure_kind"], "incomplete")
 
     def test_reasoning_only_delegate_can_complete_without_tools(self):
         """Pure synthesis remains valid when the goal needs no external evidence."""
@@ -1884,17 +2015,8 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertIs(kwargs["provider_require_parameters"], False)
             self.assertEqual(kwargs["provider_data_collection"], "")
 
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_same_provider_inherits_all_routing_preferences(self, mock_creds, mock_cfg):
-        mock_cfg.return_value = {"max_iterations": 45}
-        mock_creds.return_value = {
-            "model": None,
-            "provider": None,
-            "base_url": None,
-            "api_key": None,
-            "api_mode": None,
-        }
+    def test_child_without_provider_override_inherits_all_routing_preferences(self):
+        """The helper preserves parent preferences only when no lane overrides provider."""
         parent = _make_mock_parent(depth=0)
         parent.provider = "nous"
         parent.providers_allowed = ["deepseek"]
@@ -1905,12 +2027,17 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         parent.provider_data_collection = "deny"
 
         with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            mock_child.run_conversation.return_value = {
-                "final_response": "done", "completed": True, "api_calls": 1
-            }
-            MockAgent.return_value = mock_child
-            delegate_task(goal="Keep routing", parent_agent=parent)
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Keep routing",
+                context=None,
+                toolsets=None,
+                model=parent.model,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
 
         _, kwargs = MockAgent.call_args
         self.assertEqual(kwargs["providers_allowed"], ["deepseek"])
@@ -1926,6 +2053,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         mock_cfg.return_value = {
             "max_iterations": 45,
             "model": "qwen2.5-coder",
+            "provider": "custom:local",
             "base_url": "http://localhost:1234/v1",
             "api_key": "local-key",
         }
@@ -1956,8 +2084,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_empty_config_inherits_parent(self, mock_creds, mock_cfg):
-        """When delegation config is empty, child inherits parent credentials."""
+    def test_empty_config_fails_without_inheriting_parent(self, mock_creds, mock_cfg):
         mock_cfg.return_value = {"max_iterations": 45, "model": "", "provider": ""}
         mock_creds.return_value = {
             "model": None,
@@ -1975,12 +2102,12 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Test inherit", parent_agent=parent)
+            result = json.loads(delegate_task(goal="Test inherit", parent_agent=parent))
 
-            _, kwargs = MockAgent.call_args
-            self.assertEqual(kwargs["model"], parent.model)
-            self.assertEqual(kwargs["provider"], parent.provider)
-            self.assertEqual(kwargs["base_url"], parent.base_url)
+            self.assertEqual(result["results"][0]["failure_kind"], "provider_error")
+            self.assertEqual(result["results"][0]["lane"], "code_worker")
+            MockAgent.assert_not_called()
+            mock_creds.assert_not_called()
 
     def test_inherit_parent_base_url_prefers_client_kwargs(self):
         parent = _make_mock_parent(depth=0)
@@ -2119,8 +2246,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
-    def test_model_only_no_provider_inherits_parent_credentials(self, mock_creds, mock_cfg):
-        """Setting only model (no provider) changes model but keeps parent credentials."""
+    def test_model_only_no_provider_fails_closed(self, mock_creds, mock_cfg):
         mock_cfg.return_value = {
             "max_iterations": 45,
             "model": "google/gemini-3-flash-preview",
@@ -2142,14 +2268,12 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Model only test", parent_agent=parent)
+            result = json.loads(delegate_task(goal="Model only test", parent_agent=parent))
 
-            _, kwargs = MockAgent.call_args
-            # Model should be overridden
-            self.assertEqual(kwargs["model"], "google/gemini-3-flash-preview")
-            # But provider/base_url/api_key should inherit from parent
-            self.assertEqual(kwargs["provider"], parent.provider)
-            self.assertEqual(kwargs["base_url"], parent.base_url)
+            self.assertEqual(result["results"][0]["failure_kind"], "provider_error")
+            self.assertEqual(result["results"][0]["lane"], "code_worker")
+            MockAgent.assert_not_called()
+            mock_creds.assert_not_called()
 
 
 class TestChildCredentialPoolResolution(unittest.TestCase):
@@ -2884,7 +3008,12 @@ class TestConcurrencyDefaults(unittest.TestCase):
                 "hermes_cli.config.load_config_readonly", return_value=active_config
             ):
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
-                self.assertEqual(_get_max_concurrent_children(), 50)
+                # setUpModule replaces the module-global loader for machine-config
+                # isolation. Restore the real loader for this accessor contract.
+                with patch(
+                    "tools.delegate_tool._load_config", side_effect=_load_config
+                ):
+                    self.assertEqual(_get_max_concurrent_children(), 50)
 
     def test_load_config_falls_back_to_cli_config_when_persistent_load_fails(self):
         fallback_cli = types.ModuleType("cli")
@@ -3033,7 +3162,7 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
+           return_value={"max_spawn_depth": 2, "provider": "test", "model": "test"})
     def _run_with_mock_child(self, role_arg, mock_cfg, mock_creds):
         mock_creds.return_value = {
             "provider": None, "base_url": None,
@@ -3126,7 +3255,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
+           return_value={"max_spawn_depth": 2, "provider": "test", "model": "test"})
     def test_orchestrator_role_keeps_delegation_at_depth_1(
         self, mock_cfg, mock_creds
     ):
@@ -3150,7 +3279,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
+           return_value={"max_spawn_depth": 2, "provider": "test", "model": "test"})
     def test_orchestrator_blocked_at_max_spawn_depth(
         self, mock_cfg, mock_creds
     ):
@@ -3171,7 +3300,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             self.assertEqual(mock_child._delegate_role, "leaf")
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._load_config", return_value={"provider": "test", "model": "test"})
     def test_orchestrator_blocked_at_default_flat_depth(
         self, mock_cfg, mock_creds
     ):
@@ -3204,7 +3333,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         parent = _make_mock_parent(depth=0)
         parent.enabled_toolsets = ["terminal", "delegation"]
         with patch("tools.delegate_tool._load_config",
-                   return_value={"orchestrator_enabled": False}):
+                   return_value={"orchestrator_enabled": False, "provider": "test", "model": "test"}):
             with patch("run_agent.AIAgent") as MockAgent:
                 mock_child = _make_role_mock_child()
                 MockAgent.return_value = mock_child
@@ -3257,7 +3386,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
+           return_value={"max_spawn_depth": 2, "provider": "test", "model": "test"})
     def test_batch_mode_per_task_role_override(self, mock_cfg, mock_creds):
         """Per-task role beats top-level; no top-level role → "leaf".
 
@@ -3293,7 +3422,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
+           return_value={"max_spawn_depth": 2, "provider": "test", "model": "test"})
     def test_intersection_preserves_delegation_bound(
         self, mock_cfg, mock_creds
     ):
@@ -3339,7 +3468,7 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
+           return_value={"max_spawn_depth": 2, "provider": "test", "model": "test"})
     def test_end_to_end_nested_orchestration(self, mock_cfg, mock_creds):
         mock_creds.return_value = {
             "provider": None, "base_url": None,

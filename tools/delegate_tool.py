@@ -307,7 +307,8 @@ def _looks_like_error_output(content: Any) -> bool:
       - structured JSON with an ``error`` key
       - structured JSON with ``success: false`` or ``ok: false``
       - structured JSON with ``status`` of error/failed
-      - first line starts with a classic error marker
+      - first line starts with a classic error marker or one of Hermes'
+        canonical tool-executor failure prefixes
     """
     content = _stringify_tool_content(content)
     if not content:
@@ -320,6 +321,13 @@ def _looks_like_error_output(content: Any) -> bool:
             if isinstance(parsed, dict):
                 if parsed.get("error"):
                     return True
+                for exit_key in ("exit_code", "returncode", "return_code"):
+                    if exit_key in parsed:
+                        try:
+                            if int(parsed[exit_key]) != 0:
+                                return True
+                        except (TypeError, ValueError):
+                            return True
                 for flag in ("success", "ok"):
                     if flag in parsed and parsed[flag] is False:
                         return True
@@ -332,7 +340,9 @@ def _looks_like_error_output(content: Any) -> bool:
     first = content.splitlines()[0].strip().lower() if content.splitlines() else ""
     return (
         first.startswith("error:")
+        or first.startswith("error executing tool")
         or first.startswith("failed:")
+        or first.startswith("tool execution failed:")
         or first.startswith("traceback ")
         or first.startswith("exception:")
     )
@@ -2160,10 +2170,7 @@ def _run_single_child(
             # evidence. An intent statement, rejected call, or all-error trace
             # is not completion.
             status = "failed"
-        elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output. exit_reason
-            # ("completed" vs "max_iterations") still tells the parent how the
-            # task ended; reasoning-only delegates may legitimately use no tools.
+        elif completed and summary and not _empty_sentinel:
             status = "completed"
         else:
             status = "failed"
@@ -2238,6 +2245,12 @@ def _run_single_child(
                     if any(item.get("status") == "error" for item in tool_trace)
                     else "no_tool_evidence"
                 )
+            elif summary and not completed:
+                entry["error"] = (
+                    "Subagent produced partial output but did not complete before "
+                    "its iteration limit."
+                )
+                entry["failure_kind"] = "incomplete"
             else:
                 entry["error"] = "Subagent did not produce a response."
                 entry["failure_kind"] = "provider_error"
@@ -2460,6 +2473,40 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _structured_delegate_failure(
+    message: str,
+    *,
+    task_index: int,
+    task: dict,
+    lane: Optional[str],
+    failure_kind: str,
+    credentials: Optional[dict] = None,
+) -> str:
+    """Return a serializable failure that preserves routing and evidence."""
+    mode = str(task.get("mode") or "execute").strip().lower()
+    if mode not in {"execute", "review", "reason"}:
+        mode = "execute"
+    mode_lanes = {
+        "execute": "code_worker",
+        "review": "smart_reviewer",
+        "reason": "local_worker",
+    }
+    credentials = credentials or {}
+    entry = {
+        "task_index": task_index,
+        "status": "failed",
+        "summary": None,
+        "error": str(message),
+        "failure_kind": failure_kind,
+        "mode": mode,
+        "lane": lane or str(task.get("route") or "").strip() or mode_lanes[mode],
+        "provider": credentials.get("provider"),
+        "routed_model": credentials.get("model"),
+        "evidence": {"tool_turn_count": 0, "successful_tool_count": 0},
+    }
+    return tool_error(message, results=[entry])
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2544,11 +2591,7 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     #
-    # Per-task lane routing: when delegation.lanes is configured, each task
-    # can resolve its own credentials via _resolve_delegation_credentials_for_task.
-    # Resolve the global fallback lazily so a broken fallback provider does not
-    # block tasks that explicitly route to a valid lane.
-    global_creds = None
+    # Every task resolves to a named lane before any child is constructed.
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2620,27 +2663,36 @@ def delegate_task(
     # This prevents task N's broken lane/toolset from leaving tasks 0..N-1
     # partially spawned.
     task_specs = []
-    for t in task_list:
+    for task_index, t in enumerate(task_list):
+        lane_name = None
+        task_creds = None
         try:
             lane_name = _resolve_lane_for_task(t, cfg)
-            if lane_name is not None:
-                task_creds = _resolve_delegation_credentials_for_task(
-                    cfg, parent_agent, t
-                )
-            else:
-                if global_creds is None:
-                    global_creds = _resolve_delegation_credentials(cfg, parent_agent)
-                task_creds = global_creds
+            task_creds = _resolve_delegation_credentials_for_task(
+                cfg, parent_agent, t
+            )
             lane_toolsets = _normalize_lane_toolsets(task_creds.get("toolsets"))
-            if lane_name is not None:
-                _preflight_lane_toolsets(
-                    parent_agent,
-                    lane_toolsets,
-                    lane=lane_name,
-                    mode=t["mode"],
-                )
-        except ValueError as exc:
-            return tool_error(str(exc))
+            _preflight_lane_toolsets(
+                parent_agent,
+                lane_toolsets,
+                lane=lane_name,
+                mode=t["mode"],
+            )
+        except Exception as exc:
+            failure_kind = (
+                "tool_execution_failed"
+                if "usable tools" in str(exc).lower()
+                or "toolset" in str(exc).lower()
+                else "provider_error"
+            )
+            return _structured_delegate_failure(
+                str(exc),
+                task_index=task_index,
+                task=t,
+                lane=lane_name,
+                failure_kind=failure_kind,
+                credentials=task_creds,
+            )
         task_specs.append((t, lane_name, task_creds, lane_toolsets))
 
     # Build all child agents on the main thread (thread-safe construction)
@@ -2675,14 +2727,27 @@ def delegate_task(
                     override_acp_command=task_creds.get("command"),
                     override_acp_args=task_creds.get("args"),
                     role=effective_role,
-                    inherit_parent_fallback=(lane_name is None),
+                    inherit_parent_fallback=False,
                 )
-            except ValueError as exc:
-                return tool_error(str(exc))
+            except Exception as exc:
+                logger.warning(
+                    "delegate_task child construction failed task_index=%d lane=%s: %s",
+                    i,
+                    lane_name,
+                    exc,
+                )
+                return _structured_delegate_failure(
+                    str(exc),
+                    task_index=i,
+                    task=t,
+                    lane=lane_name,
+                    failure_kind="provider_error",
+                    credentials=task_creds,
+                )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             child._delegate_mode = t["mode"]
-            child._delegate_lane = lane_name or "global"
+            child._delegate_lane = lane_name
             child._delegate_provider = task_creds.get("provider")
             child._delegate_model = task_creds.get("model")
             child._tool_use_enforcement = t["mode"] in {"execute", "review"}
@@ -3558,15 +3623,15 @@ def _preflight_lane_toolsets(
 def _resolve_delegation_credentials_for_task(
     cfg: dict, parent_agent, task: Optional[dict] = None
 ) -> dict:
-    """Resolve credentials for a single task, with optional lane routing.
+    """Resolve credentials for a task's validated, deterministic lane.
 
-    When ``task`` is provided and lane routing is configured, resolves
-    per-task credentials from the named lane. Falls back to the global
-    ``_resolve_delegation_credentials`` when no lane is resolved.
+    Every task must resolve to a named lane. The only compatibility path is an
+    execution task mapped to ``code_worker`` by an older explicit global
+    provider/model configuration; review and reasoning never inherit or fall
+    back to another runtime.
 
-    Returns the same dict shape as ``_resolve_delegation_credentials``.
-    Additionally, if the lane specifies ``toolsets``, they are returned
-    under the ``toolsets`` key for the child builder to use.
+    Returns the same dict shape as ``_resolve_delegation_credentials`` plus
+    the selected lane and any explicitly configured lane toolsets.
     """
     if task is not None:
         try:
@@ -3600,105 +3665,6 @@ def _resolve_delegation_credentials_for_task(
             return lane_creds
 
     raise ValueError("Delegation task did not resolve to a configured lane.")
-
-
-def _load_config() -> dict:
-    """Load delegation config from CLI_CONFIG or persistent config.
->>>>>>> 8ce3aa302 (fix delegation execution contracts)
-
-    Resolution order:
-    1. task["route"] — explicit lane name (must exist in cfg["lanes"])
-    2. task["model_tier"] → cfg["tier_routes"][tier] → lane name
-    3. cfg["default_lane"]
-
-    Returns None when no lane is resolved (fall back to global delegation config).
-    """
-    lanes = cfg.get("lanes") or {}
-    if not lanes:
-        return None
-
-    # 1. Explicit route
-    route = str(task.get("route") or "").strip()
-    if route:
-        if route not in lanes:
-            raise ValueError(
-                f"Task route '{route}' not found in delegation.lanes "
-                f"(available: {', '.join(sorted(lanes))})."
-            )
-        return route
-
-    # 2. model_tier → tier_routes
-    tier = str(task.get("model_tier") or "").strip()
-    if tier:
-        tier_routes = cfg.get("tier_routes") or {}
-        lane = tier_routes.get(tier)
-        if lane:
-            if lane not in lanes:
-                raise ValueError(
-                    f"Tier '{tier}' maps to lane '{lane}' which is not in "
-                    f"delegation.lanes (available: {', '.join(sorted(lanes))})."
-                )
-            return lane
-        # Tier specified but no mapping — fall through to default_lane
-        logger.debug("model_tier='%s' has no tier_routes mapping, falling back", tier)
-
-    # 3. default_lane
-    default_lane = str(cfg.get("default_lane") or "").strip()
-    if default_lane and default_lane in lanes:
-        return default_lane
-
-    return None
-
-
-def _normalize_lane_toolsets(value) -> Optional[list[str]]:
-    """Normalize optional lane toolsets config to a list of names.
-
-    ``hermes config set`` writes scalar values, so tolerate comma-separated
-    strings instead of turning ``"terminal,file"`` into a character list.
-    """
-    if value is None:
-        return None
-    if isinstance(value, str):
-        names = [part.strip() for part in value.split(",")]
-        return [name for name in names if name] or None
-    if isinstance(value, (list, tuple, set)):
-        names = [str(part).strip() for part in value]
-        return [name for name in names if name] or None
-    return None
-
-
-def _resolve_delegation_credentials_for_task(
-    cfg: dict, parent_agent, task: Optional[dict] = None
-) -> dict:
-    """Resolve credentials for a single task, with optional lane routing.
-
-    When ``task`` is provided and lane routing is configured, resolves
-    per-task credentials from the named lane. Falls back to the global
-    ``_resolve_delegation_credentials`` when no lane is resolved.
-
-    Returns the same dict shape as ``_resolve_delegation_credentials``.
-    Additionally, if the lane specifies ``toolsets``, they are returned
-    under the ``toolsets`` key for the child builder to use.
-    """
-    if task is not None:
-        try:
-            lane_name = _resolve_lane_for_task(task, cfg)
-        except ValueError:
-            raise  # re-raise route validation errors
-
-        if lane_name is not None:
-            lane_cfg = cfg["lanes"][lane_name]
-            # Build a sub-config dict in the same shape _resolve_delegation_credentials expects
-            lane_creds = _resolve_delegation_credentials(lane_cfg, parent_agent)
-            # Carry lane-level toolsets if specified
-            lane_toolsets = _normalize_lane_toolsets(lane_cfg.get("toolsets"))
-            if lane_toolsets:
-                lane_creds["toolsets"] = lane_toolsets
-            lane_creds["lane"] = lane_name
-            return lane_creds
-
-    # Fall back to global delegation config
-    return _resolve_delegation_credentials(cfg, parent_agent)
 
 
 def _load_config() -> dict:
