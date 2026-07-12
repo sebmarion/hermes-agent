@@ -1368,7 +1368,10 @@ export const zhHant = defineLocale({
     customPlaceholder: '0 9 * * * 或 weekdays at 9am',
     customHint: 'Cron 表達式，或類似「每小時」「工作日上午 9 點」的短語。',
     optional: '選填',
+    promptRequired: '提示詞為必填項目。',
     promptScheduleRequired: '提示詞和排程為必填項目。',
+    scheduleRequired: '排程為必填項目。',
+    scriptOnlyEditHint: '僅腳本任務（無 AI 提示詞）。任務 ID：',
     saveChanges: '儲存變更',
     createAction: '建立排程工作'
   },
@@ -1819,6 +1822,7 @@ export const zhHant = defineLocale({
     featuredPitch: '一個訂閱，300+ 前沿模型 — 執行 Hermes 的建議方式',
     openRouterPitch: '一個金鑰，數百個模型 — 穩定的預設選擇',
     apiKeyOptions: {
+      fireworks: { short: '直接模型 API', description: '直接存取 Fireworks AI 託管的模型。' },
       openrouter: { short: '一個金鑰，多個模型', description: '用一個金鑰存取數百個模型。適合新安裝的預設選擇。' },
       openai: { short: 'GPT 等級模型', description: '直接存取 OpenAI 模型。' },
       gemini: { short: 'Gemini 模型', description: '直接存取 Google Gemini 模型。' },

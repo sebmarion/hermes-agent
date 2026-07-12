@@ -1647,7 +1647,10 @@ export const zh: Translations = {
     customPlaceholder: '0 9 * * * 或 weekdays at 9am',
     customHint: 'Cron 表达式，或类似"每小时""工作日上午 9 点"的短语。',
     optional: '可选',
+    promptRequired: '提示词为必填项。',
     promptScheduleRequired: '提示词和排程为必填项。',
+    scheduleRequired: '排程为必填项。',
+    scriptOnlyEditHint: '仅脚本任务（无 AI 提示词）。任务 ID：',
     saveChanges: '保存更改',
     createAction: '创建定时任务'
   },
@@ -2102,6 +2105,7 @@ export const zh: Translations = {
     featuredPitch: '一个订阅，300+ 前沿模型 — 运行 Hermes 的推荐方式',
     openRouterPitch: '一个密钥，数百个模型 — 稳妥的默认选择',
     apiKeyOptions: {
+      fireworks: { short: '直接模型 API', description: '直接访问 Fireworks AI 托管的模型。' },
       openrouter: { short: '一个密钥，多个模型', description: '用一个密钥访问数百个模型。适合新安装的默认选择。' },
       openai: { short: 'GPT 级模型', description: '直接访问 OpenAI 模型。' },
       gemini: { short: 'Gemini 模型', description: '直接访问 Google Gemini 模型。' },
