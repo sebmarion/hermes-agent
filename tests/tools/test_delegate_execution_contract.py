@@ -170,4 +170,74 @@ def test_batch_preflight_rejects_unusable_lane_before_build(monkeypatch):
     )
 
     assert "no usable tools" in payload["error"].lower()
+    assert payload["results"][0]["status"] == "failed"
+    assert payload["results"][0]["lane"] == "smart_reviewer"
+    assert payload["results"][0]["failure_kind"] == "tool_execution_failed"
+    assert payload["results"][0]["evidence"] == {
+        "tool_turn_count": 0,
+        "successful_tool_count": 0,
+    }
     build.assert_not_called()
+
+
+def test_missing_execution_lane_returns_structured_failure_before_build(monkeypatch):
+    build = MagicMock()
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+    monkeypatch.setattr(delegate_tool, "_build_child_agent", build)
+
+    payload = json.loads(
+        delegate_tool.delegate_task(
+            tasks=[{"goal": "Execute"}],
+            parent_agent=_parent(),
+        )
+    )
+
+    assert "requires delegation.lanes.code_worker" in payload["error"]
+    assert payload["results"] == [
+        {
+            "task_index": 0,
+            "status": "failed",
+            "summary": None,
+            "error": payload["error"],
+            "failure_kind": "provider_error",
+            "mode": "execute",
+            "lane": "code_worker",
+            "provider": None,
+            "routed_model": None,
+            "evidence": {"tool_turn_count": 0, "successful_tool_count": 0},
+        }
+    ]
+    build.assert_not_called()
+
+
+def test_child_build_failure_preserves_selected_routing(monkeypatch):
+    cfg = _config()
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: cfg)
+    monkeypatch.setattr(
+        delegate_tool,
+        "_resolve_delegation_credentials_for_task",
+        lambda config, parent, task: {
+            "provider": "custom:code",
+            "model": "code-model",
+            "base_url": "https://example.invalid/v1",
+            "api_key": "key",
+            "api_mode": "chat_completions",
+            "toolsets": ["terminal", "file"],
+        },
+    )
+    monkeypatch.setattr(
+        delegate_tool,
+        "_build_child_agent",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("provider init failed")),
+    )
+
+    payload = json.loads(
+        delegate_tool.delegate_task(
+            tasks=[{"goal": "Execute"}], parent_agent=_parent()
+        )
+    )
+
+    assert payload["results"][0]["lane"] == "code_worker"
+    assert payload["results"][0]["provider"] == "custom:code"
+    assert payload["results"][0]["routed_model"] == "code-model"
+    assert payload["results"][0]["failure_kind"] == "provider_error"

@@ -5053,15 +5053,26 @@ def run_conversation(
                 )
 
                 _ack_mode = intent_ack_continuation_mode(agent)
+                _delegate_mode = getattr(agent, "_delegate_mode", None)
+                _delegate_needs_first_tool = (
+                    _delegate_mode in {"execute", "review"}
+                    and not any(
+                        isinstance(msg, dict) and msg.get("role") == "tool"
+                        for msg in messages[current_turn_user_idx + 1 :]
+                    )
+                )
                 if (
-                    _ack_mode != "off"
+                    (_ack_mode != "off" or _delegate_needs_first_tool)
                     and agent.valid_tool_names
                     and codex_ack_continuations < 1
-                    and agent._looks_like_codex_intermediate_ack(
-                        user_message=user_message,
-                        assistant_content=final_response,
-                        messages=messages,
-                        require_workspace=(_ack_mode == "codex_only"),
+                    and (
+                        _delegate_needs_first_tool
+                        or agent._looks_like_codex_intermediate_ack(
+                            user_message=user_message,
+                            assistant_content=final_response,
+                            messages=messages,
+                            require_workspace=(_ack_mode == "codex_only"),
+                        )
                     )
                 ):
                     codex_ack_continuations += 1

@@ -2199,6 +2199,40 @@ def test_run_conversation_forces_exactly_one_ack_continuation(monkeypatch):
     assert len(continuations) == 1
 
 
+def test_execution_delegate_forces_one_continuation_for_arbitrary_tool_free_prose(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent._delegate_mode = "execute"
+    responses = [
+        _codex_message_response("The repository appears ready."),
+        _codex_tool_call_response(),
+        _codex_message_response("Repository inspection complete."),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, *_args):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("inspect the repository")
+
+    continuations = [
+        msg for msg in result["messages"]
+        if msg.get("role") == "user"
+        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
+    ]
+    assert len(continuations) == 1
+    assert any(msg.get("role") == "tool" for msg in result["messages"])
+    assert result["completed"] is True
+
+
 def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
     """Debug dumps should show /responses URL when in codex_responses mode."""
     import json

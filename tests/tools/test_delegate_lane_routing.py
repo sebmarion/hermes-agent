@@ -64,12 +64,17 @@ def test_execute_mode_applies_when_task_has_no_route_or_tier():
     assert lane == "code_worker"
 
 
-def test_missing_lanes_falls_back_to_global_delegation_config_without_selector():
+def test_explicit_global_provider_model_is_treated_as_code_worker_compat_lane():
     cfg = {"provider": "global-provider", "model": "global-model"}
 
     lane = delegate_tool._resolve_lane_for_task({}, cfg)
 
-    assert lane is None
+    assert lane == "code_worker"
+
+
+def test_missing_lanes_and_explicit_delegate_runtime_fails_closed():
+    with pytest.raises(ValueError, match="requires delegation.lanes.code_worker"):
+        delegate_tool._resolve_lane_for_task({}, {})
 
 
 @pytest.mark.parametrize("invalid_lanes", [[], "", "worker", 42, {}])
@@ -84,14 +89,14 @@ def test_explicit_empty_or_malformed_lanes_config_fails_closed(invalid_lanes):
         delegate_tool._resolve_lane_for_task({}, cfg)
 
 
-def test_legacy_default_lane_without_lanes_does_not_override_global_config():
+def test_legacy_default_lane_without_lanes_does_not_override_code_worker_compat():
     cfg = {
         "provider": "global-provider",
         "model": "global-model",
         "default_lane": "worker",
     }
 
-    assert delegate_tool._resolve_lane_for_task({}, cfg) is None
+    assert delegate_tool._resolve_lane_for_task({}, cfg) == "code_worker"
 
 
 @pytest.mark.parametrize("bad_routes", [[], "large:worker", 42, None])
@@ -398,6 +403,7 @@ def test_credentials_fall_back_to_global_when_no_lane_resolves(monkeypatch):
         "base_url": None,
         "api_key": "test-key",
         "api_mode": None,
+        "lane": "code_worker",
     }
 
 

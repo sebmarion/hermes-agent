@@ -5811,15 +5811,21 @@ class SessionDB:
 
         def _do(conn):
             cursor = conn.execute(
-                f"SELECT s.id FROM sessions s WHERE {where}", where_params
+                f"SELECT s.id, s.source FROM sessions s WHERE {where}", where_params
             )
-            session_ids = {row["id"] for row in cursor.fetchall()}
+            selected_rows = cursor.fetchall()
+            session_ids = {row["id"] for row in selected_rows}
 
             if not session_ids:
                 return 0
 
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
+            visible_orphan = conn.execute(
+                f"SELECT 1 FROM sessions WHERE parent_session_id IN ({placeholders}) "
+                "AND source != 'subagent' LIMIT 1",
+                list(session_ids),
+            ).fetchone()
             conn.execute(
                 f"UPDATE sessions SET parent_session_id = NULL "
                 f"WHERE parent_session_id IN ({placeholders})",
@@ -5830,6 +5836,10 @@ class SessionDB:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
+            if visible_orphan or any(
+                row["source"] != "subagent" for row in selected_rows
+            ):
+                self._bump_session_projection(conn)
             return len(session_ids)
 
         count = self._execute_write(_do)

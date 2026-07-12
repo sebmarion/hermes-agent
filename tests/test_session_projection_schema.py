@@ -190,6 +190,24 @@ def test_bulk_delete_invalidates_projection_once_and_ignores_subagent_only_batch
         db.close()
 
 
+def test_prune_invalidates_visible_projection_once_and_ignores_subagent_only_prune(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("visible", "cli")
+        db.create_session("child", "subagent")
+        db.end_session("visible", "done")
+        db.end_session("child", "done")
+        before = _generation(db)
+
+        assert db.prune_sessions(older_than_days=None, source="cli") == 1
+        assert _generation(db) == before + 1
+
+        assert db.prune_sessions(older_than_days=None, source="subagent") == 1
+        assert _generation(db) == before + 1
+    finally:
+        db.close()
+
+
 def test_legacy_activity_backfill_is_resumable_and_batched(tmp_path):
     path = tmp_path / "state.db"
     db = SessionDB(path, _start_projection_backfill=False)
