@@ -12324,6 +12324,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 except Exception:
                     reset_current_session_key = None  # type: ignore[assignment]
                     _approval_session_token = None
+                _bestplan_delivery_context = None
+                try:
+                    from agent.bestplan_state import bind_bestplan_delivery_context
+                    from hermes_constants import get_hermes_home
+
+                    _bestplan_delivery_context = bind_bestplan_delivery_context(
+                        session_key=str(self.session_id or "default"),
+                        session_id=str(self.session_id or "default"),
+                        profile=str(os.environ.get("HERMES_PROFILE") or ""),
+                        hermes_home=get_hermes_home(),
+                    )
+                    _bestplan_delivery_context.__enter__()
+                except Exception:
+                    logging.exception("failed to bind CLI BestPlan delivery context")
+                    _bestplan_delivery_context = None
                 agent_message = _voice_prefix + message if _voice_prefix else message
                 # Prepend pending notes via _prepend_note_to_message, which
                 # handles both plain-string and multimodal content-parts list
@@ -12431,6 +12446,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         "error": _summary,
                     }
                 finally:
+                    if _bestplan_delivery_context is not None:
+                        try:
+                            _bestplan_delivery_context.__exit__(None, None, None)
+                        except Exception:
+                            logging.exception("failed to reset CLI BestPlan delivery context")
                     # Surface any credit notices queued during the turn (cold-start
                     # seed / per-turn capture) now that the response is done — printing
                     # at this boundary paints cleanly above the prompt instead of being

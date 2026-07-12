@@ -89,7 +89,7 @@ _CLEANUP_INTERVAL_SECONDS = 15 * 60
 _last_cleanup_at = 0.0
 _persist_lock = threading.Lock()
 _recovery_attempted = False
-_replayed_persisted_ids: set[str] = set()
+_replayed_persisted_ids: set[tuple[str, str]] = set()
 _PERSISTENCE_VERSION = 1
 # Lightweight liveness ping for status consumers (/agents, TUI/Desktop
 # delegation.status). Completion delivery still rides the shared process queue;
@@ -126,13 +126,26 @@ def active_count() -> int:
         return sum(
             1
             for record in _records.values()
-            if record.get("status") == "running"
+            if record.get("status") in {"scheduled", "running"}
             or record.get("delivery_status") == "finalizing"
         )
 
 
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
+
+
+def _owner_pid_alive(value: Any) -> bool:
+    try:
+        pid = int(value)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True
 
 
 def _prune_completed_locked() -> None:
@@ -501,6 +514,19 @@ def recover_async_delegations(
             status = str(entry.get("status") or record.get("status") or "")
             delivery_status = str(entry.get("delivery_status") or "")
             event = entry.get("event") if isinstance(entry.get("event"), dict) else None
+            if status == "scheduled" and not _owner_pid_alive(record.get("owner_pid")):
+                # The durable worker gate opens only after this phase is stored.
+                # A fresh process cannot own that queued Future, and the runner
+                # never crossed its running gate, so retry from intent.
+                record = dict(record)
+                record["status"] = "intent"
+                record["delivery_status"] = "intent"
+                entry["record"] = record
+                entry["status"] = "intent"
+                entry["delivery_status"] = "intent"
+                entry["updated_at"] = now
+                status = "intent"
+                delivery_status = "intent"
             if status == "running":
                 record = dict(record)
                 record["status"] = "lost"
@@ -516,9 +542,10 @@ def recover_async_delegations(
                 status = "lost"
                 delivery_status = "pending"
                 lost += 1
-            if status != "running" and delivery_status != "delivered" and event and rid not in _replayed_persisted_ids:
+            replay_identity = (str(_persistence_path(tracker_path)), str(rid))
+            if status != "running" and delivery_status != "delivered" and event and replay_identity not in _replayed_persisted_ids:
                 process_registry.completion_queue.put(event)
-                _replayed_persisted_ids.add(rid)
+                _replayed_persisted_ids.add(replay_identity)
                 entry["delivery_status"] = "queued"
                 entry["queued_at"] = now
                 entry["updated_at"] = now
@@ -957,11 +984,25 @@ def dispatch_async_delegation_batch(
             persisted = _read_persisted_unlocked(origin_tracker_path)
             existing = (persisted.get("records") or {}).get(delegation_id)
         if isinstance(existing, dict):
-            return {
-                "status": "dispatched",
-                "delegation_id": delegation_id,
-                "idempotent_replay": True,
-            }
+            phase = str(existing.get("status") or (existing.get("record") or {}).get("status") or "")
+            if phase in {"scheduled", "running"}:
+                owner_pid = (existing.get("record") or {}).get("owner_pid")
+                if phase == "scheduled" and not _owner_pid_alive(owner_pid):
+                    phase = "intent"
+                else:
+                    return {
+                        "status": "dispatched",
+                        "delegation_id": delegation_id,
+                        "phase": phase,
+                        "idempotent_replay": True,
+                    }
+            if phase not in {"", "intent"}:
+                return {
+                    "status": "terminal",
+                    "phase": phase,
+                    "delegation_id": delegation_id,
+                    "idempotent_replay": True,
+                }
     dispatched_at = time.time()
     n = len(goals)
     # A combined goal label for status listings / the completion header.
@@ -983,18 +1024,19 @@ def dispatch_async_delegation_batch(
         "parent_session_id": parent_session_id,
         "bestplan_plan_id": bestplan_plan_id,
         "resolved_runtimes": list(resolved_runtimes or []),
-        "status": "running",
+        "status": "intent",
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "last_heartbeat_at": dispatched_at,
         "heartbeat_count": 0,
-        "delivery_status": "running",
+        "delivery_status": "intent",
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
+        "owner_pid": os.getpid(),
     }
     with _records_lock:
         running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
+            1 for r in _records.values() if r.get("status") in {"scheduled", "running"}
         )
         if running >= max_async_children:
             return {
@@ -1007,7 +1049,7 @@ def dispatch_async_delegation_batch(
                 ),
             }
         _records[delegation_id] = record
-    _persist_record(record, delivery_status="running")
+    _persist_record(record, delivery_status="intent")
     if origin_tracker_path:
         with _persist_lock:
             verify = _read_persisted_unlocked(origin_tracker_path)
@@ -1020,14 +1062,22 @@ def dispatch_async_delegation_batch(
                 "error": "strict async dispatch intent could not be persisted",
             }
 
-    heartbeat_stop = _start_heartbeat_thread(delegation_id)
-    with _records_lock:
-        if delegation_id in _records:
-            _records[delegation_id]["heartbeat_stop"] = heartbeat_stop
-
     executor = _get_executor(max_async_children)
+    start_gate = threading.Event()
+    abort_gate = threading.Event()
 
     def _worker() -> None:
+        start_gate.wait()
+        if abort_gate.is_set():
+            return
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is None or live.get("status") != "scheduled":
+                return
+            live["status"] = "running"
+            live["delivery_status"] = "running"
+            running_record = dict(live)
+        _persist_record(running_record, delivery_status="running")
         combined: Dict[str, Any] = {}
         status = "error"
         try:
@@ -1054,18 +1104,62 @@ def dispatch_async_delegation_batch(
 
     try:
         # Propagate the dispatching profile to the detached batch children.
-        executor.submit(propagate_context_to_thread(_worker))
+        future = executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
         with _records_lock:
-            failed_record = _records.pop(delegation_id, None)
-        if failed_record:
-            hb_stop = failed_record.get("heartbeat_stop")
-            if hasattr(hb_stop, "set"):
-                hb_stop.set()
+            failed_record = _records.get(delegation_id)
+            if failed_record is not None:
+                failed_record["status"] = "intent"
+                failed_record["delivery_status"] = "intent"
+                failed_record["last_error"] = str(exc)
+                failed_snapshot = dict(failed_record)
+            else:
+                failed_snapshot = record
+        _persist_record(failed_snapshot, delivery_status="intent")
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
+
+    with _records_lock:
+        live = _records.get(delegation_id)
+        if live is not None:
+            live["status"] = "scheduled"
+            live["delivery_status"] = "scheduled"
+            scheduled_record = dict(live)
+        else:
+            scheduled_record = None
+    if scheduled_record is not None:
+        _persist_record(scheduled_record, delivery_status="scheduled")
+    durable_scheduled = True
+    if origin_tracker_path:
+        with _persist_lock:
+            verified = _read_persisted_unlocked(origin_tracker_path)
+            durable = (verified.get("records") or {}).get(delegation_id) or {}
+        durable_scheduled = str(durable.get("status") or "") == "scheduled"
+    if not durable_scheduled:
+        abort_gate.set()
+        start_gate.set()
+        future.cancel()
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None:
+                live["status"] = "intent"
+                live["delivery_status"] = "intent"
+                repaired = dict(live)
+            else:
+                repaired = record
+        _persist_record(repaired, delivery_status="intent")
+        return {
+            "status": "rejected",
+            "error": "strict async scheduled phase could not be persisted",
+        }
+
+    heartbeat_stop = _start_heartbeat_thread(delegation_id)
+    with _records_lock:
+        if delegation_id in _records:
+            _records[delegation_id]["heartbeat_stop"] = heartbeat_stop
+    start_gate.set()
 
     logger.info(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",

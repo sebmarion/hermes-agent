@@ -18907,19 +18907,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                try:
-                    from agent.autonomy_shadow import submit_shadow_observation
+                from agent.bestplan_state import run_planning_only_bestplan_turn
 
-                    submit_shadow_observation(
-                        message,
-                        session_id=str(session_entry.session_id or ""),
-                        source=f"gateway:{source.platform}",
-                        workspace=os.getcwd(),
-                        parent_agent=agent,
-                    )
-                except Exception as _shadow_exc:
-                    logger.debug("autonomy ingress failed open: %s", _shadow_exc)
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                def _run_gateway_model_turn():
+                    try:
+                        from agent.autonomy_shadow import submit_shadow_observation
+
+                        submit_shadow_observation(
+                            message,
+                            session_id=str(session_entry.session_id or ""),
+                            source=f"gateway:{source.platform}",
+                            workspace=os.getcwd(),
+                            parent_agent=agent,
+                        )
+                    except Exception as _shadow_exc:
+                        logger.debug("autonomy ingress failed open: %s", _shadow_exc)
+                    return agent.run_conversation(_api_run_message, **_conversation_kwargs)
+
+                result = run_planning_only_bestplan_turn(
+                    invocation_message=message,
+                    conversation_history=agent_history,
+                    host_name=f"messaging gateway ({source.platform})",
+                    host_agent=agent,
+                    run_model_turn=_run_gateway_model_turn,
+                )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent

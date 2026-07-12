@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 BESTPLAN_ENVELOPE_START = "<<<HERMES_BESTPLAN_V1>>>"
 BESTPLAN_ENVELOPE_END = "<<<END_HERMES_BESTPLAN_V1>>>"
+BESTPLAN_HOST_CAPABILITY_VERSION = 1
 _ENVELOPE_RE = re.compile(
     re.escape(BESTPLAN_ENVELOPE_START)
     + r"\s*(?P<payload>\{.*?\})\s*"
@@ -164,9 +166,24 @@ def compute_baseline_fingerprint(workspace: str) -> str:
             ["git", "ls-files", "--others", "--exclude-standard", "-z"],
             cwd=root, capture_output=True, timeout=10, check=True,
         ).stdout
+        ignored_raw = subprocess.run(
+            ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+            cwd=root, capture_output=True, timeout=10, check=True,
+        ).stdout
+        for relative_raw in sorted(part for part in ignored_raw.split(b"\0") if part):
+            ignored = Path(root) / os.fsdecode(relative_raw)
+            try:
+                mode = ignored.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                raise BaselineFingerprintError(
+                    f"workspace contains ignored regular file omitted by detached worktrees: "
+                    f"{ignored.relative_to(root)}"
+                )
         # Git intentionally omits sockets/FIFOs/devices from its untracked
-        # listing.  Walk only to reject those unsafe baseline inputs (regular
-        # ignored files remain outside the Git baseline by design).
+        # listing. Walk only to reject those unsafe baseline inputs; ignored
+        # regular files and symlinks were rejected explicitly above.
         scanned = 0
         deadline = time.monotonic() + 10
         for current, dirnames, filenames in os.walk(
@@ -326,6 +343,8 @@ def _plan_to_delegate_tasks(
             "role": "leaf",
             "_bestplan_read_only": item.read_only,
             "_bestplan_leases": list(item.allowed_paths),
+            "_bestplan_workspace": _canonical_workspace(workspace or item.workspace),
+            "_bestplan_expected_artifacts": list(item.expected_artifacts),
         })
     return tasks
 
@@ -341,8 +360,16 @@ def _render_authoritative_manifest(
         f"- workspace: {_canonical_workspace(workspace)}",
     ]
     for item in plan.slices:
+        from agent.bestplan_sandbox import sandbox_backend_identity
+
         route = _LANE_FOR_SLICE[(item.kind, item.capability)]
+        sandbox = sandbox_backend_identity(
+            workspace=workspace,
+            allowed_paths=item.allowed_paths,
+            read_only=item.read_only,
+        )
         leases = ", ".join(item.allowed_paths) if item.allowed_paths else "none (read-only)"
+        artifacts = ", ".join(item.expected_artifacts) if item.expected_artifacts else "none"
         acceptance = "; ".join(item.acceptance)
         lines.extend([
             f"- slice {item.id}:",
@@ -351,6 +378,9 @@ def _render_authoritative_manifest(
             f"  - kind/capability: {item.kind}/{item.capability}",
             f"  - read_only: {str(item.read_only).lower()}",
             f"  - write leases: {leases}",
+            f"  - expected artifacts: {artifacts}",
+            f"  - sandbox backend: {sandbox['backend']}",
+            f"  - sandbox policy digest: {sandbox['policy_digest']}",
             f"  - acceptance: {acceptance}",
         ])
     return "\n".join(lines)
@@ -410,6 +440,7 @@ class BestplanStore:
             self._owned_connection.executescript(_TABLE_SQL)
             self._owned_connection.commit()
         self._ensure_schema()
+        self.reconcile_async_tracker()
 
     def close(self) -> None:
         with self._lock:
@@ -464,6 +495,79 @@ class BestplanStore:
 
     def _read_lock(self):
         return getattr(self._session_db, "_lock", self._lock)
+
+    def reconcile_async_tracker(self) -> int:
+        """Reconcile plan rows with the deterministic async tracker at startup."""
+        if self._db_path is None:
+            return 0
+        tracker = self._db_path.parent / "async_delegations.json"
+        try:
+            raw = json.loads(tracker.read_text(encoding="utf-8"))
+            records = raw.get("records") or {}
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+            return 0
+        if not isinstance(records, dict):
+            return 0
+
+        def reconcile(conn):
+            changed = 0
+            rows = conn.execute(
+                "SELECT plan_id, state, dispatch_id FROM bestplan_plans "
+                "WHERE state IN (?, ?)",
+                (PlanState.RUNNING, PlanState.WAITING),
+            ).fetchall()
+            for row in rows:
+                delegation_id = str(row["dispatch_id"] or f"bestplan-{row['plan_id']}")
+                entry = records.get(delegation_id)
+                if not isinstance(entry, dict):
+                    continue
+                record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
+                phase = str(entry.get("status") or record.get("status") or "")
+                event = entry.get("event") if isinstance(entry.get("event"), dict) else None
+                if phase in {"scheduled", "running"} and row["state"] == PlanState.RUNNING:
+                    owner_live = True
+                    if phase == "scheduled":
+                        try:
+                            owner_pid = int(record.get("owner_pid"))
+                            if owner_pid <= 0:
+                                raise ValueError("invalid owner pid")
+                            os.kill(owner_pid, 0)
+                        except (ProcessLookupError, TypeError, ValueError):
+                            owner_live = False
+                        except PermissionError:
+                            owner_live = True
+                    if owner_live:
+                        changed += conn.execute(
+                            "UPDATE bestplan_plans SET state=?, dispatch_state='scheduled', "
+                            "dispatch_updated_at=? WHERE plan_id=? AND state=?",
+                            (PlanState.WAITING, time.time(), row["plan_id"], PlanState.RUNNING),
+                        ).rowcount
+                    else:
+                        changed += conn.execute(
+                            "UPDATE bestplan_plans SET dispatch_state='intent', dispatch_owner=NULL, "
+                            "dispatch_updated_at=?, error='recovered_pre_run_schedule' "
+                            "WHERE plan_id=? AND state=?",
+                            (time.time(), row["plan_id"], PlanState.RUNNING),
+                        ).rowcount
+                elif phase in {"completed", "error", "failed", "lost", "interrupted"} or event:
+                    evidence = event or {
+                        "delegation_id": delegation_id,
+                        "status": phase or "terminal",
+                        "result": entry.get("result"),
+                    }
+                    changed += conn.execute(
+                        "UPDATE bestplan_plans SET state=?, dispatch_state='terminal', "
+                        "evidence_json=?, completed_at=COALESCE(completed_at, ?), "
+                        "dispatch_updated_at=? WHERE plan_id=? AND state IN (?, ?)",
+                        (
+                            PlanState.COMPLETED_UNVERIFIED,
+                            json.dumps(evidence, sort_keys=True), time.time(), time.time(),
+                            row["plan_id"], PlanState.RUNNING, PlanState.WAITING,
+                        ),
+                    ).rowcount
+            return changed
+
+        return int(self._execute_write(reconcile))
 
     def create_plan(
         self,
@@ -753,16 +857,28 @@ class BestplanStore:
         delegation_ids: list[str],
         sandbox_workspace: str = "",
     ) -> bool:
-        return bool(self._execute_write(lambda conn: conn.execute(
-            """UPDATE bestplan_plans SET state=?, delegation_ids_json=?,
-               dispatch_state='dispatched', dispatch_updated_at=?, error=NULL,
-               sandbox_workspace=?
-               WHERE plan_id=? AND state=? AND dispatch_state='dispatching'""",
-            (
-                PlanState.WAITING, json.dumps(delegation_ids), time.time(),
-                str(sandbox_workspace or ""), plan_id, PlanState.RUNNING,
-            ),
-        ).rowcount))
+        def record(conn):
+            row = conn.execute(
+                "SELECT state, dispatch_state FROM bestplan_plans WHERE plan_id=?",
+                (plan_id,),
+            ).fetchone()
+            if row is None or row["state"] not in {
+                PlanState.RUNNING, PlanState.COMPLETED_UNVERIFIED,
+            }:
+                return 0
+            terminal = row["state"] == PlanState.COMPLETED_UNVERIFIED
+            return conn.execute(
+                """UPDATE bestplan_plans SET state=?, delegation_ids_json=?,
+                   dispatch_state=?, dispatch_updated_at=?, error=NULL,
+                   sandbox_workspace=? WHERE plan_id=?""",
+                (
+                    PlanState.COMPLETED_UNVERIFIED if terminal else PlanState.WAITING,
+                    json.dumps(delegation_ids),
+                    "terminal" if terminal else "scheduled",
+                    time.time(), str(sandbox_workspace or ""), plan_id,
+                ),
+            ).rowcount
+        return bool(self._execute_write(record))
 
     def record_dispatch_failure(self, plan_id: str, error: str) -> bool:
         return bool(self._execute_write(lambda conn: conn.execute(
@@ -781,9 +897,12 @@ class BestplanStore:
 
     def mark_completed_unverified(self, plan_id: str, evidence: dict[str, Any]) -> bool:
         return bool(self._execute_write(lambda conn: conn.execute(
-            "UPDATE bestplan_plans SET state=?, evidence_json=?, completed_at=? "
-            "WHERE plan_id=? AND state=?",
-            (PlanState.COMPLETED_UNVERIFIED, json.dumps(evidence, sort_keys=True), time.time(), plan_id, PlanState.WAITING),
+            "UPDATE bestplan_plans SET state=?, dispatch_state='terminal', "
+            "evidence_json=?, completed_at=? WHERE plan_id=? AND state IN (?, ?)",
+            (
+                PlanState.COMPLETED_UNVERIFIED, json.dumps(evidence, sort_keys=True),
+                time.time(), plan_id, PlanState.RUNNING, PlanState.WAITING,
+            ),
         ).rowcount))
 
     def mark_completed_verified(self, plan_id: str) -> bool:
@@ -851,6 +970,132 @@ def is_bestplan_invocation(message: Any) -> bool:
         and "bestplan" in prefix
         and " skill" in prefix
     )
+
+
+def _history_has_executable_bestplan(history: list[dict[str, Any]]) -> bool:
+    for item in reversed(list(history or [])):
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "")
+        if (
+            BESTPLAN_ENVELOPE_START in content
+            or "Bestplan executable receipt:" in content
+            or "Authoritative executable manifest" in content
+            or "BestPlan status: planning-only" in content
+        ):
+            return True
+        # Stop at the most recent unrelated user turn: an old planning answer
+        # must not reserve the word "go" forever.
+        if item.get("role") == "user" and content.strip().casefold() != "go":
+            break
+    return False
+
+
+def unsupported_host_bestplan_before_model(
+    message: Any,
+    *,
+    conversation_history: list[dict[str, Any]],
+    host_name: str,
+) -> ResolvedGo | None:
+    """Reject only a plan-associated bare ``go`` on planning-only hosts."""
+    if not isinstance(message, str) or not _is_go_trigger(message):
+        return None
+    if not _history_has_executable_bestplan(conversation_history):
+        return None
+    return ResolvedGo(
+        True,
+        "unsupported_host",
+        reason=(
+            f"{host_name} is planning-only for BestPlan V1; use a supported "
+            "host and explicitly approve the host-rendered manifest"
+        ),
+    )
+
+
+def unsupported_host_bestplan_after_model(
+    result: dict[str, Any],
+    *,
+    invocation_message: Any,
+    host_name: str,
+) -> dict[str, Any]:
+    """Remove executable authority from a /bestplan answer on unsupported hosts."""
+    if not is_bestplan_invocation(invocation_message) or not isinstance(result, dict):
+        return result
+    visible = _ENVELOPE_RE.sub("", str(result.get("final_response") or "")).strip()
+    suffix = (
+        f"[BestPlan status: planning-only on {host_name}; no executable manifest "
+        "was persisted and bare `go` cannot dispatch this plan here.]"
+    )
+    response = "\n\n".join(part for part in (visible, suffix) if part)
+    updated = dict(result)
+    updated["final_response"] = response
+    messages = [dict(item) if isinstance(item, dict) else item for item in (updated.get("messages") or [])]
+    for index in range(len(messages) - 1, -1, -1):
+        item = messages[index]
+        if isinstance(item, dict) and item.get("role") == "assistant":
+            item["content"] = response
+            break
+    updated["messages"] = messages
+    updated["bestplan_capture"] = {
+        "executable": False,
+        "plan_id": None,
+        "digest": None,
+        "error": "unsupported_host",
+    }
+    return updated
+
+
+def run_planning_only_bestplan_turn(
+    *,
+    invocation_message: Any,
+    conversation_history: list[dict[str, Any]],
+    host_name: str,
+    host_agent: Any,
+    run_model_turn: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    """Shared production ingress for hosts without executable BestPlan V1."""
+    blocked = unsupported_host_bestplan_before_model(
+        invocation_message,
+        conversation_history=conversation_history,
+        host_name=host_name,
+    )
+    if blocked is not None:
+        return blocked.to_agent_result(
+            conversation_history=conversation_history,
+            user_message=str(invocation_message),
+            host_agent=host_agent,
+        )
+    return unsupported_host_bestplan_after_model(
+        run_model_turn(),
+        invocation_message=invocation_message,
+        host_name=host_name,
+    )
+
+
+@contextmanager
+def bind_bestplan_delivery_context(
+    *, session_key: str, session_id: str, profile: str, hermes_home: str | Path,
+):
+    """Stack-bind the strict V1 delivery/profile identity for one host turn."""
+    from gateway.session_context import bind_delivery_context, reset_delivery_context
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = Path(hermes_home).expanduser().resolve()
+    home_token = set_hermes_home_override(home)
+    delivery_tokens = bind_delivery_context(
+        session_key=session_key,
+        session_id=session_id,
+        ui_session_id=session_id,
+        async_delivery=True,
+        profile=profile,
+        hermes_home=str(home),
+        capability_version=1,
+    )
+    try:
+        yield
+    finally:
+        reset_delivery_context(delivery_tokens)
+        reset_hermes_home_override(home_token)
 
 
 def capture_bestplan_agent_result(

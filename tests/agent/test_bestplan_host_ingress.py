@@ -355,7 +355,7 @@ def test_runtime_is_resolved_once_before_durable_intent_and_reused_by_dispatch(t
     assert dispatch_kwargs["dispatch_id"] == f"bestplan-{capture.plan_id}"
     assert dispatch_kwargs["resolved_runtimes"][0]["model"] == "coder"
     row = store.get_plan(capture.plan_id)
-    assert row["dispatch_state"] == "dispatched"
+    assert row["dispatch_state"] == "scheduled"
     assert json.loads(row["resolved_runtime_json"])[0]["provider"] == "test"
 
 
@@ -503,39 +503,63 @@ def test_real_strict_dispatcher_enforces_worktree_and_runtime_identity(
     subprocess.run(["git", "commit", "-qm", "base"], cwd=workspace, check=True)
     hermes_home = tmp_path / "hermes-home"
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(
+        delegate_tool, "delegate_task",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("strict child must not be built in-process")),
+    )
     calls = []
 
-    def delegate_task(**kwargs):
-        calls.append(kwargs)
-        return json.dumps({
-            "status": "dispatched",
-            "delegation_id": kwargs["_dispatch_id"],
-        })
+    class Launch:
+        policy_digest = "policy"
+        def close(self):
+            pass
 
-    monkeypatch.setattr(delegate_tool, "delegate_task", delegate_task)
-    runtime = {"route": "code_worker", "provider": "controlled", "model": "coder"}
-    result = delegate_tool.dispatch_bestplan_tasks_async(
-        tasks=[{
+    monkeypatch.setattr(
+        "agent.bestplan_sandbox.create_bestplan_sandbox_launch",
+        lambda **_kwargs: Launch(),
+    )
+    monkeypatch.setattr(
+        delegate_tool,
+        "_bestplan_runtime_identity",
+        lambda _task, _runtime: {
+            "runtime_fingerprint": "fingerprint",
+            "sandbox_policy_digest": "policy",
+        },
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        lambda **kwargs: calls.append(kwargs) or {
+            "status": "dispatched", "delegation_id": kwargs["delegation_id"],
+        },
+    )
+    task = {
             "goal": "Implement safely",
             "context": "Workspace: /tmp/untrusted",
             "route": "code_worker",
             "role": "leaf",
             "_bestplan_read_only": False,
             "_bestplan_leases": ["src/"],
-        }],
-        parent_agent=SimpleNamespace(),
-        dispatch_id="bestplan-plan-1",
-        plan_id="plan-1",
-        workspace=str(workspace),
-        resolved_runtimes=[runtime],
-    )
+            "_bestplan_expected_artifacts": ["src/change.py"],
+            "_bestplan_workspace": str(workspace),
+    }
+    runtime = {
+        "route": "code_worker", "provider": "controlled", "model": "coder",
+        "runtime_fingerprint": "fingerprint", "sandbox_policy_digest": "policy",
+    }
+    from agent.bestplan_state import bind_bestplan_delivery_context
+    with bind_bestplan_delivery_context(
+        session_key="s1", session_id="s1", profile="coder", hermes_home=hermes_home,
+    ):
+        result = delegate_tool.dispatch_bestplan_tasks_async(
+            tasks=[task], parent_agent=SimpleNamespace(),
+            dispatch_id="bestplan-plan-1", plan_id="plan-1",
+            workspace=str(workspace), resolved_runtimes=[runtime],
+        )
 
     sandbox = Path(result["sandbox_workspace"])
     assert sandbox.is_dir()
     assert sandbox != workspace
-    assert calls[0]["_strict_async"] is True
-    assert calls[0]["_workspace_override"] == str(sandbox)
-    assert calls[0]["_resolved_runtimes"] == [runtime]
-    assert calls[0]["tasks"][0]["context"].startswith(
-        f"Host-enforced isolated worktree: {sandbox}"
-    )
+    assert calls[0]["delegation_id"] == "bestplan-plan-1"
+    assert calls[0]["origin_profile"] == "coder"
+    assert calls[0]["origin_tracker_path"] == str(hermes_home.resolve() / "async_delegations.json")
+    assert calls[0]["runner"] is not None

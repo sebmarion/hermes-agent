@@ -104,6 +104,89 @@ def test_deterministic_batch_dispatch_id_is_idempotent(tmp_path):
     assert calls == ["run"]
 
 
+def test_submit_failure_repairs_intent_and_retry_schedules_once(tmp_path, monkeypatch):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    calls = []
+
+    class BrokenExecutor:
+        def submit(self, _fn):
+            raise RuntimeError("submit failed")
+
+    real_get_executor = ad._get_executor
+    monkeypatch.setattr(ad, "_get_executor", lambda _workers: BrokenExecutor())
+    kwargs = dict(
+        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=lambda: calls.append("run") or {"results": []},
+        max_async_children=1, delegation_id="bestplan-submit",
+        origin_tracker_path=str(tracker), origin_profile="coder",
+        bestplan_plan_id="bp-submit",
+    )
+    failed = ad.dispatch_async_delegation_batch(**kwargs)
+    assert failed["status"] == "rejected"
+    entry = ad._read_persisted_unlocked(tracker)["records"]["bestplan-submit"]
+    assert entry["status"] == "intent"
+    assert calls == []
+
+    monkeypatch.setattr(ad, "_get_executor", real_get_executor)
+    retried = ad.dispatch_async_delegation_batch(**kwargs)
+    assert retried["status"] == "dispatched"
+    assert _drain_one(delegation_id="bestplan-submit") is not None
+    assert calls == ["run"]
+
+
+def test_crash_before_submit_leaves_intent_retryable(tmp_path):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    delegation_id = "bestplan-crash-before-submit"
+    ad._write_persisted_unlocked(
+        {
+            "version": 1,
+            "records": {
+                delegation_id: {
+                    "status": "intent",
+                    "delivery_status": "intent",
+                    "record": {
+                        "delegation_id": delegation_id,
+                        "status": "intent",
+                        "delivery_status": "intent",
+                        "owner_pid": 99999999,
+                    },
+                },
+            },
+        },
+        tracker,
+    )
+    calls = []
+    result = ad.dispatch_async_delegation_batch(
+        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=lambda: calls.append("run") or {"results": []},
+        max_async_children=1, delegation_id=delegation_id,
+        origin_tracker_path=str(tracker), origin_profile="coder",
+        bestplan_plan_id="bp-crash-before-submit",
+    )
+    assert result["status"] == "dispatched"
+    assert _drain_one(delegation_id=delegation_id) is not None
+    assert calls == ["run"]
+
+
+def test_profile_replay_identity_includes_canonical_tracker_path(tmp_path):
+    first = tmp_path / "p1" / "async_delegations.json"
+    second = tmp_path / "p2" / "async_delegations.json"
+    for tracker, profile in ((first, "p1"), (second, "p2")):
+        record = {
+            "delegation_id": "same-id", "status": "completed",
+            "origin_profile": profile, "origin_tracker_path": str(tracker),
+            "session_key": profile,
+        }
+        event = {
+            "type": "async_delegation", "delegation_id": "same-id",
+            "origin_profile": profile, "origin_tracker_path": str(tracker),
+            "session_key": profile,
+        }
+        ad._persist_record(record, event=event, delivery_status="pending")
+    assert ad.recover_async_delegations(first)["queued"] == 1
+    assert ad.recover_async_delegations(second)["queued"] == 1
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 

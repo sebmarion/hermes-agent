@@ -9056,7 +9056,15 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     run_kwargs["task_id"] = session["session_key"]
             except (TypeError, ValueError):
                 pass
-            result = agent.run_conversation(run_message, **run_kwargs)
+            from agent.bestplan_state import run_planning_only_bestplan_turn
+
+            result = run_planning_only_bestplan_turn(
+                invocation_message=prompt,
+                conversation_history=list(history),
+                host_name="TUI/desktop/dashboard",
+                host_agent=agent,
+                run_model_turn=lambda: agent.run_conversation(run_message, **run_kwargs),
+            )
             if "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.

@@ -155,7 +155,14 @@ hermes config set autonomy.go_enabled true
 The executable host ingress is currently supported by the classic CLI and the
 coordinated Hermes WebUI integration. The TUI/desktop and messaging gateway do
 not claim this bare-`go` execution contract yet; on those surfaces `/bestplan`
-remains planning-only.
+is planning-only, executable envelopes are stripped, and a follow-up bare
+`go` associated with that plan is rejected before the model. An unrelated bare
+`go` with no BestPlan context remains an ordinary model turn.
+
+V1 execution also requires an enforceable host filesystem sandbox. macOS uses
+`/usr/bin/sandbox-exec` when a live capability probe succeeds. Other platforms,
+and managed environments where the probe is denied, fail closed before claim
+or dispatch; there is no cwd/chmod/prose fallback.
 
 Before enabling it, configure `delegation.lanes.code_worker.provider` and
 `.model` for implementation plans, and
