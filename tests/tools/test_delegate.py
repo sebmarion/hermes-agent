@@ -47,6 +47,16 @@ def _make_mock_parent(depth=0):
     parent.api_mode = "chat_completions"
     parent.model = "anthropic/claude-sonnet-4"
     parent.platform = "cli"
+    parent.enabled_toolsets = ["terminal", "file", "web", "delegation"]
+    parent.valid_tool_names = {
+        "terminal",
+        "read_file",
+        "write_file",
+        "search_files",
+        "patch",
+        "web_search",
+        "delegate_task",
+    }
     parent.providers_allowed = None
     parent.providers_ignored = None
     parent.providers_order = None
@@ -434,6 +444,393 @@ class TestDelegateTask(unittest.TestCase):
             )
 
         self.assertIs(mock_child._print_fn, sink)
+
+    def test_child_forces_execution_semantics_for_all_models(self):
+        """Delegates must continue intent acks and receive tool-use guidance.
+
+        Regression for chat-completions children that returned ``I'll begin by``
+        after one API call and were incorrectly accepted as completed work.
+        """
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            child = _build_child_agent(
+                task_index=0,
+                goal="Inspect, repair, and verify the repository",
+                context=None,
+                toolsets=["terminal", "file"],
+                model="glm-4.7-flash",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertIs(child._tool_use_enforcement, True)
+        self.assertIs(child._intent_ack_continuation, True)
+
+    def test_explicit_lane_child_does_not_inherit_parent_fallback_chain(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "custom:zeus", "model": "glm-4.7-flash"}]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Review the repository",
+                context=None,
+                toolsets=["file"],
+                model="gpt-5.6-sol",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="openai-codex",
+                inherit_parent_fallback=False,
+            )
+
+        self.assertIsNone(MockAgent.call_args.kwargs["fallback_model"])
+
+    def test_non_lane_child_retains_parent_fallback_chain(self):
+        parent = _make_mock_parent(depth=0)
+        fallback = [{"provider": "custom:zeus", "model": "glm-4.7-flash"}]
+        parent._fallback_chain = fallback
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Synthesize supplied context",
+                context=None,
+                toolsets=["file"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], fallback)
+
+    def test_execution_delegate_with_zero_tool_calls_fails_closed(self):
+        """Intent prose must not count as completed implementation work."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"read_file", "terminal"}
+        child.run_conversation.return_value = {
+            "final_response": "I'll inspect the repository and start fixing it now.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Inspect, repair, test, and verify the repository",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["tool_trace"], [])
+        self.assertIn("without any successful tool evidence", result["error"])
+
+    def test_review_delegate_with_zero_tool_calls_fails_closed(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"read_file"}
+        child.run_conversation.return_value = {
+            "final_response": "I'll review the target changes now.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Review the target changes and report defects",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("successful tool evidence", result["error"])
+
+    def test_execution_delegate_with_unanswered_tool_call_fails_closed(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"read_file"}
+        child.run_conversation.return_value = {
+            "final_response": "Review complete.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-missing-result",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            }],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Review the target file",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertNotIn("status", result["tool_trace"][0])
+
+    def test_execution_delegate_with_orphan_tool_result_fails_closed(self):
+        from tools.delegate_tool import _run_single_child
+
+        for orphan_id in (None, "call-unknown"):
+            child = MagicMock()
+            child.valid_tool_names = {"read_file"}
+            orphan_result = {
+                "role": "tool",
+                "content": '{"content":"looks successful but is unmatched"}',
+            }
+            if orphan_id is not None:
+                orphan_result["tool_call_id"] = orphan_id
+            child.run_conversation.return_value = {
+                "final_response": "Review complete.",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 2,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-expected",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }],
+                    },
+                    orphan_result,
+                ],
+            }
+
+            result = _run_single_child(
+                task_index=0,
+                goal="Review the target file",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertNotIn("status", result["tool_trace"][0])
+
+    def test_execution_delegate_with_only_error_tool_results_fails_closed(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"read_file"}
+        child.run_conversation.return_value = {
+            "final_response": "Review complete.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-error",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-error",
+                    "content": '{"error":"file not found"}',
+                },
+            ],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Audit the target file",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["tool_trace"][0]["status"], "error")
+
+    def test_execution_delegate_with_explicit_false_success_result_fails_closed(self):
+        from tools.delegate_tool import _run_single_child
+
+        for failed_payload in (
+            '{"success":false,"message":"operation rejected"}',
+            '{"ok":false,"message":"permission denied"}',
+        ):
+            child = MagicMock()
+            child.valid_tool_names = {"read_file"}
+            child.run_conversation.return_value = {
+                "final_response": "Review complete.",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 2,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-false-success",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-false-success",
+                        "content": failed_payload,
+                    },
+                ],
+            }
+
+            result = _run_single_child(
+                task_index=0,
+                goal="Review the target file",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["tool_trace"][0]["status"], "error")
+
+    def test_execution_delegate_with_successful_tool_result_completes(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"read_file"}
+        child.run_conversation.return_value = {
+            "final_response": "Review complete with evidence.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 2,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-ok",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-ok",
+                    "content": '{"content":"evidence"}',
+                },
+            ],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Review the target file",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["tool_trace"][0]["status"], "ok")
+
+    def test_reasoning_only_delegate_can_complete_without_tools(self):
+        """Pure synthesis remains valid when the goal needs no external evidence."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._delegate_mode = "reason"
+        child.valid_tool_names = {"read_file"}
+        child.run_conversation.return_value = {
+            "final_response": "Option A has the lowest coordination cost.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Synthesize the supplied options and choose one",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["tool_trace"], [])
+
+    def test_runtime_error_prose_is_not_completed(self):
+        """A non-empty error explanation cannot mask a failed child run."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"read_file"}
+        child.run_conversation.return_value = {
+            "final_response": "I could not connect to the provider.",
+            "error": "Connection error.",
+            "completed": False,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Read and review the target file",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "Connection error.")
+
+    def test_child_accepts_read_only_file_lane_when_parent_has_file_tools(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["file"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Read one repository file",
+                context=None,
+                toolsets=["read_only_files"],
+                model="glm-4.7-flash",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            MockAgent.call_args.kwargs["enabled_toolsets"],
+            ["read_only_files"],
+        )
+
+    def test_child_rejects_explicit_toolsets_that_resolve_to_no_tools(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["file"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            with self.assertRaisesRegex(ValueError, "resolved to no usable tools"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Read one repository file",
+                    context=None,
+                    toolsets=["missing_lane_toolset"],
+                    model="glm-4.7-flash",
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        MockAgent.assert_not_called()
 
     def test_child_uses_thinking_callback_when_progress_callback_available(self):
         parent = _make_mock_parent(depth=0)
@@ -1954,6 +2351,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         leased_entry.id = "cred-b"
 
         child = MagicMock()
+        child._delegate_mode = "reason"
         child._credential_pool = MagicMock()
         child._credential_pool.acquire_lease.return_value = "cred-b"
         child._credential_pool.current.return_value = leased_entry
@@ -2121,7 +2519,13 @@ class TestDelegateHeartbeat(unittest.TestCase):
 
         parent = _make_mock_parent()
         touch_calls = []
-        parent._touch_activity = lambda desc: touch_calls.append(desc)
+        heartbeat_seen = threading.Event()
+
+        def record_touch(desc):
+            touch_calls.append(desc)
+            heartbeat_seen.set()
+
+        parent._touch_activity = record_touch
 
         child = MagicMock()
         child.get_activity_summary.return_value = {
@@ -2132,7 +2536,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         }
 
         def slow_run(**kwargs):
-            time.sleep(0.15)
+            heartbeat_seen.wait(timeout=2.0)
             return {"final_response": "done", "completed": True, "api_calls": 5}
 
         child.run_conversation.side_effect = slow_run
@@ -2165,10 +2569,16 @@ class TestDelegateHeartbeat(unittest.TestCase):
 
         parent = _make_mock_parent()
         touch_calls = []
-        parent._touch_activity = lambda desc: touch_calls.append(desc)
+        enough_touches = threading.Event()
+
+        def record_touch(desc):
+            touch_calls.append(desc)
+            if len(touch_calls) >= 3:
+                enough_touches.set()
+
+        parent._touch_activity = record_touch
 
         child = MagicMock()
-        # Child is stuck inside a single terminal call for the whole run.
         # api_call_count never advances, current_tool is always set.
         child.get_activity_summary.return_value = {
             "current_tool": "terminal",
@@ -2178,10 +2588,10 @@ class TestDelegateHeartbeat(unittest.TestCase):
         }
 
         def slow_run(**kwargs):
-            # Long enough to exceed the OLD idle threshold (5 cycles) at
-            # the patched interval, but shorter than the new in-tool
-            # threshold.
-            time.sleep(0.4)
+            # Keep the child active until the heartbeat proves it survived more
+            # than the idle stale limit. Event synchronization avoids relying on
+            # wall-clock scheduling under concurrent CI load.
+            enough_touches.wait(timeout=2.0)
             return {"final_response": "done", "completed": True, "api_calls": 1}
 
         child.run_conversation.side_effect = slow_run
@@ -2206,7 +2616,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         self.assertGreater(
             len(touch_calls), 2,
             f"Heartbeat stopped too early while child was inside a tool; "
-            f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
+            f"got {len(touch_calls)} touches before the synchronization deadline",
         )
 
 

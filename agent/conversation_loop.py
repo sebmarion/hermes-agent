@@ -5104,7 +5104,7 @@ def run_conversation(
                 if (
                     _ack_mode != "off"
                     and agent.valid_tool_names
-                    and codex_ack_continuations < 2
+                    and codex_ack_continuations < 1
                     and agent._looks_like_codex_intermediate_ack(
                         user_message=user_message,
                         assistant_content=final_response,

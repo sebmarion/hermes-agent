@@ -211,6 +211,11 @@ class TestToolsetConsistency:
             assert "tools" in ts, f"{name} missing tools"
             assert "includes" in ts, f"{name} missing includes"
 
+    def test_read_only_files_excludes_mutating_file_tools(self):
+        tools = set(resolve_toolset("read_only_files"))
+        assert tools == {"read_file", "search_files"}
+        assert tools.isdisjoint({"write_file", "patch"})
+
     def test_all_includes_reference_existing_toolsets(self):
         for name, ts in TOOLSETS.items():
             for inc in ts["includes"]:
