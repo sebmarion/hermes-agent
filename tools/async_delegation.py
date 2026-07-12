@@ -153,7 +153,9 @@ def _prune_completed_locked() -> None:
         _records.pop(rid, None)
 
 
-def _persistence_path() -> Path:
+def _persistence_path(explicit: str | Path | None = None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
     try:
         from hermes_cli.config import get_hermes_home
 
@@ -163,8 +165,8 @@ def _persistence_path() -> Path:
     return Path(home) / "async_delegations.json"
 
 
-def _read_persisted_unlocked() -> Dict[str, Any]:
-    path = _persistence_path()
+def _read_persisted_unlocked(path: str | Path | None = None) -> Dict[str, Any]:
+    path = Path(_persistence_path() if path is None else _persistence_path(path))
     if not path.exists():
         return {"version": _PERSISTENCE_VERSION, "records": {}}
     try:
@@ -180,8 +182,8 @@ def _read_persisted_unlocked() -> Dict[str, Any]:
         return {"version": _PERSISTENCE_VERSION, "records": {}}
 
 
-def _write_persisted_unlocked(data: Dict[str, Any]) -> None:
-    path = _persistence_path()
+def _write_persisted_unlocked(data: Dict[str, Any], path: str | Path | None = None) -> None:
+    path = Path(_persistence_path() if path is None else _persistence_path(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(
@@ -358,7 +360,8 @@ def _persist_record(
             entry["delivered_at"] = now
     try:
         with _persist_lock:
-            data = _read_persisted_unlocked()
+            tracker_path = record.get("origin_tracker_path") or None
+            data = _read_persisted_unlocked(tracker_path)
             existing = data.setdefault("records", {}).get(delegation_id, {})
             merged = dict(existing) if isinstance(existing, dict) else {}
             merged.update(entry)
@@ -370,21 +373,27 @@ def _persist_record(
                 merged["delivery_status"] = existing["delivery_status"]
             data["records"][delegation_id] = merged
             _cleanup_persisted_data_locked(data, now=now)
-            _write_persisted_unlocked(data)
+            _write_persisted_unlocked(data, tracker_path)
     except Exception as exc:
         logger.warning("Failed to persist async delegation %s: %s", delegation_id, exc)
 
 
-def _mark_persisted_delivery(delegation_id: str, status: str) -> None:
+def _mark_persisted_delivery(
+    delegation_id: str,
+    status: str,
+    *,
+    tracker_path: str | Path | None = None,
+    raise_on_error: bool = False,
+) -> bool:
     if not delegation_id:
-        return
+        return False
     now = time.time()
     try:
         with _persist_lock:
-            data = _read_persisted_unlocked()
+            data = _read_persisted_unlocked(tracker_path)
             entry = data.setdefault("records", {}).get(delegation_id)
             if not isinstance(entry, dict):
-                return
+                return False
             entry["delivery_status"] = status
             entry["updated_at"] = now
             if status == "queued":
@@ -392,24 +401,42 @@ def _mark_persisted_delivery(delegation_id: str, status: str) -> None:
             elif status == "delivered":
                 entry["delivered_at"] = now
             _cleanup_persisted_data_locked(data, now=now)
-            _write_persisted_unlocked(data)
+            _write_persisted_unlocked(data, tracker_path)
+            verify = _read_persisted_unlocked(tracker_path)
+            stored = (verify.get("records") or {}).get(delegation_id) or {}
+            if stored.get("delivery_status") != status:
+                raise OSError("async delegation ACK verification failed")
+            return True
     except Exception as exc:
+        if raise_on_error:
+            raise OSError(
+                f"Failed to update async delegation delivery {delegation_id}: {exc}"
+            ) from exc
         logger.warning("Failed to update async delegation delivery %s: %s", delegation_id, exc)
+    return False
 
 
-def mark_async_delegation_delivered(evt: Dict[str, Any]) -> None:
+def mark_async_delegation_delivered(evt: Dict[str, Any]) -> bool:
     """ACK that an async-delegation notification was consumed by a driver."""
     if not isinstance(evt, dict) or evt.get("type") != "async_delegation":
-        return
+        raise ValueError("async delegation ACK requires an async_delegation event")
     delegation_id = str(evt.get("delegation_id") or "")
     if not delegation_id:
-        return
+        raise ValueError("async delegation ACK requires delegation_id")
     with _records_lock:
         record = _records.get(delegation_id)
         if record is not None:
             record["delivery_status"] = "delivered"
             record["delivered_at"] = time.time()
-    _mark_persisted_delivery(delegation_id, "delivered")
+    tracker_path = str(evt.get("origin_tracker_path") or "") or None
+    if not _mark_persisted_delivery(
+        delegation_id,
+        "delivered",
+        tracker_path=tracker_path,
+        raise_on_error=True,
+    ):
+        raise KeyError(f"async delegation tracker record not found: {delegation_id}")
+    return True
 
 
 def _event_for_lost_record(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -430,6 +457,11 @@ def _event_for_lost_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "type": "async_delegation",
         "delegation_id": delegation_id,
         "session_key": record.get("session_key") or "",
+        "origin_ui_session_id": record.get("origin_ui_session_id") or "",
+        "origin_profile": record.get("origin_profile") or "",
+        "origin_tracker_path": record.get("origin_tracker_path") or "",
+        "parent_session_id": record.get("parent_session_id"),
+        "bestplan_plan_id": record.get("bestplan_plan_id") or "",
         "goal": record.get("goal") or "background delegation",
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -442,7 +474,9 @@ def _event_for_lost_record(record: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def recover_async_delegations() -> Dict[str, Any]:
+def recover_async_delegations(
+    tracker_path: str | Path | None = None,
+) -> Dict[str, Any]:
     """Replay undelivered completions and mark previous-process runners lost."""
     global _recovery_attempted
     queued = 0
@@ -453,7 +487,7 @@ def recover_async_delegations() -> Dict[str, Any]:
     except Exception as exc:
         return {"queued": 0, "lost": 0, "error": str(exc)}
     with _persist_lock:
-        data = _read_persisted_unlocked()
+        data = _read_persisted_unlocked(tracker_path)
         records = data.setdefault("records", {})
         if not isinstance(records, dict):
             return {"queued": 0, "lost": 0, "error": "invalid records"}
@@ -495,7 +529,7 @@ def recover_async_delegations() -> Dict[str, Any]:
                         restored["delivery_status"] = "queued"
                         _records[rid] = restored
         _cleanup_persisted_data_locked(data, now=now)
-        _write_persisted_unlocked(data)
+        _write_persisted_unlocked(data, tracker_path)
     _recovery_attempted = True
     return {"queued": queued, "lost": lost}
 
@@ -889,6 +923,11 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    delegation_id: Optional[str] = None,
+    origin_profile: str = "",
+    origin_tracker_path: str = "",
+    bestplan_plan_id: str = "",
+    resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -910,9 +949,19 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
-    _recover_once()
-
-    delegation_id = _new_delegation_id()
+    if not origin_tracker_path:
+        _recover_once()
+    delegation_id = str(delegation_id or _new_delegation_id())
+    if origin_tracker_path:
+        with _persist_lock:
+            persisted = _read_persisted_unlocked(origin_tracker_path)
+            existing = (persisted.get("records") or {}).get(delegation_id)
+        if isinstance(existing, dict):
+            return {
+                "status": "dispatched",
+                "delegation_id": delegation_id,
+                "idempotent_replay": True,
+            }
     dispatched_at = time.time()
     n = len(goals)
     # A combined goal label for status listings / the completion header.
@@ -929,7 +978,11 @@ def dispatch_async_delegation_batch(
         "model": model,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
+        "origin_profile": origin_profile,
+        "origin_tracker_path": origin_tracker_path,
         "parent_session_id": parent_session_id,
+        "bestplan_plan_id": bestplan_plan_id,
+        "resolved_runtimes": list(resolved_runtimes or []),
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -955,6 +1008,17 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
     _persist_record(record, delivery_status="running")
+    if origin_tracker_path:
+        with _persist_lock:
+            verify = _read_persisted_unlocked(origin_tracker_path)
+            durable = (verify.get("records") or {}).get(delegation_id)
+        if not isinstance(durable, dict):
+            with _records_lock:
+                _records.pop(delegation_id, None)
+            return {
+                "status": "rejected",
+                "error": "strict async dispatch intent could not be persisted",
+            }
 
     heartbeat_stop = _start_heartbeat_thread(delegation_id)
     with _records_lock:
@@ -1047,7 +1111,11 @@ def _finalize_batch(
         "delegation_id": delegation_id,
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
+        "origin_profile": event_record.get("origin_profile", ""),
+        "origin_tracker_path": event_record.get("origin_tracker_path", ""),
         "parent_session_id": event_record.get("parent_session_id"),
+        "bestplan_plan_id": event_record.get("bestplan_plan_id", ""),
+        "resolved_runtimes": event_record.get("resolved_runtimes") or [],
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
@@ -1064,9 +1132,28 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    plan_id = str(event_record.get("bestplan_plan_id") or "")
+    tracker_path = str(event_record.get("origin_tracker_path") or "")
+    if plan_id and tracker_path:
+        try:
+            from agent.bestplan_state import BestplanStore
+
+            plan_store = BestplanStore(db_path=Path(tracker_path).parent / "state.db")
+            try:
+                plan_store.mark_completed_unverified(plan_id, evt)
+            finally:
+                plan_store.close()
+        except Exception:
+            logger.warning(
+                "BestPlan completion evidence persistence failed for %s",
+                plan_id,
+                exc_info=True,
+            )
     try:
         _persist_record(event_record, result=combined, event=evt, delivery_status="pending")
-        _mark_persisted_delivery(delegation_id, "queued")
+        _mark_persisted_delivery(
+            delegation_id, "queued", tracker_path=tracker_path or None,
+        )
         with _records_lock:
             live = _records.get(delegation_id)
             if live is not None:
@@ -1074,7 +1161,12 @@ def _finalize_batch(
                 live["queued_at"] = time.time()
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
-        _mark_persisted_delivery(delegation_id, "pending")
+        try:
+            _mark_persisted_delivery(
+                delegation_id, "pending", tracker_path=tracker_path or None,
+            )
+        except Exception:
+            logger.warning("failed to retain async delegation pending marker", exc_info=True)
         with _records_lock:
             live = _records.get(delegation_id)
             if live is not None:

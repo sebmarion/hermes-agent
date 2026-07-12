@@ -25,6 +25,11 @@ def set_session_cwd(cwd: str | None) -> Token:
     return _SESSION_CWD.set((cwd or "").strip())
 
 
+def reset_session_cwd(token: Token) -> None:
+    """Restore the logical cwd that preceded ``set_session_cwd``."""
+    _SESSION_CWD.reset(token)
+
+
 def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
 

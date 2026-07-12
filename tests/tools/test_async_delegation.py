@@ -28,7 +28,9 @@ def _clean_state(monkeypatch, tmp_path):
     monkeypatch.setattr(
         ad,
         "_persistence_path",
-        lambda: tmp_path / "async_delegations.json",
+        lambda explicit=None: (
+            explicit if explicit is not None else tmp_path / "async_delegations.json"
+        ),
     )
     _wait_for_async_idle()
     ad._reset_for_tests()
@@ -51,6 +53,55 @@ def _drain_one(timeout=5.0, delegation_id=None):
             continue
         time.sleep(0.02)
     return None
+
+
+def test_explicit_tracker_ack_is_verified_and_profile_isolated(tmp_path):
+    coder = tmp_path / "coder" / "async_delegations.json"
+    other = tmp_path / "other" / "async_delegations.json"
+    record = {
+        "delegation_id": "bestplan-1",
+        "status": "completed",
+        "origin_tracker_path": str(coder),
+    }
+    ad._persist_record(record, delivery_status="pending")
+
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "bestplan-1",
+        "origin_tracker_path": str(coder),
+    }
+    assert ad.mark_async_delegation_delivered(evt) is True
+    assert ad._read_persisted_unlocked(coder)["records"]["bestplan-1"]["delivery_status"] == "delivered"
+    assert ad._read_persisted_unlocked(other)["records"] == {}
+
+    wrong = {**evt, "origin_tracker_path": str(other)}
+    with pytest.raises(KeyError):
+        ad.mark_async_delegation_delivered(wrong)
+
+
+def test_deterministic_batch_dispatch_id_is_idempotent(tmp_path):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    gate = threading.Event()
+    calls = []
+
+    def runner():
+        calls.append("run")
+        gate.wait(timeout=5)
+        return {"results": [{"status": "completed", "summary": "done"}]}
+
+    kwargs = dict(
+        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=runner, max_async_children=2,
+        delegation_id="bestplan-fixed", origin_tracker_path=str(tracker),
+        origin_profile="coder", bestplan_plan_id="bp-1",
+    )
+    first = ad.dispatch_async_delegation_batch(**kwargs)
+    second = ad.dispatch_async_delegation_batch(**kwargs)
+    assert first["delegation_id"] == second["delegation_id"] == "bestplan-fixed"
+    assert second["idempotent_replay"] is True
+    gate.set()
+    assert _drain_one(delegation_id="bestplan-fixed") is not None
+    assert calls == ["run"]
 
 
 def test_dispatch_returns_immediately_without_blocking():
@@ -886,5 +937,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-
