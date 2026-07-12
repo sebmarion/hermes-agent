@@ -15,6 +15,7 @@ Source file: `hermes_state.py`
 ├── messages              — Full message history per session
 ├── messages_fts          — FTS5 virtual table (content + tool_name + tool_calls)
 ├── messages_fts_trigram  — FTS5 virtual table with trigram tokenizer (CJK / substring search)
+├── session_projection_meta — Sidebar projection generation + resumable backfill cursor
 ├── state_meta            — Key/value metadata table
 └── schema_version        — Single-row table tracking migration state
 ```
@@ -24,6 +25,8 @@ Key design decisions:
 - **FTS5 virtual table** for fast text search across all session messages
 - **Session lineage** via `parent_session_id` chains (compression-triggered splits)
 - **Source tagging** (`cli`, `telegram`, `discord`, etc.) for platform filtering
+- **Agent-owned session projection** so UI clients never derive sidebar state
+  from the full message store
 - Batch runner and RL trajectories are NOT stored here (separate systems)
 
 
@@ -60,6 +63,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pricing_version TEXT,
     title TEXT,
     api_call_count INTEGER DEFAULT 0,
+    last_activity_at REAL,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -68,6 +72,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique
     ON sessions(title) WHERE title IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sessions_projection_activity
+    ON sessions(last_activity_at DESC, started_at DESC)
+    WHERE source != 'subagent';
 ```
 
 ### Messages Table
@@ -133,7 +140,7 @@ END;
 
 ## Schema Version and Migrations
 
-Current schema version: **11**
+Current schema version: **20**
 
 The `schema_version` table stores a single integer. Simple column additions are handled declaratively by `_reconcile_columns()` (which diffs live columns against `SCHEMA_SQL` and ADDs any missing ones). The version-gated chain is reserved for data migrations and index/FTS changes that can't be expressed declaratively:
 
@@ -150,8 +157,28 @@ The `schema_version` table stores a single integer. Simple column additions are 
 | 9 | Add `codex_message_items` column to messages for Codex Responses message id/phase replay |
 | 10 | Add `messages_fts_trigram` virtual table (trigram tokenizer for CJK / substring search) and backfill existing rows |
 | 11 | Re-index `messages_fts` and `messages_fts_trigram` to cover `tool_name` + `tool_calls` and switch from external-content to inline mode; drop old triggers and backfill every message row |
+| 20 | Add `sessions.last_activity_at`, the partial activity index, and `session_projection_meta` generation/backfill state |
 
 Declarative column adds use `ALTER TABLE ADD COLUMN` wrapped in try/except to handle the column-already-exists case (idempotent). The version number is bumped after each successful migration block.
+
+
+## Stable Agent/WebUI Session Boundary
+
+Session-list clients must use the Agent-owned projection instead of scanning or
+aggregating `messages`:
+
+- `SessionDB.list_session_projection()` returns a bounded, activity-ordered
+  summary and excludes `source='subagent'` before aggregation.
+- `SessionDB.get_session_projection_generation()` is the cache invalidation
+  token. It increments only when sidebar-visible metadata or activity changes.
+- Message writes for subagent sessions update that child's own
+  `last_activity_at`, but do not increment the default projection generation.
+- Existing databases backfill `last_activity_at` in resumable batches on a
+  daemon-owned connection after startup. No message scan runs on a request or
+  startup-critical path.
+
+WebUI may use its legacy query only as a background compatibility fallback for
+Agent schemas older than v20. WebUI must never migrate or repair Agent state.
 
 
 ## Write Contention Handling

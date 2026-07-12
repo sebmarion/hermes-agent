@@ -122,7 +122,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -742,6 +742,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     compression_failure_error TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
+    last_activity_at REAL,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -771,6 +772,17 @@ CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS session_projection_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    generation INTEGER NOT NULL DEFAULT 0,
+    backfill_rowid INTEGER NOT NULL DEFAULT 0,
+    backfill_complete INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT OR IGNORE INTO session_projection_meta (
+    id, generation, backfill_rowid, backfill_complete
+) VALUES (1, 0, 0, 1);
 
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
@@ -808,6 +820,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_projection_activity
+    ON sessions(last_activity_at DESC, started_at DESC)
+    WHERE source != 'subagent';
 """
 
 FTS_SQL = """
@@ -898,8 +913,16 @@ class SessionDB:
     # pays almost nothing; the cadence is deliberately coarse so the one-off
     # merge cost is amortised far below the checkpoint cadence.
     _OPTIMIZE_EVERY_N_WRITES = 1000
+    _projection_backfill_claims: set[str] = set()
+    _projection_backfill_claims_lock = threading.Lock()
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Path = None,
+        read_only: bool = False,
+        *,
+        _start_projection_backfill: bool = True,
+    ):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.read_only = read_only
 
@@ -974,6 +997,8 @@ class SessionDB:
                 if not report.get("repaired"):
                     raise
                 _connect_and_init()
+            if _start_projection_backfill:
+                self.start_session_projection_backfill()
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -1190,6 +1215,197 @@ class SessionDB:
         raise last_err or sqlite3.OperationalError(
             "database is locked after max retries"
         )
+
+    # ── Lightweight session projection ───────────────────────────────
+
+    @staticmethod
+    def _projection_source_is_visible(source: Any) -> bool:
+        return str(source or "").strip().lower() != "subagent"
+
+    @staticmethod
+    def _bump_session_projection(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "UPDATE session_projection_meta SET generation = generation + 1 "
+            "WHERE id = 1"
+        )
+
+    @classmethod
+    def _bump_session_projection_for_id(
+        cls, conn: sqlite3.Connection, session_id: str
+    ) -> None:
+        row = conn.execute(
+            "SELECT source FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is not None and cls._projection_source_is_visible(row[0]):
+            cls._bump_session_projection(conn)
+
+    def get_session_projection_generation(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT generation FROM session_projection_meta WHERE id = 1"
+            ).fetchone()
+        return int(row[0] if row is not None else 0)
+
+    def list_session_projection(
+        self,
+        *,
+        limit: int = 200,
+        include_archived: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return the bounded Agent-owned sidebar summary.
+
+        Delegated children remain directly addressable through normal session
+        lookup APIs but are deliberately absent from this default projection.
+        """
+        try:
+            bounded_limit = max(0, min(int(limit), 10000))
+        except (TypeError, ValueError):
+            bounded_limit = 200
+        archived_clause = "" if include_archived else " AND archived = 0"
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, source, title, model, parent_session_id, started_at, "
+                "ended_at, end_reason, message_count, tool_call_count, archived, "
+                "last_activity_at FROM sessions "
+                "WHERE source != 'subagent'" + archived_clause + " "
+                "ORDER BY last_activity_at DESC, started_at DESC LIMIT ?",
+                (bounded_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def explain_session_projection(self, *, limit: int = 200) -> List[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "EXPLAIN QUERY PLAN SELECT id FROM sessions "
+                "WHERE source != 'subagent' AND archived = 0 "
+                "ORDER BY last_activity_at DESC, started_at DESC LIMIT ?",
+                (max(0, int(limit)),),
+            ).fetchall()
+        return [str(row[3]) for row in rows]
+
+    def backfill_session_projection_batch(self, *, batch_size: int = 500) -> dict:
+        """Backfill ``last_activity_at`` in a small resumable transaction."""
+        bounded_batch = max(1, min(int(batch_size), 5000))
+
+        def _do(conn):
+            meta = conn.execute(
+                "SELECT backfill_rowid, backfill_complete "
+                "FROM session_projection_meta WHERE id = 1"
+            ).fetchone()
+            cursor_rowid = int(meta[0] or 0) if meta is not None else 0
+            if meta is not None and int(meta[1] or 0):
+                return {"rows_scanned": 0, "rows_updated": 0, "complete": True}
+
+            rows = conn.execute(
+                "SELECT rowid, id, source FROM sessions WHERE rowid > ? "
+                "ORDER BY rowid LIMIT ?",
+                (cursor_rowid, bounded_batch),
+            ).fetchall()
+            updated_visible = False
+            rows_updated = 0
+            for row in rows:
+                activity = conn.execute(
+                    "SELECT MAX(timestamp) FROM messages WHERE session_id = ?",
+                    (row[1],),
+                ).fetchone()[0]
+                if activity is not None:
+                    changed = conn.execute(
+                        "UPDATE sessions SET last_activity_at = ? "
+                        "WHERE id = ? AND last_activity_at IS NULL",
+                        (activity, row[1]),
+                    ).rowcount
+                    if changed:
+                        rows_updated += 1
+                        updated_visible = updated_visible or self._projection_source_is_visible(row[2])
+
+            next_rowid = int(rows[-1][0]) if rows else cursor_rowid
+            more = conn.execute(
+                "SELECT 1 FROM sessions WHERE rowid > ? LIMIT 1", (next_rowid,)
+            ).fetchone()
+            complete = more is None
+            conn.execute(
+                "UPDATE session_projection_meta SET backfill_rowid = ?, "
+                "backfill_complete = ? WHERE id = 1",
+                (next_rowid, 1 if complete else 0),
+            )
+            if updated_visible:
+                self._bump_session_projection(conn)
+            return {
+                "rows_scanned": len(rows),
+                "rows_updated": rows_updated,
+                "complete": complete,
+            }
+
+        return self._execute_write(_do)
+
+    def start_session_projection_backfill(self, *, batch_size: int = 500) -> bool:
+        """Start one daemon-owned resumable projection backfill for this DB.
+
+        The caller only claims and starts a thread; SQLite reads and writes run
+        on a dedicated connection so Agent/WebUI startup never waits for old
+        message history to be aggregated.
+        """
+        with self._lock:
+            meta = self._conn.execute(
+                "SELECT backfill_complete FROM session_projection_meta WHERE id = 1"
+            ).fetchone()
+        if meta is None or int(meta[0] or 0):
+            return False
+
+        claim = str(Path(self.db_path).expanduser().resolve())
+        with self._projection_backfill_claims_lock:
+            if claim in self._projection_backfill_claims:
+                return False
+            self._projection_backfill_claims.add(claim)
+
+        def _run() -> None:
+            started = time.monotonic()
+            scanned = 0
+            updated = 0
+            worker = None
+            try:
+                worker = SessionDB(
+                    Path(claim),
+                    _start_projection_backfill=False,
+                )
+                while True:
+                    result = worker.backfill_session_projection_batch(
+                        batch_size=batch_size
+                    )
+                    scanned += int(result.get("rows_scanned", 0))
+                    updated += int(result.get("rows_updated", 0))
+                    if result.get("complete"):
+                        break
+                    time.sleep(0)
+                logger.info(
+                    "session projection backfill complete db=%s rows_scanned=%d "
+                    "rows_updated=%d duration_ms=%d",
+                    claim,
+                    scanned,
+                    updated,
+                    int((time.monotonic() - started) * 1000),
+                )
+            except Exception:
+                logger.warning(
+                    "session projection backfill failed db=%s rows_scanned=%d "
+                    "rows_updated=%d",
+                    claim,
+                    scanned,
+                    updated,
+                    exc_info=True,
+                )
+            finally:
+                if worker is not None:
+                    worker.close()
+                with self._projection_backfill_claims_lock:
+                    self._projection_backfill_claims.discard(claim)
+
+        threading.Thread(
+            target=_run,
+            name="hermes-session-projection-backfill",
+            daemon=True,
+        ).start()
+        return True
 
     def _try_wal_checkpoint(self) -> None:
         """Best-effort TRUNCATE WAL checkpoint.  Never raises.
@@ -1546,6 +1762,15 @@ class SessionDB:
                     # means consumers fall back to sessions.json for those
                     # rows until the gateway rewrites them.
                     logger.debug("v18 gateway metadata backfill skipped: %s", exc)
+            if current_version < 20:
+                # v20's activity projection is deliberately backfilled by a
+                # daemon after this startup transaction commits. Marking the
+                # resumable cursor here is O(1); no message aggregation occurs
+                # on the startup-critical path.
+                cursor.execute(
+                    "UPDATE session_projection_meta SET backfill_rowid = 0, "
+                    "backfill_complete = 0 WHERE id = 1"
+                )
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -1622,6 +1847,12 @@ class SessionDB:
         no chat/thread to compare).
         """
         def _do(conn):
+            before = conn.execute(
+                "SELECT source, model, model_config, system_prompt, session_key, "
+                "chat_id, chat_type, thread_id, parent_session_id, cwd "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
@@ -1654,6 +1885,15 @@ class SessionDB:
                     time.time(),
                 ),
             )
+            after = conn.execute(
+                "SELECT source, model, model_config, system_prompt, session_key, "
+                "chat_id, chat_type, thread_id, parent_session_id, cwd "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if after is not None and tuple(after) != (tuple(before) if before is not None else None):
+                if self._projection_source_is_visible(after[0]):
+                    self._bump_session_projection(conn)
         self._execute_write(_do)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
@@ -2014,20 +2254,25 @@ class SessionDB:
         intentionally need to re-end a closed session with a new reason.
         """
         def _do(conn):
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",
                 (time.time(), end_reason, session_id),
             )
+            if cursor.rowcount:
+                self._bump_session_projection_for_id(conn, session_id)
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
         def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+            cursor = conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                "WHERE id = ? AND (ended_at IS NOT NULL OR end_reason IS NOT NULL)",
                 (session_id,),
             )
+            if cursor.rowcount:
+                self._bump_session_projection_for_id(conn, session_id)
         self._execute_write(_do)
 
     def update_session_cwd(
@@ -2361,10 +2606,12 @@ class SessionDB:
         so that the dashboard reflects the user's latest /model choice.
         """
         def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET model = ? WHERE id = ?",
-                (model, session_id),
+            cursor = conn.execute(
+                "UPDATE sessions SET model = ? WHERE id = ? AND model IS NOT ?",
+                (model, session_id, model),
             )
+            if cursor.rowcount:
+                self._bump_session_projection_for_id(conn, session_id)
         self._execute_write(_do)
 
     def update_session_billing_route(
@@ -2706,6 +2953,11 @@ class SessionDB:
         """
         title = self.sanitize_title(title)
         def _do(conn):
+            existing = conn.execute(
+                "SELECT title FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if existing is None:
+                return 0
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
                 cursor = conn.execute(
@@ -2737,11 +2989,13 @@ class SessionDB:
                         raise ValueError(
                             f"Title '{title}' is already in use by session {conflict_id}"
                         )
-            cursor = conn.execute(
-                "UPDATE sessions SET title = ? WHERE id = ?",
-                (title, session_id),
-            )
-            return cursor.rowcount
+            if existing[0] != title:
+                conn.execute(
+                    "UPDATE sessions SET title = ? WHERE id = ?",
+                    (title, session_id),
+                )
+                self._bump_session_projection_for_id(conn, session_id)
+            return 1
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
@@ -2765,6 +3019,41 @@ class SessionDB:
         Returns True when at least one row was updated.
         """
         def _do(conn):
+            target = 1 if archived else 0
+            visible_change = conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                SELECT 1 FROM sessions
+                WHERE id IN (SELECT id FROM lineage)
+                  AND archived != ?
+                  AND source != 'subagent'
+                LIMIT 1
+                """,
+                (session_id, session_id, target),
+            ).fetchone() is not None
             cursor = conn.execute(
                 """
                 WITH RECURSIVE
@@ -2794,12 +3083,15 @@ class SessionDB:
                 UPDATE sessions
                 SET archived = ?
                 WHERE id IN (SELECT id FROM lineage)
+                  AND archived != ?
                 """,
-                (session_id, session_id, 1 if archived else 0),
+                (session_id, session_id, target, target),
             )
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:
                 rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            if rowcount and visible_change:
+                self._bump_session_projection(conn)
             return rowcount
         rowcount = self._execute_write(_do)
         return rowcount > 0
@@ -3492,14 +3784,23 @@ class SessionDB:
             if num_tool_calls > 0:
                 conn.execute(
                     """UPDATE sessions SET message_count = message_count + 1,
-                       tool_call_count = tool_call_count + ? WHERE id = ?""",
-                    (num_tool_calls, session_id),
+                       tool_call_count = tool_call_count + ?,
+                       last_activity_at = CASE
+                           WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ?
+                           ELSE last_activity_at END
+                       WHERE id = ?""",
+                    (num_tool_calls, message_timestamp, message_timestamp, session_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
-                    (session_id,),
+                    """UPDATE sessions SET message_count = message_count + 1,
+                       last_activity_at = CASE
+                           WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ?
+                           ELSE last_activity_at END
+                       WHERE id = ?""",
+                    (message_timestamp, message_timestamp, session_id),
                 )
+            self._bump_session_projection_for_id(conn, session_id)
             return msg_id
 
         return self._execute_write(_do)
@@ -3627,9 +3928,12 @@ class SessionDB:
                 conn, session_id, messages
             )
             conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (total_messages, total_tool_calls, session_id),
+                "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                "last_activity_at = (SELECT MAX(timestamp) FROM messages "
+                "WHERE session_id = ? AND active = 1) WHERE id = ?",
+                (total_messages, total_tool_calls, session_id, session_id),
             )
+            self._bump_session_projection_for_id(conn, session_id)
 
         self._execute_write(_do)
 
@@ -3692,9 +3996,12 @@ class SessionDB:
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
             conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (inserted, tool_calls_total, session_id),
+                "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                "last_activity_at = (SELECT MAX(timestamp) FROM messages "
+                "WHERE session_id = ? AND active = 1) WHERE id = ?",
+                (inserted, tool_calls_total, session_id, session_id),
             )
+            self._bump_session_projection_for_id(conn, session_id)
             return inserted
 
         return self._execute_write(_do)
@@ -4976,9 +5283,11 @@ class SessionDB:
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
             conn.execute(
-                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
+                "UPDATE sessions SET message_count = 0, tool_call_count = 0, "
+                "last_activity_at = NULL WHERE id = ?",
                 (session_id,),
             )
+            self._bump_session_projection_for_id(conn, session_id)
         self._execute_write(_do)
 
     @staticmethod
@@ -5026,11 +5335,18 @@ class SessionDB:
         removed_delegate_ids: List[str] = []
 
         def _do(conn):
-            cursor = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
-            )
-            if cursor.fetchone()[0] == 0:
+            row = conn.execute(
+                "SELECT source FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
                 return False
+            visible_change = self._projection_source_is_visible(row[0])
+            if not visible_change:
+                visible_change = conn.execute(
+                    "SELECT 1 FROM sessions WHERE parent_session_id = ? "
+                    "AND source != 'subagent' LIMIT 1",
+                    (session_id,),
+                ).fetchone() is not None
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
@@ -5040,6 +5356,8 @@ class SessionDB:
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            if visible_change:
+                self._bump_session_projection(conn)
             return True
 
         deleted = self._execute_write(_do)
@@ -5137,12 +5455,17 @@ class SessionDB:
             # First, filter to IDs that actually exist — we want to
             # return the real deleted count, not the input length.
             cursor = conn.execute(
-                f"SELECT id FROM sessions WHERE id IN ({placeholders})",
+                f"SELECT id, source FROM sessions WHERE id IN ({placeholders})",
                 unique_ids,
             )
-            existing = [row["id"] for row in cursor.fetchall()]
+            existing_rows = cursor.fetchall()
+            existing = [row["id"] for row in existing_rows]
             if not existing:
                 return 0
+            visible_change = any(
+                self._projection_source_is_visible(row["source"])
+                for row in existing_rows
+            )
 
             existing_placeholders = ",".join("?" * len(existing))
             removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
@@ -5164,6 +5487,8 @@ class SessionDB:
                 f"DELETE FROM sessions WHERE id IN ({existing_placeholders})",
                 existing,
             )
+            if visible_change:
+                self._bump_session_projection(conn)
             removed_ids.extend(existing)
             return len(existing)
 
