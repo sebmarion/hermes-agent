@@ -205,6 +205,28 @@ def test_real_macos_sandbox_denies_shell_python_symlink_chmod_and_original_check
     assert not (outside / "chmod.txt").exists()
 
 
+def test_detached_sandbox_preserves_approved_git_subdirectory(tmp_path, monkeypatch):
+    from tools.delegate_tool import _bestplan_sandbox_workspace
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    project = repo / "services" / "api"
+    project.mkdir(parents=True)
+    (project / "tracked.txt").write_text("base", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    home = tmp_path / "hermes-home"
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+
+    detached = _bestplan_sandbox_workspace(str(project), "bp-subdir")
+    expected_root = home / "bestplan" / "worktrees" / "bp-subdir"
+    assert detached.relative_to(expected_root) == Path("services/api")
+    assert (detached / "tracked.txt").read_text(encoding="utf-8") == "base"
+
+
 def test_fast_completion_evidence_wins_over_late_dispatch_write(tmp_path):
     workspace = str(tmp_path.resolve())
     store = BestplanStore(db_path=tmp_path / "state.db")
