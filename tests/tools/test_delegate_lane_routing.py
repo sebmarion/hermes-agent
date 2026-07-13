@@ -299,6 +299,31 @@ def test_lane_credentials_and_toolsets_are_resolved_per_task(monkeypatch):
     }
 
 
+def test_direct_endpoint_lane_without_key_fails_closed(monkeypatch):
+    cfg = _lane_cfg()
+    cfg["lanes"]["smart_reviewer"].update(
+        {"provider": "custom", "base_url": "https://lane.invalid/v1"}
+    )
+    monkeypatch.setattr(
+        delegate_tool,
+        "_resolve_delegation_credentials",
+        lambda lane_cfg, parent_agent: {
+            "model": lane_cfg.get("model"),
+            "provider": "custom",
+            "base_url": lane_cfg.get("base_url"),
+            "api_key": None,
+            "api_mode": "chat_completions",
+        },
+    )
+
+    with pytest.raises(ValueError, match="direct endpoint.*no api_key"):
+        delegate_tool._resolve_delegation_credentials_for_task(
+            cfg,
+            parent_agent=object(),
+            task={"route": "smart_reviewer"},
+        )
+
+
 @pytest.mark.parametrize(
     "invalid_toolsets",
     [[], "", " , ", 42, [42], [None], [{}], ["missing_toolset"]],

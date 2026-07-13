@@ -517,6 +517,62 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertIsNone(MockAgent.call_args.kwargs["fallback_model"])
 
+    def test_explicit_lane_child_does_not_inherit_parent_credentials(self):
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "https://parent.invalid/v1"
+        parent.api_key = "parent-secret"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Review the repository",
+                context=None,
+                toolsets=["file"],
+                model="lane-model",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="custom",
+                override_base_url="https://lane.invalid/v1",
+                override_api_key=None,
+                inherit_parent_fallback=False,
+                inherit_parent_credentials=False,
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["base_url"], "https://lane.invalid/v1")
+        self.assertIsNone(kwargs["api_key"])
+        self.assertNotEqual(kwargs["api_key"], parent.api_key)
+
+    def test_explicit_lane_child_does_not_attach_any_credential_pool(self):
+        parent = _make_mock_parent(depth=0)
+        parent._credential_pool = MagicMock()
+        child = MagicMock()
+
+        with (
+            patch("run_agent.AIAgent", return_value=child),
+            patch("tools.delegate_tool._resolve_child_credential_pool") as resolve_pool,
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="Review the repository",
+                context=None,
+                toolsets=["file"],
+                model="lane-model",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="custom",
+                override_base_url="https://lane.invalid/v1",
+                override_api_key="lane-key",
+                inherit_parent_fallback=False,
+                inherit_parent_credentials=False,
+            )
+
+        resolve_pool.assert_not_called()
+        self.assertNotIn("_credential_pool", child.__dict__)
+
     def test_non_lane_child_retains_parent_fallback_chain(self):
         parent = _make_mock_parent(depth=0)
         fallback = [{"provider": "custom:zeus", "model": "glm-4.7-flash"}]
@@ -728,6 +784,92 @@ class TestDelegateTask(unittest.TestCase):
 
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["tool_trace"][0]["status"], "error")
+
+    def test_wrapped_external_tool_error_is_failed_tool_evidence(self):
+        """Real untrusted-result wrapping must not hide structured failures."""
+        from agent.tool_dispatch_helpers import make_tool_result_message
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"web_search"}
+        wrapped_result = make_tool_result_message(
+            "web_search",
+            json.dumps(
+                {
+                    "error": (
+                        "provider rejected the request because authentication failed"
+                    )
+                }
+            ),
+            "call-wrapped-error",
+        )
+        child.run_conversation.return_value = {
+            "final_response": "Search complete.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 2,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-wrapped-error",
+                            "function": {"name": "web_search", "arguments": "{}"},
+                        }
+                    ],
+                },
+                wrapped_result,
+            ],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Search for evidence",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertIn("<untrusted_tool_result", wrapped_result["content"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_kind"], "tool_execution_failed")
+        self.assertEqual(result["evidence"]["successful_tool_count"], 0)
+        self.assertEqual(result["tool_trace"][0]["status"], "error")
+
+    def test_malformed_untrusted_wrappers_fail_closed(self):
+        from agent.tool_dispatch_helpers import make_tool_result_message
+        from tools.delegate_tool import _looks_like_error_output
+
+        valid = make_tool_result_message(
+            "web_search",
+            json.dumps({"result": "successful external payload with enough length"}),
+            "call-wrapper",
+        )["content"]
+        malformed = {
+            "truncated": valid.removesuffix("\n</untrusted_tool_result>"),
+            "trailing_bytes": valid + "\nCORRUPTED",
+            "malformed_open": valid.replace(
+                '<untrusted_tool_result source="web_search">',
+                '<untrusted_tool_result source="web_search" extra>',
+                1,
+            ),
+            "duplicate_close": valid + "\n</untrusted_tool_result>",
+            "nested_delimiter": valid.replace(
+                "successful external payload",
+                "successful <untrusted_tool_result> external payload",
+                1,
+            ),
+            "uppercase_tag": valid.replace(
+                "untrusted_tool_result", "UNTRUSTED_TOOL_RESULT"
+            ),
+            "leading_text": "NOTICE\n" + valid,
+            "leading_blank_line": "\n" + valid,
+            "trailing_whitespace": valid + "\n",
+        }
+
+        self.assertFalse(_looks_like_error_output(valid))
+        for label, content in malformed.items():
+            with self.subTest(label=label):
+                self.assertTrue(_looks_like_error_output(content))
 
     def test_executor_exception_string_is_failed_tool_evidence(self):
         """Canonical executor failures must never satisfy the evidence gate."""
@@ -1700,8 +1842,8 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_mode"], "anthropic_messages")
 
     def test_direct_endpoint_returns_none_api_key_when_not_configured(self):
-        # When base_url is set without api_key, api_key should be None so
-        # _build_child_agent inherits the parent's key (effective_api_key = override or parent).
+        # The low-level resolver stays side-effect free and reports the omission;
+        # lane resolution rejects it before child construction can inherit a key.
         parent = _make_mock_parent(depth=0)
         cfg = {
             "model": "qwen2.5-coder",
@@ -1713,7 +1855,8 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["provider"], "custom")
 
     def test_direct_endpoint_no_raise_when_only_provider_env_key_present(self):
-        # Even if OPENAI_API_KEY is absent, no ValueError — _build_child_agent uses parent key.
+        # The low-level resolver records no key. Deterministic lane resolution
+        # rejects that incomplete direct-endpoint config before building a child.
         parent = _make_mock_parent(depth=0)
         cfg = {
             "model": "qwen2.5-coder",
