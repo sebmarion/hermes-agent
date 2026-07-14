@@ -19,9 +19,12 @@ session list while the app remains running.
 ## Goal
 
 While Hermes One is running, externally committed session-list changes should
-be reflected in every open Hermes One window within five seconds under normal
-macOS scheduling, regardless of window focus, minimization, or active screen.
-Returning from system sleep should trigger an immediate catch-up check.
+be detected by the next five-second probe under normal macOS scheduling,
+regardless of window focus, minimization, or active screen. The refreshed list
+is published after the canonical refresh completes, so end-to-end visibility is
+one probe interval plus refresh and IPC time rather than a strict five-second
+wall-clock SLA. Returning from system sleep should trigger an immediate
+catch-up check.
 
 ## Non-goals
 
@@ -85,6 +88,8 @@ Introduce a narrowly scoped main-process component, referred to here as
 
 - one stable, read-only SQLite connection for the active profile database;
 - the last observed `PRAGMA data_version` value;
+- the database path and filesystem identity used by that connection;
+- a monotonically increasing profile/database generation token;
 - a five-second timer;
 - single-flight refresh state; and
 - start, stop, profile-change, and system-resume lifecycle methods.
@@ -95,6 +100,15 @@ the active profile or database path changes, it closes the old connection,
 opens the new one, establishes a new baseline, and requests an immediate full
 refresh through the existing profile-switch path.
 
+Before comparing `data_version`, each tick also validates that the database
+path still resolves to the same file identity (device/inode or the closest
+portable equivalent available to the Electron main process). If the database
+disappears or the identity changes because `state.db` was atomically replaced,
+the monitor closes the stale connection. When the path becomes available, it
+opens a new read-only connection, increments the generation token, establishes
+a baseline, and requests a canonical full refresh. It must never continue
+polling an unlinked old database inode.
+
 The timer belongs to Electron's main process rather than a React component.
 Chromium may throttle renderer timers when a window is hidden, minimized, or
 unfocused; the main process must continue monitoring for as long as the app is
@@ -104,13 +118,31 @@ running.
 
 On each tick:
 
-1. Read `PRAGMA data_version` from the monitor connection.
-2. If the value is unchanged, do nothing else.
-3. If it changed, request one refresh through the existing canonical session
-   list/cache function.
-4. If another change arrives while a refresh is running, remember one pending
-   check instead of starting a concurrent refresh.
-5. After the refresh settles, run the pending check once.
+1. Validate the connection's database path and file identity.
+2. Read `PRAGMA data_version` from the monitor connection.
+3. If the value matches the last successfully acknowledged revision and no
+   dirty refresh is pending, do nothing else.
+4. If it differs, capture the candidate revision and current generation, mark
+   the monitor dirty, and request one refresh through the existing canonical
+   session list/cache function.
+5. If another tick or lifecycle event arrives while a refresh is running,
+   remember one pending check instead of starting a concurrent refresh.
+6. A candidate revision is acknowledged only after the canonical refresh
+   succeeds for the same profile/database generation. A failed refresh leaves
+   the monitor dirty so the next tick retries even if `data_version` has not
+   changed again.
+7. Immediately after a successful refresh, re-read `data_version`. If it no
+   longer matches the candidate revision, keep the monitor dirty and run one
+   follow-up refresh/check so a commit that landed during the refresh cannot be
+   lost.
+8. If the generation changed while the refresh was in flight, discard its
+   result and notification. It must not update or publish state for the newly
+   active profile.
+
+Refresh work must be scoped to the captured profile/database identity. It may
+either write only that profile's own cache or return a staged result that is
+committed after the generation guard passes; it must not re-resolve a mutable
+"active profile" halfway through asynchronous work.
 
 The monitor must not introduce a second session-list projection or duplicate
 the filtering, paging, lineage, archive, pin, or profile rules already owned by
@@ -119,8 +151,12 @@ the canonical refresh path.
 ### Renderer notification
 
 After a successful refresh, the main process emits one session-list-changed
-notification to every live Hermes One renderer window through the existing
-preload/IPC boundary.
+invalidation to every live Hermes One renderer window through the existing
+preload/IPC boundary. The event carries the profile key and generation, not a
+copied session-list payload. A renderer whose current scope includes that
+profile reads back through the existing canonical cache/list API; a stale event
+for a prior generation is ignored. This keeps filtering, paging, lineage,
+archive, pin, and merge semantics in their current owner.
 
 Renderer behavior:
 
@@ -151,9 +187,13 @@ Renderer behavior:
   tick, and establish a baseline when the database appears.
 - If the database is temporarily locked, replaced, or unavailable, keep the
   last good list and retry. Do not clear the sidebar.
-- If the change probe succeeds but the full refresh fails, do not publish a
-  success notification. Preserve the last good cache and retry after a later
-  revision/check.
+- If the change probe succeeds but the full refresh fails, do not acknowledge
+  the candidate revision or publish a success notification. Preserve the last
+  good cache, keep the monitor dirty, and retry on the next tick even if no
+  later commit occurs.
+- If a database or profile generation changes during an in-flight refresh,
+  discard that refresh's result and notification before it can affect the new
+  generation.
 - Log repeated failures with rate limiting or state-transition logging; do not
   show a toast every five seconds.
 - A failure in one tick must not stop the monitor permanently.
@@ -178,17 +218,24 @@ Renderer behavior:
 2. With two real SQLite connections against a temporary profile database, a
    commit on the writer connection changes the monitor connection's
    `data_version` and triggers one refresh within the next tick.
-3. Multiple ticks or commits while a refresh is in flight coalesce into one
-   follow-up check and never run concurrent refreshes.
-4. A missing, locked, or replaced database preserves the last good list and
+3. A failed refresh does not acknowledge the candidate revision, remains dirty,
+   and retries on the next tick without requiring another database commit.
+4. A commit that lands during a successful refresh is found by the post-refresh
+   probe and produces one coalesced follow-up refresh.
+5. Multiple ticks or commits while a refresh is in flight never run concurrent
+   refreshes.
+6. A missing, locked, or atomically replaced database preserves the last good
+   list; replacement changes file identity, reopens the connection, and
    recovers on a later tick.
-5. Switching profiles closes the previous connection, resets the revision
-   baseline, and cannot publish rows from the old profile.
-6. Successful refresh emits one IPC notification to all live windows.
-7. Renderer reconciliation preserves optimistic, pinned, active, and recently
+7. Switching profiles closes the previous connection, increments the
+   generation, resets the revision baseline, and cannot publish rows or an IPC
+   invalidation from the old profile.
+8. Successful refresh emits one profile/generation-scoped invalidation to all
+   live windows; renderer read-back uses the canonical list API.
+9. Renderer reconciliation preserves optimistic, pinned, active, and recently
    settled rows under the existing merge contract.
-8. System resume invokes an immediate check without creating a second timer.
-9. Shutdown clears the timer and closes the monitor connection.
+10. System resume invokes an immediate check without creating a second timer.
+11. Shutdown clears the timer and closes the monitor connection.
 
 Tests that exercise SQLite behavior must use a real temporary database rather
 than mocking `PRAGMA data_version`. They must not read or write the user's real
@@ -199,8 +246,9 @@ than mocking `PRAGMA data_version`. They must not read or write the user's real
 1. Start Hermes One and leave its sessions visible in an unfocused or minimized
    window.
 2. Create or continue a conversation in Hermes WebUI.
-3. Confirm Hermes One's session state updates within five seconds without first
-   focusing the app.
+3. Confirm Hermes One starts the refresh by the next five-second probe and the
+   session state appears after that refresh completes, without first focusing
+   the app.
 4. Repeat while Hermes One is showing a non-session screen; open the sessions
    view afterward and confirm the already-refreshed list appears immediately.
 5. Put the Mac to sleep, mutate session state from another surface if possible,
