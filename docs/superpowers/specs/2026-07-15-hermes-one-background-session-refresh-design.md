@@ -200,8 +200,9 @@ Renderer behavior:
 
 ## Performance invariants
 
-- An unchanged `data_version` must not run the full session projection or write
-  the JSON cache.
+- An unchanged `data_version` while the monitor is clean must not run the full
+  session projection or write the JSON cache. A dirty monitor intentionally
+  retries an unacknowledged failed refresh without requiring a new revision.
 - At most one full session refresh may run at a time.
 - The monitor uses a read-only connection and must not create an empty
   `state.db` as a side effect.
@@ -213,8 +214,8 @@ Renderer behavior:
 
 ### Automated tests
 
-1. With a fake clock and unchanged revision, multiple ticks perform only the
-   lightweight probe and never call the full refresh.
+1. With a fake clock, unchanged revision, and a clean monitor, multiple ticks
+   perform only the lightweight probe and never call the full refresh.
 2. With two real SQLite connections against a temporary profile database, a
    commit on the writer connection changes the monitor connection's
    `data_version` and triggers one refresh within the next tick.
