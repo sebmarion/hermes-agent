@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  getAllProfileSessionsRevision,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -57,6 +58,17 @@ describe('Hermes REST session helpers', () => {
         timeoutMs: 60_000
       })
     )
+  })
+
+  it('uses the lightweight timeout for the all-profile revision probe', async () => {
+    api.mockResolvedValue({ profiles: ['worker one'], revision: 'revision-1' })
+
+    await getAllProfileSessionsRevision('worker one')
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/profiles/sessions/revision?profile=worker%20one',
+      timeoutMs: 5_000
+    })
   })
 
   it('uses a longer timeout for profile listing during desktop startup', async () => {

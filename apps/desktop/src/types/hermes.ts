@@ -301,6 +301,11 @@ export interface PaginatedSessions {
   errors?: Array<{ profile: string; error: string }>
 }
 
+export interface SessionRevisionResponse {
+  profiles: string[]
+  revision: string
+}
+
 export interface RpcEvent<T = unknown> {
   payload?: T
   session_id?: string
