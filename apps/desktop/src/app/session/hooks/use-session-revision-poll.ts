@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 
 import { getAllProfileSessionsRevision } from '@/hermes'
+import { ALL_PROFILES } from '@/store/profile'
 
 const SESSION_REVISION_POLL_INTERVAL_MS = 5_000
 
@@ -105,6 +106,7 @@ export function useSessionRevisionPoll({ enabled, profileScope, refreshSessions 
       profileScope,
       refreshSessions
     }
+    const revisionProfileScope = generation.profileScope === ALL_PROFILES ? 'all' : generation.profileScope
 
     coordinator.disposed = false
     coordinator.activeGeneration = generation
@@ -138,7 +140,7 @@ export function useSessionRevisionPoll({ enabled, profileScope, refreshSessions 
 
     const runCycle = async (): Promise<void> => {
       try {
-        const candidate = (await getAllProfileSessionsRevision(generation.profileScope)).revision
+        const candidate = (await getAllProfileSessionsRevision(revisionProfileScope)).revision
 
         if (!isCurrent()) {
           return
@@ -164,7 +166,7 @@ export function useSessionRevisionPoll({ enabled, profileScope, refreshSessions 
           return
         }
 
-        const confirmed = (await getAllProfileSessionsRevision(generation.profileScope)).revision
+        const confirmed = (await getAllProfileSessionsRevision(revisionProfileScope)).revision
 
         if (!isCurrent()) {
           return

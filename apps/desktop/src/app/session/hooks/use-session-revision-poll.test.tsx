@@ -3,10 +3,12 @@ import { type PropsWithChildren, StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getAllProfileSessionsRevision } from '@/hermes'
+import { ALL_PROFILES } from '@/store/profile'
 
 import { useSessionRevisionPoll } from './use-session-revision-poll'
 
-vi.mock('@/hermes', () => ({
+vi.mock('@/hermes', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   getAllProfileSessionsRevision: vi.fn()
 }))
 
@@ -85,6 +87,18 @@ describe('useSessionRevisionPoll', () => {
 
     expect(revisionProbe).toHaveBeenCalledTimes(3)
     expect(refreshSessions).toHaveBeenCalledTimes(1)
+  })
+
+  it('normalizes the real all-profiles UI sentinel for the backend revision API', async () => {
+    revisionProbe.mockResolvedValue(revision('r1'))
+    const refreshSessions = vi.fn().mockResolvedValue('applied')
+
+    renderHook(() => useSessionRevisionPoll({ enabled: true, profileScope: ALL_PROFILES, refreshSessions }))
+    await settleAsyncWork()
+
+    expect(revisionProbe).toHaveBeenCalledTimes(2)
+    expect(revisionProbe).toHaveBeenNthCalledWith(1, 'all')
+    expect(revisionProbe).toHaveBeenNthCalledWith(2, 'all')
   })
 
   it('refreshes a changed revision by the next five-second tick', async () => {
