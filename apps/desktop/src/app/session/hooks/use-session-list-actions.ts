@@ -71,6 +71,16 @@ interface UseSessionListActionsArgs {
   profileScope: string
 }
 
+function assertCompleteSessionPage(result: PaginatedSessions): void {
+  if (!result.errors?.length) {
+    return
+  }
+
+  const profiles = result.errors.map(item => item.profile).join(', ')
+
+  throw new Error(`Session refresh incomplete for profiles: ${profiles}`)
+}
+
 /** Owns the sidebar's session-list fetching + paging: recents, cron runs/jobs,
  *  and the per-platform messaging slices. Returns the callbacks the controller
  *  wires into the sidebar and refresh effects. */
@@ -85,15 +95,13 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
   // the sidebar now lists cron *jobs*, not run sessions) so a pinned cron run
   // still resolves into the Pinned section via sessionByAnyId.
   const fetchCronSessions = useCallback(async () => {
-    const result = await listAllProfileSessions(CRON_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
+    return listAllProfileSessions(CRON_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
       source: 'cron'
     })
-
-    return result.sessions
   }, [])
 
-  const applyCronSessions = useCallback((sessions: SessionInfo[]) => {
-    setCronSessions(prev => (sameCronSignature(prev, sessions) ? prev : sessions))
+  const applyCronSessions = useCallback((result: PaginatedSessions) => {
+    setCronSessions(prev => (sameCronSignature(prev, result.sessions) ? prev : result.sessions))
   }, [])
 
   const refreshCronSessions = useCallback(async () => {
@@ -101,10 +109,10 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     refreshCronSessionsRequestRef.current = requestId
 
     try {
-      const sessions = await fetchCronSessions()
+      const result = await fetchCronSessions()
 
       if (refreshCronSessionsRequestRef.current === requestId) {
-        applyCronSessions(sessions)
+        applyCronSessions(result)
       }
     } catch {
       // Non-fatal for standalone refreshes: the cron section keeps its last-known rows.
@@ -191,7 +199,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     }
   }, [])
 
-  const refreshCoreSessions = useCallback(async () => {
+  const fetchCoreSessions = useCallback(async () => {
     const requestId = refreshSessionsRequestRef.current + 1
     refreshSessionsRequestRef.current = requestId
     const loadingRequestId = refreshSessionsLoadingRequestRef.current + 1
@@ -218,15 +226,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         excludeSources: SIDEBAR_EXCLUDED_SOURCES
       })
 
-      if (refreshSessionsRequestRef.current !== requestId) {
-        return { requestId, status: 'superseded' as const }
-      }
-
-      setSessions(prev => mergeSessionPage(prev, result.sessions, sessionsToKeep()))
-      setSessionsTotal(typeof result.total === 'number' ? result.total : result.sessions.length)
-      setSessionProfileTotals(result.profile_totals ?? {})
-
-      return { requestId, status: 'applied' as const }
+      return { requestId, result }
     } finally {
       if (refreshSessionsLoadingRequestRef.current === loadingRequestId) {
         setSessionsLoading(false)
@@ -234,12 +234,32 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     }
   }, [profileScope])
 
-  const refreshSessionsForRevision = useCallback(async () => {
-    const coreResult = await refreshCoreSessions()
+  const applyCoreSessions = useCallback((result: PaginatedSessions) => {
+    setSessions(prev => mergeSessionPage(prev, result.sessions, sessionsToKeep()))
+    setSessionsTotal(typeof result.total === 'number' ? result.total : result.sessions.length)
+    setSessionProfileTotals(result.profile_totals ?? {})
+  }, [])
 
-    if (coreResult.status === 'superseded') {
+  const refreshCoreSessions = useCallback(async () => {
+    const coreResult = await fetchCoreSessions()
+
+    if (refreshSessionsRequestRef.current !== coreResult.requestId) {
       return 'superseded' as const
     }
+
+    applyCoreSessions(coreResult.result)
+
+    return 'applied' as const
+  }, [applyCoreSessions, fetchCoreSessions])
+
+  const refreshSessionsForRevision = useCallback(async () => {
+    const coreResult = await fetchCoreSessions()
+
+    if (refreshSessionsRequestRef.current !== coreResult.requestId) {
+      return 'superseded' as const
+    }
+
+    assertCompleteSessionPage(coreResult.result)
 
     const cronRequestId = refreshCronSessionsRequestRef.current + 1
     refreshCronSessionsRequestRef.current = cronRequestId
@@ -252,13 +272,16 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       refreshMessagingSessionsRequestRef.current === messagingRequestId
 
     try {
-      const [cronSessions, messagingResult] = await Promise.all([fetchCronSessions(), fetchMessagingSessions()])
+      const [cronResult, messagingResult] = await Promise.all([fetchCronSessions(), fetchMessagingSessions()])
 
       if (!requestIsCurrent()) {
         return 'superseded' as const
       }
 
-      applyCronSessions(cronSessions)
+      assertCompleteSessionPage(cronResult)
+      assertCompleteSessionPage(messagingResult)
+      applyCoreSessions(coreResult.result)
+      applyCronSessions(cronResult)
       applyMessagingSessions(messagingResult)
     } catch (error) {
       if (!requestIsCurrent()) {
@@ -273,10 +296,11 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     return 'applied' as const
   }, [
     applyCronSessions,
+    applyCoreSessions,
     applyMessagingSessions,
+    fetchCoreSessions,
     fetchCronSessions,
     fetchMessagingSessions,
-    refreshCoreSessions,
     refreshCronJobs
   ])
 

@@ -106,6 +106,7 @@ export function useSessionRevisionPoll({ enabled, profileScope, refreshSessions 
       profileScope,
       refreshSessions
     }
+
     const revisionProfileScope = generation.profileScope === ALL_PROFILES ? 'all' : generation.profileScope
 
     coordinator.disposed = false

@@ -43,8 +43,8 @@ function session(id: string, source: string): SessionInfo {
   }
 }
 
-function sessionsPage(sessions: SessionInfo[] = []) {
-  return { limit: 50, offset: 0, profile_totals: {}, sessions, total: sessions.length }
+function sessionsPage(sessions: SessionInfo[] = [], errors?: Array<{ profile: string; error: string }>) {
+  return { errors, limit: 50, offset: 0, profile_totals: {}, sessions, total: sessions.length }
 }
 
 function deferred<T>() {
@@ -108,6 +108,40 @@ describe('useSessionListActions refresh acknowledgement', () => {
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
 
     await expect(result.current.refreshSessionsForRevision()).rejects.toThrow('cron sessions failed')
+  })
+
+  it('rejects a partial-success core payload without publishing it', async () => {
+    const oldLocal = session('local-old', 'desktop')
+    setSessions([oldLocal])
+    listSessionsMock
+      .mockResolvedValueOnce(
+        sessionsPage([session('local-partial', 'desktop')], [{ profile: 'worker', error: 'database is locked' }])
+      )
+      .mockResolvedValue(sessionsPage())
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
+
+    await expect(result.current.refreshSessionsForRevision()).rejects.toThrow('incomplete')
+    expect($sessions.get().map(row => row.id)).toEqual(['local-old'])
+  })
+
+  it('rejects a partial-success section payload before publishing any strict projection', async () => {
+    setSessions([session('local-old', 'desktop')])
+    setCronSessions([session('cron-old', 'cron')])
+    setMessagingSessions([session('telegram-old', 'telegram')])
+    listSessionsMock
+      .mockResolvedValueOnce(sessionsPage([session('local-new', 'desktop')]))
+      .mockResolvedValueOnce(
+        sessionsPage([session('cron-partial', 'cron')], [{ profile: 'worker', error: 'database is locked' }])
+      )
+      .mockResolvedValueOnce(sessionsPage([session('telegram-new', 'telegram')]))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
+
+    await expect(result.current.refreshSessionsForRevision()).rejects.toThrow('incomplete')
+    expect($sessions.get().map(row => row.id)).toEqual(['local-old'])
+    expect($cronSessions.get().map(row => row.id)).toEqual(['cron-old'])
+    expect($messagingSessions.get().map(row => row.id)).toEqual(['telegram-old'])
   })
 
   it('keeps optional section failures non-fatal for the existing refresh callback', async () => {
