@@ -1,6 +1,6 @@
 import { useCallback, useRef } from 'react'
 
-import { getCronJobs, listAllProfileSessions, type SessionInfo } from '@/hermes'
+import { getCronJobs, listAllProfileSessions, type PaginatedSessions, type SessionInfo } from '@/hermes'
 import {
   isMessagingSource,
   LOCAL_SESSION_SOURCE_IDS,
@@ -75,51 +75,86 @@ interface UseSessionListActionsArgs {
  *  and the per-platform messaging slices. Returns the callbacks the controller
  *  wires into the sidebar and refresh effects. */
 export function useSessionListActions({ profileScope }: UseSessionListActionsArgs) {
+  const refreshCronSessionsRequestRef = useRef(0)
+  const refreshMessagingSessionsRequestRef = useRef(0)
+  const refreshSessionsLoadingRequestRef = useRef(0)
   const refreshSessionsRequestRef = useRef(0)
 
   // Cron-job sessions as their own list (latest N). Independent of the recents
   // page so the two never compete for slots. Cheap + bounded. Kept (even though
   // the sidebar now lists cron *jobs*, not run sessions) so a pinned cron run
   // still resolves into the Pinned section via sessionByAnyId.
-  const refreshCronSessions = useCallback(async () => {
-    try {
-      const { sessions } = await listAllProfileSessions(CRON_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
-        source: 'cron'
-      })
+  const fetchCronSessions = useCallback(async () => {
+    const result = await listAllProfileSessions(CRON_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
+      source: 'cron'
+    })
 
-      setCronSessions(prev => (sameCronSignature(prev, sessions) ? prev : sessions))
-    } catch {
-      // Non-fatal: the cron section just stays empty/stale.
-    }
+    return result.sessions
   }, [])
+
+  const applyCronSessions = useCallback((sessions: SessionInfo[]) => {
+    setCronSessions(prev => (sameCronSignature(prev, sessions) ? prev : sessions))
+  }, [])
+
+  const refreshCronSessions = useCallback(async () => {
+    const requestId = refreshCronSessionsRequestRef.current + 1
+    refreshCronSessionsRequestRef.current = requestId
+
+    try {
+      const sessions = await fetchCronSessions()
+
+      if (refreshCronSessionsRequestRef.current === requestId) {
+        applyCronSessions(sessions)
+      }
+    } catch {
+      // Non-fatal for standalone refreshes: the cron section keeps its last-known rows.
+    }
+  }, [applyCronSessions, fetchCronSessions])
 
   // Messaging-platform sessions as their own slice, fetched separately from
   // local recents so each platform renders a self-managed section and never
   // competes with local chats for the recents page budget. One combined fetch
   // seeds every platform; the sidebar splits the rows per source.
-  const refreshMessagingSessions = useCallback(async () => {
-    try {
-      const result = await listAllProfileSessions(MESSAGING_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
+  const fetchMessagingSessions = useCallback(
+    () =>
+      listAllProfileSessions(MESSAGING_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
         excludeSources: MESSAGING_EXCLUDED_SOURCES
-      })
+      }),
+    []
+  )
 
-      // Drop any non-messaging source the broad exclude didn't catch (custom
-      // sources) — those stay in local recents, not a platform section.
-      const rows = result.sessions.filter(s => isMessagingSource(s.source))
+  const applyMessagingSessions = useCallback((result: PaginatedSessions) => {
+    // Drop any non-messaging source the broad exclude didn't catch (custom
+    // sources) — those stay in local recents, not a platform section.
+    const rows = result.sessions.filter(s => isMessagingSource(s.source))
 
-      setMessagingSessions(prev => (sameCronSignature(prev, rows) ? prev : rows))
-      // Hit the cap → at least one platform may have more on disk than loaded,
-      // so platform sections offer their own per-platform "load more".
-      setMessagingTruncated(result.sessions.length >= MESSAGING_SECTION_LIMIT)
-    } catch {
-      // Non-fatal: the messaging sections just stay empty/stale.
-    }
+    setMessagingSessions(prev => (sameCronSignature(prev, rows) ? prev : rows))
+    // Hit the cap → at least one platform may have more on disk than loaded,
+    // so platform sections offer their own per-platform "load more".
+    setMessagingTruncated(result.sessions.length >= MESSAGING_SECTION_LIMIT)
   }, [])
+
+  const refreshMessagingSessions = useCallback(async () => {
+    const requestId = refreshMessagingSessionsRequestRef.current + 1
+    refreshMessagingSessionsRequestRef.current = requestId
+
+    try {
+      const result = await fetchMessagingSessions()
+
+      if (refreshMessagingSessionsRequestRef.current === requestId) {
+        applyMessagingSessions(result)
+      }
+    } catch {
+      // Non-fatal for standalone refreshes: messaging sections keep their last-known rows.
+    }
+  }, [applyMessagingSessions, fetchMessagingSessions])
 
   // Page a single platform's section independently (mirrors the per-profile
   // pager): fetch that source's next window and merge it back in place, leaving
   // every other platform's rows untouched. Resolves the platform's exact total.
   const loadMoreMessagingForPlatform = useCallback(async (platform: string) => {
+    const requestId = refreshMessagingSessionsRequestRef.current + 1
+    refreshMessagingSessionsRequestRef.current = requestId
     const inPlatform = (s: SessionInfo) => normalizeSessionSource(s.source) === platform
     const loaded = $messagingSessions.get().filter(inPlatform).length
 
@@ -128,6 +163,10 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     })
 
     const incoming = result.sessions.filter(s => normalizeSessionSource(s.source) === platform)
+
+    if (refreshMessagingSessionsRequestRef.current !== requestId) {
+      return
+    }
 
     setMessagingSessions(prev => [
       ...prev.filter(s => !inPlatform(s)),
@@ -152,9 +191,11 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     }
   }, [])
 
-  const refreshSessions = useCallback(async () => {
+  const refreshCoreSessions = useCallback(async () => {
     const requestId = refreshSessionsRequestRef.current + 1
     refreshSessionsRequestRef.current = requestId
+    const loadingRequestId = refreshSessionsLoadingRequestRef.current + 1
+    refreshSessionsLoadingRequestRef.current = loadingRequestId
     setSessionsLoading(true)
 
     try {
@@ -177,21 +218,74 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         excludeSources: SIDEBAR_EXCLUDED_SOURCES
       })
 
-      if (refreshSessionsRequestRef.current === requestId) {
-        setSessions(prev => mergeSessionPage(prev, result.sessions, sessionsToKeep()))
-        setSessionsTotal(typeof result.total === 'number' ? result.total : result.sessions.length)
-        setSessionProfileTotals(result.profile_totals ?? {})
+      if (refreshSessionsRequestRef.current !== requestId) {
+        return { requestId, status: 'superseded' as const }
       }
+
+      setSessions(prev => mergeSessionPage(prev, result.sessions, sessionsToKeep()))
+      setSessionsTotal(typeof result.total === 'number' ? result.total : result.sessions.length)
+      setSessionProfileTotals(result.profile_totals ?? {})
+
+      return { requestId, status: 'applied' as const }
     } finally {
-      if (refreshSessionsRequestRef.current === requestId) {
+      if (refreshSessionsLoadingRequestRef.current === loadingRequestId) {
         setSessionsLoading(false)
       }
     }
+  }, [profileScope])
 
+  const refreshSessionsForRevision = useCallback(async () => {
+    const coreResult = await refreshCoreSessions()
+
+    if (coreResult.status === 'superseded') {
+      return 'superseded' as const
+    }
+
+    const cronRequestId = refreshCronSessionsRequestRef.current + 1
+    refreshCronSessionsRequestRef.current = cronRequestId
+    const messagingRequestId = refreshMessagingSessionsRequestRef.current + 1
+    refreshMessagingSessionsRequestRef.current = messagingRequestId
+
+    const requestIsCurrent = (): boolean =>
+      refreshSessionsRequestRef.current === coreResult.requestId &&
+      refreshCronSessionsRequestRef.current === cronRequestId &&
+      refreshMessagingSessionsRequestRef.current === messagingRequestId
+
+    try {
+      const [cronSessions, messagingResult] = await Promise.all([fetchCronSessions(), fetchMessagingSessions()])
+
+      if (!requestIsCurrent()) {
+        return 'superseded' as const
+      }
+
+      applyCronSessions(cronSessions)
+      applyMessagingSessions(messagingResult)
+    } catch (error) {
+      if (!requestIsCurrent()) {
+        return 'superseded' as const
+      }
+
+      throw error
+    }
+
+    void refreshCronJobs()
+
+    return 'applied' as const
+  }, [
+    applyCronSessions,
+    applyMessagingSessions,
+    fetchCronSessions,
+    fetchMessagingSessions,
+    refreshCoreSessions,
+    refreshCronJobs
+  ])
+
+  const refreshSessions = useCallback(async () => {
+    await refreshCoreSessions()
     void refreshCronSessions()
     void refreshCronJobs()
     void refreshMessagingSessions()
-  }, [profileScope, refreshCronSessions, refreshCronJobs, refreshMessagingSessions])
+  }, [refreshCoreSessions, refreshCronJobs, refreshCronSessions, refreshMessagingSessions])
 
   const loadMoreSessions = useCallback(async () => {
     bumpSessionsLimit()
@@ -201,6 +295,8 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
   // ALL-profiles view pages one profile at a time: fetch that profile's next
   // page and merge it in place, leaving every other profile's rows untouched.
   const loadMoreSessionsForProfile = useCallback(async (profile: string) => {
+    const requestId = refreshSessionsRequestRef.current + 1
+    refreshSessionsRequestRef.current = requestId
     const key = normalizeProfileKey(profile)
     const inKey = (s: SessionInfo) => normalizeProfileKey(s.profile) === key
     const loaded = $sessions.get().filter(inKey).length
@@ -208,6 +304,10 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     const result = await listAllProfileSessions(loaded + SIDEBAR_SESSIONS_PAGE_SIZE, 1, 'exclude', 'recent', key, {
       excludeSources: SIDEBAR_EXCLUDED_SOURCES
     })
+
+    if (refreshSessionsRequestRef.current !== requestId) {
+      return
+    }
 
     const keep = sessionsToKeep(key)
 
@@ -226,6 +326,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     loadMoreSessionsForProfile,
     refreshCronJobs,
     refreshMessagingSessions,
-    refreshSessions
+    refreshSessions,
+    refreshSessionsForRevision
   }
 }
