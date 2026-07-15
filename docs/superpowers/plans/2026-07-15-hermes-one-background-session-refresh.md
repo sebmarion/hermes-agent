@@ -56,7 +56,7 @@ The missing-file test must also assert `not db_path.exists()` after probing. The
 
 - [ ] **Step 2: Run the test and confirm the expected failure**
 
-From `apps/desktop`, run:
+From the repository root, run:
 
 ```bash
 scripts/run_tests.sh tests/hermes_cli/test_session_revision.py -q
@@ -455,7 +455,7 @@ git commit -m "feat(desktop): keep session refresh active offscreen"
 
 - [ ] **Step 1: Run the backend suite for the touched surface**
 
-From `apps/desktop`, run:
+From the repository root, run:
 
 ```bash
 scripts/run_tests.sh tests/hermes_cli/test_session_revision.py tests/hermes_cli/test_web_server.py -q
