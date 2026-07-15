@@ -119,6 +119,25 @@ def test_scope_pruning_and_close_are_idempotent(
     assert [connection.close_calls for connection in opened] == [1, 1]
 
 
+def test_pruned_target_gets_a_new_epoch_when_reintroduced(tmp_path: Path) -> None:
+    default_path = tmp_path / "default.db"
+    worker_path = tmp_path / "worker.db"
+    writer = _create_database(default_path)
+    _create_database(worker_path).close()
+    tracker = SessionRevisionTracker()
+
+    try:
+        first = tracker.revision([("default", default_path)])
+        tracker.revision([("worker", worker_path)])
+        writer.execute("INSERT INTO sessions(id) VALUES (?)", ("external",))
+        writer.commit()
+
+        assert tracker.revision([("default", default_path)]) != first
+    finally:
+        tracker.close()
+        writer.close()
+
+
 def test_failed_data_version_probe_closes_and_reopens_connection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

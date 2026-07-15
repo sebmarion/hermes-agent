@@ -29,6 +29,7 @@ class SessionRevisionTracker:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._entries: dict[tuple[str, Path], _TrackedDatabase] = {}
+        self._epochs: dict[tuple[str, Path], int] = {}
 
     def revision(self, targets: Iterable[tuple[str, Path]]) -> str:
         """Return an opaque token for the sorted local profile/database set."""
@@ -86,26 +87,31 @@ class SessionRevisionTracker:
                 self._close_entry(entry)
             raise SessionRevisionProbeError("Session database cannot be inspected") from exc
 
+        retains_connection = _retains_sqlite_connections()
         if entry is None:
-            if not _retains_sqlite_connections():
-                entry = _TrackedDatabase(None, identity, epoch=1)
-                self._entries[key] = entry
+            epoch = self._next_epoch(key)
+            if retains_connection:
+                entry = self._open_entry(db_path, identity, epoch=epoch)
             else:
-                entry = self._open_entry(db_path, identity, epoch=1)
-                self._entries[key] = entry
-        elif entry.connection is None or entry.identity != identity:
+                entry = _TrackedDatabase(None, identity, epoch=epoch)
+            self._entries[key] = entry
+        elif entry.identity != identity:
             self._close_entry(entry)
-            if not _retains_sqlite_connections():
-                next_epoch = (
-                    entry.epoch + 1 if entry.identity != identity else entry.epoch
-                )
-                entry = _TrackedDatabase(None, identity, epoch=next_epoch)
+            epoch = self._next_epoch(key)
+            if retains_connection:
+                entry = self._open_entry(db_path, identity, epoch=epoch)
             else:
-                next_epoch = entry.epoch + 1
-                entry = self._open_entry(db_path, identity, epoch=next_epoch)
+                entry = _TrackedDatabase(None, identity, epoch=epoch)
+            self._entries[key] = entry
+        elif retains_connection and entry.connection is None:
+            entry = self._open_entry(
+                db_path,
+                identity,
+                epoch=self._next_epoch(key),
+            )
             self._entries[key] = entry
 
-        if not _retains_sqlite_connections():
+        if not retains_connection:
             return {
                 "profile": profile,
                 "path": str(db_path),
@@ -176,6 +182,11 @@ class SessionRevisionTracker:
         if entry.connection is not None:
             entry.connection.close()
             entry.connection = None
+
+    def _next_epoch(self, key: tuple[str, Path]) -> int:
+        epoch = self._epochs.get(key, 0) + 1
+        self._epochs[key] = epoch
+        return epoch
 
 
 def _normalize_path(path: Path) -> Path:

@@ -75,6 +75,10 @@ from hermes_cli.config import (
     write_platform_config_field,
     _deep_merge,
 )
+from hermes_cli.session_revision import (
+    SessionRevisionProbeError,
+    SessionRevisionTracker,
+)
 from gateway.status import (
     derive_gateway_busy,
     derive_gateway_drainable,
@@ -180,6 +184,14 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
+    with _SESSION_REVISION_TRACKER_INIT_LOCK:
+        stale_revision_tracker = getattr(
+            app.state, "session_revision_tracker", None
+        )
+        if stale_revision_tracker is not None:
+            stale_revision_tracker.close()
+        session_revision_tracker = SessionRevisionTracker()
+        app.state.session_revision_tracker = session_revision_tracker
 
     # Fire hermes_cli.gateway import into a background thread so the event
     # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
@@ -211,9 +223,22 @@ async def _lifespan(app: "FastAPI"):
         yield
     finally:
         pty_reaper_task.cancel()
-        await PTY_REGISTRY.close_all()
-        if cron_stop is not None:
-            cron_stop.set()
+        try:
+            await PTY_REGISTRY.close_all()
+        finally:
+            try:
+                if cron_stop is not None:
+                    cron_stop.set()
+            finally:
+                try:
+                    session_revision_tracker.close()
+                finally:
+                    with _SESSION_REVISION_TRACKER_INIT_LOCK:
+                        if (
+                            getattr(app.state, "session_revision_tracker", None)
+                            is session_revision_tracker
+                        ):
+                            del app.state.session_revision_tracker
 
 
 def _get_event_state(app: "FastAPI"):
@@ -254,6 +279,23 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
     except AttributeError:
         app.state.pty_active_session_files = {}
         return app.state.pty_active_session_files
+
+
+_SESSION_REVISION_TRACKER_INIT_LOCK = threading.Lock()
+
+
+def _get_session_revision_tracker(app: "FastAPI") -> SessionRevisionTracker:
+    """Return the lifespan-owned tracker, creating one for legacy tests."""
+
+    tracker = getattr(app.state, "session_revision_tracker", None)
+    if tracker is not None:
+        return tracker
+    with _SESSION_REVISION_TRACKER_INIT_LOCK:
+        tracker = getattr(app.state, "session_revision_tracker", None)
+        if tracker is None:
+            tracker = SessionRevisionTracker()
+            app.state.session_revision_tracker = tracker
+        return tracker
 
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
@@ -4063,6 +4105,47 @@ def get_sessions(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+def _profile_session_targets(profile: str = "all") -> List[Tuple[str, Path]]:
+    """Resolve local profile homes in deterministic order."""
+
+    from hermes_cli import profiles as profiles_mod
+
+    targets: List[Tuple[str, Path]] = []
+    if profile and profile != "all":
+        name, home = _cron_profile_home(profile)
+        targets.append((name, Path(home)))
+    else:
+        try:
+            infos = profiles_mod.list_profiles()
+            targets = [(info.name, Path(info.path)) for info in infos]
+        except Exception:
+            _log.exception("GET /api/profiles/sessions: list_profiles failed")
+        if not targets:
+            targets.append(
+                ("default", Path(profiles_mod.get_profile_dir("default")))
+            )
+    return sorted(targets, key=lambda target: (target[0], str(target[1])))
+
+
+@app.get("/api/profiles/sessions/revision")
+def get_profiles_sessions_revision(profile: str = "all"):
+    """Return a cheap aggregate revision for local profile databases."""
+
+    targets = _profile_session_targets(profile)
+    db_targets = [(name, home / "state.db") for name, home in targets]
+    try:
+        revision = _get_session_revision_tracker(app).revision(db_targets)
+    except SessionRevisionProbeError:
+        raise HTTPException(
+            status_code=503,
+            detail="Session revision probe unavailable",
+        )
+    return {
+        "revision": revision,
+        "profiles": [name for name, _ in targets],
+    }
+
+
 @app.get("/api/profiles/sessions")
 def get_profiles_sessions(
     limit: int = 20,
@@ -4093,21 +4176,7 @@ def get_profiles_sessions(
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
 
     from hermes_state import SessionDB
-    from hermes_cli import profiles as profiles_mod
-
-    targets: List[Tuple[str, Path]] = []
-    if profile and profile != "all":
-        name, home = _cron_profile_home(profile)
-        targets.append((name, home))
-    else:
-        try:
-            infos = profiles_mod.list_profiles()
-            targets = [(info.name, info.path) for info in infos]
-        except Exception:
-            _log.exception("GET /api/profiles/sessions: list_profiles failed")
-            targets = []
-        if not targets:
-            targets.append(("default", profiles_mod.get_profile_dir("default")))
+    targets = _profile_session_targets(profile)
 
     min_message_count = max(0, min_messages)
     archived_only = archived == "only"

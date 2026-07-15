@@ -1248,6 +1248,145 @@ class TestWebServerEndpoints:
         assert row["is_default_profile"] is True
         assert isinstance(data.get("errors"), list)
 
+    def test_profiles_sessions_revision_changes_after_external_commit(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="revision-initial", source="cli")
+        finally:
+            db.close()
+
+        first = self.client.get("/api/profiles/sessions/revision?profile=default")
+        assert first.status_code == 200
+
+        writer = SessionDB()
+        try:
+            writer.create_session(session_id="revision-external", source="cli")
+        finally:
+            writer.close()
+
+        second = self.client.get("/api/profiles/sessions/revision?profile=default")
+        assert second.status_code == 200
+        assert second.json()["revision"] != first.json()["revision"]
+        assert second.json()["profiles"] == ["default"]
+
+    def test_profiles_sessions_revision_scopes_to_requested_profile(self, monkeypatch):
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        default_home = profiles_mod.get_profile_dir("default")
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True)
+        default_db = SessionDB()
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            default_db.create_session(session_id="default-revision", source="cli")
+            worker_db.create_session(session_id="worker-revision", source="cli")
+        finally:
+            default_db.close()
+            worker_db.close()
+
+        monkeypatch.setattr(
+            profiles_mod,
+            "list_profiles",
+            lambda: [
+                SimpleNamespace(name="worker", path=worker_home),
+                SimpleNamespace(name="default", path=default_home),
+            ],
+        )
+
+        default_before = self.client.get(
+            "/api/profiles/sessions/revision?profile=default"
+        ).json()
+        writer = SessionDB(db_path=worker_home / "state.db")
+        try:
+            writer.create_session(session_id="worker-external", source="cli")
+        finally:
+            writer.close()
+        default_after = self.client.get(
+            "/api/profiles/sessions/revision?profile=default"
+        ).json()
+
+        assert default_after["revision"] == default_before["revision"]
+        assert default_after["profiles"] == ["default"]
+        assert self.client.get(
+            "/api/profiles/sessions/revision?profile=worker"
+        ).json()["profiles"] == ["worker"]
+        assert self.client.get(
+            "/api/profiles/sessions/revision?profile=all"
+        ).json()["profiles"] == ["default", "worker"]
+
+    def test_profiles_sessions_revision_returns_503_for_observed_missing_db(self):
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="revision-disappears", source="cli")
+        finally:
+            db.close()
+
+        first = self.client.get("/api/profiles/sessions/revision?profile=default")
+        assert first.status_code == 200
+        (get_hermes_home() / "state.db").unlink()
+
+        missing = self.client.get(
+            "/api/profiles/sessions/revision?profile=default"
+        )
+        assert missing.status_code == 503
+        assert missing.json() == {"detail": "Session revision probe unavailable"}
+
+    def test_session_revision_tracker_closes_at_lifespan_shutdown(self, monkeypatch):
+        from starlette.testclient import TestClient
+
+        import hermes_cli.web_server as web_server
+
+        previous = getattr(web_server.app.state, "session_revision_tracker", None)
+        if previous is not None:
+            previous.close()
+        stale_tracker = MagicMock()
+        lifespan_tracker = MagicMock()
+        web_server.app.state.session_revision_tracker = stale_tracker
+        monkeypatch.setattr(
+            web_server, "SessionRevisionTracker", lambda: lifespan_tracker
+        )
+        monkeypatch.setattr(web_server, "_warm_gateway_module", lambda: None)
+
+        with TestClient(web_server.app):
+            assert web_server.app.state.session_revision_tracker is lifespan_tracker
+            stale_tracker.close.assert_called_once_with()
+
+        lifespan_tracker.close.assert_called_once_with()
+        assert not hasattr(web_server.app.state, "session_revision_tracker")
+
+    def test_session_revision_tracker_closes_when_pty_cleanup_fails(self, monkeypatch):
+        from starlette.testclient import TestClient
+
+        import hermes_cli.web_server as web_server
+
+        previous = getattr(web_server.app.state, "session_revision_tracker", None)
+        if previous is not None:
+            previous.close()
+            del web_server.app.state.session_revision_tracker
+        lifespan_tracker = MagicMock()
+
+        async def fail_pty_cleanup():
+            raise RuntimeError("synthetic PTY cleanup failure")
+
+        monkeypatch.setattr(
+            web_server, "SessionRevisionTracker", lambda: lifespan_tracker
+        )
+        monkeypatch.setattr(web_server, "_warm_gateway_module", lambda: None)
+        monkeypatch.setattr(web_server.PTY_REGISTRY, "close_all", fail_pty_cleanup)
+
+        with pytest.raises(RuntimeError, match="synthetic PTY cleanup failure"):
+            with TestClient(web_server.app):
+                pass
+
+        lifespan_tracker.close.assert_called_once_with()
+        assert not hasattr(web_server.app.state, "session_revision_tracker")
+
     def test_profiles_sessions_rejects_unknown_archived_value(self):
         resp = self.client.get("/api/profiles/sessions?archived=bogus")
         assert resp.status_code == 400
