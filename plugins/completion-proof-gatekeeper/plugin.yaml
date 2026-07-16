@@ -1,0 +1,6 @@
+name: completion-proof-gatekeeper
+version: "0.1.0"
+description: "Report unsupported completion claims before they become false-success receipts."
+author: "Hermes Radar"
+hooks:
+  - transform_llm_output
