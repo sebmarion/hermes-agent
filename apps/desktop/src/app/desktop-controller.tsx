@@ -116,6 +116,7 @@ import { usePromptActions } from './session/hooks/use-prompt-actions'
 import { useRouteResume } from './session/hooks/use-route-resume'
 import { useSessionActions } from './session/hooks/use-session-actions'
 import { useSessionListActions } from './session/hooks/use-session-list-actions'
+import { useSessionRevisionPoll } from './session/hooks/use-session-revision-poll'
 import { useSessionStateCache } from './session/hooks/use-session-state-cache'
 import { AppShell } from './shell/app-shell'
 import { useOverlayRouting } from './shell/hooks/use-overlay-routing'
@@ -399,6 +400,12 @@ export function DesktopController() {
     refreshMessagingSessions,
     refreshSessions
   } = useSessionListActions({ profileScope })
+
+  useSessionRevisionPoll({
+    enabled: gatewayState === 'open' && !isSecondaryWindow(),
+    profileScope,
+    refreshSessions
+  })
 
   // Another window mutated the shared session list (e.g. a chat started in the
   // pop-out). Re-pull so the sidebar reflects it. Pop-outs have no sidebar, so
