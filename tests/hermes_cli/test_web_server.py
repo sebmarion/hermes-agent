@@ -785,6 +785,118 @@ class TestWebServerEndpoints:
         resp = self.client.get("/api/profiles/sessions?archived=bogus")
         assert resp.status_code == 400
 
+    def test_profiles_sessions_revision_changes_after_external_commit(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="revision-initial", source="cli")
+        finally:
+            db.close()
+
+        first = self.client.get("/api/profiles/sessions/revision?profile=all")
+        assert first.status_code == 200
+
+        writer = SessionDB()
+        try:
+            writer.create_session(session_id="revision-external", source="cli")
+        finally:
+            writer.close()
+
+        second = self.client.get("/api/profiles/sessions/revision?profile=all")
+        assert second.status_code == 200
+        assert second.json()["revision"] != first.json()["revision"]
+        assert second.json()["profiles"] == ["default"]
+
+    def test_profiles_sessions_revision_scopes_to_requested_profile(self):
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        default_db = SessionDB()
+        try:
+            default_db.create_session(session_id="revision-default", source="cli")
+        finally:
+            default_db.close()
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True)
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            worker_db.create_session(session_id="revision-worker", source="cli")
+        finally:
+            worker_db.close()
+
+        worker_first = self.client.get(
+            "/api/profiles/sessions/revision?profile=worker"
+        ).json()
+        all_first = self.client.get(
+            "/api/profiles/sessions/revision?profile=all"
+        ).json()
+
+        writer = SessionDB()
+        try:
+            writer.create_session(session_id="revision-default-later", source="cli")
+        finally:
+            writer.close()
+
+        worker_second = self.client.get(
+            "/api/profiles/sessions/revision?profile=worker"
+        ).json()
+        all_second = self.client.get(
+            "/api/profiles/sessions/revision?profile=all"
+        ).json()
+        assert worker_second["revision"] == worker_first["revision"]
+        assert all_second["revision"] != all_first["revision"]
+        assert worker_second["profiles"] == ["worker"]
+        assert all_second["profiles"] == ["default", "worker"]
+
+    def test_profiles_sessions_revision_returns_503_for_observed_missing_db(self):
+        from hermes_state import SessionDB
+        from hermes_constants import get_hermes_home
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="revision-disappears", source="cli")
+        finally:
+            db.close()
+        observed = self.client.get(
+            "/api/profiles/sessions/revision?profile=default"
+        )
+        assert observed.status_code == 200
+
+        (get_hermes_home() / "state.db").unlink()
+
+        missing = self.client.get(
+            "/api/profiles/sessions/revision?profile=default"
+        )
+        assert missing.status_code == 503
+        assert missing.json()["detail"] == "Session revision probe unavailable"
+
+    def test_session_revision_tracker_closes_at_lifespan_shutdown(self, monkeypatch):
+        from hermes_cli import web_server
+
+        closed = []
+
+        class Tracker:
+            def close(self):
+                closed.append(True)
+
+        monkeypatch.setattr(
+            web_server,
+            "SessionRevisionTracker",
+            lambda: Tracker(),
+            raising=False,
+        )
+
+        async def exercise():
+            async with web_server._lifespan(web_server.app):
+                assert isinstance(
+                    web_server.app.state.session_revision_tracker,
+                    Tracker,
+                )
+
+        asyncio.run(exercise())
+        assert closed == [True]
+
     def test_sessions_endpoint_reads_requested_profile(self):
         """The machine dashboard's global profile switcher must retarget
         the Sessions page, not just config/skills/model pages."""
