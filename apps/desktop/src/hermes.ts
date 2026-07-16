@@ -44,6 +44,7 @@ import type {
   ProfilesResponse,
   SessionInfo,
   SessionMessagesResponse,
+  SessionRevisionResponse,
   SessionSearchResponse,
   SkillHubPreview,
   SkillHubScanResult,
@@ -71,6 +72,7 @@ import type {
 export const STARTUP_REQUEST_TIMEOUT_MS = 60_000
 const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
+const SESSION_REVISION_REQUEST_TIMEOUT_MS = 5_000
 // prompt.submit is effectively fire-and-forget: turn completion is signaled by
 // stream / message.complete events, NOT by the RPC return. A long turn (MoA
 // presets running references + aggregator in series, deep reasoning, large tool
@@ -146,6 +148,7 @@ export type {
   SessionInfo,
   SessionMessage,
   SessionMessagesResponse,
+  SessionRevisionResponse,
   SessionResumeResponse,
   SessionRuntimeInfo,
   SessionSearchResponse,
@@ -254,6 +257,15 @@ export async function listAllProfileSessions(
     sessions: result.sessions.slice(0, limit),
     offset: 0
   }
+}
+
+export function getAllProfileSessionsRevision(
+  profile: 'all' | (string & {}) = 'all'
+): Promise<SessionRevisionResponse> {
+  return window.hermesDesktop.api<SessionRevisionResponse>({
+    path: `/api/profiles/sessions/revision?profile=${encodeURIComponent(profile)}`,
+    timeoutMs: SESSION_REVISION_REQUEST_TIMEOUT_MS
+  })
 }
 
 // Mutations take the owning `profile` so Electron routes them to that profile's
