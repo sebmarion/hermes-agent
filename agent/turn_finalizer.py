@@ -374,6 +374,7 @@ def finalize_turn(
                 "transform_llm_output",
                 response_text=final_response,
                 session_id=agent.session_id or "",
+                turn_id=turn_id or "",
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
             )

@@ -211,3 +211,23 @@ def test_text_response_on_last_allowed_call_is_completed():
     )
     assert result["final_response"] == "final report"
     assert result["completed"] is True
+
+
+def test_transform_hook_receives_current_turn_id(monkeypatch):
+    calls = []
+
+    def capture_hook(name, **kwargs):
+        calls.append((name, kwargs))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture_hook)
+
+    result = _run(
+        _StubAgent(raise_in=()),
+        final_response="final report",
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "final report"
+    transform_call = next(call for call in calls if call[0] == "transform_llm_output")
+    assert transform_call[1]["turn_id"] == "turn-1"

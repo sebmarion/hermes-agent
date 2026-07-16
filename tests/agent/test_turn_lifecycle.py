@@ -1,5 +1,6 @@
 """Turn-boundary lifecycle coverage for every conversation exit path."""
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -77,3 +78,12 @@ def test_run_conversation_closes_a_raised_turn_and_reraises(monkeypatch):
     assert calls[0][0] == "on_session_end"
     assert calls[0][1]["turn_id"] == "turn-2"
     assert calls[0][1]["completed"] is False
+
+
+def test_pre_verify_hook_receives_current_turn_id():
+    source = inspect.getsource(conversation_loop._run_conversation)
+
+    call_start = source.index("get_pre_verify_continue_message(")
+    hook_call = source[call_start : call_start + 1_200]
+
+    assert 'turn_id=getattr(agent, "_current_turn_id", "") or ""' in hook_call
