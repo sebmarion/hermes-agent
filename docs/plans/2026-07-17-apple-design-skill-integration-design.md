@@ -1,6 +1,6 @@
 ---
 title: "Apple design specialist skill integration"
-status: proposed
+status: approved
 date: 2026-07-17
 type: design
 target_repo: hermes-agent
@@ -45,7 +45,7 @@ examples. The approved source snapshot is:
 - Repository: `https://github.com/emilkowalski/skills`
 - Skill: `skills/apple-design/SKILL.md`
 - Source commit: `56de6f5d6642f761b5e17629fccf53e303b3da9b`
-- License: MIT, copyright Emil Kowalski (2026)
+- License: MIT; repository notice copyright Matt Pocock (2026)
 
 The source is valuable but cannot be copied unchanged. Its discovery
 description exceeds Hermes's 60-character limit, its trigger boundary is broad,
@@ -160,9 +160,10 @@ The short description is both trigger-focused and fully visible in Hermes's
 60-character compact index. The skill is cross-platform because it contains
 web guidance and no platform-specific executable code.
 
-The human source author is credited first. `UPSTREAM_LICENSE.txt` will contain
-the complete upstream MIT notice rather than relying only on the frontmatter
-license field or a link.
+The skill's human source author is credited first. `UPSTREAM_LICENSE.txt` will
+reproduce the repository's complete MIT notice verbatim, including its Matt
+Pocock copyright line, rather than relying only on the frontmatter license
+field or a link.
 
 ## Trigger and routing contract
 
