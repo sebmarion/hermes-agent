@@ -144,7 +144,7 @@ committed. The implementation will not hand-edit generated skill documentation.
 ```yaml
 ---
 name: apple-design
-description: Use for gesture-driven UI and physical web motion.
+description: Use when designing gesture-driven UI or physical web motion.
 version: 1.0.0
 author: Emil Kowalski (emilkowalski), Hermes Agent
 license: MIT
