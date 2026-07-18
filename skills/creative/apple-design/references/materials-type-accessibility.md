@@ -56,7 +56,11 @@ static transitions. State feedback must still be visible.
 
 `prefers-reduced-transparency` is an independent accessibility adaptation. When
 the user has requested reduced transparency, replace translucent materials with
-solid surfaces and remove `backdrop-filter` (which disables blur) entirely.
+opaque solid surfaces and remove `backdrop-filter` (which disables blur)
+entirely. Treat opaque solid surfaces as the safe default until support and the
+user's preference are known. When the media query is unsupported or
+unavailable, provide an application-level reduced-transparency control that
+applies the same solid-surface behavior.
 
 ## Increased Contrast
 
