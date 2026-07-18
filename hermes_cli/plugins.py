@@ -50,6 +50,7 @@ from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.tool_policy import ToolPolicyRegistration
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -273,6 +274,32 @@ def _get_enabled_plugins() -> Optional[set]:
 # ---------------------------------------------------------------------------
 
 _VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+_VALID_PLUGIN_POLICIES = frozenset({"tool_dispatch"})
+
+
+def _parse_manifest_policies(value: object, plugin_key: str) -> List[str]:
+    """Validate the strict ``policies`` manifest declaration."""
+    if type(value) is not list:
+        raise ValueError(f"Plugin {plugin_key!r}: policies must be a list")
+
+    policies: List[str] = []
+    seen: Set[str] = set()
+    for policy_name in value:
+        if type(policy_name) is not str or not policy_name:
+            raise ValueError(
+                f"Plugin {plugin_key!r}: policy names must be non-empty strings"
+            )
+        if policy_name not in _VALID_PLUGIN_POLICIES:
+            raise ValueError(
+                f"Plugin {plugin_key!r}: unsupported policy {policy_name!r}"
+            )
+        if policy_name in seen:
+            raise ValueError(
+                f"Plugin {plugin_key!r}: duplicate policy {policy_name!r}"
+            )
+        seen.add(policy_name)
+        policies.append(policy_name)
+    return policies
 
 
 @dataclass
@@ -286,6 +313,7 @@ class PluginManifest:
     requires_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
     provides_tools: List[str] = field(default_factory=list)
     provides_hooks: List[str] = field(default_factory=list)
+    provides_policies: List[str] = field(default_factory=list)
     source: str = ""        # "user", "project", or "entrypoint"
     path: Optional[str] = None
     # Plugin kind — see plugins.py module docstring for semantics.
@@ -322,6 +350,7 @@ class LoadedPlugin:
     hooks_registered: List[str] = field(default_factory=list)
     middleware_registered: List[str] = field(default_factory=list)
     commands_registered: List[str] = field(default_factory=list)
+    policies_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
     # True for a bundled platform plugin recorded as a deferred (not-yet-
@@ -441,6 +470,40 @@ class PluginContext:
         logger.debug(
             "Plugin %s registered tool: %s%s",
             self.manifest.name, name, " (override)" if override else "",
+        )
+
+    # -- policy registration --------------------------------------------------
+
+    def register_policy(
+        self,
+        name: str,
+        callback: Callable,
+        timeout_ms: int = 2_000,
+    ) -> None:
+        """Register one named, manifest-declared required policy."""
+        if name not in _VALID_PLUGIN_POLICIES:
+            supported = ", ".join(sorted(_VALID_PLUGIN_POLICIES))
+            raise ValueError(f"Unsupported policy {name!r}; supported: {supported}")
+        if not callable(callback):
+            raise TypeError("policy callback must be callable")
+        if type(timeout_ms) is not int:
+            raise TypeError("timeout_ms must be an integer")
+        if not 1 <= timeout_ms <= 10_000:
+            raise ValueError("timeout_ms must be between 1 and 10000")
+        if name not in self.manifest.provides_policies:
+            plugin_key = self.manifest.key or self.manifest.name
+            raise ValueError(
+                f"Plugin {plugin_key!r} did not declare policy {name!r}"
+            )
+
+        plugin_key = self.manifest.key or self.manifest.name
+        self._manager._register_policy(
+            ToolPolicyRegistration(
+                plugin_key=plugin_key,
+                policy_name=name,
+                callback=callback,
+                timeout_ms=timeout_ms,
+            )
         )
 
     # -- override trust gate ------------------------------------------------
@@ -1208,6 +1271,11 @@ class PluginManager:
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
+        # Required-policy callbacks stay manager-owned. Public accessors return
+        # frozen registrations in immutable tuple snapshots.
+        self._policy_registrations: Dict[
+            tuple[str, str], ToolPolicyRegistration
+        ] = {}
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
@@ -1226,6 +1294,45 @@ class PluginManager:
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
+
+    def _register_policy(self, registration: ToolPolicyRegistration) -> None:
+        """Store one plugin-attributed policy registration exactly once."""
+        registry_key = (registration.plugin_key, registration.policy_name)
+        if registry_key in self._policy_registrations:
+            plugin_key, policy_name = registry_key
+            raise ValueError(
+                f"Plugin {plugin_key!r} already registered policy {policy_name!r}"
+            )
+        self._policy_registrations[registry_key] = registration
+
+    def get_policy_registration(
+        self,
+        plugin_key: str,
+        policy_name: str,
+    ) -> Optional[ToolPolicyRegistration]:
+        """Return one frozen registration, or ``None`` when absent."""
+        return self._policy_registrations.get((plugin_key, policy_name))
+
+    def get_policy_registrations(
+        self,
+        plugin_key: Optional[str] = None,
+    ) -> tuple[ToolPolicyRegistration, ...]:
+        """Return a deterministic immutable snapshot of registrations."""
+        registrations = (
+            registration
+            for (registered_plugin, _), registration
+            in self._policy_registrations.items()
+            if plugin_key is None or registered_plugin == plugin_key
+        )
+        return tuple(
+            sorted(
+                registrations,
+                key=lambda registration: (
+                    registration.plugin_key,
+                    registration.policy_name,
+                ),
+            )
+        )
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
@@ -1256,6 +1363,7 @@ class PluginManager:
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
+            self._policy_registrations.clear()
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
         # raises so a failed scan is NOT cached as "discovered with an empty
@@ -1534,6 +1642,10 @@ class PluginManager:
 
             name = data.get("name", plugin_dir.name)
             key = f"{prefix}/{plugin_dir.name}" if prefix else name
+            provides_policies = _parse_manifest_policies(
+                data.get("policies", []),
+                key,
+            )
 
             raw_kind = data.get("kind", "standalone")
             if not isinstance(raw_kind, str):
@@ -1595,6 +1707,7 @@ class PluginManager:
                 requires_env=data.get("requires_env", []),
                 provides_tools=data.get("provides_tools", []),
                 provides_hooks=data.get("provides_hooks", []),
+                provides_policies=provides_policies,
                 source=source,
                 path=str(plugin_dir),
                 kind=kind,
@@ -1715,6 +1828,7 @@ class PluginManager:
             f"{_NS_PARENT}.{_slug}",
             PluginContext(manifest, self)._tool_override_allowed(""),
         )
+        _policy_keys_before = set(self._policy_registrations)
         try:
             if manifest.source in {"user", "project", "bundled"}:
                 module = self._load_directory_module(manifest)
@@ -1759,16 +1873,24 @@ class PluginManager:
                     for kind, cbs in self._middleware.items()
                     if len(cbs) > _mw_counts_before.get(kind, 0)
                 ]
+                loaded.policies_registered = sorted(
+                    policy_name
+                    for plugin_key, policy_name
+                    in set(self._policy_registrations) - _policy_keys_before
+                    if plugin_key == _plugin_id
+                )
                 loaded.commands_registered = [
                     c for c in self._plugin_commands
                     if self._plugin_commands[c].get("plugin") == manifest.name
                 ]
                 loaded.enabled = True
                 logger.debug(
-                    "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s), %d CLI command(s)",
+                    "  registered: %d tool(s), %d hook(s), %d middleware, "
+                    "%d policy, %d slash command(s), %d CLI command(s)",
                     len(loaded.tools_registered),
                     len(loaded.hooks_registered),
                     len(loaded.middleware_registered),
+                    len(loaded.policies_registered),
                     len(loaded.commands_registered),
                     sum(
                         1 for c in self._cli_commands
@@ -1777,6 +1899,8 @@ class PluginManager:
                 )
 
         except Exception as exc:
+            for policy_key in set(self._policy_registrations) - _policy_keys_before:
+                self._policy_registrations.pop(policy_key, None)
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",
@@ -1948,6 +2072,8 @@ class PluginManager:
                     "tools": len(loaded.tools_registered),
                     "hooks": len(loaded.hooks_registered),
                     "middleware": len(loaded.middleware_registered),
+                    "policies": list(loaded.policies_registered),
+                    "policy_count": len(loaded.policies_registered),
                     "commands": len(loaded.commands_registered),
                     "error": loaded.error,
                 }
