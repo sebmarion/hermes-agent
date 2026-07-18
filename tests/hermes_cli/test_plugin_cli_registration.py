@@ -58,6 +58,25 @@ class TestRegisterCliCommand:
         ctx.register_cli_command("nocb", "test", MagicMock())
         assert mgr._cli_commands["nocb"]["handler_fn"] is None
 
+    def test_policy_registration_does_not_change_cli_registry(self):
+        manager = PluginManager()
+        manifest = PluginManifest(
+            name="test-plugin",
+            key="category/test-plugin",
+            provides_policies=["tool_dispatch"],
+        )
+        context = PluginContext(manifest, manager)
+
+        context.register_policy("tool_dispatch", MagicMock())
+
+        assert manager._cli_commands == {}
+        registration = manager.get_policy_registration(
+            "category/test-plugin",
+            "tool_dispatch",
+        )
+        assert registration is not None
+        assert registration.plugin_key == "category/test-plugin"
+
 
 # ── Memory plugin CLI discovery ───────────────────────────────────────────
 

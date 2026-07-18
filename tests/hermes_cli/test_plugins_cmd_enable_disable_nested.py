@@ -10,6 +10,7 @@ nested bundled plugin can actually be toggled.
 
 import sys  # noqa: F401
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -33,7 +34,10 @@ def nested_plugin_env(tmp_path):
     """A user-plugins dir containing one nested and one flat plugin, with the
     bundled dir pointed at an empty path. Returns the tmp_path."""
     _make_category_plugin(tmp_path, "observability", "nemo_relay", {
-        "name": "nemo_relay", "version": "1.0.0", "description": "relay obs"
+        "name": "nemo_relay",
+        "version": "1.0.0",
+        "description": "relay obs",
+        "policies": ["tool_dispatch"],
     })
     _make_plugin_dir(tmp_path, "disk-cleanup", {
         "name": "disk-cleanup", "version": "1.0.0"
@@ -92,6 +96,58 @@ class TestResolvePluginKey:
         # Bare "openai" is ambiguous -> None; the full key still resolves.
         assert _resolve_plugin_key("openai") is None
         assert _resolve_plugin_key("image_gen/openai") == "image_gen/openai"
+
+
+class TestRequiredPolicyNestedKey:
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    @patch("hermes_cli.config.load_config")
+    def test_configured_bare_name_normalizes_to_canonical_nested_key(
+        self,
+        mock_load_config,
+        mock_user,
+        mock_bundled,
+        nested_plugin_env,
+    ):
+        from hermes_cli.plugins_cmd import _get_required_policies
+
+        mock_user.return_value = nested_plugin_env
+        mock_bundled.return_value = nested_plugin_env / "nonexistent"
+        mock_load_config.return_value = {
+            "plugins": {
+                "required_policies": {"nemo_relay": ["tool_dispatch"]}
+            }
+        }
+
+        assert _get_required_policies() == {
+            "observability/nemo_relay": ["tool_dispatch"]
+        }
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    @patch("hermes_cli.plugins_cmd._save_required_policies")
+    @patch("hermes_cli.plugins_cmd._get_required_policies", return_value={})
+    def test_require_bare_name_writes_canonical_nested_key(
+        self,
+        mock_get_required,
+        mock_save_required,
+        mock_user,
+        mock_bundled,
+        nested_plugin_env,
+    ):
+        from hermes_cli.plugins_cmd import cmd_require_policy
+
+        mock_user.return_value = nested_plugin_env
+        mock_bundled.return_value = nested_plugin_env / "nonexistent"
+
+        cmd_require_policy(
+            SimpleNamespace(plugin="nemo_relay", policy="tool_dispatch")
+        )
+
+        mock_get_required.assert_called_once_with()
+        mock_save_required.assert_called_once_with(
+            {"observability/nemo_relay": ["tool_dispatch"]}
+        )
 
 
 # ---------------------------------------------------------------------------

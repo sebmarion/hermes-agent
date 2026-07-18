@@ -2868,6 +2868,8 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                original_function_args={"q": "test"},
+                on_authorized=None,
             )
             assert result == "result"
 
@@ -2880,7 +2882,7 @@ class TestConcurrentToolExecution:
         agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
 
-        with patch("run_agent.handle_function_call", return_value='{"success": true}'):
+        with patch("model_tools.registry.dispatch", return_value='{"success": true}'):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert starts == [("c1", "web_search", {"query": "hello"})]
@@ -2902,7 +2904,10 @@ class TestConcurrentToolExecution:
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
         agent.tool_progress_callback = lambda event, name, preview, args, **kw: progress.append((event, name, preview, args))
 
-        with patch("run_agent.handle_function_call", return_value='{"success": true, "typed": "sk-pro...EFGH"}'):
+        with patch(
+            "model_tools.registry.dispatch",
+            return_value='{"success": true, "typed": "sk-pro...EFGH"}',
+        ):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert starts[0][2]["text"].startswith("sk-pro")
@@ -2920,10 +2925,13 @@ class TestConcurrentToolExecution:
         agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
 
-        with patch("run_agent.handle_function_call", side_effect=['{"id":1}', '{"id":2}']):
+        with patch(
+            "model_tools.registry.dispatch",
+            side_effect=['{"id":1}', '{"id":2}'],
+        ):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
-        assert starts == [
+        assert sorted(starts) == [
             ("c1", "web_search", {"query": "one"}),
             ("c2", "web_search", {"query": "two"}),
         ]
@@ -2947,7 +2955,10 @@ class TestConcurrentToolExecution:
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
         agent.tool_progress_callback = lambda event, name, preview, args, **kw: progress.append((event, name, preview, args))
 
-        with patch("run_agent.handle_function_call", return_value='{"success": true, "typed": "sk-pro...EFGH"}'):
+        with patch(
+            "model_tools.registry.dispatch",
+            return_value='{"success": true, "typed": "sk-pro...EFGH"}',
+        ):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
         assert starts[0][2]["text"].startswith("sk-pro")
@@ -3287,10 +3298,10 @@ class TestConcurrentToolExecution:
 
         agent._checkpoint_mgr.enabled = True
 
-        def fake_handle(name, args, task_id, **kwargs):
+        def fake_handle(name, args, **kwargs):
             return f"result_{name}"
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        with patch("model_tools.registry.dispatch", side_effect=fake_handle):
             with patch.object(agent._checkpoint_mgr, "ensure_checkpoint") as cp_mock:
                 agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
@@ -3375,10 +3386,10 @@ class TestConcurrentToolExecution:
 
         agent._checkpoint_mgr.enabled = True
 
-        def fake_handle(name, args, task_id, **kwargs):
+        def fake_handle(name, args, **kwargs):
             return f"result_{name}"
 
-        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        with patch("model_tools.registry.dispatch", side_effect=fake_handle):
             with patch.object(agent._checkpoint_mgr, "ensure_checkpoint") as cp_mock:
                 agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
@@ -7607,3 +7618,301 @@ class TestMemoryProviderTurnStart:
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
         assert "on_turn_start(agent._user_turn_count" in src
+
+
+class TestRequiredPolicyDispatchBoundary:
+    @staticmethod
+    def _install_middleware(
+        monkeypatch,
+        *,
+        request_middleware=None,
+        execution_middleware=None,
+    ):
+        middleware = {}
+        if request_middleware is not None:
+            middleware["tool_request"] = [request_middleware]
+        if execution_middleware is not None:
+            middleware["tool_execution"] = [execution_middleware]
+        manager = SimpleNamespace(_middleware=middleware)
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_middleware",
+            lambda kind, **kwargs: (
+                [request_middleware(**kwargs)]
+                if kind == "tool_request" and request_middleware is not None
+                else []
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins._get_required_policies_for_module",
+            lambda: {},
+        )
+
+    def test_sequential_agent_tool_preserves_original_and_final_args(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        policy_inputs = []
+
+        def request_middleware(**kwargs):
+            return {
+                "args": {**kwargs["args"], "stage": "request"},
+                "source": "request-test",
+            }
+
+        def execution_middleware(**kwargs):
+            return kwargs["next_call"](
+                {**kwargs["args"], "stage": "execution", "merge": True}
+            )
+
+        self._install_middleware(
+            monkeypatch,
+            request_middleware=request_middleware,
+            execution_middleware=execution_middleware,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda policy_input: policy_inputs.append(policy_input),
+        )
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: False)
+        tool_call = _mock_tool_call(
+            name="todo",
+            arguments='{"todos":[],"stage":"original"}',
+            call_id="todo-1",
+        )
+        assistant = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as todo:
+            agent._execute_tool_calls_sequential(assistant, messages, "task-1")
+
+        assert len(policy_inputs) == 1
+        assert policy_inputs[0].original_args == {
+            "todos": [],
+            "stage": "original",
+        }
+        assert policy_inputs[0].effective_args == {
+            "todos": [],
+            "stage": "execution",
+            "merge": True,
+        }
+        todo.assert_called_once_with(
+            todos=[],
+            merge=True,
+            store=agent._todo_store,
+        )
+
+    def test_concurrent_registry_tool_authorizes_only_innermost_final_args(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        policy_inputs = []
+        handler_calls = []
+        complete_calls = []
+
+        def request_middleware(**kwargs):
+            return {
+                "args": {**kwargs["args"], "stage": "request"},
+                "source": "request-test",
+            }
+
+        def execution_middleware(**kwargs):
+            next_count = int(kwargs["args"].get("execution_count", 0)) + 1
+            return kwargs["next_call"](
+                {**kwargs["args"], "execution_count": next_count}
+            )
+
+        self._install_middleware(
+            monkeypatch,
+            request_middleware=request_middleware,
+            execution_middleware=execution_middleware,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda policy_input: policy_inputs.append(policy_input),
+        )
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: False)
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda name, args, **_kwargs: (
+                handler_calls.append((name, args)) or '{"ok":true}'
+            ),
+        )
+        tool_call = _mock_tool_call(
+            name="web_search",
+            arguments='{"q":"test","stage":"original"}',
+            call_id="web-1",
+        )
+        assistant = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        agent.tool_complete_callback = (
+            lambda tool_call_id, function_name, function_args, function_result: (
+                complete_calls.append(
+                    (tool_call_id, function_name, function_args, function_result)
+                )
+            )
+        )
+
+        agent._execute_tool_calls_concurrent(assistant, [], "task-1")
+
+        assert len(policy_inputs) == 1
+        assert policy_inputs[0].original_args == {
+            "q": "test",
+            "stage": "original",
+        }
+        assert policy_inputs[0].effective_args == {
+            "q": "test",
+            "stage": "request",
+            "execution_count": 2,
+        }
+        assert handler_calls == [
+            (
+                "web_search",
+                {
+                    "q": "test",
+                    "stage": "request",
+                    "execution_count": 2,
+                },
+            )
+        ]
+        assert complete_calls == [
+            (
+                "web-1",
+                "web_search",
+                {
+                    "q": "test",
+                    "stage": "request",
+                    "execution_count": 2,
+                },
+                '{"ok":true}',
+            )
+        ]
+
+    @pytest.mark.parametrize("concurrent", [False, True])
+    def test_required_block_skips_write_side_effects_and_emits_once(
+        self,
+        agent,
+        monkeypatch,
+        concurrent,
+    ):
+        from hermes_cli.tool_policy import PolicyDecisionCode, ToolPolicyBlock
+
+        self._install_middleware(monkeypatch)
+        block = ToolPolicyBlock(
+            policy="tool_dispatch",
+            policy_code=PolicyDecisionCode.BLOCKED,
+            message="Denied by governor.",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda _policy_input: block,
+        )
+        hook_calls = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
+        )
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
+        monkeypatch.setattr(
+            "acp_adapter.edit_approval.maybe_require_edit_approval",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("edit approval must not run")
+            ),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("handler must not run")
+            ),
+        )
+        agent._checkpoint_mgr.enabled = True
+        agent._checkpoint_mgr.ensure_checkpoint = MagicMock()
+        agent._subdirectory_hints.check_tool_call = MagicMock(
+            return_value="\nSHOULD_NOT_MUTATE_POLICY_BLOCK"
+        )
+        progress_calls = []
+        start_calls = []
+        agent.tool_progress_callback = lambda *args, **kwargs: progress_calls.append(
+            (args, kwargs)
+        )
+        agent.tool_start_callback = lambda *args, **kwargs: start_calls.append(
+            (args, kwargs)
+        )
+        tool_call = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"x.txt","content":"x"}',
+            call_id="write-1",
+        )
+        assistant = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        if concurrent:
+            agent._execute_tool_calls_concurrent(assistant, messages, "task-1")
+        else:
+            agent._execute_tool_calls_sequential(assistant, messages, "task-1")
+
+        assert agent._checkpoint_mgr.ensure_checkpoint.call_count == 0
+        assert progress_calls == []
+        assert start_calls == []
+        post_calls = [call for call in hook_calls if call[0] == "post_tool_call"]
+        assert len(post_calls) == 1
+        assert post_calls[0][1]["status"] == "blocked"
+        assert post_calls[0][1]["error_type"] == "required_policy_block"
+        assert json.loads(messages[0]["content"]) == block.to_result()
+
+    def test_required_block_skips_agent_tool_start_and_duplicate_post(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from hermes_cli.tool_policy import PolicyDecisionCode, ToolPolicyBlock
+
+        self._install_middleware(monkeypatch)
+        block = ToolPolicyBlock(
+            policy="tool_dispatch",
+            policy_code=PolicyDecisionCode.BLOCKED,
+            message="Denied by governor.",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda _policy_input: block,
+        )
+        hook_calls = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
+        )
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
+        progress_calls = []
+        start_calls = []
+        agent.tool_progress_callback = lambda *args, **kwargs: progress_calls.append(
+            (args, kwargs)
+        )
+        agent.tool_start_callback = lambda *args, **kwargs: start_calls.append(
+            (args, kwargs)
+        )
+        tool_call = _mock_tool_call(
+            name="todo",
+            arguments='{"todos":[]}',
+            call_id="todo-1",
+        )
+        assistant = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        with patch(
+            "tools.todo_tool.todo_tool",
+            side_effect=AssertionError("todo handler must not run"),
+        ):
+            agent._execute_tool_calls_sequential(assistant, messages, "task-1")
+
+        assert progress_calls == []
+        assert start_calls == []
+        post_calls = [call for call in hook_calls if call[0] == "post_tool_call"]
+        assert len(post_calls) == 1
+        assert post_calls[0][1]["error_type"] == "required_policy_block"
+        assert json.loads(messages[0]["content"]) == block.to_result()

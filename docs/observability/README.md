@@ -178,7 +178,7 @@ Tool hooks describe individual tool calls:
 | --- | --- |
 | `ok` | Tool completed normally. |
 | `error` | Tool ran and returned or raised an error outcome. |
-| `blocked` | A `pre_tool_call` hook blocked execution. |
+| `blocked` | A legacy `pre_tool_call` directive or a required tool policy blocked execution. Required-policy details use `error_type: "required_policy_block"` and a structured JSON result. |
 | `cancelled` | Execution was cancelled before normal completion. |
 
 `post_tool_call` is emitted for blocked and cancelled paths so telemetry
@@ -200,8 +200,10 @@ Common fields include `command`, `description`, `pattern_key`,
 `session`, `always`, `deny`, and `timeout`.
 
 Approval hooks are observer-only. Plugins cannot pre-answer or veto approvals
-from these hooks. To prevent a tool from reaching approval, use
-`pre_tool_call` blocking.
+from these hooks. Legacy `pre_tool_call` blocking remains fail-open
+compatibility behavior. To prevent a tool from reaching approval through an
+explicit fail-closed boundary, configure a required `tool_dispatch` policy as
+documented in [`docs/middleware/README.md`](../middleware/README.md).
 
 ### Subagent Lifecycle
 

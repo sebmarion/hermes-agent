@@ -3,6 +3,7 @@
 import logging
 import sys
 import types
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +29,7 @@ from hermes_cli.middleware import (
     apply_tool_request_middleware,
     run_tool_execution_middleware,
 )
+from hermes_cli.tool_policy import ToolPolicyRegistration
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -171,6 +173,73 @@ class TestPluginDiscovery:
         assert run_tool_execution_middleware("terminal", args, lambda payload: payload) is args
         assert has_middleware("tool_request") is False
 
+    def test_no_execution_middleware_still_authorizes_final_dispatch(
+        self,
+        monkeypatch,
+    ):
+        manager = types.SimpleNamespace(_middleware={})
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        policy_inputs = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda policy_input: policy_inputs.append(policy_input),
+        )
+
+        terminal_calls = []
+        result = run_tool_execution_middleware(
+            "read_file",
+            {"path": "effective.txt"},
+            lambda payload: terminal_calls.append(payload) or "ok",
+            original_args={"path": "original.txt"},
+            task_id="task-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+        )
+
+        assert result == "ok"
+        assert terminal_calls == [{"path": "effective.txt"}]
+        assert len(policy_inputs) == 1
+        assert policy_inputs[0].original_args == {"path": "original.txt"}
+        assert policy_inputs[0].effective_args == {"path": "effective.txt"}
+        assert policy_inputs[0].task_id == "task-1"
+        assert policy_inputs[0].session_id == "session-1"
+        assert policy_inputs[0].turn_id == "turn-1"
+        assert policy_inputs[0].tool_call_id == "call-1"
+
+    def test_replacement_execution_middleware_stays_outside_ordinary_dispatch(
+        self,
+        monkeypatch,
+    ):
+        def replacement(**_kwargs):
+            return "trusted-host-replacement"
+
+        manager = types.SimpleNamespace(
+            _middleware={"tool_execution": [replacement]}
+        )
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        policy_inputs = []
+        terminal_calls = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda policy_input: policy_inputs.append(policy_input),
+        )
+
+        result = run_tool_execution_middleware(
+            "read_file",
+            {"path": "effective.txt"},
+            lambda payload: terminal_calls.append(payload) or "unexpected",
+            original_args={"path": "original.txt"},
+            task_id="task-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+        )
+
+        assert result == "trusted-host-replacement"
+        assert policy_inputs == []
+        assert terminal_calls == []
+
     def test_request_middleware_changed_tracks_trace_not_deep_equality(self, monkeypatch):
         def same_payload_middleware(**kwargs):
             return {"args": kwargs["args"], "source": "same-payload"}
@@ -275,6 +344,7 @@ class TestPluginDiscovery:
 
     def test_execution_middleware_double_next_call_does_not_run_terminal_twice(self, monkeypatch):
         calls = []
+        policy_inputs = []
 
         def middleware(**kwargs):
             first = kwargs["next_call"](kwargs["args"])
@@ -286,6 +356,10 @@ class TestPluginDiscovery:
 
         manager = types.SimpleNamespace(_middleware={"tool_execution": [middleware]})
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda policy_input: policy_inputs.append(policy_input),
+        )
 
         def terminal(args):
             calls.append(args)
@@ -295,6 +369,7 @@ class TestPluginDiscovery:
 
         assert result == "terminal-result"
         assert calls == [{"command": "printf ok"}]
+        assert len(policy_inputs) == 1
 
     def test_request_middleware_tolerates_non_deepcopyable_payload(self, monkeypatch):
         import threading
@@ -2201,3 +2276,263 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+# ── TestRequiredToolPolicy ─────────────────────────────────────────────────
+
+
+class TestRequiredToolPolicy:
+    """Required policies are strict, attributed, and lifecycle-safe."""
+
+    @staticmethod
+    def _parse_manifest(tmp_path, name, manifest_extra):
+        plugin_dir = tmp_path / name
+        plugin_dir.mkdir()
+        manifest_file = plugin_dir / "plugin.yaml"
+        manifest_file.write_text(
+            yaml.safe_dump({"name": name, **manifest_extra}),
+            encoding="utf-8",
+        )
+        return PluginManager()._parse_manifest(
+            manifest_file,
+            plugin_dir,
+            "user",
+            "",
+        )
+
+    @staticmethod
+    def _make_context(*, key="category/test-plugin", declared=True):
+        manager = PluginManager()
+        manifest = PluginManifest(
+            name="test-plugin",
+            key=key,
+            provides_policies=["tool_dispatch"] if declared else [],
+        )
+        return PluginContext(manifest, manager), manager
+
+    def test_manifest_parses_declared_policies_and_defaults_to_empty(
+        self,
+        tmp_path,
+    ):
+        declared = self._parse_manifest(
+            tmp_path,
+            "declared",
+            {"policies": ["tool_dispatch"]},
+        )
+        absent = self._parse_manifest(tmp_path, "absent", {})
+
+        assert declared is not None
+        assert declared.provides_policies == ["tool_dispatch"]
+        assert absent is not None
+        assert absent.provides_policies == []
+
+    @pytest.mark.parametrize(
+        "policies",
+        [
+            None,
+            "tool_dispatch",
+            [1],
+            [""],
+            ["unknown_policy"],
+            ["tool_dispatch", "tool_dispatch"],
+        ],
+    )
+    def test_manifest_rejects_invalid_policy_declarations(
+        self,
+        tmp_path,
+        policies,
+    ):
+        manifest = self._parse_manifest(
+            tmp_path,
+            f"invalid-{len(list(tmp_path.iterdir()))}",
+            {"policies": policies},
+        )
+
+        assert manifest is None
+
+    def test_register_policy_uses_canonical_plugin_key_and_default_timeout(self):
+        callback = lambda payload: {"action": "block", "message": "blocked"}
+        context, manager = self._make_context()
+
+        context.register_policy("tool_dispatch", callback)
+
+        registration = manager.get_policy_registration(
+            "category/test-plugin",
+            "tool_dispatch",
+        )
+        assert registration == ToolPolicyRegistration(
+            plugin_key="category/test-plugin",
+            policy_name="tool_dispatch",
+            callback=callback,
+            timeout_ms=2_000,
+        )
+        assert manager.get_policy_registrations() == (registration,)
+
+    def test_registration_snapshots_are_immutable_and_filtered(self):
+        first_context, manager = self._make_context(key="category/first")
+        second_manifest = PluginManifest(
+            name="second",
+            key="category/second",
+            provides_policies=["tool_dispatch"],
+        )
+        second_context = PluginContext(second_manifest, manager)
+
+        first_context.register_policy("tool_dispatch", lambda payload: None)
+        second_context.register_policy(
+            "tool_dispatch",
+            lambda payload: None,
+            timeout_ms=7_500,
+        )
+
+        snapshot = manager.get_policy_registrations()
+        assert isinstance(snapshot, tuple)
+        assert [item.plugin_key for item in snapshot] == [
+            "category/first",
+            "category/second",
+        ]
+        assert manager.get_policy_registrations("category/second") == (
+            snapshot[1],
+        )
+        with pytest.raises(TypeError):
+            snapshot[0] = snapshot[1]
+        with pytest.raises(FrozenInstanceError):
+            snapshot[0].timeout_ms = 1
+        assert manager.get_policy_registration(
+            "category/first",
+            "tool_dispatch",
+        ).timeout_ms == 2_000
+
+    def test_duplicate_pair_is_rejected_but_different_plugins_can_share_name(self):
+        first_context, manager = self._make_context(key="category/first")
+        second_context = PluginContext(
+            PluginManifest(
+                name="second",
+                key="category/second",
+                provides_policies=["tool_dispatch"],
+            ),
+            manager,
+        )
+
+        first_context.register_policy("tool_dispatch", lambda payload: None)
+        with pytest.raises(ValueError, match="already registered"):
+            first_context.register_policy(
+                "tool_dispatch",
+                lambda payload: None,
+            )
+
+        second_context.register_policy("tool_dispatch", lambda payload: None)
+        assert len(manager.get_policy_registrations()) == 2
+
+    @pytest.mark.parametrize(
+        ("name", "callback", "timeout_ms", "error_type"),
+        [
+            ("unknown", lambda payload: None, 2_000, ValueError),
+            ("tool_dispatch", None, 2_000, TypeError),
+            ("tool_dispatch", lambda payload: None, True, TypeError),
+            ("tool_dispatch", lambda payload: None, 0, ValueError),
+            ("tool_dispatch", lambda payload: None, 10_001, ValueError),
+            ("tool_dispatch", lambda payload: None, 1.5, TypeError),
+        ],
+    )
+    def test_register_policy_rejects_invalid_inputs(
+        self,
+        name,
+        callback,
+        timeout_ms,
+        error_type,
+    ):
+        context, _ = self._make_context()
+
+        with pytest.raises(error_type):
+            context.register_policy(
+                name,
+                callback,
+                timeout_ms=timeout_ms,
+            )
+
+    def test_register_policy_requires_manifest_declaration(self):
+        context, manager = self._make_context(declared=False)
+
+        with pytest.raises(ValueError, match="did not declare"):
+            context.register_policy(
+                "tool_dispatch",
+                lambda payload: None,
+            )
+
+        assert manager.get_policy_registrations() == ()
+
+    def test_force_rediscovery_clears_policy_registrations(self, monkeypatch):
+        context, manager = self._make_context()
+        context.register_policy("tool_dispatch", lambda payload: None)
+        manager._discovered = True
+        monkeypatch.setattr(
+            PluginManager,
+            "_discover_and_load_inner",
+            lambda self: None,
+        )
+
+        manager.discover_and_load(force=True)
+
+        assert manager.get_policy_registrations() == ()
+
+    def test_loaded_plugin_attributes_policy_without_changing_other_counts(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        _make_plugin_dir(
+            hermes_home / "plugins",
+            "policy_plugin",
+            register_body=(
+                "ctx.register_policy('tool_dispatch', lambda payload: None)\n"
+                "    ctx.register_hook('pre_tool_call', lambda **kw: None)\n"
+                "    ctx.register_middleware('tool_request', lambda **kw: None)"
+            ),
+            manifest_extra={"policies": ["tool_dispatch"]},
+        )
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        loaded = manager._plugins["policy_plugin"]
+        info = next(
+            item
+            for item in manager.list_plugins()
+            if item["key"] == "policy_plugin"
+        )
+        assert loaded.policies_registered == ["tool_dispatch"]
+        assert info["policies"] == ["tool_dispatch"]
+        assert info["policy_count"] == 1
+        assert info["hooks"] == 1
+        assert info["middleware"] == 1
+        assert "callback" not in repr(info).lower()
+
+    def test_failed_plugin_load_rolls_back_policy_registration(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        _make_plugin_dir(
+            hermes_home / "plugins",
+            "broken_policy_plugin",
+            register_body=(
+                "ctx.register_policy('tool_dispatch', lambda payload: None)\n"
+                "    raise RuntimeError('boom')"
+            ),
+            manifest_extra={"policies": ["tool_dispatch"]},
+        )
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        loaded = manager._plugins["broken_policy_plugin"]
+        assert loaded.enabled is False
+        assert loaded.error == "boom"
+        assert manager.get_policy_registration(
+            "broken_policy_plugin",
+            "tool_dispatch",
+        ) is None

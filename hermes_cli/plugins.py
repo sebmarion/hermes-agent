@@ -50,6 +50,14 @@ from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.tool_policy import (
+    PluginMiddlewareRegistration,
+    RequiredPolicyFailureCode,
+    ToolDispatchPolicyInput,
+    ToolPolicyBlock,
+    ToolPolicyRegistration,
+    run_required_policy,
+)
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -273,6 +281,32 @@ def _get_enabled_plugins() -> Optional[set]:
 # ---------------------------------------------------------------------------
 
 _VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+_VALID_PLUGIN_POLICIES = frozenset({"tool_dispatch"})
+
+
+def _parse_manifest_policies(value: object, plugin_key: str) -> List[str]:
+    """Validate the strict ``policies`` manifest declaration."""
+    if type(value) is not list:
+        raise ValueError(f"Plugin {plugin_key!r}: policies must be a list")
+
+    policies: List[str] = []
+    seen: Set[str] = set()
+    for policy_name in value:
+        if type(policy_name) is not str or not policy_name:
+            raise ValueError(
+                f"Plugin {plugin_key!r}: policy names must be non-empty strings"
+            )
+        if policy_name not in _VALID_PLUGIN_POLICIES:
+            raise ValueError(
+                f"Plugin {plugin_key!r}: unsupported policy {policy_name!r}"
+            )
+        if policy_name in seen:
+            raise ValueError(
+                f"Plugin {plugin_key!r}: duplicate policy {policy_name!r}"
+            )
+        seen.add(policy_name)
+        policies.append(policy_name)
+    return policies
 
 
 @dataclass
@@ -286,6 +320,7 @@ class PluginManifest:
     requires_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
     provides_tools: List[str] = field(default_factory=list)
     provides_hooks: List[str] = field(default_factory=list)
+    provides_policies: List[str] = field(default_factory=list)
     source: str = ""        # "user", "project", or "entrypoint"
     path: Optional[str] = None
     # Plugin kind — see plugins.py module docstring for semantics.
@@ -322,6 +357,7 @@ class LoadedPlugin:
     hooks_registered: List[str] = field(default_factory=list)
     middleware_registered: List[str] = field(default_factory=list)
     commands_registered: List[str] = field(default_factory=list)
+    policies_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
     # True for a bundled platform plugin recorded as a deferred (not-yet-
@@ -441,6 +477,40 @@ class PluginContext:
         logger.debug(
             "Plugin %s registered tool: %s%s",
             self.manifest.name, name, " (override)" if override else "",
+        )
+
+    # -- policy registration --------------------------------------------------
+
+    def register_policy(
+        self,
+        name: str,
+        callback: Callable,
+        timeout_ms: int = 2_000,
+    ) -> None:
+        """Register one named, manifest-declared required policy."""
+        if name not in _VALID_PLUGIN_POLICIES:
+            supported = ", ".join(sorted(_VALID_PLUGIN_POLICIES))
+            raise ValueError(f"Unsupported policy {name!r}; supported: {supported}")
+        if not callable(callback):
+            raise TypeError("policy callback must be callable")
+        if type(timeout_ms) is not int:
+            raise TypeError("timeout_ms must be an integer")
+        if not 1 <= timeout_ms <= 10_000:
+            raise ValueError("timeout_ms must be between 1 and 10000")
+        if name not in self.manifest.provides_policies:
+            plugin_key = self.manifest.key or self.manifest.name
+            raise ValueError(
+                f"Plugin {plugin_key!r} did not declare policy {name!r}"
+            )
+
+        plugin_key = self.manifest.key or self.manifest.name
+        self._manager._register_policy(
+            ToolPolicyRegistration(
+                plugin_key=plugin_key,
+                policy_name=name,
+                callback=callback,
+                timeout_ms=timeout_ms,
+            )
         )
 
     # -- override trust gate ------------------------------------------------
@@ -1141,7 +1211,14 @@ class PluginContext:
                 kind,
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
-        self._manager._middleware.setdefault(kind, []).append(callback)
+        plugin_key = self.manifest.key or self.manifest.name
+        self._manager._middleware.setdefault(kind, []).append(
+            PluginMiddlewareRegistration(
+                plugin_key=plugin_key,
+                kind=kind,
+                callback=callback,
+            )
+        )
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
 
     # -- skill registration -------------------------------------------------
@@ -1208,6 +1285,11 @@ class PluginManager:
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
+        # Required-policy callbacks stay manager-owned. Public accessors return
+        # frozen registrations in immutable tuple snapshots.
+        self._policy_registrations: Dict[
+            tuple[str, str], ToolPolicyRegistration
+        ] = {}
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
@@ -1226,6 +1308,45 @@ class PluginManager:
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
+
+    def _register_policy(self, registration: ToolPolicyRegistration) -> None:
+        """Store one plugin-attributed policy registration exactly once."""
+        registry_key = (registration.plugin_key, registration.policy_name)
+        if registry_key in self._policy_registrations:
+            plugin_key, policy_name = registry_key
+            raise ValueError(
+                f"Plugin {plugin_key!r} already registered policy {policy_name!r}"
+            )
+        self._policy_registrations[registry_key] = registration
+
+    def get_policy_registration(
+        self,
+        plugin_key: str,
+        policy_name: str,
+    ) -> Optional[ToolPolicyRegistration]:
+        """Return one frozen registration, or ``None`` when absent."""
+        return self._policy_registrations.get((plugin_key, policy_name))
+
+    def get_policy_registrations(
+        self,
+        plugin_key: Optional[str] = None,
+    ) -> tuple[ToolPolicyRegistration, ...]:
+        """Return a deterministic immutable snapshot of registrations."""
+        registrations = (
+            registration
+            for (registered_plugin, _), registration
+            in self._policy_registrations.items()
+            if plugin_key is None or registered_plugin == plugin_key
+        )
+        return tuple(
+            sorted(
+                registrations,
+                key=lambda registration: (
+                    registration.plugin_key,
+                    registration.policy_name,
+                ),
+            )
+        )
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
@@ -1256,6 +1377,7 @@ class PluginManager:
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
+            self._policy_registrations.clear()
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
         # raises so a failed scan is NOT cached as "discovered with an empty
@@ -1534,6 +1656,10 @@ class PluginManager:
 
             name = data.get("name", plugin_dir.name)
             key = f"{prefix}/{plugin_dir.name}" if prefix else name
+            provides_policies = _parse_manifest_policies(
+                data.get("policies", []),
+                key,
+            )
 
             raw_kind = data.get("kind", "standalone")
             if not isinstance(raw_kind, str):
@@ -1595,6 +1721,7 @@ class PluginManager:
                 requires_env=data.get("requires_env", []),
                 provides_tools=data.get("provides_tools", []),
                 provides_hooks=data.get("provides_hooks", []),
+                provides_policies=provides_policies,
                 source=source,
                 path=str(plugin_dir),
                 kind=kind,
@@ -1715,6 +1842,7 @@ class PluginManager:
             f"{_NS_PARENT}.{_slug}",
             PluginContext(manifest, self)._tool_override_allowed(""),
         )
+        _policy_keys_before = set(self._policy_registrations)
         try:
             if manifest.source in {"user", "project", "bundled"}:
                 module = self._load_directory_module(manifest)
@@ -1759,16 +1887,24 @@ class PluginManager:
                     for kind, cbs in self._middleware.items()
                     if len(cbs) > _mw_counts_before.get(kind, 0)
                 ]
+                loaded.policies_registered = sorted(
+                    policy_name
+                    for plugin_key, policy_name
+                    in set(self._policy_registrations) - _policy_keys_before
+                    if plugin_key == _plugin_id
+                )
                 loaded.commands_registered = [
                     c for c in self._plugin_commands
                     if self._plugin_commands[c].get("plugin") == manifest.name
                 ]
                 loaded.enabled = True
                 logger.debug(
-                    "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s), %d CLI command(s)",
+                    "  registered: %d tool(s), %d hook(s), %d middleware, "
+                    "%d policy, %d slash command(s), %d CLI command(s)",
                     len(loaded.tools_registered),
                     len(loaded.hooks_registered),
                     len(loaded.middleware_registered),
+                    len(loaded.policies_registered),
                     len(loaded.commands_registered),
                     sum(
                         1 for c in self._cli_commands
@@ -1777,6 +1913,8 @@ class PluginManager:
                 )
 
         except Exception as exc:
+            for policy_key in set(self._policy_registrations) - _policy_keys_before:
+                self._policy_registrations.pop(policy_key, None)
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",
@@ -1948,6 +2086,8 @@ class PluginManager:
                     "tools": len(loaded.tools_registered),
                     "hooks": len(loaded.hooks_registered),
                     "middleware": len(loaded.middleware_registered),
+                    "policies": list(loaded.policies_registered),
+                    "policy_count": len(loaded.policies_registered),
                     "commands": len(loaded.commands_registered),
                     "error": loaded.error,
                 }
@@ -1990,6 +2130,130 @@ def get_plugin_manager() -> PluginManager:
     if _plugin_manager is None:
         _plugin_manager = PluginManager()
     return _plugin_manager
+
+
+def _get_required_policies_for_module() -> dict[str, list[str]]:
+    """Import ``_get_required_policies`` from plugins_cmd lazily.
+
+    Imported inside a function body so the module-level import order stays
+    sane: ``hermes_cli.plugins`` is imported before ``hermes_cli.plugins_cmd``
+    by most call sites, so the circular dependency would otherwise manifest as
+    a ``RuntimeError: module is being imported during execution`` on the first
+    plugin that triggers policy enforcement.
+    """
+    from hermes_cli.plugins_cmd import _get_required_policies
+
+    return _get_required_policies()
+
+
+def _required_policy_system_block(
+    policy_name: str,
+    policy_code: str,
+    message: str,
+) -> ToolPolicyBlock:
+    return ToolPolicyBlock(
+        policy=policy_name,
+        policy_code=policy_code,
+        message=message,
+    )
+
+
+def authorize_required_tool_policies(
+    policy_input: ToolDispatchPolicyInput,
+) -> ToolPolicyBlock | None:
+    """Return a ``ToolPolicyBlock`` when any required policy blocks the call.
+
+    Returns ``None`` only when every configured policy explicitly allows
+    execution. System-facing failure messages never include loaded-plugin
+    error detail — those details stay out of the LLM prompt.
+    """
+    try:
+        required_policies = _get_required_policies_for_module()
+    except Exception:
+        return _required_policy_system_block(
+            "tool_dispatch",
+            RequiredPolicyFailureCode.CONFIG_INVALID,
+            "Required policy configuration is invalid.",
+        )
+
+    if type(required_policies) is not dict:
+        return _required_policy_system_block(
+            "tool_dispatch",
+            RequiredPolicyFailureCode.CONFIG_INVALID,
+            "Required policy configuration is invalid.",
+        )
+    if not required_policies:
+        return None
+
+    manager = get_plugin_manager()
+    try:
+        manager.discover_and_load()
+    except Exception:
+        return _required_policy_system_block(
+            "tool_dispatch",
+            RequiredPolicyFailureCode.PLUGIN_LOAD_ERROR,
+            "Required policy plugin failed to load.",
+        )
+
+    for plugin_key in sorted(required_policies):
+        policy_names = required_policies[plugin_key]
+        if (
+            type(plugin_key) is not str
+            or type(policy_names) is not list
+            or not policy_names
+            or any(type(policy_name) is not str for policy_name in policy_names)
+        ):
+            return _required_policy_system_block(
+                "tool_dispatch",
+                RequiredPolicyFailureCode.CONFIG_INVALID,
+                "Required policy configuration is invalid.",
+            )
+        for policy_name in sorted(policy_names):
+            loaded = manager._plugins.get(plugin_key)
+            if loaded is None:
+                return _required_policy_system_block(
+                    policy_name,
+                    RequiredPolicyFailureCode.PLUGIN_MISSING,
+                    "Required policy plugin is not installed.",
+                )
+            if not loaded.enabled:
+                load_error = loaded.error if type(loaded.error) is str else ""
+                if load_error == "disabled via config" or load_error.startswith(
+                    "not enabled in config"
+                ):
+                    return _required_policy_system_block(
+                        policy_name,
+                        RequiredPolicyFailureCode.PLUGIN_DISABLED,
+                        "Required policy plugin is disabled.",
+                    )
+                return _required_policy_system_block(
+                    policy_name,
+                    RequiredPolicyFailureCode.PLUGIN_LOAD_ERROR,
+                    "Required policy plugin failed to load.",
+                )
+
+            registration = manager.get_policy_registration(
+                plugin_key,
+                policy_name,
+            )
+            if registration is None:
+                return _required_policy_system_block(
+                    policy_name,
+                    RequiredPolicyFailureCode.REGISTRATION_MISSING,
+                    "Required policy is not registered.",
+                )
+            try:
+                block = run_required_policy(registration, policy_input)
+            except Exception:
+                return _required_policy_system_block(
+                    policy_name,
+                    RequiredPolicyFailureCode.CALLBACK_ERROR,
+                    "Required policy callback failed.",
+                )
+            if block is not None:
+                return block
+
+    return None
 
 
 def discover_plugins(force: bool = False) -> None:

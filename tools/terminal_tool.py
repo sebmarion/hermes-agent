@@ -1997,6 +1997,12 @@ def _resolve_command_cwd(
     the old cwd back through ``env.execute(..., cwd=...)``. Explicit
     ``workdir=`` must still override everything.
     """
+    from agent.tool_runtime_context import get_prepared_tool_runtime
+
+    prepared = get_prepared_tool_runtime()
+    if prepared is not None and prepared.effective_cwd:
+        return prepared.effective_cwd
+
     if workdir:
         return workdir
 

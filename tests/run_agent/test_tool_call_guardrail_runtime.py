@@ -98,7 +98,11 @@ def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_e
     msg = SimpleNamespace(content="", tool_calls=[tc])
     messages = []
 
-    with patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc:
+    def fake_handle(name, call_args, task_id, **kwargs):
+        kwargs["on_authorized"](call_args)
+        return json.dumps({"error": "boom"})
+
+    with patch("run_agent.handle_function_call", side_effect=fake_handle) as mock_hfc:
         agent._execute_tool_calls_sequential(msg, messages, "task-1")
 
     mock_hfc.assert_called_once()
@@ -202,6 +206,7 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     executed = []
 
     def fake_handle(name, args, task_id, **kwargs):
+        kwargs["on_authorized"](args)
         executed.append((name, args, kwargs["tool_call_id"]))
         return json.dumps({"ok": args["query"]})
 
