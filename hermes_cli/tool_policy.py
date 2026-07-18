@@ -18,9 +18,13 @@ import hashlib
 import hmac
 import json
 import math
+import threading
 from collections.abc import Callable, Mapping
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import TypeAlias
+
+from tools.daemon_pool import DaemonThreadPoolExecutor
 
 POLICY_SCHEMA_VERSION = 1
 MAX_POLICY_BLOCK_MESSAGE_BYTES = 1_000
@@ -41,6 +45,20 @@ class PolicyDecisionCode:
     BINDING_MISMATCH = "policy_binding_mismatch"
     EMPTY_BLOCK_MESSAGE = "policy_empty_block_message"
     INVALID_BLOCK_MESSAGE = "policy_invalid_block_message"
+
+
+class RequiredPolicyFailureCode:
+    """Stable codes for failures enforcing ``tool_dispatch`` required policies."""
+
+    CONFIG_INVALID = "required_policy_config_invalid"
+    PLUGIN_MISSING = "required_policy_plugin_missing"
+    PLUGIN_DISABLED = "required_policy_plugin_disabled"
+    PLUGIN_LOAD_ERROR = "required_policy_plugin_load_error"
+    REGISTRATION_MISSING = "required_policy_registration_missing"
+    CALLBACK_ERROR = "required_policy_callback_error"
+    TIMEOUT = "required_policy_timeout"
+    EXECUTOR_SATURATED = "required_policy_executor_saturated"
+    QUARANTINED = "required_policy_quarantined"
 
 
 def _validate_json_value(value: object, path: str) -> None:
@@ -411,6 +429,161 @@ def parse_policy_decision(
         False,
         PolicyDecisionCode.NON_EXPLICIT,
         "Policy did not explicitly allow execution.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Process-wide executor, semaphore, and quarantine
+# ---------------------------------------------------------------------------
+
+_REQUIRED_POLICY_MAX_WORKERS = 4
+_required_policy_executor = DaemonThreadPoolExecutor(
+    max_workers=_REQUIRED_POLICY_MAX_WORKERS,
+    thread_name_prefix="required-policy",
+)
+_required_policy_slots = threading.BoundedSemaphore(_REQUIRED_POLICY_MAX_WORKERS)
+_required_policy_quarantine: set[tuple[str, str, str]] = set()
+_required_policy_quarantine_lock = threading.Lock()
+
+
+def _required_policy_key(
+    session_id: str,
+    plugin_key: str,
+    policy_name: str,
+) -> tuple[str, str, str]:
+    return session_id, plugin_key, policy_name
+
+
+def _quarantine_required_policy(key: tuple[str, str, str]) -> None:
+    with _required_policy_quarantine_lock:
+        _required_policy_quarantine.add(key)
+
+
+def _required_policy_block(
+    registration: ToolPolicyRegistration,
+    policy_code: str,
+    message: str,
+) -> ToolPolicyBlock:
+    return ToolPolicyBlock(
+        policy=registration.policy_name,
+        policy_code=policy_code,
+        message=message,
+    )
+
+
+def is_required_policy_quarantined(
+    session_id: str,
+    plugin_key: str,
+    policy_name: str,
+) -> bool:
+    key = _required_policy_key(session_id, plugin_key, policy_name)
+    with _required_policy_quarantine_lock:
+        return key in _required_policy_quarantine
+
+
+def clear_required_policy_quarantine(session_id: str | None = None) -> None:
+    """Clear quarantine entries. When ``session_id`` is ``None`` clear all."""
+    with _required_policy_quarantine_lock:
+        if session_id is None:
+            _required_policy_quarantine.clear()
+        else:
+            retained = {
+                key
+                for key in _required_policy_quarantine
+                if key[0] != session_id
+            }
+            _required_policy_quarantine.clear()
+            _required_policy_quarantine.update(retained)
+
+
+def run_required_policy(
+    registration: ToolPolicyRegistration,
+    policy_input: ToolDispatchPolicyInput,
+) -> ToolPolicyBlock | None:
+    """Run one required policy callback and return the resulting block or ``None`` on explicit allow.
+
+    A callback that times out or raises is quarantined so subsequent calls from
+    the same (session, plugin, policy) triple are short-circuited without
+    submitting another future. The matching capacity slot is released only
+    from the worker's ``finally`` block, so wedged workers cannot create
+    unbounded queued work.
+
+    ``None`` is returned only when the callback produced a valid explicit allow.
+    """
+    quarantine_key = _required_policy_key(
+        policy_input.session_id,
+        registration.plugin_key,
+        registration.policy_name,
+    )
+    if is_required_policy_quarantined(*quarantine_key):
+        return _required_policy_block(
+            registration,
+            RequiredPolicyFailureCode.QUARANTINED,
+            message="Required policy was quarantined from a prior failure.",
+        )
+
+    if not _required_policy_slots.acquire(blocking=False):
+        return _required_policy_block(
+            registration,
+            RequiredPolicyFailureCode.EXECUTOR_SATURATED,
+            message="Required policy executor is saturated.",
+        )
+
+    def _run_and_release() -> object:
+        try:
+            return registration.callback(policy_input.to_callback_payload())
+        finally:
+            _required_policy_slots.release()
+
+    try:
+        future = _required_policy_executor.submit(_run_and_release)
+    except Exception:
+        _required_policy_slots.release()
+        _quarantine_required_policy(quarantine_key)
+        return _required_policy_block(
+            registration,
+            RequiredPolicyFailureCode.CALLBACK_ERROR,
+            message="Required policy callback could not be scheduled.",
+        )
+
+    try:
+        decision = future.result(timeout=registration.timeout_ms / 1000.0)
+    except FuturesTimeoutError:
+        _quarantine_required_policy(quarantine_key)
+        if future.done():
+            try:
+                completed_exception = future.exception(timeout=0)
+            except Exception:
+                completed_exception = FuturesTimeoutError()
+            if completed_exception is not None:
+                return _required_policy_block(
+                    registration,
+                    RequiredPolicyFailureCode.CALLBACK_ERROR,
+                    message="Required policy callback failed.",
+                )
+        return _required_policy_block(
+            registration,
+            RequiredPolicyFailureCode.TIMEOUT,
+            message="Required policy callback timed out.",
+        )
+    except Exception:
+        _quarantine_required_policy(quarantine_key)
+        return _required_policy_block(
+            registration,
+            RequiredPolicyFailureCode.CALLBACK_ERROR,
+            message="Required policy callback failed.",
+        )
+
+    parsed = parse_policy_decision(decision, policy_input.policy_binding)
+    if parsed.allows():
+        return None
+
+    if parsed.policy_code != PolicyDecisionCode.BLOCKED:
+        _quarantine_required_policy(quarantine_key)
+    return _required_policy_block(
+        registration,
+        parsed.policy_code,
+        parsed.message,
     )
 
 

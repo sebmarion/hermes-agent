@@ -50,7 +50,13 @@ from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
-from hermes_cli.tool_policy import ToolPolicyRegistration
+from hermes_cli.tool_policy import (
+    RequiredPolicyFailureCode,
+    ToolDispatchPolicyInput,
+    ToolPolicyBlock,
+    ToolPolicyRegistration,
+    run_required_policy,
+)
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -2116,6 +2122,130 @@ def get_plugin_manager() -> PluginManager:
     if _plugin_manager is None:
         _plugin_manager = PluginManager()
     return _plugin_manager
+
+
+def _get_required_policies_for_module() -> dict[str, list[str]]:
+    """Import ``_get_required_policies`` from plugins_cmd lazily.
+
+    Imported inside a function body so the module-level import order stays
+    sane: ``hermes_cli.plugins`` is imported before ``hermes_cli.plugins_cmd``
+    by most call sites, so the circular dependency would otherwise manifest as
+    a ``RuntimeError: module is being imported during execution`` on the first
+    plugin that triggers policy enforcement.
+    """
+    from hermes_cli.plugins_cmd import _get_required_policies
+
+    return _get_required_policies()
+
+
+def _required_policy_system_block(
+    policy_name: str,
+    policy_code: str,
+    message: str,
+) -> ToolPolicyBlock:
+    return ToolPolicyBlock(
+        policy=policy_name,
+        policy_code=policy_code,
+        message=message,
+    )
+
+
+def authorize_required_tool_policies(
+    policy_input: ToolDispatchPolicyInput,
+) -> ToolPolicyBlock | None:
+    """Return a ``ToolPolicyBlock`` when any required policy blocks the call.
+
+    Returns ``None`` only when every configured policy explicitly allows
+    execution. System-facing failure messages never include loaded-plugin
+    error detail — those details stay out of the LLM prompt.
+    """
+    try:
+        required_policies = _get_required_policies_for_module()
+    except Exception:
+        return _required_policy_system_block(
+            "tool_dispatch",
+            RequiredPolicyFailureCode.CONFIG_INVALID,
+            "Required policy configuration is invalid.",
+        )
+
+    if type(required_policies) is not dict:
+        return _required_policy_system_block(
+            "tool_dispatch",
+            RequiredPolicyFailureCode.CONFIG_INVALID,
+            "Required policy configuration is invalid.",
+        )
+    if not required_policies:
+        return None
+
+    manager = get_plugin_manager()
+    try:
+        manager.discover_and_load()
+    except Exception:
+        return _required_policy_system_block(
+            "tool_dispatch",
+            RequiredPolicyFailureCode.PLUGIN_LOAD_ERROR,
+            "Required policy plugin failed to load.",
+        )
+
+    for plugin_key in sorted(required_policies):
+        policy_names = required_policies[plugin_key]
+        if (
+            type(plugin_key) is not str
+            or type(policy_names) is not list
+            or not policy_names
+            or any(type(policy_name) is not str for policy_name in policy_names)
+        ):
+            return _required_policy_system_block(
+                "tool_dispatch",
+                RequiredPolicyFailureCode.CONFIG_INVALID,
+                "Required policy configuration is invalid.",
+            )
+        for policy_name in sorted(policy_names):
+            loaded = manager._plugins.get(plugin_key)
+            if loaded is None:
+                return _required_policy_system_block(
+                    policy_name,
+                    RequiredPolicyFailureCode.PLUGIN_MISSING,
+                    "Required policy plugin is not installed.",
+                )
+            if not loaded.enabled:
+                load_error = loaded.error if type(loaded.error) is str else ""
+                if load_error == "disabled via config" or load_error.startswith(
+                    "not enabled in config"
+                ):
+                    return _required_policy_system_block(
+                        policy_name,
+                        RequiredPolicyFailureCode.PLUGIN_DISABLED,
+                        "Required policy plugin is disabled.",
+                    )
+                return _required_policy_system_block(
+                    policy_name,
+                    RequiredPolicyFailureCode.PLUGIN_LOAD_ERROR,
+                    "Required policy plugin failed to load.",
+                )
+
+            registration = manager.get_policy_registration(
+                plugin_key,
+                policy_name,
+            )
+            if registration is None:
+                return _required_policy_system_block(
+                    policy_name,
+                    RequiredPolicyFailureCode.REGISTRATION_MISSING,
+                    "Required policy is not registered.",
+                )
+            try:
+                block = run_required_policy(registration, policy_input)
+            except Exception:
+                return _required_policy_system_block(
+                    policy_name,
+                    RequiredPolicyFailureCode.CALLBACK_ERROR,
+                    "Required policy callback failed.",
+                )
+            if block is not None:
+                return block
+
+    return None
 
 
 def discover_plugins(force: bool = False) -> None:

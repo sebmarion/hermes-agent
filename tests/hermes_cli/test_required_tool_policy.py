@@ -1,22 +1,35 @@
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import FrozenInstanceError, fields
 from types import MappingProxyType
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_cli.plugins import (
+    LoadedPlugin,
+    PluginManager,
+    PluginManifest,
+    authorize_required_tool_policies,
+)
 from hermes_cli.tool_policy import (
     MAX_POLICY_BLOCK_MESSAGE_BYTES,
     POLICY_SCHEMA_VERSION,
     PolicyDecision,
     PolicyDecisionCode,
     PreparedToolRuntime,
+    RequiredPolicyFailureCode,
     ToolDispatchPolicyInput,
     ToolPolicyBlock,
     ToolPolicyRegistration,
+    clear_required_policy_quarantine,
     compute_policy_binding,
     create_tool_dispatch_policy_input,
+    is_required_policy_quarantined,
     parse_policy_decision,
+    run_required_policy,
 )
 
 
@@ -451,3 +464,510 @@ class TestStructuredBlock:
             message=" " * 1_100 + "reason",
         )
         assert block.message == "reason"
+
+
+def _runner_input(session_id: str = "session-runner") -> ToolDispatchPolicyInput:
+    return create_tool_dispatch_policy_input(
+        tool_name="terminal",
+        original_args={"command": "before"},
+        effective_args={"command": "after"},
+        task_id="task-runner",
+        session_id=session_id,
+        turn_id="turn-runner",
+        tool_call_id=f"call-{session_id}",
+        prepared_runtime=_runtime(),
+    )
+
+
+def _registration(
+    callback,
+    *,
+    plugin_key: str = "governor",
+    timeout_ms: int = 250,
+) -> ToolPolicyRegistration:
+    return ToolPolicyRegistration(
+        plugin_key=plugin_key,
+        policy_name="tool_dispatch",
+        callback=callback,
+        timeout_ms=timeout_ms,
+    )
+
+
+def _allow(payload: dict) -> dict:
+    return {
+        "action": "allow",
+        "policy_binding": payload["policy_binding"],
+    }
+
+
+def _assert_policy_slots_recovered() -> None:
+    from hermes_cli import tool_policy
+
+    acquired = 0
+    try:
+        for _ in range(tool_policy._REQUIRED_POLICY_MAX_WORKERS):
+            assert tool_policy._required_policy_slots.acquire(timeout=1)
+            acquired += 1
+    finally:
+        for _ in range(acquired):
+            tool_policy._required_policy_slots.release()
+
+
+@pytest.fixture(autouse=True)
+def _reset_required_policy_runner_state():
+    clear_required_policy_quarantine()
+    yield
+    clear_required_policy_quarantine()
+    _assert_policy_slots_recovered()
+
+
+def _manager_with_plugin(
+    *,
+    plugin_key: str = "governor",
+    enabled: bool,
+    error: str | None = None,
+    registration: ToolPolicyRegistration | None = None,
+) -> PluginManager:
+    manager = PluginManager()
+    manager._discovered = True
+    manager._plugins[plugin_key] = LoadedPlugin(
+        manifest=PluginManifest(
+            name=plugin_key,
+            key=plugin_key,
+            provides_policies=["tool_dispatch"],
+        ),
+        enabled=enabled,
+        error=error,
+    )
+    if registration is not None:
+        manager._register_policy(registration)
+    return manager
+
+
+class TestRequiredPolicyRunner:
+    def test_uses_one_eager_process_wide_bounded_executor(self):
+        from hermes_cli import tool_policy
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        assert isinstance(
+            tool_policy._required_policy_executor,
+            DaemonThreadPoolExecutor,
+        )
+        assert tool_policy._required_policy_executor._max_workers == 4
+        assert tool_policy._REQUIRED_POLICY_MAX_WORKERS == 4
+        assert tool_policy._required_policy_slots._initial_value == 4
+
+    def test_explicit_allow_returns_none(self):
+        assert run_required_policy(_registration(_allow), _runner_input()) is None
+
+    def test_explicit_block_is_bounded_and_not_quarantined(self):
+        calls = []
+
+        def callback(_payload):
+            calls.append(True)
+            return {"action": "block", "message": " denied "}
+
+        registration = _registration(callback)
+        policy_input = _runner_input()
+
+        first = run_required_policy(registration, policy_input)
+        second = run_required_policy(registration, policy_input)
+
+        assert first is not None
+        assert first.to_result() == {
+            "status": "blocked",
+            "error_type": "required_policy_block",
+            "policy": "tool_dispatch",
+            "policy_code": PolicyDecisionCode.BLOCKED,
+            "message": "denied",
+        }
+        assert second is not None
+        assert second.policy_code == PolicyDecisionCode.BLOCKED
+        assert calls == [True, True]
+        assert not is_required_policy_quarantined(
+            policy_input.session_id,
+            registration.plugin_key,
+            registration.policy_name,
+        )
+
+    def test_callback_exception_is_safe_and_quarantines_without_resubmit(self):
+        calls = []
+
+        def callback(_payload):
+            calls.append(True)
+            raise RuntimeError("TOP_SECRET_CALLBACK_FAILURE")
+
+        registration = _registration(callback)
+        policy_input = _runner_input()
+
+        first = run_required_policy(registration, policy_input)
+        second = run_required_policy(registration, policy_input)
+
+        assert first is not None
+        assert first.policy == "tool_dispatch"
+        assert first.policy_code == RequiredPolicyFailureCode.CALLBACK_ERROR
+        assert "TOP_SECRET_CALLBACK_FAILURE" not in json.dumps(first.to_result())
+        assert second is not None
+        assert second.policy_code == RequiredPolicyFailureCode.QUARANTINED
+        assert calls == [True]
+
+    def test_callback_timeout_exception_is_classified_as_callback_error(self):
+        def callback(_payload):
+            raise FuturesTimeoutError("TOP_SECRET_CALLBACK_TIMEOUT")
+
+        block = run_required_policy(_registration(callback), _runner_input())
+
+        assert block is not None
+        assert block.policy_code == RequiredPolicyFailureCode.CALLBACK_ERROR
+        assert "TOP_SECRET_CALLBACK_TIMEOUT" not in json.dumps(block.to_result())
+
+    def test_completed_future_after_deadline_remains_a_timeout(self):
+        from hermes_cli import tool_policy
+
+        future = MagicMock()
+
+        def finish_after_deadline(*, timeout):
+            assert timeout == pytest.approx(0.25)
+            tool_policy._required_policy_slots.release()
+            raise FuturesTimeoutError
+
+        future.result.side_effect = finish_after_deadline
+        future.done.return_value = True
+        future.exception.return_value = None
+        with patch.object(
+            tool_policy._required_policy_executor,
+            "submit",
+            return_value=future,
+        ):
+            block = run_required_policy(_registration(_allow), _runner_input())
+
+        assert block is not None
+        assert block.policy_code == RequiredPolicyFailureCode.TIMEOUT
+
+    def test_submit_failure_releases_slot_and_quarantines(self):
+        from hermes_cli import tool_policy
+
+        registration = _registration(_allow)
+        policy_input = _runner_input()
+        with patch.object(
+            tool_policy._required_policy_executor,
+            "submit",
+            side_effect=RuntimeError("TOP_SECRET_SUBMIT_FAILURE"),
+        ):
+            block = run_required_policy(registration, policy_input)
+
+        assert block is not None
+        assert block.policy_code == RequiredPolicyFailureCode.CALLBACK_ERROR
+        assert "TOP_SECRET_SUBMIT_FAILURE" not in json.dumps(block.to_result())
+        assert is_required_policy_quarantined(
+            policy_input.session_id,
+            registration.plugin_key,
+            registration.policy_name,
+        )
+
+    def test_timeout_quarantines_and_late_allow_has_no_authority(self):
+        started = threading.Event()
+        release = threading.Event()
+        returned = threading.Event()
+        handler_calls = []
+        callback_calls = []
+
+        def callback(payload):
+            callback_calls.append(True)
+            started.set()
+            assert release.wait(2)
+            returned.set()
+            return _allow(payload)
+
+        registration = _registration(callback, timeout_ms=20)
+        policy_input = _runner_input()
+
+        block = run_required_policy(registration, policy_input)
+        if block is None:
+            handler_calls.append(True)
+
+        assert started.is_set()
+        assert block is not None
+        assert block.policy_code == RequiredPolicyFailureCode.TIMEOUT
+        repeated = run_required_policy(registration, policy_input)
+        assert repeated is not None
+        assert repeated.policy_code == RequiredPolicyFailureCode.QUARANTINED
+        assert callback_calls == [True]
+
+        release.set()
+        assert returned.wait(1)
+        _assert_policy_slots_recovered()
+        assert handler_calls == []
+
+    @pytest.mark.parametrize(
+        ("decision", "expected_code"),
+        [
+            ("allow", PolicyDecisionCode.MALFORMED),
+            ({"action": "later"}, PolicyDecisionCode.NON_EXPLICIT),
+            ({"action": "allow"}, PolicyDecisionCode.BINDING_MISSING),
+            (
+                {"action": "allow", "policy_binding": "0" * 64},
+                PolicyDecisionCode.BINDING_MISMATCH,
+            ),
+            (
+                {"action": "block", "message": ""},
+                PolicyDecisionCode.EMPTY_BLOCK_MESSAGE,
+            ),
+        ],
+    )
+    def test_invalid_decision_quarantines(self, decision, expected_code):
+        calls = []
+
+        def callback(_payload):
+            calls.append(True)
+            return decision
+
+        registration = _registration(callback)
+        policy_input = _runner_input()
+
+        first = run_required_policy(registration, policy_input)
+        second = run_required_policy(registration, policy_input)
+
+        assert first is not None
+        assert first.policy_code == expected_code
+        assert second is not None
+        assert second.policy_code == RequiredPolicyFailureCode.QUARANTINED
+        assert calls == [True]
+
+    def test_quarantine_is_scoped_and_can_clear_one_session(self):
+        calls = []
+
+        def callback(_payload):
+            calls.append(True)
+            raise RuntimeError("failure")
+
+        registration = _registration(callback)
+        first_input = _runner_input("session-one")
+        second_input = _runner_input("session-two")
+
+        assert run_required_policy(registration, first_input).policy_code == (
+            RequiredPolicyFailureCode.CALLBACK_ERROR
+        )
+        assert run_required_policy(registration, second_input).policy_code == (
+            RequiredPolicyFailureCode.CALLBACK_ERROR
+        )
+        assert calls == [True, True]
+
+        clear_required_policy_quarantine("session-one")
+        assert not is_required_policy_quarantined(
+            "session-one", "governor", "tool_dispatch"
+        )
+        assert is_required_policy_quarantined(
+            "session-two", "governor", "tool_dispatch"
+        )
+
+    def test_real_wedged_callbacks_saturate_without_queue_growth(self):
+        from hermes_cli import tool_policy
+
+        started_count = 0
+        started_lock = threading.Lock()
+        all_started = threading.Event()
+        release = threading.Event()
+        callback_calls = []
+
+        def callback(payload):
+            nonlocal started_count
+            with started_lock:
+                started_count += 1
+                callback_calls.append(payload["session_id"])
+                if started_count == tool_policy._REQUIRED_POLICY_MAX_WORKERS:
+                    all_started.set()
+            assert release.wait(2)
+            return _allow(payload)
+
+        registration = _registration(callback, timeout_ms=1500)
+        caller_pool = ThreadPoolExecutor(max_workers=4)
+        futures = []
+        try:
+            futures = [
+                caller_pool.submit(
+                    run_required_policy,
+                    registration,
+                    _runner_input(f"wedged-{index}"),
+                )
+                for index in range(tool_policy._REQUIRED_POLICY_MAX_WORKERS)
+            ]
+            assert all_started.wait(1)
+
+            saturated = run_required_policy(
+                registration,
+                _runner_input("saturated-extra"),
+            )
+            assert saturated is not None
+            assert saturated.policy_code == (
+                RequiredPolicyFailureCode.EXECUTOR_SATURATED
+            )
+            assert len(callback_calls) == 4
+        finally:
+            release.set()
+            caller_pool.shutdown(wait=True)
+
+        assert all(future.result() is None for future in futures)
+        _assert_policy_slots_recovered()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        ("disabled via config", RequiredPolicyFailureCode.PLUGIN_DISABLED),
+        (
+            "not enabled in config (run command)",
+            RequiredPolicyFailureCode.PLUGIN_DISABLED,
+        ),
+        (
+            "TOP_SECRET_PLUGIN_LOAD_FAILURE",
+            RequiredPolicyFailureCode.PLUGIN_LOAD_ERROR,
+        ),
+    ],
+)
+def test_authorize_reports_safe_unavailable_plugin_state(error, expected_code):
+    policy_input = _runner_input()
+    manager = _manager_with_plugin(enabled=False, error=error)
+    with (
+        patch(
+            "hermes_cli.plugins._get_required_policies_for_module",
+            return_value={"governor": ["tool_dispatch"]},
+        ),
+        patch("hermes_cli.plugins.get_plugin_manager", return_value=manager),
+    ):
+        block = authorize_required_tool_policies(policy_input)
+
+    assert block is not None
+    assert block.policy == "tool_dispatch"
+    assert block.policy_code == expected_code
+    assert "TOP_SECRET_PLUGIN_LOAD_FAILURE" not in json.dumps(block.to_result())
+
+
+def test_authorize_blocks_invalid_config_without_read_error_leak():
+    with patch(
+        "hermes_cli.plugins._get_required_policies_for_module",
+        side_effect=RuntimeError("TOP_SECRET_CONFIG_FAILURE"),
+    ):
+        block = authorize_required_tool_policies(_runner_input())
+
+    assert block is not None
+    assert block.policy == "tool_dispatch"
+    assert block.policy_code == RequiredPolicyFailureCode.CONFIG_INVALID
+    assert "TOP_SECRET_CONFIG_FAILURE" not in json.dumps(block.to_result())
+
+
+def test_authorize_empty_mapping_allows_without_discovery():
+    with (
+        patch(
+            "hermes_cli.plugins._get_required_policies_for_module",
+            return_value={},
+        ),
+        patch("hermes_cli.plugins.get_plugin_manager") as get_manager,
+    ):
+        assert authorize_required_tool_policies(_runner_input()) is None
+
+    get_manager.assert_not_called()
+
+
+def test_authorize_rejects_non_mapping_runtime_config():
+    with patch(
+        "hermes_cli.plugins._get_required_policies_for_module",
+        return_value="invalid",
+    ):
+        block = authorize_required_tool_policies(_runner_input())
+
+    assert block is not None
+    assert block.policy_code == RequiredPolicyFailureCode.CONFIG_INVALID
+
+
+def test_authorize_blocks_missing_plugin():
+    manager = PluginManager()
+    manager._discovered = True
+    with (
+        patch(
+            "hermes_cli.plugins._get_required_policies_for_module",
+            return_value={"missing": ["tool_dispatch"]},
+        ),
+        patch("hermes_cli.plugins.get_plugin_manager", return_value=manager),
+    ):
+        block = authorize_required_tool_policies(_runner_input())
+
+    assert block is not None
+    assert block.policy == "tool_dispatch"
+    assert block.policy_code == RequiredPolicyFailureCode.PLUGIN_MISSING
+
+
+def test_authorize_blocks_missing_registration():
+    manager = _manager_with_plugin(enabled=True)
+    with (
+        patch(
+            "hermes_cli.plugins._get_required_policies_for_module",
+            return_value={"governor": ["tool_dispatch"]},
+        ),
+        patch("hermes_cli.plugins.get_plugin_manager", return_value=manager),
+    ):
+        block = authorize_required_tool_policies(_runner_input())
+
+    assert block is not None
+    assert block.policy_code == RequiredPolicyFailureCode.REGISTRATION_MISSING
+
+
+def test_authorize_blocks_discovery_failure_without_exception_text():
+    manager = MagicMock()
+    manager.discover_and_load.side_effect = RuntimeError(
+        "TOP_SECRET_DISCOVERY_FAILURE"
+    )
+    with (
+        patch(
+            "hermes_cli.plugins._get_required_policies_for_module",
+            return_value={"governor": ["tool_dispatch"]},
+        ),
+        patch("hermes_cli.plugins.get_plugin_manager", return_value=manager),
+    ):
+        block = authorize_required_tool_policies(_runner_input())
+
+    assert block is not None
+    assert block.policy_code == RequiredPolicyFailureCode.PLUGIN_LOAD_ERROR
+    assert "TOP_SECRET_DISCOVERY_FAILURE" not in json.dumps(block.to_result())
+
+
+def test_authorize_evaluates_plugins_in_sorted_order_and_first_block_wins():
+    calls = []
+
+    def callback_for(name):
+        def callback(_payload):
+            calls.append(name)
+            return {"action": "block", "message": name}
+
+        return callback
+
+    manager = PluginManager()
+    manager._discovered = True
+    for key in ("z-plugin", "a-plugin"):
+        registration = _registration(callback_for(key), plugin_key=key)
+        loaded = LoadedPlugin(
+            manifest=PluginManifest(
+                name=key,
+                key=key,
+                provides_policies=["tool_dispatch"],
+            ),
+            enabled=True,
+        )
+        manager._plugins[key] = loaded
+        manager._register_policy(registration)
+
+    with (
+        patch(
+            "hermes_cli.plugins._get_required_policies_for_module",
+            return_value={
+                "z-plugin": ["tool_dispatch"],
+                "a-plugin": ["tool_dispatch"],
+            },
+        ),
+        patch("hermes_cli.plugins.get_plugin_manager", return_value=manager),
+    ):
+        block = authorize_required_tool_policies(_runner_input())
+
+    assert block is not None
+    assert block.message == "a-plugin"
+    assert calls == ["a-plugin"]
