@@ -10,6 +10,65 @@ def _generation(db: SessionDB) -> int:
     return db.get_session_projection_generation()
 
 
+_DIVERGENT_SCHEMA_VERSION = 20
+
+
+def _schema_version(db: SessionDB) -> int:
+    return int(db._conn.execute("SELECT version FROM schema_version").fetchone()[0])
+
+
+def _seed_projection_v20_database(path) -> None:
+    """Model the local v20 lineage: projection exists, usage attribution does not."""
+    db = SessionDB(path, _start_projection_backfill=False)
+    try:
+        db.create_session("legacy-usage", "cli", model="gpt-4o")
+        db.update_token_counts(
+            "legacy-usage",
+            input_tokens=1234,
+            output_tokens=567,
+            model="gpt-4o",
+            billing_provider="openai",
+            api_call_count=2,
+            absolute=True,
+        )
+        db._conn.execute("DROP TABLE session_model_usage")
+        db._conn.execute(
+            "UPDATE schema_version SET version = ?",
+            (_DIVERGENT_SCHEMA_VERSION,),
+        )
+    finally:
+        db.close()
+
+
+def _seed_usage_v20_database(path) -> None:
+    """Model the fork v20 lineage: usage attribution exists, projection does not."""
+    db = SessionDB(path, _start_projection_backfill=False)
+    try:
+        db.create_session("legacy-projection", "cli", model="gpt-4o")
+        db.append_message(
+            "legacy-projection",
+            "user",
+            "hello",
+            timestamp=9.0,
+        )
+        db.update_token_counts(
+            "legacy-projection",
+            input_tokens=12,
+            output_tokens=3,
+            model="gpt-4o",
+            billing_provider="openai",
+            api_call_count=1,
+        )
+        db._conn.execute("DROP TABLE session_projection_meta")
+        db._conn.execute("UPDATE sessions SET last_activity_at = NULL")
+        db._conn.execute(
+            "UPDATE schema_version SET version = ?",
+            (_DIVERGENT_SCHEMA_VERSION,),
+        )
+    finally:
+        db.close()
+
+
 def test_projection_schema_is_additive_and_indexed(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     try:
@@ -326,3 +385,78 @@ def test_v19_database_migrates_without_rewriting_messages(tmp_path):
         assert db.get_session("legacy")["last_activity_at"] == 9.0
     finally:
         db.close()
+
+
+def test_projection_v20_lineage_backfills_model_usage_and_advances_schema(tmp_path):
+    path = tmp_path / "projection-v20.db"
+    _seed_projection_v20_database(path)
+
+    db = SessionDB(path, _start_projection_backfill=False)
+    try:
+        usage = db._conn.execute(
+            "SELECT model, billing_provider, api_call_count, input_tokens, "
+            "output_tokens FROM session_model_usage "
+            "WHERE session_id = 'legacy-usage'"
+        ).fetchone()
+
+        assert _schema_version(db) == SCHEMA_VERSION
+        assert _schema_version(db) > _DIVERGENT_SCHEMA_VERSION
+        assert tuple(usage) == ("gpt-4o", "openai", 2, 1234, 567)
+    finally:
+        db.close()
+
+
+def test_usage_v20_lineage_schedules_projection_backfill_and_advances_schema(tmp_path):
+    path = tmp_path / "usage-v20.db"
+    _seed_usage_v20_database(path)
+
+    db = SessionDB(path, _start_projection_backfill=False)
+    try:
+        meta = db._conn.execute(
+            "SELECT backfill_rowid, backfill_complete "
+            "FROM session_projection_meta WHERE id = 1"
+        ).fetchone()
+
+        assert _schema_version(db) == SCHEMA_VERSION
+        assert _schema_version(db) > _DIVERGENT_SCHEMA_VERSION
+        assert tuple(meta) == (0, 0)
+        assert db.get_session("legacy-projection")["last_activity_at"] is None
+    finally:
+        db.close()
+
+
+def test_reopening_reconciled_schema_does_not_repeat_v20_data_migrations(tmp_path):
+    path = tmp_path / "reconciled.db"
+    _seed_projection_v20_database(path)
+
+    first = SessionDB(path, _start_projection_backfill=False)
+    try:
+        assert _schema_version(first) == SCHEMA_VERSION
+        assert _schema_version(first) > _DIVERGENT_SCHEMA_VERSION
+        usage_count = first._conn.execute(
+            "SELECT COUNT(*) FROM session_model_usage "
+            "WHERE session_id = 'legacy-usage'"
+        ).fetchone()[0]
+        first._conn.execute(
+            "UPDATE session_projection_meta SET backfill_rowid = 37, "
+            "backfill_complete = 1 WHERE id = 1"
+        )
+    finally:
+        first.close()
+
+    reopened = SessionDB(path, _start_projection_backfill=False)
+    try:
+        meta = reopened._conn.execute(
+            "SELECT backfill_rowid, backfill_complete "
+            "FROM session_projection_meta WHERE id = 1"
+        ).fetchone()
+        reopened_usage_count = reopened._conn.execute(
+            "SELECT COUNT(*) FROM session_model_usage "
+            "WHERE session_id = 'legacy-usage'"
+        ).fetchone()[0]
+
+        assert _schema_version(reopened) == SCHEMA_VERSION
+        assert tuple(meta) == (37, 1)
+        assert usage_count == reopened_usage_count == 1
+    finally:
+        reopened.close()

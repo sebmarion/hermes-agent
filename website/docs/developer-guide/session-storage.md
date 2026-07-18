@@ -140,7 +140,7 @@ END;
 
 ## Schema Version and Migrations
 
-Current schema version: **20**
+Current schema version: **21**
 
 The `schema_version` table stores a single integer. Simple column additions are handled declaratively by `_reconcile_columns()` (which diffs live columns against `SCHEMA_SQL` and ADDs any missing ones). The version-gated chain is reserved for data migrations and index/FTS changes that can't be expressed declaratively:
 
@@ -157,7 +157,8 @@ The `schema_version` table stores a single integer. Simple column additions are 
 | 9 | Add `codex_message_items` column to messages for Codex Responses message id/phase replay |
 | 10 | Add `messages_fts_trigram` virtual table (trigram tokenizer for CJK / substring search) and backfill existing rows |
 | 11 | Re-index `messages_fts` and `messages_fts_trigram` to cover `tool_name` + `tool_calls` and switch from external-content to inline mode; drop old triggers and backfill every message row |
-| 20 | Add `sessions.last_activity_at`, the partial activity index, and `session_projection_meta` generation/backfill state |
+| 20 | Divergent release histories introduced either the activity projection or per-model usage attribution; version 20 alone is not a capability signal |
+| 21 | Reconcile both version-20 histories by scheduling the activity backfill and seeding historical `session_model_usage` rows |
 
 Declarative column adds use `ALTER TABLE ADD COLUMN` wrapped in try/except to handle the column-already-exists case (idempotent). The version number is bumped after each successful migration block.
 
@@ -178,7 +179,9 @@ aggregating `messages`:
   startup-critical path.
 
 WebUI may use its legacy query only as a background compatibility fallback for
-Agent schemas older than v20. WebUI must never migrate or repair Agent state.
+Agent schemas older than v21. Version 20 is ambiguous because two release
+histories assigned it to different features. WebUI must never migrate or repair
+Agent state.
 
 
 ## Write Contention Handling

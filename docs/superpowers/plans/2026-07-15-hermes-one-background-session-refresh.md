@@ -4,7 +4,7 @@
 
 **Goal:** Refresh Hermes One's local session list after external `state.db` commits by the next five-second probe while the primary window is open, including when it is minimized, unfocused, occluded, or showing another route.
 
-**Architecture:** The Python desktop backend retains stable, read-only SQLite connections and exposes one cheap aggregate revision endpoint based on `PRAGMA data_version` plus database identity. One main-renderer hook polls that endpoint every five seconds using Hermes One's existing no-background-throttling contract, then invokes the existing canonical `refreshSessions()` action only when required. The poller acknowledges a revision only after refresh and a confirming probe both succeed.
+**Architecture:** The Python desktop backend retains stable, read-only SQLite connections and exposes one cheap aggregate revision endpoint based on `PRAGMA data_version` plus database identity. One main-renderer hook polls that endpoint every five seconds using Hermes One's existing no-background-throttling contract, then invokes a strict wrapper around the canonical session projections only when required. The poller acknowledges a revision only after the core, cron, and messaging projections apply for the same request generation and a confirming probe succeeds.
 
 **Tech Stack:** Python 3.11-3.13, FastAPI, stdlib `sqlite3`, React 19, TypeScript, Vitest, Testing Library, Electron 40, nanostores.
 
@@ -12,14 +12,11 @@
 
 ## Execution prerequisites
 
-- Preserve the dirty checkout at `/Users/seb/.hermes/hermes-agent`; none of its unrelated user changes belong to this feature.
-- This ignored plan must be force-added and committed on `main` before creating
-  the worktree. The worktree starts from that exact plan commit, so the final
-  feature diff and build stamp include both the approved spec and this plan.
-- Use `superpowers:using-git-worktrees` to create an isolated worktree from the commit containing this plan, on a `codex/` branch such as `codex/hermes-one-background-refresh`.
-- Read `README.md`, `CONTRIBUTING.md`, `docs/CONTRACTS.md`, `CHANGELOG.md`, `ARCHITECTURE.md`, and `TESTING.md` in the worktree before editing.
+- Preserve the runtime checkout at `/Users/seb/.hermes/hermes-agent`; it is outside this sandbox's writable roots and is not the delivery target for this task.
+- Work directly on `main` in a standalone clone of Seb's fork. Configure only `origin = git@github.com:sebmarion/hermes-agent.git`; do not add or push an upstream remote, create a feature branch, or use a Git worktree.
+- Read the repository and desktop contribution guidance before editing. Some documents named by the parent workspace guidance are not present in this fork; treat the files that exist here as authoritative.
 - Use GitNexus `impact(..., direction: "upstream")` for `_lifespan`, `get_profiles_sessions`, `listAllProfileSessions`, and `DesktopController` before touching those symbols. Report HIGH or CRITICAL findings before proceeding.
-- Before every commit below, run GitNexus `detect_changes({ scope: "compare", base_ref: "main" })` and confirm only the expected symbols and flows changed.
+- Before every commit below, run GitNexus `detect_changes({ scope: "compare", base_ref: "main" })`. If the local index is incompatible, record the error and verify scope from the direct diff and call sites.
 - Use `scripts/run_tests.sh` for every Python test command. Do not invoke bare `pytest`.
 
 ## Task 1: Build the stable read-only revision tracker
@@ -59,7 +56,7 @@ The missing-file test must also assert `not db_path.exists()` after probing. The
 
 - [ ] **Step 2: Run the test and confirm the expected failure**
 
-Run:
+From the repository root, run:
 
 ```bash
 scripts/run_tests.sh tests/hermes_cli/test_session_revision.py -q
@@ -226,12 +223,12 @@ git commit -m "feat(desktop): expose session revision endpoint"
 Import `getAllProfileSessionsRevision` and assert the exact API call:
 
 ```typescript
-await getAllProfileSessionsRevision('worker one')
+await getAllProfileSessionsRevision("worker one");
 
 expect(api).toHaveBeenCalledWith({
-  path: '/api/profiles/sessions/revision?profile=worker%20one',
-  timeoutMs: 5_000
-})
+  path: "/api/profiles/sessions/revision?profile=worker%20one",
+  timeoutMs: 5_000,
+});
 ```
 
 - [ ] **Step 2: Run the test and confirm the expected failure**
@@ -250,23 +247,23 @@ Add:
 
 ```typescript
 export interface SessionRevisionResponse {
-  profiles: string[]
-  revision: string
+  profiles: string[];
+  revision: string;
 }
 ```
 
 and:
 
 ```typescript
-const SESSION_REVISION_REQUEST_TIMEOUT_MS = 5_000
+const SESSION_REVISION_REQUEST_TIMEOUT_MS = 5_000;
 
 export function getAllProfileSessionsRevision(
-  profile: 'all' | (string & {}) = 'all'
+  profile: "all" | (string & {}) = "all",
 ): Promise<SessionRevisionResponse> {
   return window.hermesDesktop.api<SessionRevisionResponse>({
     path: `/api/profiles/sessions/revision?profile=${encodeURIComponent(profile)}`,
-    timeoutMs: SESSION_REVISION_REQUEST_TIMEOUT_MS
-  })
+    timeoutMs: SESSION_REVISION_REQUEST_TIMEOUT_MS,
+  });
 }
 ```
 
@@ -308,6 +305,7 @@ Mock `getAllProfileSessionsRevision`, use `vi.useFakeTimers()`, and provide a co
 it('refreshes once on the first probe and not again for an unchanged acknowledged revision', ...)
 it('refreshes a changed revision by the next five-second tick', ...)
 it('retries the same dirty revision after refresh failure', ...)
+it('retries when the requested refresh was superseded before it applied', ...)
 it('keeps the revision dirty when the confirmation probe fails', ...)
 it('coalesces ticks and follows a commit that lands during refresh', ...)
 it('does not overlap old and new profile generations', ...)
@@ -324,7 +322,7 @@ Run:
 
 ```bash
 npx vitest run \
-  apps/desktop/src/app/session/hooks/use-session-revision-poll.test.tsx \
+  src/app/session/hooks/use-session-revision-poll.test.tsx \
   --environment jsdom
 ```
 
@@ -335,13 +333,15 @@ Expected: FAIL because the hook does not exist.
 Export:
 
 ```typescript
+type SessionRefreshResult = "applied" | "superseded";
+
 interface UseSessionRevisionPollArgs {
-  enabled: boolean
-  profileScope: string
-  refreshSessions: () => Promise<void>
+  enabled: boolean;
+  profileScope: string;
+  refreshSessions: () => Promise<SessionRefreshResult>;
 }
 
-export function useSessionRevisionPoll(args: UseSessionRevisionPollArgs): void
+export function useSessionRevisionPoll(args: UseSessionRevisionPollArgs): void;
 ```
 
 Keep the coordinator state in hook-level refs so it survives effect cleanup and
@@ -356,8 +356,8 @@ replacement. Within one effect per enabled scope:
 - If a probe arrives while work is running, set `pendingGeneration` to the
   latest active generation; never start concurrent poller refreshes.
 - If clean and the candidate equals the acknowledged revision, stop after the cheap probe.
-- Otherwise await `refreshSessions()`, then make a mandatory confirmation revision request.
-- Acknowledge only when refresh succeeds, confirmation succeeds, the confirmed token equals the candidate, and the effect generation is still current.
+- Otherwise await the strict refresh callback. A `superseded` result stays dirty and skips confirmation; an `applied` result proceeds to the mandatory confirmation revision request.
+- Acknowledge only when refresh returns `applied`, confirmation succeeds, the confirmed token equals the candidate, and the effect generation is still current.
 - On a changed confirmation token, keep dirty and schedule one coalesced follow-up cycle.
 - On any probe, refresh, or confirmation error, keep dirty and retry on the next tick. Log only the transition into a failing state; do not warn every five seconds.
 - On profile/gateway generation change, the new effect must wait for the shared
@@ -372,11 +372,11 @@ Do not check `document.visibilityState`; background operation relies on the exis
 
 - [ ] **Step 4: Run all poller tests**
 
-Run:
+From `apps/desktop`, run:
 
 ```bash
 npx vitest run \
-  apps/desktop/src/app/session/hooks/use-session-revision-poll.test.tsx \
+  src/app/session/hooks/use-session-revision-poll.test.tsx \
   --environment jsdom
 ```
 
@@ -399,8 +399,10 @@ git commit -m "feat(desktop): poll session revisions in background"
 **Files:**
 
 - Modify: `apps/desktop/src/app/desktop-controller.tsx`
-- Verify: `apps/desktop/electron/session-windows.cjs`
-- Verify: `apps/desktop/electron/session-windows.test.cjs`
+- Modify: `apps/desktop/src/app/session/hooks/use-session-list-actions.ts`
+- Create: `apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx`
+- Verify: `apps/desktop/electron/session-windows.ts`
+- Verify: `apps/desktop/electron/session-windows.test.ts`
 
 - [ ] **Step 1: Mount the hook beside the canonical list actions**
 
@@ -408,25 +410,26 @@ Immediately after `useSessionListActions({ profileScope })`, call:
 
 ```typescript
 useSessionRevisionPoll({
-  enabled: gatewayState === 'open' && !isSecondaryWindow(),
+  enabled: gatewayState === "open" && !isSecondaryWindow(),
   profileScope,
-  refreshSessions
-})
+  refreshSessions: refreshSessionsForRevision,
+});
 ```
 
-Import the hook from the session hooks directory. Do not move or remove existing immediate refreshes for local mutations, gateway boot/reconnect, or profile changes.
+Import the hook from the session hooks directory. The strict revision callback must report `applied` or `superseded`, await every revision-covered projection, and share generation guards with standalone refreshes and pagers. Preserve the existing `refreshSessions(): Promise<void>` semantics for local mutations, gateway boot/reconnect, and profile changes.
 
 - [ ] **Step 2: Verify secondary-window and background contracts**
 
-Run:
+From `apps/desktop`, run:
 
 ```bash
 npx vitest run \
-  apps/desktop/src/hermes.test.ts \
-  apps/desktop/src/app/session/hooks/use-session-revision-poll.test.tsx \
+  src/hermes.test.ts \
+  src/app/session/hooks/use-session-list-actions.test.tsx \
+  src/app/session/hooks/use-session-revision-poll.test.tsx \
   --environment jsdom
-node --test apps/desktop/electron/session-windows.test.cjs
-npm --prefix apps/desktop run typecheck
+npx tsx --test electron/session-windows.test.ts
+npm run typecheck
 ```
 
 Expected: PASS, including the existing assertion that Hermes BrowserWindows use `backgroundThrottling: false`.
@@ -436,7 +439,10 @@ Expected: PASS, including the existing assertion that Hermes BrowserWindows use 
 Run GitNexus `detect_changes({ scope: "compare", base_ref: "main" })`, then:
 
 ```bash
-git add apps/desktop/src/app/desktop-controller.tsx
+git add \
+  apps/desktop/src/app/desktop-controller.tsx \
+  apps/desktop/src/app/session/hooks/use-session-list-actions.ts \
+  apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
 git diff --cached --check
 git commit -m "feat(desktop): keep session refresh active offscreen"
 ```
@@ -449,7 +455,7 @@ git commit -m "feat(desktop): keep session refresh active offscreen"
 
 - [ ] **Step 1: Run the backend suite for the touched surface**
 
-Run:
+From the repository root, run:
 
 ```bash
 scripts/run_tests.sh tests/hermes_cli/test_session_revision.py tests/hermes_cli/test_web_server.py -q
@@ -461,12 +467,13 @@ Run:
 
 ```bash
 npx vitest run \
-  apps/desktop/src/hermes.test.ts \
-  apps/desktop/src/app/session/hooks/use-session-revision-poll.test.tsx \
+  src/hermes.test.ts \
+  src/app/session/hooks/use-session-list-actions.test.tsx \
+  src/app/session/hooks/use-session-revision-poll.test.tsx \
   --environment jsdom
-node --test apps/desktop/electron/session-windows.test.cjs
-npm --prefix apps/desktop run typecheck
-npm --prefix apps/desktop run build
+npx tsx --test electron/session-windows.test.ts
+npm run typecheck
+npm run build
 ```
 
 - [ ] **Step 3: Audit the final feature diff**
@@ -474,131 +481,55 @@ npm --prefix apps/desktop run build
 Run:
 
 ```bash
-git diff --check main...HEAD
+git diff --check origin/main...HEAD
 git status --short
-git log --oneline main..HEAD
+git log --oneline origin/main..HEAD
 ```
 
 Run GitNexus `detect_changes({ scope: "compare", base_ref: "main" })` one final time. Confirm the diff is limited to the tracker, route, client helper, poll hook, controller integration, tests, spec, and plan.
 
-## Task 7: Package, deploy both halves safely, and prove the live behavior
+## Task 7: Package what is buildable and push Seb's fork main
 
 **Files:**
 
-- Build artifact: `apps/desktop/release/mac-arm64/Hermes.app`
-- Installed target: `/Applications/Hermes One.app`
-- Runtime checkout: `/Users/seb/.hermes/hermes-agent`
+- Optional build artifact: `apps/desktop/release/mac-arm64/Hermes.app`
+- Git destination: `git@github.com:sebmarion/hermes-agent.git`, branch `main`
 
-- [ ] **Step 1: Build and validate the packaged app**
+- [ ] **Step 1: Validate repository ownership and remote state**
 
-From the clean feature worktree, run:
+Confirm `origin` is Seb's fork and no upstream push target exists:
 
 ```bash
+git remote -v
+git fetch origin main
+git rev-list --left-right --count origin/main...main
+```
+
+Do not force-push. If `origin/main` advanced, integrate it normally and repeat
+the verification suite before pushing.
+
+- [ ] **Step 2: Build and optionally package from a clean `main`**
+
+Run the desktop build after every source and documentation change is committed:
+
+```bash
+npm --prefix apps/desktop run build
 npm --prefix apps/desktop run pack
 ```
 
-Confirm the bundle exists and its install stamp names the clean feature-branch
-HEAD. Do not launch it against the old runtime yet: the desktop package is a
-thin shell and the revision endpoint lives in the Python source checkout.
+Packaging is best-effort within the sandbox. If it succeeds, verify the bundle
+and install stamp name the clean `main` HEAD. Do not copy into `/Applications`
+or modify `/Users/seb/.hermes/hermes-agent`; neither location is an authorized
+writable delivery target for this task.
 
-- [ ] **Step 2: Deploy the Python runtime with a guarded fast-forward**
-
-Record the original runtime commit as `BACKEND_ROLLBACK_HEAD`. In the original
-dirty checkout, verify the feature-touched paths have no pre-existing local
-changes:
+- [ ] **Step 3: Push directly to Seb's fork**
 
 ```bash
-git -C /Users/seb/.hermes/hermes-agent diff --name-only -- \
-  hermes_cli/session_revision.py \
-  hermes_cli/web_server.py \
-  apps/desktop/src/types/hermes.ts \
-  apps/desktop/src/hermes.ts \
-  apps/desktop/src/hermes.test.ts \
-  apps/desktop/src/app/desktop-controller.tsx \
-  apps/desktop/src/app/session/hooks/use-session-revision-poll.ts \
-  apps/desktop/src/app/session/hooks/use-session-revision-poll.test.tsx
+git push origin main
 ```
 
-Expected: no output. If any touched path is dirty, stop; do not stash, reset,
-or overwrite it.
-
-Fast-forward `main` to the completed feature branch:
-
-```bash
-git -C /Users/seb/.hermes/hermes-agent merge --ff-only codex/hermes-one-background-refresh
-```
-
-This preserves every unrelated dirty file while making the new Python endpoint
-available to the installed thin shell. Confirm `hermes_cli/session_revision.py`
-exists and query the endpoint through a controlled local backend before
-replacing the app. If the live deployment later fails, restore the old bundle
-and revert only the feature range without resetting user work:
-
-```bash
-git -C /Users/seb/.hermes/hermes-agent revert --no-commit "${BACKEND_ROLLBACK_HEAD}..HEAD"
-git -C /Users/seb/.hermes/hermes-agent commit -m "revert: disable background session refresh"
-```
-
-Use that rollback only after rechecking that feature-touched paths have not
-acquired new user edits. Never use `git reset --hard` or discard unrelated
-changes.
-
-- [ ] **Step 3: Validate the packaged shell against the deployed runtime**
-
-From the feature worktree, run:
-
-```bash
-HERMES_DESKTOP_SKIP_BUILD=1 npm --prefix apps/desktop run test:desktop:existing
-```
-
-Confirm the validator reports the packaged binary, renderer payload, native
-dependencies, runtime root `/Users/seb/.hermes/hermes-agent`, and feature-branch
-install-stamp commit. Confirm the launched shell can call the revision endpoint
-without 404 or 503 errors.
-
-- [ ] **Step 4: Preserve a rollback bundle and install the rebuilt app**
-
-Quit Hermes One cleanly. Move `/Applications/Hermes One.app` to a timestamped sibling backup, then copy `apps/desktop/release/mac-arm64/Hermes.app` to `/Applications/Hermes One.app` with `ditto`. Do not delete the backup during verification.
-
-Verify before launch:
-
-```bash
-/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' '/Applications/Hermes One.app/Contents/Info.plist'
-/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' '/Applications/Hermes One.app/Contents/Info.plist'
-python3 -m json.tool '/Applications/Hermes One.app/Contents/Resources/install-stamp.json'
-```
-
-Expected bundle identifier: `com.nousresearch.hermes`. Expected install stamp: the feature branch HEAD with `dirty: false`.
-
-- [ ] **Step 5: Verify startup and backend health**
-
-Launch `/Applications/Hermes One.app`. Confirm the expected Hermes process tree is running, the desktop backend port is listening, and its health/readiness endpoint succeeds. Inspect startup logs for revision-route or SQLite errors without printing tokens or credentials.
-
-- [ ] **Step 6: Prove the five-second cross-surface refresh**
-
-Use one uniquely named disposable session so cleanup cannot affect an existing conversation:
-
-1. Leave Hermes One's primary window showing Sessions, then unfocus or minimize it.
-2. Create the disposable session through the shared Hermes WebUI/CLI state path and record the commit time.
-3. Without focusing Hermes One, confirm logs show the next revision probe and canonical session refresh starts within five seconds under normal scheduling.
-4. Restore Hermes One and confirm the session row is already present without a focus-triggered refresh.
-5. Repeat with Hermes One on a non-session route; open Sessions afterward and confirm the row is already in the store.
-6. Delete only the uniquely named disposable session through the canonical API and confirm that deletion also propagates.
-
-Do not manipulate arbitrary existing session rows directly.
-
-- [ ] **Step 7: Prove idle efficiency and resume behavior**
-
-Observe at least three unchanged five-second probes and confirm they do not call `/api/profiles/sessions` or run a full projection. Trigger the existing power-resume callback through a real sleep/wake cycle when practical, or through the tested Electron bridge in a controlled packaged run, and confirm it makes one immediate probe without adding an interval.
-
-- [ ] **Step 8: Keep or roll back based on evidence**
-
-Keep the new bundle and fast-forwarded runtime only if startup, backend health,
-minimized-window propagation, deletion propagation, and idle-efficiency checks
-all pass. Otherwise quit it, restore the timestamped app backup atomically,
-relaunch, and use the guarded feature-range revert above if the backend source
-also needs rollback. Report the failing evidence. Do not remove the rollback
-bundle until the user confirms the new build is satisfactory.
+Confirm the pushed commit equals local `HEAD`. Do not create a PR or push any
+remote other than Seb's `origin`.
 
 ## Final handoff
 
@@ -606,8 +537,6 @@ Report:
 
 - focused Python, Vitest, Electron, typecheck, and build results;
 - GitNexus final change scope;
-- packaged install-stamp commit and bundle identifier;
-- measured external-commit-to-probe and external-commit-to-visible-list latency;
-- minimized/off-route and resume verification results;
-- idle probes versus full refresh count; and
-- the exact rollback-bundle path and `BACKEND_ROLLBACK_HEAD` retained.
+- pushed fork branch and commit;
+- packaged artifact/install-stamp details if packaging succeeded; and
+- the explicit boundary that installed-app/runtime deployment and live minimized-window measurement remain pending when those targets are not writable.

@@ -1,9 +1,10 @@
-"""Cheap aggregate revision tokens for local Hermes session databases."""
+"""Cheap committed-change detection for local Hermes session databases."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -12,145 +13,230 @@ from typing import Iterable
 
 
 class SessionRevisionProbeError(RuntimeError):
-    """Raised when an observed session database cannot be probed safely."""
+    """Raised when a requested database revision cannot be read safely."""
 
 
 @dataclass
 class _TrackedDatabase:
-    ever_present: bool = False
-    connection: sqlite3.Connection | None = None
-    identity: tuple[int, int] | None = None
-    epoch: int = 0
-    data_version: int = 0
+    connection: sqlite3.Connection | None
+    identity: tuple[int, ...]
+    epoch: int
 
 
 class SessionRevisionTracker:
-    """Retain read-only SQLite handles and expose an opaque aggregate token."""
+    """Track SQLite revisions using stable, read-only connections."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._entries: dict[tuple[str, str], _TrackedDatabase] = {}
-        self._epochs: dict[tuple[str, str], int] = {}
-
-    @staticmethod
-    def _close_entry(entry: _TrackedDatabase) -> None:
-        connection = entry.connection
-        entry.connection = None
-        entry.identity = None
-        if connection is not None:
-            try:
-                connection.close()
-            except sqlite3.Error:
-                pass
-
-    @staticmethod
-    def _file_identity(path: Path) -> tuple[int, int] | None:
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise SessionRevisionProbeError(
-                "Session revision probe unavailable"
-            ) from exc
-        return int(stat.st_dev), int(stat.st_ino)
-
-    @staticmethod
-    def _open_read_only(path: Path) -> sqlite3.Connection:
-        try:
-            return sqlite3.connect(
-                f"{path.as_uri()}?mode=ro",
-                uri=True,
-                check_same_thread=False,
-                timeout=1.0,
-                isolation_level=None,
-            )
-        except (OSError, sqlite3.Error) as exc:
-            raise SessionRevisionProbeError(
-                "Session revision probe unavailable"
-            ) from exc
-
-    def _descriptor_for_target(
-        self,
-        key: tuple[str, str],
-        profile: str,
-        path: Path,
-    ) -> dict:
-        entry = self._entries.setdefault(key, _TrackedDatabase())
-        identity = self._file_identity(path)
-        if identity is None:
-            if entry.ever_present:
-                self._close_entry(entry)
-                raise SessionRevisionProbeError(
-                    "Session revision probe unavailable"
-                )
-            return {
-                "profile": profile,
-                "path": key[1],
-                "state": "absent",
-                "identity": None,
-                "epoch": entry.epoch,
-                "data_version": 0,
-            }
-
-        if entry.connection is None or entry.identity != identity:
-            self._close_entry(entry)
-            entry.connection = self._open_read_only(path)
-            entry.identity = identity
-            entry.epoch = self._epochs.get(key, 0) + 1
-            self._epochs[key] = entry.epoch
-            entry.ever_present = True
-
-        try:
-            row = entry.connection.execute("PRAGMA data_version").fetchone()
-            entry.data_version = int(row[0]) if row else 0
-        except (TypeError, ValueError, sqlite3.Error) as exc:
-            self._close_entry(entry)
-            raise SessionRevisionProbeError(
-                "Session revision probe unavailable"
-            ) from exc
-
-        return {
-            "profile": profile,
-            "path": key[1],
-            "state": "present",
-            "identity": list(identity),
-            "epoch": entry.epoch,
-            "data_version": entry.data_version,
-        }
+        self._entries: dict[tuple[str, Path], _TrackedDatabase] = {}
+        self._epochs: dict[tuple[str, Path], int] = {}
 
     def revision(self, targets: Iterable[tuple[str, Path]]) -> str:
         """Return an opaque token for the sorted local profile/database set."""
-        normalized: dict[tuple[str, str], tuple[str, Path]] = {}
-        for raw_profile, raw_path in targets:
-            profile = str(raw_profile or "").strip()
-            path = Path(raw_path).expanduser().resolve(strict=False)
-            key = (profile, str(path))
-            normalized[key] = (profile, path)
+
+        normalized_targets = sorted(
+            {
+                (str(profile), _normalize_path(db_path))
+                for profile, db_path in targets
+            },
+            key=lambda target: (target[0], str(target[1])),
+        )
 
         with self._lock:
-            requested = set(normalized)
-            for stale_key in set(self._entries) - requested:
-                self._close_entry(self._entries.pop(stale_key))
+            requested = set(normalized_targets)
+            for key in tuple(self._entries):
+                if key not in requested:
+                    self._close_entry(self._entries.pop(key))
+
             descriptors = [
-                self._descriptor_for_target(key, *normalized[key])
-                for key in sorted(normalized)
+                self._descriptor(profile, db_path)
+                for profile, db_path in normalized_targets
             ]
             payload = json.dumps(
                 descriptors,
                 ensure_ascii=True,
                 separators=(",", ":"),
-                sort_keys=True,
             ).encode("utf-8")
             return hashlib.sha256(payload).hexdigest()
 
     def close(self) -> None:
         """Close every retained connection; safe to call repeatedly."""
+
         with self._lock:
             for entry in self._entries.values():
                 self._close_entry(entry)
             self._entries.clear()
-            self._epochs.clear()
+
+    def _descriptor(self, profile: str, db_path: Path) -> dict[str, object]:
+        key = (profile, db_path)
+        entry = self._entries.get(key)
+
+        try:
+            identity = _file_identity(db_path)
+        except FileNotFoundError as exc:
+            if entry is None:
+                return {
+                    "profile": profile,
+                    "path": str(db_path),
+                    "present": False,
+                }
+            self._close_entry(entry)
+            raise SessionRevisionProbeError("Session database is unavailable") from exc
+        except OSError as exc:
+            if entry is not None:
+                self._close_entry(entry)
+            raise SessionRevisionProbeError("Session database cannot be inspected") from exc
+
+        retains_connection = _retains_sqlite_connections()
+        if entry is None:
+            epoch = self._next_epoch(key)
+            if retains_connection:
+                entry = self._open_entry(db_path, identity, epoch=epoch)
+            else:
+                entry = _TrackedDatabase(None, identity, epoch=epoch)
+            self._entries[key] = entry
+        elif entry.identity != identity:
+            self._close_entry(entry)
+            epoch = self._next_epoch(key)
+            if retains_connection:
+                entry = self._open_entry(db_path, identity, epoch=epoch)
+            else:
+                entry = _TrackedDatabase(None, identity, epoch=epoch)
+            self._entries[key] = entry
+        elif retains_connection and entry.connection is None:
+            entry = self._open_entry(
+                db_path,
+                identity,
+                epoch=self._next_epoch(key),
+            )
+            self._entries[key] = entry
+
+        if not retains_connection:
+            return {
+                "profile": profile,
+                "path": str(db_path),
+                "present": True,
+                "identity": entry.identity,
+                "epoch": entry.epoch,
+                "data_version": None,
+                "files": {
+                    "database": _file_change_fingerprint(
+                        db_path,
+                        expected_identity=identity,
+                        missing_ok=False,
+                    ),
+                    "wal": _file_change_fingerprint(Path(f"{db_path}-wal")),
+                },
+            }
+
+        connection = entry.connection
+        if connection is None:
+            raise SessionRevisionProbeError("Session database connection is unavailable")
+        try:
+            row = connection.execute("PRAGMA data_version").fetchone()
+            if row is None:
+                raise sqlite3.DatabaseError("PRAGMA data_version returned no row")
+            data_version = int(row[0])
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            self._close_entry(entry)
+            raise SessionRevisionProbeError("Session database revision is unavailable") from exc
+
+        return {
+            "profile": profile,
+            "path": str(db_path),
+            "present": True,
+            "identity": entry.identity,
+            "epoch": entry.epoch,
+            "data_version": data_version,
+        }
+
+    def _open_entry(
+        self, db_path: Path, expected_identity: tuple[int, ...], epoch: int
+    ) -> _TrackedDatabase:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                f"{db_path.as_uri()}?mode=ro",
+                uri=True,
+                check_same_thread=False,
+                timeout=1.0,
+                isolation_level=None,
+            )
+            actual_identity = _file_identity(db_path)
+            if actual_identity != expected_identity:
+                raise SessionRevisionProbeError(
+                    "Session database changed while opening"
+                )
+            return _TrackedDatabase(connection, actual_identity, epoch)
+        except SessionRevisionProbeError:
+            if connection is not None:
+                connection.close()
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            if connection is not None:
+                connection.close()
+            raise SessionRevisionProbeError("Session database cannot be opened") from exc
+
+    @staticmethod
+    def _close_entry(entry: _TrackedDatabase) -> None:
+        if entry.connection is not None:
+            entry.connection.close()
+            entry.connection = None
+
+    def _next_epoch(self, key: tuple[str, Path]) -> int:
+        epoch = self._epochs.get(key, 0) + 1
+        self._epochs[key] = epoch
+        return epoch
 
 
-__all__ = ["SessionRevisionProbeError", "SessionRevisionTracker"]
+def _normalize_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.path.normpath(os.fspath(path.expanduser()))))
+
+
+def _file_identity(path: Path) -> tuple[int, ...]:
+    return _file_identity_from_stat(path.stat())
+
+
+def _file_identity_from_stat(stat_result: os.stat_result) -> tuple[int, ...]:
+    if stat_result.st_ino:
+        return (stat_result.st_dev, stat_result.st_ino)
+    return (
+        stat_result.st_dev,
+        stat_result.st_ctime_ns,
+        stat_result.st_mtime_ns,
+        stat_result.st_size,
+    )
+
+
+def _file_change_fingerprint(
+    path: Path,
+    *,
+    expected_identity: tuple[int, ...] | None = None,
+    missing_ok: bool = True,
+) -> tuple[object, ...]:
+    try:
+        stat_result = path.stat()
+    except FileNotFoundError as exc:
+        if missing_ok:
+            return ("absent",)
+        raise SessionRevisionProbeError("Session database is unavailable") from exc
+    except OSError as exc:
+        raise SessionRevisionProbeError(
+            "Session database files cannot be inspected"
+        ) from exc
+    identity = _file_identity_from_stat(stat_result)
+    if expected_identity is not None and identity != expected_identity:
+        raise SessionRevisionProbeError("Session database changed during probe")
+    return (
+        "present",
+        *identity,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def _retains_sqlite_connections() -> bool:
+    """Avoid Windows handles that block profile database replacement/removal."""
+
+    return os.name != "nt"

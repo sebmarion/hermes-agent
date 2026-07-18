@@ -121,9 +121,14 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 
 
 def active_count() -> int:
-    """Number of async delegations currently running."""
+    """Number of delegations still running or finishing durable delivery."""
     with _records_lock:
-        return sum(1 for r in _records.values() if r.get("status") == "running")
+        return sum(
+            1
+            for record in _records.values()
+            if record.get("status") == "running"
+            or record.get("delivery_status") == "finalizing"
+        )
 
 
 def _new_delegation_id() -> str:
@@ -644,7 +649,9 @@ def dispatch_async_delegation(
     role: str,
     model: Optional[str],
     session_key: str,
+    parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
+    origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
 ) -> Dict[str, Any]:
@@ -660,6 +667,11 @@ def dispatch_async_delegation(
         captured on the parent thread BEFORE dispatch, because the daemon
         worker thread won't carry the contextvar. Used to route the
         completion back to the originating session.
+    parent_session_id
+        The durable ``state.db`` session id of the parent agent that spawned
+        the delegation. Carried on the completion event so the gateway can
+        pin routing to the spawning session instead of recovering the latest
+        ``ended_at IS NULL`` row for the peer tuple (#57498).
     runner
         Zero-arg callable that builds + runs the child and returns the same
         result dict ``_run_single_child`` produces. Runs on the worker thread.
@@ -689,6 +701,8 @@ def dispatch_async_delegation(
         "role": role,
         "model": model,
         "session_key": session_key,
+        "origin_ui_session_id": origin_ui_session_id,
+        "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -776,7 +790,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         record["status"] = status
         record["completed_at"] = time.time()
         record["last_heartbeat_at"] = record["completed_at"]
-        record["delivery_status"] = "pending"
+        record["delivery_status"] = "finalizing"
         hb_stop = record.get("heartbeat_stop")
         if hasattr(hb_stop, "set"):
             hb_stop.set()
@@ -818,6 +832,8 @@ def _push_completion_event(
         # session_key routes the completion back to the originating gateway
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
+        "origin_ui_session_id": record.get("origin_ui_session_id", ""),
+        "parent_session_id": record.get("parent_session_id"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -835,15 +851,24 @@ def _push_completion_event(
         "exit_reason": result.get("exit_reason"),
     }
     try:
+        delegation_id = str(record.get("delegation_id") or "")
         _persist_record(record, result=result, event=evt, delivery_status="pending")
-        process_registry.completion_queue.put(evt)
-        _mark_persisted_delivery(str(record.get("delegation_id") or ""), "queued")
+        _mark_persisted_delivery(delegation_id, "queued")
         with _records_lock:
-            live = _records.get(str(record.get("delegation_id") or ""))
+            live = _records.get(delegation_id)
             if live is not None:
                 live["delivery_status"] = "queued"
                 live["queued_at"] = time.time()
+        # Publish only after the durable record says queued, so a fast
+        # consumer cannot ACK a completion whose persistence still says pending.
+        process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
+        delegation_id = str(record.get("delegation_id") or "")
+        _mark_persisted_delivery(delegation_id, "pending")
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None:
+                live["delivery_status"] = "pending"
         logger.error(
             "Async delegation %s: failed to enqueue completion event; "
             "persisted for replay: %s",
@@ -859,7 +884,9 @@ def dispatch_async_delegation_batch(
     role: str,
     model: Optional[str],
     session_key: str,
+    parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
+    origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
 ) -> Dict[str, Any]:
@@ -901,6 +928,8 @@ def dispatch_async_delegation_batch(
         "role": role,
         "model": model,
         "session_key": session_key,
+        "origin_ui_session_id": origin_ui_session_id,
+        "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -992,7 +1021,7 @@ def _finalize_batch(
         record["status"] = status
         record["completed_at"] = time.time()
         record["last_heartbeat_at"] = record["completed_at"]
-        record["delivery_status"] = "pending"
+        record["delivery_status"] = "finalizing"
         hb_stop = record.get("heartbeat_stop")
         if hasattr(hb_stop, "set"):
             hb_stop.set()
@@ -1017,6 +1046,8 @@ def _finalize_batch(
         "type": "async_delegation",
         "delegation_id": delegation_id,
         "session_key": event_record.get("session_key", ""),
+        "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
+        "parent_session_id": event_record.get("parent_session_id"),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
@@ -1035,14 +1066,19 @@ def _finalize_batch(
     }
     try:
         _persist_record(event_record, result=combined, event=evt, delivery_status="pending")
-        process_registry.completion_queue.put(evt)
         _mark_persisted_delivery(delegation_id, "queued")
         with _records_lock:
             live = _records.get(delegation_id)
             if live is not None:
                 live["delivery_status"] = "queued"
                 live["queued_at"] = time.time()
+        process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
+        _mark_persisted_delivery(delegation_id, "pending")
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None:
+                live["delivery_status"] = "pending"
         logger.error(
             "Async delegation batch %s: failed to enqueue completion event; "
             "persisted for replay: %s",
@@ -1087,6 +1123,62 @@ def interrupt_all(reason: str = "shutdown") -> int:
                 )
     if count:
         logger.info("Interrupted %d async delegation(s) (%s)", count, reason)
+    return count
+
+
+def interrupt_for_session(
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+    reason: str = "session_end",
+) -> int:
+    """Signal running async delegations owned by ONE session to stop.
+
+    A delegation's lifecycle is bound to the session that spawned it: when
+    that session ends, its in-flight background subagents must end with it —
+    a completed orphan would otherwise sit on the shared completion queue
+    with no live owner, either leaking into another chat or burning tokens
+    with no one listening (#55578).
+
+    Selectors (any matching field claims the record):
+    - ``origin_ui_session_id``: the live TUI tab/window that commissioned it.
+    - ``session_key``: the durable routing key captured at dispatch.
+    - ``parent_session_id``: the spawning agent's durable session-db id —
+      the right selector for gateway chats, whose ``session_key`` (the
+      platform conversation key) SURVIVES a ``/new`` reset while the
+      session id rotates.
+
+    Returns how many were interrupted.
+    """
+    if not session_key and not origin_ui_session_id and not parent_session_id:
+        return 0
+    count = 0
+    with _records_lock:
+        targets = [
+            r for r in _records.values()
+            if r.get("status") == "running"
+            and (
+                (origin_ui_session_id and str(r.get("origin_ui_session_id") or "") == origin_ui_session_id)
+                or (session_key and str(r.get("session_key") or "") == session_key)
+                or (parent_session_id and str(r.get("parent_session_id") or "") == parent_session_id)
+            )
+        ]
+    for r in targets:
+        fn = r.get("interrupt_fn")
+        if callable(fn):
+            try:
+                fn()
+                count += 1
+            except Exception as exc:
+                logger.debug(
+                    "interrupt_for_session: %s interrupt failed: %s",
+                    r.get("delegation_id"), exc,
+                )
+    if count:
+        logger.info(
+            "Interrupted %d async delegation(s) for ending session (%s)",
+            count, reason,
+        )
     return count
 
 

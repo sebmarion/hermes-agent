@@ -60,8 +60,8 @@ describe('Hermes REST session helpers', () => {
     )
   })
 
-  it('requests the aggregate session revision with a short timeout', async () => {
-    api.mockResolvedValue({ profiles: ['worker one'], revision: 'opaque' })
+  it('uses the lightweight timeout for the all-profile revision probe', async () => {
+    api.mockResolvedValue({ profiles: ['worker one'], revision: 'revision-1' })
 
     await getAllProfileSessionsRevision('worker one')
 
@@ -112,7 +112,7 @@ describe('Hermes REST session helpers', () => {
       [getHermesConfig, '/api/config'],
       [getHermesConfigDefaults, '/api/config/defaults'],
       [getGlobalModelInfo, '/api/model/info'],
-      [() => getGlobalModelOptions(), '/api/model/options'],
+      [() => getGlobalModelOptions(), '/api/model/options?explicit_only=1'],
       [getCronJobs, '/api/cron/jobs']
     ]
 
@@ -145,5 +145,25 @@ describe('Hermes REST session helpers', () => {
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
       profile: 'xiaoxuxu'
     })
+  })
+
+  it('defaults model options to configured providers only', async () => {
+    await getGlobalModelOptions()
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/model/options?explicit_only=1'
+      })
+    )
+  })
+
+  it('can opt into unconfigured providers for onboarding flows', async () => {
+    await getGlobalModelOptions({ includeUnconfigured: true, refresh: true, explicitOnly: false })
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/model/options?refresh=1&include_unconfigured=1'
+      })
+    )
   })
 })

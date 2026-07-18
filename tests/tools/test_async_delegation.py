@@ -151,6 +151,7 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     res = ad.dispatch_async_delegation(
         goal="compute X", context="some context", toolsets=["web", "file"],
         role="leaf", model="test-model", session_key="agent:main:cli:dm:local",
+        parent_session_id="20260703_parent_sid",
         runner=runner, max_async_children=3,
     )
     assert res["status"] == "dispatched"
@@ -160,6 +161,7 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["type"] == "async_delegation"
     assert evt["summary"] == "the result"
     assert evt["session_key"] == "agent:main:cli:dm:local"
+    assert evt["parent_session_id"] == "20260703_parent_sid"
     assert evt["delegation_id"] == res["delegation_id"]
 
 
@@ -435,6 +437,19 @@ def test_recovery_replays_unacked_and_marks_prior_running_lost():
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
 
+def _async_delegate_config():
+    """Minimal deterministic lane config for async dispatch fixtures."""
+    return {
+        "lanes": {
+            "code_worker": {
+                "provider": "custom:test",
+                "model": "m",
+                "toolsets": ["terminal"],
+            }
+        }
+    }
+
+
 def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     """delegate_task(background=True) returns a handle without running the
     child synchronously, and the child completes on the background thread.
@@ -448,6 +463,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
+    parent.enabled_toolsets = ["terminal"]
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
@@ -465,12 +481,18 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     creds = {
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
+        "lane": "code_worker", "toolsets": ["terminal"],
     }
     # monkeypatch (not `with`) so patches outlive delegate_task's return and
     # remain active while the background worker runs.
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
-    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(dt, "_load_config", _async_delegate_config)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials_for_task",
+        lambda *a, **k: creds,
+    )
     out = dt.delegate_task(
         goal="the real task", context="ctx",
         background=True, parent_agent=parent,
@@ -499,6 +521,75 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
+def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
+    """TUI async delegation must route to the live/compressed agent id.
+
+    Regression: delegate_task captured the stale approval/session context key
+    after compression rotated parent_agent.session_id. The resulting completion
+    was orphaned and could be consumed by an unrelated desktop session poller.
+    """
+    import json
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.approval import reset_current_session_key, set_current_session_key
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "post-compress-tip"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    parent.enabled_toolsets = ["terminal"]
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+        "lane": "code_worker", "toolsets": ["terminal"],
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
+    monkeypatch.setattr(dt, "_load_config", _async_delegate_config)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials_for_task",
+        lambda *a, **k: creds,
+    )
+    monkeypatch.setattr(
+        dt,
+        "_run_single_child",
+        lambda *a, **k: {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        },
+    )
+
+    approval_token = set_current_session_key("pre-compress-parent")
+    session_tokens = set_session_vars(
+        source="tui",
+        session_key="pre-compress-parent",
+        ui_session_id="origin-tab",
+    )
+    try:
+        out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
+        assert json.loads(out)["status"] == "dispatched"
+        evt = _drain_one()
+    finally:
+        reset_current_session_key(approval_token)
+        clear_session_vars(session_tokens)
+
+    assert evt is not None
+    assert evt["type"] == "async_delegation"
+    assert evt["session_key"] == "post-compress-tip"
+    assert evt["origin_ui_session_id"] == "origin-tab"
+
+
 def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     """A multi-item batch with background=True dispatches the WHOLE fan-out as
     ONE background unit (one handle, one async slot). The children run in
@@ -514,6 +605,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
+    parent.enabled_toolsets = ["terminal"]
 
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
@@ -531,6 +623,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     creds = {
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
+        "lane": "code_worker", "toolsets": ["terminal"],
     }
 
     # Use monkeypatch (not a `with` block) so the patches stay active while the
@@ -538,7 +631,12 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     # has already returned.
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", _blocking_child)
-    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(dt, "_load_config", _async_delegate_config)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials_for_task",
+        lambda *a, **k: creds,
+    )
     out = dt.delegate_task(
         tasks=[{"goal": "a"}, {"goal": "b"}, {"goal": "c"}],
         background=True,
@@ -668,6 +766,7 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     parent.session_id = "sess"
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
+    parent.enabled_toolsets = ["terminal"]
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
@@ -687,10 +786,16 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     creds = {
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
+        "lane": "code_worker", "toolsets": ["terminal"],
     }
     with patch.object(dt, "_build_child_agent", side_effect=build_and_register), \
          patch.object(dt, "_run_single_child", side_effect=slow_child), \
-         patch.object(dt, "_resolve_delegation_credentials", return_value=creds):
+         patch.object(dt, "_load_config", side_effect=_async_delegate_config), \
+         patch.object(
+             dt,
+             "_resolve_delegation_credentials_for_task",
+             return_value=creds,
+         ):
         out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
 
     import json
@@ -822,5 +927,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-

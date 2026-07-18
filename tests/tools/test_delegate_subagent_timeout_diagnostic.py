@@ -255,6 +255,7 @@ class TestRunSingleChildTimeoutDump:
         result = self._invoke_with_short_timeout(child, monkeypatch)
 
         assert result["status"] == "timeout"
+        assert result["failure_kind"] == "timeout"
         assert result["api_calls"] == 0
         assert result["diagnostic_path"] is not None
         dump_path = Path(result["diagnostic_path"])
@@ -271,6 +272,7 @@ class TestRunSingleChildTimeoutDump:
         result = self._invoke_with_short_timeout(child, monkeypatch)
 
         assert result["status"] == "timeout"
+        assert result["failure_kind"] == "timeout"
         assert result["api_calls"] == 5
         # No diagnostic file should be written for timeouts that made
         # actual API calls — the old generic "stuck on slow call" message
