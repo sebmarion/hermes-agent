@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_cli.config import cfg_get
@@ -63,6 +63,29 @@ def _resolve_git_executable() -> Optional[str]:
 
 class PluginOperationError(Exception):
     """Recoverable plugin install/update failure (CLI exits; HTTP maps to 4xx)."""
+
+
+class RequiredPolicyConfigError(ValueError):
+    """The configured required-policy mapping is malformed."""
+
+
+class RequiredPolicyCommandError(ValueError):
+    """A required-policy CLI request cannot be applied safely."""
+
+
+_SUPPORTED_REQUIRED_POLICIES = frozenset({"tool_dispatch"})
+_POLICY_STATUS_FIELDS = (
+    "plugin",
+    "policy",
+    "configured",
+    "installed",
+    "enabled",
+    "loaded",
+    "registered",
+    "quarantined",
+    "timeout_ms",
+    "last_error_code",
+)
 
 
 # Minimum manifest version this installer understands.
@@ -1931,6 +1954,12 @@ def plugins_command(args) -> None:
         cmd_disable(args.name)
     elif action in {"list", "ls"}:
         cmd_list(args)
+    elif action == "require-policy":
+        cmd_require_policy(args)
+    elif action == "unrequire-policy":
+        cmd_unrequire_policy(args)
+    elif action == "policy-status":
+        cmd_policy_status(args)
     elif action is None:
         cmd_toggle()
     else:
@@ -1938,3 +1967,375 @@ def plugins_command(args) -> None:
 
         Console().print(f"[red]Unknown plugins action: {action}[/red]")
         sys.exit(1)
+
+
+def _canonical_policy_key(plugin_key: str) -> str:
+    """Return an installed plugin's canonical key, preserving removed keys."""
+    return _resolve_plugin_key(plugin_key) or plugin_key
+
+
+def _normalize_required_policies(value: object) -> dict[str, list[str]]:
+    """Validate and deterministically normalize a required-policy mapping."""
+    if type(value) is not dict:
+        raise RequiredPolicyConfigError(
+            "plugins.required_policies must be a mapping"
+        )
+
+    normalized: dict[str, set[str]] = {}
+    for plugin_key, policy_names in value.items():
+        if type(plugin_key) is not str or not plugin_key.strip():
+            raise RequiredPolicyConfigError(
+                "plugins.required_policies keys must be non-empty strings"
+            )
+        if plugin_key != plugin_key.strip():
+            raise RequiredPolicyConfigError(
+                "plugins.required_policies keys must not contain surrounding whitespace"
+            )
+        if type(policy_names) is not list:
+            raise RequiredPolicyConfigError(
+                f"plugins.required_policies.{plugin_key} must be a list"
+            )
+
+        canonical_key = _canonical_policy_key(plugin_key)
+        normalized.setdefault(canonical_key, set())
+        for policy_name in policy_names:
+            if type(policy_name) is not str or not policy_name.strip():
+                raise RequiredPolicyConfigError(
+                    "required policy names must be non-empty strings"
+                )
+            if policy_name not in _SUPPORTED_REQUIRED_POLICIES:
+                raise RequiredPolicyConfigError(
+                    f"unsupported required policy for plugin {canonical_key!r}"
+                )
+            normalized[canonical_key].add(policy_name)
+
+    return {
+        plugin_key: sorted(normalized[plugin_key])
+        for plugin_key in sorted(normalized)
+        if normalized[plugin_key]
+    }
+
+
+def _get_required_policies() -> dict[str, list[str]]:
+    """Load the strict required-policy mapping from ``config.yaml``."""
+    from hermes_cli.config import load_config
+
+    config = load_config()
+    if type(config) is not dict:
+        raise RequiredPolicyConfigError("Hermes configuration must be a mapping")
+    if "plugins" not in config:
+        return {}
+    plugins_config = config["plugins"]
+    if type(plugins_config) is not dict:
+        raise RequiredPolicyConfigError("plugins must be a mapping")
+    if "required_policies" not in plugins_config:
+        return {}
+    return _normalize_required_policies(plugins_config["required_policies"])
+
+
+def _save_required_policies(policies: object) -> None:
+    """Persist required policies without replacing foreign configuration."""
+    from hermes_cli.config import load_config, save_config
+
+    normalized = _normalize_required_policies(policies)
+    config = load_config()
+    if type(config) is not dict:
+        raise RequiredPolicyConfigError("Hermes configuration must be a mapping")
+    if "plugins" not in config:
+        config["plugins"] = {}
+    elif type(config["plugins"]) is not dict:
+        raise RequiredPolicyConfigError("plugins must be a mapping")
+    config["plugins"]["required_policies"] = normalized
+    save_config(
+        config,
+        preserve_keys={("plugins", "required_policies")},
+    )
+
+
+def _require_policy_name(value: object) -> str:
+    if type(value) is not str or not value.strip():
+        raise RequiredPolicyCommandError("Policy name must be a non-empty string")
+    if value not in _SUPPORTED_REQUIRED_POLICIES:
+        raise RequiredPolicyCommandError(f"Unsupported policy {value!r}")
+    return value
+
+
+def _require_plugin_name(value: object) -> str:
+    if type(value) is not str or not value.strip():
+        raise RequiredPolicyCommandError("Plugin name must be a non-empty string")
+    if value != value.strip():
+        raise RequiredPolicyCommandError(
+            "Plugin name must not contain surrounding whitespace"
+        )
+    return value
+
+
+def _installed_plugin_entry(plugin_key: str) -> tuple | None:
+    return next(
+        (entry for entry in _discover_all_plugins() if entry[5] == plugin_key),
+        None,
+    )
+
+
+def _declared_manifest_policies(entry: tuple) -> frozenset[str]:
+    """Read and strictly validate the raw manifest policy declaration."""
+    plugin_key = entry[5]
+    plugin_dir = Path(entry[4])
+    manifest_file = plugin_dir / "plugin.yaml"
+    if not manifest_file.exists():
+        manifest_file = plugin_dir / "plugin.yml"
+    if not manifest_file.exists():
+        raise RequiredPolicyCommandError(
+            f"Plugin {plugin_key!r} has no readable manifest"
+        )
+    try:
+        import yaml
+
+        manifest = yaml.safe_load(manifest_file.read_text(encoding="utf-8")) or {}
+    except Exception:
+        raise RequiredPolicyCommandError(
+            f"Plugin {plugin_key!r} has an unreadable manifest"
+        ) from None
+    if type(manifest) is not dict:
+        raise RequiredPolicyCommandError(
+            f"Plugin {plugin_key!r} manifest must be a mapping"
+        )
+    raw_policies = manifest.get("policies", [])
+    if type(raw_policies) is not list:
+        raise RequiredPolicyCommandError(
+            f"Plugin {plugin_key!r} policies declaration must be a list"
+        )
+
+    declared: set[str] = set()
+    for policy_name in raw_policies:
+        if type(policy_name) is not str or not policy_name:
+            raise RequiredPolicyCommandError(
+                f"Plugin {plugin_key!r} declares an invalid policy name"
+            )
+        if policy_name not in _SUPPORTED_REQUIRED_POLICIES:
+            raise RequiredPolicyCommandError(
+                f"Plugin {plugin_key!r} declares an unsupported policy"
+            )
+        if policy_name in declared:
+            raise RequiredPolicyCommandError(
+                f"Plugin {plugin_key!r} declares a duplicate policy"
+            )
+        declared.add(policy_name)
+    return frozenset(declared)
+
+
+def _abort_policy_command(error: Exception) -> NoReturn:
+    """Render a bounded policy CLI error and exit nonzero."""
+    from rich.console import Console
+
+    label = (
+        "Configuration error"
+        if isinstance(error, RequiredPolicyConfigError)
+        else "Error"
+    )
+    Console(stderr=True).print(f"[red]{label}:[/red] {error}")
+    raise SystemExit(1)
+
+
+def cmd_require_policy(args) -> None:
+    """Require a manifest-declared policy under the canonical plugin key."""
+    from rich.console import Console
+
+    try:
+        requested_plugin = _require_plugin_name(args.plugin)
+        policy_name = _require_policy_name(args.policy)
+        plugin_key = _resolve_plugin_key(requested_plugin)
+        if plugin_key is None:
+            raise RequiredPolicyCommandError(
+                f"Plugin {requested_plugin!r} is not installed"
+            )
+        entry = _installed_plugin_entry(plugin_key)
+        if entry is None:
+            raise RequiredPolicyCommandError(
+                f"Plugin {requested_plugin!r} is not installed"
+            )
+        if policy_name not in _declared_manifest_policies(entry):
+            raise RequiredPolicyCommandError(
+                f"Plugin {plugin_key!r} does not declare policy {policy_name!r}"
+            )
+
+        policies = _get_required_policies()
+        existing = set(policies.get(plugin_key, []))
+        if policy_name in existing:
+            Console().print(
+                f"[dim]Policy {policy_name!r} is already required for "
+                f"plugin {plugin_key!r}.[/dim]"
+            )
+            return
+        existing.add(policy_name)
+        policies[plugin_key] = sorted(existing)
+        _save_required_policies(policies)
+    except (RequiredPolicyConfigError, RequiredPolicyCommandError) as error:
+        _abort_policy_command(error)
+
+    Console().print(
+        f"[green]\u2713[/green] Required policy {policy_name!r} for plugin "
+        f"[bold]{plugin_key}[/bold]."
+    )
+
+
+def cmd_unrequire_policy(args) -> None:
+    """Remove exactly one configured plugin/policy pair."""
+    from rich.console import Console
+
+    try:
+        requested_plugin = _require_plugin_name(args.plugin)
+        policy_name = _require_policy_name(args.policy)
+        policies = _get_required_policies()
+        plugin_key = _resolve_plugin_key(requested_plugin) or requested_plugin
+        if plugin_key not in policies and requested_plugin in policies:
+            plugin_key = requested_plugin
+
+        existing = set(policies.get(plugin_key, []))
+        if policy_name not in existing:
+            Console().print(
+                f"[dim]Policy {policy_name!r} is not required for "
+                f"plugin {plugin_key!r}.[/dim]"
+            )
+            return
+        existing.remove(policy_name)
+        if existing:
+            policies[plugin_key] = sorted(existing)
+        else:
+            policies.pop(plugin_key, None)
+        _save_required_policies(policies)
+    except (RequiredPolicyConfigError, RequiredPolicyCommandError) as error:
+        _abort_policy_command(error)
+
+    Console().print(
+        f"[green]\u2713[/green] Removed required policy {policy_name!r} from "
+        f"plugin [bold]{plugin_key}[/bold]."
+    )
+
+
+def _configured_plugin_enabled(entry: tuple | None, plugin_key: str) -> bool:
+    """Return whether config/runtime rules select an installed plugin."""
+    if entry is None:
+        return False
+    enabled = _get_enabled_set()
+    disabled = _get_disabled_set()
+    manifest_name = entry[0]
+    if plugin_key in disabled or manifest_name in disabled:
+        return False
+    if plugin_key in enabled or manifest_name in enabled:
+        return True
+    if entry[3] == "bundled":
+        try:
+            kind = _read_manifest(Path(entry[4])).get("kind", "standalone")
+        except Exception:
+            kind = "standalone"
+        return kind in {"backend", "model-provider", "platform"}
+    return False
+
+
+def _policy_status_records() -> list[dict[str, object]]:
+    """Build safe, deterministic runtime status for configured policy pairs."""
+    policies = _get_required_policies()
+    if not policies:
+        return []
+
+    entries = {entry[5]: entry for entry in _discover_all_plugins()}
+    runtime_plugins: dict[str, dict[str, Any]] = {}
+    manager = None
+    try:
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        # Plugin imports are untrusted output producers. Status is an
+        # operational projection, so discard their stdout/stderr rather than
+        # contaminating JSON or echoing plugin-controlled data.
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            discover_plugins(force=True)
+        manager = get_plugin_manager()
+        runtime_plugins = {
+            item["key"]: item
+            for item in manager.list_plugins()
+            if type(item.get("key")) is str
+        }
+    except Exception:
+        # A failed discovery sweep is represented by loaded/registered=false.
+        # Never expose exception text through this status surface.
+        runtime_plugins = {}
+        manager = None
+
+    records: list[dict[str, object]] = []
+    for plugin_key in sorted(policies):
+        entry = entries.get(plugin_key)
+        runtime = runtime_plugins.get(plugin_key)
+        for policy_name in policies[plugin_key]:
+            registration = (
+                manager.get_policy_registration(plugin_key, policy_name)
+                if manager is not None
+                else None
+            )
+            record = {
+                "plugin": plugin_key,
+                "policy": policy_name,
+                "configured": True,
+                "installed": entry is not None,
+                "enabled": _configured_plugin_enabled(entry, plugin_key),
+                "loaded": bool(runtime and runtime.get("enabled") is True),
+                "registered": registration is not None,
+                "quarantined": False,
+                "timeout_ms": (
+                    registration.timeout_ms if registration is not None else None
+                ),
+                "last_error_code": None,
+            }
+            records.append({field: record[field] for field in _POLICY_STATUS_FIELDS})
+    return records
+
+
+def cmd_policy_status(args) -> None:
+    """Show required-policy configuration and safe runtime status."""
+    from rich.console import Console
+    from rich.table import Table
+
+    try:
+        records = _policy_status_records()
+    except RequiredPolicyConfigError as error:
+        _abort_policy_command(error)
+
+    if getattr(args, "json", False):
+        print(json.dumps(records, sort_keys=True, separators=(",", ":")))
+        return
+
+    console = Console()
+    if not records:
+        console.print("[dim]No required policies configured.[/dim]")
+        return
+    table = Table(title="Required plugin policies")
+    for heading in (
+        "Plugin",
+        "Policy",
+        "Configured",
+        "Installed",
+        "Enabled",
+        "Loaded",
+        "Registered",
+        "Timeout",
+        "Quarantined",
+        "Error",
+    ):
+        table.add_column(heading)
+    for record in records:
+        table.add_row(
+            str(record["plugin"]),
+            str(record["policy"]),
+            "yes" if record["configured"] else "no",
+            "yes" if record["installed"] else "no",
+            "yes" if record["enabled"] else "no",
+            "yes" if record["loaded"] else "no",
+            "yes" if record["registered"] else "no",
+            str(record["timeout_ms"] or "-"),
+            "yes" if record["quarantined"] else "no",
+            str(record["last_error_code"] or "-"),
+        )
+    console.print(table)
