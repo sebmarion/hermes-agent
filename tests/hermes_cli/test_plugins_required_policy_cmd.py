@@ -23,6 +23,9 @@ STATUS_FIELDS = {
     "quarantined",
     "timeout_ms",
     "last_error_code",
+    "executionMiddleware",
+    "ordinaryDispatchCovered",
+    "replacementExecutionAudited",
 }
 
 
@@ -71,6 +74,36 @@ def _make_plugin(
         source = "def register(ctx):\n    pass\n"
     (plugin_dir / "__init__.py").write_text(source, encoding="utf-8")
     return plugin_dir
+
+
+def _allowing_policy_source(execution_mode: str | None = None) -> str:
+    source = (
+        "def register(ctx):\n"
+        "    def policy(payload):\n"
+        "        return {'action': 'allow', "
+        "'policy_binding': payload['policy_binding']}\n"
+        "    ctx.register_policy('tool_dispatch', policy, timeout_ms=3750)\n"
+    )
+    if execution_mode == "pass":
+        source += (
+            "    def execution(**kwargs):\n"
+            "        return kwargs['next_call'](kwargs['args'])\n"
+            "    ctx.register_middleware('tool_execution', execution)\n"
+        )
+    elif execution_mode == "rewrite":
+        source += (
+            "    def execution(**kwargs):\n"
+            "        return kwargs['next_call']({**kwargs['args'], "
+            "'execution_rewrite': True})\n"
+            "    ctx.register_middleware('tool_execution', execution)\n"
+        )
+    elif execution_mode == "replace":
+        source += (
+            "    def execution(**kwargs):\n"
+            "        return 'trusted-host-replacement'\n"
+            "    ctx.register_middleware('tool_execution', execution)\n"
+        )
+    return source
 
 
 @pytest.fixture
@@ -270,13 +303,16 @@ def test_policy_status_json_reports_disabled_unloaded_plugin(
         {
             "configured": True,
             "enabled": False,
+            "executionMiddleware": [],
             "installed": True,
             "last_error_code": None,
             "loaded": False,
+            "ordinaryDispatchCovered": False,
             "plugin": "governor",
             "policy": "tool_dispatch",
             "quarantined": False,
             "registered": False,
+            "replacementExecutionAudited": False,
             "timeout_ms": None,
         }
     ]
@@ -315,17 +351,142 @@ def test_policy_status_json_reports_loaded_registration_and_timeout(
     assert records[0] == {
         "configured": True,
         "enabled": True,
+        "executionMiddleware": [],
         "installed": True,
         "last_error_code": None,
         "loaded": True,
+        "ordinaryDispatchCovered": True,
         "plugin": "governor",
         "policy": "tool_dispatch",
         "quarantined": False,
         "registered": True,
+        "replacementExecutionAudited": False,
         "timeout_ms": 3750,
     }
     assert "TOP_SECRET_VALUE" not in output
     assert "callback" not in output.lower()
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "covered", "reached_next"),
+    [
+        ("pass", True, True),
+        ("rewrite", True, True),
+        ("replace", False, False),
+    ],
+)
+def test_policy_status_conformance_reports_execution_middleware_by_plugin(
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+    execution_mode: str,
+    covered: bool,
+    reached_next: bool,
+) -> None:
+    from hermes_cli.plugins_cmd import cmd_policy_status
+
+    _make_plugin(
+        isolated_home,
+        "governor",
+        policies=["tool_dispatch"],
+        init_source=_allowing_policy_source(execution_mode),
+    )
+    _write_config(
+        isolated_home,
+        {
+            "plugins": {
+                "enabled": ["governor"],
+                "required_policies": {"governor": ["tool_dispatch"]},
+            }
+        },
+    )
+
+    cmd_policy_status(SimpleNamespace(json=True))
+
+    record = json.loads(capsys.readouterr().out)[0]
+    assert record["ordinaryDispatchCovered"] is covered
+    assert record["replacementExecutionAudited"] is False
+    assert record["executionMiddleware"] == [
+        {
+            "plugin": "governor",
+            "reachedNextCall": reached_next,
+        }
+    ]
+
+
+def test_policy_status_requires_explicitly_allowed_self_test(
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from hermes_cli.plugins_cmd import cmd_policy_status
+
+    _make_plugin(
+        isolated_home,
+        "governor",
+        policies=["tool_dispatch"],
+        init_source=(
+            "def register(ctx):\n"
+            "    def policy(payload):\n"
+            "        return {'action': 'block', 'message': 'probe denied'}\n"
+            "    ctx.register_policy('tool_dispatch', policy)\n"
+        ),
+    )
+    _write_config(
+        isolated_home,
+        {
+            "plugins": {
+                "enabled": ["governor"],
+                "required_policies": {"governor": ["tool_dispatch"]},
+            }
+        },
+    )
+
+    cmd_policy_status(SimpleNamespace(json=True))
+
+    record = json.loads(capsys.readouterr().out)[0]
+    assert record["loaded"] is True
+    assert record["registered"] is True
+    assert record["ordinaryDispatchCovered"] is False
+
+
+def test_policy_status_uses_registration_owner_for_separate_middleware_plugin(
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from hermes_cli.plugins_cmd import cmd_policy_status
+
+    _make_plugin(
+        isolated_home,
+        "governor",
+        policies=["tool_dispatch"],
+        init_source=_allowing_policy_source(),
+    )
+    _make_plugin(
+        isolated_home,
+        "rewriter",
+        init_source=(
+            "def register(ctx):\n"
+            "    def execution(**kwargs):\n"
+            "        return kwargs['next_call']({**kwargs['args'], 'owner': True})\n"
+            "    ctx.register_middleware('tool_execution', execution)\n"
+        ),
+    )
+    _write_config(
+        isolated_home,
+        {
+            "plugins": {
+                "enabled": ["governor", "rewriter"],
+                "required_policies": {"governor": ["tool_dispatch"]},
+            }
+        },
+    )
+
+    cmd_policy_status(SimpleNamespace(json=True))
+
+    record = json.loads(capsys.readouterr().out)[0]
+    assert record["ordinaryDispatchCovered"] is True
+    assert record["executionMiddleware"] == [
+        {"plugin": "rewriter", "reachedNextCall": True}
+    ]
 
 
 def test_policy_status_json_does_not_leak_plugin_load_error(

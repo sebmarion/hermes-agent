@@ -85,6 +85,9 @@ _POLICY_STATUS_FIELDS = (
     "quarantined",
     "timeout_ms",
     "last_error_code",
+    "executionMiddleware",
+    "ordinaryDispatchCovered",
+    "replacementExecutionAudited",
 )
 
 
@@ -2233,6 +2236,142 @@ def _configured_plugin_enabled(entry: tuple | None, plugin_key: str) -> bool:
     return False
 
 
+def _execution_middleware_owner(callback: object) -> str:
+    """Return registration-time ownership, never a name/module guess."""
+    from hermes_cli.tool_policy import PluginMiddlewareRegistration
+
+    if isinstance(callback, PluginMiddlewareRegistration):
+        return callback.plugin_key
+    return "__unattributed_host__"
+
+
+def _dispatch_conformance_status(
+    manager: object,
+    *,
+    run_probe: bool,
+) -> tuple[list[dict[str, object]], bool]:
+    """Probe the real execution chain without invoking an actual tool handler."""
+    from hermes_cli.tool_policy import TOOL_DISPATCH_CONFORMANCE_TOOL_NAME
+
+    middleware = getattr(manager, "_middleware", None)
+    if type(middleware) is not dict:
+        return [], False
+
+    callbacks = list(middleware.get("tool_execution", []))
+    observations = [
+        {
+            "plugin": _execution_middleware_owner(callback),
+            "invoked": False,
+            "reached_next": False,
+        }
+        for callback in callbacks
+    ]
+
+    def _summary() -> list[dict[str, object]]:
+        by_plugin: dict[str, list[dict[str, object]]] = {}
+        for observation in observations:
+            by_plugin.setdefault(str(observation["plugin"]), []).append(
+                observation
+            )
+        return [
+            {
+                "plugin": plugin_key,
+                "reachedNextCall": bool(plugin_observations)
+                and all(
+                    item["invoked"] is True
+                    and item["reached_next"] is True
+                    for item in plugin_observations
+                ),
+            }
+            for plugin_key, plugin_observations in sorted(by_plugin.items())
+        ]
+
+    if not run_probe:
+        return _summary(), False
+
+    def _observed_callback(callback, observation):
+        def _invoke(**kwargs):
+            observation["invoked"] = True
+            downstream = kwargs.get("next_call")
+
+            def _next_call(next_payload=None):
+                observation["reached_next"] = True
+                return downstream(next_payload)
+
+            observed_kwargs = dict(kwargs)
+            observed_kwargs["next_call"] = _next_call
+            return callback(**observed_kwargs)
+
+        return _invoke
+
+    observed_callbacks = [
+        _observed_callback(callback, observation)
+        for callback, observation in zip(callbacks, observations)
+    ]
+    had_execution_key = "tool_execution" in middleware
+    original_callbacks = middleware.get("tool_execution")
+    original_args = {"conformance_stage": "original"}
+    request_args = {"conformance_stage": "request"}
+    terminal_observations: list[tuple[dict, object, object]] = []
+
+    def _terminal(final_args: dict) -> str:
+        from agent.tool_runtime_context import get_prepared_tool_runtime
+        from hermes_cli.middleware import get_authorized_tool_dispatch
+
+        terminal_observations.append(
+            (
+                dict(final_args),
+                get_authorized_tool_dispatch(),
+                get_prepared_tool_runtime(),
+            )
+        )
+        return "policy-status-conformance-terminal"
+
+    middleware["tool_execution"] = observed_callbacks
+    try:
+        from hermes_cli.middleware import run_tool_execution_middleware
+
+        run_tool_execution_middleware(
+            TOOL_DISPATCH_CONFORMANCE_TOOL_NAME,
+            request_args,
+            _terminal,
+            original_args=original_args,
+            task_id="policy-status-task",
+            session_id="policy-status-session",
+            turn_id="policy-status-turn",
+            tool_call_id="policy-status-call",
+            api_request_id="policy-status-request",
+        )
+    except (Exception, SystemExit):
+        pass
+    finally:
+        if had_execution_key:
+            middleware["tool_execution"] = original_callbacks
+        else:
+            middleware.pop("tool_execution", None)
+
+    covered = False
+    if len(terminal_observations) == 1:
+        final_args, policy_input, prepared_runtime = terminal_observations[0]
+        covered = bool(
+            policy_input is not None
+            and prepared_runtime is not None
+            and policy_input.tool_name == TOOL_DISPATCH_CONFORMANCE_TOOL_NAME
+            and policy_input.original_args == original_args
+            and policy_input.effective_args == final_args
+            and policy_input.task_id == "policy-status-task"
+            and policy_input.session_id == "policy-status-session"
+            and policy_input.turn_id == "policy-status-turn"
+            and policy_input.tool_call_id == "policy-status-call"
+            and policy_input.effective_cwd == prepared_runtime.effective_cwd
+            and policy_input.effective_cwd_source
+            == prepared_runtime.effective_cwd_source
+            and policy_input.effective_cwd_authoritative
+            == prepared_runtime.effective_cwd_authoritative
+        )
+    return _summary(), covered
+
+
 def _policy_status_records() -> list[dict[str, object]]:
     """Build safe, deterministic runtime status for configured policy pairs."""
     policies = _get_required_policies()
@@ -2265,6 +2404,30 @@ def _policy_status_records() -> list[dict[str, object]]:
         runtime_plugins = {}
         manager = None
 
+    registrations_ready = manager is not None and all(
+        manager.get_policy_registration(plugin_key, policy_name) is not None
+        for plugin_key in policies
+        for policy_name in policies[plugin_key]
+    )
+    execution_middleware: list[dict[str, object]] = []
+    ordinary_dispatch_covered = False
+    if manager is not None:
+        try:
+            from contextlib import redirect_stderr, redirect_stdout
+            from io import StringIO
+
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                (
+                    execution_middleware,
+                    ordinary_dispatch_covered,
+                ) = _dispatch_conformance_status(
+                    manager,
+                    run_probe=registrations_ready,
+                )
+        except Exception:
+            execution_middleware = []
+            ordinary_dispatch_covered = False
+
     records: list[dict[str, object]] = []
     for plugin_key in sorted(policies):
         entry = entries.get(plugin_key)
@@ -2288,6 +2451,14 @@ def _policy_status_records() -> list[dict[str, object]]:
                     registration.timeout_ms if registration is not None else None
                 ),
                 "last_error_code": None,
+                "executionMiddleware": execution_middleware,
+                "ordinaryDispatchCovered": bool(
+                    registration is not None and ordinary_dispatch_covered
+                ),
+                # Hermes currently accepts no replacement-execution audit
+                # artifact. Stay conservative even when the observed probe
+                # reached the ordinary terminal callback.
+                "replacementExecutionAudited": False,
             }
             records.append({field: record[field] for field in _POLICY_STATUS_FIELDS})
     return records
@@ -2322,6 +2493,9 @@ def cmd_policy_status(args) -> None:
         "Registered",
         "Timeout",
         "Quarantined",
+        "Ordinary covered",
+        "Replacement audited",
+        "Execution middleware",
         "Error",
     ):
         table.add_column(heading)
@@ -2336,6 +2510,14 @@ def cmd_policy_status(args) -> None:
             "yes" if record["registered"] else "no",
             str(record["timeout_ms"] or "-"),
             "yes" if record["quarantined"] else "no",
+            "yes" if record["ordinaryDispatchCovered"] else "no",
+            "yes" if record["replacementExecutionAudited"] else "no",
+            ", ".join(
+                f"{item['plugin']}:"
+                f"{'next' if item['reachedNextCall'] else 'no-next'}"
+                for item in record["executionMiddleware"]
+            )
+            or "-",
             str(record["last_error_code"] or "-"),
         )
     console.print(table)

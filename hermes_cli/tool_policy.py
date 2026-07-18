@@ -28,6 +28,7 @@ from tools.daemon_pool import DaemonThreadPoolExecutor
 
 POLICY_SCHEMA_VERSION = 1
 MAX_POLICY_BLOCK_MESSAGE_BYTES = 1_000
+TOOL_DISPATCH_CONFORMANCE_TOOL_NAME = "__hermes_policy_status_conformance__"
 
 JSONValue: TypeAlias = (
     None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
@@ -183,6 +184,18 @@ class ToolPolicyRegistration:
     policy_name: str
     callback: Callable[[Mapping[str, JSONValue]], object]
     timeout_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class PluginMiddlewareRegistration:
+    """Registration-time middleware ownership without source-code inference."""
+
+    plugin_key: str
+    kind: str
+    callback: Callable[..., object]
+
+    def __call__(self, **kwargs: object) -> object:
+        return self.callback(**kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -593,10 +606,12 @@ __all__ = [
     "POLICY_SCHEMA_VERSION",
     "PolicyDecision",
     "PolicyDecisionCode",
+    "PluginMiddlewareRegistration",
     "PreparedToolRuntime",
     "ToolDispatchPolicyInput",
     "ToolPolicyBlock",
     "ToolPolicyRegistration",
+    "TOOL_DISPATCH_CONFORMANCE_TOOL_NAME",
     "compute_policy_binding",
     "create_tool_dispatch_policy_input",
     "parse_policy_decision",

@@ -51,6 +51,7 @@ from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
 from hermes_cli.tool_policy import (
+    PluginMiddlewareRegistration,
     RequiredPolicyFailureCode,
     ToolDispatchPolicyInput,
     ToolPolicyBlock,
@@ -1210,7 +1211,14 @@ class PluginContext:
                 kind,
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
-        self._manager._middleware.setdefault(kind, []).append(callback)
+        plugin_key = self.manifest.key or self.manifest.name
+        self._manager._middleware.setdefault(kind, []).append(
+            PluginMiddlewareRegistration(
+                plugin_key=plugin_key,
+                kind=kind,
+                callback=callback,
+            )
+        )
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
 
     # -- skill registration -------------------------------------------------
