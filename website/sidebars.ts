@@ -165,6 +165,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-creative',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/bundled/creative/creative-apple-design',
                     'user-guide/skills/bundled/creative/creative-architecture-diagram',
                     'user-guide/skills/bundled/creative/creative-ascii-art',
                     'user-guide/skills/bundled/creative/creative-ascii-video',
