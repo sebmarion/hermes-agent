@@ -571,7 +571,13 @@ class ToolRegistry:
     # Dispatch
     # ------------------------------------------------------------------
 
-    def dispatch(self, name: str, args: dict, **kwargs) -> str:
+    def dispatch(
+        self,
+        name: str,
+        args: dict,
+        prepared_runtime=None,
+        **kwargs,
+    ) -> str:
         """Execute a tool handler by name.
 
         * Async handlers are bridged automatically via ``_run_async()``.
@@ -582,10 +588,25 @@ class ToolRegistry:
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
         try:
-            if entry.is_async:
-                from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+            from agent.tool_runtime_context import (
+                bind_prepared_tool_runtime,
+                prepare_tool_runtime,
+            )
+
+            runtime = prepared_runtime
+            if runtime is None:
+                runtime = prepare_tool_runtime(
+                    name,
+                    args,
+                    kwargs.get("task_id"),
+                    kwargs.get("session_id"),
+                )
+            with bind_prepared_tool_runtime(runtime):
+                if entry.is_async:
+                    from model_tools import _run_async
+
+                    return _run_async(entry.handler(args, **kwargs))
+                return entry.handler(args, **kwargs)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             # Route through the sanitizer so framing tokens / CDATA / fences

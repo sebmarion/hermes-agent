@@ -13,7 +13,14 @@ Pinning ``TERMINAL_CWD`` to the workspace fixes both.
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
+from pathlib import Path
+
+
+_REAL_POPEN = subprocess.Popen
 
 
 def _make_task(kb, *, assignee: str = "w"):
@@ -99,3 +106,60 @@ def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path
 
     # Inherited value is preserved (not overwritten with a bogus path).
     assert captured["env"]["TERMINAL_CWD"] == "/pre/existing/anchor"
+
+
+def test_worker_process_prepares_its_own_workspace_runtime(monkeypatch, tmp_path):
+    """The spawned worker derives cwd locally; no parent ContextVar is reused."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text(
+        "toolsets:\n  - kanban\n",
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "worker-workspace"
+    workspace.mkdir()
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+    child_env = dict(captured["env"])
+    child_env["TERMINAL_ENV"] = "local"
+    repo_root = Path(__file__).resolve().parents[2]
+    inherited_pythonpath = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(repo_root), inherited_pythonpath) if part
+    )
+    probe = (
+        "import json; "
+        "from agent.tool_runtime_context import "
+        "get_prepared_tool_runtime, prepare_tool_runtime; "
+        "before = get_prepared_tool_runtime(); "
+        "runtime = prepare_tool_runtime('read_file', {}, 't_cwd', 'worker'); "
+        "print(json.dumps({'before': before is None, "
+        "'cwd': runtime.effective_cwd, "
+        "'source': runtime.effective_cwd_source, "
+        "'authoritative': runtime.effective_cwd_authoritative}))"
+    )
+    proc = _REAL_POPEN(
+        [sys.executable, "-c", probe],
+        cwd=captured["cwd"],
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = proc.communicate(timeout=10)
+
+    assert proc.returncode == 0, stderr
+    observed = json.loads(stdout.strip().splitlines()[-1])
+    assert observed == {
+        "before": True,
+        "cwd": str(workspace.resolve()),
+        "source": "terminal_config",
+        "authoritative": True,
+    }

@@ -37,6 +37,12 @@ def _session_cwd_override() -> str:
 
 
 def resolve_agent_cwd() -> Path:
+    from agent.tool_runtime_context import get_prepared_tool_runtime
+
+    prepared = get_prepared_tool_runtime()
+    if prepared is not None and prepared.effective_cwd:
+        return Path(prepared.effective_cwd)
+
     override = _session_cwd_override()
     if override:
         p = Path(override).expanduser()

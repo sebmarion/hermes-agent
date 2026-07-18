@@ -269,3 +269,69 @@ def test_two_concurrent_tool_batches_keep_session_keys_isolated():
     assert results.get("B") == "session-B", (
         f"Session B worker saw {results.get('B')!r}, expected 'session-B'"
     )
+
+
+def test_registry_dispatch_rebinds_copied_parent_runtime_context(tmp_path):
+    """A copied caller context must not authorize a child's handler cwd."""
+    from agent.tool_runtime_context import (
+        bind_prepared_tool_runtime,
+        get_prepared_tool_runtime,
+    )
+    from hermes_cli.tool_policy import PreparedToolRuntime
+    from tools.registry import ToolRegistry
+    from tools.terminal_tool import (
+        clear_task_env_overrides,
+        register_task_env_overrides,
+    )
+
+    parent = tmp_path / "parent"
+    child = tmp_path / "child"
+    parent.mkdir()
+    child.mkdir()
+    parent_runtime = PreparedToolRuntime(
+        effective_cwd=str(parent),
+        effective_cwd_source="process_cwd",
+        effective_cwd_authoritative=True,
+    )
+    register_task_env_overrides("child-session", {"cwd": str(child)})
+    registry = ToolRegistry()
+    observed: dict[str, str | None] = {}
+
+    def handler(_args, **_kwargs):
+        runtime = get_prepared_tool_runtime()
+        observed["handler"] = runtime.effective_cwd if runtime else None
+        return "{}"
+
+    registry.register(
+        name="runtime-probe",
+        toolset="test",
+        schema={"name": "runtime-probe", "parameters": {"type": "object"}},
+        handler=handler,
+    )
+
+    def worker():
+        before = get_prepared_tool_runtime()
+        observed["before"] = before.effective_cwd if before else None
+        registry.dispatch(
+            "runtime-probe",
+            {},
+            task_id="default",
+            session_id="child-session",
+        )
+        after = get_prepared_tool_runtime()
+        observed["after"] = after.effective_cwd if after else None
+
+    try:
+        with bind_prepared_tool_runtime(parent_runtime):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                ctx = contextvars.copy_context()
+                executor.submit(ctx.run, worker).result(timeout=5)
+    finally:
+        clear_task_env_overrides("child-session")
+
+    assert observed == {
+        "before": str(parent),
+        "handler": str(child.resolve()),
+        "after": str(parent),
+    }
+    assert get_prepared_tool_runtime() is None
