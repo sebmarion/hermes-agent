@@ -371,6 +371,170 @@ class TestGoalManager:
         assert d2["verdict"] == "inactive"
         assert d2["should_continue"] is False
 
+    @pytest.mark.parametrize("control", ["pause", "clear"])
+    def test_user_control_during_judge_is_not_overwritten(self, hermes_home, control):
+        """A late judge result must not resurrect a paused or cleared goal."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager, load_goal
+
+        sid = f"eval-control-race-{control}"
+        evaluating = GoalManager(session_id=sid)
+        evaluating.set("ship safely")
+
+        def judge_after_control(*args, **kwargs):
+            controlling = GoalManager(session_id=sid)
+            if control == "pause":
+                controlling.pause("user-paused-during-judge")
+            else:
+                controlling.clear()
+            return "continue", "more work", False, None
+
+        with patch.object(goals, "judge_goal", side_effect=judge_after_control):
+            decision = evaluating.evaluate_after_turn("working")
+
+        persisted = load_goal(sid)
+        assert decision["should_continue"] is False
+        assert decision["verdict"] == "inactive"
+        if control == "pause":
+            assert persisted is not None
+            assert persisted.status == "paused"
+            assert persisted.paused_reason == "user-paused-during-judge"
+            assert evaluating.state is not None
+            assert evaluating.state.status == "paused"
+        else:
+            assert persisted is not None
+            assert persisted.status == "cleared"
+            assert evaluating.state is None
+
+    def test_criteria_change_during_judge_invalidates_done(self, hermes_home):
+        """A DONE verdict cannot satisfy criteria added after judging began."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager, load_goal
+
+        sid = "eval-criteria-race"
+        evaluating = GoalManager(session_id=sid)
+        evaluating.set("ship safely")
+
+        def judge_after_criteria_change(*args, **kwargs):
+            GoalManager(session_id=sid).add_subgoal("verify production health")
+            return "done", "original criteria met", False, None
+
+        with patch.object(goals, "judge_goal", side_effect=judge_after_criteria_change):
+            decision = evaluating.evaluate_after_turn("shipped")
+
+        persisted = load_goal(sid)
+        assert decision["verdict"] == "inactive"
+        assert decision["should_continue"] is False
+        assert persisted is not None
+        assert persisted.status == "active"
+        assert persisted.subgoals == ["verify production health"]
+
+    def test_pause_resume_cycle_during_judge_invalidates_verdict(self, hermes_home):
+        """A change-then-revert control cycle still supersedes the old judge."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager, load_goal
+
+        sid = "eval-pause-resume-race"
+        evaluating = GoalManager(session_id=sid)
+        evaluating.set("ship safely")
+
+        def judge_after_control_cycle(*args, **kwargs):
+            controlling = GoalManager(session_id=sid)
+            controlling.pause("inspect first")
+            controlling.resume(reset_budget=False)
+            return "done", "stale completion", False, None
+
+        with patch.object(goals, "judge_goal", side_effect=judge_after_control_cycle):
+            decision = evaluating.evaluate_after_turn("shipped")
+
+        persisted = load_goal(sid)
+        assert decision["verdict"] == "inactive"
+        assert decision["should_continue"] is False
+        assert persisted is not None
+        assert persisted.status == "active"
+        assert persisted.turns_used == 0
+
+    def test_stale_control_cannot_overwrite_completed_transition(self, hermes_home):
+        """A manager loaded before DONE cannot resurrect it with a stale pause."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager, StaleGoalState, load_goal
+
+        sid = "stale-control-after-done"
+        evaluator = GoalManager(session_id=sid)
+        evaluator.set("ship safely")
+        stale_controller = GoalManager(session_id=sid)
+
+        with patch.object(goals, "judge_goal", return_value=("done", "verified", False, None)):
+            decision = evaluator.evaluate_after_turn("done")
+
+        assert decision["verdict"] == "done"
+        with pytest.raises(StaleGoalState):
+            stale_controller.pause("too late")
+        persisted = load_goal(sid)
+        assert stale_controller.state is not None
+        assert stale_controller.state.status == "done"
+        assert persisted is not None
+        assert persisted.status == "done"
+        assert persisted.turns_used == 1
+
+    def test_stale_control_cannot_overwrite_replacement_goal(self, hermes_home):
+        from hermes_cli.goals import GoalManager, StaleGoalState, load_goal
+
+        sid = "stale-control-after-replacement"
+        replacing = GoalManager(session_id=sid)
+        replacing.set("old goal")
+        stale = GoalManager(session_id=sid)
+        replacing.set("new goal")
+
+        with pytest.raises(StaleGoalState):
+            stale.pause("stale pause")
+        persisted = load_goal(sid)
+        assert persisted is not None
+        assert persisted.goal == "new goal"
+        assert persisted.status == "active"
+        assert stale.state is not None
+        assert stale.state.goal == "new goal"
+        assert stale.state.status == "active"
+        assert persisted.revision == stale.state.revision
+
+    def test_concurrent_evaluators_accept_only_one_continuation(self, hermes_home):
+        """Only one evaluator for the same goal revision may continue the loop."""
+        import threading
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager, load_goal
+
+        sid = "eval-concurrent-turns"
+        GoalManager(session_id=sid).set("ship safely", max_turns=10)
+        barrier = threading.Barrier(2)
+        decisions = []
+        errors = []
+
+        def judge(*args, **kwargs):
+            barrier.wait(timeout=5)
+            return "continue", "more work", False, None
+
+        def run():
+            try:
+                decisions.append(GoalManager(session_id=sid).evaluate_after_turn("progress"))
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(goals, "judge_goal", side_effect=judge):
+            threads = [threading.Thread(target=run) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        assert not errors
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(decisions) == 2
+        assert sorted(decision["should_continue"] for decision in decisions) == [False, True]
+        assert sorted(decision["verdict"] for decision in decisions) == ["continue", "inactive"]
+        persisted = load_goal(sid)
+        assert persisted is not None
+        assert persisted.turns_used == 1
+
     def test_continuation_prompt_shape(self, hermes_home):
         """The continuation prompt must include the goal text verbatim —
         and must be safe to inject as a user-role message (prompt-cache
@@ -1074,10 +1238,29 @@ class TestJudgeDrivenWait:
         mgr.set("g")
         mgr.wait_for_seconds(120, reason="backoff")
         assert mgr.is_waiting() is True
-        # Force the deadline into the past → barrier auto-clears.
+        # Force the persisted deadline into the past → barrier auto-clears.
         mgr.state.waiting_until = time.time() - 1
+        from hermes_cli.goals import save_goal
+        save_goal(mgr.session_id, mgr.state)
         assert mgr.is_waiting() is False
         assert mgr.state.waiting_until == 0.0
+
+    def test_released_wait_resumes_judging_same_turn(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager, save_goal
+
+        mgr = GoalManager(session_id="jw-release-resume")
+        mgr.set("g")
+        mgr.wait_for_seconds(120, reason="backoff")
+        mgr.state.waiting_until = time.time() - 1
+        save_goal(mgr.session_id, mgr.state)
+
+        with patch.object(goals, "judge_goal", return_value=("continue", "ready", False, None)) as judge:
+            decision = mgr.evaluate_after_turn("dependency ready")
+
+        judge.assert_called_once()
+        assert decision["should_continue"] is True
+        assert mgr.state.turns_used == 1
 
     def test_continue_verdict_still_continues_with_background(self, hermes_home):
         """A running process present but judge says continue → normal loop."""

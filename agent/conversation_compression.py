@@ -753,7 +753,7 @@ def compress_context(
 
                         set_current_session_id(agent.session_id)
                     except Exception:
-                        os.environ["HERMES_SESSION_ID"] = agent.session_id
+                        logger.debug("Failed to update task-local session context", exc_info=True)
                     # The gateway/tools session context (ContextVar + env) and the
                     # logging session context are SEPARATE mechanisms. The call above
                     # moves the former; the ``[session_id]`` tag on log lines comes
@@ -798,7 +798,7 @@ def compress_context(
                             from gateway.session_context import set_current_session_id
                             set_current_session_id(agent.session_id)
                         except Exception:
-                            os.environ["HERMES_SESSION_ID"] = agent.session_id
+                            logger.debug("Failed to restore task-local session context", exc_info=True)
                         try:
                             from hermes_logging import set_session_context
                             set_session_context(agent.session_id)

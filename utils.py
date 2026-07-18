@@ -305,6 +305,20 @@ def atomic_roundtrip_yaml_update(
     should survive a single setting mutation.  Writes still use the same temp
     file + fsync + atomic replace pattern.
     """
+    atomic_roundtrip_yaml_updates(path, {key_path: value})
+
+
+def atomic_roundtrip_yaml_updates(
+    path: Union[str, Path],
+    updates: dict[str, Any],
+    *,
+    delete_paths: tuple[str, ...] = (),
+) -> None:
+    """Atomically update and delete multiple dotted YAML keys.
+
+    This is the multi-field form of :func:`atomic_roundtrip_yaml_update` for
+    invariants that must never be observed half-written.
+    """
     from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap
 
@@ -326,15 +340,28 @@ def atomic_roundtrip_yaml_update(
     if not isinstance(config, CommentedMap):
         config = CommentedMap(config)
 
-    current = config
-    keys = key_path.split(".")
-    for key in keys[:-1]:
-        next_value = current.get(key)
-        if not isinstance(next_value, CommentedMap):
-            next_value = CommentedMap()
-            current[key] = next_value
-        current = next_value
-    current[keys[-1]] = value
+    for key_path, value in updates.items():
+        current = config
+        keys = key_path.split(".")
+        for key in keys[:-1]:
+            next_value = current.get(key)
+            if not isinstance(next_value, CommentedMap):
+                next_value = CommentedMap()
+                current[key] = next_value
+            current = next_value
+        current[keys[-1]] = value
+
+    for key_path in delete_paths:
+        current = config
+        keys = key_path.split(".")
+        for key in keys[:-1]:
+            next_value = current.get(key)
+            if not isinstance(next_value, dict):
+                current = None
+                break
+            current = next_value
+        if current is not None:
+            current.pop(keys[-1], None)
 
     original_mode = _preserve_file_mode(path)
     original_owner = _preserve_file_owner(path)

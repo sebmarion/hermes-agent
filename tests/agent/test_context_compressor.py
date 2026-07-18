@@ -238,7 +238,18 @@ class TestCompress:
         from agent.context_compressor import MINIMUM_CONTEXT_LENGTH
         t = ContextCompressor._compute_threshold_tokens(MINIMUM_CONTEXT_LENGTH, 0.50)
         assert t < MINIMUM_CONTEXT_LENGTH
-        assert t == 54400  # 85% of 64000
+        assert t == 27852  # 85% of the effective 32768 floor
+
+    def test_threshold_below_window_near_minimum_ctx(self):
+        """A 65,536-token local route must not inherit the 64,000-token floor.
+
+        Leaving only ~1.5K tokens of headroom lets rough-token drift, tool
+        schemas, and output reservation push the request over the provider
+        limit before preflight compression can help.
+        """
+        t = ContextCompressor._compute_threshold_tokens(65536, 0.50)
+        assert t == 32768
+        assert t < 64000
 
     def test_threshold_below_window_for_small_ctx(self):
         # 32K model: the 64000 floor exceeds the window — trigger at 85%.
@@ -250,8 +261,8 @@ class TestCompress:
         from agent.context_compressor import MINIMUM_CONTEXT_LENGTH
         # 200K model at 50% = 100000 (above floor) — unchanged.
         assert ContextCompressor._compute_threshold_tokens(200000, 0.50) == 100000
-        # 100K model at 50% = 50000 (below floor) — floored to MINIMUM.
-        assert ContextCompressor._compute_threshold_tokens(100000, 0.50) == MINIMUM_CONTEXT_LENGTH
+        # 100K model at 50% = 50000 (above the new 32K floor) — unchanged.
+        assert ContextCompressor._compute_threshold_tokens(100000, 0.50) == 50000
 
     def test_minimum_ctx_model_can_actually_compress(self):
         """End-to-end: a model at exactly the minimum context length must have
@@ -261,11 +272,12 @@ class TestCompress:
             c = ContextCompressor(model="small-64k", quiet_mode=True)
             c.context_length = 64000
             c.threshold_tokens = c._compute_threshold_tokens(64000, c.threshold_percent)
-        assert c.threshold_tokens == 54400
+        assert c.threshold_tokens == 32768
         assert c.threshold_tokens < 64000
-        # At 85%+ usage compaction fires; below it, it doesn't (no premature compact).
+        # The 32K floor is the trigger for this 64K model under the new policy.
         assert c.should_compress(55000) is True
-        assert c.should_compress(40000) is False
+        assert c.should_compress(40000) is True
+        assert c.should_compress(30000) is False
 
     def test_max_tokens_reservation_lowers_threshold(self):
         """#43547: the provider reserves max_tokens out of the window, so the
@@ -285,7 +297,7 @@ class TestCompress:
         # 128K window, 65536 reserved → effective 62464 (< MINIMUM 64000).
         # Floor (64000) >= effective window (62464) → 85% of effective.
         t = ContextCompressor._compute_threshold_tokens(128000, 0.50, 65536)
-        assert t == int(62464 * 0.85)  # 53094
+        assert t == 32768
         assert t < 62464
 
     def test_max_tokens_exceeding_window_falls_back_to_full(self):
@@ -293,8 +305,8 @@ class TestCompress:
         budget <= 0; fall back to the full window rather than produce a
         non-positive threshold."""
         t = ContextCompressor._compute_threshold_tokens(64000, 0.50, 70000)
-        # effective_window <= 0 → fall back to full context (64000) → 85% guard.
-        assert t == 54400  # 85% of 64000, same as no-reservation small-ctx case
+        # effective_window <= 0 → fall back to the configured minimum policy.
+        assert t == 32768
         assert t > 0
 
     def test_max_tokens_coercion_treats_non_int_as_no_reservation(self):
@@ -2230,8 +2242,8 @@ class TestSummaryTargetRatio:
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True)
         assert c.threshold_percent == 0.50
-        # 50% of 100K = 50K, but the floor is 64K
-        assert c.threshold_tokens == 64_000
+        # 50% of 100K = 50K, above the new 32K floor.
+        assert c.threshold_tokens == 50_000
 
     def test_threshold_floor_does_not_apply_above_128k(self):
         """On large-context models the 50% percentage is used directly."""

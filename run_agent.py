@@ -3383,6 +3383,18 @@ class AIAgent:
         except Exception:
             pass
 
+    def _close_codex_app_server_session(self) -> None:
+        """Close and detach the owned Codex subprocess session idempotently."""
+        codex_session = getattr(self, "_codex_session", None)
+        if codex_session is None:
+            return
+        # Detach first so repeated or re-entrant teardown cannot close twice.
+        self._codex_session = None
+        try:
+            codex_session.close()
+        except Exception:
+            pass
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
@@ -3396,6 +3408,7 @@ class AIAgent:
           - memory provider (has its own lifecycle; keeps running)
 
         We DO close:
+          - Codex app-server subprocess session, when active
           - OpenAI/httpx client pool (big chunk of held memory + sockets;
             the rebuilt agent gets a fresh client anyway)
           - Active child subagents (per-turn artefacts; safe to drop)
@@ -3421,6 +3434,8 @@ class AIAgent:
         except Exception:
             pass
 
+        self._close_codex_app_server_session()
+
         # Close the OpenAI/httpx client to release sockets immediately.
         try:
             client = getattr(self, "client", None)
@@ -3434,6 +3449,7 @@ class AIAgent:
         """Release all resources held by this agent instance.
 
         Cleans up subprocess resources that would otherwise become orphans:
+        - Codex app-server subprocess session
         - Background processes tracked in ProcessRegistry
         - Terminal sandbox environments
         - Browser daemon sessions
@@ -3444,6 +3460,8 @@ class AIAgent:
         independently guarded so a failure in one does not prevent the rest.
         """
         task_id = getattr(self, "session_id", None) or ""
+
+        self._close_codex_app_server_session()
 
         # 1. Kill background processes for this task
         try:

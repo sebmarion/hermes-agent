@@ -4018,6 +4018,28 @@ class TestStateMeta:
         db.set_meta("key", "v2")
         assert db.get_meta("key") == "v2"
 
+    def test_update_meta_transforms_atomically(self, db):
+        db.set_meta("counter", "1")
+        committed = db.update_meta("counter", lambda value: str(int(value or 0) + 1))
+        assert committed == "2"
+        assert db.get_meta("counter") == "2"
+
+    def test_update_meta_none_deletes_key(self, db):
+        db.set_meta("ephemeral", "value")
+        assert db.update_meta("ephemeral", lambda value: None) is None
+        assert db.get_meta("ephemeral") is None
+
+    def test_move_meta_if_absent_is_atomic_and_preserves_target(self, db):
+        db.set_meta("parent", "active")
+        assert db.move_meta_if_absent("parent", "child", lambda _raw: "cleared") is True
+        assert db.get_meta("parent") == "cleared"
+        assert db.get_meta("child") == "active"
+
+        db.set_meta("other", "other-active")
+        assert db.move_meta_if_absent("other", "child", lambda _raw: "cleared") is False
+        assert db.get_meta("other") == "other-active"
+        assert db.get_meta("child") == "active"
+
 
 class TestVacuum:
     def test_vacuum_runs_without_error(self, db):

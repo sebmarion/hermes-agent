@@ -132,17 +132,13 @@ _VAR_MAP = {
 
 
 def set_current_session_id(session_id: str) -> None:
-    """Synchronize ``HERMES_SESSION_ID`` across ContextVar and ``os.environ``.
+    """Update the task-local session ID without clobbering other sessions.
 
-    Long-lived single-process entrypoints like the CLI can rotate sessions via
-    ``/new``, ``/resume``, ``/branch``, or compression splits without
-    reconstructing the entire agent. Tools still consult
-    ``get_session_env("HERMES_SESSION_ID")`` with an ``os.environ`` fallback,
-    so both storage paths must move together when the active session changes.
+    Gateway turns can overlap, so their session identity must live exclusively
+    in the ContextVar. Unbound CLI/cron paths retain the legacy environment
+    fallback through :func:`get_session_env`, but a bound session must never
+    overwrite that process-global fallback.
     """
-    import os
-
-    os.environ["HERMES_SESSION_ID"] = session_id
     _SESSION_ID.set(session_id)
 
 

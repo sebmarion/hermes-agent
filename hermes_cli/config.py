@@ -2145,6 +2145,11 @@ DEFAULT_CONFIG = {
         # instruction). 0 disables the hard ceiling; the dynamic headroom
         # budget still applies.
         "max_summary_chars": 24000,
+        # Optional total context window for delegated children. When omitted,
+        # delegate_task reads the selected lane's endpoint metadata, then
+        # falls back to the parent window. Set this for local models whose
+        # /v1/models endpoint does not report n_ctx (for example 32768).
+        "context_length": None,
 
         "child_timeout_seconds": 0,  # optional wall-clock cap per child agent. 0 (default)
                                      # = no timeout: children fail only from real errors
@@ -2179,6 +2184,15 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # --- Lane routing (Phase 2) ---
+        # Optional per-task model-lane routing. When configured, each task can
+        # specify ``route`` (explicit lane name) or ``model_tier`` (mapped via
+        # ``tier_routes``) to select a different provider:model pair for that
+        # specific child. When absent or unresolved, children use the global
+        # ``delegation.provider/model`` above — backward compatible.
+        "default_lane": "",  # e.g. "local_worker"
+        "lanes": {},  # name → {provider, model, base_url, api_key, api_mode, toolsets}
+        "tier_routes": {},  # tier name → lane name, e.g. {"micro": "local_worker", "large": "smart_reviewer"}
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

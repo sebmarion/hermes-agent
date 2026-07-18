@@ -175,7 +175,7 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert "cleanup_errors" not in result
 
 
-def test_budget_exhaustion_with_unverified_code_returns_incomplete_without_model_summary(tmp_path, monkeypatch):
+def test_budget_exhaustion_with_unverified_code_returns_recovery_required_without_model_summary(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     (tmp_path / "package.json").write_text(
@@ -192,12 +192,13 @@ def test_budget_exhaustion_with_unverified_code_returns_incomplete_without_model
 
     result = _run(agent)
 
-    assert result["final_response"].startswith("INCOMPLETE:")
+    assert result["final_response"].startswith("RECOVERY_REQUIRED:")
     assert result["messages"][-1]["role"] == "assistant"
     assert result["messages"][-1]["content"] == result["final_response"]
     assert "Budget: 3/3" in result["final_response"]
     assert changed in result["final_response"]
     assert "`pnpm run test`" in result["final_response"]
+    assert "Recovery prompt:" in result["final_response"]
     assert agent._handle_max_iterations_called is False
 
 

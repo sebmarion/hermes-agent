@@ -169,6 +169,23 @@ class TestLifecycle:
         s.close()
         assert client._closed is True
 
+    def test_multi_agent_enable_flag_reaches_app_server_process(self):
+        client = FakeClient()
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            enable_multi_agent=True,
+            client_factory=factory,
+        )
+        session.ensure_started()
+
+        assert captured["extra_args"] == ["--enable", "multi_agent"]
+
 
 # ---- turn loop ----
 
@@ -195,6 +212,41 @@ class TestRunTurn:
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
+
+    def test_turn_start_includes_optional_model_and_effort_controls(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+
+        s.run_turn(
+            "use real ultra",
+            model="gpt-5.6-sol",
+            effort="ultra",
+            turn_timeout=2.0,
+        )
+
+        _, params = next(r for r in client.requests if r[0] == "turn/start")
+        assert params["model"] == "gpt-5.6-sol"
+        assert params["effort"] == "ultra"
+
+    def test_turn_start_omits_empty_model_and_effort_controls(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+
+        s.run_turn("ordinary turn", turn_timeout=2.0)
+
+        _, params = next(r for r in client.requests if r[0] == "turn/start")
+        assert "model" not in params
+        assert "effort" not in params
 
     def test_token_usage_notification_is_captured(self):
         client = FakeClient()
@@ -449,6 +501,40 @@ class TestRunTurn:
 # ---- approval bridge ----
 
 class TestServerRequestRouting:
+    def test_preapproval_notification_drain_invokes_event_callback_once(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="req-event-drain",
+            command="ls /tmp",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "item/started",
+            threadId="t",
+            turnId="tu1",
+            item={
+                "type": "commandExecution",
+                "id": "cmd-1",
+                "command": "ls /tmp",
+                "cwd": "/tmp",
+                "status": "inProgress",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        seen = []
+        session = make_session(client, on_event=lambda note: seen.append(note))
+
+        session.run_turn("hi", turn_timeout=1.0)
+
+        methods = [note["method"] for note in seen]
+        assert methods.count("item/started") == 1
+        assert methods.count("turn/completed") == 1
+
     def test_exec_approval_with_callback_approves_once(self):
         client = FakeClient()
         client.queue_server_request(

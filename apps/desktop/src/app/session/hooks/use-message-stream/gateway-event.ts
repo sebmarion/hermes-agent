@@ -303,6 +303,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           return
         }
 
+        const autoContinuing = payload?.auto_continuing === true
+
         // Turn ended — drop any blocking prompt still open for THIS session
         // (e.g. interrupted, or the approval already resolved). Scoped to the
         // session so a background turn finishing can't wipe the active chat's
@@ -312,30 +314,40 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // Turn ended without a final `todo` update — drop a still-unfinished
         // list so "Tasks N/M" doesn't stay pinned above the composer with the
         // last item stuck pending/in_progress. Finished lists keep their linger.
-        clearActiveSessionTodos(sessionId)
+        if (!autoContinuing) {
+          clearActiveSessionTodos(sessionId)
+        }
         setSessionCompacting(sessionId, false)
 
         flushQueuedDeltas(sessionId)
 
-        playCompletionSound()
+        if (!autoContinuing) {
+          playCompletionSound()
+        }
 
         const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
         completeAssistantMessage(sessionId, finalText)
 
         if (isActiveEvent) {
-          setTurnStartedAt(null)
+          if (!autoContinuing) {
+            setTurnStartedAt(null)
+          }
 
           // Pet beat: a finished turn always celebrates — go straight to the
           // jump, never linger on the run/reason pose. One atom update (clears
           // toolRunning/reasoning AND sets celebrate together) so no stray "run"
           // frame leaks to the sprite — including the popped-out overlay, which
           // mirrors each activity change. The jump runs ~2 loops, then settles.
-          flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+          if (!autoContinuing) {
+            flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+          } else {
+            setPetActivity({ reasoning: true, toolRunning: false })
+          }
 
           // Light up the pet's mail icon if the user wasn't looking when the turn
           // finished — a glanceable "new message" hint on the popped-out overlay.
           // Cleared when they open the app via the mail icon or refocus the window.
-          if (typeof document !== 'undefined' && !document.hasFocus()) {
+          if (!autoContinuing && typeof document !== 'undefined' && !document.hasFocus()) {
             markPetUnread()
           }
         }

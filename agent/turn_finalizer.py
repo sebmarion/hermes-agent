@@ -374,6 +374,7 @@ def finalize_turn(
                 "transform_llm_output",
                 response_text=final_response,
                 session_id=agent.session_id or "",
+                turn_id=turn_id or "",
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
             )
@@ -512,23 +513,5 @@ def finalize_turn(
     # provider before the second message. Actual session-end cleanup is
     # handled by the CLI (atexit / /reset) and gateway (session expiry /
     # _reset_session).
-
-    # Plugin hook: on_session_end
-    # Fired at the very end of every run_conversation call.
-    # Plugins can use this for cleanup, flushing buffers, etc.
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            interrupted=interrupted,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_end hook failed: %s", exc)
 
     return result

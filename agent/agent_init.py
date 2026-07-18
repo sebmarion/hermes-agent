@@ -1131,16 +1131,15 @@ def init_agent(
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
 
-    # Expose session ID to tools (terminal, execute_code) so agents can
-    # reference their own session for --resume commands, cross-session
-    # coordination, and logging. Keep the ContextVar and os.environ
-    # fallback synchronized because different tool paths still read both.
+    # Expose the session ID to tools through the task-local ContextVar. Do not
+    # write a process-global fallback: concurrent gateway turns would overwrite
+    # each other's identity.
     try:
         from gateway.session_context import set_current_session_id
 
         set_current_session_id(agent.session_id)
     except Exception:
-        os.environ["HERMES_SESSION_ID"] = agent.session_id
+        logger.debug("Failed to bind task-local session context", exc_info=True)
 
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
@@ -1338,13 +1337,20 @@ def init_agent(
     _agent_section = _agent_cfg.get("agent", {})
     if not isinstance(_agent_section, dict):
         _agent_section = {}
-    agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
-
-    # Intent-ack continuation config: "auto" (default — codex_responses only,
-    # the historical gate), true (all api_modes), false (never), or a list of
-    # model-name substrings.  Resolved against the active api_mode/model in the
-    # conversation loop's intent-ack block.
-    agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
+    # Delegated agents are execution workers rather than conversational turns.
+    # Their lifecycle can re-run this initializer after a provider/fallback
+    # switch, so enforce these semantics here (not only in delegate_tool) to
+    # prevent a chat-completions child from ending on "I'll begin by...".
+    if getattr(agent, "platform", None) == "subagent":
+        agent._tool_use_enforcement = True
+        agent._intent_ack_continuation = True
+    else:
+        agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+        # Intent-ack continuation config: "auto" (default — codex_responses only,
+        # the historical gate), true (all api_modes), false (never), or a list of
+        # model-name substrings.  Resolved against the active api_mode/model in the
+        # conversation loop's intent-ack block.
+        agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
 
     # Universal task-completion guidance toggle.  Default True.  Surfaced
     # as a separate flag from tool_use_enforcement because the guidance
@@ -1723,8 +1729,8 @@ def init_agent(
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
 
-    # Reject models whose context window is below the minimum required
-    # for reliable tool-calling workflows (64K tokens).
+    # Reject models whose context window is below the configured minimum
+    # required for reliable tool-calling workflows.
     _ctx = getattr(agent.context_compressor, "context_length", 0)
     if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
         raise ValueError(

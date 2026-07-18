@@ -4974,6 +4974,17 @@ def test_interrupt_clears_multiple_own_pending():
             server._answers.pop(key, None)
 
 
+def test_tool_limit_continuation_is_bounded_and_requires_explicit_exit_reason():
+    result = {"turn_exit_reason": "max_iterations_reached(90/90)"}
+
+    prompt = server._next_tool_limit_continuation(result, "finish the task")
+
+    assert prompt is not None
+    assert server._TOOL_LIMIT_CONTINUATION_MARKER in prompt
+    assert server._next_tool_limit_continuation(result, prompt) is None
+    assert server._next_tool_limit_continuation({}, "finish the task") is None
+
+
 def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
     """_run_prompt_submit must expose the actual turn thread to session.interrupt.
 

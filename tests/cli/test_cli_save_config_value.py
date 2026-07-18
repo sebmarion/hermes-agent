@@ -59,6 +59,29 @@ class TestSaveConfigValueAtomic:
         result = yaml.safe_load(config_env.read_text())
         assert result["display"]["skin"] == "ares"
 
+    def test_reasoning_effort_write_atomically_clears_stale_ultra_mode(
+        self, config_env
+    ):
+        config_env.write_text(
+            "# keep this comment\n"
+            "agent:\n"
+            "  reasoning_effort: max\n"
+            "  reasoning_mode: ultra\n"
+            "  max_turns: 90\n",
+            encoding="utf-8",
+        )
+
+        from cli import save_config_value
+
+        assert save_config_value("agent.reasoning_effort", "high") is True
+
+        text = config_env.read_text(encoding="utf-8")
+        result = yaml.safe_load(text)
+        assert result["agent"]["reasoning_effort"] == "high"
+        assert "reasoning_mode" not in result["agent"]
+        assert result["agent"]["max_turns"] == 90
+        assert "# keep this comment" in text
+
     def test_preserves_env_ref_templates_in_unrelated_fields(self, config_env):
         """The /model --global persistence path must not inline env-backed secrets."""
         config_env.write_text(yaml.dump({
