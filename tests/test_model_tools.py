@@ -1,6 +1,7 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import ANY, call, patch
 
 
@@ -200,6 +201,286 @@ class TestHandleFunctionCall:
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
+
+
+class TestRequiredPolicyFinalDispatch:
+    def test_handle_function_call_carries_original_final_args_and_identity(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from hermes_cli.tool_policy import ToolDispatchPolicyInput
+
+        monkeypatch.chdir(tmp_path)
+        policy_inputs: list[ToolDispatchPolicyInput] = []
+        dispatch_calls: list[tuple[str, dict, dict]] = []
+
+        def request_middleware(**kwargs):
+            return {
+                "args": {**kwargs["args"], "stage": "request"},
+                "source": "request-test",
+            }
+
+        def execution_middleware(**kwargs):
+            return kwargs["next_call"](
+                {**kwargs["args"], "stage": "execution"}
+            )
+
+        manager = SimpleNamespace(
+            _middleware={
+                "tool_request": [request_middleware],
+                "tool_execution": [execution_middleware],
+            }
+        )
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_middleware",
+            lambda kind, **kwargs: (
+                [request_middleware(**kwargs)] if kind == "tool_request" else []
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda policy_input: policy_inputs.append(policy_input),
+        )
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: False)
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda name, args, **kwargs: (
+                dispatch_calls.append((name, args, kwargs)) or '{"ok":true}'
+            ),
+        )
+
+        result = handle_function_call(
+            "web_search",
+            {"q": "test", "stage": "original"},
+            task_id="task-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            api_request_id="request-1",
+        )
+
+        assert result == '{"ok":true}'
+        assert len(policy_inputs) == 1
+        assert policy_inputs[0].original_args == {
+            "q": "test",
+            "stage": "original",
+        }
+        assert policy_inputs[0].effective_args == {
+            "q": "test",
+            "stage": "execution",
+        }
+        assert policy_inputs[0].task_id == "task-1"
+        assert policy_inputs[0].session_id == "session-1"
+        assert policy_inputs[0].turn_id == "turn-1"
+        assert policy_inputs[0].tool_call_id == "call-1"
+        assert dispatch_calls == [
+            (
+                "web_search",
+                {"q": "test", "stage": "execution"},
+                {
+                    "task_id": "task-1",
+                    "session_id": "session-1",
+                    "user_task": None,
+                    "turn_id": "turn-1",
+                    "tool_call_id": "call-1",
+                },
+            )
+        ]
+
+    def test_policy_block_precedes_edit_approval_and_emits_once(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli.tool_policy import PolicyDecisionCode, ToolPolicyBlock
+
+        manager = SimpleNamespace(_middleware={})
+        block = ToolPolicyBlock(
+            policy="tool_dispatch",
+            policy_code=PolicyDecisionCode.BLOCKED,
+            message="Denied by governor.",
+        )
+        observer_calls: list[dict] = []
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda _policy_input: block,
+        )
+        monkeypatch.setattr(
+            "acp_adapter.edit_approval.maybe_require_edit_approval",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("edit approval must not run")
+            ),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("registry handler must not run")
+            ),
+        )
+        monkeypatch.setattr(
+            "model_tools._emit_post_tool_call_hook",
+            lambda **kwargs: observer_calls.append(kwargs),
+        )
+
+        result = handle_function_call(
+            "write_file",
+            {"path": "x.txt", "content": "x"},
+            task_id="task-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+        )
+
+        assert json.loads(result) == block.to_result()
+        assert len(observer_calls) == 1
+        assert observer_calls[0]["status"] == "blocked"
+        assert observer_calls[0]["error_type"] == "required_policy_block"
+        assert observer_calls[0]["function_args"] == {
+            "path": "x.txt",
+            "content": "x",
+        }
+
+    def test_execute_code_policy_block_prevents_registry_and_sandbox_start(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli.tool_policy import PolicyDecisionCode, ToolPolicyBlock
+
+        manager = SimpleNamespace(_middleware={})
+        block = ToolPolicyBlock(
+            policy="tool_dispatch",
+            policy_code=PolicyDecisionCode.BLOCKED,
+            message="Sandbox denied.",
+        )
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda _policy_input: block,
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("execute_code sandbox must not start")
+            ),
+        )
+        monkeypatch.setattr("model_tools._emit_post_tool_call_hook", lambda **_kwargs: None)
+
+        result = handle_function_call(
+            "execute_code",
+            {"code": "print('unsafe')"},
+            task_id="task-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+        )
+
+        assert json.loads(result) == block.to_result()
+
+    def test_tool_search_unwrap_preserves_underlying_original_and_final_args(
+        self,
+        monkeypatch,
+    ):
+        from tools import tool_search
+
+        policy_inputs = []
+        dispatch_calls = []
+
+        def request_middleware(**kwargs):
+            return {
+                "args": {**kwargs["args"], "stage": "request"},
+                "source": "request-test",
+            }
+
+        def execution_middleware(**kwargs):
+            return kwargs["next_call"](
+                {**kwargs["args"], "stage": "execution"}
+            )
+
+        manager = SimpleNamespace(
+            _middleware={
+                "tool_request": [request_middleware],
+                "tool_execution": [execution_middleware],
+            }
+        )
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_middleware",
+            lambda kind, **kwargs: (
+                [request_middleware(**kwargs)] if kind == "tool_request" else []
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda policy_input: policy_inputs.append(policy_input),
+        )
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: False)
+        monkeypatch.setattr("model_tools.get_tool_definitions", lambda **_kwargs: [])
+        monkeypatch.setattr(
+            tool_search,
+            "resolve_underlying_call",
+            lambda _args: (
+                "web_search",
+                {"q": "test", "stage": "original"},
+                None,
+            ),
+        )
+        monkeypatch.setattr(
+            tool_search,
+            "scoped_deferrable_names",
+            lambda _defs: frozenset({"web_search"}),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda name, args, **_kwargs: (
+                dispatch_calls.append((name, args)) or '{"ok":true}'
+            ),
+        )
+
+        result = handle_function_call(
+            "tool_call",
+            {
+                "name": "web_search",
+                "arguments": {"q": "test", "stage": "original"},
+            },
+            task_id="task-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+        )
+
+        assert result == '{"ok":true}'
+        assert len(policy_inputs) == 1
+        assert policy_inputs[0].tool_name == "web_search"
+        assert policy_inputs[0].original_args == {
+            "q": "test",
+            "stage": "original",
+        }
+        assert policy_inputs[0].effective_args == {
+            "q": "test",
+            "stage": "execution",
+        }
+        assert policy_inputs[0].tool_call_id == "call-1"
+        assert dispatch_calls == [
+            ("web_search", {"q": "test", "stage": "execution"})
+        ]
 
 
 # =========================================================================

@@ -576,6 +576,8 @@ class ToolRegistry:
         name: str,
         args: dict,
         prepared_runtime=None,
+        turn_id=None,
+        tool_call_id=None,
         **kwargs,
     ) -> str:
         """Execute a tool handler by name.
@@ -590,10 +592,12 @@ class ToolRegistry:
         try:
             from agent.tool_runtime_context import (
                 bind_prepared_tool_runtime,
+                get_prepared_tool_runtime,
                 prepare_tool_runtime,
             )
+            from hermes_cli.middleware import registry_dispatch_policy_block
 
-            runtime = prepared_runtime
+            runtime = prepared_runtime or get_prepared_tool_runtime()
             if runtime is None:
                 runtime = prepare_tool_runtime(
                     name,
@@ -601,6 +605,17 @@ class ToolRegistry:
                     kwargs.get("task_id"),
                     kwargs.get("session_id"),
                 )
+            policy_block = registry_dispatch_policy_block(
+                tool_name=name,
+                args=args,
+                task_id=str(kwargs.get("task_id") or ""),
+                session_id=str(kwargs.get("session_id") or ""),
+                turn_id=str(turn_id or ""),
+                tool_call_id=str(tool_call_id or ""),
+                prepared_runtime=runtime,
+            )
+            if policy_block is not None:
+                return json.dumps(policy_block.to_result(), ensure_ascii=False)
             with bind_prepared_tool_runtime(runtime):
                 if entry.is_async:
                     from model_tools import _run_async

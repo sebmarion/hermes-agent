@@ -27,7 +27,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Callable, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
@@ -1113,6 +1113,8 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    original_function_args: Optional[Dict[str, Any]] = None,
+    on_authorized: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1210,6 +1212,8 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1217,9 +1221,15 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                original_function_args=underlying_args,
+                on_authorized=on_authorized,
             )
 
-    _tool_original_args = dict(function_args)
+    _tool_original_args = dict(
+        original_function_args
+        if isinstance(original_function_args, dict)
+        else function_args
+    )
     if not skip_tool_request_middleware:
         try:
             from hermes_cli.middleware import apply_tool_request_middleware
@@ -1234,7 +1244,8 @@ def handle_function_call(
                 api_request_id=api_request_id or "",
             )
             function_args = _tool_request_mw.payload
-            _tool_original_args = _tool_request_mw.original_payload
+            if original_function_args is None:
+                _tool_original_args = _tool_request_mw.original_payload
             _tool_middleware_trace = _tool_request_mw.trace
         except Exception as _mw_err:
             logger.debug("tool_request middleware error: %s", _mw_err)
@@ -1288,29 +1299,6 @@ def handle_function_call(
                 )
                 return result
 
-        # ACP/Zed edit approval runs before any file mutation.  The requester
-        # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
-        # are unaffected when it is unset.
-        try:
-            from acp_adapter.edit_approval import maybe_require_edit_approval
-
-            edit_block_message = maybe_require_edit_approval(function_name, function_args)
-            if edit_block_message is not None:
-                return edit_block_message
-        except Exception as _edit_approval_err:
-            logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
-            if function_name in {"write_file", "patch"}:
-                return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
-
-        # Notify the read-loop tracker when a non-read/search tool runs,
-        # so the *consecutive* counter resets (reads after other work are fine).
-        if function_name not in _READ_SEARCH_TOOLS:
-            try:
-                from tools.file_tools import notify_other_tool_call
-                notify_other_tool_call(task_id or "default")
-            except Exception:
-                pass  # file_tools may not be loaded yet
-
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.
         # Inspired by Claude Code 2.1.119, which added ``duration_ms`` to
@@ -1332,23 +1320,78 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            _tool_effective_args = function_args
+
+            def _prepare_authorized_dispatch(
+                next_args: Dict[str, Any],
+            ) -> Optional[str]:
+                nonlocal _tool_effective_args
+                _tool_effective_args = next_args
+                if on_authorized is not None:
+                    on_authorized(next_args)
+
+                # ACP/Zed edit approval is a mutation-capable guard. It runs
+                # only after required policies allow the exact final args.
+                try:
+                    from acp_adapter.edit_approval import maybe_require_edit_approval
+
+                    edit_block = maybe_require_edit_approval(
+                        function_name,
+                        next_args,
+                    )
+                    if edit_block is not None:
+                        return edit_block
+                except Exception as _edit_approval_err:
+                    logger.debug(
+                        "ACP edit approval guard error: %s",
+                        _edit_approval_err,
+                    )
+                    if function_name in {"write_file", "patch"}:
+                        return json.dumps(
+                            {
+                                "error": (
+                                    "Edit approval denied: approval guard failed"
+                                )
+                            },
+                            ensure_ascii=False,
+                        )
+
+                if function_name not in _READ_SEARCH_TOOLS:
+                    try:
+                        from tools.file_tools import notify_other_tool_call
+
+                        notify_other_tool_call(task_id or "default")
+                    except Exception:
+                        pass
+                return None
+
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    dispatch_block = _prepare_authorized_dispatch(next_args)
+                    if dispatch_block is not None:
+                        return dispatch_block
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        turn_id=turn_id,
+                        tool_call_id=tool_call_id,
                         enabled_tools=sandbox_enabled,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    dispatch_block = _prepare_authorized_dispatch(next_args)
+                    if dispatch_block is not None:
+                        return dispatch_block
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        turn_id=turn_id,
+                        tool_call_id=tool_call_id,
                         user_task=user_task,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
@@ -1363,6 +1406,7 @@ def handle_function_call(
                 tool_call_id=tool_call_id or "",
                 turn_id=turn_id or "",
                 api_request_id=api_request_id or "",
+                middleware_trace=list(_tool_middleware_trace),
             )
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
@@ -1371,6 +1415,12 @@ def handle_function_call(
                 except Exception:
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+
+        from hermes_cli.middleware import is_required_policy_block_result
+
+        if is_required_policy_block_result(result):
+            return result
+        function_args = _tool_effective_args
 
         _emit_post_tool_call_hook(
             function_name=function_name,

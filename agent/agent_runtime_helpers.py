@@ -2075,6 +2075,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    from hermes_cli.middleware import get_tool_dispatch_delegation
+
+    _dispatch_delegation = get_tool_dispatch_delegation()
+    _tool_original_args = (
+        dict(_dispatch_delegation.original_args)
+        if _dispatch_delegation is not None
+        else dict(function_args)
+    )
+    _on_authorized = (
+        _dispatch_delegation.on_authorized
+        if _dispatch_delegation is not None
+        else None
+    )
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
@@ -2090,6 +2103,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
             )
             function_args = _tool_request_mw.payload
+            if _dispatch_delegation is None:
+                _tool_original_args = _tool_request_mw.original_payload
             _tool_middleware_trace = _tool_request_mw.trace
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
@@ -2255,20 +2270,32 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                original_function_args=_tool_original_args,
+                on_authorized=_on_authorized,
             )
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
+    _final_dispatch = agent_runtime_owns_post_tool_hook(agent, function_name)
+
+    def _terminal_call(next_args: dict) -> Any:
+        final_args = next_args if isinstance(next_args, dict) else function_args
+        if _final_dispatch and _on_authorized is not None:
+            _on_authorized(final_args)
+        return _execute(final_args)
+
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
-        original_args=function_args,
+        _terminal_call,
+        original_args=_tool_original_args,
+        final_dispatch=_final_dispatch,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
         tool_call_id=tool_call_id or "",
         turn_id=getattr(agent, "_current_turn_id", "") or "",
         api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        middleware_trace=list(_tool_middleware_trace),
     )
 
 

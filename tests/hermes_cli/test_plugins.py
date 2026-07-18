@@ -173,6 +173,73 @@ class TestPluginDiscovery:
         assert run_tool_execution_middleware("terminal", args, lambda payload: payload) is args
         assert has_middleware("tool_request") is False
 
+    def test_no_execution_middleware_still_authorizes_final_dispatch(
+        self,
+        monkeypatch,
+    ):
+        manager = types.SimpleNamespace(_middleware={})
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        policy_inputs = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda policy_input: policy_inputs.append(policy_input),
+        )
+
+        terminal_calls = []
+        result = run_tool_execution_middleware(
+            "read_file",
+            {"path": "effective.txt"},
+            lambda payload: terminal_calls.append(payload) or "ok",
+            original_args={"path": "original.txt"},
+            task_id="task-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+        )
+
+        assert result == "ok"
+        assert terminal_calls == [{"path": "effective.txt"}]
+        assert len(policy_inputs) == 1
+        assert policy_inputs[0].original_args == {"path": "original.txt"}
+        assert policy_inputs[0].effective_args == {"path": "effective.txt"}
+        assert policy_inputs[0].task_id == "task-1"
+        assert policy_inputs[0].session_id == "session-1"
+        assert policy_inputs[0].turn_id == "turn-1"
+        assert policy_inputs[0].tool_call_id == "call-1"
+
+    def test_replacement_execution_middleware_stays_outside_ordinary_dispatch(
+        self,
+        monkeypatch,
+    ):
+        def replacement(**_kwargs):
+            return "trusted-host-replacement"
+
+        manager = types.SimpleNamespace(
+            _middleware={"tool_execution": [replacement]}
+        )
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        policy_inputs = []
+        terminal_calls = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda policy_input: policy_inputs.append(policy_input),
+        )
+
+        result = run_tool_execution_middleware(
+            "read_file",
+            {"path": "effective.txt"},
+            lambda payload: terminal_calls.append(payload) or "unexpected",
+            original_args={"path": "original.txt"},
+            task_id="task-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+        )
+
+        assert result == "trusted-host-replacement"
+        assert policy_inputs == []
+        assert terminal_calls == []
+
     def test_request_middleware_changed_tracks_trace_not_deep_equality(self, monkeypatch):
         def same_payload_middleware(**kwargs):
             return {"args": kwargs["args"], "source": "same-payload"}
@@ -277,6 +344,7 @@ class TestPluginDiscovery:
 
     def test_execution_middleware_double_next_call_does_not_run_terminal_twice(self, monkeypatch):
         calls = []
+        policy_inputs = []
 
         def middleware(**kwargs):
             first = kwargs["next_call"](kwargs["args"])
@@ -288,6 +356,10 @@ class TestPluginDiscovery:
 
         manager = types.SimpleNamespace(_middleware={"tool_execution": [middleware]})
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.authorize_required_tool_policies",
+            lambda policy_input: policy_inputs.append(policy_input),
+        )
 
         def terminal(args):
             calls.append(args)
@@ -297,6 +369,7 @@ class TestPluginDiscovery:
 
         assert result == "terminal-result"
         assert calls == [{"command": "printf ok"}]
+        assert len(policy_inputs) == 1
 
     def test_request_middleware_tolerates_non_deepcopyable_payload(self, monkeypatch):
         import threading
