@@ -299,6 +299,7 @@ from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
+from hermes_cli.subcommands.trajectory import build_trajectory_parser
 from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
@@ -3888,6 +3889,7 @@ def _set_reasoning_effort(config, effort: str) -> None:
         agent_cfg = {}
         config["agent"] = agent_cfg
     agent_cfg["reasoning_effort"] = effort
+    agent_cfg.pop("reasoning_mode", None)
 
 
 def _prompt_reasoning_effort_selection(efforts, current_effort=""):
@@ -12214,7 +12216,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "tools", "trajectory", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -12644,6 +12646,34 @@ def cmd_insights(args):
         db.close()
     except Exception as e:
         print(f"Error generating insights: {e}")
+
+
+def cmd_trajectory(args):
+    try:
+        if getattr(args, "trajectory_command", None) not in ("radar", None):
+            print("Unknown trajectory command")
+            return
+        from hermes_state import SessionDB
+        from agent.trajectory_radar import TrajectoryRadar, write_report
+
+        db = SessionDB()
+        try:
+            radar = TrajectoryRadar(db)
+            report = radar.generate(
+                days=args.days,
+                source=args.source,
+                limit=args.limit,
+                include_snippets=args.include_snippets,
+            )
+            rendered_or_path = write_report(report, fmt=args.format, out=args.out)
+            if args.out:
+                print(f"Trajectory radar written to: {rendered_or_path}")
+            else:
+                print(rendered_or_path, end="")
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"Error generating trajectory radar: {e}")
 
 
 def cmd_skills(args):
@@ -13935,6 +13965,7 @@ def main():
     # insights command  (parser built in hermes_cli/subcommands/insights.py)
     # =========================================================================
     build_insights_parser(subparsers, cmd_insights=cmd_insights)
+    build_trajectory_parser(subparsers, cmd_trajectory=cmd_trajectory)
 
     # =========================================================================
     # claw command  (parser built in hermes_cli/subcommands/claw.py)

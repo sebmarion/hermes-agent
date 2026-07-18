@@ -75,6 +75,42 @@ class TestCodexBuildKwargs:
         )
         assert kw.get("reasoning", {}).get("effort") == "high"
 
+    def test_raw_responses_rejects_ultra_reasoning_config(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+
+        with pytest.raises(ValueError, match="Ultra|ultra|app-server"):
+            transport.build_kwargs(
+                model="gpt-5.6-sol",
+                messages=messages,
+                tools=[],
+                reasoning_config={"effort": "ultra"},
+            )
+
+    @pytest.mark.parametrize(
+        "request_overrides",
+        [
+            {"reasoning": {"effort": "ultra"}},
+            {"reasoning_effort": "ULTRA"},
+            {"reasoning.effort": "ultra"},
+            {"extra_body": {"reasoning": {"effort": "ultra"}}},
+            {"extra_body": {"reasoning_effort": "ultra"}},
+            {"extra_body": {"reasoning.effort": "ultra"}},
+        ],
+    )
+    def test_raw_responses_rejects_ultra_request_overrides(
+        self, transport, request_overrides
+    ):
+        messages = [{"role": "user", "content": "Hi"}]
+
+        with pytest.raises(ValueError, match="Ultra|ultra|app-server"):
+            transport.build_kwargs(
+                model="gpt-5.6-sol",
+                messages=messages,
+                tools=[],
+                reasoning_config={"effort": "max"},
+                request_overrides=request_overrides,
+            )
+
     def test_reasoning_disabled(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

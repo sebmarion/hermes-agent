@@ -129,6 +129,7 @@ def _set_reasoning_effort(config: Dict[str, Any], effort: str) -> None:
         agent_cfg = {}
         config["agent"] = agent_cfg
     agent_cfg["reasoning_effort"] = effort
+    agent_cfg.pop("reasoning_mode", None)
 
 
 

@@ -41,6 +41,7 @@ from gateway.session import (
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
     atomic_json_write,
+    atomic_roundtrip_yaml_updates,
     base_url_host_matches,
     is_truthy_value,
 )
@@ -2666,6 +2667,15 @@ class GatewaySlashCommandsMixin:
         def _save_config_key(key_path: str, value):
             """Save a dot-separated key to config.yaml."""
             try:
+                if key_path == "agent.reasoning_effort":
+                    # Persist canonical effort and clear the orthogonal Ultra
+                    # execution mode as one comment-preserving transaction.
+                    atomic_roundtrip_yaml_updates(
+                        config_path,
+                        {key_path: value},
+                        delete_paths=("agent.reasoning_mode",),
+                    )
+                    return True
                 user_config = {}
                 if config_path.exists():
                     with open(config_path, encoding="utf-8") as f:

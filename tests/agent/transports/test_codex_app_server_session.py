@@ -196,6 +196,41 @@ class TestRunTurn:
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
 
+    def test_turn_start_includes_optional_model_and_effort_controls(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+
+        s.run_turn(
+            "use real ultra",
+            model="gpt-5.6-sol",
+            effort="ultra",
+            turn_timeout=2.0,
+        )
+
+        _, params = next(r for r in client.requests if r[0] == "turn/start")
+        assert params["model"] == "gpt-5.6-sol"
+        assert params["effort"] == "ultra"
+
+    def test_turn_start_omits_empty_model_and_effort_controls(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+
+        s.run_turn("ordinary turn", turn_timeout=2.0)
+
+        _, params = next(r for r in client.requests if r[0] == "turn/start")
+        assert "model" not in params
+        assert "effort" not in params
+
     def test_token_usage_notification_is_captured(self):
         client = FakeClient()
         client.queue_notification(

@@ -3636,8 +3636,22 @@ def save_config_value(key_path: str, value: any) -> bool:
         
         # Save back atomically while preserving comments, ordering, quotes, and
         # readable Unicode in user-edited config.yaml.
-        from utils import atomic_roundtrip_yaml_update
-        atomic_roundtrip_yaml_update(config_path, key_path, value)
+        if key_path == "agent.reasoning_effort":
+            if str(value or "").strip().lower() == "ultra":
+                raise ValueError(
+                    "Ultra is a Codex app-server mode, not a persisted reasoning effort"
+                )
+            from utils import atomic_roundtrip_yaml_updates
+
+            atomic_roundtrip_yaml_updates(
+                config_path,
+                {key_path: value},
+                delete_paths=("agent.reasoning_mode",),
+            )
+        else:
+            from utils import atomic_roundtrip_yaml_update
+
+            atomic_roundtrip_yaml_update(config_path, key_path, value)
         
         # Enforce owner-only permissions on config files (contain API keys)
         try:
@@ -9176,7 +9190,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             prompt = decision.get("continuation_prompt")
             if prompt:
                 try:
-                    self._pending_input.put(prompt)
+                    self._pending_input.put((prompt, [], {
+                        "kind": "goal_continuation",
+                        "session_id": mgr.session_id,
+                        "revision": decision.get("goal_revision"),
+                    }))
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
 
@@ -15063,10 +15081,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     # post-resize transient suppression should end here.
                     self._status_bar_suppressed_after_resize = False
 
-                    # Unpack image payload: (text, [Path, ...]) or plain str
+                    # Unpack image payload or an internally guarded goal continuation.
                     submit_images = []
+                    _internal_meta = None
                     if isinstance(user_input, tuple):
-                        user_input, submit_images = user_input
+                        if len(user_input) == 3:
+                            user_input, submit_images, _internal_meta = user_input
+                        else:
+                            user_input, submit_images = user_input
+                    if isinstance(_internal_meta, dict) and _internal_meta.get("kind") == "goal_continuation":
+                        try:
+                            from hermes_cli.goals import load_goal
+                            _gs = load_goal(str(_internal_meta.get("session_id") or ""))
+                            _rev = int(_internal_meta.get("revision"))
+                        except Exception:
+                            _gs = None
+                            _rev = -1
+                        if _gs is None or _gs.status != "active" or _gs.revision != _rev:
+                            continue
 
                     if isinstance(user_input, str):
                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)

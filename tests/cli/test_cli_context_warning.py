@@ -48,7 +48,7 @@ class TestLowContextWarning:
 
     def test_warning_for_below_minimum_context(self, cli_obj):
         """Warning shown when context is below Hermes' minimum."""
-        cli_obj.agent.context_compressor.context_length = 32768
+        cli_obj.agent.context_compressor.context_length = 16384
         with patch("cli.get_tool_definitions", return_value=[]), \
              patch("cli.build_welcome_banner"):
             cli_obj.show_banner()

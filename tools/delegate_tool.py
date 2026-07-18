@@ -599,6 +599,13 @@ DEFAULT_MAX_ITERATIONS = 50
 # headroom budget (see _apply_summary_budget). Belt-and-suspenders for
 # models that ignore the "be concise" instruction. 0 disables the ceiling.
 DEFAULT_MAX_SUMMARY_CHARS = 24000
+# A delegated request's context window includes the child system prompt,
+# tool schemas, input handoff, and generated output. Keep the explicit handoff
+# below the total window so a 32K local model does not receive a request that
+# only fits if it emits zero tokens.
+_CHILD_HANDOFF_OUTPUT_RESERVE = 4096
+_CHILD_HANDOFF_PROMPT_RESERVE = 4096
+_CHILD_HANDOFF_MIN_CHARS = 4096 * 4
 # Fraction of the parent's *remaining* context headroom that the whole batch
 # of subagent summaries is allowed to consume. The per-summary budget is this
 # slice divided across the batch, so N children can't collectively blow the
@@ -1597,6 +1604,150 @@ def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
     except Exception as exc:
         logger.debug("Failed to spill subagent summary to file: %s", exc)
         return None
+
+
+def _child_handoff_char_budget(
+    *, context_length: int, max_tokens: Optional[int]
+) -> int:
+    """Return the maximum explicit handoff size for a child prompt.
+
+    The budget is deliberately conservative: the child prompt also contains
+    tool definitions and fixed execution instructions, and the provider needs
+    room for a useful response. Four characters per token matches the existing
+    delegation summary budgeting estimate.
+    """
+    output_reserve = max(
+        _CHILD_HANDOFF_OUTPUT_RESERVE,
+        int(max_tokens or 0),
+    )
+    available_tokens = int(context_length) - output_reserve - _CHILD_HANDOFF_PROMPT_RESERVE
+    return max(_CHILD_HANDOFF_MIN_CHARS, available_tokens * 4)
+
+
+def _spill_child_handoff_to_file(task_index: int, context: str) -> Optional[str]:
+    """Persist the complete delegated context for on-demand child recall."""
+    try:
+        from hermes_constants import get_hermes_dir
+        import datetime as _dt
+
+        cache_dir = get_hermes_dir("cache/delegation", "delegation_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = cache_dir / f"child-handoff-{task_index}-{ts}.txt"
+        path.write_text(context, encoding="utf-8")
+        path.chmod(0o600)
+        return str(path)
+    except Exception as exc:
+        logger.debug("Failed to spill child handoff to file: %s", exc)
+        return None
+
+
+def _bound_child_handoff(
+    *,
+    goal: str,
+    context: Optional[str],
+    context_length: Optional[int],
+    max_tokens: Optional[int],
+    task_index: int,
+) -> Optional[str]:
+    """Bound a child handoff while preserving the complete source context."""
+    if not context or not context.strip() or not context_length:
+        return context
+
+    # The goal is always retained in the system prompt separately. The context
+    # cap therefore applies only to the caller-provided handoff, which is where
+    # /bestplan payloads can grow without limit.
+    cap = _child_handoff_char_budget(
+        context_length=context_length,
+        max_tokens=max_tokens,
+    )
+    if len(context) <= cap:
+        return context
+
+    spill_path = _spill_child_handoff_to_file(task_index, context)
+    footer = [
+        "[DELEGATED CONTEXT COMPACTED TO FIT THE CHILD MODEL]",
+        f"Full delegated context length: {len(context):,} chars.",
+    ]
+    if spill_path:
+        footer.extend(
+            [
+                f"Full delegated context saved to: {spill_path}",
+                f'read_file path="{spill_path}" offset=1 limit=200 to retrieve it.',
+            ]
+        )
+    else:
+        footer.append("The full delegated context could not be saved to disk.")
+    separator = "\n\n[... middle omitted ...]\n\n"
+    footer_text = "\n\n" + "\n".join(footer)
+    excerpt_budget = max(0, cap - len(separator) - len(footer_text) - 128)
+    head_budget = int(excerpt_budget * 0.75)
+    tail_budget = excerpt_budget - head_budget
+    head = context[:head_budget]
+    tail = context[-tail_budget:] if tail_budget else ""
+    head_nl = head.rfind("\n")
+    if head_nl > head_budget * 0.5:
+        head = head[:head_nl]
+    tail_nl = tail.find("\n")
+    if 0 <= tail_nl < tail_budget * 0.5:
+        tail = tail[tail_nl + 1:]
+
+    footer[1] = (
+        f"Showing {len(head):,} head + {len(tail):,} tail chars of "
+        f"{len(context):,} total."
+    )
+    footer_text = "\n\n" + "\n".join(footer)
+    return head + separator + tail + footer_text
+
+
+def _resolve_child_context_length(
+    cfg: dict,
+    credentials: dict,
+    parent_agent,
+    *,
+    task: Optional[dict] = None,
+) -> Optional[int]:
+    """Resolve the child's total context window before constructing it."""
+    task = task or {}
+    candidates = (task.get("context_length"), credentials.get("context_length"), cfg.get("context_length"))
+    for value in candidates:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+
+    # Prefer the delegated endpoint's advertised window over the parent's
+    # window. This is what distinguishes a 32K Ornith lane from a 64K parent
+    # after /bestplan. The metadata helper is cached/probe-aware and falls
+    # through safely when a custom endpoint does not expose model metadata.
+    model = credentials.get("model")
+    base_url = credentials.get("base_url")
+    if model and base_url:
+        try:
+            from agent.model_metadata import get_model_context_length
+
+            resolved = get_model_context_length(
+                model=str(model),
+                base_url=str(base_url),
+                api_key=str(credentials.get("api_key") or ""),
+                provider=str(credentials.get("provider") or ""),
+            )
+            if isinstance(resolved, int) and resolved > 0:
+                return resolved
+        except Exception:
+            logger.debug("Child context-length probe failed", exc_info=True)
+
+    parent_context = getattr(
+        getattr(parent_agent, "context_compressor", None), "context_length", None
+    )
+    try:
+        if int(parent_context) > 0:
+            return int(parent_context)
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def _trim_summary_with_footer(
@@ -2675,11 +2826,25 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            child_context_length = _resolve_child_context_length(
+                cfg, task_creds, parent_agent, task=t
+            )
+            child_max_tokens = (
+                task_creds.get("max_output_tokens")
+                or getattr(parent_agent, "max_tokens", None)
+            )
+            bounded_context = _bound_child_handoff(
+                goal=t["goal"],
+                context=t.get("context"),
+                context_length=child_context_length,
+                max_tokens=child_max_tokens,
+                task_index=i,
+            )
             try:
                 child = _build_child_agent(
                     task_index=i,
                     goal=t["goal"],
-                    context=t.get("context"),
+                    context=bounded_context,
                     # When a lane specifies toolsets, pass them so the child
                     # gets a narrow set (e.g. [terminal, file] for local workers).
                     # Otherwise None = inherit parent toolsets.
@@ -2938,8 +3103,23 @@ def delegate_task(
                     parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
                     child_session_id=getattr(_child_agent, "session_id", None),
                     child_role=child_role,
+                    child_goal=(
+                        task_list[_child_index].get("goal", "")
+                        if isinstance(_child_index, int)
+                        and 0 <= _child_index < len(task_list)
+                        else ""
+                    ),
                     child_summary=entry.get("summary"),
                     child_status=entry.get("status"),
+                    child_lane=entry.get("lane") or "",
+                    child_provider=entry.get("provider") or "",
+                    child_model=(entry.get("routed_model") or entry.get("model") or ""),
+                    child_mode=entry.get("mode") or "",
+                    child_failure_kind=entry.get("failure_kind") or "",
+                    child_exit_reason=entry.get("exit_reason") or "",
+                    child_successful_tool_count=int(
+                        (entry.get("evidence") or {}).get("successful_tool_count") or 0
+                    ),
                     duration_ms=int((entry.get("duration_seconds") or 0) * 1000),
                 )
             except Exception:
@@ -3331,14 +3511,71 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _apply_local_first_lane_policy(lane: str, cfg: dict, lanes: dict) -> str:
+    """Fail closed from the local execution lane unless controller state is fresh."""
+    if "local_first" not in cfg:
+        return lane
+    policy = cfg.get("local_first")
+    if not isinstance(policy, dict):
+        raise ValueError("delegation.local_first must be a mapping when configured.")
+    enabled = policy.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("delegation.local_first.enabled must be true or false.")
+    if not enabled:
+        return lane
+    required = {}
+    for key in ("state_file", "local_lane", "degraded_lane"):
+        value = policy.get(key)
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            raise ValueError(
+                f"delegation.local_first.{key} must be a non-empty trimmed string."
+            )
+        required[key] = value
+    local_lane = required["local_lane"]
+    degraded_lane = required["degraded_lane"]
+    for policy_lane in (local_lane, degraded_lane):
+        if policy_lane not in lanes:
+            raise ValueError(
+                f"delegation.local_first references lane '{policy_lane}', which is not "
+                f"in delegation.lanes (available: {', '.join(sorted(lanes))})."
+            )
+    if lane != local_lane:
+        return lane
+    try:
+        max_state_age = int(policy.get("max_state_age_seconds", 1800))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "delegation.local_first.max_state_age_seconds must be a positive integer."
+        ) from exc
+    if max_state_age <= 0:
+        raise ValueError(
+            "delegation.local_first.max_state_age_seconds must be a positive integer."
+        )
+    state_path = os.path.expanduser(required["state_file"])
+    try:
+        if os.path.getsize(state_path) > 65_536:
+            return degraded_lane
+        with open(state_path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return degraded_lane
+    updated_epoch = state.get("updated_epoch") if isinstance(state, dict) else None
+    if not isinstance(updated_epoch, (int, float)):
+        return degraded_lane
+    state_age = time.time() - float(updated_epoch)
+    if state.get("mode") != "local" or state_age > max_state_age or state_age < -300:
+        return degraded_lane
+    return local_lane
+
+
 def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
     """Resolve which lane name a task should use, if lane routing is configured.
 
     Resolution order:
     1. task["route"] — explicit lane name (must exist in cfg["lanes"])
     2. task["model_tier"] → cfg["tier_routes"][tier] → lane name
-    3. task mode: execute → code_worker, review → smart_reviewer,
-       reason → local_worker
+    3. task mode → cfg["mode_routes"][mode], falling back to the legacy
+       execute/review/reason lane names when no mode_routes are configured
 
     Older explicit global provider/model configuration is represented as a
     compatibility ``code_worker`` lane. Parent-runtime inheritance is never a
@@ -3348,6 +3585,8 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
     lanes_configured = "lanes" in cfg
     raw_tier_routes = cfg.get("tier_routes")
     tier_routes_configured = "tier_routes" in cfg
+    raw_mode_routes = cfg.get("mode_routes")
+    mode_routes_configured = "mode_routes" in cfg
     route = str(task.get("route") or "").strip()
     tier = str(task.get("model_tier") or "").strip()
     mode = str(task.get("mode") or "execute").strip().lower()
@@ -3356,6 +3595,23 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
         "review": "smart_reviewer",
         "reason": "local_worker",
     }
+    if mode_routes_configured:
+        required_modes = set(mode_routes)
+        if not isinstance(raw_mode_routes, dict) or set(raw_mode_routes) != required_modes:
+            raise ValueError(
+                "delegation.mode_routes must map exactly execute, review, and reason."
+            )
+        for mode_name, lane_name in raw_mode_routes.items():
+            if (
+                not isinstance(mode_name, str)
+                or not isinstance(lane_name, str)
+                or not lane_name.strip()
+                or lane_name != lane_name.strip()
+            ):
+                raise ValueError(
+                    "delegation.mode_routes values must be non-empty trimmed lane names."
+                )
+        mode_routes = dict(raw_mode_routes)
     if mode not in mode_routes:
         raise ValueError(
             f"Task mode '{mode}' is invalid (expected: execute, review, reason)."
@@ -3386,6 +3642,10 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
                     )
             raise ValueError(
                 "delegation.tier_routes was configured but delegation.lanes is not configured."
+            )
+        if mode_routes_configured:
+            raise ValueError(
+                "delegation.mode_routes was configured but delegation.lanes is not configured."
             )
         if route:
             raise ValueError(
@@ -3436,6 +3696,13 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
                 f"Delegation lane '{lane_name}' has empty, unknown, or invalid toolsets."
             )
 
+    for mode_name, lane_name in mode_routes.items():
+        if lane_name not in lanes:
+            raise ValueError(
+                f"delegation.mode_routes.{mode_name} maps to lane '{lane_name}', which "
+                f"is not in delegation.lanes (available: {', '.join(sorted(lanes))})."
+            )
+
     raw_tier_routes = cfg.get("tier_routes")
     if "tier_routes" in cfg:
         if not isinstance(raw_tier_routes, dict):
@@ -3465,7 +3732,7 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
                 f"Task route '{route}' not found in delegation.lanes "
                 f"(available: {', '.join(sorted(lanes))})."
             )
-        return route
+        return _apply_local_first_lane_policy(route, cfg, lanes)
 
     # 2. model_tier → tier_routes
     if tier:
@@ -3477,7 +3744,7 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
                     f"Tier '{tier}' maps to lane '{lane}' which is not in "
                     f"delegation.lanes (available: {', '.join(sorted(lanes))})."
                 )
-            return lane
+            return _apply_local_first_lane_policy(lane, cfg, lanes)
         raise ValueError(
             f"Task model_tier '{tier}' is not mapped in delegation.tier_routes."
         )
@@ -3490,7 +3757,7 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
             f"Task mode '{mode}' requires lane '{lane}', which is not in "
             f"delegation.lanes (available: {', '.join(sorted(lanes))})."
         )
-    return lane
+    return _apply_local_first_lane_policy(lane, cfg, lanes)
 
 
 def _normalize_lane_toolsets(value) -> Optional[list[str]]:
@@ -3595,6 +3862,8 @@ def _resolve_delegation_credentials_for_task(
                         f"Delegation lane '{lane_name}' has empty or invalid toolsets."
                     )
                 lane_creds["toolsets"] = lane_toolsets
+            if "context_length" in lane_cfg:
+                lane_creds["context_length"] = lane_cfg.get("context_length")
             lane_creds["lane"] = lane_name
             return lane_creds
 
@@ -3737,8 +4006,10 @@ def _build_top_level_description() -> str:
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
         "- Routing precedence is explicit route, then model_tier, then mode. "
-        "Mode defaults to execute (code_worker); review uses smart_reviewer; "
-        "reason uses local_worker. Arbitrary provider/model values are not accepted per call.\n"
+        "Mode defaults to execute and resolves through delegation.mode_routes "
+        "when configured (otherwise the legacy code_worker/smart_reviewer/"
+        "local_worker mapping applies). Arbitrary provider/model values are not "
+        "accepted per call.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )

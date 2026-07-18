@@ -46,6 +46,27 @@ def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]])
     return f"pck_{digest}"
 
 
+def _raw_request_contains_ultra_effort(payload: Dict[str, Any]) -> bool:
+    """Return True when raw Responses kwargs try to carry Codex-only Ultra."""
+    if not isinstance(payload, dict):
+        return False
+    containers = [payload]
+    extra_body = payload.get("extra_body")
+    if isinstance(extra_body, dict):
+        containers.append(extra_body)
+    for container in containers:
+        candidates = [
+            container.get("reasoning_effort"),
+            container.get("reasoning.effort"),
+        ]
+        reasoning = container.get("reasoning")
+        if isinstance(reasoning, dict):
+            candidates.append(reasoning.get("effort"))
+        if any(str(value or "").strip().lower() == "ultra" for value in candidates):
+            return True
+    return False
+
+
 class ResponsesApiTransport(ProviderTransport):
     """Transport for api_mode='codex_responses'.
 
@@ -295,6 +316,13 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+
+        if _raw_request_contains_ultra_effort(kwargs):
+            raise ValueError(
+                "Reasoning effort 'ultra' is a Codex app-server control, not a raw "
+                "Responses API effort. Raw provider requests support efforts only "
+                "through 'max'; route Sol Ultra through codex_app_server."
+            )
 
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
         # supported: service_tier") — hit when ``/fast`` priority-processing

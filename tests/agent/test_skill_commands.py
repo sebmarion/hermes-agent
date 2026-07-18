@@ -58,6 +58,19 @@ class TestScanSkillCommands:
         assert "/my-skill" in result
         assert result["/my-skill"]["name"] == "my-skill"
 
+    def test_bestplan_registers_bp_alias(self, tmp_path):
+        """/bp is a short alias for the installed /bestplan skill."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "bestplan")
+            result = scan_skill_commands()
+
+        assert "/bestplan" in result
+        assert "/bp" in result
+        assert result["/bp"]["name"] == "bestplan"
+        assert result["/bp"]["alias_for"] == "/bestplan"
+        assert resolve_skill_command_key("bp") == "/bp"
+        assert resolve_skill_command_key("/bp") == "/bp"
+
     def test_empty_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             result = scan_skill_commands()

@@ -96,6 +96,25 @@ class TestConfigSetReasoningSessionScope:
         assert resp["result"]["value"] == "low"
         write_key.assert_called_once_with("agent.reasoning_effort", "low")
 
+    def test_global_effort_write_clears_stale_ultra_mode_atomically(self) -> None:
+        saved = []
+        config = {
+            "agent": {
+                "reasoning_effort": "max",
+                "reasoning_mode": "ultra",
+            },
+            "unrelated": {"keep": True},
+        }
+        with patch.object(server, "_load_cfg", return_value=config), patch.object(
+            server, "_save_cfg", side_effect=lambda value: saved.append(value)
+        ):
+            server._write_config_key("agent.reasoning_effort", "low")
+
+        assert len(saved) == 1
+        assert saved[0]["agent"]["reasoning_effort"] == "low"
+        assert "reasoning_mode" not in saved[0]["agent"]
+        assert saved[0]["unrelated"] == {"keep": True}
+
     def test_unknown_value_rejected(self) -> None:
         resp = self._dispatch({"key": "reasoning", "value": "bogus"})
         assert "error" in resp

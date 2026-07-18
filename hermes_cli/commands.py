@@ -198,7 +198,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills", aliases=("suggest",), args_hint="[accept|dismiss N | catalog]",
                subcommands=("accept", "dismiss", "catalog", "clear")),
     CommandDef("blueprint", "Set up an automation from a blueprint template",
-               "Tools & Skills", aliases=("bp",), args_hint="[name] [slot=value ...]"),
+               "Tools & Skills", args_hint="[name] [slot=value ...]"),
     CommandDef("curator", "Background skill maintenance (status, run, pin, archive, list-archived)",
                "Tools & Skills", args_hint="[subcommand]",
                subcommands=("status", "run", "pause", "resume", "pin", "unpin", "restore", "list-archived")),

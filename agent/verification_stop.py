@@ -336,14 +336,15 @@ def build_budget_exhausted_verification_response(
     api_call_count: int | None = None,
     max_iterations: int | None = None,
 ) -> str | None:
-    """Return a deterministic INCOMPLETE response for budget exhaustion.
+    """Return a deterministic recovery handoff for budget exhaustion.
 
     This is the hard stop counterpart to ``build_verify_on_stop_nudge``. The
     nudge path spends another model turn while budget remains; once the loop is
     out of iterations, asking the model for a summary can reintroduce the exact
     false-success failure this guard is meant to prevent. Use deterministic text
-    instead: pending verification means ``INCOMPLETE``, plus a compact
-    continuation brief a future run can execute.
+    instead: pending verification means ``RECOVERY_REQUIRED``, plus a compact
+    recovery prompt a fresh run can execute without requiring the user to infer
+    the next step from a passive ``INCOMPLETE`` label.
     """
     details = _verification_gap_details(
         session_id=session_id,
@@ -367,20 +368,32 @@ def build_budget_exhausted_verification_response(
             "`hermes-verify-*` ad-hoc verifier, then report it as ad-hoc evidence."
         )
 
+    recovery_prompt = (
+        "You are recovering an interrupted Hermes coding turn.\n\n"
+        "Rules:\n"
+        "- Do not plan broadly; verify or repair the existing work.\n"
+        "- First inspect `git status --short --branch` and the relevant diff.\n"
+        "- Run the pending verification gate listed below.\n"
+        "- If a gate fails, repair and rerun it.\n"
+        "- Report PASS only with same-run command/read-back evidence; otherwise "
+        "report FAIL or BLOCKED."
+    )
+
     return (
-        "INCOMPLETE: iteration budget was exhausted before fresh verification "
-        "evidence existed for edited code.\n\n"
+        "RECOVERY_REQUIRED: iteration budget was exhausted before fresh "
+        "verification evidence existed for edited code.\n\n"
+        "The work is deliberately not marked complete. Start a fresh recovery "
+        "turn/session with the prompt below; it is scoped to verification and "
+        "repair, not more planning.\n\n"
         f"Budget: {budget}\n\n"
         f"Verification status: {_status_detail(status)}\n\n"
         f"Changed paths:\n{_format_changed_paths(paths)}\n\n"
-        "Continuation brief:\n"
-        "1. Resume in the workspace containing the changed paths above.\n"
-        "2. Inspect current `git status --short` / diff before trusting this brief.\n"
-        "3. Run the pending verification gate:\n"
-        f"{verification_lines}\n"
-        "4. If verification fails, repair and rerun it.\n"
-        "5. Report PASS only with same-run command/read-back evidence; otherwise "
-        "report FAIL or BLOCKED."
+        "Pending verification gate:\n"
+        f"{verification_lines}\n\n"
+        "Recovery prompt:\n"
+        "```text\n"
+        f"{recovery_prompt}\n"
+        "```"
     )
 
 

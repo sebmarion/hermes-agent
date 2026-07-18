@@ -366,6 +366,8 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
@@ -406,13 +408,23 @@ class CodexAppServerSession:
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
+        # Model/effort overrides are per-turn Codex controls. Keeping them here
+        # avoids mutating global ~/.codex/config.toml, which would race with
+        # concurrent Codex/Hermes sessions.
+        turn_params = {
+            "threadId": self._thread_id,
+            "input": [{"type": "text", "text": user_input_text}],
+        }
+        normalized_model = str(model or "").strip()
+        normalized_effort = str(effort or "").strip().lower()
+        if normalized_model:
+            turn_params["model"] = normalized_model
+        if normalized_effort:
+            turn_params["effort"] = normalized_effort
         try:
             ts = self._client.request(
                 "turn/start",
-                {
-                    "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
-                },
+                turn_params,
                 timeout=10,
             )
         except CodexAppServerError as exc:

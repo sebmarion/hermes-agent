@@ -74,6 +74,39 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _emit_turn_end_hook(
+    agent,
+    *,
+    task_id: Optional[str],
+    turn_id: Optional[str],
+    completed: bool,
+    interrupted: bool,
+) -> None:
+    """Emit one lifecycle close for every turn that reached the loop body.
+
+    The loop has several intentional early returns and can also raise after
+    turn setup. Keeping this at the public turn boundary makes the lifecycle
+    hook independent of which branch produced the result.
+    """
+    if not turn_id:
+        return
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(
+            "on_session_end",
+            session_id=getattr(agent, "session_id", None),
+            task_id=task_id,
+            turn_id=turn_id,
+            completed=completed,
+            interrupted=interrupted,
+            model=getattr(agent, "model", None),
+            platform=getattr(agent, "platform", None) or "",
+        )
+    except Exception as exc:
+        logger.warning("on_session_end hook failed: %s", exc)
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -515,7 +548,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
-def run_conversation(
+def _run_conversation(
     agent,
     user_message: str,
     system_message: str = None,
@@ -5186,6 +5219,7 @@ def run_conversation(
                             agent._resolved_is_coding = coding
                         _verify_nudge2 = get_pre_verify_continue_message(
                             session_id=getattr(agent, "session_id", None) or "",
+                            turn_id=getattr(agent, "_current_turn_id", "") or "",
                             platform=getattr(agent, "platform", "") or "",
                             model=getattr(agent, "model", "") or "",
                             coding=coding,
@@ -5300,6 +5334,45 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
     )
 
+
+
+def run_conversation(
+    agent,
+    user_message: str,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    task_id: str = None,
+    stream_callback: Optional[callable] = None,
+    persist_user_message: Optional[str] = None,
+    persist_user_timestamp: Optional[float] = None,
+    moa_config: Optional[dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one turn and close its lifecycle on every return or exception."""
+    # Do not let a setup failure close the previous turn using stale identity.
+    agent._current_turn_id = None
+    agent._current_task_id = None
+    result = None
+    try:
+        result = _run_conversation(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            persist_user_timestamp=persist_user_timestamp,
+            moa_config=moa_config,
+        )
+        return result
+    finally:
+        _emit_turn_end_hook(
+            agent,
+            task_id=getattr(agent, "_current_task_id", None) or task_id,
+            turn_id=getattr(agent, "_current_turn_id", None),
+            completed=bool(result and result.get("completed")),
+            interrupted=bool(result and result.get("interrupted")),
+        )
 
 
 __all__ = ["run_conversation"]

@@ -11,6 +11,10 @@ import type { RpcEvent } from '@/types/hermes'
 
 import { useMessageStream } from './index'
 
+const { playCompletionSound } = vi.hoisted(() => ({ playCompletionSound: vi.fn() }))
+
+vi.mock('@/lib/completion-sound', () => ({ playCompletionSound }))
+
 const SID = 'session-1'
 const todo = (id: string, status: TodoItem['status']): TodoItem => ({ content: `task ${id}`, id, status })
 
@@ -54,6 +58,7 @@ const complete = () => act(() => handleEvent!({ payload: { text: 'done' }, sessi
 describe('useMessageStream turn-end todo cleanup', () => {
   beforeEach(() => {
     handleEvent = null
+    playCompletionSound.mockClear()
     clearSessionTodos(SID)
   })
 
@@ -80,6 +85,22 @@ describe('useMessageStream turn-end todo cleanup', () => {
 
     // Not cleared immediately — the finished-list linger still owns it.
     expect($todosBySession.get()[SID]).toHaveLength(1)
+  })
+
+  it('does not celebrate or clear task progress while continuing automatically', async () => {
+    await mountStream()
+    setSessionTodos(SID, [todo('a', 'completed'), todo('b', 'in_progress')])
+
+    act(() =>
+      handleEvent!({
+        payload: { auto_continuing: true, text: 'partial result' },
+        session_id: SID,
+        type: 'message.complete'
+      })
+    )
+
+    expect(playCompletionSound).not.toHaveBeenCalled()
+    expect($todosBySession.get()[SID]).toHaveLength(2)
   })
 
   it('drops a still-active task list when the turn errors out', async () => {

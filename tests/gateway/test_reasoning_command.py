@@ -113,7 +113,13 @@ class TestReasoningCommand:
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         config_path = hermes_home / "config.yaml"
-        config_path.write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
+        config_path.write_text(
+            "# keep this comment\n"
+            "agent:\n"
+            "  reasoning_effort: max\n"
+            "  reasoning_mode: ultra\n",
+            encoding="utf-8",
+        )
 
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
@@ -124,6 +130,8 @@ class TestReasoningCommand:
 
         saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         assert saved["agent"]["reasoning_effort"] == "low"
+        assert "reasoning_mode" not in saved["agent"]
+        assert "# keep this comment" in config_path.read_text(encoding="utf-8")
         assert runner._reasoning_config == {"enabled": True, "effort": "low"}
         assert "takes effect on next message" in result
 
