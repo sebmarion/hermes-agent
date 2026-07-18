@@ -1,296 +1,423 @@
-"""Required tool-dispatch policy contract.
+"""Provider-neutral contract for required tool-dispatch policies.
 
-Provider-neutral, fail-closed policy boundary that sees the final tool
-arguments and the exact runtime working directory immediately before ordinary
-tool execution.
+The callback payload contains only JSON-shaped tool data and execution
+identity: ``tool_name``, ``original_args``, ``effective_args``, ``task_id``,
+``session_id``, ``turn_id``, ``tool_call_id``, prepared cwd metadata, and a
+``policy_binding``. The binding authorizes the final execution shape, so it
+covers a schema version, the effective arguments, all execution identities,
+and the prepared cwd metadata. ``original_args`` is visible for audit but is
+not authorization input.
 
-The dispatch input contains only JSON-shaped tool and identity/cwd fields:
-  * tool_name: str
-  * effective_args: dict
-  * task_id: str
-  * session_id: str
-  * turn_id: str
-  * tool_call_id: str
-  * effective_cwd: str | None
-  * effective_cwd_source: str
-  * effective_cwd_authoritative: bool
-
-Never store prompts, source bytes, environment variables, command output,
-credentials, or arbitrary runtime objects in the payload.
-
-The policy binding is SHA-256 over canonical UTF-8 JSON containing:
-  * schema_version: str
-  * tool_name: str
-  * effective_args: dict
-  * task_id, session_id, turn_id, tool_call_id: str
-  * effective_cwd: str | None
-  * effective_cwd_source: str
-  * effective_cwd_authoritative: bool
-
-A valid allow response is exactly a mapping with ``action: "allow"`` and the
-same ``policy_binding``. A valid block response is ``action: "block"`` with a
-bounded non-empty message (capped at 1000 UTF-8 bytes). Missing plugin/
-registration, load error, callback exception, timeout, executor saturation,
-malformed response, binding mismatch, or any non-explicit action blocks before
-the handler runs.
+This module defines data and validation only. Plugin registration, deadlines,
+quarantine, and final dispatch enforcement are implemented by later layers.
 """
 
-import hashlib
-import json
-from typing import Any
+from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# Stable internal policy codes
-# ---------------------------------------------------------------------------
+import hashlib
+import hmac
+import json
+import math
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import TypeAlias
+
+POLICY_SCHEMA_VERSION = 1
+MAX_POLICY_BLOCK_MESSAGE_BYTES = 1_000
+
+JSONValue: TypeAlias = (
+    None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
+)
+
 
 class PolicyDecisionCode:
-    """Stable internal codes for policy decisions. Never leak raw exception
-    text to the model; use these codes instead."""
+    """Stable codes safe to expose without callback or exception details."""
 
-    ALLOWED = "ALLOWED"
-    BLOCKED = "BLOCKED"
-    MALFORMED = "MALFORMED"
-    NON_EXPLICIT = "NON_EXPLICIT"
-    BINDING_MISMATCH = "BINDING_MISMATCH"
-    EMPTY_BLOCK_MESSAGE = "EMPTY_BLOCK_MESSAGE"
-    ALLOW_WITHOUT_BINDING = "ALLOW_WITHOUT_BINDING"
-
-
-class PolicyDecision:
-    """Result of parsing a policy decision."""
-
-    def __init__(self, allows: bool, policy_code: str, message: str = "") -> None:
-        self._allows = allows
-        self._policy_code = policy_code
-        self._message = message
-
-    def allows(self) -> bool:
-        return self._allows
-
-    @property
-    def policy_code(self) -> str:
-        return self._policy_code
-
-    @property
-    def message(self) -> str:
-        return self._message
+    ALLOWED = "policy_allowed"
+    BLOCKED = "policy_blocked"
+    MALFORMED = "policy_malformed_decision"
+    NON_EXPLICIT = "policy_non_explicit_action"
+    BINDING_MISSING = "policy_binding_missing"
+    BINDING_MISMATCH = "policy_binding_mismatch"
+    EMPTY_BLOCK_MESSAGE = "policy_empty_block_message"
+    INVALID_BLOCK_MESSAGE = "policy_invalid_block_message"
 
 
-# ---------------------------------------------------------------------------
-# Immutable dataclasses
-# ---------------------------------------------------------------------------
+def _validate_json_value(value: object, path: str) -> None:
+    if value is None or type(value) in (bool, int, str):
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise TypeError(f"{path} must contain only finite JSON numbers")
+        return
+    if type(value) is list:
+        for index, item in enumerate(value):
+            _validate_json_value(item, f"{path}[{index}]")
+        return
+    if type(value) is dict:
+        for index, (key, item) in enumerate(value.items()):
+            if type(key) is not str:
+                raise TypeError(f"{path} must contain only string object keys")
+            _validate_json_value(item, f"{path}.value[{index}]")
+        return
+    raise TypeError(f"{path} must be JSON-shaped")
 
-class ImmutableDataclass:
-    """Mixin that prevents attribute mutation after construction."""
 
-    def __setattr__(self, name: str, value: Any) -> None:
-        if hasattr(self, name):
-            raise AssertionError(
-                f"Cannot modify immutable attribute '{name}' on {self.__class__.__name__}"
-            )
-        object.__setattr__(self, name, value)
+def _require_string(value: object, field_name: str) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be a string")
+    return value
 
 
-from dataclasses import dataclass, field
-from typing import Optional
+def _require_args(value: object, field_name: str) -> dict[str, JSONValue]:
+    if type(value) is not dict:
+        raise TypeError(f"{field_name} must be a JSON object")
+    _validate_json_value(value, field_name)
+    return value
 
 
-@dataclass(frozen=True)
+def _clone_json_object(value: dict[str, JSONValue]) -> dict[str, JSONValue]:
+    return json.loads(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _truncate_utf8(message: str) -> str:
+    encoded = message.encode("utf-8")
+    if len(encoded) <= MAX_POLICY_BLOCK_MESSAGE_BYTES:
+        return message
+    return encoded[:MAX_POLICY_BLOCK_MESSAGE_BYTES].decode("utf-8", errors="ignore")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedToolRuntime:
+    effective_cwd: str | None
+    effective_cwd_source: str
+    effective_cwd_authoritative: bool
+
+    def __post_init__(self) -> None:
+        if self.effective_cwd is not None and type(self.effective_cwd) is not str:
+            raise TypeError("effective_cwd must be a string or None")
+        _require_string(self.effective_cwd_source, "effective_cwd_source")
+        if type(self.effective_cwd_authoritative) is not bool:
+            raise TypeError("effective_cwd_authoritative must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
 class ToolDispatchPolicyInput:
-    """Immutable input to a required tool-dispatch policy callback.
-
-    Contains only JSON-shaped tool and identity/cwd fields.
-    """
-
     tool_name: str
-    effective_args: dict
+    original_args: dict[str, JSONValue]
+    effective_args: dict[str, JSONValue]
     task_id: str
     session_id: str
     turn_id: str
     tool_call_id: str
-    effective_cwd: Optional[str]
+    effective_cwd: str | None
     effective_cwd_source: str
     effective_cwd_authoritative: bool
+    policy_binding: str
+
+    def __post_init__(self) -> None:
+        _validate_dispatch_fields(
+            tool_name=self.tool_name,
+            original_args=self.original_args,
+            effective_args=self.effective_args,
+            task_id=self.task_id,
+            session_id=self.session_id,
+            turn_id=self.turn_id,
+            tool_call_id=self.tool_call_id,
+            effective_cwd=self.effective_cwd,
+            effective_cwd_source=self.effective_cwd_source,
+            effective_cwd_authoritative=self.effective_cwd_authoritative,
+        )
+        if not _is_policy_binding(self.policy_binding):
+            raise ValueError("policy_binding must be a lowercase SHA-256 digest")
+        expected = compute_policy_binding(self)
+        if not hmac.compare_digest(self.policy_binding, expected):
+            raise ValueError("policy_binding does not match the dispatch input")
+        object.__setattr__(self, "original_args", _clone_json_object(self.original_args))
+        object.__setattr__(self, "effective_args", _clone_json_object(self.effective_args))
+
+    def to_callback_payload(self) -> dict[str, JSONValue]:
+        return {
+            "tool_name": self.tool_name,
+            "original_args": _clone_json_object(self.original_args),
+            "effective_args": _clone_json_object(self.effective_args),
+            "task_id": self.task_id,
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "tool_call_id": self.tool_call_id,
+            "effective_cwd": self.effective_cwd,
+            "effective_cwd_source": self.effective_cwd_source,
+            "effective_cwd_authoritative": self.effective_cwd_authoritative,
+            "policy_binding": self.policy_binding,
+        }
 
 
-@dataclass(frozen=True)
-class PreparedToolRuntime:
-    """Immutable prepared runtime context for tool execution.
-
-    Contains only the authoritative working directory and its metadata.
-    """
-
-    effective_cwd: str
-    effective_cwd_source: str
-    effective_cwd_authoritative: bool
-
-
-@dataclass(frozen=True)
-class ToolPolicyBlock:
-    """Immutable structured block result returned when a policy blocks execution."""
-
-    error_type: str
-    policy: str
-    policy_code: str
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ToolPolicyRegistration:
-    """Immutable registration record for a plugin's required policy."""
-
     plugin_key: str
     policy_name: str
-    callback: Any  # Callable
+    callback: Callable[[Mapping[str, JSONValue]], object]
     timeout_ms: int
 
 
-# ---------------------------------------------------------------------------
-# compute_policy_binding
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class PolicyDecision:
+    is_allowed: bool
+    policy_code: str
+    message: str = ""
 
-def compute_policy_binding(payload: dict) -> str:
-    """Compute the policy binding as SHA-256 over canonical UTF-8 JSON.
+    def allows(self) -> bool:
+        return self.is_allowed
 
-    Args:
-        payload: Dict containing the canonical fields:
-            - tool_name: str
-            - effective_args: dict
-            - task_id: str
-            - session_id: str
-            - turn_id: str
-            - tool_call_id: str
-            - effective_cwd: str | None
-            - effective_cwd_source: str
-            - effective_cwd_authoritative: bool
 
-    Returns:
-        SHA-256 hex digest (64-character string).
+@dataclass(frozen=True, slots=True)
+class ToolPolicyBlock:
+    policy: str
+    policy_code: str
+    message: str
+    status: str = field(default="blocked", init=False)
+    error_type: str = field(default="required_policy_block", init=False)
 
-    Raises:
-        TypeError: If any field has a non-JSON-compatible type.
-    """
-    # Validate all fields are JSON-compatible before hashing.
-    required_fields = {
-        "tool_name": str,
-        "effective_args": dict,
-        "task_id": str,
-        "session_id": str,
-        "turn_id": str,
-        "tool_call_id": str,
-        "effective_cwd": (str, type(None)),
-        "effective_cwd_source": str,
-        "effective_cwd_authoritative": bool,
+    def __post_init__(self) -> None:
+        _require_string(self.policy, "policy")
+        _require_string(self.policy_code, "policy_code")
+        if type(self.message) is not str or not self.message.strip():
+            raise ValueError("message must be a non-empty string")
+        object.__setattr__(self, "message", _truncate_utf8(self.message.strip()))
+
+    def to_result(self) -> dict[str, str]:
+        return {
+            "status": self.status,
+            "error_type": self.error_type,
+            "policy": self.policy,
+            "policy_code": self.policy_code,
+            "message": self.message,
+        }
+
+
+_BINDING_FIELDS = frozenset(
+    {
+        "tool_name",
+        "effective_args",
+        "task_id",
+        "session_id",
+        "turn_id",
+        "tool_call_id",
+        "effective_cwd",
+        "effective_cwd_source",
+        "effective_cwd_authoritative",
     }
+)
 
-    for field_name, expected_types in required_fields.items():
-        value = payload.get(field_name)
-        if value is None:
-            raise TypeError(f"Missing required field: {field_name}")
-        if not isinstance(value, expected_types):
-            raise TypeError(
-                f"Field '{field_name}' must be {expected_types}, "
-                f"got {type(value).__name__}"
-            )
 
-    # Build canonical JSON with sorted keys for determinism.
-    canonical_json = json.dumps(
-        {
-            "tool_name": payload["tool_name"],
-            "effective_args": payload["effective_args"],
-            "task_id": payload["task_id"],
-            "session_id": payload["session_id"],
-            "turn_id": payload["turn_id"],
-            "tool_call_id": payload["tool_call_id"],
-            "effective_cwd": payload["effective_cwd"],
-            "effective_cwd_source": payload["effective_cwd_source"],
-            "effective_cwd_authoritative": payload["effective_cwd_authoritative"],
-        },
+def _validate_dispatch_fields(
+    *,
+    tool_name: object,
+    original_args: object,
+    effective_args: object,
+    task_id: object,
+    session_id: object,
+    turn_id: object,
+    tool_call_id: object,
+    effective_cwd: object,
+    effective_cwd_source: object,
+    effective_cwd_authoritative: object,
+) -> None:
+    _require_string(tool_name, "tool_name")
+    _require_args(original_args, "original_args")
+    _require_args(effective_args, "effective_args")
+    for name, value in (
+        ("task_id", task_id),
+        ("session_id", session_id),
+        ("turn_id", turn_id),
+        ("tool_call_id", tool_call_id),
+        ("effective_cwd_source", effective_cwd_source),
+    ):
+        _require_string(value, name)
+    if effective_cwd is not None and type(effective_cwd) is not str:
+        raise TypeError("effective_cwd must be a string or None")
+    if type(effective_cwd_authoritative) is not bool:
+        raise TypeError("effective_cwd_authoritative must be a boolean")
+
+
+def _binding_values(
+    payload: ToolDispatchPolicyInput | Mapping[str, object],
+) -> dict[str, object]:
+    if isinstance(payload, ToolDispatchPolicyInput):
+        return {name: getattr(payload, name) for name in _BINDING_FIELDS}
+    if not isinstance(payload, Mapping):
+        raise TypeError("policy binding input must be a mapping")
+    try:
+        keys = set(payload.keys())
+    except Exception:
+        raise TypeError("policy binding input must expose stable keys") from None
+    if keys != _BINDING_FIELDS:
+        raise TypeError("policy binding input has missing or unexpected fields")
+    return {name: payload[name] for name in _BINDING_FIELDS}
+
+
+def compute_policy_binding(
+    payload: ToolDispatchPolicyInput | Mapping[str, object],
+) -> str:
+    values = _binding_values(payload)
+    _validate_dispatch_fields(
+        original_args={},
+        **values,
+    )
+    canonical = json.dumps(
+        {"schema_version": POLICY_SCHEMA_VERSION, **values},
         sort_keys=True,
         ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def create_tool_dispatch_policy_input(
+    *,
+    tool_name: str,
+    original_args: dict[str, JSONValue],
+    effective_args: dict[str, JSONValue],
+    task_id: str,
+    session_id: str,
+    turn_id: str,
+    tool_call_id: str,
+    prepared_runtime: PreparedToolRuntime,
+) -> ToolDispatchPolicyInput:
+    if not isinstance(prepared_runtime, PreparedToolRuntime):
+        raise TypeError("prepared_runtime must be a PreparedToolRuntime")
+    _validate_dispatch_fields(
+        tool_name=tool_name,
+        original_args=original_args,
+        effective_args=effective_args,
+        task_id=task_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        tool_call_id=tool_call_id,
+        effective_cwd=prepared_runtime.effective_cwd,
+        effective_cwd_source=prepared_runtime.effective_cwd_source,
+        effective_cwd_authoritative=prepared_runtime.effective_cwd_authoritative,
+    )
+    original_snapshot = _clone_json_object(original_args)
+    effective_snapshot = _clone_json_object(effective_args)
+    binding_values = {
+        "tool_name": tool_name,
+        "effective_args": effective_snapshot,
+        "task_id": task_id,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "tool_call_id": tool_call_id,
+        "effective_cwd": prepared_runtime.effective_cwd,
+        "effective_cwd_source": prepared_runtime.effective_cwd_source,
+        "effective_cwd_authoritative": prepared_runtime.effective_cwd_authoritative,
+    }
+    return ToolDispatchPolicyInput(
+        original_args=original_snapshot,
+        policy_binding=compute_policy_binding(binding_values),
+        **binding_values,
     )
 
-    # Compute SHA-256 hex digest.
-    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+def _is_policy_binding(value: object) -> bool:
+    if type(value) is not str or len(value) != 64 or value != value.lower():
+        return False
+    return all(character in "0123456789abcdef" for character in value)
 
 
-# ---------------------------------------------------------------------------
-# parse_policy_decision
-# ---------------------------------------------------------------------------
-
-def parse_policy_decision(decision: Any, expected_binding: str) -> PolicyDecision:
-    """Parse and validate a policy decision.
-
-    Args:
-        decision: The policy decision to parse (typically a dict from a callback).
-        expected_binding: The expected policy binding this decision must match.
-
-    Returns:
-        PolicyDecision with the parsed result.
-    """
-    # Validate decision structure.
-    if not isinstance(decision, dict):
-        return PolicyDecision(
-            allows=False,
-            policy_code=PolicyDecisionCode.MALFORMED,
-            message="Decision is not a dict",
-        )
-
-    action = decision.get("action")
-
-    if action is None:
-        return PolicyDecision(
-            allows=False,
-            policy_code=PolicyDecisionCode.MALFORMED,
-            message="Missing action field",
-        )
-
-    # Handle explicit allow.
-    if action == "allow":
-        policy_binding = decision.get("policy_binding")
-        if policy_binding != expected_binding:
-            return PolicyDecision(
-                allows=False,
-                policy_code=PolicyDecisionCode.BINDING_MISMATCH,
-                message="Allow decision binding mismatch",
-            )
-        return PolicyDecision(
-            allows=True,
-            policy_code=PolicyDecisionCode.ALLOWED,
-            message="Allowed",
-        )
-
-    # Handle explicit block.
-    if action == "block":
-        message = decision.get("message", "")
-        if not message:
-            return PolicyDecision(
-                allows=False,
-                policy_code=PolicyDecisionCode.EMPTY_BLOCK_MESSAGE,
-                message="Block decision missing message",
-            )
-        # Cap message at 1000 UTF-8 bytes.
-        if len(message.encode("utf-8")) > 1000:
-            message = message.encode("utf-8")[:1000].decode("utf-8", errors="ignore")
-        return PolicyDecision(
-            allows=False,
-            policy_code=PolicyDecisionCode.BLOCKED,
-            message=message,
-        )
-
-    # Non-explicit actions are treated as blocks.
+def _decision(
+    is_allowed: bool,
+    policy_code: str,
+    message: str,
+) -> PolicyDecision:
     return PolicyDecision(
-        allows=False,
-        policy_code=PolicyDecisionCode.NON_EXPLICIT,
-        message=f"Non-explicit action: {action}",
+        is_allowed=is_allowed,
+        policy_code=policy_code,
+        message=_truncate_utf8(message),
     )
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def parse_policy_decision(
+    decision: object,
+    expected_binding: str,
+) -> PolicyDecision:
+    if not _is_policy_binding(expected_binding):
+        return _decision(
+            False,
+            PolicyDecisionCode.BINDING_MISMATCH,
+            "Policy binding did not match.",
+        )
+    if not isinstance(decision, Mapping):
+        return _decision(False, PolicyDecisionCode.MALFORMED, "Malformed policy decision.")
+    try:
+        normalized = dict(decision)
+    except Exception:
+        return _decision(False, PolicyDecisionCode.MALFORMED, "Malformed policy decision.")
+
+    action = normalized.get("action")
+    if type(action) is not str:
+        return _decision(False, PolicyDecisionCode.MALFORMED, "Malformed policy decision.")
+
+    if action == "allow":
+        if set(normalized) == {"action"}:
+            return _decision(
+                False,
+                PolicyDecisionCode.BINDING_MISSING,
+                "Policy binding is required.",
+            )
+        if set(normalized) != {"action", "policy_binding"}:
+            return _decision(False, PolicyDecisionCode.MALFORMED, "Malformed policy decision.")
+        binding = normalized.get("policy_binding")
+        if type(binding) is not str or not hmac.compare_digest(binding, expected_binding):
+            return _decision(
+                False,
+                PolicyDecisionCode.BINDING_MISMATCH,
+                "Policy binding did not match.",
+            )
+        return _decision(True, PolicyDecisionCode.ALLOWED, "")
+
+    if action == "block":
+        if "message" not in normalized:
+            return _decision(
+                False,
+                PolicyDecisionCode.EMPTY_BLOCK_MESSAGE,
+                "A block message is required.",
+            )
+        if set(normalized) != {"action", "message"}:
+            return _decision(False, PolicyDecisionCode.MALFORMED, "Malformed policy decision.")
+        message = normalized.get("message")
+        if type(message) is not str:
+            return _decision(
+                False,
+                PolicyDecisionCode.INVALID_BLOCK_MESSAGE,
+                "The block message must be a string.",
+            )
+        if not message.strip():
+            return _decision(
+                False,
+                PolicyDecisionCode.EMPTY_BLOCK_MESSAGE,
+                "A block message is required.",
+            )
+        return _decision(False, PolicyDecisionCode.BLOCKED, message.strip())
+
+    return _decision(
+        False,
+        PolicyDecisionCode.NON_EXPLICIT,
+        "Policy did not explicitly allow execution.",
+    )
+
 
 __all__ = [
-    "ImmutableDataclass",
+    "JSONValue",
+    "MAX_POLICY_BLOCK_MESSAGE_BYTES",
+    "POLICY_SCHEMA_VERSION",
     "PolicyDecision",
     "PolicyDecisionCode",
     "PreparedToolRuntime",
@@ -298,5 +425,6 @@ __all__ = [
     "ToolPolicyBlock",
     "ToolPolicyRegistration",
     "compute_policy_binding",
+    "create_tool_dispatch_policy_input",
     "parse_policy_decision",
 ]

@@ -1,401 +1,453 @@
-"""Tests for required tool-dispatch policy contract.
-
-These tests validate:
-  * deterministic canonical policy binding (reordered keys, changed fields)
-  * non-JSON value rejection
-  * strict policy-decision parsing (allow/block validity, message cap, codes)
-  * immutable dataclass invariants
-
-The contract:
-
-  * ``compute_policy_binding()`` is SHA-256 over canonical UTF-8 JSON containing
-    a schema version, tool name, effective args, task/session/turn/tool-call
-    identities, and prepared cwd fields.
-  * The dispatch input may contain only JSON-shaped tool and identity/cwd fields.
-    Prompts, source bytes, environment variables, command output, credentials,
-    or arbitrary runtime objects must not be stored in the payload.
-  * An explicit allow is valid only for a mapping with ``action: "allow"`` and
-    the exact policy binding.
-  * An explicit block requires a non-empty bounded message. Block messages are
-    capped at 1000 UTF-8 bytes and must not produce invalid UTF-8.
-  * Malformed, non-explicit, or binding-mismatched decisions use stable
-    internal policy codes, never raw exception text.
-"""
-
 import hashlib
 import json
+from dataclasses import FrozenInstanceError, fields
+from types import MappingProxyType
 
 import pytest
 
 from hermes_cli.tool_policy import (
+    MAX_POLICY_BLOCK_MESSAGE_BYTES,
+    POLICY_SCHEMA_VERSION,
     PolicyDecision,
     PolicyDecisionCode,
-    ToolDispatchPolicyInput,
     PreparedToolRuntime,
+    ToolDispatchPolicyInput,
     ToolPolicyBlock,
     ToolPolicyRegistration,
     compute_policy_binding,
+    create_tool_dispatch_policy_input,
     parse_policy_decision,
 )
 
 
-# ---------------------------------------------------------------------------
-# Test helpers
-# ---------------------------------------------------------------------------
+def _runtime(cwd: str | None = "/workspace") -> PreparedToolRuntime:
+    return PreparedToolRuntime(
+        effective_cwd=cwd,
+        effective_cwd_source="process_cwd",
+        effective_cwd_authoritative=True,
+    )
 
-def _canonical_payload(**overrides):
-    """Return the canonical payload dict used by tests.
 
-    Defaults mirror the contract: every required identity/cwd field is present
-    and JSON-shaped. Override any field to exercise a specific case.
-    """
-    defaults = dict(
+def _binding_fields(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "tool_name": "terminal",
+        "effective_args": {
+            "z": 3,
+            "a": {"second": [1, True, None], "first": "value"},
+            "m": 2.5,
+        },
+        "task_id": "task-1",
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+        "tool_call_id": "call-1",
+        "effective_cwd": "/workspace",
+        "effective_cwd_source": "process_cwd",
+        "effective_cwd_authoritative": True,
+    }
+    values.update(overrides)
+    return values
+
+
+def _create_input(
+    *,
+    original_args: dict | None = None,
+    effective_args: dict | None = None,
+    cwd: str | None = "/workspace",
+) -> ToolDispatchPolicyInput:
+    return create_tool_dispatch_policy_input(
         tool_name="terminal",
-        effective_args={"command": "echo hello"},
+        original_args=original_args or {"command": "before"},
+        effective_args=effective_args or {"command": "after"},
         task_id="task-1",
         session_id="session-1",
         turn_id="turn-1",
         tool_call_id="call-1",
-        effective_cwd="/home/user",
-        effective_cwd_source="task",
-        effective_cwd_authoritative=True,
+        prepared_runtime=_runtime(cwd),
     )
-    defaults.update(overrides)
-    return defaults
 
 
-# ---------------------------------------------------------------------------
-# compute_policy_binding
-# ---------------------------------------------------------------------------
-
-class TestComputePolicyBinding:
-    """Deterministic canonical payload hashing."""
-
-    def test_reordered_mapping_keys_give_same_binding(self):
-        """Canonical JSON must serialize the same way regardless of key order."""
-        payload = _canonical_payload()
-        # Reorder the effective_args dict keys.
-        reordered = _canonical_payload()
-        reordered["effective_args"] = dict(
-            (k, v) for k, v in reversed(list(payload["effective_args"].items()))
+class TestPolicyBinding:
+    def test_hashes_exact_canonical_payload_with_schema_version(self):
+        values = _binding_fields()
+        canonical = json.dumps(
+            {"schema_version": POLICY_SCHEMA_VERSION, **values},
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
         )
-        binding_a = compute_policy_binding(payload)
-        binding_b = compute_policy_binding(reordered)
-        assert binding_a == binding_b
+        assert compute_policy_binding(values) == hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
 
-    def test_changed_tool_name_changes_binding(self):
-        """A different tool name must produce a different binding."""
-        a = compute_policy_binding(_canonical_payload())
-        binding_alt = compute_policy_binding(_canonical_payload(tool_name="read_file"))
-        assert a != binding_alt
-        # Verify SHA-256 hexdigest shape.
-        assert len(a) == 64
+    def test_reordered_top_level_and_nested_keys_have_same_binding(self):
+        first = _binding_fields()
+        second = {
+            "effective_cwd_authoritative": True,
+            "effective_cwd_source": "process_cwd",
+            "effective_cwd": "/workspace",
+            "tool_call_id": "call-1",
+            "turn_id": "turn-1",
+            "session_id": "session-1",
+            "task_id": "task-1",
+            "effective_args": {
+                "m": 2.5,
+                "a": {"first": "value", "second": [1, True, None]},
+                "z": 3,
+            },
+            "tool_name": "terminal",
+        }
+        assert compute_policy_binding(first) == compute_policy_binding(second)
 
-    def test_changed_effective_args_changes_binding(self):
-        a = compute_policy_binding(_canonical_payload())
-        b = compute_policy_binding(
-            _canonical_payload(effective_args={"command": "echo other"})
+    @pytest.mark.parametrize(
+        ("field_name", "changed"),
+        [
+            ("tool_name", "read_file"),
+            ("effective_args", {"command": "different"}),
+            ("task_id", "task-2"),
+            ("session_id", "session-2"),
+            ("turn_id", "turn-2"),
+            ("tool_call_id", "call-2"),
+            ("effective_cwd", "/different"),
+            ("effective_cwd_source", "explicit_workdir"),
+            ("effective_cwd_authoritative", False),
+        ],
+    )
+    def test_each_authorization_field_changes_binding(self, field_name, changed):
+        assert compute_policy_binding(_binding_fields()) != compute_policy_binding(
+            _binding_fields(**{field_name: changed})
         )
-        assert a != b
 
-    def test_changed_cwd_changes_binding(self):
-        a = compute_policy_binding(_canonical_payload())
-        b = compute_policy_binding(
-            _canonical_payload(effective_cwd="/other/path")
+    def test_nullable_cwd_is_valid_and_deterministic(self):
+        first = compute_policy_binding(_binding_fields(effective_cwd=None))
+        second = compute_policy_binding(_binding_fields(effective_cwd=None))
+        assert first == second
+        assert first != compute_policy_binding(_binding_fields())
+
+    def test_requires_exact_binding_field_set(self):
+        missing = _binding_fields()
+        missing.pop("turn_id")
+        with pytest.raises(TypeError):
+            compute_policy_binding(missing)
+        with pytest.raises(TypeError):
+            compute_policy_binding({**_binding_fields(), "prompt": "secret"})
+
+    def test_accepts_input_object(self):
+        policy_input = _create_input()
+        assert compute_policy_binding(policy_input) == policy_input.policy_binding
+
+
+class TestJsonAndFieldValidation:
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            b"bytes",
+            {"a", "set"},
+            ("tuple",),
+            object(),
+            complex(1, 2),
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            {1: "non-string key"},
+            {"nested": ["ok", {"bad": b"bytes"}]},
+        ],
+    )
+    def test_rejects_nested_non_json_effective_args(self, invalid):
+        with pytest.raises(TypeError):
+            compute_policy_binding(_binding_fields(effective_args={"value": invalid}))
+
+    def test_accepts_json_numbers(self):
+        binding = compute_policy_binding(
+            _binding_fields(effective_args={"integer": 3, "float": 1.25})
         )
-        assert a != b
-
-    def test_changed_session_id_changes_binding(self):
-        a = compute_policy_binding(_canonical_payload())
-        b = compute_policy_binding(_canonical_payload(session_id="session-2"))
-        assert a != b
-
-    def test_changed_turn_id_changes_binding(self):
-        a = compute_policy_binding(_canonical_payload())
-        b = compute_policy_binding(_canonical_payload(turn_id="turn-2"))
-        assert a != b
-
-    def test_changed_tool_call_id_changes_binding(self):
-        a = compute_policy_binding(_canonical_payload())
-        b = compute_policy_binding(_canonical_payload(tool_call_id="call-2"))
-        assert a != b
-
-    def test_changed_task_id_changes_binding(self):
-        a = compute_policy_binding(_canonical_payload())
-        b = compute_policy_binding(_canonical_payload(task_id="task-2"))
-        assert a != b
-
-    def test_changed_effective_cwd_source_changes_binding(self):
-        a = compute_policy_binding(_canonical_payload())
-        b = compute_policy_binding(
-            _canonical_payload(effective_cwd_source="other")
-        )
-        assert a != b
-
-    def test_changed_effective_cwd_authoritative_changes_binding(self):
-        a = compute_policy_binding(_canonical_payload())
-        b = compute_policy_binding(
-            _canonical_payload(effective_cwd_authoritative=False)
-        )
-        assert a != b
-
-    def test_binding_is_sha256_hexdigest(self):
-        binding = compute_policy_binding(_canonical_payload())
         assert len(binding) == 64
-        # Must be valid hex.
-        int(binding, 16)
 
-    def test_binding_is_canonical_sha256_over_json(self):
-        """Confirm the binding equals hashlib.sha256(utf8_json).hexdigest()."""
-        payload = _canonical_payload()
-        # Canonical JSON must be sorted keys at the top level.
-        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        # The binding should equal SHA-256 of the canonical JSON.
-        assert compute_policy_binding(payload) == expected
-
-
-class TestComputePolicyBindingNonJsonRejection:
-    """Non-JSON values are rejected before a future callback could see them."""
-
-    def test_non_dict_effective_args_raises(self):
-        payload = _canonical_payload(effective_args="not a dict")
+    @pytest.mark.parametrize(
+        ("field_name", "invalid"),
+        [
+            ("tool_name", 1),
+            ("effective_args", "not-an-object"),
+            ("task_id", 1),
+            ("session_id", None),
+            ("turn_id", []),
+            ("tool_call_id", {}),
+            ("effective_cwd", 1),
+            ("effective_cwd_source", False),
+            ("effective_cwd_authoritative", "yes"),
+        ],
+    )
+    def test_rejects_wrong_binding_field_types(self, field_name, invalid):
         with pytest.raises(TypeError):
-            compute_policy_binding(payload)
+            compute_policy_binding(_binding_fields(**{field_name: invalid}))
 
-    def test_non_string_tool_name_raises(self):
-        payload = _canonical_payload(tool_name=123)
+    def test_factory_rejects_nested_non_json_original_args(self):
         with pytest.raises(TypeError):
-            compute_policy_binding(payload)
+            _create_input(original_args={"secret": b"bytes"})
 
-    def test_non_string_ids_raise(self):
-        for field in ("task_id", "session_id", "turn_id", "tool_call_id"):
-            payload = _canonical_payload(**{field: 123})
-            with pytest.raises(TypeError):
-                compute_policy_binding(payload)
 
-    def test_non_string_cwd_fields_raise(self):
-        for field in ("effective_cwd", "effective_cwd_source"):
-            payload = _canonical_payload(**{field: 123})
-            with pytest.raises(TypeError):
-                compute_policy_binding(payload)
+class TestPolicyInputFactory:
+    def test_populates_complete_callback_payload(self):
+        policy_input = _create_input()
+        payload = policy_input.to_callback_payload()
+        assert set(payload) == {
+            "tool_name",
+            "original_args",
+            "effective_args",
+            "task_id",
+            "session_id",
+            "turn_id",
+            "tool_call_id",
+            "effective_cwd",
+            "effective_cwd_source",
+            "effective_cwd_authoritative",
+            "policy_binding",
+        }
+        assert payload["policy_binding"] == policy_input.policy_binding
 
-    def test_non_bool_authoritative_raises(self):
-        payload = _canonical_payload(effective_cwd_authoritative="truthy")
+    def test_original_args_are_visible_but_not_hashed(self):
+        first = _create_input(original_args={"command": "one"})
+        second = _create_input(original_args={"command": "two"})
+        assert first.original_args != second.original_args
+        assert first.policy_binding == second.policy_binding
+
+    def test_snapshots_argument_dicts(self):
+        original = {"command": ["before"]}
+        effective = {"command": ["after"]}
+        policy_input = _create_input(
+            original_args=original,
+            effective_args=effective,
+        )
+        original["command"].append("mutated")
+        effective["command"].append("mutated")
+        assert policy_input.original_args == {"command": ["before"]}
+        assert policy_input.effective_args == {"command": ["after"]}
+
+    def test_callback_payload_returns_fresh_argument_copies(self):
+        policy_input = _create_input()
+        payload = policy_input.to_callback_payload()
+        payload["effective_args"]["command"] = "mutated"
+        assert policy_input.effective_args == {"command": "after"}
+
+    def test_direct_constructor_rejects_wrong_binding(self):
+        with pytest.raises(ValueError):
+            ToolDispatchPolicyInput(
+                tool_name="terminal",
+                original_args={},
+                effective_args={},
+                task_id="task",
+                session_id="session",
+                turn_id="turn",
+                tool_call_id="call",
+                effective_cwd=None,
+                effective_cwd_source="remote_unmapped",
+                effective_cwd_authoritative=False,
+                policy_binding="0" * 64,
+            )
+
+    def test_unknown_factory_keyword_is_rejected(self):
+        kwargs = {
+            "tool_name": "terminal",
+            "original_args": {},
+            "effective_args": {},
+            "task_id": "task",
+            "session_id": "session",
+            "turn_id": "turn",
+            "tool_call_id": "call",
+            "prepared_runtime": _runtime(),
+            "prompt": "secret",
+        }
         with pytest.raises(TypeError):
-            compute_policy_binding(payload)
+            create_tool_dispatch_policy_input(**kwargs)
 
-    def test_extra_payload_fields_ignored(self):
-        """Extra keys in the payload dict must not affect the binding."""
-        payload = _canonical_payload()
-        payload["extra_ignored_key"] = "irrelevant"
-        assert (
-            compute_policy_binding(payload) == compute_policy_binding(_canonical_payload())
+    def test_factory_requires_prepared_runtime(self):
+        with pytest.raises(TypeError):
+            create_tool_dispatch_policy_input(
+                tool_name="terminal",
+                original_args={},
+                effective_args={},
+                task_id="task",
+                session_id="session",
+                turn_id="turn",
+                tool_call_id="call",
+                prepared_runtime=object(),
+            )
+
+    def test_sensitive_fields_are_absent(self):
+        field_names = {item.name for item in fields(ToolDispatchPolicyInput)}
+        assert not field_names & {
+            "prompt",
+            "source_bytes",
+            "environment",
+            "command_output",
+            "credentials",
+        }
+
+
+class TestImmutableContracts:
+    @pytest.mark.parametrize(
+        ("instance", "field_name", "value"),
+        [
+            (_create_input(), "tool_name", "other"),
+            (_runtime(), "effective_cwd", "/other"),
+            (
+                ToolPolicyRegistration("plugin", "tool_dispatch", lambda _: {}, 2_000),
+                "timeout_ms",
+                1,
+            ),
+            (
+                ToolPolicyBlock("tool_dispatch", "policy_blocked", "blocked"),
+                "policy_code",
+                "other",
+            ),
+        ],
+    )
+    def test_required_dataclasses_are_frozen(self, instance, field_name, value):
+        with pytest.raises(FrozenInstanceError):
+            setattr(instance, field_name, value)
+
+    def test_policy_decision_is_frozen(self):
+        decision = PolicyDecision(False, PolicyDecisionCode.MALFORMED, "fixed")
+        with pytest.raises(FrozenInstanceError):
+            decision.policy_code = "other"
+
+
+class TestDecisionParsing:
+    def test_explicit_allow_requires_matching_binding(self):
+        binding = _create_input().policy_binding
+        decision = parse_policy_decision(
+            MappingProxyType({"action": "allow", "policy_binding": binding}),
+            binding,
         )
+        assert decision.allows()
+        assert decision.policy_code == PolicyDecisionCode.ALLOWED
+        assert decision.message == ""
 
+    def test_allow_without_binding_is_stably_blocked(self):
+        decision = parse_policy_decision({"action": "allow"}, "a" * 64)
+        assert not decision.allows()
+        assert decision.policy_code == PolicyDecisionCode.BINDING_MISSING
 
-# ---------------------------------------------------------------------------
-# Immutable dataclasses
-# ---------------------------------------------------------------------------
-
-class TestImmutableDataclasses:
-    """ToolDispatchPolicyInput, PreparedToolRuntime, ToolPolicyBlock,
-    and ToolPolicyRegistration must be immutable."""
-
-    def test_tool_dispatch_policy_input_immutable(self):
-        import dataclasses
-        # Confirm the dataclass is actually a dataclass.
-        assert dataclasses.is_dataclass(ToolDispatchPolicyInput)
-        # Test that we can instantiate it with canonical payload
-        instance = ToolDispatchPolicyInput(**_canonical_payload())
-        assert instance.tool_name == "terminal"
-
-    def test_prepared_tool_runtime_immutable(self):
-        instance = PreparedToolRuntime(effective_cwd="/x", effective_cwd_source="y", effective_cwd_authoritative=True)
-        with pytest.raises(Exception):
-            instance.effective_cwd = "/z"
-
-    def test_tool_policy_block_immutable(self):
-        instance = ToolPolicyBlock(error_type="required_policy_block", policy="tool_dispatch", policy_code="BLOCKED")
-        with pytest.raises(Exception):
-            instance.policy_code = "OTHER"
-
-    def test_tool_policy_registration_immutable(self):
-        instance = ToolPolicyRegistration(
-            plugin_key="test_plugin", policy_name="tool_dispatch", callback=lambda: None, timeout_ms=2000,
+    def test_allow_with_wrong_binding_is_stably_blocked(self):
+        decision = parse_policy_decision(
+            {"action": "allow", "policy_binding": "b" * 64},
+            "a" * 64,
         )
-        with pytest.raises(Exception):
-            instance.timeout_ms = 1000
+        assert decision.policy_code == PolicyDecisionCode.BINDING_MISMATCH
 
-    def test_tool_policy_block_fields(self):
-        block = ToolPolicyBlock(error_type="required_policy_block", policy="tool_dispatch", policy_code="BLOCKED")
-        assert block.error_type == "required_policy_block"
-        assert block.policy == "tool_dispatch"
-        assert block.policy_code == "BLOCKED"
-
-    def test_tool_policy_registration_fields(self):
-        reg = ToolPolicyRegistration(
-            plugin_key="p", policy_name="tool_dispatch", callback=lambda: None, timeout_ms=500,
+    def test_invalid_expected_binding_fails_closed(self):
+        decision = parse_policy_decision(
+            {"action": "allow", "policy_binding": "short"},
+            "short",
         )
-        assert reg.plugin_key == "p"
-        assert reg.policy_name == "tool_dispatch"
-        assert reg.timeout_ms == 500
+        assert not decision.allows()
+        assert decision.policy_code == PolicyDecisionCode.BINDING_MISMATCH
 
-
-# ---------------------------------------------------------------------------
-# parse_policy_decision
-# ---------------------------------------------------------------------------
-
-class TestParsePolicyDecision:
-    """Strict policy-decision parsing."""
-
-    def test_explicit_allow_matching_binding(self):
-        binding = compute_policy_binding(_canonical_payload())
-        decision = {
-            "action": "allow",
-            "policy_binding": binding,
-        }
-        result = parse_policy_decision(decision, binding)
-        assert result.allows()
-        assert result.policy_code == PolicyDecisionCode.ALLOWED
-
-    def test_explicit_block_with_message(self):
-        decision = {
-            "action": "block",
-            "message": "Not allowed",
-        }
-        result = parse_policy_decision(decision, "any-binding")
-        assert not result.allows()
-        assert result.policy_code == PolicyDecisionCode.BLOCKED
-        assert result.message == "Not allowed"
-
-    def test_block_message_capped_at_1000_utf8_bytes(self):
-        long_message = "x" * 2000
-        decision = {
-            "action": "block",
-            "message": long_message,
-        }
-        result = parse_policy_decision(decision, "any-binding")
-        assert len(result.message.encode("utf-8")) <= 1000
-        # Must still be valid UTF-8.
-        result.message.encode("utf-8")
-
-    def test_block_message_with_non_ascii_chars(self):
-        decision = {
-            "action": "block",
-            "message": "日本語",
-        }
-        result = parse_policy_decision(decision, "any-binding")
-        assert result.policy_code == PolicyDecisionCode.BLOCKED
-        # Verify valid UTF-8.
-        result.message.encode("utf-8")
-
-    def test_binding_mismatched_decision_uses_stable_code(self):
-        wrong_binding = "wrong"
-        decision = {
-            "action": "block",
-            "message": "mismatch",
-        }
-        result = parse_policy_decision(decision, wrong_binding)
-        assert result.policy_code == PolicyDecisionCode.BLOCKED
-
-    def test_non_explicit_action_uses_stable_code(self):
-        decision = {"action": "observe"}
-        result = parse_policy_decision(decision, "any-binding")
-        assert result.policy_code == PolicyDecisionCode.NON_EXPLICIT
-
-    def test_missing_action_uses_stable_code(self):
-        decision = {"other": "value"}
-        result = parse_policy_decision(decision, "any-binding")
-        assert result.policy_code == PolicyDecisionCode.MALFORMED
-
-    def test_empty_block_message_uses_stable_code(self):
-        decision = {"action": "block", "message": ""}
-        result = parse_policy_decision(decision, "any-binding")
-        assert result.policy_code == PolicyDecisionCode.EMPTY_BLOCK_MESSAGE
-
-    def test_allow_with_wrong_binding_uses_stable_code(self):
-        wrong_binding = "wrong"
-        decision = {"action": "allow", "policy_binding": wrong_binding}
-        result = parse_policy_decision(decision, "right")
-        assert result.policy_code == PolicyDecisionCode.BINDING_MISMATCH
-
-    def test_malformed_decision_uses_stable_code(self):
-        result = parse_policy_decision("not a dict", "any")
-        assert result.policy_code == PolicyDecisionCode.MALFORMED
-
-    def test_policy_decision_fields(self):
-        binding = compute_policy_binding(_canonical_payload())
-        result = parse_policy_decision({"action": "allow", "policy_binding": binding}, binding)
-        assert result.allows()
-        assert result.policy_code == PolicyDecisionCode.ALLOWED
-
-    def test_exception_text_not_leaked(self):
-        """Raw exception text must never appear in the policy result."""
-        # Confirm stable codes never contain exception class names.
-        for code in PolicyDecisionCode.__dict__.values():
-            if isinstance(code, str):
-                assert "Exception" not in code
-                assert "Error" not in code
-
-
-# ---------------------------------------------------------------------------
-# ToolDispatchPolicyInput - JSON-shaped payload only
-# ---------------------------------------------------------------------------
-
-class TestToolDispatchPolicyInput:
-    """The dispatch input may contain only JSON-shaped fields."""
-
-    def test_cannot_store_prompts(self):
-        # Confirm the dataclass has no prompt field.
-        import dataclasses
-        fields = {f.name for f in dataclasses.fields(ToolDispatchPolicyInput)}
-        assert "prompt" not in fields
-        assert "source_bytes" not in fields
-        assert "env_vars" not in fields
-        assert "command_output" not in fields
-        assert "credentials" not in fields
-
-    def test_fields_are_json_compatible_types(self):
-        """All fields on the input must serialize to/from JSON."""
-        instance = ToolDispatchPolicyInput(**_canonical_payload())
-        # Verify JSON round-trip.
-        import json as _json
-        payload = _json.loads(_json.dumps(instance.__dict__))
-        assert isinstance(payload["tool_name"], str)
-        assert isinstance(payload["effective_args"], dict)
-
-
-# ---------------------------------------------------------------------------
-# PreparedToolRuntime - JSON-shaped cwd fields only
-# ---------------------------------------------------------------------------
-
-class TestPreparedToolRuntime:
-    def test_cwd_fields_are_json_compatible(self):
-        instance = PreparedToolRuntime(
-            effective_cwd="/x",
-            effective_cwd_source="task",
-            effective_cwd_authoritative=True,
+    def test_allow_with_extra_fields_is_malformed(self):
+        decision = parse_policy_decision(
+            {"action": "allow", "policy_binding": "a" * 64, "extra": True},
+            "a" * 64,
         )
-        import json as _json
-        payload = _json.loads(_json.dumps(instance.__dict__))
-        assert isinstance(payload["effective_cwd"], str)
-        assert isinstance(payload["effective_cwd_source"], str)
-        assert isinstance(payload["effective_cwd_authoritative"], bool)
+        assert decision.policy_code == PolicyDecisionCode.MALFORMED
+
+    def test_explicit_block_returns_bounded_safe_message(self):
+        message = "一" * 400
+        decision = parse_policy_decision(
+            {"action": "block", "message": message},
+            "a" * 64,
+        )
+        assert not decision.allows()
+        assert decision.policy_code == PolicyDecisionCode.BLOCKED
+        assert len(decision.message.encode("utf-8")) <= MAX_POLICY_BLOCK_MESSAGE_BYTES
+        decision.message.encode("utf-8")
+
+    def test_block_trims_before_utf8_bounding(self):
+        decision = parse_policy_decision(
+            {"action": "block", "message": " " * 1_100 + "reason"},
+            "a" * 64,
+        )
+        assert decision.policy_code == PolicyDecisionCode.BLOCKED
+        assert decision.message == "reason"
+
+    @pytest.mark.parametrize("message", [None, 1, [], {}, b"bytes"])
+    def test_non_string_block_messages_are_invalid(self, message):
+        decision = parse_policy_decision(
+            {"action": "block", "message": message},
+            "a" * 64,
+        )
+        assert decision.policy_code == PolicyDecisionCode.INVALID_BLOCK_MESSAGE
+
+    @pytest.mark.parametrize("message", ["", " ", "\n\t"])
+    def test_empty_block_messages_are_invalid(self, message):
+        decision = parse_policy_decision(
+            {"action": "block", "message": message},
+            "a" * 64,
+        )
+        assert decision.policy_code == PolicyDecisionCode.EMPTY_BLOCK_MESSAGE
+
+    def test_missing_block_message_is_stably_blocked(self):
+        decision = parse_policy_decision({"action": "block"}, "a" * 64)
+        assert decision.policy_code == PolicyDecisionCode.EMPTY_BLOCK_MESSAGE
+
+    def test_block_with_extra_fields_is_malformed(self):
+        decision = parse_policy_decision(
+            {"action": "block", "message": "no", "extra": True},
+            "a" * 64,
+        )
+        assert decision.policy_code == PolicyDecisionCode.MALFORMED
+
+    @pytest.mark.parametrize("malformed", [None, True, 1, "allow", [], object()])
+    def test_non_mapping_decisions_are_malformed(self, malformed):
+        decision = parse_policy_decision(malformed, "a" * 64)
+        assert decision.policy_code == PolicyDecisionCode.MALFORMED
+
+    def test_non_explicit_action_never_echoes_untrusted_content(self):
+        sentinel = "do-not-echo-this-secret"
+        decision = parse_policy_decision(
+            {"action": sentinel},
+            "a" * 64,
+        )
+        assert decision.policy_code == PolicyDecisionCode.NON_EXPLICIT
+        assert sentinel not in decision.message
+
+    def test_stable_codes_are_lowercase_and_bounded(self):
+        codes = [
+            value
+            for name, value in vars(PolicyDecisionCode).items()
+            if name.isupper()
+        ]
+        assert codes
+        assert all(code == code.lower() and len(code) < 80 for code in codes)
 
 
-# ---------------------------------------------------------------------------
-# ToolPolicyBlock
-# ---------------------------------------------------------------------------
+class TestStructuredBlock:
+    def test_has_stable_result_shape(self):
+        block = ToolPolicyBlock(
+            policy="tool_dispatch",
+            policy_code=PolicyDecisionCode.BLOCKED,
+            message="not authorized",
+        )
+        assert block.to_result() == {
+            "status": "blocked",
+            "error_type": "required_policy_block",
+            "policy": "tool_dispatch",
+            "policy_code": "policy_blocked",
+            "message": "not authorized",
+        }
 
-class TestToolPolicyBlock:
-    def test_block_has_required_fields(self):
-        block = ToolPolicyBlock(error_type="required_policy_block", policy="tool_dispatch", policy_code="BLOCKED")
-        assert block.error_type == "required_policy_block"
-        assert block.policy == "tool_dispatch"
-        assert block.policy_code == "BLOCKED"
+    def test_bounds_multibyte_message_at_construction(self):
+        block = ToolPolicyBlock(
+            policy="tool_dispatch",
+            policy_code=PolicyDecisionCode.BLOCKED,
+            message="一" * 400,
+        )
+        assert len(block.message.encode("utf-8")) <= MAX_POLICY_BLOCK_MESSAGE_BYTES
+        block.message.encode("utf-8")
 
-    def test_block_message_not_in_policy_block(self):
-        import dataclasses
-        fields = {f.name for f in dataclasses.fields(ToolPolicyBlock)}
-        assert "message" not in fields
+    def test_trims_before_bounding_message_at_construction(self):
+        block = ToolPolicyBlock(
+            policy="tool_dispatch",
+            policy_code=PolicyDecisionCode.BLOCKED,
+            message=" " * 1_100 + "reason",
+        )
+        assert block.message == "reason"
