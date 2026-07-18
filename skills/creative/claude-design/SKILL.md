@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [design, html, prototype, ux, ui, creative, artifact, deck, motion, design-system]
-    related_skills: [design-md, popular-web-designs, excalidraw, architecture-diagram]
+    related_skills: [design-md, popular-web-designs, excalidraw, architecture-diagram, apple-design]
 ---
 
 # Claude Design for CLI/API Agents
@@ -21,21 +21,24 @@ The goal is to preserve Claude Design's useful design behavior and taste while r
 
 ## When To Use This Skill vs `popular-web-designs` vs `design-md`
 
-Hermes has three design-related skills under `skills/creative/`. They do different jobs — load the right one (or combine them):
+Hermes has four design-related skills under `skills/creative/`. They do different jobs — load the right one (or combine them):
 
 | Skill | What it gives you | Use when the user wants... |
 |---|---|---|
 | **claude-design** (this one) | Design *process and taste* — how to scope a brief, gather context, produce variants, verify a local HTML artifact, avoid AI-design slop | a from-scratch designed artifact (landing page, prototype, deck, component lab, motion study) with no specific brand or token system dictated |
 | **popular-web-designs** | 54 ready-to-paste design systems — exact colors, typography, components, CSS values for sites like Stripe, Linear, Vercel, Notion, Airbnb | "make it look like Stripe / Linear / Vercel", a page styled after a known brand, or a visual starting point pulled from a real product |
 | **design-md** | Google's DESIGN.md spec format — author/validate/diff/export design-token files, WCAG contrast checking, Tailwind/DTCG export | a formal, persistent, machine-readable design-system *spec file* (tokens + rationale) that lives in a repo and gets consumed by agents over time |
+| **apple-design** | Physical interaction and material craft — direct manipulation, interruption, springs, velocity, momentum, boundaries, translucent depth, and accessibility alternatives | Apple-like or tactile behavior, drag/swipe/sheet interactions, snap points, interruptible motion, significant translucent materials, or a focused gesture/motion review |
 
 Rule of thumb:
 
 - **Process + taste, one-off artifact** → claude-design
 - **Match a known brand's look** → popular-web-designs (and let claude-design drive the process)
 - **Author the tokens spec itself** → design-md
+- **Physical interaction behavior** → claude-design + apple-design
+- **Significant translucent material behavior** → claude-design + apple-design
 
-These compose: use `popular-web-designs` for the visual vocabulary, `claude-design` for how to turn a brief into a thoughtful local HTML file, and `design-md` when the output is the token file rather than a rendered artifact.
+These compose: use `popular-web-designs` for the visual vocabulary, `claude-design` for how to turn a brief into a thoughtful local HTML file, `design-md` when the output is the token file rather than a rendered artifact, and `apple-design` for Apple-like, fluid, physical interaction and significant translucent material behavior — `claude-design` still supplies the general design-process layer, artifact format rules, composition, and verification.
 
 ## Runtime Mode
 
@@ -108,6 +111,25 @@ Use this skill for:
 - redesigns based on screenshots, repos, brand docs, or UI kits
 
 Do not use this skill for pure DESIGN.md token authoring unless the user specifically asks for a DESIGN.md file. Use `design-md` for that.
+
+## Physical Interaction Routing
+
+Load `apple-design` alongside this skill when the user explicitly wants an
+Apple-like, fluid, physical, or tactile interaction, or when the work involves
+drag, swipe, throw, flick, sheets, drawers, carousels, snap points,
+rubber-banding, live-value interruption, velocity handoff, momentum projection,
+focused gesture/motion review, or significant translucent-material behavior
+that needs reduced-transparency or higher-contrast alternatives.
+
+Do not load `apple-design` merely for static layout, spacing, hierarchy, color,
+copy, icons, ordinary responsive CSS, generic UI, or DESIGN.md token authoring.
+Typography or accessibility alone is also insufficient unless the task has
+Apple-style, physical-interaction, or significant translucent-material scope.
+
+When it does apply, keep this skill as the general design-process layer and use
+`apple-design` only for the qualifying physical-interaction or significant
+material behavior. Existing repository design contracts, tokens, component
+APIs, accessibility requirements, and measured evidence remain authoritative.
 
 ## Design Principle: Start From Context, Not Vibes
 

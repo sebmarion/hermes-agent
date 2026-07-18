@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_DIR = REPO_ROOT / "skills" / "creative" / "apple-design"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 REFERENCES_DIR = SKILL_DIR / "references"
+CLAUDE_DESIGN_MD = REPO_ROOT / "skills" / "creative" / "claude-design" / "SKILL.md"
 
 SOURCE_COMMIT = "56de6f5d6642f761b5e17629fccf53e303b3da9b"
 EXPECTED_DESCRIPTION = "Use when designing gesture-driven UI or physical web motion."
@@ -521,3 +522,49 @@ def test_package_adds_no_executable_or_dependency_payload() -> None:
     )
     assert not re.search(r"\b(?:npm|pnpm|yarn)\s+(?:install|add)\b", payload)
     assert not re.search(r"\bpip(?:3)?\s+install\b", payload)
+
+
+def test_related_design_skills_are_bidirectional(parsed_skill) -> None:
+    apple_frontmatter, _ = parsed_skill
+    claude_source = _read(CLAUDE_DESIGN_MD)
+    claude_frontmatter, _ = parse_frontmatter(claude_source)
+
+    assert "claude-design" in apple_frontmatter["metadata"]["hermes"]["related_skills"]
+    assert "apple-design" in claude_frontmatter["metadata"]["hermes"]["related_skills"]
+
+
+def test_claude_design_has_positive_and_negative_routing_boundaries() -> None:
+    source = _read(CLAUDE_DESIGN_MD)
+    routing = _plain(_section_body(source, "Physical Interaction Routing")).lower()
+
+    assert "| **apple-design**" in source
+    assert "## Physical Interaction Routing" in source
+    assert "load apple-design alongside this skill when" in routing
+    assert "do not load apple-design merely for static layout" in routing
+
+    for positive_pattern in (
+        r"\bdrag\b",
+        r"\bswipe\b",
+        r"\bsheets\b",
+        r"\bsnap points\b",
+        r"\bvelocity handoff\b",
+        r"\bmomentum projection\b",
+        r"\blive-value interruption\b",
+        r"\brubber-banding\b",
+        r"\bsignificant translucent-material behavior\b",
+        r"\breduced-transparency\b",
+        r"\bhigher-contrast\b",
+    ):
+        assert re.search(positive_pattern, routing), positive_pattern
+
+    for negative_term in (
+        "spacing",
+        "hierarchy",
+        "color",
+        "copy",
+        "icons",
+        "DESIGN.md",
+    ):
+        assert negative_term.lower() in routing
+
+    assert "typography or accessibility alone is also insufficient" in routing
