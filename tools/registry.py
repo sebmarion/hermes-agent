@@ -595,9 +595,25 @@ class ToolRegistry:
                 get_prepared_tool_runtime,
                 prepare_tool_runtime,
             )
-            from hermes_cli.middleware import registry_dispatch_policy_block
+            from hermes_cli.middleware import (
+                get_authorized_tool_dispatch,
+                registry_dispatch_policy_block,
+            )
 
-            runtime = prepared_runtime or get_prepared_tool_runtime()
+            runtime = prepared_runtime
+            ambient_runtime = get_prepared_tool_runtime()
+            authorization = get_authorized_tool_dispatch()
+            if (
+                runtime is None
+                and ambient_runtime is not None
+                and authorization is not None
+                and authorization.effective_cwd == ambient_runtime.effective_cwd
+                and authorization.effective_cwd_source
+                == ambient_runtime.effective_cwd_source
+                and authorization.effective_cwd_authoritative
+                == ambient_runtime.effective_cwd_authoritative
+            ):
+                runtime = ambient_runtime
             if runtime is None:
                 runtime = prepare_tool_runtime(
                     name,
