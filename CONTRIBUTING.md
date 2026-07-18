@@ -95,6 +95,11 @@ Publish these as a **standalone plugin repo** instead:
 
 - Implement the relevant ABC and use the existing plugin discovery path (`~/.hermes/plugins/`, project `.hermes/plugins/`, or a pip entry point) — see [Build a Hermes Plugin](https://hermes-agent.nousresearch.com/docs/guides/build-a-hermes-plugin)
 - Register lifecycle hooks (`pre_tool_call`, `post_tool_call`, `pre_llm_call`, `post_llm_call`, `on_session_start`, `on_session_end`), tools (`ctx.register_tool`), and CLI subcommands (`ctx.register_cli_command`) through the surface we already expose — no core changes needed
+- If the integration must fail closed before ordinary tool execution, use the
+  provider-neutral required-policy contract in
+  [`docs/middleware/README.md`](docs/middleware/README.md). Do not present a
+  fail-open observer hook or replacement-capable middleware as an enforcement
+  boundary.
 - If your plugin needs a capability the framework doesn't expose, that's a feature request to **widen the generic plugin surface** (a new hook or `ctx` method) — never special-case your plugin in core
 - Promote it in the [Nous Research Discord](https://discord.gg/NousResearch) `#plugins-skills-and-skins` channel so users can find and install it
 
@@ -874,6 +879,7 @@ Hermes has terminal access. Security matters.
 | **Write deny list** | Protected paths (`~/.ssh/authorized_keys`, `/etc/shadow`) resolved via `os.path.realpath()` to prevent symlink bypass |
 | **Skills guard** | Security scanner for hub-installed skills (`tools/skills_guard.py`) |
 | **Code execution sandbox** | `execute_code` child process runs with API keys stripped from environment |
+| **Required tool policy** | Explicitly configured plugin callbacks fail closed on the final ordinary tool args and prepared cwd; replacement middleware and human terminal commands remain outside that claim |
 | **Container hardening** | Docker: all capabilities dropped, no privilege escalation, PID limits, size-limited tmpfs |
 
 ### When contributing security-sensitive code
@@ -882,6 +888,11 @@ Hermes has terminal access. Security matters.
 - **Resolve symlinks** with `os.path.realpath()` before path-based access control checks
 - **Don't log secrets.** API keys, tokens, and passwords should never appear in log output
 - **Catch broad exceptions** around tool execution so a single failure doesn't crash the agent loop
+- **Do not overclaim policy coverage.** Required policies do not sandbox
+  arbitrary plugin Python, inspect operations nested inside `execute_code`, or
+  govern commands a human enters directly. Check `hermes plugins policy-status
+  --json` and keep `replacementExecutionAudited` false without a complete
+  conformance artifact.
 - **Test on all platforms** if your change touches file paths, process management, or shell commands
 
 If your PR affects security, note it explicitly in the description.
