@@ -125,6 +125,8 @@ Do not load `apple-design` merely for static layout, spacing, hierarchy, color,
 copy, icons, ordinary responsive CSS, generic UI, or DESIGN.md token authoring.
 Typography or accessibility alone is also insufficient unless the task has
 Apple-style, physical-interaction, or significant translucent-material scope.
+Known-brand matching already handled by `popular-web-designs` is also
+insufficient on its own.
 
 When it does apply, keep this skill as the general design-process layer and use
 `apple-design` only for the qualifying physical-interaction or significant

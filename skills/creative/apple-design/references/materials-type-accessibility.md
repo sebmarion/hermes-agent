@@ -42,6 +42,9 @@ vibration to a component that does not already have it.
 
 Visual feedback is always present. Multimodal feedback is always optional. The
 user must be able to complete the task without sound, haptics, or vibration.
+Require platform support and feature detection before calling the relevant
+APIs. When an API is unsupported, unavailable, or denied, omit that feedback
+and preserve the visual path without breaking the interaction.
 
 ## Reduced Motion
 

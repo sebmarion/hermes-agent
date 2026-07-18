@@ -356,6 +356,41 @@ def test_interaction_activation_semantics() -> None:
     assert "restores state" in lower, "must restore state"
 
 
+def test_input_samples_are_coalesced_into_frame_aligned_rendering() -> None:
+    """Input history and visual mutation must not be conflated."""
+    src = _read(REFERENCES_DIR / "interaction-physics.md")
+    immediate = _plain(_section_body(src, "Immediate and Continuous Response")).lower()
+    smoothness = _plain(_section_body(src, "Frame-Level Smoothness")).lower()
+
+    assert "retain" in immediate and "samples" in immediate
+    assert "velocity" in immediate
+    assert "latest interaction state" in immediate
+    assert re.search(
+        r"(?:at most|no more than) one (?:visual )?(?:mutation|update|render) "
+        r"per animation frame",
+        smoothness,
+    )
+    combined = f"{immediate} {smoothness}"
+    assert not re.search(
+        r"every (?:input )?sample.{0,80}(?:must be )?render(?:ed)?",
+        combined,
+    )
+
+
+def test_springs_are_limited_to_physical_interruptible_behavior() -> None:
+    """Spring guidance must not generalize to ordinary controls."""
+    src = _read(REFERENCES_DIR / "interaction-physics.md")
+    section = _plain(_section_body(src, "Springs as Behavior")).lower()
+
+    assert "direct manipulation" in section
+    assert "genuinely interruptible physical behavior" in section
+    assert "not the default for every clickable or touchable control" in section
+    assert not re.search(
+        r"(?<!not the )default for every (?:clickable|touchable|ordinary)",
+        section,
+    )
+
+
 def test_materials_accessibility_sections() -> None:
     """Positive accessibility checks in materials sections."""
     src = _read(REFERENCES_DIR / "materials-type-accessibility.md")
@@ -396,6 +431,17 @@ def test_materials_accessibility_sections() -> None:
             assert phrase not in s_lower, (
                 f"Found accessibility opt-out {phrase!r} in: {section_text}"
             )
+
+
+def test_multimodal_feedback_requires_support_and_graceful_degradation() -> None:
+    """Optional platform feedback must never become a runtime dependency."""
+    src = _read(REFERENCES_DIR / "materials-type-accessibility.md")
+    section = _plain(_section_body(src, "Multimodal Feedback")).lower()
+
+    assert "platform support" in section
+    assert "feature detection" in section
+    assert "unsupported" in section
+    assert "without breaking the interaction" in section
 
 
 def test_design_principles_human_needs_and_feedback() -> None:
@@ -486,6 +532,24 @@ def test_interaction_hysteresis_semantics() -> None:
     assert "does not restore tap candidacy" in lower
 
 
+def test_tap_cancellation_and_drag_recognition_are_separate_states() -> None:
+    """A reversible tap boundary must not contradict committed dragging."""
+    src = _read(REFERENCES_DIR / "interaction-physics.md")
+    section = _plain(_section_body(src, "Gesture Disambiguation and Cancellation"))
+    lower = section.lower()
+
+    assert "tap-cancellation boundary" in lower
+    assert "separate" in lower and "drag-recognition threshold" in lower
+    assert re.search(
+        r"do not use .*tap boundary alone as drag commitment",
+        lower,
+    )
+    assert re.search(
+        r"after drag commitment.*does not restore tap candidacy",
+        lower,
+    )
+
+
 def test_interaction_rubber_banding_no_10px() -> None:
     """Rubber-Banding at Boundaries must NOT contain 10px."""
     src = _read(REFERENCES_DIR / "interaction-physics.md")
@@ -568,3 +632,17 @@ def test_claude_design_has_positive_and_negative_routing_boundaries() -> None:
         assert negative_term.lower() in routing
 
     assert "typography or accessibility alone is also insufficient" in routing
+
+
+def test_claude_design_routes_known_brand_matching_away_from_apple() -> None:
+    source = _read(CLAUDE_DESIGN_MD)
+    routing = _plain(_section_body(source, "Physical Interaction Routing")).lower()
+
+    assert re.search(
+        r"known-brand matching.{0,120}popular-web-designs.{0,80}insufficient",
+        routing,
+    )
+    assert not re.search(
+        r"known-brand matching.{0,120}(?:load|use|add) apple-design",
+        routing,
+    )

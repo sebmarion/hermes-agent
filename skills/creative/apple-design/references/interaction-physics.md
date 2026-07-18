@@ -5,14 +5,16 @@
 
 ## Immediate and Continuous Response
 
-Every user gesture is sampled and rendered at the highest frame rate the
-target device can sustain. The user's expectation is that motion begins in the
-same frame their input begins and that the next frame carries the next sample.
-Anything that stalls that chain — a JavaScript main-thread task, a forced
-synchronous layout, or a compositor block on a non-atomic property — is a
-suspension of disbelief. Prefer `requestAnimationFrame`-driven loops,
-compositor-friendly properties (`transform`, `opacity`), and off-main-thread
-compositing wherever the project stack supports it.
+Retain timestamped input samples for velocity and history, and update the
+latest interaction state as samples arrive. Render that state at the highest
+frame rate the target device can sustain, coalescing samples into the next
+available animation frame when input arrives faster than display refresh. The
+user's expectation is that motion begins without perceptible delay and every
+rendered frame reflects the newest state. Avoid JavaScript main-thread stalls,
+forced synchronous layout, and compositor blocks on non-atomic properties.
+Prefer `requestAnimationFrame`-driven loops, compositor-friendly properties
+(`transform`, `opacity`), and off-main-thread compositing wherever the project
+stack supports it.
 
 If the target constraints cannot sustain smooth motion, a reduced or direct-state
 mechanism at the current position is appropriate. For motion loops that the stack
@@ -47,17 +49,19 @@ does not re-initiate motion on the other.
 
 ## Springs as Behavior
 
-A spring is the system's answer to "the thing should feel like it has weight,
-should slow itself down, and should arrive at the right place." The deterministic
-starting point is a critically damped spring with a damping ratio of `1.0`
-(no overshoot), with a response time in the range `0.3–0.4` seconds as the
-speed starting point. Reserve a damping ratio of approximately `0.8` for
-momentum-driven interactions such as flicks, throws, or drag releases, where a
-little overshoot and settle-back reinforces the sense of weight.
+A spring is appropriate when direct manipulation or genuinely interruptible
+physical behavior should carry weight, slow itself down, and arrive at the
+right place. It is not the default for every clickable or touchable control.
+For qualifying behavior, the deterministic starting point is a critically
+damped spring with a damping ratio of `1.0` (no overshoot), with a response time
+in the range `0.3–0.4` seconds as the speed starting point. Reserve a damping
+ratio of approximately `0.8` for momentum-driven interactions such as flicks,
+throws, or drag releases, where a little overshoot and settle-back reinforces
+the sense of weight.
 
-Springs are not decorative. They are the system's way of telling the user
-"the thing is real, it has mass, and it is going somewhere." Remove a spring
-only when removing it does not make the interaction feel cheaper.
+Springs are behavioral, not decorative. Use one only when the interaction's
+physical continuity benefits from it; ordinary control feedback should keep
+the product's existing transition or no-motion behavior.
 
 ## Velocity Sampling and Handoff
 
@@ -143,13 +147,17 @@ click/touch-up commits pointer activation; keyboard and assistive technology
 activation pathways remain intact. Cancellation suppresses activation or
 restores state.
 
-A tap remains a candidate while movement stays within approximately `10px` of
-gesture hysteresis. Dragging away can cancel a pending tap, and returning below
-the threshold before release can restore it while the gesture remains
-uncommitted. Once movement crosses the threshold, commit to a drag direction
-and track 1:1; after drag commitment, returning below the threshold does not
-restore tap candidacy. Detect plausible gestures in parallel, then cancel the
-losing interpretations once intent is clear.
+A tap remains a candidate while movement stays within a reversible
+tap-cancellation boundary, with approximately `10px` of gesture hysteresis as a
+starting point. Dragging away can cancel a pending tap, and returning below the
+threshold before release can restore it while the gesture remains uncommitted.
+Treat drag recognition as a separate state transition with its own
+drag-recognition threshold based on movement, direction, and competing scroll
+intent; do not use the reversible tap boundary alone as drag commitment. Once
+movement crosses the drag-recognition threshold, commit to a drag direction and
+track 1:1; after drag commitment, returning below the threshold does not restore
+tap candidacy. Detect plausible gestures in parallel, then cancel the losing
+interpretations once intent is clear.
 
 When the user cancels a gesture — by pressing Escape, by issuing a new
 command, by navigating away — the element must return to its pre-gesture
@@ -159,12 +167,13 @@ the pre-gesture position.
 
 ## Frame-Level Smoothness
 
-Motion must be smooth at the frame level. Every frame, every sample, every
-spring step must be rendered in a single frame. Use compositor-friendly
-properties (`transform`, `opacity`) for motion. Avoid non-compositor-friendly
-properties (`left`, `top`, `width`, `height`). If the target constraints
-cannot meet smooth motion, fall back to a reduced or static mechanism at the
-current position.
+Motion must be smooth at the frame level. Retain relevant input samples for
+state and velocity history, but make at most one visual mutation per animation
+frame and render the latest state. Advance each spring step once per frame. Use
+compositor-friendly properties (`transform`, `opacity`) for motion. Avoid
+non-compositor-friendly properties (`left`, `top`, `width`, `height`). If the
+target constraints cannot meet smooth motion, fall back to a reduced or static
+mechanism at the current position.
 
 `requestAnimationFrame` must be used for motion loops. If the stack cannot
 support `requestAnimationFrame`, fall back to a direct-state mechanism at the
