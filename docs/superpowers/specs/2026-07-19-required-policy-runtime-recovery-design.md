@@ -21,12 +21,13 @@ directory plugin in the same active `HERMES_HOME` and process. It also stops a
 turn deterministically when required-policy enforcement itself is unavailable.
 
 It does not hot-replace an already loaded plugin, hot-unload a disabled plugin,
-reload pip entry points, or claim full cross-profile plugin isolation. Hermes'
-general plugin registries include process-global tools, providers, platforms,
-and module names; solving per-profile isolation for every plugin capability is a
-separate architectural change. This recovery path therefore refuses plugins
-that need those global registration surfaces and never rebuilds the global
-plugin universe.
+reload pip entry points, or claim full cross-profile isolation for the ordinary
+plugin manager. Hermes' general plugin registries include process-global tools,
+providers, platforms, and module names; solving per-profile isolation for every
+plugin capability is a separate architectural change. This recovery path
+therefore refuses plugins that need those global registration surfaces, scopes
+its own recovered hooks/policies to one explicit home, and never rebuilds the
+global plugin universe.
 
 ## Considered Approaches
 
@@ -46,15 +47,26 @@ plugin universe.
 
 ### Restricted required-policy recovery
 
-At the start of each turn, before plugin lifecycle and `pre_llm_call` hooks,
-Hermes will best-effort reconcile configured required policies. Authorization
-will repeat the same reconciliation immediately before returning a missing or
-disabled-plugin block, covering an install that lands after turn setup.
+WebUI will bind its already resolved `_profile_home` through
+`hermes_constants.set_hermes_home_override()` for the exact
+`agent.run_conversation()` call and reset the token in `finally`. This is the
+explicit cross-thread handoff: recovery and later authorization never infer the
+turn's home from process-global `os.environ`, which another WebUI turn can
+change concurrently.
+
+At the start of each Agent turn, before plugin lifecycle and `pre_llm_call`
+hooks, Hermes will best-effort reconcile configured required policies for that
+explicit active home. Authorization will repeat the same reconciliation
+immediately before returning a missing or disabled-plugin block, covering an
+install that lands after turn setup.
 
 Recovery is serialized by one process-wide re-entrant lock. A recovery attempt
 captures the resolved `HERMES_HOME`, project-plugin enablement, project root,
-safe-mode state, and required-policy mapping once. The capture is checked again
-before publication; a changed context aborts fail-closed.
+safe-mode state, required-policy mapping, and the manager's recorded discovery
+home once. The capture is checked again before publication; a changed context
+or manager/home mismatch aborts fail-closed. Initial and forced discovery record
+the resolved home only after a successful sweep. This is provenance checking,
+not a claim that the ordinary global manager is profile-isolated.
 
 For each absent or never-loaded required plugin, Hermes resolves the current
 winner from an existing disabled manifest or by rescanning the active user and,
@@ -66,27 +78,40 @@ inside an existing directory. The candidate must:
 - be a directory plugin whose normal `register(ctx)` path has not already run;
 - register only hooks and required-policy callbacks during recovery.
 
-The plugin is imported and registered against a staging `PluginManager` through
-a restricted `PluginContext`. `register_hook` and `register_policy` are the only
-allowed registration methods. Access to any other `register_*` method raises a
-controlled load error before that context can mutate global tool, provider, or
-platform registries. The current `gitnexus-governor` qualifies: it registers
-hooks plus `tool_dispatch`, and no tools/providers/platforms.
+The plugin source is executed in a private staging module that is not installed
+under its canonical `hermes_plugins.*` name. Registration receives a detached,
+sealed context exposing only `register_hook` and `register_policy`. Access to
+any other `register_*` surface fails before that context can mutate global tool,
+provider, or platform registries. The current `gitnexus-governor` qualifies: it
+registers hooks plus `tool_dispatch`, and no tools/providers/platforms.
 
 Only after registration succeeds and every required callback exists does Hermes
-publish copied hook, policy-registration, and plugin maps to the live manager.
-The plugin map is the commit marker and is published last. Concurrent readers
-therefore see either the old missing plugin or a complete usable registration;
-concurrent recoverers converge on one load. Normal discovery, explicit
-`force=True`, and direct `_plugin_manager` test replacement keep their existing
-semantics.
+build a new frozen required-policy runtime snapshot. The snapshot contains
+home-scoped recovered plugins with immutable hook and policy-registration
+tuples and keeps their private modules alive. Publication is one reference swap
+under a short lock; readers capture one snapshot under that lock and release it
+before invoking callbacks. They therefore observe the complete old generation
+or complete new generation, never hooks from one and policies from another.
+
+Module-level hook accessors append only the recovered hooks whose home matches
+the current ContextVar override. Required-policy authorization resolves one
+plugin/policy pair from the same captured snapshot. It may consult the ordinary
+startup-discovered manager only when that manager has a known discovery home
+equal to the captured active home. If the discovery home is unknown or differs,
+authorization returns the existing stable `required_policy_plugin_load_error`
+infrastructure block without reading that manager's plugin, hook, or policy
+maps. Thus neither recovered nor ordinary manager state for home A is visible
+under home B. Normal discovery, explicit `force=True`, and direct
+`_plugin_manager` test replacement keep their existing semantics within a
+matching active home.
 
 This is monotonic. An enabled loaded plugin is never re-imported, and no loaded
 hook is removed. A candidate that is still absent/disabled, runs in safe mode,
 uses an unsupported registration surface, changes execution context during
-load, or fails to register the declared policy remains fail-closed with the
-existing stable required-policy failure codes. Tool-registry generation and the
-model's cached schema remain unchanged.
+load, comes from a home different from the manager's discovery home, or fails
+to register the declared policy remains fail-closed with the existing stable
+required-policy failure codes. Tool-registry generation and the model's cached
+schema remain unchanged.
 
 ### Trusted policy-block provenance
 
@@ -132,10 +157,10 @@ loop will:
 The text will not suggest install commands or expose exception/plugin details.
 Turn metadata will include `required_policy` with the structured safe block.
 
-For `required_policy_halt`, finalization will not run output transforms,
-`post_llm_call`, the completion explainer, or background memory/skill model
-review. Persistence, cleanup, session-end lifecycle, and non-model telemetry
-still run.
+For `required_policy_halt`, finalization will not run the file-mutation footer,
+output transforms, `post_llm_call`, the completion explainer, external-memory
+sync/prefetch, or background memory/skill model review. Persistence, cleanup,
+session-end lifecycle, pending-steer handoff, and non-model telemetry still run.
 
 ## Verification
 
@@ -145,8 +170,14 @@ Automated regressions will prove:
   then installed/enabled, and the next turn recovers it under the same PID;
 - the same recovery succeeds when a manifest was initially discovered but the
   plugin was not enabled;
-- concurrent recovery publishes one hook/callback set, detects a changed
-  captured home/project context, and leaves tool-registry generation unchanged;
+- paused and concurrent recovery proves snapshot readers see only a complete
+  old or new hook+policy generation, detects changed/mismatched home/project
+  context, and leaves tool-registry generation unchanged;
+- when home B requires the same plugin key as an ordinary manager discovered
+  under home A, authorization returns a stable infrastructure block and never
+  invokes A's callback;
+- WebUI binds the resolved profile home before `run_conversation`, resets it on
+  every exit, and concurrent turns cannot make recovery read another profile;
 - a recovery candidate that tries to register a tool/provider/platform remains
   fail-closed and does not publish partial hooks or policies;
 - an infrastructure block ends sequential and concurrent turns after one model
@@ -163,6 +194,7 @@ Live acceptance has two parts:
 1. Run an isolated-home single-process probe that performs initial discovery,
    creates/enables a harmless required-policy plugin, and successfully dispatches
    without restarting that PID.
-2. Sync only reviewed files into the installed Agent checkout, restart WebUI,
-   wait for `/health`, and execute a harmless real tool call under the configured
-   governor. Real `~/.hermes` state is preserved throughout.
+2. Sync only reviewed Agent files plus the narrow WebUI home-binding change into
+   their installed/runtime owners, restart WebUI, wait for `/health`, and execute
+   a harmless real tool call under the configured governor. Real `~/.hermes`
+   state is preserved throughout.
