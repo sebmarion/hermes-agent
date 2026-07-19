@@ -327,6 +327,17 @@ def build_turn_context(
             f"{'...' if len(_print_preview) > 60 else ''}'"
         )
 
+    # Reconcile newly installed/enabled required-policy plugins before either
+    # first-session lifecycle hooks (inside prompt construction below) or the
+    # per-turn pre_llm_call hook.  Recovery is best-effort here; dispatch-time
+    # authorization repeats it and produces the stable user-visible block.
+    try:
+        from hermes_cli.plugins import recover_required_policy_plugins
+
+        recover_required_policy_plugins()
+    except Exception:
+        logger.debug("required-policy turn-boundary recovery skipped", exc_info=True)
+
     # ── System prompt (cached per session for prefix caching) ──
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
