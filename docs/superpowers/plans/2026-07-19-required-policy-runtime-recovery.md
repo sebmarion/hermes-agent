@@ -4,7 +4,7 @@
 
 **Goal:** Make a long-lived Hermes process notice a newly installed/enabled required policy plugin without a restart, and deterministically stop a tool turn after a host policy-infrastructure block instead of asking the model to retry.
 
-**Architecture:** Add a restricted, monotonic hooks+policy recovery path alongside the existing global `PluginManager`; it stages a directory plugin and atomically publishes one immutable, home-scoped hook/policy snapshot without refreshing the global tool/provider/platform universe. WebUI binds its resolved profile home through the Agent's ContextVar for the whole turn. Separately, carry the concrete `ToolPolicyBlock` from both host producers through a ContextVar collector into the executor, then halt the conversation loop on every code except the explicit recoverable `policy_blocked` decision. Preserve one tool-result row per tool-call ID and bypass response rewriting/model review on the deterministic halt path.
+**Architecture:** Add a restricted, monotonic hooks+policy recovery path alongside the existing global `PluginManager`; it stages a standalone directory plugin with no declared tools and atomically publishes one immutable, home-scoped hook/policy snapshot without refreshing the global tool/provider/platform universe. WebUI binds its resolved profile home through the Agent's ContextVar for the whole turn. Separately, carry the concrete `ToolPolicyBlock` from both host producers through a ContextVar collector into the executor, then halt the conversation loop on every code except the explicit recoverable `policy_blocked` decision. Preserve one tool-result row per tool-call ID and bypass response rewriting/model review on the deterministic halt path.
 
 **Tech Stack:** Python 3.11-3.13, pytest through `./scripts/run_tests.sh`, ContextVars, thread-safe collectors, existing Hermes plugin and agent-loop contracts.
 
@@ -159,11 +159,12 @@ git commit -m "fix: halt required policy infrastructure failures"
 
 ---
 
-## Task 3: Recover a late hooks+policy directory plugin safely
+## Task 3: Recover a late hooks+policy standalone directory plugin safely
 
 **Files:**
 
 - Modify: `hermes_cli/plugins.py`
+- Modify: `hermes_cli/tool_policy.py`
 - Modify: `agent/turn_context.py`
 - Modify in clean WebUI worktree: `api/streaming.py`
 - Test: `tests/hermes_cli/test_required_tool_policy.py`
@@ -178,7 +179,7 @@ Add tests proving:
 - a manifest discovered as not enabled can be enabled later and recovered once;
 - simultaneous reconciliation invokes `register()` once and publishes one immutable home-scoped hook/policy generation;
 - the resolver sees a new `plugin.yaml` inside an already-existing user plugin root and respects project-over-user precedence only when project plugins are enabled;
-- safe mode, current disablement, undeclared policies, context drift, load failure, and non-directory entry points stay fail-closed;
+- safe mode, current disablement, undeclared policies, context drift, load failure, non-standalone kinds, declared tools, and non-directory entry points stay fail-closed before unsafe registration/import surfaces are reached;
 - a candidate that accesses any registration API other than `register_hook`/`register_policy` publishes no hooks/policies/plugins and leaves `tools.registry.registry._generation` unchanged;
 - a reader paused across publication observes a complete old or complete new generation, never mixed hooks/policies;
 - a snapshot published for home A is invisible under home B, and a manager/discovery-home mismatch refuses recovery;
@@ -234,7 +235,7 @@ In `hermes_cli/plugins.py`:
 
 - record the resolved discovery home only after a successful initial/forced manager sweep;
 - add a process-wide recovery `RLock` and immutable capture of resolved home, manager discovery home, project root/enablement, safe mode, and normalized required mapping;
-- select only absent or never-loaded directory candidates from an existing disabled manifest or a fresh user/project directory scan;
+- select only absent or never-loaded standalone directory candidates with no declared tools from an existing disabled manifest or a fresh user/project directory scan;
 - re-read enabled/disabled config, require every requested policy declaration, and reject already-loaded replacement/unload and entry-point recovery;
 - reject manager/home mismatches and revalidate the full capture before publication.
 
@@ -244,6 +245,8 @@ In `hermes_cli/plugins.py`:
 - execute the plugin in a private staging module without installing its canonical `hermes_plugins.*` name, validate all required registrations, and discard all staged state on failure;
 - build one frozen required-policy runtime snapshot containing immutable home-scoped plugin, hook, and policy tuples, then publish it with one reference swap under a short lock;
 - make module-level hook accessors and policy resolution capture the same snapshot and select only entries matching the current home override;
+- capture ordinary and recovered callback ownership atomically with forced discovery, preserve sorted first-block semantics, and copy the bound home ContextVar into policy executor workers;
+- retain UUID-scoped private modules when explicit force discovery supersedes recovered ownership so already-captured callbacks can finish lazy relative imports;
 - consult ordinary manager policy/plugin maps only when its recorded discovery home is known and equals the captured active home; otherwise return the stable `required_policy_plugin_load_error` block without touching those maps;
 - never call or modify `PluginManager._load_plugin()`, never call `discover_and_load(force=True)`, and never mutate the tool/provider/platform registries;
 - expose a best-effort `recover_required_policy_plugins()` for the turn boundary and invoke the same narrow recovery from `authorize_required_tool_policies()` before returning missing/disabled.
@@ -279,7 +282,7 @@ Expected: both commands PASS.
 Run `detect_changes()` in both worktrees, verify the recovery does not affect global tool-schema flows, then commit each logical patch:
 
 ```bash
-git add hermes_cli/plugins.py agent/turn_context.py tests/hermes_cli/test_required_tool_policy.py tests/hermes_cli/test_plugins.py
+git add hermes_cli/plugins.py hermes_cli/tool_policy.py agent/turn_context.py tests/hermes_cli/test_required_tool_policy.py tests/hermes_cli/test_plugins.py
 git commit -m "fix: recover late required policy plugins"
 ```
 

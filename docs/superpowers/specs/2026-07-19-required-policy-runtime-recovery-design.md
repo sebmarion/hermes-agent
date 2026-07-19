@@ -17,8 +17,9 @@ the model.
 ## Scope
 
 This change provides monotonic recovery for a newly installed or newly enabled
-directory plugin in the same active `HERMES_HOME` and process. It also stops a
-turn deterministically when required-policy enforcement itself is unavailable.
+standalone directory plugin in the same active `HERMES_HOME` and process. It
+also stops a turn deterministically when required-policy enforcement itself is
+unavailable.
 
 It does not hot-replace an already loaded plugin, hot-unload a disabled plugin,
 reload pip entry points, or claim full cross-profile isolation for the ordinary
@@ -75,7 +76,8 @@ inside an existing directory. The candidate must:
 
 - be currently enabled and not explicitly disabled;
 - declare every required policy in its manifest;
-- be a directory plugin whose normal `register(ctx)` path has not already run;
+- be a standalone directory plugin whose normal `register(ctx)` path has not
+  already run and whose manifest declares no tools;
 - register only hooks and required-policy callbacks during recovery.
 
 The plugin source is executed in a private staging module that is not installed
@@ -89,9 +91,11 @@ Only after registration succeeds and every required callback exists does Hermes
 build a new frozen required-policy runtime snapshot. The snapshot contains
 home-scoped recovered plugins with immutable hook and policy-registration
 tuples and keeps their private modules alive. Publication is one reference swap
-under a short lock; readers capture one snapshot under that lock and release it
-before invoking callbacks. They therefore observe the complete old generation
-or complete new generation, never hooks from one and policies from another.
+under a short lock. Hook and authorization readers capture the ordinary manager
+generation and recovered snapshot while holding the same recovery lock used by
+recovery and forced discovery, then release it before invoking callbacks. They
+therefore observe the complete old generation or complete new generation,
+never hooks from one and policies from another.
 
 Module-level hook accessors append only the recovered hooks whose home matches
 the current ContextVar override. Required-policy authorization resolves one
@@ -105,13 +109,26 @@ under home B. Normal discovery, explicit `force=True`, and direct
 `_plugin_manager` test replacement keep their existing semantics within a
 matching active home.
 
-This is monotonic. An enabled loaded plugin is never re-imported, and no loaded
-hook is removed. A candidate that is still absent/disabled, runs in safe mode,
-uses an unsupported registration surface, changes execution context during
-load, comes from a home different from the manager's discovery home, or fails
-to register the declared policy remains fail-closed with the existing stable
-required-policy failure codes. Tool-registry generation and the model's cached
-schema remain unchanged.
+Authorization freezes one sorted sequence containing either a concrete policy
+callback or a stable static block for each pair, stopping capture at the first
+static block. It then invokes captured callbacks outside the recovery lock in
+that same order. A concurrent force reload therefore cannot substitute another
+home or mix generations, while an earlier explicit callback block still wins
+over a later infrastructure failure. Callback executor workers receive a copy
+of the dispatch ContextVar context, so the callback observes the same bound
+home as the authorizing turn.
+
+This is monotonic during narrow recovery. An enabled loaded plugin is never
+re-imported, and no recovered hook is removed by another recovery attempt. A
+successful explicit `force=True` discovery atomically retires the matching
+home's recovered ownership after the ordinary generation is ready. UUID-named
+private modules remain retained for callbacks already in flight, including lazy
+relative imports, and cannot shadow the new canonical generation. A candidate
+that is still absent/disabled, runs in safe mode, uses an unsupported
+registration surface, changes execution context during load, comes from a home
+different from the manager's discovery home, or fails to register the declared
+policy remains fail-closed with the existing stable required-policy failure
+codes. Tool-registry generation and the model's cached schema remain unchanged.
 
 ### Trusted policy-block provenance
 
