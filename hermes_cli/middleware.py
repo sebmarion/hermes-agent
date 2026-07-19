@@ -97,6 +97,7 @@ class RequiredPolicyBlockCollector:
         self._active = True
         self._lock = threading.Lock()
         self._records: dict[str, RequiredPolicyBlockRecord] = {}
+        self._appended: set[str] = set()
 
     def record(self, tool_call_id: str, block: ToolPolicyBlock) -> bool:
         """Keep the first trusted block for *tool_call_id*."""
@@ -118,17 +119,33 @@ class RequiredPolicyBlockCollector:
         with self._lock:
             return self._records.get(tool_call_id)
 
+    def mark_appended(self, tool_call_id: str) -> bool:
+        """Mark that the recorded block became this call's transcript result."""
+        with self._lock:
+            if (
+                not self._active
+                or self._pid != os.getpid()
+                or tool_call_id not in self._records
+            ):
+                return False
+            self._appended.add(tool_call_id)
+            return True
+
     def first_terminal(
         self,
         tool_call_ids: Iterable[str],
+        *,
+        require_appended: bool = False,
     ) -> RequiredPolicyBlockRecord | None:
         """Choose the first non-recoverable block in assistant call order."""
         with self._lock:
             records = dict(self._records)
+            appended = frozenset(self._appended)
         for tool_call_id in tool_call_ids:
             record = records.get(tool_call_id)
             if (
                 record is not None
+                and (not require_appended or tool_call_id in appended)
                 and record.block.policy_code != PolicyDecisionCode.BLOCKED
             ):
                 return record
@@ -188,6 +205,14 @@ def get_required_policy_block_record(
     if collector is None:
         return None
     return collector.get(tool_call_id)
+
+
+def mark_required_policy_block_appended(tool_call_id: str) -> bool:
+    """Confirm that a trusted block was appended as this call's tool result."""
+    collector = _REQUIRED_POLICY_BLOCK_COLLECTOR.get()
+    if collector is None:
+        return False
+    return collector.mark_appended(tool_call_id)
 
 
 def _active_authorized_tool_dispatch() -> _AuthorizedToolDispatch | None:

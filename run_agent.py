@@ -5595,6 +5595,25 @@ class AIAgent:
         if decision.should_halt and self._tool_guardrail_halt_decision is None:
             self._tool_guardrail_halt_decision = decision
 
+    def _set_required_policy_halt(self, block) -> None:
+        """Record the first typed required-policy infrastructure failure."""
+        from hermes_cli.tool_policy import PolicyDecisionCode, ToolPolicyBlock
+
+        if (
+            isinstance(block, ToolPolicyBlock)
+            and block.policy_code != PolicyDecisionCode.BLOCKED
+            and self._required_policy_halt_block is None
+        ):
+            self._required_policy_halt_block = block
+
+    @staticmethod
+    def _required_policy_controlled_halt_response(block) -> str:
+        """Build the fixed host response for a policy-infrastructure halt."""
+        return (
+            "Hermes stopped this turn because required policy enforcement failed "
+            f"({block.policy_code}). The blocked tool did not run."
+        )
+
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         tool = decision.tool_name or "a tool"
         return (
@@ -5640,14 +5659,34 @@ class AIAgent:
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if not _should_parallelize_tool_batch(tool_calls):
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
+            from hermes_cli.middleware import bind_required_policy_block_collector
 
-            return self._execute_tool_calls_concurrent(
-                assistant_message, messages, effective_task_id, api_call_count
-            )
+            with bind_required_policy_block_collector() as collector:
+                if not _should_parallelize_tool_batch(tool_calls):
+                    result = self._execute_tool_calls_sequential(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                else:
+                    result = self._execute_tool_calls_concurrent(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                collector.close()
+                terminal = collector.first_terminal(
+                    (
+                        str(getattr(tool_call, "id", "") or "")
+                        for tool_call in tool_calls
+                    ),
+                    require_appended=True,
+                )
+                if terminal is not None:
+                    self._set_required_policy_halt(terminal.block)
+                return result
         finally:
             self._executing_tools = False
 

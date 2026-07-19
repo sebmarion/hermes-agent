@@ -4669,6 +4669,26 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                if agent._required_policy_halt_block is not None:
+                    block = agent._required_policy_halt_block
+                    failed = True
+                    _turn_exit_reason = "required_policy_halt"
+                    final_response = agent._required_policy_controlled_halt_response(block)
+                    agent._emit_status(
+                        "Required policy enforcement halted this turn "
+                        f"({block.policy_code})."
+                    )
+                    messages.append({"role": "assistant", "content": final_response})
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

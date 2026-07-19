@@ -694,9 +694,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
-            from hermes_cli.middleware import is_required_policy_block_result
+            from hermes_cli.middleware import get_required_policy_block_record
 
-            required_policy_blocked = is_required_policy_block_result(result)
+            required_policy_blocked = (
+                get_required_policy_block_record(
+                    str(getattr(tool_call, "id", "") or "")
+                )
+                is not None
+            )
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
@@ -1084,6 +1089,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # String results pass through unchanged.
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
         messages.append(make_tool_result_message(name, _tool_content, tc.id))
+        if r is not None:
+            from hermes_cli.middleware import mark_required_policy_block_appended
+
+            mark_required_policy_block_appended(
+                str(getattr(tc, "id", "") or "")
+            )
         _flush_session_db_after_tool_progress(
             agent,
             messages,
@@ -1610,9 +1621,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
-        from hermes_cli.middleware import is_required_policy_block_result
+        from hermes_cli.middleware import get_required_policy_block_record
+        from hermes_cli.tool_policy import PolicyDecisionCode
 
-        if is_required_policy_block_result(function_result):
+        _required_policy_record = get_required_policy_block_record(
+            str(getattr(tool_call, "id", "") or "")
+        )
+        if _required_policy_record is not None:
             _execution_blocked = True
 
         if isinstance(function_result, str):
@@ -1729,6 +1744,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         messages.append(make_tool_result_message(function_name, _tool_content, tool_call.id))
+        from hermes_cli.middleware import mark_required_policy_block_appended
+
+        mark_required_policy_block_appended(
+            str(getattr(tool_call, "id", "") or "")
+        )
         _flush_session_db_after_tool_progress(
             agent,
             messages,
@@ -1740,6 +1760,27 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # injection lands as soon as a tool finishes — not after the
         # entire batch.  The model sees it on the next API iteration.
         agent._apply_pending_steer_to_tool_results(messages, 1)
+
+        if (
+            _required_policy_record is not None
+            and _required_policy_record.block.policy_code != PolicyDecisionCode.BLOCKED
+        ):
+            for skipped_tc in assistant_message.tool_calls[i:]:
+                skipped_name = skipped_tc.function.name
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    (
+                        f"[Tool execution skipped — {skipped_name} was not started "
+                        "because required policy enforcement halted this turn]"
+                    ),
+                    skipped_tc.id,
+                ))
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"required-policy skipped tool result {skipped_name}",
+                )
+            break
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:

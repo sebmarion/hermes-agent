@@ -307,6 +307,24 @@ def test_collector_terminal_selection_is_typed_and_original_ordered():
     assert middleware_mod.record_required_policy_block("outside", unknown_terminal) is False
 
 
+def test_copied_context_cannot_record_after_collector_closes():
+    block = ToolPolicyBlock(
+        policy="tool_dispatch",
+        policy_code="required_policy_timeout",
+        message="Required policy timed out.",
+    )
+
+    with middleware_mod.bind_required_policy_block_collector() as collector:
+        copied = contextvars.copy_context()
+
+    assert copied.run(
+        middleware_mod.record_required_policy_block,
+        "call-late",
+        block,
+    ) is False
+    assert collector.get("call-late") is None
+
+
 def test_direct_registry_dispatch_fails_closed_when_policy_is_required(
     monkeypatch,
 ):
