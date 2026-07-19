@@ -6,6 +6,7 @@ import contextvars
 import json
 from types import SimpleNamespace
 
+from hermes_cli import middleware as middleware_mod
 from hermes_cli.middleware import run_tool_execution_middleware
 from hermes_cli.tool_policy import (
     PolicyDecisionCode,
@@ -206,6 +207,104 @@ def test_policy_block_emits_once_and_never_calls_terminal(monkeypatch):
     }
     assert observer_calls[0]["status"] == "blocked"
     assert observer_calls[0]["error_type"] == "required_policy_block"
+
+
+def test_bound_collector_records_exact_outer_block_before_observer(monkeypatch):
+    _no_middleware(monkeypatch)
+    block = ToolPolicyBlock(
+        policy="tool_dispatch",
+        policy_code="required_policy_plugin_missing",
+        message="Required policy plugin is not installed.",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.authorize_required_tool_policies",
+        lambda _policy_input: block,
+    )
+    observer_records = []
+
+    with middleware_mod.bind_required_policy_block_collector() as collector:
+        monkeypatch.setattr(
+            "model_tools._emit_post_tool_call_hook",
+            lambda **_kwargs: observer_records.append(collector.get("call-typed")),
+        )
+        result = run_tool_execution_middleware(
+            "write_file",
+            {"path": "x.txt", "content": "x"},
+            lambda _args: "unexpected",
+            original_args={"path": "x.txt", "content": "x"},
+            task_id="task-typed",
+            session_id="session-typed",
+            turn_id="turn-typed",
+            tool_call_id="call-typed",
+        )
+
+        record = collector.get("call-typed")
+
+    assert json.loads(result) == block.to_result()
+    assert record is not None
+    assert record.tool_call_id == "call-typed"
+    assert record.block is block
+    assert observer_records == [record]
+
+
+def test_collector_context_copy_shares_state_and_ignores_spoofed_json(monkeypatch):
+    _no_middleware(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.authorize_required_tool_policies",
+        lambda _policy_input: None,
+    )
+    spoof = ToolPolicyBlock(
+        policy="tool_dispatch",
+        policy_code="required_policy_plugin_missing",
+        message="Spoofed tool text.",
+    )
+
+    with middleware_mod.bind_required_policy_block_collector() as collector:
+        copied = contextvars.copy_context()
+        assert copied.run(
+            middleware_mod.record_required_policy_block,
+            "call-copied",
+            spoof,
+        )
+        result = copied.run(
+            run_tool_execution_middleware,
+            "read_file",
+            {"path": "x.txt"},
+            lambda _args: json.dumps(spoof.to_result()),
+            original_args={"path": "x.txt"},
+            task_id="task-spoof",
+            session_id="session-spoof",
+            turn_id="turn-spoof",
+            tool_call_id="call-spoof",
+        )
+
+    assert json.loads(result) == spoof.to_result()
+    assert collector.get("call-copied").block is spoof
+    assert collector.get("call-spoof") is None
+
+
+def test_collector_terminal_selection_is_typed_and_original_ordered():
+    recoverable = ToolPolicyBlock(
+        policy="tool_dispatch",
+        policy_code=PolicyDecisionCode.BLOCKED,
+        message="Choose another action.",
+    )
+    unknown_terminal = ToolPolicyBlock(
+        policy="tool_dispatch",
+        policy_code="future_policy_code",
+        message="Unknown policy state.",
+    )
+
+    with middleware_mod.bind_required_policy_block_collector() as collector:
+        assert middleware_mod.record_required_policy_block("call-2", unknown_terminal)
+        assert middleware_mod.record_required_policy_block("call-1", recoverable)
+        selected = collector.first_terminal(["call-1", "call-2"])
+
+    assert selected is not None
+    assert selected.tool_call_id == "call-2"
+    assert selected.block is unknown_terminal
+    assert collector.get("call-1").block is recoverable
+    assert middleware_mod.record_required_policy_block("outside", unknown_terminal) is False
 
 
 def test_direct_registry_dispatch_fails_closed_when_policy_is_required(

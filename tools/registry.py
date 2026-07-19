@@ -597,6 +597,7 @@ class ToolRegistry:
             )
             from hermes_cli.middleware import (
                 get_authorized_tool_dispatch,
+                record_required_policy_block,
                 registry_dispatch_policy_block,
             )
 
@@ -631,6 +632,7 @@ class ToolRegistry:
                 prepared_runtime=runtime,
             )
             if policy_block is not None:
+                record_required_policy_block(str(tool_call_id or ""), policy_block)
                 return json.dumps(policy_block.to_result(), ensure_ascii=False)
             with bind_prepared_tool_runtime(runtime):
                 if entry.is_async:

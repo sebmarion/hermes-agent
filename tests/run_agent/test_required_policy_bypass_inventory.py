@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_cli import middleware as middleware_mod
 from hermes_cli.middleware import run_tool_execution_middleware
 from hermes_cli.tool_policy import PolicyDecisionCode
 from tools.registry import ToolRegistry
@@ -168,6 +169,39 @@ def test_direct_registry_call_is_a_stable_negative_probe(
     )
 
     assert result["policy_code"] == PolicyDecisionCode.BINDING_MISSING
+    assert handler_calls == []
+
+
+def test_registry_binding_failure_records_typed_block_when_collector_is_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _required_config(monkeypatch)
+    registry = ToolRegistry()
+    handler_calls = []
+    registry.register(
+        name="probe",
+        toolset="test",
+        schema={"name": "probe", "parameters": {"type": "object"}},
+        handler=lambda args, **_kwargs: handler_calls.append(args) or "handled",
+    )
+
+    with middleware_mod.bind_required_policy_block_collector() as collector:
+        result = json.loads(
+            registry.dispatch(
+                "probe",
+                {"value": 1},
+                task_id="task-typed",
+                session_id="session-typed",
+                turn_id="turn-typed",
+                tool_call_id="call-typed",
+            )
+        )
+        record = collector.get("call-typed")
+
+    assert result["policy_code"] == PolicyDecisionCode.BINDING_MISSING
+    assert record is not None
+    assert record.tool_call_id == "call-typed"
+    assert record.block.to_result() == result
     assert handler_calls == []
 
 
