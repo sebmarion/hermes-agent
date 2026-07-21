@@ -188,6 +188,24 @@ class TestProjectFacts:
         assert "make test" in block
         assert "make deploy" not in block
 
+    def test_style_scripts_surface_as_verify_commands(self, tmp_path):
+        """style:contract / style:css should surface as verify commands."""
+        _git_init(tmp_path)
+        (tmp_path / "package.json").write_text(
+            json.dumps({"scripts": {
+                "style:contract": "node scripts/check-visual-style-contract.cjs",
+                "style:css": "node scripts/check-css-token-discipline.cjs",
+                "style:full": "npm run style:contract && npm run style:css",
+                "dev": "vite",
+            }})
+        )
+        (tmp_path / "pnpm-lock.yaml").write_text("")
+        f = cc.detect_project_facts(tmp_path)
+        assert "pnpm run style:contract" in f.verify_commands
+        assert "pnpm run style:css" in f.verify_commands
+        # style:full is a composite — still surfaces because it's style-prefixed
+        assert "pnpm run style:full" in f.verify_commands
+
     def test_context_files_listed(self, tmp_path):
         _git_init(tmp_path)
         (tmp_path / "AGENTS.md").write_text("# rules")

@@ -147,12 +147,12 @@ _JS_LOCKFILES = (
 )
 
 # package.json scripts / Makefile targets worth surfacing as verify commands.
-_VERIFY_TARGETS = ("test", "tests", "lint", "typecheck", "check", "build", "fmt", "format")
+_VERIFY_TARGETS = ("test", "tests", "lint", "typecheck", "check", "build", "fmt", "format", "style")
 # Scripts that start with a verify target followed by a separator are also
 # verify commands (e.g. ``test:unit``, ``test:ci``, ``lint:css``).  This lets
 # projects with namespaced script names produce verification events.
 _VERIFY_PREFIX_SEPARATOR = (":", "-")
-_MAX_VERIFY_COMMANDS = 8
+_MAX_VERIFY_COMMANDS = 12
 _MAX_FACT_FILE_BYTES = 256 * 1024
 
 _GIT_TIMEOUT = 2.5
