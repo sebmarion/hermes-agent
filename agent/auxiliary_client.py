@@ -1023,9 +1023,11 @@ class _CodexCompletionsAdapter:
             # ourselves from ``response.output_item.done`` makes us
             # structurally immune to that drift.
             from agent.codex_runtime import _consume_codex_event_stream
+            from agent.codex_responses_adapter import validate_raw_responses_reasoning_effort
 
             stream_kwargs = dict(resp_kwargs)
             stream_kwargs["stream"] = True
+            validate_raw_responses_reasoning_effort(stream_kwargs)
 
             def _on_each_event(_event: Any) -> None:
                 # Re-check timeout/cancellation per event, matching the

@@ -13,6 +13,7 @@ from agent.verification_stop import (
     build_verify_on_stop_nudge,
     verify_on_stop_enabled,
 )
+from gateway.session_context import reset_session_vars
 
 
 def _node_project(root: Path) -> None:
@@ -30,11 +31,13 @@ def _make_project(root: Path) -> None:
 
 @pytest.fixture
 def clear_verify_env(monkeypatch):
-    """Clear every env signal verify_on_stop_enabled consults.
+    """Start each surface-resolution test in a fresh session context.
 
-    Tests then set only the variable they exercise, mirroring how the CLI/TUI
-    set HERMES_SESSION_SOURCE and the gateway sets HERMES_SESSION_PLATFORM.
+    ``get_session_env`` intentionally ignores process-global values once a
+    gateway context is cleared, so reset to its ``_UNSET`` state before tests
+    that exercise CLI/cron environment fallback behavior.
     """
+    reset_session_vars()
     for var in (
         "HERMES_VERIFY_ON_STOP",
         "HERMES_PLATFORM",
@@ -42,7 +45,10 @@ def clear_verify_env(monkeypatch):
         "HERMES_SESSION_SOURCE",
     ):
         monkeypatch.delenv(var, raising=False)
-    return monkeypatch
+    try:
+        yield monkeypatch
+    finally:
+        reset_session_vars()
 
 
 def test_verify_on_stop_default_is_auto(clear_verify_env):
@@ -311,7 +317,7 @@ def test_nudge_attempts_are_bounded(tmp_path, monkeypatch):
     ) is None
 
 
-def test_budget_exhaustion_response_is_incomplete_continuation_brief(tmp_path, monkeypatch):
+def test_budget_exhaustion_response_is_recovery_handoff(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     _node_project(tmp_path)
     changed = str(tmp_path / "src" / "app.ts")
@@ -325,10 +331,12 @@ def test_budget_exhaustion_response_is_incomplete_continuation_brief(tmp_path, m
     )
 
     assert response is not None
-    assert response.startswith("INCOMPLETE:")
+    assert response.startswith("RECOVERY_REQUIRED:")
     assert "Budget: 3/3" in response
     assert changed in response
     assert "`pnpm run test`" in response
+    assert "Recovery prompt:" in response
+    assert "Do not plan broadly" in response
     assert "Report PASS only with same-run" in response
 
 

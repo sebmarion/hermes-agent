@@ -3677,6 +3677,17 @@ class TestCodexAdapterReasoningTranslation:
         )
         assert captured.get("reasoning") == {"effort": "high", "summary": "auto"}
 
+    def test_reasoning_effort_ultra_is_rejected_before_raw_create(self):
+        adapter, captured = self._build_adapter()
+
+        with pytest.raises(ValueError, match="Ultra|ultra|app-server"):
+            adapter.create(
+                messages=[{"role": "user", "content": "hi"}],
+                extra_body={"reasoning": {"effort": "ultra"}},
+            )
+
+        assert captured == {}
+
     def test_reasoning_disabled_omits_reasoning_and_include(self):
         adapter, captured = self._build_adapter()
         adapter.create(

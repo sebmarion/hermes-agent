@@ -21,6 +21,7 @@ import math
 import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from typing import TypeAlias
 
@@ -549,7 +550,11 @@ def run_required_policy(
             _required_policy_slots.release()
 
     try:
-        future = _required_policy_executor.submit(_run_and_release)
+        policy_context = copy_context()
+        future = _required_policy_executor.submit(
+            policy_context.run,
+            _run_and_release,
+        )
     except Exception:
         _required_policy_slots.release()
         _quarantine_required_policy(quarantine_key)

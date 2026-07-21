@@ -233,6 +233,7 @@ def build_turn_context(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
+    agent._required_policy_halt_block = None
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()
@@ -325,6 +326,17 @@ def build_turn_context(
             f"💬 Starting conversation: '{_print_preview[:60]}"
             f"{'...' if len(_print_preview) > 60 else ''}'"
         )
+
+    # Reconcile newly installed/enabled required-policy plugins before either
+    # first-session lifecycle hooks (inside prompt construction below) or the
+    # per-turn pre_llm_call hook.  Recovery is best-effort here; dispatch-time
+    # authorization repeats it and produces the stable user-visible block.
+    try:
+        from hermes_cli.plugins import recover_required_policy_plugins
+
+        recover_required_policy_plugins()
+    except Exception:
+        logger.debug("required-policy turn-boundary recovery skipped", exc_info=True)
 
     # ── System prompt (cached per session for prefix caching) ──
     if agent._cached_system_prompt is None:

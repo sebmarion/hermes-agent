@@ -2265,6 +2265,11 @@ def _write_config_key(key_path: str, value):
             current[key] = {}
         current = current[key]
     current[keys[-1]] = value
+    if key_path == "agent.reasoning_effort":
+        # Ultra is an execution mode layered on canonical effort=max. Any
+        # ordinary global effort selection must clear that mode in the same
+        # config write or the next process can resurrect Ultra accidentally.
+        current.pop("reasoning_mode", None)
     _save_cfg(cfg)
 
 
@@ -8487,6 +8492,34 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+_TOOL_LIMIT_CONTINUATION_MARKER = "[HERMES INTERNAL AUTO-CONTINUATION]"
+_TOOL_LIMIT_CONTINUATION_SOURCE = "tool_limit_continuation"
+
+
+def _tool_limit_reached(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    reason = str(result.get("turn_exit_reason") or "").strip().lower()
+    return reason.startswith("max_iterations_reached(")
+
+
+def _next_tool_limit_continuation(result: Any, text: Any) -> str | None:
+    """Return one bounded server-authored continuation after budget exhaustion."""
+    if not _tool_limit_reached(result):
+        return None
+    if isinstance(text, str) and _TOOL_LIMIT_CONTINUATION_MARKER in text:
+        return None
+    return (
+        f"{_TOOL_LIMIT_CONTINUATION_MARKER} Attempt 1/1. "
+        "This is server control, not a user message.\n\n"
+        "Continue the original task autonomously. Re-read the conversation and actual "
+        "workspace state, finish the remaining work, and rerun pending verification from "
+        "scratch. Do not ask the user to type continue or copy a recovery prompt. Stop only "
+        "when the task is verified complete, a real user decision is required, an external "
+        "blocker is confirmed, or this bounded continuation also reaches its limit."
+    )
+
+
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -8508,6 +8541,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        tool_limit_followup = None
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -8742,7 +8776,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 raw = str(result)
                 status = "complete"
 
+            tool_limit_followup = _next_tool_limit_continuation(result, text)
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if tool_limit_followup:
+                payload["auto_continuing"] = True
+                payload["continuation_source"] = _TOOL_LIMIT_CONTINUATION_SOURCE
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -8912,6 +8950,26 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
         if _drain_queued_prompt(rid, sid, session):
+            return
+
+        # Budget exhaustion is an implementation boundary, not a user decision.
+        # Start one bounded successor turn after releasing the running guard.
+        # A queued user prompt still wins via _drain_queued_prompt above.
+        if tool_limit_followup:
+            with session["history_lock"]:
+                if session.get("running"):
+                    return
+                session["running"] = True
+            try:
+                _run_prompt_submit(rid, sid, session, tool_limit_followup)
+            except Exception as _cont_exc:
+                print(
+                    f"[tui_gateway] tool-limit continuation dispatch failed: "
+                    f"{type(_cont_exc).__name__}: {_cont_exc}",
+                    file=sys.stderr,
+                )
+                with session["history_lock"]:
+                    session["running"] = False
             return
 
         # Chain a goal-continuation turn if the judge said so. We do
@@ -13254,6 +13312,14 @@ def _browser_connect(rid, params: dict) -> dict:
                     hint = launch.hint
                     if hint:
                         announce(hint, level="error")
+                    from hermes_cli.browser_connect import get_chrome_debug_candidates
+                    if not get_chrome_debug_candidates(system):
+                        announce(
+                            "No supported Chromium-family browser executable was found in this environment.",
+                            level="error",
+                        )
+                    # launch.hint may be generic; always surface the actionable
+                    # executable/remote-debugging guidance from the shared helper.
                     for line in _failure_messages(url, port, system)[1:]:
                         announce(line, level="error")
                     return _ok(

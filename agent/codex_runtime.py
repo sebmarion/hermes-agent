@@ -25,6 +25,54 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+_CODEX_COLLAB_TOOL_NAMES = {
+    "spawnAgent": "codex.spawn_agent",
+    "sendInput": "codex.send_message",
+    "resumeAgent": "codex.resume_agent",
+    "wait": "codex.wait_agent",
+    "closeAgent": "codex.close_agent",
+}
+
+
+def _codex_collab_tool_args(item: dict) -> dict:
+    """Return bounded, user-relevant arguments for a Codex collab item."""
+    args = {
+        "prompt": item.get("prompt"),
+        "model": item.get("model"),
+        "reasoning_effort": item.get("reasoningEffort"),
+        "sender_thread_id": item.get("senderThreadId"),
+        "receiver_thread_ids": item.get("receiverThreadIds") or [],
+    }
+    return {key: value for key, value in args.items() if value not in (None, "", [])}
+
+
+def _codex_collab_structured_event(note: dict) -> dict | None:
+    """Map Codex collab start/completion notes to Hermes callback fields."""
+    if not isinstance(note, dict) or note.get("method") not in {
+        "item/started",
+        "item/completed",
+    }:
+        return None
+    item = (note.get("params") or {}).get("item") or {}
+    if not isinstance(item, dict) or item.get("type") != "collabAgentToolCall":
+        return None
+    item_id = str(item.get("id") or "").strip()
+    tool_name = _CODEX_COLLAB_TOOL_NAMES.get(str(item.get("tool") or ""))
+    if not item_id or not tool_name:
+        return None
+    return {
+        "phase": "started" if note.get("method") == "item/started" else "completed",
+        "id": item_id,
+        "name": tool_name,
+        "args": _codex_collab_tool_args(item),
+        "result": {
+            "status": item.get("status"),
+            "receiver_thread_ids": item.get("receiverThreadIds") or [],
+            "agents_states": item.get("agentsStates") or {},
+        },
+    }
+
+
 def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
     """Map a Codex app-server ``item/started`` notification to a Hermes
     tool-progress event ``(tool_name, preview, args)``.
@@ -76,6 +124,14 @@ def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
         if not isinstance(args, dict):
             args = {"arguments": args}
         return tool, tool, args
+
+    if item_type == "collabAgentToolCall":
+        tool_name = _CODEX_COLLAB_TOOL_NAMES.get(str(item.get("tool") or ""))
+        if not tool_name:
+            return None
+        prompt = str(item.get("prompt") or "").strip()
+        preview = prompt[:240] if prompt else tool_name.removeprefix("codex.")
+        return tool_name, preview, _codex_collab_tool_args(item)
 
     return None
 
@@ -249,6 +305,32 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
 
+    reasoning_config = getattr(agent, "reasoning_config", None)
+    turn_effort = None
+    if isinstance(reasoning_config, dict):
+        if reasoning_config.get("enabled") is False:
+            # turn/start effort overrides are sticky on a reused Codex thread;
+            # omission would preserve the preceding Max/Ultra selection.
+            turn_effort = "none"
+        else:
+            turn_effort = str(reasoning_config.get("effort") or "").strip() or None
+    requires_multi_agent = str(turn_effort or "").strip().lower() == "ultra"
+
+    existing_session = getattr(agent, "_codex_session", None)
+    if (
+        existing_session is not None
+        and requires_multi_agent
+        and not bool(getattr(existing_session, "multi_agent_enabled", False))
+    ):
+        # Upgrade a session created before Ultra was selected. Feature flags
+        # are process-scoped, so the existing subprocess cannot be upgraded by
+        # a turn/start field alone.
+        try:
+            existing_session.close()
+        except Exception:
+            pass
+        agent._codex_session = None
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
@@ -290,6 +372,32 @@ def run_codex_app_server_turn(
             # Bridge Codex app-server item/started notifications to Hermes
             # tool-progress so gateways show verbose "running X" breadcrumbs
             # on this route too (#38835).
+            structured = _codex_collab_structured_event(note)
+            if structured is not None:
+                if structured["phase"] == "started":
+                    start_callback = getattr(agent, "tool_start_callback", None)
+                    if callable(start_callback):
+                        try:
+                            start_callback(
+                                structured["id"],
+                                structured["name"],
+                                structured["args"],
+                            )
+                        except Exception:
+                            logger.debug("codex structured tool-start callback raised", exc_info=True)
+                else:
+                    complete_callback = getattr(agent, "tool_complete_callback", None)
+                    if callable(complete_callback):
+                        try:
+                            complete_callback(
+                                structured["id"],
+                                structured["name"],
+                                structured["args"],
+                                structured["result"],
+                            )
+                        except Exception:
+                            logger.debug("codex structured tool-complete callback raised", exc_info=True)
+
             progress_callback = getattr(agent, "tool_progress_callback", None)
             if progress_callback is None:
                 return
@@ -304,6 +412,7 @@ def run_codex_app_server_turn(
 
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            enable_multi_agent=requires_multi_agent,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -317,7 +426,11 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            model=str(getattr(agent, "model", "") or "").strip() or None,
+            effort=turn_effort,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -753,6 +866,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     the terminal event's ``output`` field.
     """
     import httpx as _httpx
+    from agent.codex_responses_adapter import validate_raw_responses_reasoning_effort
+
+    # This is the last shared raw-Responses boundary, after request and
+    # execution middleware may have replaced the payload built by transport.
+    validate_raw_responses_reasoning_effort(api_kwargs)
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1

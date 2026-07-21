@@ -74,6 +74,39 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _emit_turn_end_hook(
+    agent,
+    *,
+    task_id: Optional[str],
+    turn_id: Optional[str],
+    completed: bool,
+    interrupted: bool,
+) -> None:
+    """Emit one lifecycle close for every turn that reached the loop body.
+
+    The loop has several intentional early returns and can also raise after
+    turn setup. Keeping this at the public turn boundary makes the lifecycle
+    hook independent of which branch produced the result.
+    """
+    if not turn_id:
+        return
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(
+            "on_session_end",
+            session_id=getattr(agent, "session_id", None),
+            task_id=task_id,
+            turn_id=turn_id,
+            completed=completed,
+            interrupted=interrupted,
+            model=getattr(agent, "model", None),
+            platform=getattr(agent, "platform", None) or "",
+        )
+    except Exception as exc:
+        logger.warning("on_session_end hook failed: %s", exc)
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -515,7 +548,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
-def run_conversation(
+def _run_conversation(
     agent,
     user_message: str,
     system_message: str = None,
@@ -525,6 +558,7 @@ def run_conversation(
     persist_user_message: Optional[str] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    bestplan_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -547,6 +581,19 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    if bestplan_config is None and isinstance(user_message, str):
+        from agent.bestplan_orchestrator import TURN_MARKER
+        if user_message.startswith(TURN_MARKER):
+            marker_end = user_message.find("\x00", len(TURN_MARKER))
+            if marker_end > len(TURN_MARKER):
+                try:
+                    bestplan_config = json.loads(user_message[len(TURN_MARKER):marker_end])
+                    user_message = user_message[marker_end + 1 :].lstrip()
+                    if persist_user_message is None:
+                        persist_user_message = user_message
+                except json.JSONDecodeError:
+                    bestplan_config = {"enabled": False}
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -596,6 +643,38 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    # Host-owned BestPlan is a one-shot branch after canonical turn setup and
+    # before ordinary app-server/MoA/model execution. The parent model and
+    # toolset are never mutated; only the synthesized response is finalized.
+    if bestplan_config is not None:
+        from agent.bestplan_orchestrator import run_bestplan
+        outcome = run_bestplan(agent, user_message, **bestplan_config)
+        response = outcome.get("final_response") or (
+            "BestPlan unavailable: " + str(outcome.get("error", "unknown error"))
+        )
+        agent._bestplan_receipt_metadata = {
+            "bestplan_receipt_version": 1,
+            "run_id": outcome.get("run_id"),
+            "body_sha256": outcome.get("body") and __import__("hashlib").sha256(outcome["body"].encode()).hexdigest(),
+        }
+        from agent.turn_finalizer import finalize_turn
+        return finalize_turn(
+            agent,
+            final_response=response,
+            api_call_count=0,
+            interrupted=False,
+            failed=outcome.get("status") != "completed",
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=False,
+            _turn_exit_reason="bestplan",
+            preserve_final_response=True,
+        )
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -4669,6 +4748,26 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                if agent._required_policy_halt_block is not None:
+                    block = agent._required_policy_halt_block
+                    failed = True
+                    _turn_exit_reason = "required_policy_halt"
+                    final_response = agent._required_policy_controlled_halt_response(block)
+                    agent._emit_status(
+                        "Required policy enforcement halted this turn "
+                        f"({block.policy_code})."
+                    )
+                    messages.append({"role": "assistant", "content": final_response})
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
@@ -5186,6 +5285,7 @@ def run_conversation(
                             agent._resolved_is_coding = coding
                         _verify_nudge2 = get_pre_verify_continue_message(
                             session_id=getattr(agent, "session_id", None) or "",
+                            turn_id=getattr(agent, "_current_turn_id", "") or "",
                             platform=getattr(agent, "platform", "") or "",
                             model=getattr(agent, "model", "") or "",
                             coding=coding,
@@ -5300,6 +5400,47 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
     )
 
+
+
+def run_conversation(
+    agent,
+    user_message: str,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    task_id: str = None,
+    stream_callback: Optional[callable] = None,
+    persist_user_message: Optional[str] = None,
+    persist_user_timestamp: Optional[float] = None,
+    moa_config: Optional[dict[str, Any]] = None,
+    bestplan_config: Optional[dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one turn and close its lifecycle on every return or exception."""
+    # Do not let a setup failure close the previous turn using stale identity.
+    agent._current_turn_id = None
+    agent._current_task_id = None
+    result = None
+    try:
+        result = _run_conversation(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            persist_user_timestamp=persist_user_timestamp,
+            moa_config=moa_config,
+            bestplan_config=bestplan_config,
+        )
+        return result
+    finally:
+        _emit_turn_end_hook(
+            agent,
+            task_id=getattr(agent, "_current_task_id", None) or task_id,
+            turn_id=getattr(agent, "_current_turn_id", None),
+            completed=bool(result and result.get("completed")),
+            interrupted=bool(result and result.get("interrupted")),
+        )
 
 
 __all__ = ["run_conversation"]

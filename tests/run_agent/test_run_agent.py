@@ -1336,7 +1336,7 @@ class TestBuildSystemPrompt:
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""
 
-    def _make_agent(self, model="openai/gpt-4.1", tool_use_enforcement="auto"):
+    def _make_agent(self, model="openai/gpt-4.1", tool_use_enforcement="auto", platform="cli"):
         """Create an agent with tools and a specific enforcement config."""
         with (
             patch(
@@ -1357,6 +1357,7 @@ class TestToolUseEnforcementConfig:
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
+                platform=platform,
             )
             a.client = MagicMock()
             return a
@@ -1372,6 +1373,16 @@ class TestToolUseEnforcementConfig:
         agent = self._make_agent(model="openai/codex-mini", tool_use_enforcement="auto")
         prompt = agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
+
+    def test_subagent_forces_execution_semantics_even_when_user_config_disables_them(self):
+        agent = self._make_agent(
+            model="glm-4.7-flash",
+            tool_use_enforcement=False,
+            platform="subagent",
+        )
+
+        assert agent._tool_use_enforcement is True
+        assert agent._intent_ack_continuation is True
 
     def test_auto_skips_for_claude(self):
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE

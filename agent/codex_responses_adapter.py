@@ -23,6 +23,42 @@ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 logger = logging.getLogger(__name__)
 
 
+def validate_raw_responses_reasoning_effort(payload: Dict[str, Any]) -> None:
+    """Reject Codex-only Ultra at the final raw Responses boundary.
+
+    ``ultra`` is valid as a Codex app-server turn control, but the shared
+    Responses API accepts provider reasoning efforts only through ``max``.
+    Check both normal kwargs and SDK ``extra_body``/``body`` escape hatches so
+    late middleware or auxiliary adapters cannot reintroduce the invalid value.
+    """
+    if not isinstance(payload, dict):
+        return
+    containers = [payload]
+    seen: set[int] = set()
+    while containers:
+        container = containers.pop()
+        if not isinstance(container, dict) or id(container) in seen:
+            continue
+        seen.add(id(container))
+        candidates = [
+            container.get("reasoning_effort"),
+            container.get("reasoning.effort"),
+        ]
+        reasoning = container.get("reasoning")
+        if isinstance(reasoning, dict):
+            candidates.append(reasoning.get("effort"))
+        if any(str(value or "").strip().lower() == "ultra" for value in candidates):
+            raise ValueError(
+                "Reasoning effort 'ultra' is a Codex app-server control, not a raw "
+                "Responses API effort. Raw provider requests support efforts only "
+                "through 'max'; route Sol Ultra through codex_app_server."
+            )
+        for nested_key in ("extra_body", "body"):
+            nested = container.get(nested_key)
+            if isinstance(nested, dict):
+                containers.append(nested)
+
+
 def _classify_responses_issuer(
     *,
     is_xai_responses: bool = False,

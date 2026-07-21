@@ -950,6 +950,30 @@ class TestHasStreamConsumers:
 class TestCodexStreamCallbacks:
     """Verify _run_codex_stream fires delta callbacks."""
 
+    def test_late_middleware_ultra_is_rejected_before_raw_responses_create(self):
+        """Final outbound guard catches payloads replaced after build_kwargs."""
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="gpt-5.6-sol",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+        mock_client = MagicMock()
+
+        with pytest.raises(ValueError, match="Ultra|ultra|app-server"):
+            agent._run_codex_stream(
+                {"reasoning": {"effort": "ultra"}},
+                client=mock_client,
+            )
+
+        mock_client.responses.create.assert_not_called()
+
     def test_codex_text_delta_fires_callback(self):
         from run_agent import AIAgent
 

@@ -922,10 +922,11 @@ class ContextCompressor(ContextEngine):
         equal the ENTIRE window — auto-compression can never fire because the
         provider rejects the request before usage reaches 100% (#14690).
 
-        When the floor would meet or exceed the context window, trigger at
+        When the floor would meet or crowd the context window, trigger at
         ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the window — high enough that a
-        small model uses most of its context before compacting, but below
-        100% so compaction fires before the provider rejects the request.
+        small model uses most of its context before compacting, but far enough
+        below 100% that rough-token drift, tool schemas, and output headroom do
+        not let the provider reject the request before compaction fires.
 
         The provider reserves ``max_tokens`` of output space out of the same
         window, so the usable INPUT budget is ``context_length - max_tokens``.
@@ -941,11 +942,13 @@ class ContextCompressor(ContextEngine):
             effective_window = context_length
         pct_value = int(effective_window * threshold_percent)
         floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # If flooring pushed the threshold to/over the effective window it can
-        # never be reached. Trigger at 85% of the effective input budget so a
-        # minimum-context model rides most of its budget before compacting
-        # instead of wasting half.
-        if effective_window > 0 and floored >= effective_window:
+        # If flooring pushed the threshold to/over the effective window — or so
+        # close to it that only a sliver of headroom remains (e.g. 64,000 floor
+        # on a 65,536-token local route) — it fires too late in practice. The
+        # request can cross the provider's real limit before compression has a
+        # chance to make progress. Trigger at 85% of the effective input budget
+        # for that near-minimum band instead of leaving ~1–2K tokens of headroom.
+        if effective_window > 0 and floored >= int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO):
             return max(1, min(int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO),
                               effective_window - 1))
         return floored

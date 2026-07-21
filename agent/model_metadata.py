@@ -179,10 +179,10 @@ CONTEXT_PROBE_TIERS = [
 # Default context length when no detection method succeeds.
 DEFAULT_FALLBACK_CONTEXT = CONTEXT_PROBE_TIERS[0]
 
-# Minimum context length required to run Hermes Agent.  Models with fewer
-# tokens cannot maintain enough working memory for tool-calling workflows.
-# Sessions, model switches, and cron jobs should reject models below this.
-MINIMUM_CONTEXT_LENGTH = 64_000
+# Minimum context length required to run Hermes Agent. Local deployments such
+# as Ornith may expose a verified 32K window; prompt budgeting reserves room
+# for tools and output so that window is usable without pretending it is 64K.
+MINIMUM_CONTEXT_LENGTH = 32_768
 
 # Short-lived in-process cache for local-server context probes. Bounds the
 # probe rate when the new local-endpoint live-probe paths (reconcile-on-hit +

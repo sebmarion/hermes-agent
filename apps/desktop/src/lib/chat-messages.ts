@@ -25,6 +25,8 @@ export type GatewayEventPayload = {
   text?: string
   rendered?: string
   status?: string
+  auto_continuing?: boolean
+  continuation_source?: string
   message?: string
   id?: string
   name?: string
@@ -746,6 +748,14 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   }
 
   messages.forEach((message, index) => {
+    if (
+      message.role === 'user' &&
+      typeof message.content === 'string' &&
+      message.content.includes('[HERMES INTERNAL AUTO-CONTINUATION]')
+    ) {
+      return
+    }
+
     if (message.role === 'tool') {
       const updatedPendingToolParts = applyStoredToolResultToParts(pendingToolParts, message)
 

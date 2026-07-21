@@ -51,10 +51,10 @@ class FakeClient:
             return self._request_handler(method, params or {})
         # Sensible defaults for protocol methods used by the session
         if method == "thread/start":
-            return {"thread": {"id": "thread-fake-001"},
+            return {"thread": {"id": "t"},
                     "activePermissionProfile": {"id": "workspace-write"}}
         if method == "turn/start":
-            return {"turn": {"id": "turn-fake-001"}}
+            return {"turn": {"id": "tu1"}}
         if method == "turn/interrupt":
             return {}
         return {}
@@ -144,7 +144,7 @@ class TestLifecycle:
         s = make_session(client)
         tid_a = s.ensure_started()
         tid_b = s.ensure_started()
-        assert tid_a == tid_b == "thread-fake-001"
+        assert tid_a == tid_b == "t"
         # thread/start should be called exactly once
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
@@ -161,6 +161,18 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_thread_start_allows_sixty_second_startup_budget(self):
+        client = FakeClient()
+        with patch.object(client, "request", wraps=client.request) as request:
+            make_session(client).ensure_started()
+
+        thread_start = next(
+            call
+            for call in request.call_args_list
+            if call.args[0] == "thread/start"
+        )
+        assert thread_start.kwargs["timeout"] >= 60
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -168,6 +180,23 @@ class TestLifecycle:
         s.close()
         s.close()
         assert client._closed is True
+
+    def test_multi_agent_enable_flag_reaches_app_server_process(self):
+        client = FakeClient()
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            enable_multi_agent=True,
+            client_factory=factory,
+        )
+        session.ensure_started()
+
+        assert captured["extra_args"] == ["--enable", "multi_agent"]
 
 
 # ---- turn loop ----
@@ -194,14 +223,225 @@ class TestRunTurn:
         assert any(m["role"] == "assistant" and m.get("content") == "hello world"
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
-        assert r.turn_id == "turn-fake-001"
+        assert r.turn_id == "tu1"
+
+    def test_child_subagent_events_do_not_complete_or_replace_root_turn(self):
+        """Multi-agent notifications share one app-server stream.
+
+        A child can complete before the parent. Its text, tool counters, usage,
+        and terminal event must remain visible to the event callback without
+        becoming the canonical Hermes result for the root turn.
+        """
+        client = FakeClient()
+        child_thread = "thread-child-001"
+        child_turn = "turn-child-001"
+        client.queue_notification(
+            "item/completed",
+            threadId=child_thread,
+            turnId=child_turn,
+            item={"type": "agentMessage", "id": "child-m1", "text": "child answer"},
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId=child_thread,
+            turnId=child_turn,
+            item={
+                "type": "commandExecution",
+                "id": "child-ex1",
+                "command": "pwd",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "/tmp",
+                "exitCode": 0,
+            },
+        )
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId=child_thread,
+            turnId=child_turn,
+            tokenUsage={"last": {"totalTokens": 999}},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId=child_thread,
+            turn={"id": child_turn, "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={"type": "agentMessage", "id": "root-m1", "text": "root answer"},
+        )
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="t",
+            turnId="tu1",
+            tokenUsage={"last": {"totalTokens": 123}},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        seen: list[dict] = []
+
+        result = make_session(client, on_event=seen.append).run_turn(
+            "delegate", turn_timeout=2.0
+        )
+
+        assert result.final_text == "root answer"
+        assert result.tool_iterations == 0
+        assert result.token_usage_last == {"totalTokens": 123}
+        assert [m.get("content") for m in result.projected_messages] == [
+            "root answer"
+        ]
+        assert any(
+            (note.get("params") or {}).get("threadId") == child_thread
+            for note in seen
+        )
+
+    def test_stale_same_thread_turn_events_do_not_complete_current_turn(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="turn-old",
+            item={"type": "agentMessage", "id": "old-m1", "text": "stale answer"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "turn-old", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={"type": "agentMessage", "id": "new-m1", "text": "current answer"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        result = make_session(client).run_turn("next", turn_timeout=2.0)
+
+        assert result.final_text == "current answer"
+        assert [m.get("content") for m in result.projected_messages] == [
+            "current answer"
+        ]
+
+    @pytest.mark.parametrize(
+        "malformed_item_ids,malformed_completion_ids",
+        [
+            ({"turnId": "tu1"}, {"turn": {"id": "tu1", "status": "completed"}}),
+            ({"threadId": "t"}, {"threadId": "t", "turn": {"status": "completed"}}),
+        ],
+        ids=["missing-thread-id", "missing-turn-id"],
+    )
+    def test_missing_correlation_ids_fail_closed(
+        self, malformed_item_ids, malformed_completion_ids
+    ):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            **malformed_item_ids,
+            item={"type": "agentMessage", "id": "bad-m1", "text": "uncorrelated"},
+        )
+        client.queue_notification("turn/completed", **malformed_completion_ids)
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={"type": "agentMessage", "id": "root-m1", "text": "root answer"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        result = make_session(client).run_turn("correlate", turn_timeout=2.0)
+
+        assert result.final_text == "root answer"
+        assert [m.get("content") for m in result.projected_messages] == [
+            "root answer"
+        ]
+
+    def test_turn_start_includes_optional_model_and_effort_controls(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+
+        s.run_turn(
+            "use real ultra",
+            model="gpt-5.6-sol",
+            effort="ultra",
+            turn_timeout=2.0,
+        )
+
+        _, params = next(r for r in client.requests if r[0] == "turn/start")
+        assert params["model"] == "gpt-5.6-sol"
+        assert params["effort"] == "ultra"
+
+    def test_turn_start_omits_empty_model_and_effort_controls(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+
+        s.run_turn("ordinary turn", turn_timeout=2.0)
+
+        _, params = next(r for r in client.requests if r[0] == "turn/start")
+        assert "model" not in params
+        assert "effort" not in params
+
+    def test_turn_start_without_id_fails_closed_and_retires(self):
+        client = FakeClient()
+
+        def missing_turn_id(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "t"}}
+            if method == "turn/start":
+                return {"turn": {}}
+            return {}
+
+        client._request_handler = missing_turn_id
+
+        result = make_session(client).run_turn(
+            "hi", turn_timeout=0.05, notification_poll_timeout=0.005
+        )
+
+        assert result.error and "no turn id" in result.error
+        assert result.should_retire is True
+
+    def test_server_interrupted_completion_sets_result_flag(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "interrupted", "error": None},
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.error is None
 
     def test_token_usage_notification_is_captured(self):
         client = FakeClient()
         client.queue_notification(
             "thread/tokenUsage/updated",
-            threadId="thread-fake-001",
-            turnId="turn-fake-001",
+            threadId="t",
+            turnId="tu1",
             tokenUsage={
                 "last": {
                     "totalTokens": 130,
@@ -404,7 +644,7 @@ class TestRunTurn:
         assert r.interrupted is True
         # turn/interrupt was requested with the right turnId
         assert any(
-            method == "turn/interrupt" and params.get("turnId") == "turn-fake-001"
+            method == "turn/interrupt" and params.get("turnId") == "tu1"
             for (method, params) in client.requests
         )
 
@@ -449,6 +689,42 @@ class TestRunTurn:
 # ---- approval bridge ----
 
 class TestServerRequestRouting:
+    def test_preapproval_notification_drain_invokes_event_callback_once(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="req-event-drain",
+            command="ls /tmp",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "item/started",
+            threadId="t",
+            turnId="tu1",
+            item={
+                "type": "commandExecution",
+                "id": "cmd-1",
+                "command": "ls /tmp",
+                "cwd": "/tmp",
+                "status": "inProgress",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        seen = []
+        session = make_session(client, on_event=lambda note: seen.append(note))
+
+        result = session.run_turn("hi", turn_timeout=1.0)
+
+        methods = [note["method"] for note in seen]
+        assert methods.count("item/started") == 1
+        assert methods.count("turn/completed") == 1
+        assert result.error is None
+        assert result.interrupted is False
+
     def test_exec_approval_with_callback_approves_once(self):
         client = FakeClient()
         client.queue_server_request(
@@ -1001,7 +1277,7 @@ class TestThreadStartCrossFill:
         client = FakeClient()
         s = make_session(client)
         tid = s.ensure_started()
-        assert tid == "thread-fake-001"
+        assert tid == "t"
 
     def test_thread_session_id_alias_under_thread_key(self):
         client = FakeClient()

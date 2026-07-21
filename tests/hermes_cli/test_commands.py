@@ -112,6 +112,10 @@ class TestResolveCommand:
         assert resolve_command("codex_runtime").name == "codex-runtime"
         assert resolve_command("tasks").name == "agents"
 
+    def test_bp_is_not_a_builtin_alias(self):
+        """/bp is reserved for the /bestplan skill alias, not /blueprint."""
+        assert resolve_command("bp") is None
+
     def test_topic_is_gateway_command(self):
         topic = resolve_command("topic")
         assert topic is not None
@@ -152,6 +156,7 @@ class TestDerivedDicts:
         assert "/exit" in COMMANDS
         assert "/reload_mcp" in COMMANDS
         assert "/gateway" in COMMANDS
+        assert "/bp" not in COMMANDS
 
     def test_commands_by_category_covers_all_categories(self):
         registry_categories = {cmd.category for cmd in COMMAND_REGISTRY if not cmd.gateway_only}

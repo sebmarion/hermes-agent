@@ -241,6 +241,66 @@ the same session block immediately without submitting more callback work. An
 explicit policy block does not quarantine the callback. Required plugin keys
 are evaluated in sorted order, so the first stable block code is deterministic.
 
+### Late plugin recovery
+
+A long-lived process can finish ordinary plugin discovery before an operator
+installs or enables a required policy plugin. Before turn hooks run, and again
+during required-policy authorization, Hermes can monotonically recover an
+eligible standalone directory plugin without restarting the process. Recovery
+is scoped to the same resolved `HERMES_HOME` in which ordinary discovery ran.
+
+The recovery path accepts only a currently enabled, non-disabled standalone
+directory plugin that declares every required policy, declares no tools, has
+not already run or failed its ordinary registration, and registers hooks and
+policy callbacks only. It does not refresh the model's tool schema or the
+process-global tool, provider, platform, middleware, or canonical module
+registries. Safe mode, a changed or mismatched home, an entry-point or other
+plugin kind, an already loaded plugin, a prior load failure, an unsupported
+registration surface, or invalid/missing policy registration remains
+fail-closed.
+
+Restart the process, or deliberately use the ordinary discovery lifecycle,
+for plugin replacement, unload after disablement, entry-point changes, or a
+plugin that registers capabilities beyond hooks and policies. A successful
+explicit `PluginManager.discover_and_load(force=True)` for the active home
+retires that home's recovered overlay, so the newly discovered ordinary plugin
+state supersedes it instead of running alongside stale recovered callbacks.
+Privately named recovered modules remain retained so a callback that was
+already captured can still complete a lazy relative import; their UUID-scoped
+names cannot shadow the new ordinary generation.
+
+Home matching prevents a recovered callback or an ordinary manager discovered
+for home A from authorizing a turn bound to home B. This is a provenance guard,
+not full cross-profile plugin isolation: ordinary tools, providers, platforms,
+and imported modules remain process-global. Run separate processes when
+profiles need independent complete plugin universes. Policy callback workers
+inherit the dispatch turn's bound home rather than rereading process-global
+environment state.
+
+### Transcript result and terminal turn behavior
+
+The JSON `required_policy_block` remains the tool result stored in the
+conversation transcript, but Hermes does not parse that text as a host control
+signal. The authorization producers also record the concrete, typed policy
+block against its `tool_call_id`; only that trusted provenance can halt a turn.
+Ordinary handler output that resembles the JSON envelope cannot spoof a halt.
+
+Only `policy_code: policy_blocked`, an explicit policy decision, is recoverable
+by the model. Every enforcement/infrastructure failure code, malformed or
+non-explicit decision, and unknown future code is terminal. Hermes then makes
+no further model request, marks the turn `failed: true` and `completed: false`,
+sets `turn_exit_reason: required_policy_halt`, records the safe structured
+block under `required_policy`, and appends and streams a fixed host-authored
+assistant response.
+
+For a sequential multi-call response, Hermes appends deterministic skipped
+results for unstarted siblings so every assistant `tool_call_id` has exactly
+one tool result. Concurrently submitted calls are allowed to settle, their
+results are appended in assistant call order, and the first terminal block in
+that order controls the halt. Persistence, cleanup, and session-end lifecycle
+still run, while response rewriting and model-backed completion or memory
+review are skipped.
+
 ### Coverage limits
 
 - The gate covers ordinary Hermes tool dispatch. It does not sandbox arbitrary

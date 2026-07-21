@@ -11,12 +11,13 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 from copy import deepcopy
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 from hermes_cli.tool_policy import (
     PolicyDecisionCode,
@@ -80,6 +81,82 @@ class ToolDispatchDelegation:
     active: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class RequiredPolicyBlockRecord:
+    """Trusted host observation for one serialized policy-block result."""
+
+    tool_call_id: str
+    block: ToolPolicyBlock
+
+
+class RequiredPolicyBlockCollector:
+    """Thread-safe per-batch store for host-created policy blocks."""
+
+    def __init__(self) -> None:
+        self._pid = os.getpid()
+        self._active = True
+        self._lock = threading.Lock()
+        self._records: dict[str, RequiredPolicyBlockRecord] = {}
+        self._appended: set[str] = set()
+
+    def record(self, tool_call_id: str, block: ToolPolicyBlock) -> bool:
+        """Keep the first trusted block for *tool_call_id*."""
+        if type(tool_call_id) is not str or not isinstance(block, ToolPolicyBlock):
+            return False
+        with self._lock:
+            if not self._active or self._pid != os.getpid():
+                return False
+            if tool_call_id in self._records:
+                return False
+            self._records[tool_call_id] = RequiredPolicyBlockRecord(
+                tool_call_id=tool_call_id,
+                block=block,
+            )
+            return True
+
+    def get(self, tool_call_id: str) -> RequiredPolicyBlockRecord | None:
+        """Return the trusted record for *tool_call_id*, if observed."""
+        with self._lock:
+            return self._records.get(tool_call_id)
+
+    def mark_appended(self, tool_call_id: str) -> bool:
+        """Mark that the recorded block became this call's transcript result."""
+        with self._lock:
+            if (
+                not self._active
+                or self._pid != os.getpid()
+                or tool_call_id not in self._records
+            ):
+                return False
+            self._appended.add(tool_call_id)
+            return True
+
+    def first_terminal(
+        self,
+        tool_call_ids: Iterable[str],
+        *,
+        require_appended: bool = False,
+    ) -> RequiredPolicyBlockRecord | None:
+        """Choose the first non-recoverable block in assistant call order."""
+        with self._lock:
+            records = dict(self._records)
+            appended = frozenset(self._appended)
+        for tool_call_id in tool_call_ids:
+            record = records.get(tool_call_id)
+            if (
+                record is not None
+                and (not require_appended or tool_call_id in appended)
+                and record.block.policy_code != PolicyDecisionCode.BLOCKED
+            ):
+                return record
+        return None
+
+    def close(self) -> None:
+        """Prevent copied contexts from recording after the batch exits."""
+        with self._lock:
+            self._active = False
+
+
 _AUTHORIZED_TOOL_DISPATCH: ContextVar[_AuthorizedToolDispatch | None] = ContextVar(
     "HERMES_AUTHORIZED_TOOL_DISPATCH",
     default=None,
@@ -88,6 +165,54 @@ _TOOL_DISPATCH_DELEGATION: ContextVar[ToolDispatchDelegation | None] = ContextVa
     "HERMES_TOOL_DISPATCH_DELEGATION",
     default=None,
 )
+_REQUIRED_POLICY_BLOCK_COLLECTOR: ContextVar[
+    RequiredPolicyBlockCollector | None
+] = ContextVar(
+    "HERMES_REQUIRED_POLICY_BLOCK_COLLECTOR",
+    default=None,
+)
+
+
+@contextmanager
+def bind_required_policy_block_collector(
+) -> Iterator[RequiredPolicyBlockCollector]:
+    """Bind one trusted policy-block collector around a tool-call batch."""
+    collector = RequiredPolicyBlockCollector()
+    token = _REQUIRED_POLICY_BLOCK_COLLECTOR.set(collector)
+    try:
+        yield collector
+    finally:
+        collector.close()
+        _REQUIRED_POLICY_BLOCK_COLLECTOR.reset(token)
+
+
+def record_required_policy_block(
+    tool_call_id: str,
+    block: ToolPolicyBlock,
+) -> bool:
+    """Record a host-created block when a batch collector is active."""
+    collector = _REQUIRED_POLICY_BLOCK_COLLECTOR.get()
+    if collector is None:
+        return False
+    return collector.record(tool_call_id, block)
+
+
+def get_required_policy_block_record(
+    tool_call_id: str,
+) -> RequiredPolicyBlockRecord | None:
+    """Return a trusted block record from the active batch collector."""
+    collector = _REQUIRED_POLICY_BLOCK_COLLECTOR.get()
+    if collector is None:
+        return None
+    return collector.get(tool_call_id)
+
+
+def mark_required_policy_block_appended(tool_call_id: str) -> bool:
+    """Confirm that a trusted block was appended as this call's tool result."""
+    collector = _REQUIRED_POLICY_BLOCK_COLLECTOR.get()
+    if collector is None:
+        return False
+    return collector.mark_appended(tool_call_id)
 
 
 def _active_authorized_tool_dispatch() -> _AuthorizedToolDispatch | None:
@@ -270,6 +395,7 @@ def _emit_required_policy_block(
     duration_ms: int,
     middleware_trace: list[dict[str, Any]],
 ) -> None:
+    record_required_policy_block(tool_call_id, block)
     try:
         from model_tools import _emit_post_tool_call_hook
 

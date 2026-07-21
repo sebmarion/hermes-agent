@@ -12,6 +12,26 @@ import {
 } from './chat-messages'
 
 describe('toChatMessages', () => {
+  it('hides server-authored tool-limit continuation prompts', () => {
+    const messages = toChatMessages([
+      { role: 'user', content: 'finish the task', timestamp: 1 },
+      { role: 'assistant', content: 'partial result', timestamp: 2 },
+      {
+        role: 'user',
+        content: '[HERMES INTERNAL AUTO-CONTINUATION] Attempt 1/1. This is server control.',
+        timestamp: 3
+      },
+      { role: 'assistant', content: 'verified complete', timestamp: 4 }
+    ])
+
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'assistant'])
+    expect(
+      messages.some(message =>
+        message.parts.some(part => part.type === 'text' && part.text.includes('AUTO-CONTINUATION'))
+      )
+    ).toBe(false)
+  })
+
   it('keeps a turn with interleaved tool-only rows in a single bubble', () => {
     const messages = toChatMessages([
       { role: 'assistant', content: 'Planning.', timestamp: 1 },

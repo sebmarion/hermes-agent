@@ -3383,6 +3383,18 @@ class AIAgent:
         except Exception:
             pass
 
+    def _close_codex_app_server_session(self) -> None:
+        """Close and detach the owned Codex subprocess session idempotently."""
+        codex_session = getattr(self, "_codex_session", None)
+        if codex_session is None:
+            return
+        # Detach first so repeated or re-entrant teardown cannot close twice.
+        self._codex_session = None
+        try:
+            codex_session.close()
+        except Exception:
+            pass
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
@@ -3396,6 +3408,7 @@ class AIAgent:
           - memory provider (has its own lifecycle; keeps running)
 
         We DO close:
+          - Codex app-server subprocess session, when active
           - OpenAI/httpx client pool (big chunk of held memory + sockets;
             the rebuilt agent gets a fresh client anyway)
           - Active child subagents (per-turn artefacts; safe to drop)
@@ -3421,6 +3434,8 @@ class AIAgent:
         except Exception:
             pass
 
+        self._close_codex_app_server_session()
+
         # Close the OpenAI/httpx client to release sockets immediately.
         try:
             client = getattr(self, "client", None)
@@ -3434,6 +3449,7 @@ class AIAgent:
         """Release all resources held by this agent instance.
 
         Cleans up subprocess resources that would otherwise become orphans:
+        - Codex app-server subprocess session
         - Background processes tracked in ProcessRegistry
         - Terminal sandbox environments
         - Browser daemon sessions
@@ -3444,6 +3460,8 @@ class AIAgent:
         independently guarded so a failure in one does not prevent the rest.
         """
         task_id = getattr(self, "session_id", None) or ""
+
+        self._close_codex_app_server_session()
 
         # 1. Kill background processes for this task
         try:
@@ -5595,6 +5613,25 @@ class AIAgent:
         if decision.should_halt and self._tool_guardrail_halt_decision is None:
             self._tool_guardrail_halt_decision = decision
 
+    def _set_required_policy_halt(self, block) -> None:
+        """Record the first typed required-policy infrastructure failure."""
+        from hermes_cli.tool_policy import PolicyDecisionCode, ToolPolicyBlock
+
+        if (
+            isinstance(block, ToolPolicyBlock)
+            and block.policy_code != PolicyDecisionCode.BLOCKED
+            and self._required_policy_halt_block is None
+        ):
+            self._required_policy_halt_block = block
+
+    @staticmethod
+    def _required_policy_controlled_halt_response(block) -> str:
+        """Build the fixed host response for a policy-infrastructure halt."""
+        return (
+            "Hermes stopped this turn because required policy enforcement failed "
+            f"({block.policy_code}). The blocked tool did not run."
+        )
+
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         tool = decision.tool_name or "a tool"
         return (
@@ -5640,14 +5677,34 @@ class AIAgent:
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if not _should_parallelize_tool_batch(tool_calls):
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
+            from hermes_cli.middleware import bind_required_policy_block_collector
 
-            return self._execute_tool_calls_concurrent(
-                assistant_message, messages, effective_task_id, api_call_count
-            )
+            with bind_required_policy_block_collector() as collector:
+                if not _should_parallelize_tool_batch(tool_calls):
+                    result = self._execute_tool_calls_sequential(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                else:
+                    result = self._execute_tool_calls_concurrent(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                collector.close()
+                terminal = collector.first_terminal(
+                    (
+                        str(getattr(tool_call, "id", "") or "")
+                        for tool_call in tool_calls
+                    ),
+                    require_appended=True,
+                )
+                if terminal is not None:
+                    self._set_required_policy_halt(terminal.block)
+                return result
         finally:
             self._executing_tools = False
 
@@ -5752,6 +5809,7 @@ class AIAgent:
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        bestplan_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
@@ -5765,6 +5823,7 @@ class AIAgent:
             persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             moa_config=moa_config,
+            bestplan_config=bestplan_config,
         )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:

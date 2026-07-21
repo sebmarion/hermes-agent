@@ -1,6 +1,7 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
 import logging
+import os
 import sys
 import types
 from dataclasses import FrozenInstanceError
@@ -10,6 +11,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from hermes_cli import plugins as plugins_mod
 from hermes_cli.plugins import (
     ENTRY_POINTS_GROUP,
     VALID_HOOKS,
@@ -558,6 +561,198 @@ class TestPluginDiscovery:
         assert mgr._plugin_skills == {}
         assert mgr._aux_tasks == {}
         assert mgr._slack_action_handlers == []
+
+    def test_force_rediscover_records_the_successful_active_home(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        empty_bundled = tmp_path / "empty-bundled"
+        empty_bundled.mkdir()
+        monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: empty_bundled)
+        monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
+
+        token_a = set_hermes_home_override(home_a)
+        try:
+            manager = PluginManager()
+            manager.discover_and_load()
+            assert manager._discovery_home == str(home_a.resolve())
+
+            token_b = set_hermes_home_override(home_b)
+            try:
+                manager.discover_and_load(force=True)
+                assert manager._discovery_home == str(home_b.resolve())
+            finally:
+                reset_hermes_home_override(token_b)
+        finally:
+            reset_hermes_home_override(token_a)
+
+    def test_discovery_rejects_context_home_drift_and_restores_exact_context(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home = tmp_path / "home-context"
+        drifted_home = tmp_path / "drifted-context"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        token = set_hermes_home_override(home)
+        try:
+            plugin_dir = _make_plugin_dir(
+                home / "plugins",
+                "drifting-plugin",
+            )
+            (plugin_dir / "__init__.py").write_text(
+                "from hermes_constants import set_hermes_home_override\n"
+                f"set_hermes_home_override({str(drifted_home)!r})\n"
+                "def register(ctx):\n    pass\n",
+                encoding="utf-8",
+            )
+            manager = PluginManager()
+
+            with pytest.raises(RuntimeError, match="home changed during discovery"):
+                manager.discover_and_load()
+
+            assert manager._discovery_home is None
+            assert plugins_mod._resolved_hermes_home() == str(home.resolve())
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_discovery_pins_home_across_environment_drift_without_clobber(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home = tmp_path / "home-environment"
+        drifted_home = tmp_path / "drifted-environment"
+        observed_home = tmp_path / "observed-home.txt"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        plugin_dir = _make_plugin_dir(
+            home / "plugins",
+            "drifting-plugin",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "from hermes_constants import get_hermes_home\n"
+            f"os.environ['HERMES_HOME'] = {str(drifted_home)!r}\n"
+            "def register(ctx):\n"
+            f"    Path({str(observed_home)!r}).write_text("
+            "str(get_hermes_home().resolve()), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        manager = PluginManager()
+
+        manager.discover_and_load()
+
+        assert manager._discovery_home == str(home.resolve())
+        assert observed_home.read_text(encoding="utf-8") == str(home.resolve())
+        assert os.environ["HERMES_HOME"] == str(drifted_home)
+
+    def test_force_rediscover_in_safe_mode_clears_prior_home_registries(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        token_a = set_hermes_home_override(home_a)
+        try:
+            manager = PluginManager()
+            manager._discovered = True
+            manager._discovery_home = str(home_a.resolve())
+            manager._plugins["home-a-plugin"] = MagicMock()
+            manager._hooks["pre_llm_call"] = [lambda **_: "home-a"]
+            manager._policy_registrations[("home-a-plugin", "tool_dispatch")] = MagicMock()
+
+            token_b = set_hermes_home_override(home_b)
+            try:
+                monkeypatch.setenv("HERMES_SAFE_MODE", "1")
+                manager.discover_and_load(force=True)
+                assert manager._discovery_home == str(home_b.resolve())
+                assert manager._plugins == {}
+                assert manager._hooks == {}
+                assert manager._policy_registrations == {}
+            finally:
+                reset_hermes_home_override(token_b)
+        finally:
+            reset_hermes_home_override(token_a)
+
+    def test_required_policy_recovery_safe_mode_clears_partial_failed_sweep_state(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        active_home = tmp_path / "active-home"
+        token = set_hermes_home_override(active_home)
+        try:
+            manager = PluginManager()
+            manager._discovered = False
+            manager._discovery_home = None
+            manager._plugins["partial-plugin"] = MagicMock()
+            manager._hooks["pre_llm_call"] = [lambda **_: "partial"]
+            manager._policy_registrations[("partial-plugin", "tool_dispatch")] = MagicMock()
+            monkeypatch.setenv("HERMES_SAFE_MODE", "1")
+
+            manager.discover_and_load()
+
+            assert manager._discovery_home == str(active_home.resolve())
+            assert manager._plugins == {}
+            assert manager._hooks == {}
+            assert manager._policy_registrations == {}
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_required_policy_recovery_replaced_manager_keeps_matching_home_semantics(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hermes_cli.plugins import authorize_required_tool_policies
+        from hermes_cli.tool_policy import PreparedToolRuntime, create_tool_dispatch_policy_input
+
+        home = tmp_path / "home"
+        token = set_hermes_home_override(home)
+        try:
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            _make_plugin_dir(
+                home / "plugins",
+                "ordinary-governor",
+                register_body=(
+                    "ctx.register_policy('tool_dispatch', "
+                    "lambda payload: {'action': 'allow', "
+                    "'policy_binding': payload['policy_binding']})"
+                ),
+                manifest_extra={"policies": ["tool_dispatch"]},
+            )
+            config = yaml.safe_load((home / "config.yaml").read_text())
+            config["plugins"]["required_policies"] = {
+                "ordinary-governor": ["tool_dispatch"]
+            }
+            (home / "config.yaml").write_text(yaml.safe_dump(config))
+
+            manager = PluginManager()
+            manager.discover_and_load()
+            monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+            policy_input = create_tool_dispatch_policy_input(
+                tool_name="terminal",
+                original_args={"command": "true"},
+                effective_args={"command": "true"},
+                task_id="task",
+                session_id="session",
+                turn_id="turn",
+                tool_call_id="call",
+                prepared_runtime=PreparedToolRuntime(
+                    effective_cwd=str(tmp_path),
+                    effective_cwd_source="process_cwd",
+                    effective_cwd_authoritative=True,
+                ),
+            )
+
+            assert authorize_required_tool_policies(policy_input) is None
+        finally:
+            reset_hermes_home_override(token)
 
 
 # ── TestPluginLoading ──────────────────────────────────────────────────────

@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+# Short aliases for high-frequency skill slash commands.  These are populated
+# only when the canonical skill is installed/enabled so disabled-skill filtering
+# and platform compatibility still apply.
+_SKILL_COMMAND_ALIASES: dict[str, str] = {
+    "bestplan": "bp",
+}
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -402,12 +408,20 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
                     if not cmd_name:
                         continue
-                    _skill_commands[f"/{cmd_name}"] = {
+                    cmd_key = f"/{cmd_name}"
+                    _skill_commands[cmd_key] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
                     }
+                    alias = _SKILL_COMMAND_ALIASES.get(cmd_name)
+                    if alias:
+                        alias_key = f"/{alias}"
+                        _skill_commands[alias_key] = {
+                            **_skill_commands[cmd_key],
+                            "alias_for": cmd_key,
+                        }
                 except Exception:
                     continue
     except Exception:
@@ -510,7 +524,7 @@ def resolve_skill_command_key(command: str) -> Optional[str]:
     """
     if not command:
         return None
-    cmd_key = f"/{command.replace('_', '-')}"
+    cmd_key = f"/{command.lstrip('/').replace('_', '-')}"
     return cmd_key if cmd_key in get_skill_commands() else None
 
 

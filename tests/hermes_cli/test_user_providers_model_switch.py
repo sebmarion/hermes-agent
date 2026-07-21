@@ -1235,3 +1235,44 @@ def test_current_custom_model_not_leaked_into_other_provider_rows(monkeypatch):
     for row in providers:
         if row["slug"] != "openrouter" and not row.get("is_current"):
             assert custom not in row.get("models", []), f"leaked into {row['slug']}"
+
+
+# =============================================================================
+# Tests for custom:<name> → providers:<name> prefix-strip fallback
+# =============================================================================
+
+def test_resolve_provider_full_strips_custom_prefix_for_user_providers():
+    """``custom:<name>`` must resolve against a bare ``providers:<name>`` dict key.
+
+    The TUI gateway's session-healing logic and the picker's ``custom:*``
+    slug convention both produce ``custom:<name>`` for providers that live
+    under the keyed ``providers:`` schema. Without a prefix-strip fallback,
+    ``custom:zeus`` fails to resolve even though ``providers.zeus`` is
+    configured — surfacing as "Unknown provider 'custom:zeus'" in the
+    dashboard and /model slash command.
+    """
+    from hermes_cli.providers import resolve_provider_full
+
+    user_providers = {
+        "zeus": {
+            "name": "Zeus RTX 5080",
+            "api": "http://zeus.local:8080/v1",
+            "key_env": "ZEUS_API_KEY",
+            "default_model": "qwopus-35b-coder",
+            "transport": "chat_completions",
+        },
+    }
+
+    # Bare name still resolves (regression guard)
+    pdef = resolve_provider_full("zeus", user_providers, [])
+    assert pdef is not None
+    assert pdef.id == "zeus"
+
+    # custom: prefix now resolves via fallback strip
+    pdef_custom = resolve_provider_full("custom:zeus", user_providers, [])
+    assert pdef_custom is not None, "custom:zeus should resolve to providers.zeus"
+    assert pdef_custom.id == "zeus"
+    assert pdef_custom.base_url == "http://zeus.local:8080/v1"
+
+    # Nonexistent custom: still returns None
+    assert resolve_provider_full("custom:nonexistent", user_providers, []) is None
