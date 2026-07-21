@@ -195,6 +195,27 @@ def _equivalent_needles(needle: list[str]) -> list[list[str]]:
     return candidates
 
 
+def _tokens_prefix_match(candidate: list[str], actual: list[str]) -> bool:
+    """Check if *actual* starts with *candidate* tokens.
+
+    The last token may also match as a ``:``-delimited subcommand extension:
+    ``test:unit:checks`` matches canonical ``test:unit`` because it extends
+    the script name with ``:checks``.  This only applies when the canonical
+    token itself contains a ``:`` (i.e. is a namespaced script name), so
+    bare commands like ``pytest`` or ``scripts/run_tests.sh`` are not
+    over-matched.
+    """
+    if not candidate or len(actual) < len(candidate):
+        return False
+    if actual[: len(candidate) - 1] != candidate[:-1]:
+        return False
+    actual_last = actual[len(candidate) - 1]
+    canonical_last = candidate[-1]
+    if actual_last == canonical_last:
+        return True
+    return ":" in canonical_last and actual_last.startswith(canonical_last + ":")
+
+
 def _find_canonical_match(command: str, canonical_commands: list[str]) -> Optional[tuple[str, list[str]]]:
     """Return ``(canonical, trailing_args)`` for the first detected command."""
 
@@ -206,7 +227,7 @@ def _find_canonical_match(command: str, canonical_commands: list[str]) -> Option
         for tokens in segments:
             candidate_tokens = _strip_command_prefix(tokens)
             for candidate in _equivalent_needles(needle):
-                if candidate_tokens[:len(candidate)] == candidate:
+                if _tokens_prefix_match(candidate, candidate_tokens):
                     return canonical, candidate_tokens[len(candidate):]
     return None
 
@@ -215,6 +236,8 @@ def _kind_for_command(canonical: str) -> str:
     lowered = canonical.lower()
     if any(word in lowered for word in ("lint", "eslint", "ruff")):
         return "lint"
+    if "style" in lowered:
+        return "check"
     if any(word in lowered for word in ("typecheck", "tsc", "mypy", "pyright", "ty")):
         return "typecheck"
     if "build" in lowered:

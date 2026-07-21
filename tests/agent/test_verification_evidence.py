@@ -249,6 +249,81 @@ def test_non_temp_script_is_not_ad_hoc_evidence(tmp_path, monkeypatch):
     assert evidence is None
 
 
+def test_subcommand_suffix_matches_namespaced_verify_command(tmp_path, monkeypatch):
+    """test:unit:checks should match canonical test:unit (subcommand extension)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (root := tmp_path).joinpath("package.json").write_text(
+        json.dumps({"scripts": {"test:unit": "vitest", "test:ci": "vitest --ci"}})
+    )
+
+    evidence = classify_verification_command(
+        "npm run test:unit:checks",
+        cwd=root,
+        session_id="s1",
+        exit_code=0,
+        output="all green",
+    )
+
+    assert evidence is not None
+    assert evidence.canonical_command == "npm run test:unit"
+    assert evidence.kind == "test"
+    assert evidence.scope == "full"
+
+
+def test_subcommand_suffix_with_target_arg_matches_namespaced_verify_command(tmp_path, monkeypatch):
+    """test:ci:affected with file arg should match canonical test:ci as targeted."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (root := tmp_path).joinpath("package.json").write_text(
+        json.dumps({"scripts": {"test:ci": "vitest --ci"}})
+    )
+
+    evidence = classify_verification_command(
+        "npm run test:ci:affected -- tests/widget.test.ts",
+        cwd=root,
+        session_id="s1",
+        exit_code=0,
+        output="passed",
+    )
+
+    assert evidence is not None
+    assert evidence.canonical_command == "npm run test:ci"
+    assert evidence.scope == "targeted"
+
+
+def test_unrelated_namespaced_script_does_not_match(tmp_path, monkeypatch):
+    """test:other should NOT match canonical test:unit."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (root := tmp_path).joinpath("package.json").write_text(
+        json.dumps({"scripts": {"test:unit": "vitest"}})
+    )
+
+    evidence = classify_verification_command(
+        "npm run test:other",
+        cwd=root,
+        session_id="s1",
+        exit_code=0,
+        output="ok",
+    )
+
+    assert evidence is None
+
+
+def test_bare_command_not_over_matched_by_subcommand_logic(tmp_path, monkeypatch):
+    """pytest should NOT match a command like pytest-something (no colon)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (root := tmp_path).joinpath("pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+
+    evidence = classify_verification_command(
+        "pytest-full",
+        cwd=root,
+        session_id="s1",
+        exit_code=0,
+        output="ok",
+    )
+
+    assert evidence is None
+
+
 def test_status_is_unverified_without_evidence(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     _node_project(tmp_path)
