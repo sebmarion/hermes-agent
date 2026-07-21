@@ -379,14 +379,14 @@ class TestAdapterInit:
         monkeypatch.setattr(
             "gateway.run._resolve_runtime_agent_kwargs",
             lambda: {
-                "provider": "openai-codex",
-                "base_url": "https://chatgpt.com/backend-api/codex",
-                "api_mode": "codex_responses",
+                "provider": "nous",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+                "api_mode": "chat_completions",
+                "api_key": "profile-provider-key",
+                "credential_pool": object(),
             },
         )
-        monkeypatch.setattr(
-            "gateway.run._resolve_gateway_model", lambda: "gpt-5.6-sol"
-        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "glm-5.2")
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
@@ -403,12 +403,17 @@ class TestAdapterInit:
 
         agent = adapter._create_agent(
             session_id="api-session",
+            request_model="gpt-5.6-sol",
             request_reasoning_effort="ultra",
         )
 
         assert isinstance(agent, FakeAgent)
         assert captured["model"] == "gpt-5.6-sol"
+        assert captured["provider"] == "openai-codex"
+        assert captured["base_url"] == "https://chatgpt.com/backend-api/codex"
         assert captured["api_mode"] == "codex_app_server"
+        assert "api_key" not in captured
+        assert "credential_pool" not in captured
         assert captured["reasoning_config"] == {"enabled": True, "effort": "ultra"}
         assert captured["fallback_model"] is None
 

@@ -1270,6 +1270,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        request_model: Optional[str] = None,
         request_reasoning_effort: Optional[str] = None,
     ) -> Any:
         """
@@ -1294,7 +1295,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         ``request_reasoning_effort`` overrides the configured effort for this
         agent instance only. ``ultra`` is a fail-closed GPT-5.6 Sol contract:
-        it forces the Codex app-server runtime and disables provider fallback.
+        it uses ``request_model`` as the authoritative run model, forces the
+        Codex app-server runtime, and disables provider fallback.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -1378,13 +1380,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
         is_sol_ultra = normalized_request_effort == "ultra"
         if is_sol_ultra:
-            normalized_model = str(model or "").strip().lower()
+            normalized_model = str(request_model or model or "").strip().lower()
             if normalized_model not in {"gpt-5.6", "gpt-5.6-sol"}:
                 raise ValueError(
                     "Reasoning effort 'ultra' requires GPT-5.6 Sol "
                     "(gpt-5.6 or gpt-5.6-sol)."
                 )
+            model = normalized_model
+            runtime_kwargs["provider"] = "openai-codex"
+            runtime_kwargs["base_url"] = "https://chatgpt.com/backend-api/codex"
             runtime_kwargs["api_mode"] = "codex_app_server"
+            runtime_kwargs.pop("api_key", None)
+            runtime_kwargs.pop("credential_pool", None)
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -4440,6 +4447,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    request_model=body.get("model"),
                     request_reasoning_effort=request_reasoning_effort,
                 )
                 self._active_run_agents[run_id] = agent

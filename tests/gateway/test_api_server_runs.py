@@ -208,6 +208,7 @@ class TestStartRun:
                 assert resp.status == 202
                 await asyncio.sleep(0)
 
+                assert mock_create.call_args.kwargs["request_model"] == "gpt-5.6-sol"
                 assert mock_create.call_args.kwargs["request_reasoning_effort"] == "ultra"
 
     @pytest.mark.asyncio
