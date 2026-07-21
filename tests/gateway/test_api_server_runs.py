@@ -212,6 +212,37 @@ class TestStartRun:
                 assert mock_create.call_args.kwargs["request_reasoning_effort"] == "ultra"
 
     @pytest.mark.asyncio
+    async def test_start_maps_agent_error_result_to_failed_run(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": None,
+                    "completed": False,
+                    "partial": True,
+                    "error": "Codex usage limit reached",
+                }
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(50):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert status["status"] == "failed"
+                assert status["error"] == "Codex usage limit reached"
+
+    @pytest.mark.asyncio
     async def test_start_invalid_history_does_not_allocate_run(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

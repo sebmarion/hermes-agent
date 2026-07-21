@@ -4540,7 +4540,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
-                elif isinstance(result, dict) and result.get("failed"):
+                elif isinstance(result, dict) and (
+                    result.get("failed")
+                    or result.get("error")
+                    or result.get("completed") is False
+                ):
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
                     _put_event_if_active({
                         "event": "run.failed",
