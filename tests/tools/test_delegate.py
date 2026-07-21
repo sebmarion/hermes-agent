@@ -13,6 +13,7 @@ import json
 import os
 import threading
 import time
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,7 @@ from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
     DelegateEvent,
     _get_max_concurrent_children,
+    _load_config,
     _LEGACY_EVENT_MAP,
     MAX_DEPTH,
     check_delegate_requirements,
@@ -515,6 +517,62 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertIsNone(MockAgent.call_args.kwargs["fallback_model"])
 
+    def test_explicit_lane_child_does_not_inherit_parent_credentials(self):
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "https://parent.invalid/v1"
+        parent.api_key = "parent-secret"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Review the repository",
+                context=None,
+                toolsets=["file"],
+                model="lane-model",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="custom",
+                override_base_url="https://lane.invalid/v1",
+                override_api_key=None,
+                inherit_parent_fallback=False,
+                inherit_parent_credentials=False,
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["base_url"], "https://lane.invalid/v1")
+        self.assertIsNone(kwargs["api_key"])
+        self.assertNotEqual(kwargs["api_key"], parent.api_key)
+
+    def test_explicit_lane_child_does_not_attach_any_credential_pool(self):
+        parent = _make_mock_parent(depth=0)
+        parent._credential_pool = MagicMock()
+        child = MagicMock()
+
+        with (
+            patch("run_agent.AIAgent", return_value=child),
+            patch("tools.delegate_tool._resolve_child_credential_pool") as resolve_pool,
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="Review the repository",
+                context=None,
+                toolsets=["file"],
+                model="lane-model",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="custom",
+                override_base_url="https://lane.invalid/v1",
+                override_api_key="lane-key",
+                inherit_parent_fallback=False,
+                inherit_parent_credentials=False,
+            )
+
+        resolve_pool.assert_not_called()
+        self.assertNotIn("_credential_pool", child.__dict__)
+
     def test_non_lane_child_retains_parent_fallback_chain(self):
         parent = _make_mock_parent(depth=0)
         fallback = [{"provider": "custom:zeus", "model": "glm-4.7-flash"}]
@@ -726,6 +784,134 @@ class TestDelegateTask(unittest.TestCase):
 
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["tool_trace"][0]["status"], "error")
+
+    def test_wrapped_external_tool_error_is_failed_tool_evidence(self):
+        """Real untrusted-result wrapping must not hide structured failures."""
+        from agent.tool_dispatch_helpers import make_tool_result_message
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"web_search"}
+        wrapped_result = make_tool_result_message(
+            "web_search",
+            json.dumps(
+                {
+                    "error": (
+                        "provider rejected the request because authentication failed"
+                    )
+                }
+            ),
+            "call-wrapped-error",
+        )
+        child.run_conversation.return_value = {
+            "final_response": "Search complete.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 2,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-wrapped-error",
+                            "function": {"name": "web_search", "arguments": "{}"},
+                        }
+                    ],
+                },
+                wrapped_result,
+            ],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Search for evidence",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertIn("<untrusted_tool_result", wrapped_result["content"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_kind"], "tool_execution_failed")
+        self.assertEqual(result["evidence"]["successful_tool_count"], 0)
+        self.assertEqual(result["tool_trace"][0]["status"], "error")
+
+    def test_malformed_untrusted_wrappers_fail_closed(self):
+        from agent.tool_dispatch_helpers import make_tool_result_message
+        from tools.delegate_tool import _looks_like_error_output
+
+        valid = make_tool_result_message(
+            "web_search",
+            json.dumps({"result": "successful external payload with enough length"}),
+            "call-wrapper",
+        )["content"]
+        malformed = {
+            "truncated": valid.removesuffix("\n</untrusted_tool_result>"),
+            "trailing_bytes": valid + "\nCORRUPTED",
+            "malformed_open": valid.replace(
+                '<untrusted_tool_result source="web_search">',
+                '<untrusted_tool_result source="web_search" extra>',
+                1,
+            ),
+            "duplicate_close": valid + "\n</untrusted_tool_result>",
+            "nested_delimiter": valid.replace(
+                "successful external payload",
+                "successful <untrusted_tool_result> external payload",
+                1,
+            ),
+            "uppercase_tag": valid.replace(
+                "untrusted_tool_result", "UNTRUSTED_TOOL_RESULT"
+            ),
+            "leading_text": "NOTICE\n" + valid,
+            "leading_blank_line": "\n" + valid,
+            "trailing_whitespace": valid + "\n",
+        }
+
+        self.assertFalse(_looks_like_error_output(valid))
+        for label, content in malformed.items():
+            with self.subTest(label=label):
+                self.assertTrue(_looks_like_error_output(content))
+
+    def test_executor_exception_string_is_failed_tool_evidence(self):
+        """Canonical executor failures must never satisfy the evidence gate."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.valid_tool_names = {"terminal"}
+        child.run_conversation.return_value = {
+            "final_response": "Command finished.",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 2,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-executor-error",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-executor-error",
+                    "content": (
+                        "Error executing tool 'terminal': "
+                        "thread did not return a result"
+                    ),
+                },
+            ],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Run command",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_kind"], "tool_execution_failed")
+        self.assertEqual(result["evidence"]["successful_tool_count"], 0)
+        self.assertEqual(result["tool_trace"][0]["status"], "error")
 
     def test_execution_delegate_with_successful_tool_result_completes(self):
         from tools.delegate_tool import _run_single_child
@@ -1656,8 +1842,8 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_mode"], "anthropic_messages")
 
     def test_direct_endpoint_returns_none_api_key_when_not_configured(self):
-        # When base_url is set without api_key, api_key should be None so
-        # _build_child_agent inherits the parent's key (effective_api_key = override or parent).
+        # The low-level resolver stays side-effect free and reports the omission;
+        # lane resolution rejects it before child construction can inherit a key.
         parent = _make_mock_parent(depth=0)
         cfg = {
             "model": "qwen2.5-coder",
@@ -1669,7 +1855,8 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["provider"], "custom")
 
     def test_direct_endpoint_no_raise_when_only_provider_env_key_present(self):
-        # Even if OPENAI_API_KEY is absent, no ValueError — _build_child_agent uses parent key.
+        # The low-level resolver records no key. Deterministic lane resolution
+        # rejects that incomplete direct-endpoint config before building a child.
         parent = _make_mock_parent(depth=0)
         cfg = {
             "model": "qwen2.5-coder",
@@ -1748,6 +1935,24 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         mock_resolve.assert_called_once_with(
             requested="crof.ai", target_model="deepseek-v4-pro-CEER"
         )
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_provider_forwards_runtime_request_overrides_and_output_cap(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "custom",
+            "model": "real-model",
+            "base_url": "https://gateway.example/v1",
+            "api_key": "gateway-key",
+            "api_mode": "chat_completions",
+            "request_overrides": {"extra_body": {"store": False}},
+            "max_output_tokens": 3072,
+        }
+        creds = _resolve_delegation_credentials(
+            {"model": "real-model", "provider": "gateway"},
+            _make_mock_parent(depth=0),
+        )
+        self.assertEqual(creds["request_overrides"], {"extra_body": {"store": False}})
+        self.assertEqual(creds["max_output_tokens"], 3072)
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_standard_provider_not_overwritten_by_configured_name(self, mock_resolve):
@@ -1930,6 +2135,8 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         parent.providers_ignored = ["openai/gpt-4o-mini"]
         parent.providers_order = ["google/gemini-2.5-pro"]
         parent.provider_sort = "price"
+        parent.provider_require_parameters = True
+        parent.provider_data_collection = "deny"
 
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
@@ -1948,6 +2155,40 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertIsNone(kwargs["providers_ignored"])
             self.assertIsNone(kwargs["providers_order"])
             self.assertIsNone(kwargs["provider_sort"])
+            self.assertIs(kwargs["provider_require_parameters"], False)
+            self.assertEqual(kwargs["provider_data_collection"], "")
+
+    def test_child_without_provider_override_inherits_all_routing_preferences(self):
+        """The helper preserves parent preferences only when no lane overrides provider."""
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "nous"
+        parent.providers_allowed = ["deepseek"]
+        parent.providers_ignored = ["deepinfra"]
+        parent.providers_order = ["anthropic"]
+        parent.provider_sort = "throughput"
+        parent.provider_require_parameters = True
+        parent.provider_data_collection = "deny"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Keep routing",
+                context=None,
+                toolsets=None,
+                model=parent.model,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["providers_allowed"], ["deepseek"])
+        self.assertEqual(kwargs["providers_ignored"], ["deepinfra"])
+        self.assertEqual(kwargs["providers_order"], ["anthropic"])
+        self.assertEqual(kwargs["provider_sort"], "throughput")
+        self.assertIs(kwargs["provider_require_parameters"], True)
+        self.assertEqual(kwargs["provider_data_collection"], "deny")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -2885,6 +3126,76 @@ class TestDelegateEventEnum(unittest.TestCase):
 
 class TestConcurrencyDefaults(unittest.TestCase):
     """Tests for the concurrency default and no hard ceiling."""
+
+    def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
+        stale_cli = types.ModuleType("cli")
+        stale_cli.CLI_CONFIG = {
+            "delegation": {
+                "max_iterations": 45,
+                "model": "",
+                "provider": "",
+                "base_url": "",
+                "api_key": "",
+            }
+        }
+        active_config = {
+            "delegation": {
+                "max_iterations": 50,
+                "max_concurrent_children": 50,
+                "max_spawn_depth": 10,
+            }
+        }
+
+        with patch.dict("sys.modules", {"cli": stale_cli}):
+            with patch(
+                "hermes_cli.config.load_config_readonly", return_value=active_config
+            ):
+                self.assertEqual(_load_config()["max_concurrent_children"], 50)
+                # setUpModule replaces the module-global loader for machine-config
+                # isolation. Restore the real loader for this accessor contract.
+                with patch(
+                    "tools.delegate_tool._load_config", side_effect=_load_config
+                ):
+                    self.assertEqual(_get_max_concurrent_children(), 50)
+
+    def test_load_config_falls_back_to_cli_config_when_persistent_load_fails(self):
+        fallback_cli = types.ModuleType("cli")
+        fallback_cli.CLI_CONFIG = {
+            "delegation": {
+                "max_iterations": 45,
+                "max_concurrent_children": 8,
+            }
+        }
+
+        with patch.dict("sys.modules", {"cli": fallback_cli}):
+            with patch(
+                "hermes_cli.config.load_config_readonly",
+                side_effect=RuntimeError("boom"),
+            ):
+                self.assertEqual(_load_config()["max_concurrent_children"], 8)
+
+    def test_load_config_prefers_cli_config_when_user_config_ignored(self):
+        # `hermes chat --ignore-user-config` sets HERMES_IGNORE_USER_CONFIG=1,
+        # which only load_cli_config() honors. The delegation loader must keep
+        # CLI_CONFIG authoritative under the flag so user config.yaml
+        # delegation keys stay suppressed.
+        ignoring_cli = types.ModuleType("cli")
+        ignoring_cli.CLI_CONFIG = {
+            "delegation": {
+                "max_iterations": 45,
+                "max_concurrent_children": 4,
+            }
+        }
+        user_config = {"delegation": {"max_concurrent_children": 50}}
+
+        with patch.dict("sys.modules", {"cli": ignoring_cli}):
+            with patch.dict(os.environ, {"HERMES_IGNORE_USER_CONFIG": "1"}):
+                with patch(
+                    "hermes_cli.config.load_config_readonly",
+                    return_value=user_config,
+                ) as mock_loader:
+                    self.assertEqual(_load_config()["max_concurrent_children"], 4)
+                    mock_loader.assert_not_called()
 
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_default_is_three(self, mock_cfg):

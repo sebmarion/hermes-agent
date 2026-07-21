@@ -1,161 +1,244 @@
 import { useEffect, useRef } from 'react'
 
 import { getAllProfileSessionsRevision } from '@/hermes'
+import { ALL_PROFILES } from '@/store/profile'
 
 const SESSION_REVISION_POLL_INTERVAL_MS = 5_000
-const ALL_PROFILES_SCOPE = '__all__'
 
 export interface UseSessionRevisionPollArgs {
   enabled: boolean
   profileScope: string
-  refreshSessions: () => Promise<void>
+  refreshSessions: () => Promise<SessionRefreshResult>
 }
 
-interface LatestProbe {
-  generation: number
-  run: () => void
+export type SessionRefreshResult = 'applied' | 'superseded'
+
+interface PollGeneration {
+  cancelled: boolean
+  id: number
+  profileScope: string
+  refreshSessions: () => Promise<SessionRefreshResult>
 }
 
-export function useSessionRevisionPoll({
-  enabled,
-  profileScope,
-  refreshSessions
-}: UseSessionRevisionPollArgs): void {
-  const generationCounterRef = useRef(0)
-  const activeGenerationRef = useRef(0)
-  const acknowledgedRevisionRef = useRef<string | null>(null)
-  const dirtyRef = useRef(true)
-  const inFlightPromiseRef = useRef<Promise<void> | null>(null)
-  const pendingGenerationRef = useRef<number | null>(null)
-  const latestProbeRef = useRef<LatestProbe | null>(null)
-  const failureLoggedRef = useRef(false)
+interface PollCoordinator {
+  acknowledgedRevision: string | null
+  activeGeneration: PollGeneration | null
+  dirty: boolean
+  disposed: boolean
+  failureActive: boolean
+  inFlightPromise: Promise<void> | null
+  latestProbe: (() => void) | null
+  nextGeneration: number
+  pendingGeneration: number | null
+}
+
+function createCoordinator(): PollCoordinator {
+  return {
+    acknowledgedRevision: null,
+    activeGeneration: null,
+    dirty: true,
+    disposed: false,
+    failureActive: false,
+    inFlightPromise: null,
+    latestProbe: null,
+    nextGeneration: 0,
+    pendingGeneration: null
+  }
+}
+
+export function useSessionRevisionPoll({ enabled, profileScope, refreshSessions }: UseSessionRevisionPollArgs): void {
+  const coordinatorRef = useRef<PollCoordinator | null>(null)
+
+  if (coordinatorRef.current === null) {
+    coordinatorRef.current = createCoordinator()
+  }
+
+  const coordinator = coordinatorRef.current
+
+  useEffect(
+    () => () => {
+      coordinator.disposed = true
+      coordinator.activeGeneration = null
+      coordinator.latestProbe = null
+      coordinator.pendingGeneration = null
+
+      const outstandingPromise = coordinator.inFlightPromise
+
+      const dispose = (): void => {
+        if (!coordinator.disposed) {
+          return
+        }
+
+        coordinator.acknowledgedRevision = null
+        coordinator.dirty = true
+        coordinator.failureActive = false
+
+        if (coordinator.inFlightPromise === outstandingPromise) {
+          coordinator.inFlightPromise = null
+        }
+      }
+
+      if (outstandingPromise) {
+        void outstandingPromise.finally(dispose)
+      } else {
+        dispose()
+      }
+    },
+    [coordinator]
+  )
 
   useEffect(() => {
-    const generation = generationCounterRef.current + 1
-    generationCounterRef.current = generation
-    activeGenerationRef.current = generation
-    acknowledgedRevisionRef.current = null
-    dirtyRef.current = true
-    failureLoggedRef.current = false
+    const generationId = ++coordinator.nextGeneration
 
     if (!enabled) {
+      coordinator.activeGeneration = null
+      coordinator.acknowledgedRevision = null
+      coordinator.dirty = true
+      coordinator.latestProbe = null
+      coordinator.pendingGeneration = null
+
       return
     }
 
-    let cancelled = false
-    const requestedProfile =
-      profileScope === ALL_PROFILES_SCOPE ? 'all' : profileScope
-    const isCurrent = () =>
-      !cancelled && activeGenerationRef.current === generation
+    const generation: PollGeneration = {
+      cancelled: false,
+      id: generationId,
+      profileScope,
+      refreshSessions
+    }
 
-    const recordFailure = (error: unknown) => {
+    const revisionProfileScope = generation.profileScope === ALL_PROFILES ? 'all' : generation.profileScope
+
+    coordinator.disposed = false
+    coordinator.activeGeneration = generation
+    coordinator.acknowledgedRevision = null
+    coordinator.dirty = true
+    coordinator.failureActive = false
+
+    const isCurrent = (): boolean =>
+      !coordinator.disposed && !generation.cancelled && coordinator.activeGeneration?.id === generation.id
+
+    const recordFailure = (error: unknown): void => {
       if (!isCurrent()) {
         return
       }
 
-      dirtyRef.current = true
-      if (!failureLoggedRef.current) {
-        console.warn('Session revision refresh failed; retrying', error)
-        failureLoggedRef.current = true
+      coordinator.dirty = true
+
+      if (coordinator.failureActive) {
+        return
+      }
+
+      coordinator.failureActive = true
+      console.warn('Session revision polling failed; retrying in the background.', error)
+    }
+
+    const recordSuccess = (): void => {
+      if (isCurrent()) {
+        coordinator.failureActive = false
       }
     }
 
-    const probe = () => {
+    const runCycle = async (): Promise<void> => {
+      try {
+        const candidate = (await getAllProfileSessionsRevision(revisionProfileScope)).revision
+
+        if (!isCurrent()) {
+          return
+        }
+
+        if (!coordinator.dirty && coordinator.acknowledgedRevision === candidate) {
+          recordSuccess()
+
+          return
+        }
+
+        coordinator.dirty = true
+        const refreshResult = await generation.refreshSessions()
+
+        if (!isCurrent()) {
+          return
+        }
+
+        if (refreshResult === 'superseded') {
+          coordinator.dirty = true
+          recordSuccess()
+
+          return
+        }
+
+        const confirmed = (await getAllProfileSessionsRevision(revisionProfileScope)).revision
+
+        if (!isCurrent()) {
+          return
+        }
+
+        if (confirmed !== candidate) {
+          coordinator.dirty = true
+          coordinator.pendingGeneration = generation.id
+          recordSuccess()
+
+          return
+        }
+
+        coordinator.acknowledgedRevision = candidate
+        coordinator.dirty = false
+        recordSuccess()
+      } catch (error) {
+        recordFailure(error)
+      }
+    }
+
+    const probe = (): void => {
       if (!isCurrent()) {
         return
       }
 
-      if (inFlightPromiseRef.current !== null) {
-        pendingGenerationRef.current = activeGenerationRef.current
+      if (coordinator.inFlightPromise) {
+        coordinator.pendingGeneration = generation.id
+
         return
       }
 
-      const work = (async () => {
-        try {
-          const candidate = (
-            await getAllProfileSessionsRevision(requestedProfile)
-          ).revision
-
-          if (!isCurrent()) {
-            return
-          }
-
-          if (
-            !dirtyRef.current &&
-            acknowledgedRevisionRef.current === candidate
-          ) {
-            failureLoggedRef.current = false
-            return
-          }
-
-          await refreshSessions()
-
-          if (!isCurrent()) {
-            return
-          }
-
-          const confirmed = (
-            await getAllProfileSessionsRevision(requestedProfile)
-          ).revision
-
-          if (!isCurrent()) {
-            return
-          }
-
-          failureLoggedRef.current = false
-          if (confirmed === candidate) {
-            acknowledgedRevisionRef.current = confirmed
-            dirtyRef.current = false
-          } else {
-            dirtyRef.current = true
-            pendingGenerationRef.current = generation
-          }
-        } catch (error) {
-          recordFailure(error)
-        }
-      })()
-
-      inFlightPromiseRef.current = work
-      void work.finally(() => {
-        if (inFlightPromiseRef.current === work) {
-          inFlightPromiseRef.current = null
-        }
-
-        const pendingGeneration = pendingGenerationRef.current
-        if (pendingGeneration === null) {
+      const task = runCycle()
+      coordinator.inFlightPromise = task
+      void task.finally(() => {
+        if (coordinator.inFlightPromise !== task) {
           return
         }
-        pendingGenerationRef.current = null
 
-        const latestProbe = latestProbeRef.current
-        if (
-          pendingGeneration === activeGenerationRef.current &&
-          latestProbe?.generation === pendingGeneration
-        ) {
-          queueMicrotask(latestProbe.run)
+        coordinator.inFlightPromise = null
+
+        if (coordinator.disposed) {
+          return
+        }
+
+        const pendingGeneration = coordinator.pendingGeneration
+        coordinator.pendingGeneration = null
+        const activeGeneration = coordinator.activeGeneration
+
+        if (pendingGeneration !== null && activeGeneration?.id === pendingGeneration && !activeGeneration.cancelled) {
+          coordinator.latestProbe?.()
         }
       })
     }
 
-    latestProbeRef.current = { generation, run: probe }
+    coordinator.latestProbe = probe
     probe()
-    const interval = window.setInterval(
-      probe,
-      SESSION_REVISION_POLL_INTERVAL_MS
-    )
-    const removePowerResumeListener =
-      window.hermesDesktop.onPowerResume?.(probe)
+
+    const intervalId = window.setInterval(probe, SESSION_REVISION_POLL_INTERVAL_MS)
+
+    const removePowerResumeListener = window.hermesDesktop.onPowerResume?.(probe)
 
     return () => {
-      cancelled = true
-      window.clearInterval(interval)
+      generation.cancelled = true
+      window.clearInterval(intervalId)
       removePowerResumeListener?.()
-      if (latestProbeRef.current?.generation === generation) {
-        latestProbeRef.current = null
-      }
-      if (pendingGenerationRef.current === generation) {
-        pendingGenerationRef.current = null
+
+      if (coordinator.activeGeneration?.id === generation.id) {
+        coordinator.activeGeneration = null
+        coordinator.latestProbe = null
       }
     }
-  }, [enabled, profileScope, refreshSessions])
+  }, [coordinator, enabled, profileScope, refreshSessions])
 }

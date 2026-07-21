@@ -18,7 +18,7 @@ interface VoiceConversationOptions {
   busy: boolean
   enabled: boolean
   onFatalError?: () => void
-  onSubmit: (text: string) => Promise<void> | void
+  onSubmit: (text: string) => Promise<boolean | void> | boolean | void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   pendingResponse: () => PendingVoiceResponse | null
   consumePendingResponse: () => void
@@ -166,9 +166,21 @@ export function useVoiceConversation({
             return
           }
 
-          awaitingSpokenResponseRef.current = true
+          awaitingSpokenResponseRef.current = false
           resetSpeechBuffer()
-          await onSubmit(transcript)
+          const submitted = await onSubmit(transcript)
+
+          if (submitted === false) {
+            if (enabledRef.current && !mutedRef.current && !busyRef.current) {
+              pendingStartRef.current = true
+            }
+
+            setStatus('idle')
+
+            return
+          }
+
+          awaitingSpokenResponseRef.current = true
           setStatus('thinking')
         } catch (error) {
           notifyError(error, voiceCopy.transcriptionFailed)

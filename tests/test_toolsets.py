@@ -51,6 +51,11 @@ class TestGetToolset:
 
 
 class TestResolveToolset:
+    def test_read_only_files_excludes_mutating_tools(self):
+        tools = set(resolve_toolset("read_only_files"))
+        assert tools == {"read_file", "search_files"}
+        assert tools.isdisjoint({"terminal", "write_file", "patch"})
+
     def test_leaf_toolset(self):
         tools = resolve_toolset("web")
         assert set(tools) == {"web_search", "web_extract"}

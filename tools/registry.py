@@ -571,6 +571,31 @@ class ToolRegistry:
     # Dispatch
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_handler_result(name: str, result):
+        """Normalize handlers to text or the supported multimodal envelope."""
+        if isinstance(result, str):
+            return result
+        if (
+            isinstance(result, dict)
+            and result.get("_multimodal") is True
+            and isinstance(result.get("content"), list)
+        ):
+            return result
+
+        result_type = type(result).__name__
+        logger.error(
+            "Tool %s handler returned unsupported result type: %s",
+            name,
+            result_type,
+        )
+        return json.dumps({
+            "error": f"Tool handler returned unsupported result type: {result_type}",
+            "error_type": "tool_result_contract",
+            "tool": name,
+            "result_type": result_type,
+        }, ensure_ascii=False)
+
     def dispatch(
         self,
         name: str,
@@ -579,10 +604,12 @@ class ToolRegistry:
         turn_id=None,
         tool_call_id=None,
         **kwargs,
-    ) -> str:
+    ) -> str | dict:
         """Execute a tool handler by name.
 
         * Async handlers are bridged automatically via ``_run_async()``.
+        * Handler results are normalized to a string or supported multimodal
+          envelope before leaving the registry.
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
@@ -638,8 +665,10 @@ class ToolRegistry:
                 if entry.is_async:
                     from model_tools import _run_async
 
-                    return _run_async(entry.handler(args, **kwargs))
-                return entry.handler(args, **kwargs)
+                    result = _run_async(entry.handler(args, **kwargs))
+                else:
+                    result = entry.handler(args, **kwargs)
+            return self._normalize_handler_result(name, result)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             # Route through the sanitizer so framing tokens / CDATA / fences

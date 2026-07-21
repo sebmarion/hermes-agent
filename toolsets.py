@@ -195,7 +195,7 @@ TOOLSETS = {
     },
 
     "read_only_files": {
-        "description": "Read-only file inspection tools: read files and search file names or contents",
+        "description": "Read-only filesystem inspection: read and search files without writes or shell access",
         "tools": ["read_file", "search_files"],
         "includes": []
     },

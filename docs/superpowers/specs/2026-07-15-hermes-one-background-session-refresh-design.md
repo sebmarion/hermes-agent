@@ -1,7 +1,7 @@
 # Hermes One Background Session Refresh Design
 
 Date: 2026-07-15
-Status: Approved for implementation planning
+Status: Implemented in source; fork delivery verification pending
 
 ## Problem
 
@@ -110,8 +110,9 @@ When the requested profile set changes, it opens missing connections and
 closes connections that no longer belong to the requested local scope.
 
 Before reading `data_version`, each request also validates that every database
-path still resolves to the same file identity (device/inode, with a portable
-fallback where necessary). If a database disappears or the identity changes
+path still resolves to the same file identity. macOS/Linux use device/inode;
+Windows uses a handle-free database/WAL fingerprint so polling does not block
+atomic replacement. If a database disappears or the identity changes
 because `state.db` was atomically replaced,
 the tracker closes the stale connection. When the path becomes available, it
 opens a new read-only connection and returns a different revision token. It
@@ -183,12 +184,14 @@ already owned by the canonical refresh path.
 
 ### Renderer reconciliation
 
-When the revision changes, the app-wide hook calls the existing
-`refreshSessions()` action. That action reads through the canonical profile
-session API and applies the existing store merge and generation rules. The
-revision endpoint never returns a copied session-list payload. This keeps
-filtering, paging, lineage, archive, pin, and merge semantics in their current
-owner.
+When the revision changes, the app-wide hook calls a strict wrapper around the
+existing session-list actions. It reads through the canonical profile session
+API, awaits the core, cron, and messaging projections, and returns `applied`
+only when all payloads still own their store generations. Standalone refreshes
+and pagers share those generation guards but retain their existing non-fatal
+behavior. The revision endpoint never returns a copied session-list payload.
+This keeps filtering, paging, lineage, archive, pin, and merge semantics in
+their current owner.
 
 Renderer behavior:
 
@@ -302,8 +305,8 @@ than mocking `PRAGMA data_version`. They must not read or write the user's real
 
 ## Delivery
 
-The implementation should be one logical desktop change with focused tests.
-The built application must be rebuilt and the installed Hermes One version must
-be verified after replacement. Completion evidence includes the automated test
-output, the installed bundle version/build identity, and the minimized-window
-cross-surface manual test.
+The implementation lands directly on Seb's fork `main` with focused tests and
+build evidence. Packaging is attempted from the clean source commit. Installing
+the rebuilt app, updating the separate runtime checkout, and measuring live
+minimized-window latency remain a separate authorized deployment step when
+those targets are writable.

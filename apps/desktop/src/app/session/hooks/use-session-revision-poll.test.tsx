@@ -1,288 +1,360 @@
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup, renderHook } from '@testing-library/react'
+import { type PropsWithChildren, StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getAllProfileSessionsRevision } from '@/hermes'
+import { ALL_PROFILES } from '@/store/profile'
 
 import { useSessionRevisionPoll } from './use-session-revision-poll'
 
-vi.mock('@/hermes', () => ({
+vi.mock('@/hermes', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   getAllProfileSessionsRevision: vi.fn()
 }))
 
-interface Deferred<T> {
-  promise: Promise<T>
-  reject: (error: Error) => void
-  resolve: (value: T) => void
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void
-  let reject!: (error: Error) => void
-  const promise = new Promise<T>((onResolve, onReject) => {
-    resolve = onResolve
-    reject = onReject
-  })
-
-  return { promise, reject, resolve }
-}
+const revisionProbe = vi.mocked(getAllProfileSessionsRevision)
 
 function revision(value: string) {
   return { profiles: ['default'], revision: value }
 }
 
-function Harness({
-  enabled = true,
-  profileScope = 'default',
-  refreshSessions
-}: {
-  enabled?: boolean
-  profileScope?: string
-  refreshSessions: () => Promise<void>
-}) {
-  useSessionRevisionPoll({ enabled, profileScope, refreshSessions })
-  return null
-}
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
 
-const getRevision = vi.mocked(getAllProfileSessionsRevision)
-let resume: (() => void) | undefined
-let removeResumeListener: ReturnType<typeof vi.fn>
-
-async function flush() {
-  await act(async () => {
-    await vi.advanceTimersByTimeAsync(0)
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
   })
+
+  return { promise, reject, resolve }
 }
 
-async function tick() {
+async function settleAsyncWork(rounds = 16): Promise<void> {
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(5_000)
-  })
-}
-
-beforeEach(() => {
-  vi.useFakeTimers()
-  getRevision.mockReset()
-  resume = undefined
-  removeResumeListener = vi.fn()
-  Object.defineProperty(window, 'hermesDesktop', {
-    configurable: true,
-    value: {
-      onPowerResume: vi.fn((callback: () => void) => {
-        resume = callback
-        return removeResumeListener
-      })
+    for (let index = 0; index < rounds; index += 1) {
+      await Promise.resolve()
     }
   })
-})
+}
 
-afterEach(() => {
-  cleanup()
-  vi.useRealTimers()
-  vi.restoreAllMocks()
-  Reflect.deleteProperty(window, 'hermesDesktop')
-})
+function StrictModeWrapper({ children }: PropsWithChildren) {
+  return <StrictMode>{children}</StrictMode>
+}
 
 describe('useSessionRevisionPoll', () => {
+  let resumeCallback: (() => void) | undefined
+  let removePowerResumeListener: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    revisionProbe.mockReset()
+    resumeCallback = undefined
+    removePowerResumeListener = vi.fn()
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        onPowerResume: vi.fn((callback: () => void) => {
+          resumeCallback = callback
+
+          return removePowerResumeListener
+        })
+      }
+    })
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.clearAllTimers()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+    Reflect.deleteProperty(window, 'hermesDesktop')
+  })
+
   it('refreshes once on the first probe and not again for an unchanged acknowledged revision', async () => {
-    getRevision.mockResolvedValue(revision('a'))
-    const refreshSessions = vi.fn(async () => undefined)
+    revisionProbe.mockResolvedValue(revision('r1'))
+    const refreshSessions = vi.fn().mockResolvedValue('applied')
 
-    render(<Harness refreshSessions={refreshSessions} />)
-    await flush()
-
-    expect(refreshSessions).toHaveBeenCalledTimes(1)
-    expect(getRevision).toHaveBeenCalledTimes(2)
-
-    await tick()
+    renderHook(() => useSessionRevisionPoll({ enabled: true, profileScope: 'all', refreshSessions }))
+    await settleAsyncWork()
 
     expect(refreshSessions).toHaveBeenCalledTimes(1)
-    expect(getRevision).toHaveBeenCalledTimes(3)
+    expect(revisionProbe).toHaveBeenCalledTimes(2)
+
+    await act(async () => vi.advanceTimersByTimeAsync(5_000))
+    await settleAsyncWork()
+
+    expect(revisionProbe).toHaveBeenCalledTimes(3)
+    expect(refreshSessions).toHaveBeenCalledTimes(1)
+  })
+
+  it('normalizes the real all-profiles UI sentinel for the backend revision API', async () => {
+    revisionProbe.mockResolvedValue(revision('r1'))
+    const refreshSessions = vi.fn().mockResolvedValue('applied')
+
+    renderHook(() => useSessionRevisionPoll({ enabled: true, profileScope: ALL_PROFILES, refreshSessions }))
+    await settleAsyncWork()
+
+    expect(revisionProbe).toHaveBeenCalledTimes(2)
+    expect(revisionProbe).toHaveBeenNthCalledWith(1, 'all')
+    expect(revisionProbe).toHaveBeenNthCalledWith(2, 'all')
   })
 
   it('refreshes a changed revision by the next five-second tick', async () => {
-    getRevision
-      .mockResolvedValueOnce(revision('a'))
-      .mockResolvedValueOnce(revision('a'))
-      .mockResolvedValueOnce(revision('b'))
-      .mockResolvedValueOnce(revision('b'))
-    const refreshSessions = vi.fn(async () => undefined)
+    revisionProbe
+      .mockResolvedValueOnce(revision('r1'))
+      .mockResolvedValueOnce(revision('r1'))
+      .mockResolvedValueOnce(revision('r2'))
+      .mockResolvedValueOnce(revision('r2'))
+    const refreshSessions = vi.fn().mockResolvedValue('applied')
 
-    render(<Harness refreshSessions={refreshSessions} />)
-    await flush()
-    await tick()
+    renderHook(() => useSessionRevisionPoll({ enabled: true, profileScope: 'all', refreshSessions }))
+    await settleAsyncWork()
+    await act(async () => vi.advanceTimersByTimeAsync(5_000))
+    await settleAsyncWork()
 
     expect(refreshSessions).toHaveBeenCalledTimes(2)
-    expect(getRevision).toHaveBeenCalledTimes(4)
+    expect(revisionProbe).toHaveBeenCalledTimes(4)
   })
 
   it('retries the same dirty revision after refresh failure', async () => {
-    getRevision.mockResolvedValue(revision('a'))
-    const refreshSessions = vi
-      .fn<() => Promise<void>>()
-      .mockRejectedValueOnce(new Error('refresh failed'))
-      .mockResolvedValue(undefined)
+    revisionProbe.mockResolvedValue(revision('r1'))
 
-    render(<Harness refreshSessions={refreshSessions} />)
-    await flush()
+    const refreshSessions = vi.fn().mockRejectedValueOnce(new Error('refresh failed')).mockResolvedValue('applied')
+
+    renderHook(() => useSessionRevisionPoll({ enabled: true, profileScope: 'all', refreshSessions }))
+    await settleAsyncWork()
+
     expect(refreshSessions).toHaveBeenCalledTimes(1)
 
-    await tick()
+    await act(async () => vi.advanceTimersByTimeAsync(5_000))
+    await settleAsyncWork()
 
     expect(refreshSessions).toHaveBeenCalledTimes(2)
-    expect(getRevision).toHaveBeenCalledTimes(3)
+    expect(revisionProbe).toHaveBeenCalledTimes(3)
+  })
+
+  it('retries when the requested refresh was superseded before it applied', async () => {
+    revisionProbe.mockResolvedValue(revision('r1'))
+
+    const refreshSessions = vi.fn().mockResolvedValueOnce('superseded').mockResolvedValueOnce('applied')
+
+    renderHook(() => useSessionRevisionPoll({ enabled: true, profileScope: 'all', refreshSessions }))
+    await settleAsyncWork()
+
+    expect(refreshSessions).toHaveBeenCalledTimes(1)
+    expect(revisionProbe).toHaveBeenCalledTimes(1)
+
+    await act(async () => vi.advanceTimersByTimeAsync(5_000))
+    await settleAsyncWork()
+
+    expect(refreshSessions).toHaveBeenCalledTimes(2)
+    expect(revisionProbe).toHaveBeenCalledTimes(3)
   })
 
   it('keeps the revision dirty when the confirmation probe fails', async () => {
-    getRevision
-      .mockResolvedValueOnce(revision('a'))
-      .mockRejectedValueOnce(new Error('confirm failed'))
-      .mockResolvedValue(revision('a'))
-    const refreshSessions = vi.fn(async () => undefined)
+    revisionProbe
+      .mockResolvedValueOnce(revision('r1'))
+      .mockRejectedValueOnce(new Error('confirmation failed'))
+      .mockResolvedValueOnce(revision('r1'))
+      .mockResolvedValueOnce(revision('r1'))
+    const refreshSessions = vi.fn().mockResolvedValue('applied')
 
-    render(<Harness refreshSessions={refreshSessions} />)
-    await flush()
-    await tick()
+    renderHook(() => useSessionRevisionPoll({ enabled: true, profileScope: 'all', refreshSessions }))
+    await settleAsyncWork()
+    await act(async () => vi.advanceTimersByTimeAsync(5_000))
+    await settleAsyncWork()
 
     expect(refreshSessions).toHaveBeenCalledTimes(2)
-    expect(getRevision).toHaveBeenCalledTimes(4)
+    expect(revisionProbe).toHaveBeenCalledTimes(4)
   })
 
   it('coalesces ticks and follows a commit that lands during refresh', async () => {
+    revisionProbe
+      .mockResolvedValueOnce(revision('r1'))
+      .mockResolvedValueOnce(revision('r2'))
+      .mockResolvedValueOnce(revision('r2'))
+      .mockResolvedValueOnce(revision('r2'))
     const firstRefresh = deferred<void>()
-    const secondRefresh = deferred<void>()
-    getRevision
-      .mockResolvedValueOnce(revision('a'))
-      .mockResolvedValueOnce(revision('b'))
-      .mockResolvedValueOnce(revision('b'))
-      .mockResolvedValueOnce(revision('b'))
-    let active = 0
-    let maximumActive = 0
+    let activeRefreshes = 0
+    let maxActiveRefreshes = 0
+    let refreshCall = 0
+
     const refreshSessions = vi.fn(async () => {
-      active += 1
-      maximumActive = Math.max(maximumActive, active)
+      refreshCall += 1
+      activeRefreshes += 1
+      maxActiveRefreshes = Math.max(maxActiveRefreshes, activeRefreshes)
+
       try {
-        if (refreshSessions.mock.calls.length === 1) {
+        if (refreshCall === 1) {
           await firstRefresh.promise
-        } else {
-          await secondRefresh.promise
         }
       } finally {
-        active -= 1
+        activeRefreshes -= 1
       }
+
+      return 'applied' as const
     })
 
-    render(<Harness refreshSessions={refreshSessions} />)
-    await flush()
-    await tick()
-    await tick()
+    renderHook(() => useSessionRevisionPoll({ enabled: true, profileScope: 'all', refreshSessions }))
+    await settleAsyncWork()
     expect(refreshSessions).toHaveBeenCalledTimes(1)
 
-    firstRefresh.resolve(undefined)
-    await flush()
+    await act(async () => vi.advanceTimersByTimeAsync(5_000))
+    expect(revisionProbe).toHaveBeenCalledTimes(1)
+
+    firstRefresh.resolve()
+    await settleAsyncWork(32)
+
     expect(refreshSessions).toHaveBeenCalledTimes(2)
-
-    secondRefresh.resolve(undefined)
-    await flush()
-
-    expect(maximumActive).toBe(1)
-    expect(getRevision).toHaveBeenCalledTimes(4)
+    expect(revisionProbe).toHaveBeenCalledTimes(4)
+    expect(maxActiveRefreshes).toBe(1)
   })
 
   it('does not overlap old and new profile generations', async () => {
+    revisionProbe
+      .mockResolvedValueOnce(revision('default-r1'))
+      .mockResolvedValueOnce(revision('worker-r1'))
+      .mockResolvedValueOnce(revision('worker-r1'))
     const oldRefresh = deferred<void>()
-    getRevision.mockImplementation(async profile => revision(String(profile)))
-    let active = 0
-    let maximumActive = 0
+    let activeRefreshes = 0
+    let maxActiveRefreshes = 0
+    let refreshCall = 0
+
     const refreshSessions = vi.fn(async () => {
-      active += 1
-      maximumActive = Math.max(maximumActive, active)
+      refreshCall += 1
+      activeRefreshes += 1
+      maxActiveRefreshes = Math.max(maxActiveRefreshes, activeRefreshes)
+
       try {
-        if (refreshSessions.mock.calls.length === 1) {
+        if (refreshCall === 1) {
           await oldRefresh.promise
         }
       } finally {
-        active -= 1
+        activeRefreshes -= 1
       }
+
+      return 'applied' as const
     })
-    const view = render(
-      <Harness profileScope="old" refreshSessions={refreshSessions} />
-    )
-    await flush()
 
-    view.rerender(
-      <Harness profileScope="new" refreshSessions={refreshSessions} />
+    const { rerender } = renderHook(
+      ({ profileScope }) => useSessionRevisionPoll({ enabled: true, profileScope, refreshSessions }),
+      { initialProps: { profileScope: 'default' } }
     )
-    await flush()
+
+    await settleAsyncWork()
+    rerender({ profileScope: 'worker' })
+    await settleAsyncWork()
+
     expect(refreshSessions).toHaveBeenCalledTimes(1)
+    expect(revisionProbe).toHaveBeenCalledTimes(1)
 
-    oldRefresh.resolve(undefined)
-    await flush()
+    oldRefresh.resolve()
+    await settleAsyncWork(32)
 
     expect(refreshSessions).toHaveBeenCalledTimes(2)
-    expect(maximumActive).toBe(1)
-    expect(getRevision).toHaveBeenCalledWith('new')
+    expect(revisionProbe).toHaveBeenCalledTimes(3)
+    expect(revisionProbe).toHaveBeenNthCalledWith(2, 'worker')
+    expect(maxActiveRefreshes).toBe(1)
+  })
+
+  it('preserves the replacement generation single-flight marker in StrictMode', async () => {
+    revisionProbe.mockResolvedValue(revision('r1'))
+    const replacementRefresh = deferred<void>()
+    let activeRefreshes = 0
+    let maxActiveRefreshes = 0
+
+    const refreshSessions = vi.fn(async () => {
+      activeRefreshes += 1
+      maxActiveRefreshes = Math.max(maxActiveRefreshes, activeRefreshes)
+
+      try {
+        if (refreshSessions.mock.calls.length === 1) {
+          await replacementRefresh.promise
+        }
+      } finally {
+        activeRefreshes -= 1
+      }
+
+      return 'applied' as const
+    })
+
+    renderHook(() => useSessionRevisionPoll({ enabled: true, profileScope: 'all', refreshSessions }), {
+      wrapper: StrictModeWrapper
+    })
+    await settleAsyncWork()
+    expect(refreshSessions).toHaveBeenCalledTimes(1)
+
+    await act(async () => vi.advanceTimersByTimeAsync(5_000))
+    await settleAsyncWork()
+
+    expect(refreshSessions).toHaveBeenCalledTimes(1)
+    expect(maxActiveRefreshes).toBe(1)
+
+    replacementRefresh.resolve()
+    await settleAsyncWork(32)
   })
 
   it('does not acknowledge an old profile generation', async () => {
     const oldConfirmation = deferred<ReturnType<typeof revision>>()
-    getRevision
+    revisionProbe
       .mockResolvedValueOnce(revision('shared'))
-      .mockReturnValueOnce(oldConfirmation.promise)
-      .mockResolvedValue(revision('shared'))
-    const refreshSessions = vi.fn(async () => undefined)
-    const view = render(
-      <Harness profileScope="old" refreshSessions={refreshSessions} />
-    )
-    await flush()
+      .mockImplementationOnce(() => oldConfirmation.promise)
+      .mockResolvedValueOnce(revision('shared'))
+      .mockResolvedValueOnce(revision('shared'))
+    const refreshSessions = vi.fn().mockResolvedValue('applied')
 
-    view.rerender(
-      <Harness profileScope="new" refreshSessions={refreshSessions} />
+    const { rerender } = renderHook(
+      ({ profileScope }) => useSessionRevisionPoll({ enabled: true, profileScope, refreshSessions }),
+      { initialProps: { profileScope: 'default' } }
     )
-    await flush()
+
+    await settleAsyncWork()
+    expect(revisionProbe).toHaveBeenCalledTimes(2)
+
+    rerender({ profileScope: 'worker' })
     oldConfirmation.resolve(revision('shared'))
-    await flush()
+    await settleAsyncWork(32)
 
     expect(refreshSessions).toHaveBeenCalledTimes(2)
+    expect(revisionProbe).toHaveBeenCalledTimes(4)
+    expect(revisionProbe).toHaveBeenNthCalledWith(3, 'worker')
   })
 
   it('does not start when disabled', async () => {
-    const refreshSessions = vi.fn(async () => undefined)
+    const refreshSessions = vi.fn().mockResolvedValue('applied')
 
-    render(<Harness enabled={false} refreshSessions={refreshSessions} />)
-    await tick()
+    renderHook(() => useSessionRevisionPoll({ enabled: false, profileScope: 'all', refreshSessions }))
+    await settleAsyncWork()
+    await act(async () => vi.advanceTimersByTimeAsync(10_000))
 
-    expect(getRevision).not.toHaveBeenCalled()
+    expect(revisionProbe).not.toHaveBeenCalled()
     expect(refreshSessions).not.toHaveBeenCalled()
-    expect(resume).toBeUndefined()
-  })
-
-  it('maps the unified profile scope to the backend all-profile selector', async () => {
-    getRevision.mockResolvedValue(revision('a'))
-
-    render(
-      <Harness
-        profileScope="__all__"
-        refreshSessions={async () => undefined}
-      />
-    )
-    await flush()
-
-    expect(getRevision).toHaveBeenCalledWith('all')
+    expect(window.hermesDesktop.onPowerResume).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('probes immediately on power resume without adding an interval', async () => {
-    getRevision.mockResolvedValue(revision('a'))
-    const setIntervalSpy = vi.spyOn(window, 'setInterval')
+    revisionProbe.mockResolvedValue(revision('r1'))
+    const refreshSessions = vi.fn().mockResolvedValue('applied')
 
-    render(<Harness refreshSessions={async () => undefined} />)
-    await flush()
-    const callsBeforeResume = getRevision.mock.calls.length
-    expect(setIntervalSpy).toHaveBeenCalledTimes(1)
+    const { unmount } = renderHook(() =>
+      useSessionRevisionPoll({ enabled: true, profileScope: 'all', refreshSessions })
+    )
 
-    act(() => resume?.())
-    await flush()
+    await settleAsyncWork()
 
-    expect(getRevision.mock.calls.length).toBe(callsBeforeResume + 1)
-    expect(setIntervalSpy).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(1)
+    expect(resumeCallback).toBeTypeOf('function')
+    await act(async () => resumeCallback?.())
+    await settleAsyncWork()
+
+    expect(revisionProbe).toHaveBeenCalledTimes(3)
+    expect(refreshSessions).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(1)
+
+    unmount()
+    expect(removePowerResumeListener).toHaveBeenCalledTimes(1)
   })
 })
