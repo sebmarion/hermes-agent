@@ -95,6 +95,15 @@ def test_inline_pastes_stores_full_content(tmp_path):
     assert cli_obj._skip_paste_collapse is True
 
 
+def test_inline_pastes_leaves_plain_text_untouched():
+    """No placeholder → buffer text and collapse flag are unchanged."""
+    cli_obj = _make_cli()
+    buffer = _FakeBuffer(text="just a normal message")
+
+    cli_obj._inline_pastes(buffer)
+
+    assert buffer.text == "just a normal message"
+    assert cli_obj._skip_paste_collapse is False
 
 
 def test_inline_pastes_missing_file_keeps_placeholder(tmp_path):
