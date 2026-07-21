@@ -608,6 +608,13 @@ class AIAgent:
                 cwd=_launch_cwd_for_session(source),
             )
             self._session_db_created = True
+            # Auto-archive delegate subagent sessions at row creation so they
+            # never appear in any sidebar (desktop app, WebUI, CLI).
+            if getattr(self, "_auto_archive_session", False):
+                try:
+                    self._session_db.set_session_archived(self.session_id, True)
+                except Exception:
+                    logger.debug("auto-archive failed for %s", self.session_id, exc_info=True)
         except Exception as e:
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.
