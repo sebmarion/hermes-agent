@@ -4426,6 +4426,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route = self._resolve_route(body.get("model"))
 
         async def _run_and_close():
+            agent = None
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
@@ -4623,6 +4624,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     _put_event_if_active(None)
                 except Exception:
                     pass
+                release_clients = getattr(agent, "release_clients", None)
+                if callable(release_clients):
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            release_clients,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[api_server] run %s client cleanup failed",
+                            run_id,
+                        )
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)

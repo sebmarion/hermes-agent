@@ -241,6 +241,11 @@ class TestStartRun:
 
                 assert status["status"] == "failed"
                 assert status["error"] == "Codex usage limit reached"
+                for _ in range(50):
+                    if mock_agent.release_clients.called:
+                        break
+                    await asyncio.sleep(0.01)
+                mock_agent.release_clients.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_start_invalid_history_does_not_allocate_run(self, adapter):
