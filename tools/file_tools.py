@@ -7,6 +7,7 @@ import logging
 import os
 import posixpath
 import sys
+import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 
@@ -651,6 +652,28 @@ _SENSITIVE_PATH_PREFIXES = (
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
+# macOS temp directory prefix (realpath of $TMPDIR).  Paths under this are
+# user-scoped temp files, not system-sensitive — exempt from the guard.
+_macos_temp_prefix = None
+
+
+def _get_macos_temp_prefix() -> str | None:
+    """Cache the macOS temp dir prefix once (/private/var/folders/...)."""
+    global _macos_temp_prefix
+    if _macos_temp_prefix is not None:
+        return _macos_temp_prefix
+    if sys.platform != "darwin":
+        _macos_temp_prefix = ""
+        return None
+    try:
+        _macos_temp_prefix = os.path.realpath(tempfile.gettempdir())
+        if not _macos_temp_prefix.endswith("/"):
+            _macos_temp_prefix += "/"
+        return _macos_temp_prefix
+    except Exception:
+        _macos_temp_prefix = ""
+        return None
+
 _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
 
@@ -689,6 +712,14 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    # Exempt the macOS user temp directory (/private/var/folders/...) —
+    # it is user-scoped, not system-sensitive, and blocks legitimate test
+    # and tool writes under pytest's tmp_path / $TMPDIR.
+    temp_prefix = _get_macos_temp_prefix()
+    if temp_prefix:
+        guard_paths = {p for p in guard_paths if not p.startswith(temp_prefix)}
+        if not guard_paths:
+            return None
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if any(path.startswith(prefix) for path in guard_paths):
             return _err

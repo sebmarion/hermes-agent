@@ -334,8 +334,12 @@ class TestCallbackSubprocess:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
         monkeypatch.setenv("HERMES_ACCEPT_HOOKS", "1")
 
-        # Fresh manager
+        # Fresh manager — set _discovery_home so invoke_hook's home guard
+        # matches the test's HERMES_HOME (the guard was added in commit
+        # dba27d852; without this, callbacks are silently skipped because
+        # _discovery_home=None != resolved HERMES_HOME).
         plugins._plugin_manager = plugins.PluginManager()
+        plugins._plugin_manager._discovery_home = plugins._resolved_hermes_home()
 
         cfg = {
             "hooks": {
