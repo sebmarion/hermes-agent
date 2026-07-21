@@ -1270,6 +1270,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        request_reasoning_effort: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1290,6 +1291,10 @@ class APIServerAdapter(BasePlatformAdapter):
         routing).  When set — and no session ``/model`` override exists for
         this session — its model/provider/api_key/base_url override the
         global defaults for this agent instance only.
+
+        ``request_reasoning_effort`` overrides the configured effort for this
+        agent instance only. ``ultra`` is a fail-closed GPT-5.6 Sol contract:
+        it forces the Codex app-server runtime and disables provider fallback.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -1362,6 +1367,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key or session_id,
             )
 
+        normalized_request_effort = (
+            str(request_reasoning_effort or "").strip().lower() or None
+        )
+        if normalized_request_effort:
+            reasoning_config = {
+                "enabled": True,
+                "effort": normalized_request_effort,
+            }
+
+        is_sol_ultra = normalized_request_effort == "ultra"
+        if is_sol_ultra:
+            normalized_model = str(model or "").strip().lower()
+            if normalized_model not in {"gpt-5.6", "gpt-5.6-sol"}:
+                raise ValueError(
+                    "Reasoning effort 'ultra' requires GPT-5.6 Sol "
+                    "(gpt-5.6 or gpt-5.6-sol)."
+                )
+            runtime_kwargs["api_mode"] = "codex_app_server"
+
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
@@ -1369,7 +1393,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
-        fallback_model = GatewayRunner._load_fallback_model()
+        fallback_model = (
+            None if is_sol_ultra else GatewayRunner._load_fallback_model()
+        )
+
+        if is_sol_ultra:
+            logger.info(
+                "api_server Sol Ultra activated: model=%s "
+                "runtime=codex_app_server provider_fallback=disabled "
+                "multi_agent=enabled",
+                model,
+            )
 
         agent = AIAgent(
             model=model,
@@ -1534,6 +1568,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
+                "request_scoped_reasoning_effort": True,
+                "sol_ultra_reasoning": True,
                 "approval_events": True,
                 "session_resources": True,
                 "session_chat": True,
@@ -1548,6 +1584,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
+            },
+            "reasoning": {
+                "request_field": "reasoning_effort",
+                "efforts": ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+                "ultra": {
+                    "models": ["gpt-5.6", "gpt-5.6-sol"],
+                    "runtime": "codex_app_server",
+                    "provider_fallback": False,
+                    "multi_agent": True,
+                },
             },
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
@@ -4235,6 +4281,37 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
+        raw_reasoning_effort = body.get("reasoning_effort")
+        request_reasoning_effort: Optional[str] = None
+        if raw_reasoning_effort is not None:
+            if not isinstance(raw_reasoning_effort, str):
+                return web.json_response(
+                    _openai_error("'reasoning_effort' must be a string"),
+                    status=400,
+                )
+            request_reasoning_effort = raw_reasoning_effort.strip().lower()
+            allowed_efforts = {
+                "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+            }
+            if request_reasoning_effort not in allowed_efforts:
+                return web.json_response(
+                    _openai_error(
+                        "'reasoning_effort' must be one of: "
+                        "minimal, low, medium, high, xhigh, max, ultra"
+                    ),
+                    status=400,
+                )
+            if request_reasoning_effort == "ultra":
+                requested_model = str(body.get("model") or "").strip().lower()
+                if requested_model not in {"gpt-5.6", "gpt-5.6-sol"}:
+                    return web.json_response(
+                        _openai_error(
+                            "Reasoning effort 'ultra' requires GPT-5.6 Sol "
+                            "(gpt-5.6 or gpt-5.6-sol)."
+                        ),
+                        status=400,
+                    )
+
         user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
@@ -4331,6 +4408,11 @@ class APIServerAdapter(BasePlatformAdapter):
             created_at=created_at,
             session_id=session_id,
             model=body.get("model", self._model_name),
+            **(
+                {"reasoning_effort": request_reasoning_effort}
+                if request_reasoning_effort
+                else {}
+            ),
         )
 
         # Per-client model routing for /v1/runs (see model_routes).
@@ -4358,6 +4440,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    request_reasoning_effort=request_reasoning_effort,
                 )
                 self._active_run_agents[run_id] = agent
 

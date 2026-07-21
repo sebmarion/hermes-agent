@@ -214,7 +214,9 @@ Returns a machine-readable description of the API server's stable surface for ex
     "run_submission": true,
     "run_status": true,
     "run_events_sse": true,
-    "run_stop": true
+    "run_stop": true,
+    "request_scoped_reasoning_effort": true,
+    "sol_ultra_reasoning": true
   }
 }
 ```
@@ -252,7 +254,17 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 }
 ```
 
-Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
+Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, `previous_response_id`, or `reasoning_effort`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
+
+`reasoning_effort` is request-scoped and accepts `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`. `ultra` is restricted to `gpt-5.6` and `gpt-5.6-sol`; it forces the Codex app-server runtime, enables multi-agent for that turn, and disables provider fallback. Clients should require both `request_scoped_reasoning_effort` and `sol_ultra_reasoning` from `/v1/capabilities` and fail closed rather than retrying Ultra through `/v1/responses` or Chat Completions.
+
+```json
+{
+  "model": "gpt-5.6-sol",
+  "input": "Solve this carefully.",
+  "reasoning_effort": "ultra"
+}
+```
 
 ### GET /v1/runs/\{run_id\}
 

@@ -154,6 +154,63 @@ class TestStartRun:
         assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_start_rejects_invalid_request_reasoning_effort(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "reasoning_effort": "warp"},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+        assert "reasoning_effort" in data["error"]["message"]
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_ultra_for_non_sol_model(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={
+                    "input": "hello",
+                    "model": "gpt-5.5",
+                    "reasoning_effort": "ultra",
+                },
+            )
+            assert resp.status == 400
+            data = await resp.json()
+        assert "GPT-5.6 Sol" in data["error"]["message"]
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_start_forwards_request_scoped_sol_ultra(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "ultra",
+                    },
+                )
+                assert resp.status == 202
+                await asyncio.sleep(0)
+
+                assert mock_create.call_args.kwargs["request_reasoning_effort"] == "ultra"
+
+    @pytest.mark.asyncio
     async def test_start_invalid_history_does_not_allocate_run(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

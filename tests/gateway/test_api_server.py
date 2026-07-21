@@ -366,6 +366,71 @@ class TestAdapterInit:
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
 
+    def test_create_agent_forces_app_server_for_request_scoped_sol_ultra(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_mode": "codex_responses",
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.run._resolve_gateway_model", lambda: "gpt-5.6-sol"
+        )
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: {"enabled": True, "effort": "medium"}),
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model",
+            staticmethod(lambda: {"provider": "openrouter", "model": "fallback/model"}),
+        )
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(
+            session_id="api-session",
+            request_reasoning_effort="ultra",
+        )
+
+        assert isinstance(agent, FakeAgent)
+        assert captured["model"] == "gpt-5.6-sol"
+        assert captured["api_mode"] == "codex_app_server"
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "ultra"}
+        assert captured["fallback_model"] is None
+
+    def test_create_agent_rejects_request_scoped_ultra_for_non_sol_model(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with pytest.raises(ValueError, match="GPT-5.6 Sol"):
+            adapter._create_agent(
+                session_id="api-session",
+                request_reasoning_effort="ultra",
+            )
+
     def test_create_agent_refreshes_max_iterations_from_runtime_config(self, monkeypatch):
         captured = {}
 
@@ -753,7 +818,10 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"), patch(
+            "gateway.platforms.api_server.collect_runtime_readiness",
+            return_value={"status": "ok", "checks": {}},
+        ):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
@@ -946,7 +1014,16 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["request_scoped_reasoning_effort"] is True
+            assert data["features"]["sol_ultra_reasoning"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
+            assert data["reasoning"]["request_field"] == "reasoning_effort"
+            assert data["reasoning"]["ultra"] == {
+                "models": ["gpt-5.6", "gpt-5.6-sol"],
+                "runtime": "codex_app_server",
+                "provider_fallback": False,
+                "multi_agent": True,
+            }
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
