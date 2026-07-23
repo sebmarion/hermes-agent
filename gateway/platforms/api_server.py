@@ -61,7 +61,15 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from gateway.drain_readiness import (
+    build_drain_readiness,
+    count_running_kanban_workers as _count_running_kanban_workers,
+)
 from gateway.readiness import collect_runtime_readiness
+from gateway.runtime_identity import (
+    public_release_identity_receipt,
+    runtime_identity_receipt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -683,6 +691,64 @@ if AIOHTTP_AVAILABLE:
 else:
     body_limit_middleware = None  # type: ignore[assignment]
 
+
+_DRAIN_HEALTH_PATHS = frozenset({"/health", "/health/detailed", "/v1/health"})
+
+
+def _drain_control_request(method: str, path: str) -> bool:
+    """Whether a request helps settle already-admitted work during drain."""
+
+    return method == "POST" and path.endswith(("/stop", "/approval"))
+
+
+if AIOHTTP_AVAILABLE:
+    @web.middleware
+    async def drain_admission_middleware(request, handler):
+        """Reject new API work after the durable drain marker is active.
+
+        Health probes are excluded from the active-request count so the proof
+        request cannot prevent its own quiescence. Stop/approval controls stay
+        available to settle work that was admitted before the fence.
+        """
+
+        path = str(request.path)
+        method = str(request.method).upper()
+        if path in _DRAIN_HEALTH_PATHS or method == "OPTIONS":
+            return await handler(request)
+
+        from gateway.drain_control import admission_rejection_requested
+
+        adapter = request.app.get("api_server_adapter")
+        if (
+            admission_rejection_requested()
+            and not _drain_control_request(method, path)
+        ):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "Gateway is draining and rejects new work.",
+                        "type": "gateway_draining",
+                        "param": None,
+                        "code": "gateway_draining",
+                    },
+                    "admission_state": "rejecting_new_work",
+                },
+                status=503,
+                headers={"Retry-After": "1"},
+            )
+
+        if adapter is None:
+            return await handler(request)
+        adapter._active_http_requests += 1
+        try:
+            return await handler(request)
+        finally:
+            adapter._active_http_requests = max(
+                0, adapter._active_http_requests - 1
+            )
+else:
+    drain_admission_middleware = None  # type: ignore[assignment]
+
 _SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
@@ -906,20 +972,53 @@ class APIServerAdapter(BasePlatformAdapter):
         # (the /v1/runs path tracks its own in-flight set via
         # _active_run_tasks).
         self._inflight_agent_runs: int = 0
+        # Requests other than health probes currently inside the aiohttp
+        # handler chain. The drain admission middleware owns this counter.
+        self._active_http_requests: int = 0
+        # Finite tasks scheduled after an HTTP response has been accepted.
+        # Adapter-level ``_background_tasks`` also contains long-lived sweep
+        # loops, so drain readiness needs this dedicated finite-work set.
+        self._drain_tracked_tasks: set[asyncio.Task[Any]] = set()
 
-    def _readiness_work_counts(self) -> tuple[int, int, int]:
+    def _readiness_work_counts(self) -> dict[str, Any]:
         """Return bounded work counts from each subsystem's public state."""
         active_api_runs = sum(
             1
             for status in self._run_statuses.values()
             if status.get("status") in {"queued", "running", "waiting_for_approval"}
         )
-        process_depth = 0
-        active_delegations = 0
+        process_depth: int | None = None
+        active_delegations: int | None = None
+        background_processes: int | None = None
+        active_cron_jobs: int | None = None
+        cron_admission: dict[str, Any] = {
+            "schema": "hermes.cron_admission.v1",
+            "verified": False,
+            "accepting": False,
+            "gate_epoch": None,
+            "active_count": None,
+            "active_job_ids": None,
+            "active_leases": None,
+            "reason": "cron admission receipt unavailable",
+        }
+        running_kanban_workers: int | None = None
         try:
             from tools.process_registry import process_registry
 
-            process_depth = process_registry.completion_queue.qsize()
+            activity = process_registry.completion_activity_snapshot()
+            if activity.get("process_completion_activity_available") is True:
+                process_depth = max(
+                    process_registry.completion_queue.qsize(),
+                    int(activity.get("durable_undelivered_completions", 0)),
+                )
+            if activity.get("process_checkpoint_available") is True:
+                running = activity.get("running_processes")
+                if (
+                    isinstance(running, int)
+                    and not isinstance(running, bool)
+                    and running >= 0
+                ):
+                    background_processes = running
         except Exception:
             pass
         try:
@@ -928,7 +1027,93 @@ class APIServerAdapter(BasePlatformAdapter):
             active_delegations = active_count()
         except Exception:
             pass
-        return active_api_runs, process_depth, active_delegations
+        try:
+            from cron.scheduler import get_cron_admission_receipt
+
+            receipt = get_cron_admission_receipt()
+            if isinstance(receipt, dict):
+                cron_admission = receipt
+                count = receipt.get("active_count")
+                if (
+                    receipt.get("verified") is True
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count >= 0
+                ):
+                    active_cron_jobs = count
+        except Exception:
+            pass
+        try:
+            running_kanban_workers = _count_running_kanban_workers()
+        except Exception:
+            pass
+        return {
+            "active_api_runs": active_api_runs,
+            "process_completion_queue_depth": process_depth,
+            "active_delegations": active_delegations,
+            "background_processes": background_processes,
+            "active_cron_jobs": active_cron_jobs,
+            "cron_admission": cron_admission,
+            "api_background_tasks": sum(
+                1 for task in self._drain_tracked_tasks if not task.done()
+            ),
+            "running_kanban_workers": running_kanban_workers,
+        }
+
+    def _runtime_drain_receipt(
+        self,
+        runtime: dict[str, Any],
+        work_counts: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Join admission acknowledgement with fail-closed active-work counts."""
+
+        from gateway.drain_control import drain_requested, pair_open_gate_receipt
+        from gateway.run import get_live_gateway_drain_state
+
+        active_api_runs = int(work_counts["active_api_runs"] or 0)
+        live_state = get_live_gateway_drain_state()
+        pair_gate = (
+            live_state.get("pair_open_gate")
+            if isinstance(live_state, dict)
+            and isinstance(live_state.get("pair_open_gate"), dict)
+            else pair_open_gate_receipt()
+        )
+        live_gateway_agents = (
+            live_state["active_agent_turns"] if live_state is not None else None
+        )
+        active_agent_turns = (
+            live_gateway_agents
+            + int(self._inflight_agent_runs)
+            + max(active_api_runs, len(self._active_run_tasks))
+            if live_gateway_agents is not None
+            else None
+        )
+        receipt = build_drain_readiness(
+            live_admission_rejecting=(
+                live_state["admission_rejecting"]
+                if live_state is not None
+                else None
+            ),
+            drain_requested=drain_requested(),
+            active_http_requests=self._active_http_requests,
+            active_agent_turns=active_agent_turns,
+            active_delegations=work_counts["active_delegations"],
+            background_processes=work_counts["background_processes"],
+            process_completion_queue_depth=work_counts[
+                "process_completion_queue_depth"
+            ],
+            active_cron_jobs=work_counts.get("active_cron_jobs"),
+            api_background_tasks=work_counts.get("api_background_tasks"),
+            running_kanban_workers=work_counts.get("running_kanban_workers"),
+            gateway_background_tasks=(
+                live_state["gateway_background_tasks"]
+                if live_state is not None
+                else None
+            ),
+            pair_open_gate=pair_gate,
+        )
+        receipt["cron_admission"] = work_counts.get("cron_admission")
+        return receipt
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1439,8 +1624,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
+        from gateway.status import read_runtime_status
+
+        runtime = read_runtime_status() or {}
+        work_counts = self._readiness_work_counts()
         return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+            {
+                "status": "ok",
+                "platform": "hermes-agent",
+                "version": _hermes_version(),
+                "release_identity": public_release_identity_receipt(),
+                "drain": self._runtime_drain_receipt(runtime, work_counts),
+            }
         )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
@@ -1467,7 +1662,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # This endpoint is served BY the gateway process, so it is by definition
         # alive — gateway_running is True. Derive busy/drainable from the same
         # shared contract /api/status uses so the two surfaces never disagree.
-        active_api_runs, process_depth, active_delegations = self._readiness_work_counts()
+        work_counts = self._readiness_work_counts()
+        active_api_runs = int(work_counts["active_api_runs"] or 0)
+        process_depth = int(work_counts["process_completion_queue_depth"] or 0)
+        active_delegations = work_counts["active_delegations"]
         from gateway.run import _resolve_gateway_model
 
         readiness = collect_runtime_readiness(
@@ -1475,8 +1673,9 @@ class APIServerAdapter(BasePlatformAdapter):
             runtime_status=runtime,
             active_api_runs=active_api_runs,
             process_completion_queue_depth=process_depth,
-            active_delegations=active_delegations,
+            active_delegations=int(active_delegations or 0),
         )
+        drain = self._runtime_drain_receipt(runtime, work_counts)
         return web.json_response({
             "status": readiness["status"],
             "readiness": readiness,
@@ -1497,6 +1696,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "exit_reason": runtime.get("exit_reason"),
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
+            "runtime_identity": runtime_identity_receipt(),
+            "drain": drain,
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
@@ -3841,11 +4042,18 @@ class APIServerAdapter(BasePlatformAdapter):
         job_id, id_err = self._check_job_id(request)
         if id_err:
             return id_err
+        from cron.admission import CronAdmissionClosed
+
         try:
             job = _cron_trigger(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
+        except CronAdmissionClosed as e:
+            return web.json_response(
+                {"error": _redact_api_error_text(e)},
+                status=503,
+            )
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -3891,13 +4099,66 @@ class APIServerAdapter(BasePlatformAdapter):
 
         from cron.scheduler_provider import resolve_cron_scheduler
         provider = resolve_cron_scheduler()
+        from cron.scheduler import (
+            _claim_cron_dispatch,
+            _cron_dispatch_profile_key,
+            _release_cron_dispatch,
+        )
+
+        admission_lease = await asyncio.to_thread(
+            _claim_cron_dispatch,
+            job_id,
+            source="chronos_webhook",
+        )
+        if admission_lease is None:
+            return web.json_response(
+                {
+                    "error": (
+                        "cron admission is closed or this job is already "
+                        "accepted; retry later"
+                    )
+                },
+                status=503,
+            )
 
         loop = asyncio.get_running_loop()
-        # Fire in the background (202 immediately). fire_due claims via the
-        # store CAS, so a retry while this is in flight is de-duped.
-        task = asyncio.create_task(
-            asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
-        )
+        profile_key = _cron_dispatch_profile_key()
+
+        def _fire_and_release() -> bool:
+            # Release in the worker thread, not an asyncio ``finally``:
+            # cancelling ``to_thread`` does not stop its underlying thread.
+            # The durable lease must remain visible until provider execution
+            # (including Chronos re-arm) has actually returned.
+            try:
+                return bool(
+                    provider.fire_due(
+                        job_id,
+                        adapters=None,
+                        loop=loop,
+                        admission_lease=admission_lease,
+                    )
+                )
+            finally:
+                _release_cron_dispatch(
+                    job_id,
+                    lease=admission_lease,
+                    profile_key=profile_key,
+                )
+
+        fire_coro = asyncio.to_thread(_fire_and_release)
+        try:
+            task = asyncio.create_task(fire_coro)
+        except BaseException:
+            fire_coro.close()
+            await asyncio.to_thread(
+                _release_cron_dispatch,
+                job_id,
+                lease=admission_lease,
+                profile_key=profile_key,
+            )
+            raise
+        self._drain_tracked_tasks.add(task)
+        task.add_done_callback(self._drain_tracked_tasks.discard)
         try:
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
@@ -4945,7 +5206,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+            mws = [
+                mw
+                for mw in (
+                    cors_middleware,
+                    drain_admission_middleware,
+                    body_limit_middleware,
+                    security_headers_middleware,
+                )
+                if mw is not None
+            ]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)

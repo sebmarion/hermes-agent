@@ -619,33 +619,53 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     job_id = job["id"]
     try:
-        from cron.scheduler import run_one_job
+        from cron.scheduler import (
+            _release_cron_dispatch,
+            _try_claim_cron_dispatch,
+            run_one_job,
+        )
 
-        # At-most-once claim: bail without running if a tick/other fire owns it.
-        if not claim_job_for_fire(job_id):
-            # claim_job_for_fire returns False for paused/disabled/missing
-            # jobs too — don't mislabel those as "already being fired"
-            # (#60703): that message sends the user chasing a phantom
-            # in-flight run when the job simply isn't runnable.
-            refreshed = get_job(job_id)
-            if refreshed is None:
-                reason = "Job no longer exists; nothing to run."
-            elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
-                reason = "Job is paused/disabled; resume it before running."
-            else:
-                reason = "Job is already being fired by the scheduler; not run again."
-            return {"claimed": False, "success": False, "error": reason}
+        # The cross-process gate must linearize before the jobs-store CAS. A
+        # manual CLI/API run rejected by drain therefore leaves jobs.json
+        # byte-for-byte untouched.
+        if not _try_claim_cron_dispatch(job_id):
+            return {
+                "claimed": False,
+                "success": False,
+                "error": (
+                    "Cron admission is closed for drain, or this job is already "
+                    "running; nothing was consumed."
+                ),
+            }
 
-        # run_one_job records last_run_at/last_status via mark_job_run (which
-        # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
-        refreshed = get_job(job_id) or {}
-        ok = refreshed.get("last_status") == "ok"
-        return {
-            "claimed": True,
-            "success": bool(processed and ok),
-            "error": refreshed.get("last_error"),
-        }
+        try:
+            # At-most-once claim: bail without running if a tick/other fire owns it.
+            if not claim_job_for_fire(job_id):
+                # claim_job_for_fire returns False for paused/disabled/missing
+                # jobs too — don't mislabel those as "already being fired"
+                # (#60703): that message sends the user chasing a phantom
+                # in-flight run when the job simply isn't runnable.
+                refreshed = get_job(job_id)
+                if refreshed is None:
+                    reason = "Job no longer exists; nothing to run."
+                elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
+                    reason = "Job is paused/disabled; resume it before running."
+                else:
+                    reason = "Job is already being fired by the scheduler; not run again."
+                return {"claimed": False, "success": False, "error": reason}
+
+            # run_one_job records last_run_at/last_status via mark_job_run (which
+            # also clears the fire claim) and returns True iff it processed the job.
+            processed = run_one_job(job, _dispatch_claimed=True)
+            refreshed = get_job(job_id) or {}
+            ok = refreshed.get("last_status") == "ok"
+            return {
+                "claimed": True,
+                "success": bool(processed and ok),
+                "error": refreshed.get("last_error"),
+            }
+        finally:
+            _release_cron_dispatch(job_id)
 
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)

@@ -1,13 +1,11 @@
 """Tests that internal synthetic events (e.g. background process completion)
 bypass user authorization and do not trigger DM pairing.
 
-Regression test for the bug where ``_run_process_watcher`` with
-``notify_on_complete=True`` injected a ``MessageEvent`` without ``user_id``,
-causing ``_is_user_authorized`` to reject it and the gateway to send a
-pairing code to the chat.
+Regression tests for the durable completion-queue owner. Completion events
+must retain their routing identity, bypass user authorization, and never
+trigger DM pairing when they are injected as internal messages.
 """
 
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -23,22 +21,6 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-class _FakeRegistry:
-    """Return pre-canned sessions, then None once exhausted."""
-
-    def __init__(self, sessions):
-        self._sessions = list(sessions)
-        self._completion_consumed: set = set()
-
-    def get(self, session_id):
-        if self._sessions:
-            return self._sessions.pop(0)
-        return None
-
-    def is_completion_consumed(self, session_id):
-        return session_id in self._completion_consumed
-
 
 def _build_runner(monkeypatch, tmp_path) -> GatewayRunner:
     """Create a GatewayRunner with notifications set to 'all'."""
@@ -57,16 +39,22 @@ def _build_runner(monkeypatch, tmp_path) -> GatewayRunner:
     return runner
 
 
-def _watcher_dict_with_notify():
-    return {
+def _durable_completion_event(**overrides):
+    event = {
+        "type": "completion",
+        "event_id": "process:proc_test_internal:completion",
         "session_id": "proc_test_internal",
-        "check_interval": 0,
         "session_key": "agent:main:discord:dm:123",
         "platform": "discord",
+        "chat_type": "dm",
         "chat_id": "123",
         "thread_id": "",
-        "notify_on_complete": True,
+        "command": "echo test",
+        "exit_code": 0,
+        "output": "done\n",
     }
+    event.update(overrides)
+    return event
 
 
 # ---------------------------------------------------------------------------
@@ -76,35 +64,22 @@ def _watcher_dict_with_notify():
 @pytest.mark.asyncio
 async def test_notify_on_complete_sets_internal_flag(monkeypatch, tmp_path):
     """Synthetic completion event must have internal=True."""
-    import tools.process_registry as pr_module
-
-    sessions = [
-        SimpleNamespace(
-            output_buffer="done\n", exited=True, exit_code=0, command="echo test"
-        ),
-    ]
-    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
-
-    async def _instant_sleep(*_a, **_kw):
-        pass
-    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
-
     runner = _build_runner(monkeypatch, tmp_path)
     adapter = runner.adapters[Platform.DISCORD]
+    event = _durable_completion_event()
 
-    await runner._run_process_watcher(_watcher_dict_with_notify())
+    await runner._inject_watch_notification("[SYSTEM: process completed]", event)
 
     assert adapter.handle_message.await_count == 1
-    event = adapter.handle_message.await_args.args[0]
-    assert isinstance(event, MessageEvent)
-    assert event.internal is True, "Synthetic completion event must be marked internal"
+    message = adapter.handle_message.await_args.args[0]
+    assert isinstance(message, MessageEvent)
+    assert message.internal is True, "Synthetic completion event must be marked internal"
+    assert message.metadata["_hermes_durable_notification"] == event
 
 
 @pytest.mark.asyncio
 async def test_poll_does_not_suppress_notify_on_complete_watcher(monkeypatch, tmp_path):
-    """Regression: polling an exited process must not suppress watcher injection."""
-    import tools.process_registry as pr_module
-
+    """Regression: polling an exited process must not suppress queue injection."""
     registry = ProcessRegistry()
     session = ProcessSession(
         id="proc_polled_completion",
@@ -120,24 +95,22 @@ async def test_poll_does_not_suppress_notify_on_complete_watcher(monkeypatch, tm
     assert poll_result["status"] == "exited"
     assert not registry.is_completion_consumed(session.id)
 
-    monkeypatch.setattr(pr_module, "process_registry", registry)
-
-    async def _instant_sleep(*_a, **_kw):
-        pass
-    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
-
     runner = _build_runner(monkeypatch, tmp_path)
     adapter = runner.adapters[Platform.DISCORD]
+    event = _durable_completion_event(
+        event_id=f"process:{session.id}:completion",
+        session_id=session.id,
+        command=session.command,
+        exit_code=session.exit_code,
+        output=session.output_buffer,
+    )
 
-    watcher = _watcher_dict_with_notify()
-    watcher["session_id"] = session.id
-
-    await runner._run_process_watcher(watcher)
+    await runner._inject_watch_notification("[SYSTEM: process completed]", event)
 
     assert adapter.handle_message.await_count == 1
-    event = adapter.handle_message.await_args.args[0]
-    assert session.id in event.text
-    assert event.internal is True
+    message = adapter.handle_message.await_args.args[0]
+    assert message.metadata["_hermes_durable_notification"] == event
+    assert message.internal is True
 
 
 @pytest.mark.asyncio
@@ -243,49 +216,21 @@ async def test_internal_event_does_not_trigger_pairing(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_notify_on_complete_preserves_user_identity(monkeypatch, tmp_path):
     """Synthetic completion event should carry user_id and user_name from the watcher."""
-    import tools.process_registry as pr_module
-
-    sessions = [
-        SimpleNamespace(
-            output_buffer="done\n", exited=True, exit_code=0, command="echo test"
-        ),
-    ]
-    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
-
-    async def _instant_sleep(*_a, **_kw):
-        pass
-    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
-
     runner = _build_runner(monkeypatch, tmp_path)
     adapter = runner.adapters[Platform.DISCORD]
+    event = _durable_completion_event(user_id="user-42", user_name="alice")
 
-    watcher = _watcher_dict_with_notify()
-    watcher["user_id"] = "user-42"
-    watcher["user_name"] = "alice"
-
-    await runner._run_process_watcher(watcher)
+    await runner._inject_watch_notification("[SYSTEM: process completed]", event)
 
     assert adapter.handle_message.await_count == 1
-    event = adapter.handle_message.await_args.args[0]
-    assert event.source.user_id == "user-42"
-    assert event.source.user_name == "alice"
+    message = adapter.handle_message.await_args.args[0]
+    assert message.source.user_id == "user-42"
+    assert message.source.user_name == "alice"
 
 
 @pytest.mark.asyncio
 async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monkeypatch, tmp_path):
-    import tools.process_registry as pr_module
     from gateway.session import SessionSource
-
-    sessions = [
-        SimpleNamespace(
-            output_buffer="done\n", exited=True, exit_code=0, command="echo test"
-        ),
-    ]
-    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
-
-    async def _instant_sleep(*_a, **_kw):
-        pass
-    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
 
     runner = GatewayRunner(GatewayConfig())
     adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
@@ -301,27 +246,25 @@ async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monk
         )
     )
 
-    watcher = {
-        "session_id": "proc_test_internal",
-        "check_interval": 0,
-        "session_key": "agent:main:telegram:group:-100:42",
-        "platform": "telegram",
-        "chat_id": "-100",
-        "thread_id": "42",
-        "notify_on_complete": True,
-    }
+    event = _durable_completion_event(
+        session_key="agent:main:telegram:group:-100:42",
+        platform="telegram",
+        chat_type="group",
+        chat_id="-100",
+        thread_id="42",
+    )
 
-    await runner._run_process_watcher(watcher)
+    await runner._inject_watch_notification("[SYSTEM: process completed]", event)
 
     assert adapter.handle_message.await_count == 1
-    event = adapter.handle_message.await_args.args[0]
-    assert event.internal is True
-    assert event.source.platform == Platform.TELEGRAM
-    assert event.source.chat_id == "-100"
-    assert event.source.chat_type == "group"
-    assert event.source.thread_id == "42"
-    assert event.source.user_id == "user-42"
-    assert event.source.user_name == "alice"
+    message = adapter.handle_message.await_args.args[0]
+    assert message.internal is True
+    assert message.source.platform == Platform.TELEGRAM
+    assert message.source.chat_id == "-100"
+    assert message.source.chat_type == "group"
+    assert message.source.thread_id == "42"
+    assert message.source.user_id == "user-42"
+    assert message.source.user_name == "alice"
 
 
 @pytest.mark.asyncio

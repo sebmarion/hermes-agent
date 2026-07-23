@@ -212,7 +212,14 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- fire -------------------------------------------------------------
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        adapters: Any = None,
+        loop: Any = None,
+        admission_lease: Any = None,
+    ) -> bool:
         """Run the due job (claim + run_one_job via the ABC default), then
         re-arm the NEXT one-shot through NAS.
 
@@ -220,16 +227,40 @@ class ChronosCronScheduler(CronScheduler):
         If the job is gone (one-shot completed / repeat-N exhausted), get_job
         returns None → nothing to re-arm (the schedule naturally stops).
         """
-        ran = super().fire_due(job_id, adapters=adapters, loop=loop)
-        if ran:
-            from cron.jobs import get_job
-            job = get_job(job_id)
-            if job and job.get("enabled") and job.get("next_run_at"):
-                try:
-                    self._arm_one_shot(job)
-                except Exception as e:
-                    logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
-        return ran
+        from cron.scheduler import _claim_cron_dispatch, _release_cron_dispatch
+
+        owns_lease = admission_lease is None
+        if owns_lease:
+            admission_lease = _claim_cron_dispatch(
+                job_id,
+                source="chronos_provider",
+            )
+            if admission_lease is None:
+                return False
+        try:
+            ran = super().fire_due(
+                job_id,
+                adapters=adapters,
+                loop=loop,
+                admission_lease=admission_lease,
+            )
+            if ran:
+                from cron.jobs import get_job
+
+                job = get_job(job_id)
+                if job and job.get("enabled") and job.get("next_run_at"):
+                    try:
+                        self._arm_one_shot(job)
+                    except Exception as e:
+                        logger.warning(
+                            "Chronos failed to re-arm job %s after fire: %s",
+                            job_id,
+                            e,
+                        )
+            return ran
+        finally:
+            if owns_lease:
+                _release_cron_dispatch(job_id, lease=admission_lease)
 
 
 def register(ctx) -> None:

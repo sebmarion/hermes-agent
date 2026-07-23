@@ -197,6 +197,23 @@ async def test_goal_verdict_skipped_when_no_active_goal(hermes_home):
 
 
 @pytest.mark.asyncio
+async def test_goal_judge_and_continuation_do_not_start_during_drain(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    runner._external_drain_active = True
+
+    with patch("hermes_cli.goals.GoalManager") as manager:
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="partial",
+        )
+
+    manager.assert_not_called()
+    assert adapter.sends == []
+    assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
 async def test_goal_verdict_survives_adapter_without_send(hermes_home):
     """Bad adapter (no ``send`` attribute) must not crash the judge hook."""
     runner, _adapter, session_entry, src = _make_runner_with_adapter()

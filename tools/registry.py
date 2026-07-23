@@ -151,6 +151,23 @@ def _check_fn_cached(fn: Callable) -> bool:
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
+    # Capability gates whose False result is authoritative (for example a
+    # provider losing credentials or a search-only backend being selected for
+    # extraction) must not inherit the generic 30s cache / 60s last-good
+    # grace.  Such a grace advertises a tool that cannot execute.  Callers opt
+    # in explicitly on the function object so expensive/flaky environment
+    # probes retain the normal protection above.
+    if getattr(fn, "_hermes_strict_availability", False):
+        try:
+            return bool(fn())
+        except Exception:
+            logger.warning(
+                "strict check_fn %s raised; dependent tools will be unavailable",
+                getattr(fn, "__qualname__", fn),
+                exc_info=True,
+            )
+            return False
+
     now = time.monotonic()
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get(fn)

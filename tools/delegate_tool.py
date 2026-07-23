@@ -1989,14 +1989,6 @@ def _run_single_child(
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
 
-    # Restore parent tool names using the value saved before child construction
-    # mutated the global. This is the correct parent toolset, not the child's.
-    import model_tools
-
-    _saved_tool_names = getattr(
-        child, "_delegate_saved_tool_names", list(model_tools._last_resolved_tool_names)
-    )
-
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
     if child_pool is not None:
@@ -2612,14 +2604,6 @@ def _run_single_child(
             except Exception as exc:
                 logger.debug("Failed to release credential lease: %s", exc)
 
-        # Restore the parent's tool names so the process-global is correct
-        # for any subsequent execute_code calls or other consumers.
-        import model_tools
-
-        saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
-        if isinstance(saved_tool_names, list):
-            model_tools._last_resolved_tool_names = list(saved_tool_names)
-
         # Remove child from active tracking
 
         # Unregister child from interrupt propagation
@@ -2770,6 +2754,8 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    route: Optional[str] = None,
+    model_tier: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2867,14 +2853,23 @@ def delegate_task(
             )
         task_list = list(tasks)
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [
-            {
-                "goal": goal,
-                "context": context,
-                "role": top_role,
-                "mode": "execute",
-            }
-        ]
+        single_task = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "mode": "execute",
+        }
+        # Propagate lane routing selectors into the single-task dict so
+        # single-task mode honors the same route/model_tier resolution as
+        # batch tasks. Without this, single-task delegation always defaults
+        # to mode_routes.execute (code_worker) and cannot be redirected to
+        # a different lane — the local_first controller then reroutes the
+        # code_worker lane to the degraded lane when Zeus is in recovery.
+        if route and isinstance(route, str) and route.strip():
+            single_task["route"] = route.strip()
+        if model_tier and isinstance(model_tier, str) and model_tier.strip():
+            single_task["model_tier"] = model_tier.strip()
+        task_list = [single_task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2912,7 +2907,7 @@ def delegate_task(
     # which overwrites model_tools._last_resolved_tool_names with child's toolset.
     import model_tools as _model_tools
 
-    _parent_tool_names = list(_model_tools._last_resolved_tool_names)
+    _parent_tool_names = _model_tools.get_last_resolved_tool_names()
 
     # Resolve and validate the complete batch before constructing any child.
     # This prevents task N's broken lane/toolset from leaving tasks 0..N-1
@@ -2956,6 +2951,8 @@ def delegate_task(
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
     child_models = []
+    _tool_state_guard = _model_tools.preserve_last_resolved_tool_names()
+    _tool_state_guard.__enter__()
     try:
         for i, (t, lane_name, task_creds, lane_toolsets) in enumerate(task_specs):
             # Per-task role beats top-level; normalise again so unknown
@@ -3080,8 +3077,8 @@ def delegate_task(
             children.append((i, t, child))
             child_models.append(task_creds.get("model"))
     finally:
-        # Authoritative restore: reset global to parent's tool names after all children built
-        _model_tools._last_resolved_tool_names = _parent_tool_names
+        # Serialize restore against every get_tool_definitions writer.
+        _tool_state_guard.__exit__(None, None, None)
 
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -3365,9 +3362,19 @@ def delegate_task(
         # work still runs and its result returns in this same response, which is
         # strictly better than a handle that never resolves. Mirrors the
         # pool-at-capacity inline fallback below.
+        _origin_ui_session_id = ""
+        _parent_session_id = ""
         try:
-            from gateway.session_context import async_delivery_supported
+            from gateway.session_context import (
+                async_delivery_supported,
+                get_session_env,
+            )
             _async_ok = async_delivery_supported()
+            _origin_ui_session_id = get_session_env(
+                "HERMES_UI_SESSION_ID",
+                "",
+            )
+            _parent_session_id = get_session_env("HERMES_SESSION_ID", "")
         except Exception:
             _async_ok = True
         if not _async_ok:
@@ -3385,7 +3392,15 @@ def delegate_task(
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
 
-        _session_key = get_current_session_key(default="")
+        # The live agent session id is authoritative after compression rotates
+        # the transcript tip.  The approval context can still carry the
+        # pre-compression key, which would orphan the detached completion.
+        _parent_session_key = getattr(parent_agent, "session_id", None)
+        _session_key = (
+            _parent_session_key.strip()
+            if isinstance(_parent_session_key, str)
+            else ""
+        ) or get_current_session_key(default="")
         _child_agents = [c for (_, _, c) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the
@@ -3428,6 +3443,8 @@ def delegate_task(
             # Per-child routing is already fixed on each built child.
             model=_async_batch_model_label(child_models),
             session_key=_session_key,
+            parent_session_id=_parent_session_id or None,
+            origin_ui_session_id=_origin_ui_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
@@ -4398,6 +4415,28 @@ DELEGATE_TASK_SCHEMA = {
                     "compatibility."
                 ),
             },
+            "route": {
+                "type": "string",
+                "description": (
+                    "Explicit lane name for per-task model routing in single-task "
+                    "mode. Must match a key in delegation.lanes in config.yaml. "
+                    "When set, the child uses that lane's provider/model/toolsets. "
+                    "Ignored when 'tasks' (batch) is provided — use per-task "
+                    "'route' in the batch array instead. Only effective when "
+                    "delegation.lanes is configured."
+                ),
+            },
+            "model_tier": {
+                "type": "string",
+                "description": (
+                    "Model tier hint for single-task mode (e.g. 'micro', 'small', "
+                    "'medium', 'large', 'security'). Mapped to a lane via "
+                    "delegation.tier_routes in config.yaml. Ignored when 'tasks' "
+                    "(batch) is provided — use per-task 'model_tier' in the batch "
+                    "array instead. Only effective when both delegation.lanes and "
+                    "delegation.tier_routes are configured. Otherwise ignored."
+                ),
+            },
         },
         "required": [],
     },
@@ -4458,6 +4497,8 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
+        route=args.get("route"),
+        model_tier=args.get("model_tier"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

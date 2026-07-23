@@ -1394,9 +1394,16 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    configured_temp_dir = os.path.abspath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(configured_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    allowed_spellings = {os.path.join(temp_dir, basename)}
+    # macOS exposes the conventional /tmp spelling through a /private/tmp
+    # symlink. Accept that one OS-owned alias, while arbitrary symlinked temp
+    # directories still require their canonical target spelling.
+    if configured_temp_dir == "/tmp":
+        allowed_spellings.add(os.path.join(configured_temp_dir, basename))
+    if operand not in allowed_spellings:
         return False
 
     target = os.path.realpath(operand)

@@ -227,6 +227,31 @@ def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
     return f"call_{digest}"
 
 
+_MAX_RESPONSES_CALL_ID_UTF8_BYTES = 64
+_HASHED_RESPONSES_CALL_ID_PREFIX = "call_h_"
+_HASHED_RESPONSES_CALL_ID_HEX_LENGTH = 56
+
+
+def _normalize_legacy_responses_call_id(source_call_id: str) -> str:
+    """Return a replay-safe alias without changing the persisted source id.
+
+    The Responses API caps ``call_id`` at 64 UTF-8 bytes.  Legacy Codex
+    sessions can contain longer ids, so only the outbound request copy is
+    replaced with a deterministic hash alias.  Valid ids are preserved byte
+    for byte to avoid needless prompt-cache churn.
+    """
+    try:
+        encoded = source_call_id.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Codex Responses call_id must be valid UTF-8.") from exc
+
+    if len(encoded) <= _MAX_RESPONSES_CALL_ID_UTF8_BYTES:
+        return source_call_id
+
+    digest = hashlib.sha256(encoded).hexdigest()[:_HASHED_RESPONSES_CALL_ID_HEX_LENGTH]
+    return f"{_HASHED_RESPONSES_CALL_ID_PREFIX}{digest}"
+
+
 def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]:
     """Split a stored tool id into (call_id, response_item_id)."""
     if not isinstance(raw_id, str):
@@ -400,6 +425,36 @@ def _chat_messages_to_responses_input(
     """
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
+    projected_call_ids: Dict[str, str] = {}
+    projected_call_id_sources: Dict[str, str] = {}
+    seen_function_call_sources: set[str] = set()
+    seen_function_output_sources: set[str] = set()
+
+    def project_call_id(source_call_id: str, *, item_type: str) -> str:
+        if item_type == "function_call":
+            seen_sources = seen_function_call_sources
+        else:
+            seen_sources = seen_function_output_sources
+
+        if source_call_id in seen_sources:
+            raise ValueError(
+                "Codex Responses projection found an ambiguous duplicate "
+                f"{item_type} source call_id."
+            )
+        seen_sources.add(source_call_id)
+
+        projected = projected_call_ids.get(source_call_id)
+        if projected is None:
+            projected = _normalize_legacy_responses_call_id(source_call_id)
+            prior_source = projected_call_id_sources.get(projected)
+            if prior_source is not None and prior_source != source_call_id:
+                raise ValueError(
+                    "Codex Responses call_id normalization collision between "
+                    "distinct source IDs."
+                )
+            projected_call_ids[source_call_id] = projected
+            projected_call_id_sources[projected] = source_call_id
+        return projected
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -571,7 +626,10 @@ def _chat_messages_to_responses_input(
                             else:
                                 _raw_args = str(fn.get("arguments", "{}"))
                                 call_id = _deterministic_call_id(fn_name, _raw_args, len(items))
-                        call_id = call_id.strip()
+                        call_id = project_call_id(
+                            call_id.strip(),
+                            item_type="function_call",
+                        )
 
                         arguments = fn.get("arguments", "{}")
                         if isinstance(arguments, dict):
@@ -604,6 +662,10 @@ def _chat_messages_to_responses_input(
                     call_id = raw_tool_call_id.strip()
             if not isinstance(call_id, str) or not call_id.strip():
                 continue
+            call_id = project_call_id(
+                call_id.strip(),
+                item_type="function_call_output",
+            )
 
             # Multimodal tool result: convert OpenAI-style content list into
             # Responses ``function_call_output.output`` array. The Responses

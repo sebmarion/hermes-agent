@@ -494,6 +494,30 @@ class TestRunJob:
                 assert data["job"] == triggered_job
                 mock_trigger.assert_called_once_with(VALID_JOB_ID)
 
+    @pytest.mark.asyncio
+    async def test_run_job_returns_503_when_shared_cron_gate_is_closed(
+        self,
+        adapter,
+    ):
+        from cron.admission import CronAdmissionClosed
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE",
+                True,
+            ), patch(
+                f"{_MOD}._cron_trigger",
+                side_effect=CronAdmissionClosed(
+                    "Cron dispatch is paused while Hermes is draining."
+                ),
+            ):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                body = await resp.json()
+
+        assert resp.status == 503
+        assert "draining" in body["error"]
+
 
 # ---------------------------------------------------------------------------
 # 17. test_auth_required

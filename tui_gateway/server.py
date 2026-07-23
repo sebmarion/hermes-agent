@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from hermes_constants import (
     get_hermes_home,
@@ -8689,6 +8689,68 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
+def _finish_notification_delivery(evt: dict, committed: bool) -> None:
+    """ACK durable notifications only after their synthetic turn commits."""
+    from tools.process_registry import process_registry
+
+    process_registry.finish_notification_delivery(evt, committed)
+
+
+def _notification_commit_kwargs(evt: dict) -> dict:
+    """Return callback kwargs only for notifications with durable ACK state."""
+    if evt.get("type") == "async_delegation" or (
+        evt.get("type") == "completion" and evt.get("event_id")
+    ):
+        return {
+            "on_commit_result": lambda committed, event=evt: (
+                _finish_notification_delivery(event, committed)
+            )
+        }
+    return {}
+
+
+def _notification_turn_commit_proven(
+    result: object,
+    *,
+    history_start: int,
+    prompt: object,
+    history_adopted: bool,
+) -> bool:
+    """Require a successful, persisted user/assistant turn before ACK."""
+    if (
+        not history_adopted
+        or not isinstance(result, dict)
+        or result.get("completed") is not True
+        or result.get("failed")
+        or result.get("partial")
+        or result.get("interrupted")
+        or result.get("cleanup_errors")
+        or not isinstance(prompt, str)
+        or not isinstance(result.get("messages"), list)
+    ):
+        return False
+    saw_prompt = False
+    for message in result["messages"][max(0, int(history_start)):]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user" and message.get("content") == prompt:
+            saw_prompt = True
+            continue
+        if saw_prompt and message.get("role") == "assistant":
+            return True
+    return False
+
+
+def _requeue_notification_tail(
+    completion_queue: object,
+    drained_notifications: list[tuple[dict, str]],
+    start_index: int,
+) -> None:
+    """Return the current and untouched remainder of a detached drain batch."""
+    for event, _text in drained_notifications[max(0, int(start_index)):]:
+        completion_queue.put(event)
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -8782,14 +8844,13 @@ def _notification_poller_loop(
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
-            if evt.get("type") == "async_delegation":
-                try:
-                    from tools.async_delegation import mark_async_delegation_delivered
-
-                    mark_async_delegation_delivered(evt)
-                except Exception:
-                    pass
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                **_notification_commit_kwargs(evt),
+            )
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
@@ -8798,6 +8859,8 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+            if _notification_commit_kwargs(evt):
+                _finish_notification_delivery(evt, False)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -8841,14 +8904,13 @@ def _notification_poller_loop(
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
-            if evt.get("type") == "async_delegation":
-                try:
-                    from tools.async_delegation import mark_async_delegation_delivered
-
-                    mark_async_delegation_delivered(evt)
-                except Exception:
-                    pass
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                **_notification_commit_kwargs(evt),
+            )
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
@@ -8857,6 +8919,8 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+            if _notification_commit_kwargs(evt):
+                _finish_notification_delivery(evt, False)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -8911,6 +8975,18 @@ def _wire_agent_terminal_output() -> None:
 def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     """Start the background notification poller for a TUI session."""
     _wire_agent_terminal_output()
+    try:
+        from tools.process_registry import process_registry
+
+        process_registry.recover_completion_notifications()
+    except Exception:
+        logger.exception("failed to replay durable process notifications")
+    try:
+        from tools.async_delegation import recover_async_delegations
+
+        recover_async_delegations()
+    except Exception:
+        logger.exception("failed to replay durable async delegation notifications")
     stop = threading.Event()
     t = threading.Thread(
         target=_notification_poller_loop,
@@ -8949,7 +9025,14 @@ def _next_tool_limit_continuation(result: Any, text: Any) -> str | None:
     )
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    on_commit_result: Callable[[bool], None] | None = None,
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -8965,7 +9048,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             pass
     _emit("message.start", sid)
 
+    turn_committed = False
+
     def run():
+        nonlocal turn_committed
+        history_adopted = False
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
@@ -9156,6 +9243,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            history_adopted = True
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
@@ -9348,6 +9436,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
+
+            turn_committed = _notification_turn_commit_proven(
+                result,
+                history_start=len(history),
+                prompt=text,
+                history_adopted=history_adopted,
+            )
         except Exception as e:
             import traceback
 
@@ -9443,18 +9538,35 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # adopt another session's (or an orphan's) delegation payload,
             # while a post-compression session still claims its own
             # pre-compression dispatches (#55578).
-            for _evt, synth in process_registry.drain_notifications(
+            _drained_notifications = process_registry.drain_notifications(
                 session_key=session.get("session_key", ""),
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
+                ack_async=False,
+            )
+            for _notification_index, (_evt, synth) in enumerate(
+                _drained_notifications
             ):
                 with session["history_lock"]:
                     if session.get("running"):
-                        process_registry.completion_queue.put(_evt)
+                        # drain_notifications removed the whole batch. Return
+                        # this event and every untouched remainder; requeueing
+                        # only the current one silently lost the tail.
+                        _requeue_notification_tail(
+                            process_registry.completion_queue,
+                            _drained_notifications,
+                            _notification_index,
+                        )
                         break
                     session["running"] = True
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        **_notification_commit_kwargs(_evt),
+                    )
                 except Exception as _n_exc:
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "
@@ -9463,6 +9575,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     )
                     with session["history_lock"]:
                         session["running"] = False
+                    if _notification_commit_kwargs(_evt):
+                        _finish_notification_delivery(_evt, False)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
@@ -9470,7 +9584,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 file=sys.stderr,
             )
 
-    run_thread = threading.Thread(target=run, daemon=True)
+    def run_with_commit_callback():
+        try:
+            run()
+        finally:
+            if on_commit_result is not None:
+                try:
+                    on_commit_result(turn_committed)
+                except Exception:
+                    logger.exception(
+                        "notification turn commit callback failed for session %s",
+                        sid,
+                    )
+
+    run_thread = threading.Thread(target=run_with_commit_callback, daemon=True)
     session["_run_thread"] = run_thread
     run_thread.start()
 

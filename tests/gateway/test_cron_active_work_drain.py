@@ -48,6 +48,24 @@ class TestActiveCronJobCount:
         runner, _adapter = make_restart_runner()
         assert runner._active_cron_job_count() == 0
 
+    def test_uses_shared_atomic_admission_count(self):
+        runner, _adapter = make_restart_runner()
+        receipt = {
+            "verified": True,
+            "active_count": 2,
+            "gate_epoch": 11,
+            "active_job_ids": ["job-1", "job-2"],
+        }
+
+        with patch(
+            "cron.scheduler.get_cron_admission_receipt",
+            return_value=receipt,
+        ), patch(
+            "cron.scheduler.get_running_job_ids",
+            return_value=frozenset(),
+        ):
+            assert runner._active_cron_job_count() == 2
+
     def test_reflects_cron_scheduler_state(self):
         import cron.scheduler as sched
 
@@ -56,15 +74,19 @@ class TestActiveCronJobCount:
 
         assert runner._active_cron_job_count() == 1
 
-    def test_never_raises_if_cron_module_unavailable(self):
-        """Best-effort: a broken/absent import must not take shutdown
-        counting down with it."""
+    def test_unverified_cron_admission_fails_closed_as_active(self):
+        """An unreadable shared gate can never be interpreted as zero work."""
         runner, _adapter = make_restart_runner()
 
         with patch(
-            "cron.scheduler.get_running_job_ids", side_effect=ImportError("boom")
+            "cron.scheduler.get_cron_admission_receipt",
+            return_value={
+                "verified": False,
+                "active_count": None,
+                "gate_epoch": None,
+            },
         ):
-            assert runner._active_cron_job_count() == 0
+            assert runner._active_cron_job_count() == 1
 
 
 class TestDrainWaitsForCronWork:

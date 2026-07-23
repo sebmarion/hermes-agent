@@ -630,6 +630,27 @@ def test_cron_pause_resume_and_run_require_confirmation(_isolate_hermes_home):
     assert "Triggered job" in triggered.output
 
 
+def test_cron_run_reports_shared_drain_rejection_without_triggering(
+    _isolate_hermes_home,
+):
+    from cron.admission import set_cron_admission_paused
+    from cron.jobs import create_job, get_job
+
+    job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
+    before = get_job(job["id"])
+    set_cron_admission_paused(True, reason="test-drain")
+    try:
+        result = HermesConsoleEngine().execute(
+            f"cron run {job['id']}",
+            confirmed=True,
+        )
+        assert result.status == "error"
+        assert "draining" in result.output
+        assert get_job(job["id"]) == before
+    finally:
+        set_cron_admission_paused(False, reason="test-release")
+
+
 def test_repl_runs_non_interactive_lines_without_prompts(_isolate_hermes_home):
     stdin = io.StringIO("help\nexit\n")
     stdout = io.StringIO()

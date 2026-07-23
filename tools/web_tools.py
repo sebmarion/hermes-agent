@@ -1085,6 +1085,54 @@ def check_web_api_key() -> bool:
         return False
 
 
+def check_web_search_available() -> bool:
+    """Return whether at least one configured search route can execute."""
+    _ensure_web_plugins_loaded()
+    return check_web_api_key()
+
+
+def check_web_extract_available() -> bool:
+    """Return whether the selected extract route is usable and extract-capable.
+
+    This deliberately follows the same selected backend as
+    :func:`web_extract_tool`.  A search-only shared backend such as DDGS must
+    not make ``web_extract`` planner-visible merely because search works.
+    """
+    _ensure_web_plugins_loaded()
+    backend = _get_extract_backend()
+    try:
+        from agent.web_search_registry import get_provider
+
+        provider = get_provider(backend)
+    except Exception as exc:  # noqa: BLE001 - optional plugin registry
+        logger.debug("web extract capability lookup failed: %s", exc)
+        return False
+    if provider is None or not provider.supports_extract():
+        return False
+    try:
+        return bool(provider.is_available())
+    except Exception as exc:  # noqa: BLE001 - broken provider is unavailable
+        logger.debug("web extract provider %r availability failed: %s", backend, exc)
+        return False
+
+
+# Unlike generic dependency probes, a stale last-good verdict here exposes a
+# route known not to work.  The registry honors this marker by bypassing its
+# TTL and transient-failure grace for this one capability gate.
+check_web_extract_available._hermes_strict_availability = True
+
+
+def web_capability_fingerprint() -> tuple:
+    """Non-secret cache fingerprint for planner-visible web capabilities."""
+    _ensure_web_plugins_loaded()
+    return (
+        _get_search_backend(),
+        bool(check_web_search_available()),
+        _get_extract_backend(),
+        bool(check_web_extract_available()),
+    )
+
+
 if __name__ == "__main__":
     """
     Simple test/demo when run directly
@@ -1216,7 +1264,7 @@ registry.register(
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
-    check_fn=check_web_api_key,
+    check_fn=check_web_search_available,
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
@@ -1230,7 +1278,7 @@ registry.register(
         "markdown",
         char_limit=args.get("char_limit"),
     ),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_available,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",

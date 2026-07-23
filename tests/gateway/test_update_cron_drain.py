@@ -59,6 +59,7 @@ async def test_gateway_stop_waits_for_cron_before_final_tool_kill():
     call_order: list[str] = []
 
     def _cron_in_flight():
+        call_order.append("observe_cron")
         return frozenset(f"job-{i}" for i in range(cron_count[0]))
 
     def _fake_kill_all(task_id=None):
@@ -70,6 +71,10 @@ async def test_gateway_stop_waits_for_cron_before_final_tool_kill():
         cron_count[0] = 0
 
     with (
+        patch(
+            "cron.scheduler.set_cron_dispatch_paused",
+            side_effect=lambda paused: call_order.append(f"cron_gate:{paused}"),
+        ),
         patch("cron.scheduler.get_running_job_ids", side_effect=_cron_in_flight),
         patch("gateway.status.remove_pid_file"),
         patch("gateway.status.write_runtime_status"),
@@ -83,4 +88,7 @@ async def test_gateway_stop_waits_for_cron_before_final_tool_kill():
         await runner.stop()
         await cron_task
 
-    assert call_order == ["kill_all"]
+    assert call_order[0] == "cron_gate:True"
+    assert "observe_cron" in call_order
+    assert call_order.index("cron_gate:True") < call_order.index("observe_cron")
+    assert call_order[-1] == "kill_all"

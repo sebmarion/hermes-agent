@@ -712,6 +712,16 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    # Exact security-config identity always wins over broad path exemptions.
+    # Tests and isolated profiles may intentionally place config.yaml under a
+    # user temp root; that does not make the config safe to mutate.
+    hermes_config = _get_hermes_config_resolved()
+    if hermes_config and hermes_config in guard_paths:
+        return (
+            f"Refusing to write to Hermes config file: {filepath}\n"
+            "Agent cannot modify security-sensitive configuration. "
+            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+        )
     # Exempt the macOS user temp directory (/private/var/folders/...) —
     # it is user-scoped, not system-sensitive, and blocks legitimate test
     # and tool writes under pytest's tmp_path / $TMPDIR.
@@ -725,17 +735,6 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if guard_paths.intersection(_SENSITIVE_EXACT_PATHS):
         return _err
-    # Prevent agents from modifying the Hermes config file directly.
-    # approvals.mode and other security settings live here; a malicious or
-    # prompt-injected agent could silently disable exec approval by writing to
-    # this file.
-    hermes_config = _get_hermes_config_resolved()
-    if hermes_config and hermes_config in guard_paths:
-        return (
-            f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
-        )
     return None
 
 
@@ -1991,6 +1990,20 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         return tool_error(str(e))
 
 
+def _looks_like_file_glob_used_as_content_regex(pattern: str) -> bool:
+    """Return true only for unambiguous file-glob syntax in content mode.
+
+    Do not guess at general wildcard-looking regular expressions: ``.*foo`` is
+    valid regex.  The rejected forms all contain a glob path/name component
+    whose wildcard has no regex operand (for example ``*.spec.ts`` or
+    ``src/**/*.py``), which ripgrep would otherwise reject as a parse error.
+    """
+    candidate = pattern.strip().replace("\\", "/")
+    if candidate.startswith("*.") or candidate.startswith("**/"):
+        return True
+    return any(component.startswith("*.") for component in candidate.split("/"))
+
+
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
@@ -1998,6 +2011,18 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
+
+        if target == "content" and _looks_like_file_glob_used_as_content_regex(pattern):
+            return tool_error(
+                "search_files: the content-search pattern looks like a file glob. "
+                "Use target='files' with this pattern to find file names, or keep "
+                "target='content' and provide a valid regular expression plus "
+                "file_glob to filter which files are searched.",
+                error_code="search_files_glob_used_as_content_regex",
+                error_class="schema_correctable",
+                retry_policy={"max_corrected_retries": 1},
+                correction={"target": "files", "pattern": pattern},
+            )
 
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated

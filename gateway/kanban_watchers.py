@@ -195,6 +195,9 @@ class GatewayKanbanWatchersMixin:
         await asyncio.sleep(5)
 
         while self._running:
+            if not self._try_begin_drain_sensitive_background_work():
+                await asyncio.sleep(min(1.0, interval))
+                continue
             try:
                 def _collect():
                     deliveries: list[dict] = []
@@ -544,8 +547,15 @@ class GatewayKanbanWatchersMixin:
                                         message_type=MessageType.TEXT,
                                         source=_source,
                                         internal=True,
+                                        metadata={
+                                            "_hermes_drain_admission_task":
+                                                asyncio.current_task(),
+                                        },
                                     )
                                     await adapter.handle_message(_synth_event)
+                                    self._track_adapter_internal_task(
+                                        adapter, _synth_event,
+                                    )
                                     logger.info(
                                         "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                         sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
@@ -567,6 +577,8 @@ class GatewayKanbanWatchersMixin:
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
+            finally:
+                self._end_drain_sensitive_background_work()
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
                 if not self._running:
@@ -1212,6 +1224,9 @@ class GatewayKanbanWatchersMixin:
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
         while self._running:
+            if not self._try_begin_drain_sensitive_background_work():
+                await asyncio.sleep(min(1.0, interval))
+                continue
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
@@ -1222,6 +1237,11 @@ class GatewayKanbanWatchersMixin:
                         len(pids),
                         pids,
                     )
+            except asyncio.CancelledError:
+                self._end_drain_sensitive_background_work()
+                _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+                self._kanban_dispatcher_lock_handle = None
+                raise
             except Exception:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
@@ -1274,6 +1294,8 @@ class GatewayKanbanWatchersMixin:
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
+            finally:
+                self._end_drain_sensitive_background_work()
 
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.

@@ -112,8 +112,9 @@ Arm (or re-arm, idempotently) exactly one one-shot for a job.
 - **Action:**
   1. Look up `(agent_id, job_id) → agent_callback_url` from the persisted row.
   2. Mint a **short-lived** JWT: `aud = "agent:{instance_id}"`,
-     `iss = {portal_url}`, `purpose = "cron_fire"`, small `exp` (≈60–120s),
-     signed with NAS's normal asymmetric signing key (published via JWKS).
+     `iss = {portal_url}`, `purpose = "cron_fire"`, optional authenticated
+     `profile = "<profile_name>"`, small `exp` (≈60–120s), signed with NAS's
+     normal asymmetric signing key (published via JWKS).
   3. `POST {agent_callback_url}/api/cron/fire` with
      `Authorization: Bearer <that JWT>` and body `{"job_id": "...", "fire_at": "..."}`.
   4. Treat a non-2xx agent response as a **retryable** failure (let the
@@ -147,13 +148,19 @@ callback through to the verifier. (Also registered on the optional
   - invalid/missing/forged/expired/wrong-aud/wrong-purpose token → **401**, no
     execution.
   - missing `job_id` → **400**.
-  - valid → **202 `{"status": "accepted", "job_id": "..."}`** immediately, and
-    the job runs in the background. 202-before-run means a long agent turn never
-    trips the relay's HTTP timeout.
-- **At-most-once:** the agent claims the job with a store-level compare-and-set
+  - the same `job_id` in multiple local profiles without an authenticated
+    `profile` claim → **409**, before admission or execution.
+  - closed/unverifiable drain admission, or an already-admitted same-profile
+    fire → **503**, before the store claim is consumed.
+  - valid → first acquire a durable, profile-qualified admission lease, then
+    return **202 `{"status": "accepted", "job_id": "..."}`** and run the job in
+    the background. A long agent turn therefore never trips the relay timeout,
+    while a 202 always means the fire is already visible to drain readiness.
+- **At-most-once:** the exact admission lease is transferred through the
+  provider and remains active through execution and Chronos re-arm. The agent
+  then claims the job with a store-level compare-and-set
   (`claim_job_for_fire`) before running. A relay/scheduler retry that arrives
-  while the first fire is in flight (or after it completed) loses the claim and
-  does not double-run.
+  while the first fire is in flight (or after it completed) does not double-run.
 
 ---
 

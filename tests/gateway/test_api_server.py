@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
@@ -33,6 +33,7 @@ from gateway.platforms.api_server import (
     _redact_api_error_text,
     check_api_server_requirements,
     cors_middleware,
+    drain_admission_middleware,
     security_headers_middleware,
 )
 
@@ -756,6 +757,80 @@ class TestAgentExecution:
 
 class TestHealthEndpoint:
     @pytest.mark.asyncio
+    async def test_public_health_contains_only_liveness_and_release_proof(self, adapter):
+        release_identity = {
+            "schema": "hermes.public_release_identity.v1",
+            "verified": True,
+            "release": {"release_pair_id": "pair-a"},
+            "process": {
+                "pid": 123,
+                "start_token": "darwin-proc:123:1000:42",
+                "start_token_status": "verified",
+            },
+        }
+        drain = {
+            "schema": "hermes.gateway_drain.v1",
+            "admission": {
+                "state": "rejecting_new_work",
+                "verified": True,
+                "drain_requested": True,
+            },
+            "work": {
+                "active_http_requests": 0,
+                "active_agent_turns": 0,
+                "active_delegations": 0,
+                "background_processes": 0,
+            },
+            "quiescence": {"verified": True, "quiescent": True, "blockers": []},
+        }
+        request = make_mocked_request("GET", "/health")
+        with patch(
+            "gateway.platforms.api_server.public_release_identity_receipt",
+            return_value=release_identity,
+            create=True,
+        ), patch(
+            "gateway.platforms.api_server.build_drain_readiness",
+            return_value=drain,
+        ), patch(
+            "gateway.status.read_runtime_status",
+            return_value={"gateway_state": "draining", "active_agents": 0},
+        ), patch.object(
+            adapter,
+            "_readiness_work_counts",
+            return_value={
+                "active_api_runs": 0,
+                "process_completion_queue_depth": 0,
+                "active_delegations": 0,
+                "background_processes": 0,
+                "active_cron_jobs": 0,
+            },
+        ), patch(
+            "gateway.drain_control.drain_requested", return_value=True
+        ):
+            response = await adapter._handle_health(request)
+
+        body = json.loads(response.text)
+        assert set(body) == {
+            "status",
+            "platform",
+            "version",
+            "release_identity",
+            "drain",
+        }
+        assert body["release_identity"] == release_identity
+        assert body["drain"] == drain
+        forbidden = {
+            "config",
+            "model",
+            "api_key",
+            "sessions",
+            "platforms",
+            "runtime_identity",
+        }
+        assert forbidden.isdisjoint(body)
+        assert "/opt/" not in response.text
+
+    @pytest.mark.asyncio
     async def test_security_headers_present(self, adapter):
         """Responses should include basic security headers."""
         app = _create_app(adapter)
@@ -813,6 +888,179 @@ class TestHealthEndpoint:
 
 
 class TestHealthDetailedEndpoint:
+    @pytest.mark.asyncio
+    async def test_health_detailed_exposes_immutable_runtime_identity(self, adapter):
+        expected = {
+            "schema": "hermes.runtime_identity.v1",
+            "verified": True,
+            "sealed": {"agent_commit": "abc123"},
+            "field_status": {"agent_commit": "verified"},
+            "missing_fields": [],
+            "invalid_fields": [],
+            "process": {"pid": 123, "start_token": "123:start"},
+        }
+        expected_drain = {
+            "schema": "hermes.gateway_drain.v1",
+            "admission": {"state": "rejecting_new_work", "verified": True},
+            "quiescence": {"verified": True, "quiescent": True},
+        }
+        request = make_mocked_request("GET", "/health/detailed")
+        with patch(
+            "gateway.platforms.api_server.runtime_identity_receipt",
+            return_value=expected,
+        ), patch(
+            "gateway.platforms.api_server.build_drain_readiness",
+            return_value=expected_drain,
+        ), patch(
+            "gateway.status.read_runtime_status",
+            return_value={"gateway_state": "draining", "active_agents": 0},
+        ), patch(
+            "gateway.run._resolve_gateway_model", return_value="test/model"
+        ), patch(
+            "gateway.platforms.api_server.collect_runtime_readiness",
+            return_value={"status": "ok", "checks": {}},
+        ):
+            resp = await adapter._handle_health_detailed(request)
+
+        assert resp.status == 200
+        body = json.loads(resp.text)
+        assert body["runtime_identity"] == expected
+        assert body["drain"] == expected_drain
+
+    @pytest.mark.asyncio
+    async def test_drain_admission_rejects_new_http_work(self, adapter):
+        request = MagicMock(
+            method="POST",
+            path="/v1/chat/completions",
+            app={"api_server_adapter": adapter},
+        )
+        handler = AsyncMock(return_value=web.Response(status=200))
+
+        with patch(
+            "gateway.drain_control.admission_rejection_requested",
+            return_value=True,
+        ):
+            response = await drain_admission_middleware(request, handler)
+
+        assert response.status == 503
+        assert json.loads(response.text)["error"]["type"] == "gateway_draining"
+        handler.assert_not_awaited()
+        assert adapter._active_http_requests == 0
+
+    @pytest.mark.asyncio
+    async def test_http_work_counter_covers_handler_lifetime(self, adapter):
+        request = MagicMock(
+            method="POST",
+            path="/v1/chat/completions",
+            app={"api_server_adapter": adapter},
+        )
+        observed = []
+
+        async def handler(_request):
+            observed.append(adapter._active_http_requests)
+            return web.Response(status=200)
+
+        with patch(
+            "gateway.drain_control.admission_rejection_requested",
+            return_value=False,
+        ):
+            response = await drain_admission_middleware(request, handler)
+
+        assert response.status == 200
+        assert observed == [1]
+        assert adapter._active_http_requests == 0
+
+    @pytest.mark.asyncio
+    async def test_health_probe_is_never_counted_or_rejected(self, adapter):
+        request = MagicMock(
+            method="GET",
+            path="/health/detailed",
+            app={"api_server_adapter": adapter},
+        )
+
+        async def handler(_request):
+            assert adapter._active_http_requests == 0
+            return web.Response(status=200)
+
+        with patch(
+            "gateway.drain_control.admission_rejection_requested",
+            return_value=True,
+        ):
+            response = await drain_admission_middleware(request, handler)
+
+        assert response.status == 200
+        assert adapter._active_http_requests == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/runs",
+            "/api/sessions/session-1/chat",
+            "/api/jobs/job-1/run",
+            "/api/cron/fire",
+        ],
+    )
+    async def test_pair_gate_alone_rejects_every_new_work_route(
+        self,
+        adapter,
+        path,
+    ):
+        request = MagicMock(
+            method="POST",
+            path=path,
+            app={"api_server_adapter": adapter},
+        )
+        handler = AsyncMock(return_value=web.Response(status=200))
+
+        with patch(
+            "gateway.drain_control.admission_rejection_requested",
+            return_value=True,
+        ):
+            response = await drain_admission_middleware(request, handler)
+
+        assert response.status == 503
+        assert json.loads(response.text)["admission_state"] == (
+            "rejecting_new_work"
+        )
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/health"),
+            ("GET", "/health/detailed"),
+            ("GET", "/v1/health"),
+            ("POST", "/v1/runs/run-1/stop"),
+            ("POST", "/v1/runs/run-1/approval"),
+            ("OPTIONS", "/v1/responses"),
+        ],
+    )
+    async def test_pair_gate_keeps_health_and_settlement_controls_open(
+        self,
+        adapter,
+        method,
+        path,
+    ):
+        request = MagicMock(
+            method=method,
+            path=path,
+            app={"api_server_adapter": adapter},
+        )
+        handler = AsyncMock(return_value=web.Response(status=204))
+
+        with patch(
+            "gateway.drain_control.admission_rejection_requested",
+            return_value=True,
+        ):
+            response = await drain_admission_middleware(request, handler)
+
+        assert response.status == 204
+        handler.assert_awaited_once_with(request)
+
     @pytest.mark.asyncio
     async def test_health_detailed_returns_ok(self, adapter):
         """GET /health/detailed returns status, platform, and runtime fields."""
@@ -919,9 +1167,460 @@ class TestHealthDetailedEndpoint:
         # Completed streams may remain attached for replay; they are not work.
         adapter._run_streams = {"done": object(), "failed": object()}
 
+        process_activity = {
+            "running_processes": 5,
+            "finalizing_processes": 0,
+            "durable_undelivered_completions": 3,
+            "process_completion_activity_available": True,
+            "process_checkpoint_available": True,
+            "process_checkpoint_reason": "verified",
+        }
+        cron_receipt = {
+            "schema": "hermes.cron_admission.v1",
+            "verified": True,
+            "accepting": True,
+            "gate_epoch": 4,
+            "active_count": 0,
+            "active_job_ids": [],
+            "active_leases": [],
+        }
         with patch("tools.process_registry.process_registry.completion_queue.qsize", return_value=4), \
-             patch("tools.async_delegation.active_count", return_value=2):
-            assert adapter._readiness_work_counts() == (3, 4, 2)
+             patch("tools.process_registry.process_registry.completion_activity_snapshot", return_value=process_activity), \
+             patch("tools.async_delegation.active_count", return_value=2), \
+             patch("cron.scheduler.get_cron_admission_receipt", return_value=cron_receipt), \
+             patch("gateway.platforms.api_server._count_running_kanban_workers", return_value=6):
+            assert adapter._readiness_work_counts() == {
+                "active_api_runs": 3,
+                "process_completion_queue_depth": 4,
+                "active_delegations": 2,
+                "background_processes": 5,
+                "active_cron_jobs": 0,
+                "cron_admission": cron_receipt,
+                "api_background_tasks": 0,
+                "running_kanban_workers": 6,
+            }
+
+    def test_readiness_uses_and_exposes_one_atomic_cron_admission_receipt(
+        self,
+        adapter,
+    ):
+        cron_receipt = {
+            "schema": "hermes.cron_admission.v1",
+            "verified": True,
+            "accepting": False,
+            "gate_epoch": 19,
+            "active_count": 2,
+            "active_job_ids": ["job-a", "job-b"],
+            "active_leases": [
+                {"job_id": "job-a", "source": "builtin_due"},
+                {"job_id": "job-b", "source": "manual"},
+            ],
+        }
+        with patch(
+            "cron.scheduler.get_cron_admission_receipt",
+            return_value=cron_receipt,
+        ), patch(
+            "cron.scheduler.get_running_job_ids",
+            return_value=frozenset(),
+        ):
+            counts = adapter._readiness_work_counts()
+
+        assert counts["active_cron_jobs"] == 2
+        assert counts["cron_admission"] == cron_receipt
+
+        with patch(
+            "gateway.run.get_live_gateway_drain_state",
+            return_value={
+                "admission_rejecting": True,
+                "active_agent_turns": 0,
+                "gateway_background_tasks": 0,
+            },
+            create=True,
+        ), patch("gateway.drain_control.drain_requested", return_value=True):
+            drain = adapter._runtime_drain_receipt(
+                {"gateway_state": "draining", "active_agents": 0},
+                counts,
+            )
+
+        assert drain["cron_admission"] == cron_receipt
+
+    def test_readiness_process_counts_fail_closed_when_checkpoint_is_unverified(
+        self, adapter
+    ):
+        process_activity = {
+            "running_processes": 0,
+            "finalizing_processes": 0,
+            "durable_undelivered_completions": 0,
+            "process_completion_activity_available": True,
+            "process_checkpoint_available": False,
+            "process_checkpoint_reason": "invalid",
+        }
+        with patch(
+            "tools.process_registry.process_registry.completion_activity_snapshot",
+            return_value=process_activity,
+        ), patch(
+            "tools.process_registry.process_registry.completion_queue.qsize",
+            return_value=0,
+        ), patch(
+            "tools.async_delegation.active_count", return_value=0
+        ), patch(
+            "cron.scheduler.get_running_job_ids", return_value=frozenset()
+        ), patch(
+            "gateway.platforms.api_server._count_running_kanban_workers",
+            return_value=0,
+        ):
+            counts = adapter._readiness_work_counts()
+
+        assert counts["background_processes"] is None
+
+    def test_readiness_completion_count_includes_durable_undelivered_events(
+        self, adapter
+    ):
+        process_activity = {
+            "running_processes": 0,
+            "finalizing_processes": 0,
+            "durable_undelivered_completions": 3,
+            "process_completion_activity_available": True,
+            "process_checkpoint_available": True,
+            "process_checkpoint_reason": "verified",
+        }
+        with patch(
+            "tools.process_registry.process_registry.completion_activity_snapshot",
+            return_value=process_activity,
+        ), patch(
+            "tools.process_registry.process_registry.completion_queue.qsize",
+            return_value=1,
+        ), patch(
+            "tools.async_delegation.active_count", return_value=0
+        ), patch(
+            "cron.scheduler.get_running_job_ids", return_value=frozenset()
+        ), patch(
+            "gateway.platforms.api_server._count_running_kanban_workers",
+            return_value=0,
+        ):
+            counts = adapter._readiness_work_counts()
+
+        assert counts["process_completion_queue_depth"] == 3
+
+    def test_running_kanban_worker_count_is_read_only_and_deduplicated(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        from gateway.platforms.api_server import _count_running_kanban_workers
+
+        board_db = tmp_path / "kanban.db"
+        conn = sqlite3.connect(board_db)
+        try:
+            conn.execute(
+                "CREATE TABLE tasks ("
+                "id TEXT, status TEXT, worker_pid INTEGER, "
+                "claim_lock TEXT, current_run_id INTEGER)"
+            )
+            conn.execute(
+                "CREATE TABLE task_runs ("
+                "id INTEGER, task_id TEXT, status TEXT, ended_at INTEGER, "
+                "worker_pid INTEGER, claim_lock TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO tasks (id, status) VALUES (?, ?)",
+                [("a", "running"), ("b", "done"), ("c", "running")],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.list_boards",
+            lambda **kw: [
+                {"slug": "one", "db_path": str(board_db)},
+                {"slug": "alias", "db_path": str(board_db)},
+                {"slug": "missing", "db_path": str(tmp_path / "missing.db")},
+            ],
+        )
+        monkeypatch.setattr(
+            "gateway.drain_readiness._live_kanban_worker_pids",
+            lambda: set(),
+        )
+
+        assert _count_running_kanban_workers() == 2
+
+    def test_running_kanban_count_includes_transitional_claim_markers(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        from gateway.platforms.api_server import _count_running_kanban_workers
+
+        board_db = tmp_path / "kanban.db"
+        conn = sqlite3.connect(board_db)
+        try:
+            conn.execute(
+                "CREATE TABLE tasks ("
+                "id TEXT, status TEXT, worker_pid INTEGER, "
+                "claim_lock TEXT, current_run_id INTEGER)"
+            )
+            conn.execute(
+                "CREATE TABLE task_runs ("
+                "id INTEGER, task_id TEXT, status TEXT, ended_at INTEGER, "
+                "worker_pid INTEGER, claim_lock TEXT)"
+            )
+            conn.executemany(
+                """
+                INSERT INTO tasks
+                    (id, status, worker_pid, claim_lock, current_run_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    ("pid-only", "ready", 101, None, None),
+                    ("claim-only", "done", None, "lease-a", None),
+                    ("linked", "ready", None, None, 41),
+                    ("inactive", "done", None, None, None),
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO task_runs
+                    (id, task_id, status, ended_at, worker_pid, claim_lock)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (41, "linked", "running", None, 202, "lease-b"),
+                    (42, "orphan", "failed", None, None, None),
+                    (43, "finished", "done", 1234, None, None),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.list_boards",
+            lambda **kw: [{"slug": "default", "db_path": str(board_db)}],
+        )
+        monkeypatch.setattr(
+            "gateway.drain_readiness._live_kanban_worker_pids",
+            lambda: set(),
+        )
+
+        # pid-only + claim-only + linked/run-41 (deduped) + open run-42.
+        assert _count_running_kanban_workers() == 4
+
+    def test_archived_board_worker_remains_visible_to_drain(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        from gateway.platforms.api_server import _count_running_kanban_workers
+
+        boards_root = tmp_path / "kanban" / "boards"
+        archived_dir = boards_root / "_archived" / "removed-123"
+        archived_dir.mkdir(parents=True)
+        board_db = archived_dir / "kanban.db"
+        conn = sqlite3.connect(board_db)
+        try:
+            conn.execute(
+                "CREATE TABLE tasks ("
+                "id TEXT, status TEXT, worker_pid INTEGER, "
+                "claim_lock TEXT, current_run_id INTEGER)"
+            )
+            conn.execute(
+                "CREATE TABLE task_runs ("
+                "id INTEGER, task_id TEXT, status TEXT, ended_at INTEGER, "
+                "worker_pid INTEGER, claim_lock TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                ("archived-live", "ready", 707, None, None),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.list_boards",
+            lambda **kw: [
+                {"slug": "default", "db_path": str(tmp_path / "missing.db")}
+            ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.boards_root", lambda: boards_root
+        )
+        monkeypatch.setattr(
+            "gateway.drain_readiness._live_kanban_worker_pids",
+            lambda: set(),
+        )
+
+        assert _count_running_kanban_workers() == 1
+
+    def test_live_worker_process_blocks_when_board_database_is_gone(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.platforms.api_server import _count_running_kanban_workers
+
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.list_boards",
+            lambda **kw: [
+                {"slug": "default", "db_path": str(tmp_path / "gone.db")}
+            ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.boards_root",
+            lambda: tmp_path / "boards",
+        )
+        monkeypatch.setattr(
+            "gateway.drain_readiness._live_kanban_worker_pids",
+            lambda: {808},
+        )
+
+        assert _count_running_kanban_workers() == 1
+
+    def test_live_worker_process_parser_uses_worker_argv_marker(self):
+        from gateway.drain_readiness import _live_kanban_worker_pids
+
+        result = MagicMock(
+            returncode=0,
+            stdout=(
+                "101 /usr/bin/python unrelated.py\n"
+                "202 hermes -p worker chat -q work kanban task task-1\n"
+                "303 hermes -p worker chat -q work kanban task task-2\n"
+            ),
+            stderr="",
+        )
+        with patch("gateway.drain_readiness.subprocess.run", return_value=result):
+            assert _live_kanban_worker_pids() == {202, 303}
+
+    def test_incomplete_kanban_ownership_schema_fails_readiness_closed(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        board_db = tmp_path / "legacy.db"
+        conn = sqlite3.connect(board_db)
+        try:
+            conn.execute("CREATE TABLE tasks (id TEXT, status TEXT)")
+            conn.commit()
+        finally:
+            conn.close()
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.list_boards",
+            lambda **kw: [{"slug": "legacy", "db_path": str(board_db)}],
+        )
+
+        assert adapter._readiness_work_counts()["running_kanban_workers"] is None
+
+    def test_unreadable_kanban_worker_source_fails_readiness_closed(
+        self, adapter
+    ):
+        with patch(
+            "gateway.platforms.api_server._count_running_kanban_workers",
+            side_effect=RuntimeError("kanban db unavailable"),
+        ):
+            counts = adapter._readiness_work_counts()
+
+        assert counts["running_kanban_workers"] is None
+
+    def test_drain_uses_live_runner_count_not_stale_persisted_zero(self, adapter):
+        runtime = {"gateway_state": "draining", "active_agents": 0}
+        work_counts = {
+            "active_api_runs": 0,
+            "process_completion_queue_depth": 0,
+            "active_delegations": 0,
+            "background_processes": 0,
+            "active_cron_jobs": 0,
+            "api_background_tasks": 0,
+            "running_kanban_workers": 0,
+        }
+
+        with patch(
+            "gateway.run.get_live_gateway_drain_state",
+            return_value={
+                "admission_rejecting": True,
+                "active_agent_turns": 1,
+                "gateway_background_tasks": 0,
+            },
+            create=True,
+        ), patch("gateway.drain_control.drain_requested", return_value=True):
+            receipt = adapter._runtime_drain_receipt(runtime, work_counts)
+
+        assert receipt["work"]["active_agent_turns"] == 1
+        assert receipt["quiescence"]["quiescent"] is False
+        assert "active_agent_turns" in receipt["quiescence"]["blockers"]
+
+    def test_pair_gate_receipt_proves_exact_owner_and_effective_rejection(
+        self, adapter
+    ):
+        runtime = {"gateway_state": "draining", "active_agents": 0}
+        work_counts = {
+            "active_api_runs": 0,
+            "process_completion_queue_depth": 0,
+            "active_delegations": 0,
+            "background_processes": 0,
+            "active_cron_jobs": 0,
+            "api_background_tasks": 0,
+            "running_kanban_workers": 0,
+        }
+        pair_gate = {
+            "active": True,
+            "verified": True,
+            "reason": "verified",
+            "schema": "hermes.pair_open_gate.v1",
+            "transaction_id": "pair-open-gate-transaction-000001",
+            "owner_hash": "a" * 64,
+            "epoch": 7,
+            "agent": {"build_id": "agent-a", "pid": 101, "start_time": "a", "instance_epoch": "ae"},
+            "webui": {"build_id": "webui-a", "pid": 202, "start_time": "w", "instance_epoch": "we"},
+            "payload_sha256": "b" * 64,
+        }
+
+        with patch(
+            "gateway.run.get_live_gateway_drain_state",
+            return_value={
+                "admission_rejecting": True,
+                "active_agent_turns": 0,
+                "gateway_background_tasks": 0,
+                "pair_open_gate": pair_gate,
+            },
+            create=True,
+        ), patch("gateway.drain_control.drain_requested", return_value=False):
+            receipt = adapter._runtime_drain_receipt(runtime, work_counts)
+
+        assert receipt["admission"] == {
+            "state": "rejecting_new_work",
+            "verified": True,
+            "drain_requested": False,
+            "pair_open_gate_active": True,
+            "effective_rejection_requested": True,
+        }
+        assert receipt["pair_open_gate"] == pair_gate
+        assert receipt["quiescence"]["quiescent"] is True
+
+    def test_stale_persisted_draining_never_proves_live_admission(self, adapter):
+        runtime = {"gateway_state": "draining", "active_agents": 0}
+        work_counts = {
+            "active_api_runs": 0,
+            "process_completion_queue_depth": 0,
+            "active_delegations": 0,
+            "background_processes": 0,
+            "active_cron_jobs": 0,
+            "api_background_tasks": 0,
+            "running_kanban_workers": 0,
+        }
+
+        with patch(
+            "gateway.run.get_live_gateway_drain_state",
+            return_value={
+                "admission_rejecting": False,
+                "active_agent_turns": 0,
+                "gateway_background_tasks": 0,
+            },
+            create=True,
+        ), patch("gateway.drain_control.drain_requested", return_value=True):
+            receipt = adapter._runtime_drain_receipt(runtime, work_counts)
+
+        assert receipt["admission"]["state"] == "transitioning_to_reject"
+        assert receipt["admission"]["verified"] is False
+        assert receipt["quiescence"]["quiescent"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -7078,12 +7078,17 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _opener)
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         with patch(
-            "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=True
-        ):
+            "hermes_cli.browser_connect.launch_chrome_debug",
+            return_value=ChromeDebugLaunch(launched=True),
+        ) as launch, patch(
+            "hermes_cli.browser_connect.subprocess.Popen"
+        ) as popen:
             resp = server.handle_request(
                 {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
             )
 
+    launch.assert_called_once()
+    popen.assert_not_called()
     assert resp["result"]["connected"] is True
     assert resp["result"]["url"] == "http://127.0.0.1:9222"
     assert resp["result"]["messages"] == [
@@ -7761,6 +7766,255 @@ def test_notification_poller_delivers_completion(monkeypatch):
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_acks_durable_completion_only_after_turn_commit(
+    monkeypatch,
+):
+    """Dequeuing is not delivery: ACK only after history accepts the turn."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    callbacks = []
+    acked = []
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        process_registry,
+        "mark_completion_consumed",
+        lambda evt: acked.append(evt) or True,
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    def capture_submit(rid, sid, session, text, *, on_commit_result=None):
+        callbacks.append(on_commit_result)
+
+    monkeypatch.setattr(server, "_run_prompt_submit", capture_submit)
+    sess = _session()
+    evt = {
+        "type": "completion",
+        "event_id": "process:proc_commit_ack:completion",
+        "session_id": "proc_commit_ack",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated_queue.put(evt)
+    stop = threading.Event()
+    stop.set()
+
+    server._notification_poller_loop(stop, "sid_commit_ack", sess)
+
+    assert len(callbacks) == 1
+    assert callable(callbacks[0])
+    assert acked == []
+    callbacks[0](True)
+    assert acked == [evt]
+    assert isolated_queue.empty()
+
+
+def test_notification_poller_requeues_durable_completion_when_turn_not_committed(
+    monkeypatch,
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    callbacks = []
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        process_registry,
+        "mark_completion_consumed",
+        lambda evt: pytest.fail("failed turn must not ACK completion"),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    def capture_submit(rid, sid, session, text, *, on_commit_result=None):
+        callbacks.append(on_commit_result)
+
+    monkeypatch.setattr(server, "_run_prompt_submit", capture_submit)
+    sess = _session()
+    evt = {
+        "type": "completion",
+        "event_id": "process:proc_commit_retry:completion",
+        "session_id": "proc_commit_retry",
+        "command": "echo retry",
+        "exit_code": 0,
+        "output": "retry",
+    }
+    isolated_queue.put(evt)
+    stop = threading.Event()
+    stop.set()
+
+    server._notification_poller_loop(stop, "sid_commit_retry", sess)
+    callbacks[0](False)
+
+    assert isolated_queue.get_nowait() == evt
+
+
+def test_post_turn_drain_finishes_durable_delivery_after_nested_turn_commit(
+    monkeypatch,
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "ok",
+                "completed": True,
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "ok"},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    delivered = []
+    monkeypatch.setattr(
+        process_registry,
+        "finish_notification_delivery",
+        lambda event, committed: delivered.append((event, committed)) or committed,
+    )
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *a, **k: None)
+
+    event = {
+        "type": "completion",
+        "event_id": "process:proc_post_turn:completion",
+        "session_id": "proc_post_turn",
+        "command": "echo post-turn",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated_queue.put(event)
+    sess = _session(
+        agent=_Agent(),
+        config_model_seen=server._config_model_target(),
+    )
+
+    server._run_prompt_submit("1", "sid_post_turn", sess, "outer")
+
+    assert delivered == [(event, True)]
+
+
+def test_notification_poller_replays_durable_completions_before_thread_start(
+    monkeypatch,
+):
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    order = []
+
+    class _CapturingThread:
+        def __init__(self, target=None, args=(), daemon=None):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            order.append("thread-start")
+
+    monkeypatch.setattr(server, "_wire_agent_terminal_output", lambda: None)
+    monkeypatch.setattr(
+        process_registry,
+        "recover_completion_notifications",
+        lambda: order.append("recover") or 1,
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "recover_async_delegations",
+        lambda: order.append("recover-async") or {"queued": 1, "lost": 0},
+    )
+    monkeypatch.setattr(server.threading, "Thread", _CapturingThread)
+
+    stop = server._start_notification_poller("sid_recovery", {})
+
+    assert order == ["recover", "recover-async", "thread-start"]
+    assert stop.is_set() is False
+
+
+def test_post_turn_drain_requeues_entire_untouched_tail_when_nested_turn_starts():
+    """Starting one nested turn must not discard later events in its batch."""
+    import queue as _queue_mod
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    events = [
+        {
+            "type": "completion",
+            "event_id": f"process:proc_tail_{index}:completion",
+            "session_id": f"proc_tail_{index}",
+            "command": f"echo {index}",
+            "exit_code": 0,
+            "output": str(index),
+        }
+        for index in range(3)
+    ]
+    drained = [(event, f"notification {index}") for index, event in enumerate(events)]
+
+    server._requeue_notification_tail(isolated_queue, drained, 1)
+
+    assert list(isolated_queue.queue) == events[1:]
+
+
+def test_notification_turn_requeues_failed_history_only_result(monkeypatch):
+    """Copying a synthetic user row into UI history is not a durable ACK."""
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "Error: provider failed",
+                "completed": False,
+                "failed": True,
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    committed = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    sess = _session(agent=_Agent())
+
+    server._run_prompt_submit(
+        "1",
+        "sid_failed_notification",
+        sess,
+        "[SYSTEM: completed]",
+        on_commit_result=committed.append,
+    )
+
+    assert committed == [False]
 
 
 def test_notification_poller_skips_consumed(monkeypatch):

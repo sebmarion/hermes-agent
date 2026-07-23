@@ -83,6 +83,11 @@ class TurnResult:
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
+    # Explicit terminal provenance prevents callers and diagnostics from
+    # treating a projected assistant item as proof that Codex closed the turn.
+    terminal_source: Optional[str] = None
+    terminal_class: Optional[str] = None
+    retirement_reason: Optional[str] = None
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.
@@ -438,6 +443,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        post_assistant_terminal_timeout: float = 30.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -448,6 +454,14 @@ class CodexAppServerSession:
         `turn/completed`, fast-fail and mark the session for retirement.
         Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
         so a wedged codex doesn't burn the full turn deadline.
+
+        post_assistant_terminal_timeout: after the latest root agentMessage,
+        retire and return its usable text as ``completed_unconfirmed`` when no
+        later correlated turn/item/tool activity arrives for this many
+        seconds. Any such activity cancels the candidate-final watchdog until
+        another root agentMessage arrives. This avoids the 600s missing-
+        ``turn/completed`` failure without treating intermediate messages as
+        terminal.
         """
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
@@ -464,6 +478,9 @@ class CodexAppServerSession:
             # Subprocess almost certainly unhealthy — retire so the next
             # turn re-spawns cleanly.
             result.should_retire = True
+            result.terminal_source = "startup"
+            result.terminal_class = "failed"
+            result.retirement_reason = "startup_failure"
             return result
         assert self._client is not None and self._thread_id is not None
         result.thread_id = self._thread_id
@@ -506,10 +523,13 @@ class CodexAppServerSession:
                 # clean handshake (and the user has a chance to re-auth
                 # via `codex login` between turns).
                 result.should_retire = True
+                result.retirement_reason = "authentication_failure"
             else:
                 result.error = self._format_error_with_stderr(
                     "turn/start failed", exc
                 )
+            result.terminal_source = "turn/start"
+            result.terminal_class = "failed"
             return result
         except TimeoutError as exc:
             # turn/start hanging is a strong signal the subprocess is wedged.
@@ -519,12 +539,18 @@ class CodexAppServerSession:
                 "turn/start timed out", exc
             )
             result.should_retire = True
+            result.terminal_source = "turn/start"
+            result.terminal_class = "timeout"
+            result.retirement_reason = "turn_start_timeout"
             return result
 
         result.turn_id = (ts.get("turn") or {}).get("id")
         if not result.turn_id:
             result.error = "codex turn/start returned no turn id"
             result.should_retire = True
+            result.terminal_source = "turn/start"
+            result.terminal_class = "failed"
+            result.retirement_reason = "missing_turn_id"
             return result
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
@@ -533,6 +559,7 @@ class CodexAppServerSession:
         # within post_tool_quiet_timeout and the turn hasn't completed, we
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
+        last_assistant_message_at: Optional[float] = None
 
         def consume_notification(note: dict) -> bool:
             """Consume one app-server notification exactly once.
@@ -542,7 +569,7 @@ class CodexAppServerSession:
             thread/turn may alter its text, messages, usage, counters, or
             terminal state. Returns True when the root turn is complete.
             """
-            nonlocal last_tool_completion_at
+            nonlocal last_tool_completion_at, last_assistant_message_at
 
             self._emit_event(note)
             # Child agents can request file-change approval too. Cache their
@@ -575,10 +602,21 @@ class CodexAppServerSession:
                 # Codex can emit multiple root agentMessage items in one turn
                 # (e.g. partial then final). Take the last root item only.
                 result.final_text = projection.final_text
+                last_assistant_message_at = time.monotonic()
                 if _has_turn_aborted_marker(projection.final_text):
                     result.interrupted = True
                     result.error = result.error or "codex reported turn_aborted"
+                    result.terminal_source = "assistant_message_marker"
+                    result.terminal_class = "interrupted"
                     return True
+            elif (
+                note.get("method", "").startswith(("item/", "turn/"))
+                or projection.messages
+                or projection.is_tool_iteration
+            ):
+                # The prior agentMessage was intermediate: correlated work
+                # continued after it, so it cannot own a terminal watchdog.
+                last_assistant_message_at = None
 
             if note.get("method", "") != "turn/completed":
                 return False
@@ -588,6 +626,12 @@ class CodexAppServerSession:
             )
             if turn_status == "interrupted":
                 result.interrupted = True
+                result.terminal_class = "interrupted"
+            elif turn_status == "completed":
+                result.terminal_class = "completed"
+            else:
+                result.terminal_class = "failed"
+            result.terminal_source = "turn/completed"
             if turn_status and turn_status not in {"completed", "interrupted"}:
                 err_obj = ((note.get("params") or {}).get("turn") or {}).get(
                     "error"
@@ -599,6 +643,7 @@ class CodexAppServerSession:
                     if hint is not None:
                         result.error = hint
                         result.should_retire = True
+                        result.retirement_reason = "authentication_failure"
                     else:
                         result.error = self._format_error_with_stderr(
                             f"turn ended status={turn_status}", err_msg
@@ -609,6 +654,8 @@ class CodexAppServerSession:
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
+                result.terminal_source = "local_interrupt"
+                result.terminal_class = "interrupted"
                 break
 
             # Detect a dead subprocess between iterations. If codex exited
@@ -626,6 +673,9 @@ class CodexAppServerSession:
                         tail_lines=20,
                     )
                 result.should_retire = True
+                result.terminal_source = "process_exit"
+                result.terminal_class = "failed"
+                result.retirement_reason = "process_exited"
                 break
 
             # Post-tool watchdog: if a tool completion was the most recent
@@ -644,6 +694,29 @@ class CodexAppServerSession:
                     f"retiring app-server session."
                 )
                 result.should_retire = True
+                result.terminal_source = "post_tool_watchdog"
+                result.terminal_class = "timeout"
+                result.retirement_reason = "post_tool_silence"
+                break
+
+            if (
+                last_assistant_message_at is not None
+                and post_assistant_terminal_timeout > 0
+                and (time.monotonic() - last_assistant_message_at)
+                    > post_assistant_terminal_timeout
+            ):
+                logger.warning(
+                    "codex app-server stayed silent for %.1fs after its latest "
+                    "assistant message without turn/completed; accepting text "
+                    "and retiring the session",
+                    post_assistant_terminal_timeout,
+                )
+                self._issue_interrupt(result.turn_id)
+                result.should_retire = True
+                result.terminal_source = "post_assistant_inactivity"
+                result.terminal_class = "completed_unconfirmed"
+                result.retirement_reason = "missing_turn_completed"
+                turn_complete = True
                 break
 
             # Drain any server-initiated requests (approvals) before
@@ -665,6 +738,7 @@ class CodexAppServerSession:
                 # Activity counts as live signal — reset the post-tool
                 # quiet timer so an approval round-trip doesn't trip it.
                 last_tool_completion_at = None
+                last_assistant_message_at = None
                 continue
 
             note = self._client.take_notification(
@@ -686,6 +760,11 @@ class CodexAppServerSession:
                 "assistant message but before turn/completed; accepting "
                 "the assistant text as the terminal response"
             )
+            self._issue_interrupt(result.turn_id)
+            result.should_retire = True
+            result.terminal_source = "assistant_message_deadline"
+            result.terminal_class = "completed_unconfirmed"
+            result.retirement_reason = "missing_turn_completed"
             turn_complete = True
 
         if not turn_complete and not result.interrupted:
@@ -700,6 +779,9 @@ class CodexAppServerSession:
                     f"turn timed out after {turn_timeout}s"
                 )
             result.should_retire = True
+            result.terminal_source = "turn_deadline"
+            result.terminal_class = "timeout"
+            result.retirement_reason = "turn_timeout"
 
         return result
 

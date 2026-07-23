@@ -18,14 +18,217 @@ for invariants and PR review criteria.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from agent.model_metadata import (
+    estimate_request_tokens_rough,
+    get_model_context_length,
+)
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
+
+
+_BACKGROUND_REVIEW_ADMISSION_VERSION = 1
+_BACKGROUND_REVIEW_DEFAULT_CONTEXT_LENGTH = 262_144
+_BACKGROUND_REVIEW_MIN_RESERVE_TOKENS = 2_048
+_BACKGROUND_REVIEW_MAX_RESERVE_TOKENS = 8_192
+
+
+def _review_tool_name(tool: object) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or "")
+    return str(tool.get("name") or "")
+
+
+def _review_tools_for_request(
+    tools: List[Dict[str, Any]],
+    *,
+    whitelist: set[str],
+    routed: bool,
+) -> List[Dict[str, Any]]:
+    """Expose exactly the schemas executable under the runtime whitelist.
+
+    When every schema is executable, preserve the parent's list identity and
+    byte order for prompt-cache parity. A denied schema is never advertised,
+    regardless of whether the review is same-model or routed.
+    """
+    narrowed = [
+        tool for tool in tools if _review_tool_name(tool) in whitelist
+    ]
+    if len(narrowed) == len(tools):
+        return tools
+    return narrowed
+
+
+def _review_tool_result_digest(content: object, *, preview_chars: int) -> str:
+    if isinstance(content, str):
+        raw = content
+    else:
+        try:
+            raw = json.dumps(
+                content,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except Exception:
+            raw = str(content)
+    digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+    preview_chars = max(0, int(preview_chars))
+    head_chars = preview_chars // 2
+    tail_chars = preview_chars - head_chars
+    head = raw[:head_chars]
+    tail = raw[-tail_chars:] if tail_chars else ""
+    return (
+        "[Background review tool-result digest; "
+        f"sha256={digest}; original_chars={len(raw)}]"
+        + (f"\nHEAD:\n{head}" if head else "")
+        + (f"\nTAIL:\n{tail}" if tail else "")
+    )
+
+
+def _bound_routed_review_history(
+    messages: List[Dict[str, Any]],
+    *,
+    context_length: int,
+) -> List[Dict[str, Any]]:
+    """Copy and deterministically digest oversized routed-review tool output."""
+    bounded = copy.deepcopy(list(messages or []))
+    context_length = max(1, int(context_length or 0))
+    per_result_chars = max(1_024, min(12_000, context_length // 32))
+    aggregate_chars = max(8_192, min(100_000, context_length))
+
+    tool_rows: List[tuple[int, int]] = []
+    for index, message in enumerate(bounded):
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        content = message.get("content", "")
+        raw = content if isinstance(content, str) else json.dumps(
+            content,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+        if len(raw) > per_result_chars:
+            message["content"] = _review_tool_result_digest(
+                raw,
+                preview_chars=min(1_024, per_result_chars // 2),
+            )
+        tool_rows.append((index, len(str(message.get("content", "")))))
+
+    total_chars = sum(size for _index, size in tool_rows)
+    if total_chars <= aggregate_chars:
+        return bounded
+
+    # Largest first, then stable source order. Pairing metadata stays intact;
+    # only the content field is replaced on this outbound copy.
+    for index, size in sorted(tool_rows, key=lambda row: (-row[1], row[0])):
+        if total_chars <= aggregate_chars:
+            break
+        message = bounded[index]
+        original = message.get("content", "")
+        replacement = _review_tool_result_digest(original, preview_chars=0)
+        message["content"] = replacement
+        total_chars += len(replacement) - size
+    return bounded
+
+
+def _resolve_review_context_length(review_agent: Any, runtime: Dict[str, Any]) -> int:
+    """Resolve the most conservative positive target-model context limit."""
+    candidates: List[int] = []
+    try:
+        compressor_value = int(
+            getattr(getattr(review_agent, "context_compressor", None), "context_length", 0)
+            or 0
+        )
+        if compressor_value > 0:
+            candidates.append(compressor_value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        resolved = int(
+            get_model_context_length(
+                str(getattr(review_agent, "model", "") or runtime.get("model") or ""),
+                base_url=str(runtime.get("base_url") or ""),
+                api_key=str(runtime.get("api_key") or ""),
+                provider=str(
+                    getattr(review_agent, "provider", "")
+                    or runtime.get("provider")
+                    or ""
+                ),
+            )
+            or 0
+        )
+        if resolved > 0:
+            candidates.append(resolved)
+    except Exception:
+        logger.warning(
+            "Background review context resolution failed; using conservative fallback",
+            exc_info=True,
+        )
+    return min(candidates) if candidates else _BACKGROUND_REVIEW_DEFAULT_CONTEXT_LENGTH
+
+
+def _background_review_admission_receipt(
+    *,
+    context_length: int,
+    system_prompt: str,
+    history: List[Dict[str, Any]],
+    user_prompt: str,
+    tools: List[Dict[str, Any]],
+    requested_output_tokens: int,
+    routed: bool,
+    provider: str,
+    model: str,
+) -> Dict[str, Any]:
+    """Account for every major request bucket before provider submission."""
+    context_length = max(1, int(context_length or 0))
+    output_tokens = max(0, int(requested_output_tokens or 0))
+    prompt_tokens = int(
+        estimate_request_tokens_rough(
+            [*list(history or []), {"role": "user", "content": user_prompt}],
+            system_prompt=system_prompt or "",
+            tools=tools or None,
+        )
+    )
+    prompt_tokens = max(0, prompt_tokens)
+    raw_requested = prompt_tokens + output_tokens
+    reserve = max(
+        _BACKGROUND_REVIEW_MIN_RESERVE_TOKENS,
+        min(_BACKGROUND_REVIEW_MAX_RESERVE_TOKENS, context_length // 50),
+    )
+    # The fast estimator is intentionally rough. A 5% input margin plus a
+    # fixed floor prevents tokenizer variance from crossing the hard provider
+    # limit after an apparently exact admission.
+    estimator_margin = max(1_024, (prompt_tokens + 19) // 20)
+    admission_tokens = raw_requested + reserve + estimator_margin
+    admitted = admission_tokens <= context_length
+    return {
+        "version": _BACKGROUND_REVIEW_ADMISSION_VERSION,
+        "admitted": admitted,
+        "reason": "admitted" if admitted else "aggregate_context_budget_exceeded",
+        "provider": str(provider or ""),
+        "model": str(model or ""),
+        "routed": bool(routed),
+        "context_length": context_length,
+        "prompt_tokens": prompt_tokens,
+        "requested_output_tokens": output_tokens,
+        "raw_requested_tokens": raw_requested,
+        "synthesis_reserve_tokens": reserve,
+        "estimator_margin_tokens": estimator_margin,
+        "admission_tokens": admission_tokens,
+        "tool_schema_count": len(tools or []),
+        "history_message_count": len(history or []),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -835,13 +1038,94 @@ def _run_review_in_thread(
                     _digest_history(messages_snapshot) if _routed
                     else messages_snapshot
                 )
+                _context_length = _resolve_review_context_length(
+                    review_agent,
+                    _rt,
+                )
+                if _routed:
+                    _review_history = _bound_routed_review_history(
+                        _review_history,
+                        context_length=_context_length,
+                    )
+
+                _existing_tools = getattr(review_agent, "tools", None)
+                if not isinstance(_existing_tools, list):
+                    _existing_tools = []
+                _request_tools = _review_tools_for_request(
+                    _existing_tools,
+                    whitelist=review_whitelist,
+                    routed=_routed,
+                )
+                if _request_tools is not _existing_tools:
+                    # Advertised schemas and the runtime whitelist must agree.
+                    # Preserve cache identity only when every parent schema is
+                    # executable under the review's restricted capability set.
+                    review_agent.tools = _request_tools
+
+                _review_user_prompt = (
+                    prompt
+                    + "\n\nYou can only call memory and skill "
+                    "management tools. Other tools will be denied "
+                    "at runtime — do not attempt them."
+                )
+                _review_system_prompt = str(
+                    getattr(review_agent, "_cached_system_prompt", "") or ""
+                )
+                if not _review_system_prompt:
+                    try:
+                        _review_system_prompt = str(
+                            review_agent._build_system_prompt() or ""
+                        )
+                        review_agent._cached_system_prompt = _review_system_prompt
+                    except Exception:
+                        logger.warning(
+                            "Background review could not prebuild its system prompt; "
+                            "admission will use the conservative token margin",
+                            exc_info=True,
+                        )
+                _requested_output_tokens = getattr(
+                    review_agent,
+                    "max_tokens",
+                    None,
+                )
+                if not isinstance(_requested_output_tokens, int):
+                    _requested_output_tokens = _rt.get("max_tokens")
+                if not isinstance(_requested_output_tokens, int):
+                    _requested_output_tokens = 8_192
+
+                _admission = _background_review_admission_receipt(
+                    context_length=_context_length,
+                    system_prompt=_review_system_prompt,
+                    history=_review_history,
+                    user_prompt=_review_user_prompt,
+                    tools=_request_tools,
+                    requested_output_tokens=_requested_output_tokens,
+                    routed=_routed,
+                    provider=str(_rt.get("provider") or agent.provider or ""),
+                    model=str(_rt.get("model") or agent.model or ""),
+                )
+                setattr(agent, "_last_background_review_admission", dict(_admission))
+                if not _admission["admitted"]:
+                    safe_receipt = json.dumps(
+                        _admission,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    logger.warning(
+                        "Background review skipped by aggregate admission: %s",
+                        safe_receipt,
+                    )
+                    agent._emit_auxiliary_failure(
+                        "background review",
+                        RuntimeError(
+                            "aggregate_context_budget_exceeded: "
+                            f"requested {_admission['admission_tokens']:,} tokens "
+                            f"for {_admission['context_length']:,}-token context"
+                        ),
+                    )
+                    return
                 review_agent.run_conversation(
-                    user_message=(
-                        prompt
-                        + "\n\nYou can only call memory and skill "
-                        "management tools. Other tools will be denied "
-                        "at runtime — do not attempt them."
-                    ),
+                    user_message=_review_user_prompt,
                     conversation_history=_review_history,
                 )
             finally:

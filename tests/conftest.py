@@ -712,10 +712,16 @@ def _live_system_guard(request, monkeypatch):
 
     def _is_process_killer(cmd) -> bool:
         cmd_str = _cmd_to_string(cmd)
-        try:
-            tokens = _shlex.split(cmd_str)
-        except ValueError:
-            tokens = cmd_str.split()
+        if isinstance(cmd, (list, tuple)):
+            # Preserve argv boundaries. Re-parsing a list after joining it can
+            # turn an innocent argument such as ``"real skill"`` into the
+            # process-killer executable ``skill``.
+            tokens = [str(token) for token in cmd]
+        else:
+            try:
+                tokens = _shlex.split(cmd_str)
+            except ValueError:
+                tokens = cmd_str.split()
         if not tokens:
             return False
         for tok in tokens:

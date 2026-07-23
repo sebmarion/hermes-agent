@@ -72,3 +72,24 @@ def test_notifier_watcher_runs_when_dispatch_enabled():
                     asyncio.run(runner._kanban_notifier_watcher())
 
     assert past_gate, "list_boards should be called when dispatch_in_gateway=true"
+
+
+def test_notifier_watcher_does_not_claim_events_during_external_drain():
+    runner = _make_runner(with_adapter=True)
+    runner._external_drain_active = True
+    sleep_calls = []
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+        # Initial startup sleep, then one drain-wait sleep.
+        if len(sleep_calls) >= 2:
+            runner._running = False
+
+    import hermes_cli.kanban_db as _kb
+
+    with patch("hermes_cli.config.load_config", return_value=_fake_config(True)):
+        with patch.object(_kb, "list_boards") as list_boards:
+            with patch("asyncio.sleep", side_effect=fake_sleep):
+                asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    list_boards.assert_not_called()

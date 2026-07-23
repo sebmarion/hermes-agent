@@ -200,6 +200,99 @@ class TestSpawnEnvIsolation:
             "subprocesses (gh, git, aws, npm) need the user's real HOME."
         )
 
+    @pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX process groups")
+    def test_spawn_and_close_own_the_complete_process_group(self, monkeypatch):
+        import os
+        import signal
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+        signals = []
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["start_new_session"] = kwargs.get("start_new_session")
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 321
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def terminate(self):
+                raise AssertionError("direct-child terminate must not bypass group ownership")
+
+            def kill(self):
+                raise AssertionError("direct-child kill must not bypass group ownership")
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        def fake_killpg(pgid, sig):
+            if sig == 0:
+                raise ProcessLookupError
+            signals.append((pgid, sig))
+
+        monkeypatch.setattr(os, "killpg", fake_killpg)
+
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client.close(timeout=0.01)
+
+        assert captured["start_new_session"] is True
+        assert signals == [(321, signal.SIGTERM)]
+
+    @pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX process groups")
+    def test_close_sigkills_group_when_direct_child_exits_but_descendant_survives(
+        self, monkeypatch
+    ):
+        import os
+        import signal
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        signals = []
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 321
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def terminate(self):
+                raise AssertionError("direct-child terminate must not bypass group ownership")
+
+            def kill(self):
+                raise AssertionError("direct-child kill must not bypass group ownership")
+
+        def fake_killpg(pgid, sig):
+            if sig != 0:
+                signals.append((pgid, sig))
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setattr(os, "killpg", fake_killpg)
+
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client.close(timeout=0)
+
+        assert signals == [
+            (321, signal.SIGTERM),
+            (321, signal.SIGKILL),
+        ]
+
     def test_spawn_env_sets_CODEX_HOME_when_provided(self, monkeypatch):
         """CODEX_HOME isolation must still work — that's the whole point
         of the codex_home arg."""

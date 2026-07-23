@@ -1,5 +1,6 @@
 """Regression tests for dashboard cron job profile routing."""
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
 from queue import Empty, SimpleQueue
@@ -7,6 +8,15 @@ import threading
 
 import pytest
 from fastapi import HTTPException
+
+
+class _CronFireRequest:
+    def __init__(self, body, token="good"):
+        self._body = body
+        self.headers = {"Authorization": f"Bearer {token}"}
+
+    async def json(self):
+        return self._body
 
 
 @pytest.fixture()
@@ -106,6 +116,171 @@ def test_fire_cron_job_scopes_store_and_runtime_home_together(
         assert scheduler._get_hermes_home() == default_home
     finally:
         reset_hermes_home_override(outer_token)
+
+
+@pytest.mark.asyncio
+async def test_cron_fire_duplicate_id_without_profile_claim_fails_closed(
+    isolated_profiles,
+    monkeypatch,
+):
+    from hermes_cli import web_server
+
+    duplicate = {
+        "id": "duplicate-fire-id",
+        "name": "duplicate",
+        "prompt": "x",
+        "schedule": {"kind": "interval", "minutes": 60},
+        "next_run_at": "2026-07-23T00:00:00+00:00",
+        "enabled": True,
+        "state": "scheduled",
+    }
+    for profile in ("default", "worker_alpha"):
+        web_server._call_cron_for_profile(profile, "save_jobs", [duplicate])
+
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **_kw: {"purpose": "cron_fire"}),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_claim_cron_fire_for_profile",
+        lambda *_a, **_kw: pytest.fail("ambiguous fire must not acquire a lease"),
+    )
+
+    response = await web_server.cron_fire_webhook(
+        _CronFireRequest({"job_id": "duplicate-fire-id"})
+    )
+
+    assert response.status_code == 409
+    assert b"multiple profiles" in response.body
+
+
+def test_authenticated_profile_claim_resolves_exact_duplicate(
+    isolated_profiles,
+):
+    from hermes_cli import web_server
+
+    duplicate = {
+        "id": "profile-bound-fire",
+        "name": "duplicate",
+        "prompt": "x",
+        "schedule": {"kind": "interval", "minutes": 60},
+        "next_run_at": "2026-07-23T00:00:00+00:00",
+        "enabled": True,
+        "state": "scheduled",
+    }
+    for profile in ("default", "worker_alpha"):
+        web_server._call_cron_for_profile(profile, "save_jobs", [duplicate])
+
+    assert (
+        web_server._resolve_cron_fire_profile(
+            "profile-bound-fire",
+            "worker_alpha",
+        )
+        == "worker_alpha"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_fire_waits_for_admission_before_202(
+    isolated_profiles,
+    monkeypatch,
+):
+    from hermes_cli import web_server
+
+    job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="wait for durable admission",
+        schedule="every 1h",
+        name="pre-202-dashboard",
+    )
+    entered = threading.Event()
+    allow = threading.Event()
+    fired = threading.Event()
+    lease = object()
+
+    def blocked_claim(profile, job_id):
+        assert profile == "worker_alpha"
+        assert job_id == job["id"]
+        entered.set()
+        assert allow.wait(timeout=5)
+        return object(), lease
+
+    def fake_fire(profile, job_id, **kwargs):
+        assert kwargs["admission_lease"] is lease
+        fired.set()
+        return True
+
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (
+            lambda **_kw: {
+                "purpose": "cron_fire",
+                "profile": "worker_alpha",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_claim_cron_fire_for_profile",
+        blocked_claim,
+    )
+    monkeypatch.setattr(web_server, "_fire_cron_job_for_profile", fake_fire)
+
+    handler = asyncio.create_task(
+        web_server.cron_fire_webhook(
+            _CronFireRequest({"job_id": job["id"]})
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2)
+    assert handler.done() is False
+    allow.set()
+    response = await handler
+
+    assert response.status_code == 202
+    assert await asyncio.to_thread(fired.wait, 2)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_fire_closed_admission_returns_503_without_worker(
+    isolated_profiles,
+    monkeypatch,
+):
+    from hermes_cli import web_server
+
+    job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="closed admission",
+        schedule="every 1h",
+        name="closed-dashboard",
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (
+            lambda **_kw: {
+                "purpose": "cron_fire",
+                "profile": "worker_alpha",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_claim_cron_fire_for_profile",
+        lambda *_a, **_kw: (object(), None),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_fire_cron_job_for_profile",
+        lambda *_a, **_kw: pytest.fail("closed fire must not start a worker"),
+    )
+
+    response = await web_server.cron_fire_webhook(
+        _CronFireRequest({"job_id": job["id"]})
+    )
+
+    assert response.status_code == 503
 
 
 def test_profile_call_cannot_retarget_ticker_store_mid_write(
@@ -300,6 +475,61 @@ async def test_cron_mutation_without_profile_finds_named_profile_job(isolated_pr
     assert len(worker_jobs) == 1
     assert worker_jobs[0]["id"] == worker_job["id"]
     assert worker_jobs[0]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_trigger_rejected_by_profile_gate_returns_service_unavailable(
+    isolated_profiles,
+):
+    from cron.admission import set_cron_admission_paused
+    from hermes_cli import web_server
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    worker_home = isolated_profiles["worker_alpha"]
+    worker_job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="managed by named profile",
+        schedule="every 1h",
+        name="drain-fenced-job",
+    )
+    before = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "get_job",
+        worker_job["id"],
+    )
+
+    token = set_hermes_home_override(str(worker_home))
+    try:
+        set_cron_admission_paused(True, reason="test-drain")
+    finally:
+        reset_hermes_home_override(token)
+
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await web_server.trigger_cron_job(
+                worker_job["id"],
+                profile="worker_alpha",
+            )
+        assert exc_info.value.status_code == 503
+        assert "draining" in str(exc_info.value.detail)
+        assert (
+            web_server._call_cron_for_profile(
+                "worker_alpha",
+                "get_job",
+                worker_job["id"],
+            )
+            == before
+        )
+    finally:
+        token = set_hermes_home_override(str(worker_home))
+        try:
+            set_cron_admission_paused(False, reason="test-release")
+        finally:
+            reset_hermes_home_override(token)
 
 
 @pytest.mark.asyncio

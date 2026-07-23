@@ -1122,11 +1122,11 @@ class TestSessionRetirement:
         s = make_session(client)
         r = s.run_turn("hi", turn_timeout=1.0)
         assert r.should_retire is False
+        assert r.terminal_source == "turn/completed"
+        assert r.terminal_class == "completed"
 
-    def test_final_agent_message_without_turn_completed_is_recovered(self):
-        """A completed assistant item is still a usable terminal response when
-        codex omits turn/completed and then goes quiet.
-        """
+    def test_final_agent_message_silence_ends_before_outer_deadline(self):
+        """Usable final text must not pay the full 600s missing-terminal wait."""
         client = FakeClient()
         client.queue_notification(
             "item/completed",
@@ -1135,19 +1135,91 @@ class TestSessionRetirement:
             turnId="tu1",
         )
         s = make_session(client)
+        started = time.monotonic()
         r = s.run_turn(
             "hi",
-            turn_timeout=0.05,
-            notification_poll_timeout=0.01,
+            turn_timeout=0.3,
+            notification_poll_timeout=0.005,
+            post_assistant_terminal_timeout=0.02,
         )
+        assert time.monotonic() - started < 0.15
         assert r.final_text == "done"
         assert r.interrupted is False
         assert r.error is None
-        assert r.should_retire is False
+        assert r.should_retire is True
+        assert r.terminal_source == "post_assistant_inactivity"
+        assert r.terminal_class == "completed_unconfirmed"
+        assert r.retirement_reason == "missing_turn_completed"
         assert any(
             msg["role"] == "assistant" and msg.get("content") == "done"
             for msg in r.projected_messages
         )
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_intermediate_agent_message_never_ends_healthy_active_turn(self):
+        class DelayedActivityClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.notification_reads = 0
+
+            def take_notification(self, timeout: float = 0.0):
+                self.notification_reads += 1
+                if self.notification_reads == 2:
+                    time.sleep(0.03)
+                return super().take_notification(timeout)
+
+        client = DelayedActivityClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "working"},
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/started",
+            item={"type": "reasoning", "id": "r1", "text": "checking"},
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution",
+                "id": "ex1",
+                "command": "echo healthy",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "healthy",
+                "exitCode": 0,
+                "commandActions": [],
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m2", "text": "finished"},
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        result = make_session(client).run_turn(
+            "keep going",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.001,
+            post_tool_quiet_timeout=0.2,
+            post_assistant_terminal_timeout=0.005,
+        )
+
+        assert result.final_text == "finished"
+        assert result.tool_iterations == 1
+        assert result.terminal_source == "turn/completed"
+        assert result.should_retire is False
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
     def test_post_tool_quiet_watchdog_trips_and_retires(self):

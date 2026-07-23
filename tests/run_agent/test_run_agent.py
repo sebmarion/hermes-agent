@@ -7577,7 +7577,7 @@ class TestDeadRetryCode:
 
     def test_no_unreachable_max_retries_after_backoff(self):
         import inspect
-        from agent.conversation_loop import run_conversation as _rc
+        from agent.conversation_loop import _run_conversation as _rc
         source = inspect.getsource(_rc)
         occurrences = source.count("if retry_count >= max_retries:")
         assert occurrences == 2, (
@@ -7904,10 +7904,11 @@ class TestRequiredPolicyDispatchBoundary:
         assistant = _mock_assistant_msg(content="", tool_calls=[tool_call])
         messages = []
 
-        if concurrent:
-            agent._execute_tool_calls_concurrent(assistant, messages, "task-1")
-        else:
-            agent._execute_tool_calls_sequential(assistant, messages, "task-1")
+        monkeypatch.setattr(
+            "run_agent._should_parallelize_tool_batch",
+            lambda _tool_calls: concurrent,
+        )
+        agent._execute_tool_calls(assistant, messages, "task-1")
 
         assert agent._checkpoint_mgr.ensure_checkpoint.call_count == 0
         assert progress_calls == []
@@ -7961,7 +7962,11 @@ class TestRequiredPolicyDispatchBoundary:
             "tools.todo_tool.todo_tool",
             side_effect=AssertionError("todo handler must not run"),
         ):
-            agent._execute_tool_calls_sequential(assistant, messages, "task-1")
+            monkeypatch.setattr(
+                "run_agent._should_parallelize_tool_batch",
+                lambda _tool_calls: False,
+            )
+            agent._execute_tool_calls(assistant, messages, "task-1")
 
         assert progress_calls == []
         assert start_calls == []

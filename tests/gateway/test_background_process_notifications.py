@@ -8,13 +8,18 @@ Contributed by @PeterFile (PR #593), reimplemented on current main.
 """
 
 import asyncio
+import queue
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.run import GatewayRunner, _parse_session_key
+from gateway.run import (
+    GatewayRunner,
+    _format_gateway_process_notification,
+    _parse_session_key,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +68,58 @@ def _watcher_dict(session_id="proc_test", thread_id=""):
     if thread_id:
         d["thread_id"] = thread_id
     return d
+
+
+def test_gateway_formats_durable_process_completion_for_agent_injection():
+    """The queue owner must not dequeue a completion into a silent ``None``."""
+    text = _format_gateway_process_notification(
+        {
+            "type": "completion",
+            "event_id": "process:proc_durable:completion",
+            "session_id": "proc_durable",
+            "command": "echo done",
+            "exit_code": 0,
+            "output": "done\n",
+        }
+    )
+
+    assert text is not None
+    assert "Background process proc_durable completed normally" in text
+    assert "echo done" in text
+
+
+@pytest.mark.asyncio
+async def test_completion_watcher_leaves_durable_queue_untouched_during_drain(
+    monkeypatch,
+):
+    from tools.process_registry import process_registry
+
+    completion_queue = queue.Queue()
+    completion_queue.put(
+        {
+            "type": "completion",
+            "event_id": "process:p1:completion",
+            "session_id": "p1",
+        }
+    )
+    monkeypatch.setattr(process_registry, "completion_queue", completion_queue)
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._external_drain_active = True
+    sleep_calls = []
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+        # Initial delay, then one admission-closed wait.
+        if len(sleep_calls) >= 2:
+            runner._running = False
+
+    monkeypatch.setattr("gateway.run.asyncio.sleep", fake_sleep)
+    await runner._async_delegation_watcher(interval=0.01)
+
+    assert completion_queue.qsize() == 1
+    assert completion_queue.queue[0]["event_id"] == "process:p1:completion"
 
 
 # ---------------------------------------------------------------------------
@@ -284,12 +341,31 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
 
 
 @pytest.mark.asyncio
-async def test_agent_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
-    """notify_on_complete injection carries the triggering message_id so the
-    synthetic event can be reply-anchored back into a Telegram DM topic.
+async def test_inject_completion_carries_durable_delivery_receipt(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    event = {
+        "type": "completion",
+        "event_id": "process:proc_durable_gateway:completion",
+        "session_id": "proc_durable_gateway",
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "done",
+    }
 
-    Without an anchor, Telegram private-chat topic sends fall back to the main
-    chat (see _thread_kwargs_for_send / telegram_dm_topic_reply_fallback)."""
+    await runner._inject_watch_notification("[SYSTEM: completed]", event)
+
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.metadata["_hermes_durable_notification"] == event
+
+
+@pytest.mark.asyncio
+async def test_process_watcher_defers_agent_notification_to_durable_queue(monkeypatch, tmp_path):
+    """The watcher must not race the stable outbox event with a second inject."""
     import tools.process_registry as pr_module
 
     sessions = [SimpleNamespace(
@@ -316,11 +392,7 @@ async def test_agent_notification_carries_message_id_reply_anchor(monkeypatch, t
     }
     await runner._run_process_watcher(watcher)
 
-    adapter.handle_message.assert_awaited_once()
-    synth_event = adapter.handle_message.await_args.args[0]
-    assert synth_event.internal is True
-    assert synth_event.message_id == "555"
-    assert synth_event.source.thread_id == "24296"
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -341,16 +413,20 @@ async def test_agent_notification_no_message_id_is_tolerated(monkeypatch, tmp_pa
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
 
-    watcher = {
+    event = {
+        "type": "completion",
+        "event_id": "process:proc_anchorless:completion",
         "session_id": "proc_anchorless",
-        "check_interval": 0,
         "session_key": "agent:main:telegram:dm:123:24296",
         "platform": "telegram",
+        "chat_type": "dm",
         "chat_id": "123",
         "thread_id": "24296",
-        "notify_on_complete": True,
+        "command": "sleep 1",
+        "exit_code": 0,
+        "output": "done",
     }
-    await runner._run_process_watcher(watcher)
+    await runner._inject_watch_notification("[SYSTEM: completed]", event)
 
     adapter.handle_message.assert_awaited_once()
     synth_event = adapter.handle_message.await_args.args[0]

@@ -127,6 +127,17 @@ def patch_startup_side_effects(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
     monkeypatch.setattr("agent.shell_hooks.register_from_config", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.process_registry.process_registry.recover_from_checkpoint", lambda: 0)
+    replay = MagicMock(return_value=0)
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.recover_completion_notifications",
+        replay,
+    )
+    replay_async = MagicMock(return_value={"queued": 0, "lost": 0})
+    monkeypatch.setattr(
+        "tools.async_delegation.recover_async_delegations",
+        replay_async,
+    )
+    return replay, replay_async
 
 
 @pytest.mark.asyncio
@@ -150,7 +161,7 @@ async def test_startup_aborts_when_restart_requested_before_start(tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_path, monkeypatch):
-    patch_startup_side_effects(monkeypatch, tmp_path)
+    replay, replay_async = patch_startup_side_effects(monkeypatch, tmp_path)
 
     runner = make_startup_runner(tmp_path)
     first_disconnected = asyncio.Event()
@@ -170,6 +181,8 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     result = await asyncio.wait_for(runner.start(), timeout=2)
 
     assert result is True
+    replay.assert_called_once_with()
+    replay_async.assert_called_once_with()
     assert telegram.disconnected is True
     assert telegram.background_cancelled is True
     assert slack.connected is False

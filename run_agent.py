@@ -5787,6 +5787,8 @@ class AIAgent:
             role=function_args.get("role"),
             background=(not _is_subagent),
             parent_agent=self,
+            route=function_args.get("route"),
+            model_tier=function_args.get("model_tier"),
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,

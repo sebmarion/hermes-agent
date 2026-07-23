@@ -11,6 +11,7 @@ Covers:
 """
 
 import json
+import os
 import time
 import pytest
 from unittest.mock import patch
@@ -266,18 +267,26 @@ class TestPerSessionRateLimit:
 # =========================================================================
 
 class TestCheckpointPersistence:
-    def test_watch_patterns_in_checkpoint(self, registry):
+    def test_watch_patterns_in_checkpoint(self, registry, tmp_path):
         """watch_patterns is included in checkpoint data."""
+        import tools.process_registry as process_registry_module
+
+        checkpoint = tmp_path / "processes.json"
         session = _make_session(watch_patterns=["ERROR", "FAIL"])
+        session.pid = os.getpid()
         with registry._lock:
             registry._running[session.id] = session
 
-        with patch("utils.atomic_json_write") as mock_write:
-            registry._write_checkpoint()
-            args = mock_write.call_args
-            entries = args[0][1]  # second positional arg
-            assert len(entries) == 1
-            assert entries[0]["watch_patterns"] == ["ERROR", "FAIL"]
+        with patch.object(
+            process_registry_module,
+            "CHECKPOINT_PATH",
+            checkpoint,
+        ):
+            assert registry._write_checkpoint() is True
+
+        entries = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert len(entries) == 1
+        assert entries[0]["watch_patterns"] == ["ERROR", "FAIL"]
 
     def test_watch_patterns_recovery(self, registry, tmp_path, monkeypatch):
         """watch_patterns survives checkpoint recovery."""
@@ -298,6 +307,7 @@ class TestCheckpointPersistence:
             "notify_on_complete": False,
             "watch_patterns": ["PANIC", "OOM"],
         }]))
+        checkpoint.chmod(0o600)
         monkeypatch.setattr(pr_mod, "CHECKPOINT_PATH", checkpoint)
         # PID doesn't exist, so nothing will be recovered
         count = registry.recover_from_checkpoint()

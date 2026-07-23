@@ -1,3 +1,5 @@
+import copy
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -282,6 +284,173 @@ def test_preflight_codex_api_kwargs_drops_oversized_message_id_end_to_end():
 
     message_item = next(item for item in kwargs["input"] if item.get("type") == "message")
     assert "id" not in message_item
+
+
+# ---------------------------------------------------------------------------
+# Legacy Responses call ids are persisted exactly as issued so tool execution
+# and session history retain their canonical identity.  Some older Codex ids
+# exceed the Responses replay limit of 64 UTF-8 bytes, though, so the outbound
+# projector must deterministically alias only the request copy while keeping a
+# function_call and its function_call_output paired.
+# ---------------------------------------------------------------------------
+
+_CAPTURED_73_BYTE_CALL_ID = "codex_abc__deadbeef__tool_shell_" + ("a" * 41)
+
+
+def _paired_call_messages(call_id):
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": '{"ok":true}'},
+    ]
+
+
+def _expected_hashed_call_id(source_call_id):
+    digest = hashlib.sha256(source_call_id.encode("utf-8")).hexdigest()[:56]
+    return f"call_h_{digest}"
+
+
+@pytest.mark.parametrize(
+    "source_call_id",
+    [
+        "a" * 64,
+        "\u00e9" * 32,
+    ],
+)
+def test_responses_call_id_preserves_exactly_64_utf8_bytes(source_call_id):
+    assert len(source_call_id.encode("utf-8")) == 64
+
+    items = _chat_messages_to_responses_input(_paired_call_messages(source_call_id))
+
+    projected_ids = [
+        item["call_id"]
+        for item in items
+        if item.get("type") in {"function_call", "function_call_output"}
+    ]
+    assert projected_ids == [source_call_id, source_call_id]
+
+
+@pytest.mark.parametrize(
+    "source_call_id",
+    [
+        "a" * 65,
+        "\u00e9" * 33,
+    ],
+)
+def test_responses_call_id_hashes_ids_over_64_utf8_bytes(source_call_id):
+    assert len(source_call_id.encode("utf-8")) > 64
+    expected = _expected_hashed_call_id(source_call_id)
+
+    items = _chat_messages_to_responses_input(_paired_call_messages(source_call_id))
+
+    projected_ids = [
+        item["call_id"]
+        for item in items
+        if item.get("type") in {"function_call", "function_call_output"}
+    ]
+    assert projected_ids == [expected, expected]
+    assert expected.startswith("call_h_")
+    assert len(expected.encode("utf-8")) == 63
+
+
+def test_responses_call_id_replays_captured_73_byte_shape_without_secrets():
+    assert len(_CAPTURED_73_BYTE_CALL_ID.encode("utf-8")) == 73
+    expected = _expected_hashed_call_id(_CAPTURED_73_BYTE_CALL_ID)
+
+    items = _chat_messages_to_responses_input(
+        _paired_call_messages(_CAPTURED_73_BYTE_CALL_ID)
+    )
+
+    function_call = next(item for item in items if item.get("type") == "function_call")
+    function_output = next(
+        item for item in items if item.get("type") == "function_call_output"
+    )
+    assert function_call["call_id"] == expected
+    assert function_output["call_id"] == expected
+
+
+def test_responses_call_id_projection_is_retry_stable_and_does_not_mutate_history():
+    messages = _paired_call_messages(_CAPTURED_73_BYTE_CALL_ID)
+    original_history = copy.deepcopy(messages)
+
+    first_attempt = _chat_messages_to_responses_input(messages)
+    second_attempt = _chat_messages_to_responses_input(messages)
+
+    assert first_attempt == second_attempt
+    assert messages == original_history
+    assert messages[0]["tool_calls"][0]["id"] == _CAPTURED_73_BYTE_CALL_ID
+    assert messages[1]["tool_call_id"] == _CAPTURED_73_BYTE_CALL_ID
+
+
+def test_responses_call_id_rejects_ambiguous_duplicate_function_calls():
+    duplicate_source_id = "call_duplicate"
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": duplicate_source_id,
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                },
+                {
+                    "id": duplicate_source_id,
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                },
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="ambiguous duplicate function_call"):
+        _chat_messages_to_responses_input(messages)
+
+
+def test_responses_call_id_rejects_ambiguous_duplicate_function_outputs():
+    duplicate_source_id = "call_duplicate"
+    messages = _paired_call_messages(duplicate_source_id)
+    messages.append(
+        {"role": "tool", "tool_call_id": duplicate_source_id, "content": "again"}
+    )
+
+    with pytest.raises(ValueError, match="ambiguous duplicate function_call_output"):
+        _chat_messages_to_responses_input(messages)
+
+
+def test_responses_call_id_rejects_collision_between_distinct_source_ids():
+    long_source_id = "x" * 65
+    colliding_short_source_id = _expected_hashed_call_id(long_source_id)
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": long_source_id,
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                },
+                {
+                    "id": colliding_short_source_id,
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                },
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="normalization collision"):
+        _chat_messages_to_responses_input(messages)
 
 
 # ---------------------------------------------------------------------------

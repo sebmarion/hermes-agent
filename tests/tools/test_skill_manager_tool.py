@@ -317,6 +317,10 @@ word word
             result = _patch_skill("my-skill", "word", "replaced")
         assert result["success"] is False
         assert "match" in result["error"].lower()
+        assert result["error_code"] == "skill_patch_ambiguous_match"
+        assert result["error_class"] == "schema_correctable"
+        assert result["retry_policy"] == {"max_corrected_retries": 1}
+        assert result["match_count"] == 2
 
     def test_patch_replace_all(self, tmp_path):
         content = """\
@@ -524,6 +528,50 @@ class TestRemoveFile:
 
 
 class TestSkillManageDispatcher:
+    def test_profile_mismatch_is_typed_nonretryable_capability(self, tmp_path):
+        with _skill_dir(tmp_path), patch(
+            "tools.skill_manager_tool._find_skill_in_other_profiles",
+            return_value=[("other", tmp_path / "profiles" / "other" / "skills" / "shared")],
+        ):
+            result = json.loads(skill_manage(
+                action="patch",
+                name="shared",
+                old_string="old",
+                new_string="new",
+            ))
+
+        assert result["success"] is False
+        assert result["error_code"] == "skill_profile_mismatch"
+        assert result["error_class"] == "capability"
+        assert result["retry_policy"] == {"max_corrected_retries": 0}
+
+    def test_invalid_frontmatter_is_typed_schema_correctable(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = json.loads(skill_manage(
+                action="create",
+                name="broken",
+                content="# Missing frontmatter\n",
+            ))
+
+        assert result["success"] is False
+        assert result["error_code"] == "skill_invalid_frontmatter"
+        assert result["error_class"] == "schema_correctable"
+        assert result["retry_policy"] == {"max_corrected_retries": 1}
+
+    def test_blank_patch_target_is_typed_schema_correctable(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = json.loads(skill_manage(
+                action="patch",
+                name="any",
+                old_string="",
+                new_string="new",
+            ))
+
+        assert result["success"] is False
+        assert result["error_code"] == "skill_patch_missing_old_string"
+        assert result["error_class"] == "schema_correctable"
+        assert result["retry_policy"] == {"max_corrected_retries": 1}
+
     def test_unknown_action(self, tmp_path):
         with _skill_dir(tmp_path):
             raw = skill_manage(action="explode", name="test")
@@ -1236,9 +1284,12 @@ class TestCuratorConsolidationDeleteGuard:
         assert (skills_root / "active-skill").exists()
 
     def test_verified_consolidation_archives_recoverably(self, tmp_path, monkeypatch):
+        from tools.skill_manager_tool import mark_background_review_skill_read
+
         with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root:
             _create_skill("umbrella", _skill_content("umbrella"))
             _create_skill("narrow", _skill_content("narrow"))
+            mark_background_review_skill_read(skills_root / "narrow" / "SKILL.md")
             result = _delete_skill("narrow", absorbed_into="umbrella")
         assert result["success"] is True, result
         assert result.get("_archived") is True
@@ -1275,10 +1326,12 @@ class TestCuratorConsolidationDeleteGuard:
         # recoverable curator archive — the record persists as archived so
         # `hermes curator restore` can bring it back.
         from tools import skill_usage
-        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+        from tools.skill_manager_tool import mark_background_review_skill_read
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root:
             _create_skill("umbrella", _skill_content("umbrella"))
             _create_skill("narrow", _skill_content("narrow"))
             skill_usage.mark_agent_created("narrow")
+            mark_background_review_skill_read(skills_root / "narrow" / "SKILL.md")
             raw = skill_manage("delete", "narrow", absorbed_into="umbrella")
             result = json.loads(raw)
             assert result["success"] is True, result
@@ -1302,9 +1355,12 @@ class TestCuratorConsolidationDeleteGuard:
             ))
             assert blocked["success"] is False
             assert blocked.get("_read_before_write_required") is True
+            assert blocked["error_code"] == "skill_view_required"
+            assert blocked["error_class"] == "schema_correctable"
 
             viewed = json.loads(skill_view("reviewed"))
             assert viewed["success"] is True
+            assert len(viewed["content_revision"]) == 64
 
             allowed = json.loads(skill_manage(
                 action="patch",
@@ -1313,6 +1369,54 @@ class TestCuratorConsolidationDeleteGuard:
                 new_string="Step 1: Do the thing safely.",
             ))
             assert allowed["success"] is True, allowed
+
+        _reset_background_review_read_marks()
+
+    def test_background_review_read_receipt_rejects_stale_content(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_skill("reviewed", _skill_content("reviewed"))
+            viewed = json.loads(skill_view("reviewed"))
+            assert len(viewed["content_revision"]) == 64
+
+            skill_md = tmp_path / ".hermes" / "skills" / "reviewed" / "SKILL.md"
+            skill_md.write_text(
+                skill_md.read_text(encoding="utf-8") + "\nExternal change.\n",
+                encoding="utf-8",
+            )
+
+            blocked = json.loads(skill_manage(
+                action="patch",
+                name="reviewed",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the thing safely.",
+            ))
+            assert blocked["success"] is False
+            assert blocked["error_code"] == "skill_view_stale"
+            assert blocked["error_class"] == "schema_correctable"
+            assert blocked["viewed_revision"] == viewed["content_revision"]
+            assert blocked["current_revision"] != viewed["content_revision"]
+
+        _reset_background_review_read_marks()
+
+    def test_background_review_delete_requires_current_skill_view(self, tmp_path, monkeypatch):
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_skill("umbrella", _skill_content("umbrella"))
+            _create_skill("narrow", _skill_content("narrow"))
+
+            blocked = json.loads(skill_manage(
+                action="delete",
+                name="narrow",
+                absorbed_into="umbrella",
+            ))
+            assert blocked["success"] is False
+            assert blocked["error_code"] == "skill_view_required"
 
         _reset_background_review_read_marks()
 

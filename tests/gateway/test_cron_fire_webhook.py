@@ -8,10 +8,11 @@ test_chronos_verify.py.
 """
 
 import asyncio
+import threading
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter, cors_middleware
@@ -40,9 +41,18 @@ class _SpyProvider:
 
     def __init__(self):
         self.fired = []
+        self.leases = []
 
-    def fire_due(self, job_id, *, adapters=None, loop=None):
+    def fire_due(
+        self,
+        job_id,
+        *,
+        adapters=None,
+        loop=None,
+        admission_lease=None,
+    ):
         self.fired.append(job_id)
+        self.leases.append(admission_lease)
         return True
 
 
@@ -72,6 +82,243 @@ async def test_valid_token_accepts_and_fires(adapter, monkeypatch):
             break
         await asyncio.sleep(0.01)
     assert spy.fired == ["abc123"]
+    assert len(spy.leases) == 1
+    assert spy.leases[0] is not None
+
+
+@pytest.mark.asyncio
+async def test_accepted_fire_is_tracked_until_worker_finishes(adapter, monkeypatch):
+    """A 202 response must not make finite cron work disappear from drain."""
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingProvider:
+        def fire_due(
+            self,
+            job_id,
+            *,
+            adapters=None,
+            loop=None,
+            admission_lease=None,
+        ):
+            started.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release cron fire")
+            return True
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: _BlockingProvider(),
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire", "aud": "agent:x"}),
+    )
+
+    try:
+        request = make_mocked_request(
+            "POST",
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+        )
+
+        async def _json():
+            return {"job_id": "abc123"}
+
+        request._payload = None
+        request.json = _json
+        resp = await adapter._handle_cron_fire(request)
+        assert resp.status == 202
+        assert await asyncio.to_thread(started.wait, 2)
+        from cron.admission import cron_admission_snapshot
+
+        receipt = cron_admission_snapshot()
+        assert receipt["active_count"] == 1
+        assert receipt["active_job_ids"] == ["abc123"]
+        assert len(adapter._drain_tracked_tasks) == 1
+        assert adapter._readiness_work_counts()["api_background_tasks"] == 1
+    finally:
+        release.set()
+
+    for _ in range(100):
+        if not adapter._drain_tracked_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert adapter._drain_tracked_tasks == set()
+    assert adapter._readiness_work_counts()["api_background_tasks"] == 0
+    assert cron_admission_snapshot()["active_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_handler_waits_for_durable_admission_before_202(adapter, monkeypatch):
+    import cron.scheduler as sched
+
+    entered = threading.Event()
+    allow = threading.Event()
+    real_claim = sched._claim_cron_dispatch
+    spy = _SpyProvider()
+
+    def blocked_claim(job_id, **kwargs):
+        entered.set()
+        assert allow.wait(timeout=5)
+        return real_claim(job_id, **kwargs)
+
+    monkeypatch.setattr(sched, "_claim_cron_dispatch", blocked_claim)
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: spy,
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+    request = make_mocked_request(
+        "POST",
+        "/api/cron/fire",
+        headers={"Authorization": "Bearer good"},
+    )
+
+    async def _json():
+        return {"job_id": "pre-202"}
+
+    request.json = _json
+    handler = asyncio.create_task(adapter._handle_cron_fire(request))
+    assert await asyncio.to_thread(entered.wait, 2)
+    assert handler.done() is False
+    allow.set()
+    response = await handler
+    assert response.status == 202
+
+    for _ in range(100):
+        if spy.fired:
+            break
+        await asyncio.sleep(0.01)
+    assert spy.fired == ["pre-202"]
+
+
+@pytest.mark.asyncio
+async def test_closed_admission_returns_503_without_provider_fire(
+    adapter,
+    monkeypatch,
+):
+    spy = _SpyProvider()
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: spy,
+    )
+    monkeypatch.setattr(
+        "cron.scheduler._claim_cron_dispatch",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+    request = make_mocked_request(
+        "POST",
+        "/api/cron/fire",
+        headers={"Authorization": "Bearer good"},
+    )
+
+    async def _json():
+        return {"job_id": "blocked"}
+
+    request.json = _json
+    response = await adapter._handle_cron_fire(request)
+
+    assert response.status == 503
+    assert spy.fired == []
+
+
+@pytest.mark.asyncio
+async def test_cancelling_async_wrapper_keeps_lease_until_thread_finishes(
+    adapter,
+    monkeypatch,
+):
+    from cron.admission import cron_admission_snapshot
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingProvider:
+        def fire_due(self, job_id, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return True
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: _BlockingProvider(),
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+    request = make_mocked_request(
+        "POST",
+        "/api/cron/fire",
+        headers={"Authorization": "Bearer good"},
+    )
+
+    async def _json():
+        return {"job_id": "cancelled-wrapper"}
+
+    request.json = _json
+    response = await adapter._handle_cron_fire(request)
+    assert response.status == 202
+    assert await asyncio.to_thread(started.wait, 2)
+    task = next(iter(adapter._drain_tracked_tasks))
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert cron_admission_snapshot()["active_job_ids"] == ["cancelled-wrapper"]
+
+    release.set()
+    for _ in range(200):
+        if cron_admission_snapshot()["active_count"] == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert cron_admission_snapshot()["active_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_task_creation_failure_releases_preaccepted_lease(
+    adapter,
+    monkeypatch,
+):
+    from cron.admission import cron_admission_snapshot
+
+    spy = _SpyProvider()
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: spy,
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "create_task",
+        lambda _coro: (_ for _ in ()).throw(
+            RuntimeError("injected task creation failure")
+        ),
+    )
+    request = make_mocked_request(
+        "POST",
+        "/api/cron/fire",
+        headers={"Authorization": "Bearer good"},
+    )
+
+    async def _json():
+        return {"job_id": "task-create-failure"}
+
+    request.json = _json
+    with pytest.raises(RuntimeError, match="task creation failure"):
+        await adapter._handle_cron_fire(request)
+
+    assert spy.fired == []
+    assert cron_admission_snapshot()["active_count"] == 0
 
 
 @pytest.mark.asyncio

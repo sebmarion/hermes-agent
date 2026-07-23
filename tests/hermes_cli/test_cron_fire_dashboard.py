@@ -64,7 +64,11 @@ def test_bad_token_401(monkeypatch):
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
         lambda: (lambda **kw: None),  # verification fails
     )
-    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
+    monkeypatch.setattr(
+        web_server,
+        "_resolve_cron_fire_profile",
+        lambda jid, authenticated_profile=None: "default",
+    )
     monkeypatch.setattr(web_server, "_fire_cron_job_for_profile",
                         lambda p, j: fired.append((p, j)))
 
@@ -103,7 +107,11 @@ def test_unknown_job_200_gone(monkeypatch):
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
         lambda: (lambda **kw: {"purpose": "cron_fire"}),
     )
-    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: None)
+    monkeypatch.setattr(
+        web_server,
+        "_resolve_cron_fire_profile",
+        lambda jid, authenticated_profile=None: None,
+    )
     client, pa, ph = _client(auth_required=False)
     try:
         resp = client.post("/api/cron/fire",
@@ -120,13 +128,28 @@ def test_valid_token_accepts_and_fires(monkeypatch):
     """Valid token + known job -> 202 and fire_due invoked for the resolved
     profile."""
     fired = []
+    provider = object()
+    admission_lease = object()
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
         lambda: (lambda **kw: {"purpose": "cron_fire", "aud": "agent:x"}),
     )
-    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
-    monkeypatch.setattr(web_server, "_fire_cron_job_for_profile",
-                        lambda p, j: fired.append((p, j)) or True)
+    monkeypatch.setattr(
+        web_server,
+        "_resolve_cron_fire_profile",
+        lambda jid, authenticated_profile=None: "default",
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_claim_cron_fire_for_profile",
+        lambda p, j: (provider, admission_lease),
+    )
+
+    def fake_fire(profile, job_id, *, provider=None, admission_lease=None):
+        fired.append((profile, job_id, provider, admission_lease))
+        return True
+
+    monkeypatch.setattr(web_server, "_fire_cron_job_for_profile", fake_fire)
 
     client, pa, ph = _client(auth_required=False)
     try:
@@ -139,4 +162,4 @@ def test_valid_token_accepts_and_fires(monkeypatch):
         _restore(pa, ph)
         client.close()
     # background task ran the fire for the resolved profile
-    assert fired == [("default", "j1")]
+    assert fired == [("default", "j1", provider, admission_lease)]

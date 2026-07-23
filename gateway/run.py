@@ -2540,8 +2540,10 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
-    if evt_type == "async_delegation":
-        # Reuse the shared rich formatter (self-contained task-source block).
+    if evt_type in {"async_delegation", "completion"}:
+        # Reuse the shared rich formatter for both durable event types. The
+        # idle queue owner drains process completions too, so returning None
+        # here would remove an un-ACKed event until the next process restart.
         from tools.process_registry import format_process_notification
         return format_process_notification(evt)
 
@@ -2581,6 +2583,102 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
 # adapter for plugin platforms.  Set in GatewayRunner.__init__().
 import weakref as _weakref
 _gateway_runner_ref: _weakref.ref = lambda: None
+
+
+def _attest_pair_gate_to_runtime(
+    pair_gate: Dict[str, Any],
+    runtime_identity: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Bind a structurally valid gate to this sealed Agent/release identity."""
+    result = dict(pair_gate)
+    structure_verified = result.get("verified") is True
+    result["structure_verified"] = structure_verified
+    if not result.get("active"):
+        result["local_identity_matches"] = None
+        return result
+    release = runtime_identity.get("release")
+    process = runtime_identity.get("process")
+    agent = result.get("agent")
+    webui = result.get("webui")
+    matches = False
+    if (
+        structure_verified
+        and runtime_identity.get("verified") is True
+        and isinstance(release, dict)
+        and isinstance(process, dict)
+        and isinstance(agent, dict)
+        and isinstance(webui, dict)
+    ):
+        try:
+            selector_generation = int(release.get("selector_generation"))
+        except (TypeError, ValueError):
+            selector_generation = 0
+        matches = bool(
+            selector_generation > 0
+            and result.get("transaction_id")
+            == release.get("release_transaction_id")
+            and result.get("epoch") == selector_generation
+            and agent.get("build_id") == release.get("agent_manifest_sha256")
+            and agent.get("pid") == process.get("pid")
+            and agent.get("start_time") == process.get("start_token")
+            and agent.get("instance_epoch") == release.get("release_pair_id")
+            and webui.get("build_id") == release.get("webui_build_id")
+            and webui.get("instance_epoch") == str(selector_generation)
+        )
+    result["local_identity_matches"] = matches
+    if not matches:
+        result["verified"] = False
+        if structure_verified:
+            result["reason"] = "identity_mismatch"
+    return result
+
+
+def get_live_gateway_drain_state() -> Optional[Dict[str, Any]]:
+    """Return the active runner's process-local drain/admission snapshot.
+
+    Persisted ``gateway_state.json`` is dashboard telemetry and can lag or fail
+    to write. Drain/cutover proof therefore reads the live runner object and
+    fails closed when any authoritative process-local source is unavailable.
+    """
+
+    runner = _gateway_runner_ref()
+    if runner is None:
+        return None
+    try:
+        from gateway.drain_control import pair_open_gate_receipt
+        from gateway.runtime_identity import public_release_identity_receipt
+
+        count = runner._running_agent_count()
+        admission_rejecting = runner._external_drain_active
+        pair_gate = _attest_pair_gate_to_runtime(
+            pair_open_gate_receipt(),
+            public_release_identity_receipt(),
+        )
+        background_tasks = sum(
+            1
+            for task in runner._background_tasks
+            if not task.done()
+        )
+        background_tasks += runner._drain_sensitive_background_work
+    except Exception:
+        return None
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    if not isinstance(admission_rejecting, bool):
+        return None
+    return {
+        "admission_rejecting": admission_rejecting,
+        "active_agent_turns": count,
+        "gateway_background_tasks": background_tasks,
+        "pair_open_gate": pair_gate,
+    }
+
+
+def get_live_gateway_agent_count() -> Optional[int]:
+    """Backward-compatible projection of the authoritative live snapshot."""
+
+    state = get_live_gateway_drain_state()
+    return None if state is None else state["active_agent_turns"]
 
 
 def _normalize_empty_agent_response(
@@ -3111,6 +3209,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Count only active critical sections of persistent state-mutating
+        # watchers. The watcher loop tasks themselves intentionally stay alive
+        # while externally drained.
+        self._drain_sensitive_background_work = 0
+        self._drain_sensitive_tasks: Dict[asyncio.Task, int] = {}
 
         # scale-to-zero (Phase 0, F13): gateway-scoped "last inbound seen" clock.
         # There is no such clock today (only a per-agent _last_activity_ts), so the
@@ -4085,9 +4188,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
 
+    def _try_begin_drain_sensitive_background_work(self) -> bool:
+        """Enter one finite mutating watcher tick while admission is open."""
+
+        if getattr(self, "_external_drain_active", False):
+            return False
+        self._drain_sensitive_background_work = (
+            getattr(self, "_drain_sensitive_background_work", 0) + 1
+        )
+        task = asyncio.current_task()
+        if task is not None:
+            if not hasattr(self, "_drain_sensitive_tasks"):
+                self._drain_sensitive_tasks = {}
+            self._drain_sensitive_tasks[task] = (
+                self._drain_sensitive_tasks.get(task, 0) + 1
+            )
+        return True
+
+    def _end_drain_sensitive_background_work(self) -> None:
+        self._drain_sensitive_background_work = max(
+            0, getattr(self, "_drain_sensitive_background_work", 0) - 1
+        )
+        task = asyncio.current_task()
+        if task is None or not hasattr(self, "_drain_sensitive_tasks"):
+            return
+        remaining = self._drain_sensitive_tasks.get(task, 0) - 1
+        if remaining > 0:
+            self._drain_sensitive_tasks[task] = remaining
+        else:
+            self._drain_sensitive_tasks.pop(task, None)
+
+    def _internal_turn_was_admitted_before_drain(self, event: Any) -> bool:
+        """Whether this exact internal task owns a pre-drain finite-work lease."""
+
+        if not getattr(event, "internal", False):
+            return False
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            return False
+        admitted_task = metadata.get("_hermes_drain_admission_task")
+        current_task = asyncio.current_task()
+        if admitted_task is None or admitted_task is not current_task:
+            return False
+        return (
+            getattr(self, "_drain_sensitive_tasks", {}).get(current_task, 0) > 0
+            or current_task in getattr(self, "_background_tasks", set())
+        )
+
+    def _track_adapter_internal_task(
+        self,
+        adapter: Any,
+        event: Any,
+    ) -> None:
+        """Transfer an admitted internal event to its adapter-owned task.
+
+        ``BasePlatformAdapter.handle_message`` installs the task synchronously
+        before returning. Mirroring it in the runner's tracked set closes the
+        interval before ``_running_agents`` claims its turn.
+        """
+
+        try:
+            session_key = self._session_key_for_source(event.source)
+            task = adapter._session_tasks.get(session_key)
+        except Exception:
+            task = None
+        if not isinstance(task, asyncio.Task):
+            return
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            event.metadata = metadata
+        metadata["_hermes_drain_admission_task"] = task
+        background_tasks = getattr(self, "_background_tasks", None)
+        if background_tasks is None:
+            background_tasks = set()
+            self._background_tasks = background_tasks
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
     def _active_cron_job_count(self) -> int:
-        """Count of cron jobs currently executing, from the cron scheduler's
-        own in-flight tracking (``cron.scheduler._running_job_ids``).
+        """Count cron work from the profile-wide admission receipt.
 
         Cron jobs run through a standalone ``AIAgent`` on the scheduler's own
         thread pool (``cron/scheduler.py::run_job``), entirely outside
@@ -4096,14 +4276,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Without this, the shutdown drain is structurally blind to in-flight
         cron work: it can report ``active_at_start=0`` and proceed straight
         to killing tool subprocesses while a cron job's terminal command is
-        still running (#60432). Best-effort: returns 0 if the cron module
-        can't be imported (e.g. a minimal test double for this class).
+        still running (#60432). The durable receipt includes jobs admitted by
+        other Hermes processes. An unreadable/unverified receipt is treated as
+        one active blocker so drain can never mistake uncertainty for zero.
         """
         try:
-            from cron.scheduler import get_running_job_ids
-            return len(get_running_job_ids())
+            from cron.scheduler import (
+                get_cron_admission_receipt,
+                get_running_job_ids,
+            )
+
+            receipt = get_cron_admission_receipt()
+            count = receipt.get("active_count")
+            if (
+                receipt.get("verified") is not True
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+            ):
+                return 1
+            # Keep the local set as a conservative compatibility backstop for
+            # an already-running pre-gate worker during a rolling upgrade.
+            try:
+                count = max(count, len(get_running_job_ids()))
+            except Exception:
+                pass
+            return count
         except Exception:
-            return 0
+            return 1
 
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
     # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
@@ -4536,8 +4736,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         best-effort status re-write. In-flight turns are NOT interrupted (the
         whole point is to let them finish); only NEW turns are refused.
         """
-        if self._external_drain_active:
+        if getattr(self, "_external_drain_active", False):
             return
+        # Close cron's dispatch gate under the same lock used to claim its
+        # in-flight set before publishing the live admission acknowledgement.
+        # Once this returns, every previously admitted cron job is visible in
+        # get_running_job_ids() and no later job can enter.
+        from cron.scheduler import set_cron_dispatch_paused
+        set_cron_dispatch_paused(True)
         self._external_drain_active = True
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
@@ -4558,40 +4764,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not self._external_drain_active:
             return
-        self._external_drain_active = False
         if self._draining or not self._running:
             # A shutdown drain is in progress / the loop has stopped — do not
             # clobber the terminal state back to running.
+            self._external_drain_active = False
             logger.info(
                 "External drain marker cleared during shutdown — not reverting "
                 "to running (shutdown takes precedence)."
             )
             return
+        # Reopen the shared cron fence before advertising a running gateway.
+        # If the profile gate is unavailable or another marker raced back in,
+        # this raises and leaves the externally-visible state draining.
+        from cron.scheduler import set_cron_dispatch_paused
+        set_cron_dispatch_paused(False)
+        self._external_drain_active = False
         logger.info(
-            "External drain RELEASED (.drain_request.json removed) — "
-            "re-accepting new turns; gateway_state -> running."
+            "External admission gates RELEASED — re-accepting new turns; "
+            "gateway_state -> running."
         )
         self._update_runtime_status("running")
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
 
-        Polls ``.drain_request.json`` (presence-based contract,
-        gateway/drain_control.py). Marker present -> ``_enter_external_drain``;
-        marker absent -> ``_exit_external_drain``. The 1s cadence bounds the
-        observe-the-marker latency the live-validation gate checks (point a).
-        Reconciles once at startup. A marker stamped with a PRIOR
+        Polls the ordinary drain marker plus the transaction-bound pair-open
+        gate. Either active gate enters external drain; both must be absent to
+        exit it. The 1s cadence bounds the observe-the-marker latency the live
+        validation gate checks (point a). Reconciles once at startup. A drain
+        marker stamped with a PRIOR
         instantiation epoch (one that survived a machine restart on the durable
         HERMES_HOME volume — NS-570) is treated as absent by ``drain_requested``
         and is NOT honoured; only a marker from the current instantiation flips
         the gateway into drain. Best-effort: any tick error is logged and the
         loop continues (a transient stat() failure must not wedge the gateway).
         """
-        from gateway.drain_control import drain_requested
+        from gateway.drain_control import admission_rejection_requested
 
         while self._running:
             try:
-                if drain_requested():
+                if admission_rejection_requested():
                     self._enter_external_drain()
                 else:
                     self._exit_external_drain()
@@ -6562,6 +6774,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent is already running are skipped regardless, so a session
         scheduled at startup is never resumed a second time.
         """
+        if getattr(self, "_external_drain_active", False):
+            return 0
         window = _auto_continue_freshness_window()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
@@ -6722,6 +6936,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
             self._gateway_loop = None
+        # Reconcile a drain marker synchronously at the first event-loop
+        # boundary. The periodic watcher is intentionally started last, but a
+        # marker can already exist when this process starts (for example after
+        # a gateway-only respawn during a live NAS drain). Admission and cron
+        # dispatch must be closed before recovery, adapters, auto-resume, or
+        # any mutating watcher can claim work.
+        from gateway.drain_control import admission_rejection_requested
+        if admission_rejection_requested():
+            self._enter_external_drain()
         logger.info("Session storage: %s", self.config.sessions_dir)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
@@ -6789,7 +7012,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(gateway_state="starting", exit_reason=None)
+            write_runtime_status(
+                gateway_state=(
+                    "draining"
+                    if getattr(self, "_external_drain_active", False)
+                    else "starting"
+                ),
+                exit_reason=None,
+            )
         except Exception:
             pass
 
@@ -6984,8 +7214,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             recovered = process_registry.recover_from_checkpoint()
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
+            replayed = process_registry.recover_completion_notifications()
+            if replayed:
+                logger.info(
+                    "Replayed %s durable process completion notification(s)",
+                    replayed,
+                )
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
+        try:
+            from tools.async_delegation import recover_async_delegations
+
+            async_recovery = recover_async_delegations()
+            if async_recovery.get("queued") or async_recovery.get("lost"):
+                logger.info(
+                    "Recovered durable async delegation notifications: %s",
+                    async_recovery,
+                )
+        except Exception as e:
+            logger.warning("Async delegation recovery: %s", e)
 
         # Suspend sessions that were active when the gateway last exited.
         # This prevents stuck sessions from being blindly resumed on restart,
@@ -7248,7 +7495,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._wire_teams_pipeline_runtime()
 
         self._running = True
-        self._update_runtime_status("running")
+        self._update_runtime_status(
+            "draining"
+            if getattr(self, "_external_drain_active", False)
+            else "running"
+        )
         
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -7429,6 +7680,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # before we try to dispatch handoffs through them.
         await asyncio.sleep(5)
         while self._running:
+            if not self._try_begin_drain_sensitive_background_work():
+                await asyncio.sleep(interval)
+                continue
             try:
                 if self._session_db is None:
                     await asyncio.sleep(interval)
@@ -7454,6 +7708,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 raise
             except Exception as exc:
                 logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
+            finally:
+                self._end_drain_sensitive_background_work()
             await asyncio.sleep(interval)
 
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
@@ -7597,6 +7853,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             text=synthetic_text,
             source=dest_source,
             internal=True,
+            metadata={
+                "_hermes_drain_admission_task": asyncio.current_task(),
+            },
         )
 
         logger.info(
@@ -7648,6 +7907,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _finalize_failures: dict[str, int] = {}  # session_id -> consecutive failure count
         _MAX_FINALIZE_RETRIES = 3
         while self._running:
+            if not self._try_begin_drain_sensitive_background_work():
+                await asyncio.sleep(1)
+                continue
             try:
                 await self.async_session_store._ensure_loaded()
                 # Collect expired sessions first, then log a single summary.
@@ -7818,6 +8080,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._last_session_store_prune_ts = time.time()
             except Exception as e:
                 logger.debug("Session expiry watcher error: %s", e)
+            finally:
+                self._end_drain_sensitive_background_work()
             # Sleep in small increments so we can stop quickly
             for _ in range(interval):
                 if not self._running:
@@ -7866,6 +8130,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.sleep(1)
                 continue
 
+            if not self._try_begin_drain_sensitive_background_work():
+                await asyncio.sleep(1)
+                continue
             now = time.monotonic()
             for platform in list(self._failed_platforms.keys()):
                 if not self._running:
@@ -8022,6 +8289,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # resolution failure, etc.) is inherently transient — keep
                     # retrying at the backoff cap rather than auto-pausing.
 
+            self._end_drain_sensitive_background_work()
             # Check every 10 seconds for platforms that need reconnection
             for _ in range(10):
                 if not self._running:
@@ -8118,6 +8386,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             def _phase_elapsed() -> float:
                 return time.monotonic() - _stop_started_at
+
+            # Fence every cron producer before shutdown begins observing active
+            # work. This is the same profile-wide, cross-process gate used by
+            # external drains; closing it first makes the active count
+            # monotonic toward zero for ordinary SIGTERM/restart paths too.
+            try:
+                from cron.scheduler import set_cron_dispatch_paused
+
+                set_cron_dispatch_paused(True)
+            except Exception as _e:
+                # set_cron_dispatch_paused closes the local fast path before
+                # attempting durable persistence, so failure still rejects
+                # in-process entrants and must never abort cleanup.
+                logger.error(
+                    "Shutdown could not verify the cron admission fence: %s",
+                    _e,
+                )
 
             self._running = False
             self._draining = True
@@ -10253,16 +10538,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # observed by _drain_control_watcher), refuse to START a new turn so
         # the in-flight set can only fall to zero — eliminating the TOCTOU race
         # (D4a: stop accepting new turns FIRST, then NAS polls until
-        # active_agents==0). In-flight turns are untouched; this only blocks the
-        # claim of a NEW session slot. Internal/system events (restart-recovery
-        # replays, background-process completions) bypass the gate — they are
-        # not user-initiated new work and must still flow during a drain.
+        # active_agents==0). In-flight turns are untouched; every NEW session
+        # claim is blocked, including internal/system continuations. Durable
+        # internal events remain queued at their source until drain release.
         # Reversible: once the marker is removed the gate opens again.
-        if self._external_drain_active and not is_internal:
+        if (
+            self._external_drain_active
+            and not self._internal_turn_was_admitted_before_drain(event)
+        ):
             logger.info(
-                "Refusing new turn for session %s — external drain active.",
+                "Refusing new %sturn for session %s — external drain active.",
+                "internal " if is_internal else "",
                 _quick_key,
             )
+            if is_internal:
+                return None
             return (
                 "⏳ This agent is draining for a maintenance action and isn't "
                 "accepting new turns right now. It'll be back in a moment — "
@@ -10791,6 +11081,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        _event_metadata = getattr(event, "metadata", None)
+        if not isinstance(_event_metadata, dict):
+            _event_metadata = {}
+            event.metadata = _event_metadata
+        if isinstance(
+            _event_metadata.get("_hermes_durable_notification"), dict
+        ):
+            _event_metadata["_hermes_notification_turn_committed"] = False
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -12162,6 +12460,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, session_entry.session_id
             )
 
+            if isinstance(
+                _event_metadata.get("_hermes_durable_notification"), dict
+            ):
+                _event_metadata["_hermes_notification_turn_committed"] = bool(
+                    agent_result.get("completed") is True
+                    and not agent_result.get("failed")
+                    and not agent_result.get("partial")
+                    and not agent_result.get("interrupted")
+                    and not agent_result.get("cleanup_errors")
+                    and not is_context_overflow_failure
+                )
+
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
             # still persisted in session history so later turns keep normal
@@ -12821,6 +13131,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user message that arrives simultaneously is handled by the same
         queue and takes priority naturally.
         """
+        if getattr(self, "_external_drain_active", False):
+            return
         try:
             from hermes_cli.goals import GoalManager
         except Exception as exc:
@@ -12859,6 +13171,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
+        if getattr(self, "_external_drain_active", False):
+            return
         if not decision.get("should_continue"):
             return
 
@@ -12868,6 +13182,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Enqueue via the adapter's FIFO so a user message already in
         # flight preempts the continuation naturally.
+        if getattr(self, "_external_drain_active", False):
+            return
         try:
             adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
@@ -15457,12 +15773,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Routing must come from the queued watch event itself, not from whatever
         foreground message happened to be active when the queue was drained.
         """
+        _durable = evt.get("type") in {"completion", "async_delegation"}
+
+        def _requeue_failed_delivery() -> None:
+            if not _durable:
+                return
+            try:
+                from tools.process_registry import process_registry
+
+                process_registry.finish_notification_delivery(evt, False)
+            except Exception:
+                logger.exception("Failed to requeue durable gateway notification")
+
         source = self._build_process_event_source(evt)
         if not source:
             logger.warning(
                 "Dropping watch notification with no routing metadata for process %s",
                 evt.get("session_id", "unknown"),
             )
+            _requeue_failed_delivery()
             return
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         adapter = None
@@ -15471,12 +15800,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = a
                 break
         if not adapter:
+            _requeue_failed_delivery()
             return
         try:
             metadata = {}
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if evt.get("type") in {"completion", "async_delegation"}:
+                metadata["_hermes_durable_notification"] = evt
+            metadata["_hermes_drain_admission_task"] = asyncio.current_task()
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -15492,8 +15825,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.thread_id,
             )
             await adapter.handle_message(synth_event)
+            self._track_adapter_internal_task(adapter, synth_event)
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
+            _requeue_failed_delivery()
 
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
         """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.
@@ -15526,34 +15861,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         subagent finishes while no agent turn is running, its result still
         re-enters the originating session promptly.
 
-        Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
-        queue has nothing for us; ignores non-async event types (those are
-        handled by ``_run_process_watcher`` / the post-turn drain).
+        Mirrors the CLI's idle ``process_loop`` drain. Durable process
+        completions share this owner so exactly one queue consumer injects
+        them; per-process watchers only handle text-only status updates.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
         while self._running:
+            if not self._try_begin_drain_sensitive_background_work():
+                await asyncio.sleep(interval)
+                continue
             try:
-                # Peek the queue for async-delegation events. We must NOT
-                # consume watch/completion events here (other drains own them),
-                # so requeue anything that isn't ours.
+                # Peek the queue for durable automatic-turn events. Watch
+                # matches remain owned by the post-turn drain.
                 requeue = []
-                async_events = []
+                notification_events = []
                 while not _pr.completion_queue.empty():
                     try:
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") == "async_delegation":
-                        async_events.append(evt)
+                    if evt.get("type") in {"async_delegation", "completion"}:
+                        notification_events.append(evt)
                     else:
                         requeue.append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
-                for evt in async_events:
-                    self._enrich_async_delegation_routing(evt)
+                for evt in notification_events:
+                    if evt.get("type") == "completion" and _pr.is_completion_consumed(
+                        str(evt.get("session_id") or "")
+                    ):
+                        continue
+                    if evt.get("type") == "async_delegation":
+                        self._enrich_async_delegation_routing(evt)
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
+                        _pr.finish_notification_delivery(evt, False)
                         continue
                     try:
                         await self._inject_watch_notification(synth_text, evt)
@@ -15561,6 +15904,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
+            finally:
+                self._end_drain_sensitive_background_work()
             await asyncio.sleep(interval)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
@@ -15617,77 +15962,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             last_output_len = current_output_len
 
             if session.exited:
-                # --- Agent-triggered completion: inject synthetic message ---
-                # Skip if the agent already consumed the result via wait/log.
-                # poll() is read-only and intentionally does NOT mark consumed
-                # (#10156) — a status check must not suppress this delivery turn.
-                from tools.process_registry import format_process_notification, process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
-                    from tools.ansi_strip import strip_ansi
-                    _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
-                    # Truncate at line boundaries so notifications never start
-                    # mid-line (fixes #23284). Keep the last ~2000 chars but
-                    # snap to the nearest preceding newline, then prepend a
-                    # truncation marker when output was cut.
-                    _LIMIT = 2000
-                    if len(_raw) > _LIMIT:
-                        _tail = _raw[-_LIMIT:]
-                        _nl = _tail.find("\n")
-                        _tail = _tail[_nl + 1:] if _nl != -1 else _tail
-                        _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
-                    else:
-                        _out = _raw
-                    synth_text = format_process_notification({
-                        "type": "completion",
-                        "session_id": session_id,
-                        "command": session.command,
-                        "exit_code": session.exit_code,
-                        "completion_reason": getattr(session, "completion_reason", "exited"),
-                        "termination_source": getattr(session, "termination_source", ""),
-                        "output": _out,
-                    })
-                    if not synth_text:
-                        break
-                    source = self._build_process_event_source({
-                        "session_id": session_id,
-                        "session_key": session_key,
-                        "platform": platform_name,
-                        "chat_id": chat_id,
-                        "thread_id": thread_id,
-                        "user_id": user_id,
-                        "user_name": user_name,
-                    })
-                    if not source:
-                        logger.warning(
-                            "Dropping completion notification with no routing metadata for process %s",
-                            session_id,
-                        )
-                        break
-
-                    adapter = None
-                    for p, a in self.adapters.items():
-                        if p == source.platform:
-                            adapter = a
-                            break
-                    if adapter and source.chat_id:
-                        try:
-                            synth_event = MessageEvent(
-                                text=synth_text,
-                                message_type=MessageType.TEXT,
-                                source=source,
-                                internal=True,
-                                message_id=message_id,
-                            )
-                            logger.info(
-                                "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
-                                session_id,
-                                session_key,
-                                source.chat_id,
-                                source.thread_id,
-                            )
-                            await adapter.handle_message(synth_event)
-                        except Exception as e:
-                            logger.error("Agent notify injection error: %s", e)
+                # Agent continuations are delivered exclusively from the
+                # durable completion queue. Injecting again here races the
+                # queue owner and loses the stable event_id needed for ACK.
+                if agent_notify:
+                    logger.debug(
+                        "Process %s completion is owned by the durable notification queue",
+                        session_id,
+                    )
                     break
 
                 # --- Normal text-only notification ---

@@ -50,8 +50,12 @@ both degrade to the original presence-only behaviour — never fail-closed.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
+import os
+import re
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -62,6 +66,22 @@ from utils import atomic_json_write
 _log = logging.getLogger(__name__)
 
 _DRAIN_REQUEST_FILENAME = ".drain_request.json"
+_PAIR_OPEN_GATE_FILENAME = ".pair_open_gate.json"
+PAIR_OPEN_GATE_SCHEMA = "hermes.pair_open_gate.v1"
+_PAIR_OPEN_GATE_MAX_BYTES = 64 * 1024
+_HEX_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PAIR_TRANSACTION_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+_PAIR_OPEN_GATE_KEYS = {
+    "schema",
+    "action",
+    "transaction_id",
+    "owner_hash",
+    "created_at",
+    "epoch",
+    "agent",
+    "webui",
+}
+_PAIR_IDENTITY_KEYS = {"build_id", "pid", "start_time", "instance_epoch"}
 
 
 @functools.lru_cache(maxsize=1)
@@ -130,6 +150,218 @@ def drain_request_path(home: Optional[Path] = None) -> Path:
     """Absolute path to the drain-request marker, respecting HERMES_HOME."""
     base = home if home is not None else get_hermes_home()
     return Path(base) / _DRAIN_REQUEST_FILENAME
+
+
+def pair_open_gate_path(home: Optional[Path] = None) -> Path:
+    """Absolute path of the transaction-bound pair-open release gate."""
+    base = home if home is not None else get_hermes_home()
+    return Path(base) / _PAIR_OPEN_GATE_FILENAME
+
+
+def _valid_pair_identity(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != _PAIR_IDENTITY_KEYS:
+        return False
+    pid = value.get("pid")
+    return (
+        isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 1
+        and all(
+            isinstance(value.get(key), str) and bool(value[key].strip())
+            for key in ("build_id", "start_time", "instance_epoch")
+        )
+    )
+
+
+def pair_open_gate_owner_hash(value: dict[str, Any]) -> str:
+    """Canonical SHA-256 binding for every gate field except the hash itself."""
+    if not isinstance(value, dict):
+        raise TypeError("pair-open gate payload must be a mapping")
+    owner_document = dict(value)
+    owner_document.pop("owner_hash", None)
+    canonical = json.dumps(
+        owner_document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _valid_pair_open_gate_payload(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != _PAIR_OPEN_GATE_KEYS:
+        return False
+    transaction_id = value.get("transaction_id")
+    owner_hash = value.get("owner_hash")
+    epoch = value.get("epoch")
+    created_at = value.get("created_at")
+    try:
+        created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        value.get("schema") == PAIR_OPEN_GATE_SCHEMA
+        and value.get("action") == "hold_pair_open"
+        and isinstance(transaction_id, str)
+        and _PAIR_TRANSACTION_RE.fullmatch(transaction_id) is not None
+        and isinstance(owner_hash, str)
+        and _HEX_SHA256_RE.fullmatch(owner_hash) is not None
+        and isinstance(created_at, str)
+        and bool(created_at.strip())
+        and created.utcoffset() == timezone.utc.utcoffset(created)
+        and created_at == created.astimezone(timezone.utc).isoformat()
+        and isinstance(epoch, int)
+        and not isinstance(epoch, bool)
+        and epoch > 0
+        and _valid_pair_identity(value.get("agent"))
+        and _valid_pair_identity(value.get("webui"))
+        and owner_hash == pair_open_gate_owner_hash(value)
+    )
+
+
+def pair_open_gate_receipt(*, home: Optional[Path] = None) -> dict[str, Any]:
+    """Return a fail-closed, path-free receipt for the shared pair-open gate.
+
+    Presence always fences admission, including malformed, stale-epoch, unsafe,
+    or unreadable files. A valid receipt binds the transaction, controller
+    owner hash, and both candidate process/build identities. Unlike the legacy
+    drain marker, this gate never auto-expires across an instantiation change:
+    only the owning transaction may remove it after durable pair acceptance or
+    verified rollback.
+    """
+    path = pair_open_gate_path(home)
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return {"active": False, "verified": True, "reason": "absent"}
+    except OSError:
+        return {"active": True, "verified": False, "reason": "lstat_error"}
+
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        return {"active": True, "verified": False, "reason": "unsafe_type"}
+    if os.name != "nt":
+        getuid = getattr(os, "geteuid", None)
+        if callable(getuid) and before.st_uid != getuid():
+            return {"active": True, "verified": False, "reason": "unsafe_owner"}
+        if stat.S_IMODE(before.st_mode) != 0o600:
+            return {"active": True, "verified": False, "reason": "unsafe_mode"}
+    if before.st_size > _PAIR_OPEN_GATE_MAX_BYTES:
+        return {"active": True, "verified": False, "reason": "oversize"}
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(nofollow, int) or nofollow == 0:
+        return {
+            "active": True,
+            "verified": False,
+            "reason": "nofollow_unavailable",
+        }
+
+    fd = None
+    try:
+        flags = os.O_RDONLY | nofollow
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size > _PAIR_OPEN_GATE_MAX_BYTES
+            or any(
+                getattr(opened, field) != getattr(before, field)
+                for field in stable_fields
+            )
+        ):
+            return {"active": True, "verified": False, "reason": "identity_changed"}
+        if os.name != "nt":
+            getuid = getattr(os, "geteuid", None)
+            if callable(getuid) and opened.st_uid != getuid():
+                return {"active": True, "verified": False, "reason": "unsafe_owner"}
+            if stat.S_IMODE(opened.st_mode) != 0o600:
+                return {"active": True, "verified": False, "reason": "unsafe_mode"}
+        raw = b""
+        while len(raw) <= _PAIR_OPEN_GATE_MAX_BYTES:
+            chunk = os.read(fd, min(65536, _PAIR_OPEN_GATE_MAX_BYTES + 1 - len(raw)))
+            if not chunk:
+                break
+            raw += chunk
+        if len(raw) > _PAIR_OPEN_GATE_MAX_BYTES:
+            return {"active": True, "verified": False, "reason": "oversize"}
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            # Unlink is the single release linearization point. Do not attest
+            # stale bytes from the already-open descriptor after it wins.
+            return {"active": False, "verified": True, "reason": "absent"}
+        except OSError:
+            return {"active": True, "verified": False, "reason": "lstat_error"}
+        after = os.fstat(fd)
+        if any(
+            getattr(after, field) != getattr(opened, field)
+            or getattr(current, field) != getattr(opened, field)
+            for field in stable_fields
+        ):
+            return {"active": True, "verified": False, "reason": "identity_changed"}
+        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            return {"active": True, "verified": False, "reason": "unsafe_type"}
+        if os.name != "nt":
+            getuid = getattr(os, "geteuid", None)
+            if callable(getuid) and current.st_uid != getuid():
+                return {"active": True, "verified": False, "reason": "unsafe_owner"}
+            if stat.S_IMODE(current.st_mode) != 0o600:
+                return {"active": True, "verified": False, "reason": "unsafe_mode"}
+    except OSError:
+        return {"active": True, "verified": False, "reason": "read_error"}
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    payload_sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return {
+            "active": True,
+            "verified": False,
+            "reason": "malformed",
+            "payload_sha256": payload_sha256,
+        }
+    if not _valid_pair_open_gate_payload(payload):
+        return {
+            "active": True,
+            "verified": False,
+            "reason": "invalid_payload",
+            "payload_sha256": payload_sha256,
+        }
+
+    return {
+        "active": True,
+        "verified": True,
+        "reason": "verified",
+        "schema": payload["schema"],
+        "transaction_id": payload["transaction_id"],
+        "owner_hash": payload["owner_hash"],
+        "epoch": payload["epoch"],
+        "agent": payload["agent"],
+        "webui": payload["webui"],
+        "payload_sha256": payload_sha256,
+    }
+
+
+def admission_rejection_requested(*, home: Optional[Path] = None) -> bool:
+    """True when either the ordinary drain or pair-open gate fences work."""
+    return drain_requested(home=home) or bool(
+        pair_open_gate_receipt(home=home)["active"]
+    )
 
 
 def write_drain_request(
@@ -218,9 +450,21 @@ def drain_requested(*, home: Optional[Path] = None) -> bool:
     lenient (see :func:`_marker_epoch_is_stale`): a legacy/corrupt marker with
     no epoch, or an environment without ``/proc``, still reads as drain-active.
     """
+    path = drain_request_path(home)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        _log.warning("drain-control: failed to inspect %s: %s", path, exc)
+        return True
+
     body = read_drain_request(home=home)
     if body is None:
-        return False
+        # The marker existed at the admission check but became unreadable (or
+        # was concurrently removed) before parsing. Treat this observation as
+        # fenced; a later clean absence reopens on the next check.
+        return True
     if _marker_epoch_is_stale(body):
         return False
     return True

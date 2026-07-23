@@ -82,7 +82,14 @@ class CronScheduler(ABC):
         Built-in: no-op (it re-reads jobs.json on every tick)."""
         return None
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        adapters: Any = None,
+        loop: Any = None,
+        admission_lease: Any = None,
+    ) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
 
@@ -95,14 +102,38 @@ class CronScheduler(ABC):
         was lost (another machine/retry won it) or the job no longer exists.
         """
         from cron.jobs import claim_job_for_fire, get_job
-        from cron.scheduler import run_one_job
+        from cron.scheduler import (
+            _claim_cron_dispatch,
+            _release_cron_dispatch,
+            run_one_job,
+        )
 
-        if not claim_job_for_fire(job_id):
-            return False  # another machine already claimed this fire
-        job = get_job(job_id)
-        if job is None:
-            return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        return run_one_job(job, adapters=adapters, loop=loop)
+        owns_lease = admission_lease is None
+        if owns_lease:
+            # Direct provider callers still acquire before the store CAS.
+            admission_lease = _claim_cron_dispatch(
+                job_id,
+                source="external_fire",
+            )
+            if admission_lease is None:
+                return False
+        elif getattr(admission_lease, "job_id", None) != job_id:
+            return False
+        try:
+            if not claim_job_for_fire(job_id):
+                return False  # another machine already claimed this fire
+            job = get_job(job_id)
+            if job is None:
+                return False  # removed (e.g. repeat-N exhausted) after arm
+            return run_one_job(
+                job,
+                adapters=adapters,
+                loop=loop,
+                _dispatch_claimed=True,
+            )
+        finally:
+            if owns_lease:
+                _release_cron_dispatch(job_id, lease=admission_lease)
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):

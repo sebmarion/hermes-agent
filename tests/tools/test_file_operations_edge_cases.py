@@ -326,6 +326,31 @@ class TestPaginationBounds:
 
 
 class TestSearchContextParsing:
+    @pytest.mark.parametrize("method_name", ["_search_with_rg", "_search_with_grep"])
+    def test_content_search_terminates_options_before_user_pattern_and_path(self, method_name):
+        env = MagicMock()
+        env.cwd = "/tmp"
+        ops = ShellFileOperations(env)
+
+        with patch.object(ops, "_exec") as mock_exec:
+            mock_exec.return_value = MagicMock(exit_code=1, stdout="")
+            method = getattr(ops, method_name)
+            method(
+                "-malformed-pattern",
+                path="-untrusted-path",
+                file_glob=None,
+                limit=10,
+                offset=0,
+                output_mode="content",
+                context=0,
+            )
+
+        command = mock_exec.call_args.args[0]
+        terminator = command.index(" -- ")
+        pattern = command.index("'-malformed-pattern'")
+        path = command.index("'-untrusted-path'")
+        assert terminator < pattern < path
+
     def test_parse_search_context_line_prefers_rightmost_numeric_separator(self):
         parsed = _parse_search_context_line("dir/file-12-name.py-8-context here")
 

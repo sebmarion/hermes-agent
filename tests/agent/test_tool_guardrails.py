@@ -132,6 +132,67 @@ def test_success_resets_exact_signature_failure_streak():
     assert controller.before_call("web_search", args).action == "allow"
 
 
+def test_same_argument_schema_retry_requires_matching_remediation_then_runs_once():
+    controller = ToolCallGuardrailController()
+    write_args = {
+        "action": "patch",
+        "name": "reviewed",
+        "old_string": "before",
+        "new_string": "after",
+    }
+    typed_error = json.dumps(
+        {
+            "success": False,
+            "error": "load the current skill before writing",
+            "error_code": "skill_view_required",
+            "error_class": "schema_correctable",
+            "retry_policy": {
+                "max_corrected_retries": 1,
+                "requires_argument_change": False,
+                "remediation": {
+                    "tool_name": "skill_view",
+                    "arguments": {"name": "reviewed"},
+                },
+            },
+        }
+    )
+
+    controller.after_call("skill_manage", write_args, typed_error, failed=True)
+
+    before_view = controller.before_call("skill_manage", write_args)
+    assert before_view.action == "deny"
+    assert before_view.code == "schema_retry_requires_remediation"
+
+    controller.after_call(
+        "skill_view",
+        {"name": "different-skill"},
+        json.dumps({"success": True, "content_revision": "wrong"}),
+        failed=False,
+    )
+    still_blocked = controller.before_call("skill_manage", write_args)
+    assert still_blocked.action == "deny"
+    assert still_blocked.code == "schema_retry_requires_remediation"
+
+    controller.after_call(
+        "skill_view",
+        {"name": "reviewed"},
+        json.dumps({"success": True, "content_revision": "current"}),
+        failed=False,
+    )
+    allowed = controller.before_call("skill_manage", write_args)
+    assert allowed.allows_execution is True
+    controller.after_call(
+        "skill_manage",
+        write_args,
+        json.dumps({"success": False, "error": "another schema error"}),
+        failed=True,
+    )
+
+    exhausted = controller.before_call("skill_manage", write_args)
+    assert exhausted.action == "deny"
+    assert exhausted.code == "schema_corrected_retry_exhausted"
+
+
 def test_file_mutation_lint_error_result_is_not_a_tool_failure():
     write_result = json.dumps({
         "bytes_written": 12,

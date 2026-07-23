@@ -537,6 +537,30 @@ class TestResolveJobRef:
         assert result is not None
         assert result["id"] == job["id"]
 
+    def test_trigger_rejected_by_closed_shared_gate_without_mutation(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+    ):
+        from cron.admission import (
+            CronAdmissionClosed,
+            set_cron_admission_paused,
+        )
+        from cron.jobs import trigger_job
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_cron_dir))
+        job = create_job(prompt="A", schedule="every 1h", name="alpha")
+        before = get_job(job["id"])
+        assert before is not None
+
+        set_cron_admission_paused(True, reason="test-drain")
+        try:
+            with pytest.raises(CronAdmissionClosed):
+                trigger_job("alpha")
+            assert get_job(job["id"]) == before
+        finally:
+            set_cron_admission_paused(False, reason="test-release")
+
     def test_pause_by_name(self, tmp_cron_dir):
         job = create_job(prompt="A", schedule="1h", name="alpha")
         result = pause_job("alpha", reason="manual")
@@ -1135,14 +1159,16 @@ class TestGetDueJobs:
 
         # Run still alive in this process → keep the record, dispatch nothing.
         monkeypatch.setattr(
-            scheduler_mod, "get_running_job_ids", lambda: frozenset({"inflight"})
+            scheduler_mod,
+            "get_locally_running_job_ids",
+            lambda: frozenset({"inflight"}),
         )
         assert get_due_jobs() == []
         assert get_job("inflight") is not None  # still visible to list/run
 
         # The claiming tick really died (running set empty) → recovered as before.
         monkeypatch.setattr(
-            scheduler_mod, "get_running_job_ids", lambda: frozenset()
+            scheduler_mod, "get_locally_running_job_ids", lambda: frozenset()
         )
         assert get_due_jobs() == []
         assert get_job("inflight") is None  # stale entry cleaned up

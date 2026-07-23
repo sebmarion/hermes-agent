@@ -66,6 +66,69 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
 
 class TestBasePlatformTopicSessions:
     @pytest.mark.asyncio
+    async def test_durable_notification_acks_only_after_runner_commit(self, monkeypatch):
+        from tools.process_registry import process_registry
+
+        adapter = DummyTelegramAdapter()
+        finished = []
+        monkeypatch.setattr(
+            process_registry,
+            "finish_notification_delivery",
+            lambda event, committed: finished.append((event, committed)),
+        )
+        durable = {
+            "type": "completion",
+            "event_id": "process:proc_gateway_commit:completion",
+            "session_id": "proc_gateway_commit",
+        }
+
+        async def handler(event):
+            event.metadata["_hermes_notification_turn_committed"] = True
+            return "ack"
+
+        adapter.set_message_handler(handler)
+        event = _make_event("-1001", "17585")
+        event.metadata["_hermes_durable_notification"] = durable
+
+        await adapter._process_message_background(
+            event, build_session_key(event.source)
+        )
+
+        assert finished == [(durable, True)]
+
+    @pytest.mark.asyncio
+    async def test_durable_notification_requeues_when_runner_does_not_commit(
+        self, monkeypatch
+    ):
+        from tools.process_registry import process_registry
+
+        adapter = DummyTelegramAdapter()
+        finished = []
+        monkeypatch.setattr(
+            process_registry,
+            "finish_notification_delivery",
+            lambda event, committed: finished.append((event, committed)),
+        )
+        durable = {
+            "type": "completion",
+            "event_id": "process:proc_gateway_retry:completion",
+            "session_id": "proc_gateway_retry",
+        }
+
+        async def handler(_event):
+            raise RuntimeError("provider failed")
+
+        adapter.set_message_handler(handler)
+        event = _make_event("-1001", "17585")
+        event.metadata["_hermes_durable_notification"] = durable
+
+        await adapter._process_message_background(
+            event, build_session_key(event.source)
+        )
+
+        assert finished == [(durable, False)]
+
+    @pytest.mark.asyncio
     async def test_handle_message_does_not_interrupt_different_topic(self, monkeypatch):
         adapter = DummyTelegramAdapter()
         adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))

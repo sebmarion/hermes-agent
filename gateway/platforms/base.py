@@ -5257,6 +5257,25 @@ class BasePlatformAdapter(ABC):
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.
             await _stop_typing_task()
+            _event_metadata = getattr(event, "metadata", None) or {}
+            _durable_notification = _event_metadata.get(
+                "_hermes_durable_notification"
+            )
+            if isinstance(_durable_notification, dict):
+                try:
+                    from tools.process_registry import process_registry
+
+                    process_registry.finish_notification_delivery(
+                        _durable_notification,
+                        _event_metadata.get(
+                            "_hermes_notification_turn_committed"
+                        )
+                        is True,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to finalize durable gateway notification"
+                    )
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
             #

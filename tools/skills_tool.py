@@ -1379,10 +1379,11 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
+            content_revision = None
             try:
                 from tools.skill_manager_tool import mark_background_review_skill_read
 
-                mark_background_review_skill_read(target_file)
+                content_revision = mark_background_review_skill_read(target_file, content)
             except Exception:
                 logger.debug(
                     "Could not record background-review skill read for %s",
@@ -1390,16 +1391,16 @@ def skill_view(
                     exc_info=True,
                 )
 
-            return json.dumps(
-                {
+            response = {
                     "success": True,
                     "name": name,
                     "file": file_path,
                     "content": content,
                     "file_type": target_file.suffix,
-                },
-                ensure_ascii=False,
-            )
+                }
+            if content_revision:
+                response["content_revision"] = content_revision
+            return json.dumps(response, ensure_ascii=False)
 
         # Reuse the parse from the platform check above
         frontmatter = parsed_frontmatter
@@ -1593,16 +1594,19 @@ def skill_view(
         if capture_result["gateway_setup_hint"]:
             result["gateway_setup_hint"] = capture_result["gateway_setup_hint"]
 
+        content_revision = None
         try:
             from tools.skill_manager_tool import mark_background_review_skill_read
 
-            mark_background_review_skill_read(skill_md)
+            content_revision = mark_background_review_skill_read(skill_md)
         except Exception:
             logger.debug(
                 "Could not record background-review skill read for %s",
                 skill_md,
                 exc_info=True,
             )
+        if content_revision:
+            result["content_revision"] = content_revision
 
         if setup_needed:
             missing_items = [

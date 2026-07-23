@@ -20,6 +20,8 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
@@ -344,6 +346,97 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
 
     assert InProcessCronScheduler().fire_due("j1") is True
     assert ran == ["j1"]
+
+
+def test_fire_due_closes_local_admission_before_store_claim(monkeypatch):
+    """Drain admission must win before the durable CAS can consume a fire."""
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    order = []
+    lease = type("Lease", (), {"job_id": "j1", "token": "lease-token"})()
+    monkeypatch.setattr(
+        sched,
+        "_claim_cron_dispatch",
+        lambda jid, **kw: order.append(("admission", jid)) or lease,
+    )
+    monkeypatch.setattr(
+        jobs,
+        "claim_job_for_fire",
+        lambda jid: order.append(("store_cas", jid)) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
+    monkeypatch.setattr(
+        sched,
+        "run_one_job",
+        lambda job, **kw: order.append(("run", kw.get("_dispatch_claimed"))) or True,
+    )
+    monkeypatch.setattr(
+        sched,
+        "_release_cron_dispatch",
+        lambda jid, **kw: order.append(("release", jid, kw.get("lease"))),
+    )
+
+    assert InProcessCronScheduler().fire_due("j1") is True
+    assert order == [
+        ("admission", "j1"),
+        ("store_cas", "j1"),
+        ("run", True),
+        ("release", "j1", lease),
+    ]
+
+
+def test_fire_due_rejected_by_drain_never_consumes_store_claim(monkeypatch):
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    store_claim = []
+    monkeypatch.setattr(
+        sched,
+        "_claim_cron_dispatch",
+        lambda jid, **kw: None,
+    )
+    monkeypatch.setattr(
+        jobs,
+        "claim_job_for_fire",
+        lambda jid: store_claim.append(jid) or True,
+        raising=False,
+    )
+
+    assert InProcessCronScheduler().fire_due("j1") is False
+    assert store_claim == []
+
+
+def test_fire_due_uses_supplied_exact_lease_without_second_admission(monkeypatch):
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    lease = type("Lease", (), {"job_id": "j1", "token": "exact-token"})()
+    monkeypatch.setattr(
+        sched,
+        "_claim_cron_dispatch",
+        lambda *_a, **_kw: pytest.fail("must not admit twice"),
+    )
+    monkeypatch.setattr(
+        sched,
+        "_release_cron_dispatch",
+        lambda *_a, **_kw: pytest.fail("supplied lease is caller-owned"),
+    )
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda _jid: True)
+    monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
+    monkeypatch.setattr(sched, "run_one_job", lambda *_a, **_kw: True)
+
+    assert (
+        InProcessCronScheduler().fire_due(
+            "j1",
+            admission_lease=lease,
+        )
+        is True
+    )
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):

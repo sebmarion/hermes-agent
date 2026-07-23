@@ -183,6 +183,30 @@ class TestPlatformReconnectWatcher:
     """Test the _platform_reconnect_watcher background task."""
 
     @pytest.mark.asyncio
+    async def test_external_drain_blocks_reconnect_attempt(self):
+        runner = _make_runner()
+        runner._external_drain_active = True
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": PlatformConfig(enabled=True, token="test"),
+            "attempts": 0,
+            "next_retry": time.monotonic() - 1,
+        }
+        sleep_calls = []
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+            # Initial delay, then one admission-closed wait.
+            if len(sleep_calls) >= 2:
+                runner._running = False
+
+        with patch("asyncio.sleep", side_effect=fake_sleep), patch.object(
+            runner, "_create_adapter"
+        ) as create_adapter:
+            await runner._platform_reconnect_watcher()
+
+        create_adapter.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_reconnect_succeeds_on_retry(self):
         """Watcher should reconnect a failed platform when connect() succeeds."""
         runner = _make_runner()

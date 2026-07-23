@@ -17,6 +17,7 @@ These tests pin:
 from __future__ import annotations
 
 import pytest
+import threading
 
 import model_tools
 
@@ -113,3 +114,36 @@ class TestQuietModeCacheIsolation:
         explains why the bug only hit Gateway."""
         model_tools.get_tool_definitions(quiet_mode=False)
         assert len(model_tools._tool_defs_cache) == 0
+
+
+def test_preserved_tool_resolution_state_serializes_competing_writer():
+    """A child build cannot restore stale state over a concurrent agent build."""
+    original = ["parent-tool"]
+    model_tools._last_resolved_tool_names = list(original)
+    child_entered = threading.Event()
+    release_child = threading.Event()
+    writer_finished = threading.Event()
+
+    def child_build():
+        with model_tools.preserve_last_resolved_tool_names():
+            model_tools._last_resolved_tool_names = ["bestplan-child-tool"]
+            child_entered.set()
+            release_child.wait(1)
+
+    def competing_writer():
+        child_entered.wait(1)
+        model_tools.set_last_resolved_tool_names(["regular-agent-tool"])
+        writer_finished.set()
+
+    child = threading.Thread(target=child_build)
+    writer = threading.Thread(target=competing_writer)
+    child.start()
+    writer.start()
+    assert child_entered.wait(1)
+    assert not writer_finished.wait(0.05)
+    release_child.set()
+    child.join(1)
+    writer.join(1)
+
+    assert writer_finished.is_set()
+    assert model_tools._last_resolved_tool_names == ["regular-agent-tool"]

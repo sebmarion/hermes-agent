@@ -84,6 +84,8 @@ def _make_fake_runner(session_db, *, fail_process=False):
                 return False
 
     fake._running = _Running()
+    fake._try_begin_drain_sensitive_background_work = lambda: True
+    fake._end_drain_sensitive_background_work = lambda: None
 
     async def _process_handoff(row):
         if fail_process:

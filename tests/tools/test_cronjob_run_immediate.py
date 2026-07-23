@@ -68,6 +68,31 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is False
         m_run.assert_not_called()
 
+    def test_execute_job_now_obeys_real_profile_gate_before_store_claim(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import cron.scheduler as sched
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        sched._dispatch_paused_for_drain = False
+        sched.set_cron_dispatch_paused(True)
+        try:
+            with patch(
+                "tools.cronjob_tools.claim_job_for_fire",
+                return_value=True,
+            ) as store_claim, patch("cron.scheduler.run_one_job") as run:
+                result = _execute_job_now(dict(_JOB))
+
+            assert result["claimed"] is False
+            assert result["success"] is False
+            assert "nothing was consumed" in result["error"]
+            store_claim.assert_not_called()
+            run.assert_not_called()
+        finally:
+            sched.set_cron_dispatch_paused(False)
+
     def test_execute_job_now_marks_failure_on_exception(self):
         """An exception during fire is captured, marked failed, not propagated."""
         with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \

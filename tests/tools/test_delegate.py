@@ -3001,6 +3001,33 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+
+def test_registry_delegate_handler_forwards_single_task_route_and_model_tier():
+    from tools.registry import registry
+
+    captured = {}
+
+    def fake_delegate_task(**kwargs):
+        captured.update(kwargs)
+        return "{}"
+
+    entry = registry.get_entry("delegate_task")
+    assert entry is not None
+    parent = _make_mock_parent(depth=0)
+    with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+        entry.handler(
+            {
+                "goal": "review",
+                "route": "local_reviewer",
+                "model_tier": "large",
+            },
+            parent_agent=parent,
+        )
+
+    assert captured["route"] == "local_reviewer"
+    assert captured["model_tier"] == "large"
+
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 

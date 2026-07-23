@@ -176,6 +176,114 @@ def get_process_start_time(pid: int) -> Optional[int]:
     return _get_process_start_time(pid)
 
 
+def _darwin_process_start_token(pid: int) -> Optional[str]:
+    """Read Darwin's kernel process-start timeval via ``libproc``."""
+
+    try:
+        import ctypes
+        import ctypes.util
+
+        class _ProcBSDInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        library_path = ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib"
+        libproc = ctypes.CDLL(library_path, use_errno=True)
+        proc_pidinfo = libproc.proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+        info = _ProcBSDInfo()
+        size = ctypes.sizeof(info)
+        copied = proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+        if copied != size or info.pbi_pid != pid:
+            return None
+        return (
+            f"darwin-proc:{pid}:{int(info.pbi_start_tvsec)}:"
+            f"{int(info.pbi_start_tvusec)}"
+        )
+    except Exception:
+        return None
+
+
+def _procfs_process_start_ticks(pid: int) -> Optional[int]:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # Field 2 (comm) is parenthesized but may itself contain spaces and
+        # closing parens. Split only after its final ")" so tail index 19 is
+        # always field 22 (starttime), matching the independent cutover parser.
+        comm_end = raw.rfind(")")
+        if comm_end < 0 or not raw.startswith(f"{pid} ("):
+            return None
+        fields_after_comm = raw[comm_end + 1 :].split()
+        return int(fields_after_comm[19])
+    except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
+        return None
+
+
+def _epoch_process_start_token(pid: int, platform_name: str) -> Optional[str]:
+    """Fallback canonical token for platforms exposing epoch create time."""
+
+    try:
+        import psutil  # type: ignore
+
+        created = float(psutil.Process(pid).create_time())
+        seconds = int(created)
+        microseconds = int(round((created - seconds) * 1_000_000))
+        if microseconds >= 1_000_000:
+            seconds += 1
+            microseconds -= 1_000_000
+        return f"{platform_name}-proc:{pid}:{seconds}:{microseconds}"
+    except Exception:
+        return None
+
+
+def get_process_start_token(pid: int) -> Optional[str]:
+    """Return the controller-comparable canonical OS process identity token.
+
+    Unlike :func:`get_process_start_time`, this wire-format helper preserves
+    Darwin's microsecond kernel timeval so an independent launch controller can
+    detect PID reuse without lossy quantization.
+    """
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return None
+    if sys.platform == "darwin":
+        return _darwin_process_start_token(pid)
+    if sys.platform.startswith("linux"):
+        ticks = _procfs_process_start_ticks(pid)
+        return f"procfs:{pid}:{ticks}" if ticks is not None else None
+    platform_name = "windows" if sys.platform == "win32" else sys.platform
+    return _epoch_process_start_token(pid, platform_name)
+
+
 def _read_process_cmdline(pid: int) -> Optional[str]:
     """Return the process command line as a space-separated string.
 

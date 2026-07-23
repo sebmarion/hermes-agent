@@ -239,6 +239,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
+    _exclude_active_cron_jobs,
     advance_next_run,
     claim_dispatch,
     claim_due_recovery_jobs,
@@ -307,6 +308,10 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+_dispatch_paused_for_drain = False
+_running_dispatch_keys: dict[tuple[str, str], object] = {}
+_dispatch_paused_profiles: set[str] = set()
+_owned_admission_leases: dict[tuple[str, str], object] = {}
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
@@ -316,6 +321,33 @@ _running_lock = threading.Lock()
 # plausible-looking final response from truncated output — can never
 # overwrite the interrupted status with a false "ok" (#60432).
 _interrupted_job_ids: set = set()
+
+
+def _cron_dispatch_profile_key() -> str:
+    return str(_get_hermes_home().expanduser().resolve())
+
+
+def _cron_dispatch_key(
+    job_id: str,
+    *,
+    profile_key: str | None = None,
+) -> tuple[str, str]:
+    return (profile_key or _cron_dispatch_profile_key(), job_id)
+
+
+def get_locally_running_job_ids() -> "frozenset[str]":
+    """Return only local jobs for the active profile (plus legacy test state)."""
+
+    profile_key = _cron_dispatch_profile_key()
+    with _running_lock:
+        keyed_ids = {job_id for _, job_id in _running_dispatch_keys}
+        legacy_ids = set(_running_job_ids) - keyed_ids
+        profile_ids = {
+            job_id
+            for candidate_profile, job_id in _running_dispatch_keys
+            if candidate_profile == profile_key
+        }
+        return frozenset(legacy_ids | profile_ids)
 
 
 def get_running_job_ids() -> "frozenset[str]":
@@ -333,8 +365,159 @@ def get_running_job_ids() -> "frozenset[str]":
     entirely outside that dict, so without this the drain is structurally
     blind to them (#60432).
     """
+    from cron.admission import cron_admission_snapshot
+
+    receipt = cron_admission_snapshot()
+    durable_ids = receipt.get("active_job_ids")
+    if not isinstance(durable_ids, list):
+        durable_ids = []
+    return frozenset(set(durable_ids) | set(get_locally_running_job_ids()))
+
+
+def get_cron_admission_receipt() -> dict:
+    """Atomic cross-process gate epoch + active lease receipt."""
+
+    from cron.admission import cron_admission_snapshot
+
+    return cron_admission_snapshot()
+
+
+def set_cron_dispatch_paused(paused: bool) -> None:
+    """Close/open the profile-wide gate before acknowledging gateway drain."""
+
+    global _dispatch_paused_for_drain
+    from cron.admission import set_cron_admission_paused
+
+    profile_key = _cron_dispatch_profile_key()
+    if paused:
+        # Close the cheap in-process fast path first. A dispatch already past
+        # this point is nevertheless visible through its durable lease.
+        with _running_lock:
+            _dispatch_paused_profiles.add(profile_key)
+            _dispatch_paused_for_drain = bool(_dispatch_paused_profiles)
+    receipt = set_cron_admission_paused(
+        bool(paused),
+        reason="gateway-external-drain",
+    )
+    if receipt.get("verified") is not True:
+        # Never publish an admission acknowledgement from an unverified gate.
+        with _running_lock:
+            _dispatch_paused_profiles.add(profile_key)
+            _dispatch_paused_for_drain = bool(_dispatch_paused_profiles)
+        raise RuntimeError(
+            "cron admission gate unavailable: "
+            f"{receipt.get('reason', 'unverified')}"
+        )
+    if not paused:
+        if receipt.get("accepting") is not True:
+            with _running_lock:
+                _dispatch_paused_profiles.add(profile_key)
+                _dispatch_paused_for_drain = bool(_dispatch_paused_profiles)
+            raise RuntimeError(
+                "cron admission gate remains fenced by an active drain marker"
+            )
+        with _running_lock:
+            _dispatch_paused_profiles.discard(profile_key)
+            _dispatch_paused_for_drain = bool(_dispatch_paused_profiles)
+
+
+def _claim_cron_dispatch(
+    job_id: str,
+    *,
+    source: str = "direct",
+):
+    """Claim and locally register one exact profile-qualified lease."""
+
+    dispatch_key = _cron_dispatch_key(job_id)
     with _running_lock:
-        return frozenset(_running_job_ids)
+        keyed_ids = {candidate_id for _, candidate_id in _running_dispatch_keys}
+        legacy_ids = _running_job_ids - keyed_ids
+        if (
+            dispatch_key[0] in _dispatch_paused_profiles
+            or dispatch_key in _running_dispatch_keys
+            or job_id in legacy_ids
+        ):
+            return None
+    from cron.admission import claim_cron_admission
+
+    lease = claim_cron_admission(job_id, source=source)
+    if lease is None:
+        return None
+    with _running_lock:
+        # Another thread may have won locally while the cross-process claim was
+        # being persisted. Release our exact token instead of stealing its run.
+        keyed_ids = {candidate_id for _, candidate_id in _running_dispatch_keys}
+        legacy_ids = _running_job_ids - keyed_ids
+        if dispatch_key in _running_dispatch_keys or job_id in legacy_ids:
+            duplicate = True
+        else:
+            duplicate = False
+            _running_dispatch_keys[dispatch_key] = lease
+            _running_job_ids.add(job_id)
+            _owned_admission_leases[dispatch_key] = lease
+    if duplicate:
+        from cron.admission import release_cron_admission
+
+        release_cron_admission(lease)
+        return None
+    return lease
+
+
+def _try_claim_cron_dispatch(job_id: str) -> bool:
+    """Compatibility boolean wrapper for ordinary direct dispatch callers."""
+
+    return _claim_cron_dispatch(job_id) is not None
+
+
+def _activate_preclaimed_cron_dispatch(job_id: str, *, lease) -> bool:
+    """Mirror an already-durable selection lease into the local running set."""
+
+    dispatch_key = _cron_dispatch_key(job_id)
+    with _running_lock:
+        keyed_ids = {candidate_id for _, candidate_id in _running_dispatch_keys}
+        legacy_ids = _running_job_ids - keyed_ids
+        if dispatch_key in _running_dispatch_keys or job_id in legacy_ids:
+            return False
+        _running_dispatch_keys[dispatch_key] = lease
+        _running_job_ids.add(job_id)
+        return True
+
+
+def _release_cron_dispatch(
+    job_id: str,
+    *,
+    lease=None,
+    profile_key: str | None = None,
+) -> None:
+    from cron.admission import release_cron_admission
+
+    dispatch_key = _cron_dispatch_key(job_id, profile_key=profile_key)
+    with _running_lock:
+        owned = _owned_admission_leases.get(dispatch_key)
+        if lease is None:
+            lease = owned
+        if (
+            lease is not None
+            and owned is not None
+            and getattr(owned, "token", None) == getattr(lease, "token", None)
+        ):
+            _owned_admission_leases.pop(dispatch_key, None)
+        active_lease = _running_dispatch_keys.get(dispatch_key)
+        exact_active = (
+            lease is not None
+            and active_lease is not None
+            and getattr(active_lease, "token", None)
+            == getattr(lease, "token", None)
+        )
+        if exact_active:
+            _running_dispatch_keys.pop(dispatch_key, None)
+        if exact_active and not any(
+            candidate_id == job_id
+            for _, candidate_id in _running_dispatch_keys
+        ):
+            _running_job_ids.discard(job_id)
+    if lease is not None:
+        release_cron_admission(lease)
 
 
 def mark_running_jobs_interrupted(reason: str) -> list:
@@ -3493,7 +3676,14 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    _dispatch_claimed: bool = False,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -3508,6 +3698,26 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    if not _dispatch_claimed:
+        job_id = str(job.get("id") or "")
+        if not job_id or not _try_claim_cron_dispatch(job_id):
+            logger.info(
+                "Job '%s' not dispatched — cron admission is paused or the "
+                "job is already running",
+                job.get("name", job_id),
+            )
+            return False
+        try:
+            return run_one_job(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                _dispatch_claimed=True,
+            )
+        finally:
+            _release_cron_dispatch(job_id)
+
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3723,13 +3933,81 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             lock_fd.close()
         return 0
 
+    pending_admission_leases: dict[str, object] = {}
     try:
-        recovery_jobs = claim_due_recovery_jobs()
-        recovery_results = [
-            _run_recovery_job(job, adapters=adapters, loop=loop)
-            for job in recovery_jobs
-        ]
-        due_jobs = get_due_jobs()
+        from cron.admission import (
+            CronAdmissionSelection,
+            admit_cron_selection,
+        )
+
+        if _interpreter_shutting_down():
+            return 0
+
+        def _select_cron_work(
+            active_job_ids: "frozenset[str]",
+        ) -> list:
+            """Claim/advance store state only inside the shared gate lock."""
+
+            recovery = claim_due_recovery_jobs(
+                exclude_job_ids=active_job_ids
+            )
+            recovery_ids = {job["id"] for job in recovery}
+            with _exclude_active_cron_jobs(set(active_job_ids)):
+                due = [
+                    job
+                    for job in get_due_jobs()
+                    if job["id"] not in active_job_ids
+                    and job["id"] not in recovery_ids
+                ]
+            # Advance only jobs that were admitted by this selection. A job
+            # already active in any process stays untouched.
+            for job in due:
+                advance_next_run(job["id"])
+            return [
+                *[
+                    CronAdmissionSelection(
+                        job_id=job["id"],
+                        source="recovery",
+                        value=("recovery", job),
+                    )
+                    for job in recovery
+                ],
+                *[
+                    CronAdmissionSelection(
+                        job_id=job["id"],
+                        source=(
+                            "builtin_no_agent"
+                            if job.get("no_agent")
+                            else "builtin_due"
+                        ),
+                        value=("due", job),
+                    )
+                    for job in due
+                ],
+            ]
+
+        admitted = admit_cron_selection(_select_cron_work)
+        recovery_jobs: list[tuple[dict, object]] = []
+        due_jobs: list[tuple[dict, object]] = []
+        for (kind, job), lease in admitted:
+            pending_admission_leases[lease.token] = lease
+            if kind == "recovery":
+                recovery_jobs.append((job, lease))
+            else:
+                due_jobs.append((job, lease))
+
+        recovery_results = []
+        for job, lease in recovery_jobs:
+            pending_admission_leases.pop(lease.token, None)
+            if not _activate_preclaimed_cron_dispatch(job["id"], lease=lease):
+                _release_cron_dispatch(job["id"], lease=lease)
+                continue
+            try:
+                recovery_results.append(
+                    _run_recovery_job(job, adapters=adapters, loop=loop)
+                )
+            finally:
+                _release_cron_dispatch(job["id"], lease=lease)
 
         if verbose and not due_jobs and not recovery_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
@@ -3737,14 +4015,6 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
 
         if verbose:
             logger.info("%s - %s job(s) due, %s recovery job(s) claimed", _hermes_now().strftime('%H:%M:%S'), len(due_jobs), len(recovery_jobs))
-
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
-        for job in due_jobs:
-            advance_next_run(job["id"])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -3778,7 +4048,13 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                _dispatch_claimed=True,
+            )
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
@@ -3786,18 +4062,29 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # That alone only keeps workdir jobs from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        sequential_jobs = [
+            (job, lease)
+            for job, lease in due_jobs
+            if (job.get("workdir") or "").strip()
+        ]
+        parallel_jobs = [
+            (job, lease)
+            for job, lease in due_jobs
+            if not (job.get("workdir") or "").strip()
+        ]
 
         _results: list = list(recovery_results)
         _all_futures: list = []
 
-        def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor):
-            """Submit a job fire-and-forget with the in-flight dedup guard.
+        def _submit_with_guard(
+            job: dict,
+            lease,
+            pool: concurrent.futures.ThreadPoolExecutor,
+        ):
+            """Submit already-admitted work and retain its durable lease.
 
-            Returns the future, or None if the job was skipped because a prior
-            tick's run of the same job is still in flight.  The running-set
-            membership is released in the worker's finally block.
+            The selection lease was persisted before any jobs.json mutation.
+            The worker releases it only after the full run settles.
             """
             job_id = job["id"]
             # A tick can race gateway teardown: once the interpreter is
@@ -3810,29 +4097,42 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     "Job '%s' not dispatched — interpreter is shutting down",
                     job.get("name", job_id),
                 )
+                pending_admission_leases.pop(lease.token, None)
+                _release_cron_dispatch(job_id, lease=lease)
                 return None
-            with _running_lock:
-                if job_id in _running_job_ids:
-                    logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                    return None
-                _running_job_ids.add(job_id)
+            if not _activate_preclaimed_cron_dispatch(job_id, lease=lease):
+                logger.info(
+                    "Job '%s' not dispatched — the job is already running",
+                    job.get("name", job_id),
+                )
+                pending_admission_leases.pop(lease.token, None)
+                _release_cron_dispatch(job_id, lease=lease)
+                return None
             _ctx = contextvars.copy_context()
 
-            def _run_and_release(j=job, ctx=_ctx):
+            def _run_and_release(j=job, ctx=_ctx, admitted_lease=lease):
                 try:
                     return ctx.run(_process_job, j)
                 finally:
-                    with _running_lock:
-                        _running_job_ids.discard(j["id"])
+                    _release_cron_dispatch(j["id"], lease=admitted_lease)
 
             try:
-                return pool.submit(_run_and_release)
-            except RuntimeError as submit_err:
+                future = pool.submit(_run_and_release)
+                pending_admission_leases.pop(lease.token, None)
+                return future
+            except BaseException as submit_err:
+                # Submission never transferred ownership to a worker, so
+                # release the in-flight claim for every failure. Otherwise a
+                # broken/replaced executor permanently wedges drain readiness
+                # with a job that never actually started.
+                pending_admission_leases.pop(lease.token, None)
+                _release_cron_dispatch(job_id, lease=lease)
                 # Interpreter began finalizing between the guard above and the
-                # submit — release the in-flight claim we just took and skip.
-                if _interpreter_shutting_down(submit_err):
-                    with _running_lock:
-                        _running_job_ids.discard(job_id)
+                # submit — skip cleanly. Preserve every other exception.
+                if (
+                    isinstance(submit_err, RuntimeError)
+                    and _interpreter_shutting_down(submit_err)
+                ):
                     logger.warning(
                         "Job '%s' not dispatched — interpreter is shutting down",
                         job.get("name", job_id),
@@ -3848,8 +4148,8 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # job from being re-queued on the next tick.
         if sequential_jobs:
             seq_pool = _get_sequential_pool()
-            for job in sequential_jobs:
-                fut = _submit_with_guard(job, seq_pool)
+            for job, lease in sequential_jobs:
+                fut = _submit_with_guard(job, lease, seq_pool)
                 if fut is None:
                     continue
                 _all_futures.append(fut)
@@ -3863,8 +4163,8 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # queue needed.
         if parallel_jobs:
             pool = _get_parallel_pool(_max_workers)
-            for job in parallel_jobs:
-                fut = _submit_with_guard(job, pool)
+            for job, lease in parallel_jobs:
+                fut = _submit_with_guard(job, lease, pool)
                 if fut is None:
                     continue
                 _all_futures.append(fut)
@@ -3920,6 +4220,12 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
 
         return sum(_results)
     finally:
+        # Any selection lease still here never transferred to a worker. Release
+        # it before dropping the tick lock so a setup/config exception cannot
+        # wedge drain readiness in this still-live process.
+        for _lease in list(pending_admission_leases.values()):
+            _release_cron_dispatch(_lease.job_id, lease=_lease)
+        pending_admission_leases.clear()
         if fcntl:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)

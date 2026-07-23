@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -134,7 +135,13 @@ class CodexAppServerClient:
             stderr=subprocess.PIPE,
             bufsize=0,
             env=spawn_env,
+            # Own the complete Codex process tree. Codex may launch tool
+            # subprocesses; terminating only the direct child can orphan them.
+            start_new_session=(os.name != "nt"),
         )
+        # start_new_session makes the child a session and process-group leader,
+        # so its spawn-time PID remains the group identity after direct exit.
+        self._process_group = self._proc.pid if os.name != "nt" else None
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
@@ -178,7 +185,7 @@ class CodexAppServerClient:
         return result
 
     def close(self, timeout: float = 3.0) -> None:
-        """Close stdin and wait for the subprocess to exit, escalating to kill."""
+        """Close stdin and terminate the complete owned subprocess tree."""
         if self._closed:
             return
         self._closed = True
@@ -187,6 +194,56 @@ class CodexAppServerClient:
                 self._proc.stdin.close()
         except Exception:
             pass
+
+        if os.name != "nt":
+            process_group = self._process_group
+            if process_group is not None:
+                try:
+                    os.killpg(process_group, signal.SIGTERM)
+                except ProcessLookupError:
+                    return
+                except OSError:
+                    process_group = None
+                if process_group is not None:
+                    deadline = time.monotonic() + max(0.0, timeout)
+                    try:
+                        self._proc.wait(timeout=max(0.0, timeout))
+                    except subprocess.TimeoutExpired:
+                        pass
+
+                    def _process_group_alive() -> bool:
+                        try:
+                            os.killpg(process_group, 0)
+                            return True
+                        except ProcessLookupError:
+                            return False
+                        except PermissionError:
+                            return True
+                        except OSError:
+                            return False
+
+                    group_alive = _process_group_alive()
+                    while group_alive and time.monotonic() < deadline:
+                        time.sleep(
+                            min(0.05, max(0.0, deadline - time.monotonic()))
+                        )
+                        group_alive = _process_group_alive()
+                    if group_alive:
+                        try:
+                            os.killpg(process_group, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    try:
+                        self._proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    return
+
+        if self._proc.poll() is not None:
+            return
+
+        # Windows, or a POSIX getpgid/killpg failure: retain direct-child
+        # fallback so close remains best-effort on unusual platforms.
         try:
             self._proc.terminate()
             self._proc.wait(timeout=timeout)

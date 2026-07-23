@@ -36,10 +36,17 @@ set -euo pipefail
 # ── Locate repo root ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CALLER_HOME="${HOME:-}"
 
 # ── Activate venv ───────────────────────────────────────────────────────────
 VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
+for candidate in \
+  "${VIRTUAL_ENV:-}" \
+  "$REPO_ROOT/.venv" \
+  "$REPO_ROOT/venv" \
+  "${CALLER_HOME:+$CALLER_HOME/.hermes/hermes-agent/venv}"
+do
+  [ -n "$candidate" ] || continue
   if [ -f "$candidate/bin/activate" ]; then
     VENV="$candidate"
     break
@@ -47,18 +54,69 @@ for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agen
 done
 
 if [ -z "$VENV" ]; then
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+  echo "error: no usable virtualenv found in VIRTUAL_ENV, $REPO_ROOT/.venv, $REPO_ROOT/venv, or caller HOME" >&2
   exit 1
 fi
 
 PYTHON="$VENV/bin/python"
 
+# ── Private test HOME and state roots ───────────────────────────────────────
+# Resolve the interpreter first, then remove the caller's HOME and state paths
+# from the test environment.  Collection-time Path.home() calls therefore also
+# resolve inside this runner-owned root.
+umask 077
+TEST_TMP_BASE="${TMPDIR:-/tmp}"
+mkdir -p "$TEST_TMP_BASE"
+TEST_PRIVATE_ROOT="$(mktemp -d "$TEST_TMP_BASE/hermes-agent-tests.XXXXXX")"
+TEST_PRIVATE_HOME="$TEST_PRIVATE_ROOT/home"
+TEST_PRIVATE_HERMES_HOME="$TEST_PRIVATE_HOME/.hermes"
+TEST_PRIVATE_TMP="$TEST_PRIVATE_ROOT/tmp"
+TEST_PRIVATE_XDG_CONFIG="$TEST_PRIVATE_ROOT/xdg-config"
+TEST_PRIVATE_XDG_CACHE="$TEST_PRIVATE_ROOT/xdg-cache"
+TEST_PRIVATE_XDG_DATA="$TEST_PRIVATE_ROOT/xdg-data"
+TEST_PRIVATE_XDG_STATE="$TEST_PRIVATE_ROOT/xdg-state"
+ISOLATION_SELFTEST="${HERMES_TEST_ISOLATION_SELFTEST:-}"
+ISOLATION_CONTROL_DIR=""
+
+mkdir -p \
+  "$TEST_PRIVATE_HERMES_HOME" \
+  "$TEST_PRIVATE_TMP" \
+  "$TEST_PRIVATE_XDG_CONFIG" \
+  "$TEST_PRIVATE_XDG_CACHE" \
+  "$TEST_PRIVATE_XDG_DATA" \
+  "$TEST_PRIVATE_XDG_STATE"
+
+if [ "$ISOLATION_SELFTEST" = "1" ]; then
+  ISOLATION_CONTROL_DIR="$TEST_PRIVATE_ROOT/isolation-control"
+  mkdir -p "$ISOLATION_CONTROL_DIR"
+fi
+
+cleanup_private_root() {
+  if [ -z "${TEST_PRIVATE_ROOT:-}" ] || [ ! -d "$TEST_PRIVATE_ROOT" ]; then
+    return
+  fi
+  case "$(basename "$TEST_PRIVATE_ROOT")" in
+    hermes-agent-tests.*)
+      rm -rf -- "$TEST_PRIVATE_ROOT"
+      ;;
+    *)
+      echo "error: refusing to remove unexpected test root: $TEST_PRIVATE_ROOT" >&2
+      ;;
+  esac
+}
+
+trap cleanup_private_root EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
 EXTRA_PYTHONPATH=""
 EXTRA_PYTEST_PLUGINS=""
-if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
-  EXTRA_PYTHONPATH="$HOME/.hermes"
+if [ -n "$CALLER_HOME" ] && [ -f "$CALLER_HOME/.hermes/pytest_live_guard.py" ]; then
+  cp "$CALLER_HOME/.hermes/pytest_live_guard.py" \
+    "$TEST_PRIVATE_HERMES_HOME/pytest_live_guard.py"
+  EXTRA_PYTHONPATH="$TEST_PRIVATE_HERMES_HOME"
   EXTRA_PYTEST_PLUGINS="pytest_live_guard"
 fi
 
@@ -67,19 +125,32 @@ fi
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
-echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
+echo "  (private HOME/state; TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
-exec env -i \
+set +e
+env -i \
   PATH="$PATH" \
-  HOME="$HOME" \
+  HOME="$TEST_PRIVATE_HOME" \
+  HERMES_HOME="$TEST_PRIVATE_HERMES_HOME" \
+  XDG_CONFIG_HOME="$TEST_PRIVATE_XDG_CONFIG" \
+  XDG_CACHE_HOME="$TEST_PRIVATE_XDG_CACHE" \
+  XDG_DATA_HOME="$TEST_PRIVATE_XDG_DATA" \
+  XDG_STATE_HOME="$TEST_PRIVATE_XDG_STATE" \
+  TMPDIR="$TEST_PRIVATE_TMP" \
+  VIRTUAL_ENV="$VENV" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
   PYTHONDONTWRITEBYTECODE=1 \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
+  ${ISOLATION_SELFTEST:+HERMES_TEST_ISOLATION_SELFTEST="$ISOLATION_SELFTEST"} \
+  ${ISOLATION_CONTROL_DIR:+HERMES_TEST_ISOLATION_CONTROL_DIR="$ISOLATION_CONTROL_DIR"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"
+TEST_STATUS=$?
+set -e
+exit "$TEST_STATUS"

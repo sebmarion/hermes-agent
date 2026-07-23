@@ -1815,11 +1815,12 @@ def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:
 def _cron_run(_engine: HermesConsoleEngine, args: list[str]) -> str:
     if len(args) != 1:
         raise ConsoleCommandError("Usage: cron run <job>")
+    from cron.admission import CronAdmissionClosed
     from cron.jobs import AmbiguousJobReference, trigger_job
 
     try:
         job = trigger_job(args[0])
-    except AmbiguousJobReference as exc:
+    except (AmbiguousJobReference, CronAdmissionClosed) as exc:
         raise ConsoleCommandError(str(exc)) from exc
     if not job:
         raise ConsoleCommandError(f"Job not found: {args[0]}")

@@ -201,6 +201,21 @@ def test_subprocess_killall_hermes_blocked():
         subprocess.run(["killall", "hermes"])
 
 
+def test_subprocess_argv_preserves_safe_multiword_arguments(tmp_path):
+    result = subprocess.run(
+        [
+            "printf",
+            "%s%s",
+            "real skill",
+            str(tmp_path / "hermes-agent-tests.synthetic" / "skills"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.startswith("real skill")
+
+
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 

@@ -43,11 +43,11 @@ class TestSmallContextThresholdFloor:
         comp = _make(128_000, pct=0.85)
         assert comp.threshold_percent == 0.85
 
-    def test_degenerate_minimum_window_still_uses_85(self):
-        # 64K window: the MINIMUM_CONTEXT_LENGTH floor pushes the threshold
-        # to/over the window, so the 85% degenerate-window guard still rules.
+    def test_64k_window_uses_small_context_floor(self):
+        # MINIMUM_CONTEXT_LENGTH is now 32K, so a 64K window is no longer in
+        # the degenerate band. The normal 75% small-context floor applies.
         comp = _make(64_000, pct=0.50)
-        assert comp.threshold_tokens == 54_400  # 85% of 64000
+        assert comp.threshold_tokens == 48_000  # 75% of 64000
 
     def test_update_model_rederives_floor_both_directions(self):
         comp = _make(128_000, pct=0.50)

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
+from agent.tool_guardrails import ToolCallGuardrailController
 
 
 def _make_tool_defs(*names: str) -> list[dict]:
@@ -114,6 +115,53 @@ def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_e
     assert "repeated_exact_failure_warning" in messages[0]["content"]
     assert "repeated_exact_failure_block" not in messages[0]["content"]
     assert agent._tool_guardrail_halt_decision is None
+
+
+def test_typed_capability_failure_is_not_executed_twice_even_without_hard_stop():
+    guardrails = ToolCallGuardrailController()
+    args = {"name": "skill-in-another-profile", "action": "patch"}
+    result = json.dumps({
+        "success": False,
+        "error": "wrong active profile",
+        "error_code": "skill_profile_mismatch",
+        "error_class": "capability",
+    })
+
+    first = guardrails.before_call("skill_manage", args)
+    assert first.allows_execution is True
+    guardrails.after_call("skill_manage", args, result, failed=True)
+    second = guardrails.before_call("skill_manage", args)
+
+    assert second.action == "deny"
+    assert second.code == "typed_permanent_failure_no_retry"
+    assert second.allows_execution is False
+    assert second.should_halt is False
+
+
+def test_schema_correctable_failure_allows_one_changed_retry_only():
+    guardrails = ToolCallGuardrailController()
+    first_args = {"pattern": "*.spec.ts", "target": "content"}
+    typed_error = json.dumps({
+        "error": "file glob used as content regex",
+        "error_code": "search_files_glob_used_as_content_regex",
+        "error_class": "schema_correctable",
+        "retry_policy": {"max_corrected_retries": 1},
+    })
+    guardrails.after_call("search_files", first_args, typed_error, failed=True)
+
+    unchanged = guardrails.before_call("search_files", first_args)
+    assert unchanged.action == "deny"
+    assert unchanged.code == "schema_retry_requires_changed_arguments"
+
+    corrected_args = {"pattern": "*.spec.ts", "target": "files"}
+    corrected = guardrails.before_call("search_files", corrected_args)
+    assert corrected.allows_execution is True
+    guardrails.after_call("search_files", corrected_args, typed_error, failed=True)
+
+    third_args = {"pattern": "*.test.ts", "target": "files"}
+    exhausted = guardrails.before_call("search_files", third_args)
+    assert exhausted.action == "deny"
+    assert exhausted.code == "schema_corrected_retry_exhausted"
 
 
 def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution():

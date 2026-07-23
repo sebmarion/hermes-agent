@@ -17,6 +17,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 
 # Ensure /bin and /usr/bin are on PATH so launchctl/systemctl are discoverable
 # when running under UV's bundled Python which ships a minimal PATH (#3849).
@@ -30,6 +31,7 @@ if os.name == "posix":
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from gateway.status import terminate_pid
+from gateway.runtime_identity import sealed_identity_environment
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -2684,6 +2686,30 @@ def _stable_service_working_dir() -> str:
     return str(PROJECT_ROOT)
 
 
+def _systemd_identity_environment_lines() -> str:
+    """Render the validated sealed identity into systemd Environment lines."""
+
+    lines: list[str] = []
+    for key, value in sealed_identity_environment().items():
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'Environment="{key}={escaped}"')
+    return "\n".join(lines)
+
+
+def _launchd_identity_environment_xml() -> str:
+    """Render the validated sealed identity into a launchd plist dictionary."""
+
+    entries: list[str] = []
+    for key, value in sealed_identity_environment().items():
+        entries.extend(
+            (
+                f"        <key>{_xml_escape(key)}</key>",
+                f"        <string>{_xml_escape(value)}</string>",
+            )
+        )
+    return "\n".join(entries)
+
+
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = _stable_service_working_dir()
@@ -2721,6 +2747,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     # (#8202). 30s of headroom covers the worst case we've observed.
     _drain_timeout = int(_get_restart_drain_timeout() or 0)
     restart_timeout = max(60, _drain_timeout) + 30
+    identity_environment = _systemd_identity_environment_lines()
 
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)
@@ -2758,6 +2785,7 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+{identity_environment}
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -2792,6 +2820,7 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+{identity_environment}
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -3906,6 +3935,7 @@ def generate_launchd_plist() -> str:
             priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
         )
     )
+    identity_environment_xml = _launchd_identity_environment_xml()
 
     # Build ProgramArguments array, including --profile when using a named profile
     prog_args = [
@@ -3948,6 +3978,7 @@ def generate_launchd_plist() -> str:
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
+{identity_environment_xml}
     </dict>
 
     <key>LimitLoadToSessionType</key>

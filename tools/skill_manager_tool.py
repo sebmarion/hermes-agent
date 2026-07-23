@@ -33,6 +33,7 @@ Directory layout for user skills:
 """
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -48,12 +49,21 @@ from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
+_background_review_read_receipts: "_ctxvars.ContextVar[tuple[tuple[str, str], ...]]" = _ctxvars.ContextVar(
+    "background_review_read_receipts", default=()
 )
 
 
-def mark_background_review_skill_read(path: Path) -> None:
+def _skill_content_revision(path: Path, content: Optional[str] = None) -> Optional[str]:
+    """Return the SHA-256 revision for the exact skill content on disk."""
+    try:
+        payload = content.encode("utf-8") if content is not None else path.read_bytes()
+    except (OSError, UnicodeError):
+        return None
+    return hashlib.sha256(payload).hexdigest()
+
+
+def mark_background_review_skill_read(path: Path, content: Optional[str] = None) -> Optional[str]:
     """Record that the active background-review fork has read a skill file.
 
     The autonomous review fork is allowed to evolve skills, but it must not
@@ -65,30 +75,40 @@ def mark_background_review_skill_read(path: Path) -> None:
     try:
         from tools.skill_provenance import is_background_review
         if not is_background_review():
-            return
+            return None
     except Exception:
-        return
+        return None
 
     try:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    revision = _skill_content_revision(path, content)
+    if revision is None:
+        return None
+    current = dict(_background_review_read_receipts.get())
+    current[resolved] = revision
+    _background_review_read_receipts.set(tuple(sorted(current.items())))
+    return revision
 
 
 def _background_review_has_read(path: Path) -> bool:
+    viewed, current = _background_review_read_revisions(path)
+    return viewed is not None and viewed == current
+
+
+def _background_review_read_revisions(path: Path) -> Tuple[Optional[str], Optional[str]]:
     try:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    viewed = dict(_background_review_read_receipts.get()).get(resolved)
+    return viewed, _skill_content_revision(path)
 
 
 def _reset_background_review_read_marks() -> None:
     """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    _background_review_read_receipts.set(())
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.
@@ -393,18 +413,45 @@ def _background_review_read_before_write_guard(
     except Exception:
         return None
 
-    if _background_review_has_read(target):
+    viewed_revision, current_revision = _background_review_read_revisions(target)
+    if viewed_revision is not None and viewed_revision == current_revision:
         return None
+
+    from agent.file_safety import _resolve_active_profile_name
+
+    stale = viewed_revision is not None
+    error_code = "skill_view_stale" if stale else "skill_view_required"
+    remediation_args = {"name": name}
+    if file_label != "SKILL.md":
+        remediation_args["file_path"] = file_label
+    reason = (
+        f"the viewed {file_label} revision is stale"
+        if stale
+        else f"the current {file_label} content has not been loaded in this review turn"
+    )
 
     return {
         "success": False,
         "error": (
             f"Refusing background curator {action} for skill '{name}': "
-            f"the current {file_label} content has not been loaded in this "
-            "review turn. Call skill_view(name) for SKILL.md, or "
+            f"{reason}. Call skill_view(name) for SKILL.md, or "
             "skill_view(name, file_path=...) for a supporting file, then "
             "retry the write using the content just returned."
         ),
+        "error_code": error_code,
+        "error_class": "schema_correctable",
+        "retry_policy": {
+            "max_corrected_retries": 1,
+            "requires_argument_change": False,
+            "remediation": {
+                "tool_name": "skill_view",
+                "arguments": remediation_args,
+            },
+        },
+        "active_profile": _resolve_active_profile_name(),
+        "skill_path": str(target),
+        "viewed_revision": viewed_revision,
+        "current_revision": current_revision,
         "_read_before_write_required": True,
     }
 
@@ -982,9 +1029,23 @@ def _patch_skill(
             err_msg += format_no_match_hint(match_error, match_count, old_string, content)
         except Exception:
             pass
+        ambiguous_match = re.match(r"Found\s+(\d+)\s+matches?", match_error or "")
+        reported_match_count = (
+            int(ambiguous_match.group(1)) if ambiguous_match else match_count
+        )
+        ambiguous = reported_match_count > 1
         return {
             "success": False,
             "error": err_msg,
+            "error_code": (
+                "skill_patch_ambiguous_match"
+                if ambiguous
+                else "skill_patch_source_mismatch"
+            ),
+            "error_class": "schema_correctable",
+            "retry_policy": {"max_corrected_retries": 1},
+            "match_count": reported_match_count,
+            "current_revision": _skill_content_revision(target, content),
             "file_preview": preview,
         }
 
@@ -1077,6 +1138,12 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
                     f"Create or patch the umbrella skill first, then retry the delete."
                 ),
             }
+
+    read_guard = _background_review_read_before_write_guard(
+        name, existing["path"] / "SKILL.md", "delete", "SKILL.md"
+    )
+    if read_guard:
+        return read_guard
 
     skill_dir = existing["path"]
     skills_root = _containing_skills_root(skill_dir)
@@ -1317,6 +1384,26 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
         _skill_gate_bypass.reset(token)
 
 
+def _apply_skill_error_policy(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach stable retry semantics to legacy skill-manager error text."""
+    if result.get("success") is not False or result.get("error_code"):
+        return result
+    lower = str(result.get("error") or "").lower()
+    if "not found in active profile" in lower:
+        result.update(
+            error_code="skill_profile_mismatch",
+            error_class="capability",
+            retry_policy={"max_corrected_retries": 0},
+        )
+    elif "frontmatter" in lower:
+        result.update(
+            error_code="skill_invalid_frontmatter",
+            error_class="schema_correctable",
+            retry_policy={"max_corrected_retries": 1},
+        )
+    return result
+
+
 def skill_manage(
     action: str,
     name: str,
@@ -1353,19 +1440,39 @@ def skill_manage(
 
     if action == "create":
         if not content:
-            return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
+            return tool_error(
+                "content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).",
+                success=False, error_code="skill_create_missing_content",
+                error_class="schema_correctable",
+                retry_policy={"max_corrected_retries": 1},
+            )
         result = _create_skill(name, content, category)
 
     elif action == "edit":
         if not content:
-            return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
+            return tool_error(
+                "content is required for 'edit'. Provide the full updated SKILL.md text.",
+                success=False, error_code="skill_edit_missing_content",
+                error_class="schema_correctable",
+                retry_policy={"max_corrected_retries": 1},
+            )
         result = _edit_skill(name, content)
 
     elif action == "patch":
         if not old_string:
-            return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
+            return tool_error(
+                "old_string is required for 'patch'. Provide the text to find.",
+                success=False, error_code="skill_patch_missing_old_string",
+                error_class="schema_correctable",
+                retry_policy={"max_corrected_retries": 1},
+            )
         if new_string is None:
-            return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
+            return tool_error(
+                "new_string is required for 'patch'. Use empty string to delete matched text.",
+                success=False, error_code="skill_patch_missing_new_string",
+                error_class="schema_correctable",
+                retry_policy={"max_corrected_retries": 1},
+            )
         result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
     elif action == "delete":
@@ -1385,6 +1492,8 @@ def skill_manage(
 
     else:
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+
+    result = _apply_skill_error_policy(result)
 
     if result.get("success"):
         try:

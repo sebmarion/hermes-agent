@@ -124,6 +124,25 @@ _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
 )
 
 
+@dataclass
+class _BufferedJobsTransaction:
+    """In-memory jobs.json transaction held under the real jobs lock."""
+
+    jobs: List[Dict[str, Any]]
+
+    def commit(self) -> None:
+        _save_jobs_unlocked(copy.deepcopy(self.jobs))
+
+
+_buffered_jobs_transaction: ContextVar[Optional[_BufferedJobsTransaction]] = (
+    ContextVar("buffered_jobs_transaction", default=None)
+)
+_active_job_ids_override: ContextVar[frozenset[str]] = ContextVar(
+    "active_cron_job_ids_override",
+    default=frozenset(),
+)
+
+
 def _current_cron_store() -> _CronStorePaths:
     """Return paths pinned to this execution context's profile."""
     override = _cron_store_override.get()
@@ -215,8 +234,9 @@ def _job_running_in_this_process(job_id: str) -> bool:
     module-level import here would be circular.
     """
     try:
-        from cron.scheduler import get_running_job_ids
-        return job_id in get_running_job_ids()
+        from cron.scheduler import get_locally_running_job_ids
+
+        return job_id in get_locally_running_job_ids()
     except Exception:
         return False
 
@@ -322,6 +342,38 @@ def _jobs_lock():
                         lock_fd.close()
         finally:
             _jobs_lock_state.depth = 0
+
+
+@contextlib.contextmanager
+def _buffer_cron_jobs_updates():
+    """Buffer nested jobs mutations until the admission receipt is durable.
+
+    The outer jobs lock remains held for the complete admission transaction.
+    Existing helpers can keep using ``load_jobs`` / ``save_jobs`` unchanged:
+    those functions transparently read/write this in-memory buffer. The caller
+    explicitly commits only after its cross-process admission leases persist.
+    """
+
+    if _buffered_jobs_transaction.get() is not None:
+        raise RuntimeError("nested buffered cron jobs transactions are unsupported")
+    with _jobs_lock():
+        transaction = _BufferedJobsTransaction(jobs=copy.deepcopy(load_jobs()))
+        token = _buffered_jobs_transaction.set(transaction)
+        try:
+            yield transaction
+        finally:
+            _buffered_jobs_transaction.reset(token)
+
+
+@contextlib.contextmanager
+def _exclude_active_cron_jobs(job_ids: Set[str]):
+    """Scope cross-process active IDs into a normal ``get_due_jobs`` call."""
+
+    token = _active_job_ids_override.set(frozenset(job_ids))
+    try:
+        yield
+    finally:
+        _active_job_ids_override.reset(token)
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
@@ -838,6 +890,10 @@ def get_ticker_success_age() -> Optional[float]:
 
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
+    buffered = _buffered_jobs_transaction.get()
+    if buffered is not None:
+        return copy.deepcopy(buffered.jobs)
+
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     if not jobs_file.exists():
@@ -907,6 +963,11 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
 
 def save_jobs(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage."""
+    buffered = _buffered_jobs_transaction.get()
+    if buffered is not None:
+        buffered.jobs = copy.deepcopy(jobs)
+        return
+
     with _jobs_lock():
         _save_jobs_unlocked(jobs)
 
@@ -1458,16 +1519,31 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
-        },
+    from cron.admission import (
+        CronAdmissionClosed,
+        claim_cron_admission,
+        release_cron_admission,
     )
+
+    lease = claim_cron_admission(job["id"], source="manual_trigger")
+    if lease is None:
+        raise CronAdmissionClosed(
+            "Cron dispatch is paused while Hermes is draining; retry after "
+            "the drain gate is released."
+        )
+    try:
+        return update_job(
+            job["id"],
+            {
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "next_run_at": _hermes_now().isoformat(),
+            },
+        )
+    finally:
+        release_cron_admission(lease)
 
 
 def remove_job(job_id: str) -> bool:
@@ -1626,13 +1702,20 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
-def claim_due_recovery_jobs(max_attempts: int = 3) -> List[Dict[str, Any]]:
-    """Atomically claim due bounded recovery work without advancing schedules."""
+def claim_due_recovery_jobs(
+    max_attempts: int = 3,
+    *,
+    exclude_job_ids: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Atomically claim due recovery work not already active elsewhere."""
     claimed: List[Dict[str, Any]] = []
+    excluded = set(exclude_job_ids or ())
     now = _hermes_now()
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
+            if job.get("id") in excluded:
+                continue
             if job.get("recovery_state") != "scheduled":
                 continue
             try:
@@ -1870,7 +1953,10 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
         return False
 
 
-def get_due_jobs() -> List[Dict[str, Any]]:
+def get_due_jobs(
+    *,
+    active_job_ids: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
     For recurring jobs (cron/interval), if the scheduled time is stale (more
@@ -1884,12 +1970,17 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     Note: firing once on catch-up flows through ``mark_job_run``, so a job with
     a ``repeat.times`` limit consumes one of its runs on that catch-up fire.
     """
+    active = set(active_job_ids or ()) | set(_active_job_ids_override.get())
     with _jobs_lock():
-        return _get_due_jobs_locked()
+        return _get_due_jobs_locked(active_job_ids=active)
 
 
-def _get_due_jobs_locked() -> List[Dict[str, Any]]:
+def _get_due_jobs_locked(
+    *,
+    active_job_ids: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
+    active = set(active_job_ids or ())
     now = _hermes_now()
     raw_jobs = load_jobs()
     needs_save = False
@@ -1997,6 +2088,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # job this tick" so healthy siblings still run and their recovered
         # state still reaches save_jobs() below.
         try:
+            if job.get("id") in active:
+                continue
             if not job.get("enabled", True):
                 continue
             # A scheduled/running recovery owns the next attempt. Do not

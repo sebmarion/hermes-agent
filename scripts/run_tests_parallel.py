@@ -42,8 +42,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -89,6 +91,68 @@ _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
 # wall-clock seconds. Used by ``--slice`` to distribute files across
 # CI jobs by estimated total time, so no one job gets all the slow files.
 _DURATIONS_FILE = "test_durations.json"
+_FILE_STATE_PREFIX = "ht."
+
+
+def _short_file_state_base() -> Path:
+    """Return a short local temp root suitable for AF_UNIX test sockets."""
+
+    configured = os.environ.get("HERMES_TEST_FILE_STATE_BASE")
+    if configured:
+        return Path(configured)
+    if os.name == "posix":
+        return Path("/tmp")
+    return Path(tempfile.gettempdir())
+
+
+def _isolated_file_environment() -> tuple[Path, dict[str, str]]:
+    """Create a private HOME/state namespace for one pytest file process."""
+
+    temp_base = _short_file_state_base()
+    temp_base.mkdir(parents=True, exist_ok=True)
+    state_root = Path(
+        tempfile.mkdtemp(prefix=_FILE_STATE_PREFIX, dir=str(temp_base))
+    )
+    home = state_root / "home"
+    hermes_home = home / ".hermes"
+    private_tmp = state_root / "tmp"
+    xdg_config = state_root / "xdg-config"
+    xdg_cache = state_root / "xdg-cache"
+    xdg_data = state_root / "xdg-data"
+    xdg_state = state_root / "xdg-state"
+    for directory in (
+        hermes_home,
+        private_tmp,
+        xdg_config,
+        xdg_cache,
+        xdg_data,
+        xdg_state,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    child_env = dict(os.environ)
+    child_env.update(
+        {
+            "HOME": str(home),
+            "HERMES_HOME": str(hermes_home),
+            "XDG_CONFIG_HOME": str(xdg_config),
+            "XDG_CACHE_HOME": str(xdg_cache),
+            "XDG_DATA_HOME": str(xdg_data),
+            "XDG_STATE_HOME": str(xdg_state),
+            "TMPDIR": str(private_tmp),
+            "HERMES_TEST_FILE_STATE_ROOT": str(state_root),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    return state_root, child_env
+
+
+def _remove_file_state(state_root: Path) -> None:
+    """Remove only a runner-created per-file state directory."""
+
+    if not state_root.name.startswith(_FILE_STATE_PREFIX):
+        raise RuntimeError(f"refusing to remove unexpected test root: {state_root}")
+    shutil.rmtree(state_root)
 
 
 def _approximately_count_tests(
@@ -251,60 +315,59 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+    state_root, child_env = _isolated_file_environment()
     subproc_start = time.monotonic()
-    # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
-        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
-
-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
-    # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+    proc: subprocess.Popen[str] | None = None
     pgid: int | None = None
-    if sys.platform != "win32":
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
-
+    output = ""
+    rc = 1
     try:
-        output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
-        try:
-            output, _ = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            output = "(file timeout exceeded; output unavailable)"
-        rc = 124  # de facto convention for "killed by timeout".
-        output = (
-            f"({file_timeout:.0f}s exceeded; "
-            f"process tree SIGKILL'd)\n{output}"
+        # launch the pytest process
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=child_env,
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: _kill_tree uses taskkill /F /T.
+            start_new_session=True,
         )
-    except BaseException:
-        # KeyboardInterrupt / runner crash — make sure no zombie
-        # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
-        raise
-    else:
-        # Happy path: pytest exited on its own. Kill the group anyway in
-        # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
 
-        output +=  "\n"
+        # Capture the pgid NOW, before the leader can exit and be reaped.
+        if sys.platform != "win32":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, PermissionError):
+                pgid = None
+
+        try:
+            output, _ = proc.communicate(timeout=file_timeout)
+            rc = int(proc.returncode or 0)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc, pgid=pgid)
+            try:
+                output, _ = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                output = "(file timeout exceeded; output unavailable)"
+            rc = 124  # de facto convention for "killed by timeout".
+            output = (
+                f"({file_timeout:.0f}s exceeded; "
+                f"process tree SIGKILL'd)\n{output}"
+            )
+        else:
+            output += "\n"
+    finally:
+        # Always kill the process group before deleting its private state.
+        # Happy-path pytest can still leave grandchildren behind.
+        if proc is not None:
+            _kill_tree(proc, pgid=pgid)
+        if rc != 0 and os.environ.get("HERMES_TEST_KEEP_FAILED_STATE") == "1":
+            output += f"\n(private failed-test state retained at {state_root})\n"
+        else:
+            _remove_file_state(state_root)
 
     if rc == 5:
         # No tests collected — every test in the file was filtered out.

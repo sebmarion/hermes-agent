@@ -5,7 +5,12 @@ onto the shared process_registry.completion_queue, the rich re-injection block
 formatting, capacity rejection, and crash handling.
 """
 
+import json
+import multiprocessing
+import os
+from pathlib import Path
 import queue
+import sys
 import threading
 import time
 
@@ -13,6 +18,113 @@ import pytest
 
 from tools import async_delegation as ad
 from tools.process_registry import process_registry, format_process_notification
+
+
+def _async_persistence_record(
+    delegation_id: str,
+    *,
+    status: str = "running",
+) -> dict:
+    now = time.time()
+    return {
+        "delegation_id": delegation_id,
+        "goal": delegation_id,
+        "status": status,
+        "dispatched_at": now - 1,
+        "completed_at": now if status != "running" else None,
+        "last_heartbeat_at": now,
+        "delivery_status": "running" if status == "running" else "finalizing",
+    }
+
+
+def _async_persistence_worker(
+    persistence_path: str,
+    action: str,
+    delegation_id: str,
+    connection,
+) -> None:
+    from tools import async_delegation as worker_ad
+
+    worker_ad._persistence_path = lambda: Path(persistence_path)
+    record = _async_persistence_record(
+        delegation_id,
+        status="completed" if action == "complete" else "running",
+    )
+    connection.send("ready")
+    connection.recv()
+    if action == "dispatch":
+        worker_ad._persist_record(record, delivery_status="running")
+    elif action == "complete":
+        event = {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "status": "completed",
+        }
+        worker_ad._persist_record(
+            record,
+            result={"status": "completed", "summary": delegation_id},
+            event=event,
+            delivery_status="pending",
+        )
+        worker_ad._mark_persisted_delivery(delegation_id, "queued")
+    elif action == "ack":
+        worker_ad._mark_persisted_delivery(delegation_id, "delivered")
+    connection.send(True)
+    connection.close()
+
+
+def _async_crash_before_replace(
+    persistence_path: str,
+    delegation_id: str,
+) -> None:
+    from tools import async_delegation as worker_ad
+    from tools import durable_state
+
+    worker_ad._persistence_path = lambda: Path(persistence_path)
+    durable_state.os.replace = lambda *_args, **_kwargs: os._exit(91)
+    worker_ad._persist_record(
+        _async_persistence_record(delegation_id),
+        delivery_status="running",
+    )
+    os._exit(92)
+
+
+def _async_live_dispatch_worker(
+    persistence_path: str,
+    label: str,
+    connection,
+) -> None:
+    from tools import async_delegation as worker_ad
+
+    worker_ad._persistence_path = lambda: Path(persistence_path)
+    release = threading.Event()
+
+    def runner() -> dict:
+        release.wait(timeout=10)
+        return {
+            "status": "completed",
+            "summary": label,
+            "model": "test",
+        }
+
+    dispatched = worker_ad.dispatch_async_delegation(
+        goal=label,
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test",
+        session_key=label,
+        runner=runner,
+        max_async_children=1,
+    )
+    connection.send(dispatched)
+    if connection.recv() == "complete":
+        release.set()
+        deadline = time.monotonic() + 10
+        while worker_ad.active_count() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        connection.send(worker_ad.active_count())
+    connection.close()
 
 
 def _wait_for_async_idle(timeout=5.0):
@@ -370,9 +482,299 @@ def test_completion_is_persisted_before_delivery_ack():
     assert entry["result"]["summary"] == "persist me"
     assert entry["event"]["delegation_id"] == res["delegation_id"]
 
-    ad.mark_async_delegation_delivered(evt)
+    assert ad.mark_async_delegation_delivered(evt) is True
     data = ad._read_persisted_unlocked()
     assert data["records"][res["delegation_id"]]["delivery_status"] == "delivered"
+
+
+def test_delivery_ack_reports_persistence_failure_and_keeps_memory_queued(monkeypatch):
+    def runner():
+        return {"status": "completed", "summary": "retry me", "model": "m"}
+
+    res = ad.dispatch_async_delegation(
+        goal="durable task", context=None, toolsets=None, role="leaf", model="m",
+        session_key="sess", runner=runner, max_async_children=1,
+    )
+    evt = _drain_one(delegation_id=res["delegation_id"])
+    assert evt is not None
+
+    def fail_write(_data):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(ad, "_write_persisted_unlocked", fail_write)
+
+    assert ad.mark_async_delegation_delivered(evt) is False
+    with ad._records_lock:
+        assert ad._records[res["delegation_id"]]["delivery_status"] == "queued"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file locks")
+def test_two_live_runtimes_dispatch_and_complete_without_stealing_ownership(
+    tmp_path,
+):
+    persistence = tmp_path / "async_delegations.json"
+    context = multiprocessing.get_context("spawn")
+    parent_a, child_a = context.Pipe()
+    parent_b, child_b = context.Pipe()
+    workers = [
+        context.Process(
+            target=_async_live_dispatch_worker,
+            args=(os.fspath(persistence), "runtime-a", child_a),
+        ),
+        context.Process(
+            target=_async_live_dispatch_worker,
+            args=(os.fspath(persistence), "runtime-b", child_b),
+        ),
+    ]
+    for worker in workers:
+        worker.start()
+    result_a = parent_a.recv()
+    result_b = parent_b.recv()
+    assert result_a["status"] == "dispatched"
+    assert result_b["status"] == "dispatched"
+
+    running = json.loads(
+        persistence.read_text(encoding="utf-8")
+    )["records"]
+    assert set(running) == {
+        result_a["delegation_id"],
+        result_b["delegation_id"],
+    }
+    assert {entry["status"] for entry in running.values()} == {"running"}
+    assert len(
+        {
+            entry["record"]["runtime_owner_id"]
+            for entry in running.values()
+        }
+    ) == 2
+
+    parent_a.send("complete")
+    parent_b.send("complete")
+    assert parent_a.recv() == 0
+    assert parent_b.recv() == 0
+    for worker in workers:
+        worker.join(timeout=10)
+        assert worker.exitcode == 0
+
+    completed = json.loads(
+        persistence.read_text(encoding="utf-8")
+    )["records"]
+    assert set(completed) == set(running)
+    assert {entry["status"] for entry in completed.values()} == {
+        "completed"
+    }
+    assert {entry["delivery_status"] for entry in completed.values()} == {
+        "queued"
+    }
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file locks")
+def test_multiprocess_dispatch_dispatch_preserves_both_records(tmp_path):
+    persistence = tmp_path / "async_delegations.json"
+    context = multiprocessing.get_context("spawn")
+    parents = []
+    workers = []
+    for delegation_id in ("deleg_runtime_a", "deleg_runtime_b"):
+        parent, child = context.Pipe()
+        parents.append(parent)
+        workers.append(
+            context.Process(
+                target=_async_persistence_worker,
+                args=(
+                    os.fspath(persistence),
+                    "dispatch",
+                    delegation_id,
+                    child,
+                ),
+            )
+        )
+    for worker in workers:
+        worker.start()
+    for parent in parents:
+        assert parent.recv() == "ready"
+    for parent in parents:
+        parent.send("go")
+    for parent in parents:
+        assert parent.recv() is True
+    for worker in workers:
+        worker.join(timeout=10)
+        assert worker.exitcode == 0
+
+    durable = json.loads(persistence.read_text(encoding="utf-8"))
+    assert set(durable["records"]) == {
+        "deleg_runtime_a",
+        "deleg_runtime_b",
+    }
+    assert persistence.stat().st_mode & 0o777 == 0o600
+    assert (
+        persistence.with_name(f".{persistence.name}.lock").stat().st_mode
+        & 0o777
+    ) == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file locks")
+def test_multiprocess_complete_and_dispatch_preserve_both_records(tmp_path):
+    persistence = tmp_path / "async_delegations.json"
+    baseline = _async_persistence_record("deleg_complete")
+    ad._persistence_path = lambda: persistence
+    ad._persist_record(baseline, delivery_status="running")
+
+    context = multiprocessing.get_context("spawn")
+    parent_complete, child_complete = context.Pipe()
+    parent_dispatch, child_dispatch = context.Pipe()
+    complete = context.Process(
+        target=_async_persistence_worker,
+        args=(
+            os.fspath(persistence),
+            "complete",
+            "deleg_complete",
+            child_complete,
+        ),
+    )
+    dispatch = context.Process(
+        target=_async_persistence_worker,
+        args=(
+            os.fspath(persistence),
+            "dispatch",
+            "deleg_new",
+            child_dispatch,
+        ),
+    )
+    complete.start()
+    dispatch.start()
+    assert parent_complete.recv() == "ready"
+    assert parent_dispatch.recv() == "ready"
+    parent_complete.send("go")
+    parent_dispatch.send("go")
+    assert parent_complete.recv() is True
+    assert parent_dispatch.recv() is True
+    complete.join(timeout=10)
+    dispatch.join(timeout=10)
+    assert complete.exitcode == 0
+    assert dispatch.exitcode == 0
+
+    records = json.loads(
+        persistence.read_text(encoding="utf-8")
+    )["records"]
+    assert set(records) == {"deleg_complete", "deleg_new"}
+    assert records["deleg_complete"]["status"] == "completed"
+    assert records["deleg_complete"]["delivery_status"] == "queued"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file locks")
+def test_multiprocess_complete_and_ack_never_downgrade_delivered(tmp_path):
+    persistence = tmp_path / "async_delegations.json"
+    delegation_id = "deleg_ack_race"
+    ad._persistence_path = lambda: persistence
+    completed = _async_persistence_record(delegation_id, status="completed")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "status": "completed",
+    }
+    ad._persist_record(
+        completed,
+        result={"status": "completed", "summary": "done"},
+        event=event,
+        delivery_status="queued",
+    )
+
+    context = multiprocessing.get_context("spawn")
+    parent_complete, child_complete = context.Pipe()
+    parent_ack, child_ack = context.Pipe()
+    complete = context.Process(
+        target=_async_persistence_worker,
+        args=(
+            os.fspath(persistence),
+            "complete",
+            delegation_id,
+            child_complete,
+        ),
+    )
+    ack = context.Process(
+        target=_async_persistence_worker,
+        args=(os.fspath(persistence), "ack", delegation_id, child_ack),
+    )
+    complete.start()
+    ack.start()
+    assert parent_complete.recv() == "ready"
+    assert parent_ack.recv() == "ready"
+    parent_complete.send("go")
+    parent_ack.send("go")
+    assert parent_complete.recv() is True
+    assert parent_ack.recv() is True
+    complete.join(timeout=10)
+    ack.join(timeout=10)
+    assert complete.exitcode == 0
+    assert ack.exitcode == 0
+
+    entry = json.loads(
+        persistence.read_text(encoding="utf-8")
+    )["records"][delegation_id]
+    assert entry["delivery_status"] == "delivered"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX crash injection")
+def test_async_crash_before_replace_preserves_prior_records(tmp_path):
+    persistence = tmp_path / "async_delegations.json"
+    ad._persistence_path = lambda: persistence
+    ad._persist_record(
+        _async_persistence_record("deleg_baseline"),
+        delivery_status="running",
+    )
+    before = persistence.read_bytes()
+
+    context = multiprocessing.get_context("spawn")
+    crashing = context.Process(
+        target=_async_crash_before_replace,
+        args=(os.fspath(persistence), "deleg_crashing"),
+    )
+    crashing.start()
+    crashing.join(timeout=10)
+    assert crashing.exitcode == 91
+    assert persistence.read_bytes() == before
+
+
+def test_malformed_async_authority_is_preserved_fail_closed(tmp_path):
+    persistence = tmp_path / "async_delegations.json"
+    persistence.write_text("{not json", encoding="utf-8")
+    persistence.chmod(0o600)
+    before = persistence.read_bytes()
+    ad._persistence_path = lambda: persistence
+
+    ad._persist_record(
+        _async_persistence_record("deleg_must_not_overwrite"),
+        delivery_status="running",
+    )
+
+    assert persistence.read_bytes() == before
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "symlink"),
+    reason="symlinks unavailable",
+)
+def test_async_authority_symlink_is_rejected_without_touching_target(tmp_path):
+    victim = tmp_path / "victim.json"
+    victim.write_text(
+        json.dumps({"version": 1, "records": {}}),
+        encoding="utf-8",
+    )
+    victim.chmod(0o600)
+    before = victim.read_bytes()
+    persistence = tmp_path / "async_delegations.json"
+    persistence.symlink_to(victim)
+    ad._persistence_path = lambda: persistence
+
+    assert (
+        ad._persist_record(
+            _async_persistence_record("deleg_symlink"),
+            delivery_status="running",
+        )
+        is False
+    )
+    assert persistence.is_symlink()
+    assert victim.read_bytes() == before
 
 
 def test_recovery_replays_unacked_and_marks_prior_running_lost():
@@ -413,6 +815,9 @@ def test_recovery_replays_unacked_and_marks_prior_running_lost():
                     "dispatched_at": now - 30,
                     "last_heartbeat_at": now - 20,
                     "session_key": "sess",
+                    "runtime_owner_id": "runtime_dead",
+                    "runtime_owner_pid": 2_147_483_647,
+                    "runtime_owner_start_token": "dead-owner-token",
                 },
             },
         },
@@ -431,6 +836,28 @@ def test_recovery_replays_unacked_and_marks_prior_running_lost():
     stored = ad._read_persisted_unlocked()["records"]
     assert stored["running"]["status"] == "lost"
     assert stored["running"]["delivery_status"] == "queued"
+
+    assert ad.recover_async_delegations() == {"queued": 0, "lost": 0}
+    assert process_registry.completion_queue.empty()
+
+
+def test_startup_recovery_does_not_duplicate_live_event_already_queued():
+    def runner():
+        return {"status": "completed", "summary": "one event", "model": "m"}
+
+    res = ad.dispatch_async_delegation(
+        goal="live completion", context=None, toolsets=None, role="leaf", model="m",
+        session_key="sess", runner=runner, max_async_children=1,
+    )
+    _wait_for_async_idle()
+    deadline = time.monotonic() + 2
+    while process_registry.completion_queue.qsize() < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert process_registry.completion_queue.qsize() == 1
+
+    assert ad.recover_async_delegations() == {"queued": 0, "lost": 0}
+    assert process_registry.completion_queue.qsize() == 1
+    assert process_registry.completion_queue.get_nowait()["delegation_id"] == res["delegation_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +899,13 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     # remain active while the background worker runs.
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
-    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials_for_task",
+        lambda *a, **k: creds,
+    )
+    monkeypatch.setattr(dt, "_resolve_lane_for_task", lambda *a, **k: "code_worker")
+    monkeypatch.setattr(dt, "_preflight_lane_toolsets", lambda *a, **k: None)
     out = dt.delegate_task(
         goal="the real task", context="ctx",
         background=True, parent_agent=parent,
@@ -528,7 +961,13 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
         "api_mode": None, "command": None, "args": None,
     }
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
-    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials_for_task",
+        lambda *a, **k: creds,
+    )
+    monkeypatch.setattr(dt, "_resolve_lane_for_task", lambda *a, **k: "code_worker")
+    monkeypatch.setattr(dt, "_preflight_lane_toolsets", lambda *a, **k: None)
     monkeypatch.setattr(
         dt,
         "_run_single_child",
@@ -602,7 +1041,13 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     # has already returned.
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", _blocking_child)
-    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials_for_task",
+        lambda *a, **k: creds,
+    )
+    monkeypatch.setattr(dt, "_resolve_lane_for_task", lambda *a, **k: "code_worker")
+    monkeypatch.setattr(dt, "_preflight_lane_toolsets", lambda *a, **k: None)
     out = dt.delegate_task(
         tasks=[{"goal": "a"}, {"goal": "b"}, {"goal": "c"}],
         background=True,
@@ -754,7 +1199,13 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     }
     with patch.object(dt, "_build_child_agent", side_effect=build_and_register), \
          patch.object(dt, "_run_single_child", side_effect=slow_child), \
-         patch.object(dt, "_resolve_delegation_credentials", return_value=creds):
+         patch.object(
+             dt,
+             "_resolve_delegation_credentials_for_task",
+             return_value=creds,
+         ), \
+         patch.object(dt, "_resolve_lane_for_task", return_value="code_worker"), \
+         patch.object(dt, "_preflight_lane_toolsets", return_value=None):
         out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
 
     import json
@@ -886,5 +1337,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-

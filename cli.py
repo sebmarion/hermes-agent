@@ -90,6 +90,68 @@ except Exception:
 import threading
 import queue
 
+
+def _enqueue_automatic_notification(
+    pending_input: "queue.Queue", event: dict, prompt: str
+) -> None:
+    """Queue a synthetic turn while preserving its durable delivery receipt."""
+    pending_input.put(
+        (
+            prompt,
+            [],
+            {"kind": "automatic_notification", "event": event},
+        )
+    )
+
+
+def _notification_turn_committed(
+    conversation_history: object,
+    history_start: int,
+    prompt: object,
+    *,
+    turn_succeeded: bool = True,
+) -> bool:
+    """Prove a successful synthetic user/assistant turn reached CLI history."""
+    if (
+        not turn_succeeded
+        or not isinstance(conversation_history, list)
+        or not isinstance(prompt, str)
+    ):
+        return False
+    start = max(0, int(history_start))
+    saw_prompt = False
+    for message in conversation_history[start:]:
+        if not isinstance(message, dict):
+            continue
+        if (
+            message.get("role") == "user"
+            and message.get("content") == prompt
+        ):
+            saw_prompt = True
+            continue
+        if saw_prompt and message.get("role") == "assistant":
+            return True
+    return False
+
+
+def _start_process_loop_with_durable_recovery(process_loop) -> threading.Thread:
+    """Replay durable work before the CLI notification consumer starts."""
+    try:
+        from tools.process_registry import process_registry
+
+        process_registry.recover_completion_notifications()
+    except Exception:
+        logger.exception("Failed to replay durable process notifications")
+    try:
+        from tools.async_delegation import recover_async_delegations
+
+        recover_async_delegations()
+    except Exception:
+        logger.exception("Failed to replay durable async delegation notifications")
+    process_thread = threading.Thread(target=process_loop, daemon=True)
+    process_thread.start()
+    return process_thread
+
 def CanonicalUsage(*args, **kwargs):
     from agent.usage_pricing import CanonicalUsage as _CanonicalUsage
 
@@ -12123,6 +12185,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         Returns:
             The agent's response, or None on error
         """
+        self._last_chat_turn_commit_proven = False
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
@@ -12790,6 +12854,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            self._last_chat_turn_commit_proven = bool(
+                result
+                and result.get("completed") is True
+                and not result.get("failed")
+                and not result.get("partial")
+                and not result.get("interrupted")
+                and not result.get("cleanup_errors")
+            )
             return response
             
         except Exception as e:
@@ -15221,8 +15293,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                                 from tools.process_registry import process_registry
                                 from tools.approval import get_current_session_key
                                 _drain_sk = get_current_session_key(default="")
-                                for _evt, _synth in process_registry.drain_notifications(session_key=_drain_sk):
-                                    self._pending_input.put(_synth)
+                                for _evt, _synth in process_registry.drain_notifications(
+                                    session_key=_drain_sk,
+                                    ack_async=False,
+                                ):
+                                    _enqueue_automatic_notification(
+                                        self._pending_input,
+                                        _evt,
+                                        _synth,
+                                    )
                             except Exception:
                                 pass
                         continue
@@ -15333,10 +15412,40 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     self._pet_reasoning = False
                     app.invalidate()  # Refresh status line
 
+                    _automatic_event = None
+                    _automatic_prompt = None
+                    _automatic_history_start = len(self.conversation_history)
+                    if (
+                        isinstance(_internal_meta, dict)
+                        and _internal_meta.get("kind") == "automatic_notification"
+                    ):
+                        _automatic_event = _internal_meta.get("event")
+                        _automatic_prompt = user_input
+
+                    self._last_chat_turn_commit_proven = False
                     try:
                         self.chat(user_input, images=submit_images or None)
                     finally:
                         self._agent_running = False
+                        if isinstance(_automatic_event, dict):
+                            try:
+                                from tools.process_registry import process_registry
+
+                                process_registry.finish_notification_delivery(
+                                    _automatic_event,
+                                    _notification_turn_committed(
+                                        self.conversation_history,
+                                        _automatic_history_start,
+                                        _automatic_prompt,
+                                        turn_succeeded=bool(
+                                            self._last_chat_turn_commit_proven
+                                        ),
+                                    ),
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to finalize automatic notification delivery"
+                                )
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
                         self._pending_tool_info.clear()
@@ -15397,17 +15506,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         # that arrived while the agent was running.
                         try:
                             from tools.process_registry import process_registry
-                            for _evt, _synth in process_registry.drain_notifications():
-                                self._pending_input.put(_synth)
+                            for _evt, _synth in process_registry.drain_notifications(
+                                ack_async=False,
+                            ):
+                                _enqueue_automatic_notification(
+                                    self._pending_input,
+                                    _evt,
+                                    _synth,
+                                )
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
 
                 except Exception as e:
                     logger.warning("process_loop unhandled error (msg may be lost): %s", e)
         
-        # Start processing thread
-        process_thread = threading.Thread(target=process_loop, daemon=True)
-        process_thread.start()
+        # Start the delivery owner only after both durable outboxes replay.
+        process_thread = _start_process_loop_with_durable_recovery(process_loop)
         
         # Register atexit cleanup so resources are freed even on unexpected exit
         atexit.register(_run_cleanup)

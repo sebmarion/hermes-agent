@@ -375,6 +375,78 @@ class TestPatchSensitivePathExtraction:
 
 class TestSearchHandler:
     @patch("tools.file_tools._get_file_ops")
+    def test_obvious_glob_in_content_mode_fails_fast_with_typed_correction(self, mock_get):
+        from tools.file_tools import search_tool
+
+        result = json.loads(
+            search_tool(pattern="*.spec.ts", target="content", path=".")
+        )
+
+        assert result["error_code"] == "search_files_glob_used_as_content_regex"
+        assert result["error_class"] == "schema_correctable"
+        assert result["retry_policy"] == {"max_corrected_retries": 1}
+        assert result["correction"] == {
+            "target": "files",
+            "pattern": "*.spec.ts",
+        }
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_valid_regex_that_contains_wildcards_is_not_reinterpreted(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"matches": []}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import search_tool
+        result = json.loads(
+            search_tool(
+                pattern=r".*\\.spec\\.ts$",
+                target="content",
+                path=".",
+                file_glob="*.ts",
+            )
+        )
+
+        assert "error" not in result
+        mock_ops.search.assert_called_once_with(
+            pattern=r".*\\.spec\\.ts$",
+            path=".",
+            target="content",
+            file_glob="*.ts",
+            limit=50,
+            offset=0,
+            output_mode="content",
+            context=0,
+        )
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_explicit_file_target_keeps_glob_semantics(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"files": ["example.spec.ts"]}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import search_tool
+        result = json.loads(
+            search_tool(pattern="*.spec.ts", target="files", path=".")
+        )
+
+        assert result["files"] == ["example.spec.ts"]
+        mock_ops.search.assert_called_once_with(
+            pattern="*.spec.ts",
+            path=".",
+            target="files",
+            file_glob=None,
+            limit=50,
+            offset=0,
+            output_mode="content",
+            context=0,
+        )
+
+    @patch("tools.file_tools._get_file_ops")
     def test_search_calls_file_ops(self, mock_get):
         mock_ops = MagicMock()
         result_obj = MagicMock()

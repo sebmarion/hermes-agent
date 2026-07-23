@@ -35,10 +35,12 @@ import os
 import platform
 import shlex
 import signal
+import stat
 import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
@@ -47,12 +49,26 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
+from tools.durable_state import (
+    FileIdentity,
+    atomic_write_private_json,
+    interprocess_authority_lock,
+    read_private_json,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# Checkpoint file for crash recovery (gateway only)
-CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+# Resolve only the trusted parent. Resolving the full leaf would follow a
+# pre-existing authority-file symlink before the no-follow open can reject it.
+_HERMES_HOME_PATH = Path(get_hermes_home()).resolve()
+CHECKPOINT_PATH = _HERMES_HOME_PATH / "processes.json"
+NOTIFICATIONS_PATH = _HERMES_HOME_PATH / "process_notifications.json"
+COMPLETION_OUTBOX_VERSION = 1
+MAX_COMPLETION_OUTBOX_RECORDS = 4096
+COMPLETION_OUTBOX_DELIVERED_TTL_SECONDS = 7 * 24 * 60 * 60
+MAX_COMPLETION_OUTBOX_BYTES = 16 * 1024 * 1024
+MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -74,6 +90,16 @@ WATCH_STRIKE_LIMIT = 3            # Strikes in a row → disable watch + promote
 WATCH_GLOBAL_MAX_PER_WINDOW = 15
 WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
+
+
+def _process_admission_anchor(
+    checkpoint_path: Optional[Path] = None,
+) -> Path:
+    """Return the stable anchor whose sibling lock gates process creation."""
+    authority = Path(
+        CHECKPOINT_PATH if checkpoint_path is None else checkpoint_path
+    )
+    return authority.with_name(f"{authority.name}.admission")
 
 
 def format_uptime_short(seconds: int) -> str:
@@ -100,6 +126,7 @@ class ProcessSession:
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
+    process_start_token: Optional[str] = None   # canonical exact OS PID/start token
     exited: bool = False                        # Whether the process has finished
     exit_code: Optional[int] = None             # Exit code (None if still running)
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
@@ -160,7 +187,31 @@ class ProcessRegistry:
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
+        self._finalizing: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+
+        # Completion notifications use a separate durable outbox. A process
+        # remains release-visible in ``_running`` + ``_finalizing`` until its
+        # completion record is fsynced and queued. Consumers ACK the stable
+        # event id only after they durably own the resulting continuation.
+        self._completion_outbox_lock = threading.Lock()
+        self._completion_outbox: Dict[str, Dict[str, Any]] = {}
+        self._completion_outbox_loaded = False
+        self._completion_outbox_available = True
+        self._completion_outbox_replayed: set[str] = set()
+
+        # ``processes.json`` is the crash-recovery authority for background
+        # work. Until startup has securely reconciled it (or a spawn has
+        # durably created it), an in-memory zero is not proof of quiescence.
+        # A malformed/unsafe recovery source blocks later writes so evidence
+        # is never silently replaced with ``[]``.
+        self._checkpoint_io_lock = threading.RLock()
+        self._process_checkpoint_available = False
+        self._process_checkpoint_reason = "unverified"
+        self._checkpoint_write_blocked = False
+        self._checkpoint_owner_id = ""
+        self._checkpoint_owner_pid = 0
+        self._checkpoint_owner_start_token = ""
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -205,6 +256,185 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    @staticmethod
+    def _completion_event_id(session_id: str) -> str:
+        return f"process:{session_id}:completion"
+
+    @staticmethod
+    def _validate_completion_record(event_id: str, raw: object) -> Dict[str, Any]:
+        if not isinstance(raw, dict) or raw.get("event_id") != event_id:
+            raise ValueError("process completion record identity is invalid")
+        if raw.get("type") != "completion":
+            raise ValueError("process completion record type is invalid")
+        session_id = str(raw.get("session_id") or "")
+        if not session_id or event_id != ProcessRegistry._completion_event_id(session_id):
+            raise ValueError("process completion session identity is invalid")
+        if not isinstance(raw.get("delivered"), bool):
+            raise ValueError("process completion delivery state is invalid")
+        created_at = raw.get("created_at")
+        if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+            raise ValueError("process completion timestamp is invalid")
+        record = dict(raw)
+        record["session_id"] = session_id
+        record["event_id"] = event_id
+        return record
+
+    def _read_completion_outbox_snapshot_locked(
+        self,
+    ) -> tuple[Dict[str, Dict[str, Any]], Optional[FileIdentity]]:
+        try:
+            raw, identity = read_private_json(
+                NOTIFICATIONS_PATH,
+                max_bytes=MAX_COMPLETION_OUTBOX_BYTES,
+            )
+        except FileNotFoundError:
+            return {}, None
+        if (
+            not isinstance(raw, dict)
+            or raw.get("version") != COMPLETION_OUTBOX_VERSION
+            or not isinstance(raw.get("events"), dict)
+        ):
+            raise ValueError("process completion outbox schema is invalid")
+        events = {
+            event_id: self._validate_completion_record(event_id, record)
+            for event_id, record in raw["events"].items()
+            if isinstance(event_id, str)
+        }
+        if len(events) != len(raw["events"]):
+            raise ValueError("process completion outbox event id is invalid")
+        return events, identity
+
+    def _ensure_completion_outbox_loaded_locked(self) -> None:
+        try:
+            with interprocess_authority_lock(NOTIFICATIONS_PATH):
+                events, _identity = self._read_completion_outbox_snapshot_locked()
+        except Exception:
+            self._completion_outbox_available = False
+            raise
+        self._completion_outbox = events
+        self._completion_outbox_loaded = True
+        self._completion_outbox_available = True
+
+    def _prune_completion_outbox_locked(self) -> None:
+        now = time.time()
+        expired = [
+            event_id
+            for event_id, record in self._completion_outbox.items()
+            if record.get("delivered") is True
+            and now - float(record.get("delivered_at") or record["created_at"])
+            > COMPLETION_OUTBOX_DELIVERED_TTL_SECONDS
+        ]
+        for event_id in expired:
+            self._completion_outbox.pop(event_id, None)
+            self._completion_outbox_replayed.discard(event_id)
+        if len(self._completion_outbox) <= MAX_COMPLETION_OUTBOX_RECORDS:
+            return
+        delivered = sorted(
+            (
+                (float(record.get("delivered_at") or record["created_at"]), event_id)
+                for event_id, record in self._completion_outbox.items()
+                if record.get("delivered") is True
+            )
+        )
+        for _timestamp, event_id in delivered:
+            if len(self._completion_outbox) <= MAX_COMPLETION_OUTBOX_RECORDS:
+                break
+            self._completion_outbox.pop(event_id, None)
+            self._completion_outbox_replayed.discard(event_id)
+        if len(self._completion_outbox) > MAX_COMPLETION_OUTBOX_RECORDS:
+            raise RuntimeError("process completion outbox capacity is exhausted")
+
+    def _write_completion_outbox_locked(self) -> None:
+        proposed = {
+            event_id: self._validate_completion_record(event_id, record)
+            for event_id, record in self._completion_outbox.items()
+        }
+        try:
+            with interprocess_authority_lock(NOTIFICATIONS_PATH):
+                current, expected_identity = (
+                    self._read_completion_outbox_snapshot_locked()
+                )
+                merged = dict(current)
+                for event_id, candidate in proposed.items():
+                    durable = merged.get(event_id)
+                    if durable is None:
+                        merged[event_id] = candidate
+                        continue
+                    durable_payload = {
+                        key: value
+                        for key, value in durable.items()
+                        if key not in {"delivered", "delivered_at"}
+                    }
+                    candidate_payload = {
+                        key: value
+                        for key, value in candidate.items()
+                        if key not in {"delivered", "delivered_at"}
+                    }
+                    if durable_payload != candidate_payload:
+                        raise ValueError(
+                            "process completion event identity collision"
+                        )
+                    if (
+                        candidate.get("delivered") is True
+                        and durable.get("delivered") is not True
+                    ):
+                        merged[event_id] = candidate
+
+                self._completion_outbox = merged
+                self._prune_completion_outbox_locked()
+                atomic_write_private_json(
+                    NOTIFICATIONS_PATH,
+                    {
+                        "version": COMPLETION_OUTBOX_VERSION,
+                        "events": self._completion_outbox,
+                    },
+                    expected=expected_identity,
+                    max_bytes=MAX_COMPLETION_OUTBOX_BYTES,
+                )
+        except Exception:
+            self._completion_outbox_available = False
+            raise
+        self._completion_outbox_loaded = True
+        self._completion_outbox_available = True
+
+    @staticmethod
+    def _public_completion_event(record: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key: value
+            for key, value in record.items()
+            if key not in {"delivered", "delivered_at"}
+        }
+
+    def _build_completion_record(self, session: ProcessSession) -> Dict[str, Any]:
+        from tools.ansi_strip import strip_ansi
+
+        with session._lock:
+            output_tail = (
+                strip_ansi(session.output_buffer[-2000:])
+                if session.output_buffer
+                else ""
+            )
+            return {
+                "event_id": self._completion_event_id(session.id),
+                "type": "completion",
+                "session_id": session.id,
+                "session_key": session.session_key,
+                "platform": session.watcher_platform,
+                "chat_id": session.watcher_chat_id,
+                "user_id": session.watcher_user_id,
+                "user_name": session.watcher_user_name,
+                "thread_id": session.watcher_thread_id,
+                "message_id": session.watcher_message_id,
+                "command": session.command,
+                "exit_code": session.exit_code,
+                "completion_reason": session.completion_reason,
+                "termination_source": session.termination_source,
+                "output": output_tail,
+                "created_at": time.time(),
+                "delivered": False,
+                "delivered_at": None,
+            }
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -461,6 +691,53 @@ class ProcessRegistry:
         except Exception:
             return None
 
+    @staticmethod
+    def _safe_host_start_token(pid: Optional[int]) -> Optional[str]:
+        """Canonical exact OS process identity token, or None when unavailable."""
+        if not pid:
+            return None
+        try:
+            from gateway.status import get_process_start_token
+
+            token = get_process_start_token(pid)
+            return token if isinstance(token, str) and token else None
+        except Exception:
+            return None
+
+    @classmethod
+    def _host_pid_matches_exact_token(
+        cls,
+        pid: Optional[int],
+        expected_token: object,
+    ) -> bool:
+        """Match a live process only with its canonical PID-bound start token."""
+        return (
+            isinstance(expected_token, str)
+            and bool(expected_token)
+            and cls._is_host_pid_alive(pid)
+            and cls._safe_host_start_token(pid) == expected_token
+        )
+
+    def _ensure_checkpoint_owner_identity(self) -> tuple[str, int, str]:
+        """Return a fork-safe runtime owner identity for checkpoint merges."""
+        pid = os.getpid()
+        token = self._safe_host_start_token(pid)
+        if token is None:
+            raise RuntimeError("current runtime process identity is unavailable")
+        if (
+            self._checkpoint_owner_pid != pid
+            or self._checkpoint_owner_start_token != token
+            or not self._checkpoint_owner_id
+        ):
+            self._checkpoint_owner_pid = pid
+            self._checkpoint_owner_start_token = token
+            self._checkpoint_owner_id = f"runtime_{uuid.uuid4().hex}"
+        return (
+            self._checkpoint_owner_id,
+            self._checkpoint_owner_pid,
+            self._checkpoint_owner_start_token,
+        )
+
     @classmethod
     def _host_pid_is_ours(cls, pid: Optional[int], expected_start: Optional[int]) -> bool:
         """True only if ``pid`` is alive AND still the process we spawned.
@@ -679,7 +956,61 @@ class ProcessRegistry:
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return "/tmp"
 
+    @staticmethod
+    def _terminate_env_process_group(env: Any, pid: Optional[int]) -> bool:
+        """Terminate and verify the dedicated sandbox process group."""
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return False
+        command = (
+            f"kill -TERM -- -{pid} 2>/dev/null || true; "
+            "attempt=0; "
+            f"while kill -0 -- -{pid} 2>/dev/null && [ $attempt -lt 20 ]; do "
+            "sleep 0.05; attempt=$((attempt + 1)); done; "
+            f"if kill -0 -- -{pid} 2>/dev/null; then "
+            f"kill -KILL -- -{pid} 2>/dev/null || true; sleep 0.05; fi; "
+            f"! kill -0 -- -{pid} 2>/dev/null"
+        )
+        try:
+            result = env.execute(
+                command,
+                timeout=5,
+                rewrite_compound_background=False,
+            )
+        except Exception:
+            logger.error(
+                "Sandbox process-group termination probe failed for pid %d",
+                pid,
+                exc_info=True,
+            )
+            return False
+        verified = result.get("returncode", 0) == 0
+        if not verified:
+            logger.error(
+                "Sandbox process group %d survived termination attempt", pid
+            )
+        return verified
+
     def spawn_local(
+        self,
+        command: str,
+        cwd: str = None,
+        task_id: str = "",
+        session_key: str = "",
+        env_vars: dict = None,
+        use_pty: bool = False,
+    ) -> ProcessSession:
+        """Admit and durably register one local process as one transaction."""
+        with interprocess_authority_lock(_process_admission_anchor()):
+            return self._spawn_local_admitted(
+                command,
+                cwd=cwd,
+                task_id=task_id,
+                session_key=session_key,
+                env_vars=env_vars,
+                use_pty=use_pty,
+            )
+
+    def _spawn_local_admitted(
         self,
         command: str,
         cwd: str = None,
@@ -709,6 +1040,8 @@ class ProcessRegistry:
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
+            pty_proc = None
+            checkpoint_committed = False
             try:
                 if _IS_WINDOWS:
                     from winpty import PtyProcess as _PtyProcessCls
@@ -728,7 +1061,19 @@ class ProcessRegistry:
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
-                # PTY reader thread
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
+
+                checkpoint_receipt = self._write_checkpoint()
+                if checkpoint_receipt is not True:
+                    raise RuntimeError(
+                        "Background process checkpoint is not durable"
+                    )
+                checkpoint_committed = checkpoint_receipt is True
+
+                # Start consuming output only after the process is durably
+                # discoverable by the next gateway instance.
                 reader = threading.Thread(
                     target=self._pty_reader_loop,
                     args=(session,),
@@ -737,18 +1082,29 @@ class ProcessRegistry:
                 )
                 session._reader_thread = reader
                 reader.start()
-
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
-
-                self._write_checkpoint()
                 return session
 
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
-                logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                if pty_proc is None:
+                    logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                else:
+                    # Once a PTY exists, falling through to Popen would launch
+                    # the command twice. Terminate this exact PTY and surface
+                    # the setup failure instead.
+                    try:
+                        pty_proc.terminate(force=True)
+                    except Exception:
+                        if session.pid:
+                            self._terminate_host_pid(
+                                session.pid, session.host_start_time
+                            )
+                    with self._lock:
+                        self._running.pop(session.id, None)
+                    if checkpoint_committed:
+                        self._write_checkpoint()
+                    raise
 
         # Standard Popen path (non-PTY or PTY fallback)
         # Use the user's login shell for consistency with LocalEnvironment --
@@ -779,8 +1135,18 @@ class ProcessRegistry:
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
 
+        checkpoint_committed = False
         try:
-            # Start output reader thread
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
+
+            checkpoint_receipt = self._write_checkpoint()
+            if checkpoint_receipt is not True:
+                raise RuntimeError("Background process checkpoint is not durable")
+            checkpoint_committed = checkpoint_receipt is True
+
+            # Start the reader only after the durable registry commit.
             reader = threading.Thread(
                 target=self._reader_loop,
                 args=(session,),
@@ -789,12 +1155,6 @@ class ProcessRegistry:
             )
             session._reader_thread = reader
             reader.start()
-
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
-
-            self._write_checkpoint()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -814,11 +1174,35 @@ class ProcessRegistry:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            with self._lock:
+                self._running.pop(session.id, None)
+            if checkpoint_committed:
+                self._write_checkpoint()
             raise
 
         return session
 
     def spawn_via_env(
+        self,
+        env: Any,
+        command: str,
+        cwd: str = None,
+        task_id: str = "",
+        session_key: str = "",
+        timeout: int = 10,
+    ) -> ProcessSession:
+        """Admit and durably register one sandbox process as one transaction."""
+        with interprocess_authority_lock(_process_admission_anchor()):
+            return self._spawn_via_env_admitted(
+                env,
+                command,
+                cwd=cwd,
+                task_id=task_id,
+                session_key=session_key,
+                timeout=timeout,
+            )
+
+    def _spawn_via_env_admitted(
         self,
         env: Any,
         command: str,
@@ -854,16 +1238,25 @@ class ProcessRegistry:
         log_path = f"{temp_dir}/hermes_bg_{session.id}.log"
         pid_path = f"{temp_dir}/hermes_bg_{session.id}.pid"
         exit_path = f"{temp_dir}/hermes_bg_{session.id}.exit"
-        quoted_command = shlex.quote(command)
         quoted_temp_dir = shlex.quote(temp_dir)
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
+        inner_command = (
+            f"{command}; rc=$?; "
+            f"printf '%s\\n' \"$rc\" > {quoted_exit_path}; exit \"$rc\""
+        )
+        quoted_inner_command = shlex.quote(inner_command)
         bg_command = (
-            f"mkdir -p {quoted_temp_dir} && "
-            f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
-            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
-            f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
+            "set +m; "
+            f"mkdir -p {quoted_temp_dir} || exit $?; "
+            "if ! command -v setsid >/dev/null 2>&1; then "
+            "printf '%s\\n' 'setsid is required for managed background work' >&2; "
+            "exit 126; fi; "
+            f"nohup setsid bash -lc {quoted_inner_command} "
+            f"> {quoted_log_path} 2>&1 < /dev/null & "
+            f"bg_pid=$!; printf '%s\\n' \"$bg_pid\" > {quoted_pid_path}; "
+            f"cat {quoted_pid_path}"
         )
 
         try:
@@ -897,24 +1290,44 @@ class ProcessRegistry:
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
 
-        if not session.exited:
-            # Start a poller thread that periodically reads the log file
-            reader = threading.Thread(
-                target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
-                daemon=True,
-                name=f"proc-poller-{session.id}",
-            )
-            session._reader_thread = reader
-            reader.start()
-
         with self._lock:
             self._prune_if_needed()
             if not session.exited:
                 self._running[session.id] = session
 
         if not session.exited:
-            self._write_checkpoint()
+            checkpoint_committed = False
+            try:
+                checkpoint_receipt = self._write_checkpoint()
+                if checkpoint_receipt is not True:
+                    raise RuntimeError(
+                        "Background process checkpoint is not durable"
+                    )
+                checkpoint_committed = checkpoint_receipt is True
+
+                # Start the poller only after the durable registry commit.
+                reader = threading.Thread(
+                    target=self._env_poller_loop,
+                    args=(session, env, log_path, pid_path, exit_path),
+                    daemon=True,
+                    name=f"proc-poller-{session.id}",
+                )
+                session._reader_thread = reader
+                reader.start()
+            except Exception as setup_error:
+                cleanup_verified = self._terminate_env_process_group(
+                    env, session.pid
+                )
+                with self._lock:
+                    self._running.pop(session.id, None)
+                if checkpoint_committed:
+                    self._write_checkpoint()
+                if not cleanup_verified:
+                    raise RuntimeError(
+                        "Background process setup failed and sandbox process-group "
+                        "termination could not be verified"
+                    ) from setup_error
+                raise
 
         return session
 
@@ -999,7 +1412,7 @@ class ProcessRegistry:
 
                 # Check if process is still running
                 check = env.execute(
-                    f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
+                    f"kill -0 -- -\"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
                     timeout=5,
                 )
                 check_output = check.get("output", "").strip()
@@ -1063,41 +1476,212 @@ class ProcessRegistry:
             session.completion_reason = "exited"
         self._move_to_finished(session)
 
-    def _move_to_finished(self, session: ProcessSession):
+    def _move_to_finished(self, session: ProcessSession) -> bool:
         """Move a session from running to finished.
 
         Idempotent: if the session was already moved (e.g. kill_process raced
         with the reader thread), the second call is a no-op — no duplicate
-        completion notification is enqueued.
+        completion notification is enqueued. A notifying process remains in
+        the release barrier until its stable event is durably persisted and
+        published; persistence failure leaves it in ``_running`` for retry.
         """
         with self._lock:
-            was_running = self._running.pop(session.id, None) is not None
-            self._finished[session.id] = session
-        session._completion_event.set()
-        self._write_checkpoint()
+            if session.id not in self._running or session.id in self._finalizing:
+                return False
+            self._finalizing[session.id] = session
 
-        # Only enqueue completion notification on the FIRST move.  Without
-        # this guard, kill_process() and the reader thread can both call
-        # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if was_running and session.notify_on_complete:
-            from tools.ansi_strip import strip_ansi
-            output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
-                "type": "completion",
-                "session_id": session.id,
-                "session_key": session.session_key,
-                "command": session.command,
-                "exit_code": session.exit_code,
-                "completion_reason": session.completion_reason,
-                "termination_source": session.termination_source,
-                "output": output_tail,
-            })
+        event = None
+        try:
+            if session.notify_on_complete:
+                proposed = self._build_completion_record(session)
+                event_id = proposed["event_id"]
+                with self._completion_outbox_lock:
+                    self._ensure_completion_outbox_loaded_locked()
+                    previous = self._completion_outbox.get(event_id)
+                    if previous is None:
+                        self._completion_outbox[event_id] = proposed
+                        try:
+                            self._write_completion_outbox_locked()
+                        except Exception:
+                            self._completion_outbox.pop(event_id, None)
+                            self._completion_outbox_available = False
+                            raise
+                        record = proposed
+                    else:
+                        record = previous
+                    if record.get("delivered") is not True:
+                        event = self._public_completion_event(record)
+
+            checkpointed = self._write_checkpoint()
+            if checkpointed is False:
+                raise OSError("process checkpoint persistence failed")
+            if event is not None:
+                event_id = str(event.get("event_id") or "")
+                with self._completion_outbox_lock:
+                    # Recovery may be called more than once as additional TUI
+                    # sessions attach. Treat a live publish as this process's
+                    # one replay claim so startup recovery cannot enqueue the
+                    # same durable event a second time.
+                    if event_id not in self._completion_outbox_replayed:
+                        self.completion_queue.put(event)
+                        self._completion_outbox_replayed.add(event_id)
+
+            with self._lock:
+                current = self._running.get(session.id)
+                if current is not session:
+                    raise RuntimeError("process registry identity changed while finalizing")
+                self._running.pop(session.id, None)
+                self._finished[session.id] = session
+                self._finalizing.pop(session.id, None)
+            session._completion_event.set()
+            return True
+        except Exception:
+            with self._lock:
+                self._finalizing.pop(session.id, None)
+            logger.error(
+                "Failed to durably finalize background process %s; keeping it release-visible",
+                session.id,
+                exc_info=True,
+            )
+            return False
 
     # ----- Query Methods -----
 
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
-        return session_id in self._completion_consumed
+        with self._lock:
+            return session_id in self._completion_consumed
+
+    def mark_completion_consumed(self, event_or_session_id: object) -> bool:
+        """Durably ACK one completion after a consumer owns its continuation."""
+        if isinstance(event_or_session_id, dict):
+            session_id = str(event_or_session_id.get("session_id") or "")
+            event_id = str(event_or_session_id.get("event_id") or "")
+        else:
+            session_id = str(event_or_session_id or "")
+            event_id = self._completion_event_id(session_id) if session_id else ""
+        if not session_id or event_id != self._completion_event_id(session_id):
+            return False
+
+        with self._completion_outbox_lock:
+            try:
+                self._ensure_completion_outbox_loaded_locked()
+                record = self._completion_outbox.get(event_id)
+                if record is not None and record.get("delivered") is not True:
+                    updated = dict(record)
+                    updated["delivered"] = True
+                    updated["delivered_at"] = time.time()
+                    self._completion_outbox[event_id] = updated
+                    try:
+                        self._write_completion_outbox_locked()
+                    except Exception:
+                        self._completion_outbox[event_id] = record
+                        self._completion_outbox_available = False
+                        raise
+            except Exception:
+                logger.error(
+                    "Failed to persist process completion ACK for %s",
+                    session_id,
+                    exc_info=True,
+                )
+                return False
+        with self._lock:
+            self._completion_consumed.add(session_id)
+        return True
+
+    def finish_notification_delivery(self, event: dict, committed: bool) -> bool:
+        """Finalize an automatic notification after its agent turn commits.
+
+        Durable process completions are ACKed only after the owner conversation
+        accepted the synthetic turn. A failed turn or failed ACK is re-queued,
+        leaving the durable outbox record available for restart replay.
+        """
+        event_type = event.get("type")
+        if event_type == "completion" and event.get("event_id"):
+            if committed and self.mark_completion_consumed(event):
+                return True
+            self.completion_queue.put(event)
+            return False
+        if event_type == "async_delegation":
+            if committed:
+                try:
+                    from tools.async_delegation import mark_async_delegation_delivered
+
+                    if mark_async_delegation_delivered(event) is True:
+                        return True
+                    logger.warning(
+                        "Async delegation delivery ACK was not persisted; requeueing"
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to ACK async delegation delivery",
+                        exc_info=True,
+                    )
+            self.completion_queue.put(event)
+            return False
+        return bool(committed)
+
+    def recover_completion_notifications(self) -> int:
+        """Replay each durable undelivered completion once in this process."""
+        with self._completion_outbox_lock:
+            try:
+                self._ensure_completion_outbox_loaded_locked()
+            except Exception:
+                logger.error(
+                    "Failed to recover durable process completion notifications",
+                    exc_info=True,
+                )
+                return 0
+            records = [
+                (event_id, self._public_completion_event(record))
+                for event_id, record in sorted(self._completion_outbox.items())
+                if record.get("delivered") is not True
+                and event_id not in self._completion_outbox_replayed
+            ]
+            for event_id, _event in records:
+                self._completion_outbox_replayed.add(event_id)
+        replayed = 0
+        for event_id, event in records:
+            try:
+                self.completion_queue.put(event)
+                replayed += 1
+            except Exception:
+                with self._completion_outbox_lock:
+                    self._completion_outbox_replayed.discard(event_id)
+                logger.error(
+                    "Failed to replay process completion notification %s",
+                    event_id,
+                    exc_info=True,
+                )
+        return replayed
+
+    def completion_activity_snapshot(self) -> Dict[str, Any]:
+        """Return fail-closed process and durable completion barrier state."""
+        with self._lock:
+            running = len(self._running)
+            finalizing = len(self._finalizing)
+        with self._completion_outbox_lock:
+            try:
+                self._ensure_completion_outbox_loaded_locked()
+                undelivered = sum(
+                    record.get("delivered") is not True
+                    for record in self._completion_outbox.values()
+                )
+                available = self._completion_outbox_available
+            except Exception:
+                undelivered = 0
+                available = False
+        with self._checkpoint_io_lock:
+            checkpoint_available = self._process_checkpoint_available
+            checkpoint_reason = self._process_checkpoint_reason
+        return {
+            "running_processes": running,
+            "finalizing_processes": finalizing,
+            "durable_undelivered_completions": int(undelivered),
+            "process_completion_activity_available": bool(available),
+            "process_checkpoint_available": bool(checkpoint_available),
+            "process_checkpoint_reason": checkpoint_reason,
+        }
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.
@@ -1149,7 +1733,11 @@ class ProcessRegistry:
         return session_id in self._completion_consumed or session_id in self._poll_observed
 
     def drain_notifications(
-        self, session_key: str = "", owns_event=None,
+        self,
+        session_key: str = "",
+        owns_event=None,
+        *,
+        ack_async: bool = True,
     ) -> "list[tuple[dict, str]]":
         """Pop all pending notification events and return formatted pairs.
 
@@ -1172,6 +1760,9 @@ class ProcessRegistry:
 
         With neither set, all events are consumed (legacy single-session
         behavior, backward compatible).
+
+        Set ``ack_async=False`` when the caller will inject the result through
+        an agent turn and ACK it later via ``finish_notification_delivery``.
         """
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
@@ -1203,13 +1794,15 @@ class ProcessRegistry:
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))
-                if evt.get("type") == "async_delegation":
+                if evt.get("type") == "async_delegation" and ack_async:
                     try:
                         from tools.async_delegation import mark_async_delegation_delivered
 
-                        mark_async_delegation_delivered(evt)
+                        if mark_async_delegation_delivered(evt) is not True:
+                            requeue.append(evt)
                     except Exception:
                         logger.debug("Failed to ACK async delegation delivery", exc_info=True)
+                        requeue.append(evt)
         for evt in requeue:
             self.completion_queue.put(evt)
         return results
@@ -1237,10 +1830,19 @@ class ProcessRegistry:
         reader thread remains stuck on its blocking `read()` but is a daemon
         thread and will be reaped with the process.
 
-        Safe no-op on sessions without a local `Popen` (env/PTY), already-
-        exited sessions, and detached-recovered sessions.
+        An already-exited session that remains in ``_running`` is a durable
+        finalization retry (for example after a transient checkpoint/outbox
+        write failure), so reconcile it through ``_move_to_finished`` again.
+        Otherwise this is a safe no-op on sessions without a local `Popen`
+        (env/PTY) and detached-recovered sessions.
         """
-        if session is None or session.exited:
+        if session is None:
+            return
+        if session.exited:
+            with self._lock:
+                retry_finalization = self._running.get(session.id) is session
+            if retry_finalization:
+                self._move_to_finished(session)
             return
         proc = getattr(session, "process", None)
         if proc is None:
@@ -1366,7 +1968,7 @@ class ProcessRegistry:
             "showing": f"{len(selected)} lines",
         }
         if session.exited:
-            self._completion_consumed.add(session_id)
+            self.mark_completion_consumed(session_id)
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -1416,7 +2018,7 @@ class ProcessRegistry:
             # child has already exited (issue #17327).
             self._reconcile_local_exit(session)
             if session.exited:
-                self._completion_consumed.add(session_id)
+                self.mark_completion_consumed(session_id)
                 result = {
                     "status": "exited",
                     "command": session.command,
@@ -1483,8 +2085,15 @@ class ProcessRegistry:
                 # shell wrapper and leaves Git Bash descendants behind.
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
-                # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                # Non-local -- each managed background command owns a
+                # dedicated process group. Do not report success until the
+                # sandbox verifies that the whole group is gone.
+                if not self._terminate_env_process_group(
+                    session.env_ref, session.pid
+                ):
+                    raise RuntimeError(
+                        "Sandbox process-group termination could not be verified"
+                    )
             elif session.detached and session.pid_scope == "host" and session.pid:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as
@@ -1796,44 +2405,244 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file atomically."""
-        try:
-            with self._lock:
-                entries = []
-                for s in self._running.values():
-                    if not s.exited:
-                        # Lazily backfill the kernel start time for host PIDs so
-                        # recovery after restart can detect PID recycling even
-                        # for sessions spawned before this field existed.
-                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
-                            s.host_start_time = self._safe_host_start_time(s.pid)
-                        entries.append({
-                            "session_id": s.id,
-                            "command": s.command,
-                            "pid": s.pid,
-                            "pid_scope": s.pid_scope,
-                            "host_start_time": s.host_start_time,
-                            "cwd": s.cwd,
-                            "started_at": s.started_at,
-                            "task_id": s.task_id,
-                            "session_key": s.session_key,
-                            "watcher_platform": s.watcher_platform,
-                            "watcher_chat_id": s.watcher_chat_id,
-                            "watcher_user_id": s.watcher_user_id,
-                            "watcher_user_name": s.watcher_user_name,
-                            "watcher_thread_id": s.watcher_thread_id,
-                            "watcher_message_id": s.watcher_message_id,
-                            "watcher_interval": s.watcher_interval,
-                            "notify_on_complete": s.notify_on_complete,
-                            "watch_patterns": s.watch_patterns,
-                        })
-            
-            # Atomic write to avoid corruption on crash
-            from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
-        except Exception as e:
-            logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+    def _checkpoint_entry_for_session(
+        self,
+        session: ProcessSession,
+        *,
+        owner_id: str,
+        owner_pid: int,
+        owner_start_token: str,
+    ) -> Dict[str, Any]:
+        if (
+            isinstance(session.pid, bool)
+            or not isinstance(session.pid, int)
+            or session.pid <= 1
+        ):
+            raise ValueError("running process has no valid checkpoint PID")
+        if session.pid_scope == "host":
+            if session.process_start_token is None:
+                session.process_start_token = self._safe_host_start_token(session.pid)
+            if session.host_start_time is None:
+                session.host_start_time = self._safe_host_start_time(session.pid)
+            if not session.process_start_token:
+                raise ValueError("running host process identity is unavailable")
+        elif session.pid_scope != "sandbox":
+            raise ValueError("running process PID scope is invalid")
+        return {
+            "session_id": session.id,
+            "command": session.command,
+            "pid": session.pid,
+            "pid_scope": session.pid_scope,
+            "host_start_time": session.host_start_time,
+            "process_start_token": session.process_start_token,
+            "checkpoint_owner_id": owner_id,
+            "checkpoint_owner_pid": owner_pid,
+            "checkpoint_owner_start_token": owner_start_token,
+            "cwd": session.cwd,
+            "started_at": session.started_at,
+            "task_id": session.task_id,
+            "session_key": session.session_key,
+            "watcher_platform": session.watcher_platform,
+            "watcher_chat_id": session.watcher_chat_id,
+            "watcher_user_id": session.watcher_user_id,
+            "watcher_user_name": session.watcher_user_name,
+            "watcher_thread_id": session.watcher_thread_id,
+            "watcher_message_id": session.watcher_message_id,
+            "watcher_interval": session.watcher_interval,
+            "notify_on_complete": session.notify_on_complete,
+            "watch_patterns": session.watch_patterns,
+        }
+
+    def _foreign_checkpoint_entry_is_active(
+        self,
+        entry: Dict[str, Any],
+    ) -> bool:
+        """Keep foreign evidence only while owner or exact process is live."""
+        owner_id = entry.get("checkpoint_owner_id")
+        owner_pid = entry.get("checkpoint_owner_pid")
+        owner_token = entry.get("checkpoint_owner_start_token")
+        if (
+            owner_id is not None
+            and self._host_pid_matches_exact_token(owner_pid, owner_token)
+        ):
+            return True
+        if entry.get("pid_scope") != "host":
+            # Sandbox PIDs cannot be safely probed from this runtime. Preserve
+            # the evidence rather than manufacturing a false global zero.
+            return True
+        process_token = entry.get("process_start_token")
+        if isinstance(process_token, str):
+            return self._host_pid_matches_exact_token(
+                entry.get("pid"),
+                process_token,
+            )
+        # Legacy host evidence without an exact token can be discarded only
+        # when the PID is definitely gone; a live PID remains fail-closed.
+        return self._is_host_pid_alive(entry.get("pid"))
+
+    def _write_checkpoint(self) -> bool:
+        """Merge this runtime's exact process set into the global authority."""
+        with self._checkpoint_io_lock:
+            if self._checkpoint_write_blocked:
+                self._process_checkpoint_available = False
+                return False
+            try:
+                owner_id, owner_pid, owner_start_token = (
+                    self._ensure_checkpoint_owner_identity()
+                )
+                with self._lock:
+                    local_entries = [
+                        self._checkpoint_entry_for_session(
+                            session,
+                            owner_id=owner_id,
+                            owner_pid=owner_pid,
+                            owner_start_token=owner_start_token,
+                        )
+                        for session in self._running.values()
+                        if not session.exited
+                    ]
+
+                with interprocess_authority_lock(CHECKPOINT_PATH):
+                    existing, expected = self._read_checkpoint_snapshot_secure(
+                        missing_ok=True
+                    )
+                    foreign = []
+                    for entry in existing:
+                        if entry.get("checkpoint_owner_id") == owner_id:
+                            continue
+                        if self._foreign_checkpoint_entry_is_active(entry):
+                            foreign.append(entry)
+                        else:
+                            logger.info(
+                                "Reconciled inactive foreign process "
+                                "checkpoint row %s",
+                                entry.get("session_id", "?"),
+                            )
+                    foreign_ids = {entry["session_id"] for entry in foreign}
+                    local_ids = {entry["session_id"] for entry in local_entries}
+                    collision = foreign_ids & local_ids
+                    if collision:
+                        raise ValueError(
+                            "process checkpoint session identity collides across runtimes"
+                        )
+                    merged = sorted(
+                        [*foreign, *local_entries],
+                        key=lambda entry: entry["session_id"],
+                    )
+                    atomic_write_private_json(
+                        CHECKPOINT_PATH,
+                        merged,
+                        expected=expected,
+                        max_bytes=MAX_CHECKPOINT_BYTES,
+                        sort_keys=True,
+                    )
+                self._process_checkpoint_available = True
+                self._process_checkpoint_reason = "verified"
+                return True
+            except ValueError as exc:
+                self._checkpoint_write_blocked = True
+                self._process_checkpoint_available = False
+                self._process_checkpoint_reason = "invalid"
+                logger.error(
+                    "Process checkpoint evidence is unsafe or malformed",
+                    exc_info=True,
+                )
+                return False
+            except Exception as e:
+                self._process_checkpoint_available = False
+                self._process_checkpoint_reason = "write_failed"
+                logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+                return False
+
+    @staticmethod
+    def _validate_checkpoint_entries(raw: object) -> List[Dict[str, Any]]:
+        """Validate the bounded JSON checkpoint before mutating registry state."""
+        if not isinstance(raw, list):
+            raise ValueError("process checkpoint must be a JSON list")
+        entries: List[Dict[str, Any]] = []
+        session_ids: set[str] = set()
+        for raw_entry in raw:
+            if not isinstance(raw_entry, dict):
+                raise ValueError("process checkpoint entry is not an object")
+            entry = dict(raw_entry)
+            session_id = entry.get("session_id")
+            pid = entry.get("pid")
+            pid_scope = entry.get("pid_scope", "host")
+            start_time = entry.get("host_start_time")
+            process_start_token = entry.get("process_start_token")
+            owner_values = (
+                entry.get("checkpoint_owner_id"),
+                entry.get("checkpoint_owner_pid"),
+                entry.get("checkpoint_owner_start_token"),
+            )
+            if (
+                not isinstance(session_id, str)
+                or not session_id
+                or session_id in session_ids
+            ):
+                raise ValueError("process checkpoint session id is invalid")
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+                raise ValueError("process checkpoint pid is invalid")
+            if pid_scope not in {"host", "sandbox"}:
+                raise ValueError("process checkpoint PID scope is invalid")
+            if (
+                start_time is not None
+                and (
+                    isinstance(start_time, bool)
+                    or not isinstance(start_time, int)
+                    or start_time <= 0
+                )
+            ):
+                raise ValueError("process checkpoint start time is invalid")
+            if process_start_token is not None and (
+                not isinstance(process_start_token, str)
+                or not process_start_token
+            ):
+                raise ValueError("process checkpoint exact start token is invalid")
+            owner_present = [value is not None for value in owner_values]
+            if any(owner_present) and not all(owner_present):
+                raise ValueError("process checkpoint owner identity is incomplete")
+            if all(owner_present):
+                owner_id, owner_pid, owner_start_token = owner_values
+                if (
+                    not isinstance(owner_id, str)
+                    or not owner_id
+                    or isinstance(owner_pid, bool)
+                    or not isinstance(owner_pid, int)
+                    or owner_pid <= 1
+                    or not isinstance(owner_start_token, str)
+                    or not owner_start_token
+                ):
+                    raise ValueError("process checkpoint owner identity is invalid")
+                if pid_scope == "host" and process_start_token is None:
+                    raise ValueError(
+                        "owned host checkpoint lacks an exact start token"
+                    )
+            session_ids.add(session_id)
+            entry["pid_scope"] = pid_scope
+            entries.append(entry)
+        return entries
+
+    @classmethod
+    def _read_checkpoint_snapshot_secure(
+        cls,
+        *,
+        missing_ok: bool,
+    ) -> tuple[List[Dict[str, Any]], Optional[FileIdentity]]:
+        raw, identity = read_private_json(
+            CHECKPOINT_PATH,
+            max_bytes=MAX_CHECKPOINT_BYTES,
+            missing_ok=missing_ok,
+        )
+        if raw is None and identity is None:
+            return [], None
+        return cls._validate_checkpoint_entries(raw), identity
+
+    @classmethod
+    def _read_checkpoint_entries_secure(cls) -> List[Dict[str, Any]]:
+        """Read ``processes.json`` from one private, stable file descriptor."""
+        entries, _identity = cls._read_checkpoint_snapshot_secure(missing_ok=False)
+        return entries
 
     def recover_from_checkpoint(self) -> int:
         """
@@ -1841,94 +2650,149 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
-            return 0
-
-        try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return 0
-
-        recovered = 0
-        for entry in entries:
-            pid = entry.get("pid")
-            if not pid:
-                continue
-
-            pid_scope = entry.get("pid_scope", "host")
-            if pid_scope != "host":
-                # Sandbox-backed processes keep only in-sandbox PIDs in the
-                # checkpoint, which are not meaningful to the restarted host
-                # process once the original environment handle is gone.
-                logger.info(
-                    "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
-                    entry.get("command", "unknown")[:60],
-                    pid,
-                    pid_scope,
+        with self._checkpoint_io_lock:
+            self._process_checkpoint_available = False
+            self._process_checkpoint_reason = "unverified"
+            self._checkpoint_write_blocked = True
+            try:
+                owner_id, owner_pid, owner_start_token = (
+                    self._ensure_checkpoint_owner_identity()
                 )
-                continue
-
-            # The PID must be alive AND still the same process we spawned. A
-            # bare liveness check is unsafe: across a restart (especially a
-            # reboot or long uptime) the kernel may have recycled this number
-            # onto an unrelated process — adopting it would let a later kill or
-            # watcher tree-kill a stranger (e.g. a browser). Re-validate the
-            # kernel start time recorded in the checkpoint.
-            recorded_start = entry.get("host_start_time")
-            if not self._host_pid_is_ours(pid, recorded_start):
-                if self._is_host_pid_alive(pid):
-                    logger.info(
-                        "Not recovering session %s: pid %d is alive but its "
-                        "start time no longer matches — PID was recycled onto "
-                        "an unrelated process; refusing to adopt it.",
-                        entry.get("session_id", "?"), pid,
+                with interprocess_authority_lock(CHECKPOINT_PATH):
+                    entries, expected = self._read_checkpoint_snapshot_secure(
+                        missing_ok=False
                     )
-                continue
 
-            session = ProcessSession(
-                id=entry["session_id"],
-                command=entry.get("command", "unknown"),
-                task_id=entry.get("task_id", ""),
-                session_key=entry.get("session_key", ""),
-                pid=pid,
-                host_start_time=recorded_start,
-                pid_scope=pid_scope,
-                cwd=entry.get("cwd"),
-                started_at=entry.get("started_at", time.time()),
-                detached=True,  # Can't read output, but can report status + kill
-                watcher_platform=entry.get("watcher_platform", ""),
-                watcher_chat_id=entry.get("watcher_chat_id", ""),
-                watcher_user_id=entry.get("watcher_user_id", ""),
-                watcher_user_name=entry.get("watcher_user_name", ""),
-                watcher_thread_id=entry.get("watcher_thread_id", ""),
-                watcher_message_id=entry.get("watcher_message_id", ""),
-                watcher_interval=entry.get("watcher_interval", 0),
-                notify_on_complete=entry.get("notify_on_complete", False),
-                watch_patterns=entry.get("watch_patterns", []),
-            )
-            with self._lock:
-                self._running[session.id] = session
-            recovered += 1
-            logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+                    survivors: List[Dict[str, Any]] = []
+                    adopted_entries: List[Dict[str, Any]] = []
+                    for entry in entries:
+                        entry_owner_id = entry.get("checkpoint_owner_id")
+                        entry_owner_pid = entry.get("checkpoint_owner_pid")
+                        entry_owner_token = entry.get(
+                            "checkpoint_owner_start_token"
+                        )
+                        owner_alive = (
+                            entry_owner_id is not None
+                            and self._host_pid_matches_exact_token(
+                                entry_owner_pid,
+                                entry_owner_token,
+                            )
+                        )
+                        if owner_alive and entry_owner_id != owner_id:
+                            survivors.append(entry)
+                            continue
 
-            # Re-enqueue watcher so gateway can resume notifications
-            if session.watcher_interval > 0:
-                self.pending_watchers.append({
-                    "session_id": session.id,
-                    "check_interval": session.watcher_interval,
-                    "session_key": session.session_key,
-                    "platform": session.watcher_platform,
-                    "chat_id": session.watcher_chat_id,
-                    "user_id": session.watcher_user_id,
-                    "user_name": session.watcher_user_name,
-                    "thread_id": session.watcher_thread_id,
-                    "message_id": session.watcher_message_id,
-                    "notify_on_complete": session.notify_on_complete,
-                })
+                        if entry["pid_scope"] != "host":
+                            self._process_checkpoint_reason = (
+                                "identity_unverified"
+                            )
+                            return 0
 
-        self._write_checkpoint()
+                        pid = entry["pid"]
+                        if not self._is_host_pid_alive(pid):
+                            continue
+                        process_start_token = entry.get("process_start_token")
+                        if not isinstance(process_start_token, str):
+                            self._process_checkpoint_reason = (
+                                "identity_unverified"
+                            )
+                            return 0
+                        if not self._host_pid_matches_exact_token(
+                            pid,
+                            process_start_token,
+                        ):
+                            logger.info(
+                                "Not recovering session %s: exact process "
+                                "identity no longer matches",
+                                entry.get("session_id", "?"),
+                            )
+                            continue
 
-        return recovered
+                        adopted = dict(entry)
+                        adopted["checkpoint_owner_id"] = owner_id
+                        adopted["checkpoint_owner_pid"] = owner_pid
+                        adopted["checkpoint_owner_start_token"] = (
+                            owner_start_token
+                        )
+                        survivors.append(adopted)
+                        adopted_entries.append(adopted)
+
+                    atomic_write_private_json(
+                        CHECKPOINT_PATH,
+                        sorted(
+                            survivors,
+                            key=lambda entry: entry["session_id"],
+                        ),
+                        expected=expected,
+                        max_bytes=MAX_CHECKPOINT_BYTES,
+                        sort_keys=True,
+                    )
+            except FileNotFoundError:
+                self._process_checkpoint_reason = "missing"
+                return 0
+            except Exception:
+                self._process_checkpoint_reason = "invalid"
+                logger.error(
+                    "Process checkpoint could not be securely reconciled",
+                    exc_info=True,
+                )
+                return 0
+
+            self._checkpoint_write_blocked = False
+
+            recovered = 0
+            for entry in adopted_entries:
+                pid = entry["pid"]
+
+                session = ProcessSession(
+                    id=entry["session_id"],
+                    command=entry.get("command", "unknown"),
+                    task_id=entry.get("task_id", ""),
+                    session_key=entry.get("session_key", ""),
+                    pid=pid,
+                    host_start_time=entry.get("host_start_time"),
+                    process_start_token=entry.get("process_start_token"),
+                    pid_scope="host",
+                    cwd=entry.get("cwd"),
+                    started_at=entry.get("started_at", time.time()),
+                    detached=True,  # Can't read output, but can report status + kill
+                    watcher_platform=entry.get("watcher_platform", ""),
+                    watcher_chat_id=entry.get("watcher_chat_id", ""),
+                    watcher_user_id=entry.get("watcher_user_id", ""),
+                    watcher_user_name=entry.get("watcher_user_name", ""),
+                    watcher_thread_id=entry.get("watcher_thread_id", ""),
+                    watcher_message_id=entry.get("watcher_message_id", ""),
+                    watcher_interval=entry.get("watcher_interval", 0),
+                    notify_on_complete=entry.get("notify_on_complete", False),
+                    watch_patterns=entry.get("watch_patterns", []),
+                )
+                with self._lock:
+                    self._running[session.id] = session
+                recovered += 1
+                logger.info(
+                    "Recovered detached process: %s (pid=%d)",
+                    session.command[:60],
+                    pid,
+                )
+
+                # Re-enqueue watcher so gateway can resume notifications.
+                if session.watcher_interval > 0:
+                    self.pending_watchers.append({
+                        "session_id": session.id,
+                        "check_interval": session.watcher_interval,
+                        "session_key": session.session_key,
+                        "platform": session.watcher_platform,
+                        "chat_id": session.watcher_chat_id,
+                        "user_id": session.watcher_user_id,
+                        "user_name": session.watcher_user_name,
+                        "thread_id": session.watcher_thread_id,
+                        "message_id": session.watcher_message_id,
+                        "notify_on_complete": session.notify_on_complete,
+                    })
+
+            self._process_checkpoint_available = True
+            self._process_checkpoint_reason = "verified"
+            return recovered
 
 
 # Module-level singleton

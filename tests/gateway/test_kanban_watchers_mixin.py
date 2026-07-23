@@ -7,7 +7,11 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+from unittest.mock import patch
+
+import pytest
 
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
@@ -43,6 +47,43 @@ def test_watcher_loops_are_coroutines():
     # The two long-running watchers are async loops.
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_notifier_watcher)
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_dispatcher_watcher)
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_and_auto_decompose_do_not_tick_during_drain(tmp_path):
+    from gateway.run import GatewayRunner
+    from hermes_cli import kanban_db as kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._external_drain_active = True
+    sleep_calls = []
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+        # Initial startup delay, then one admission-closed wait.
+        if len(sleep_calls) >= 2:
+            runner._running = False
+
+    cfg = {
+        "kanban": {
+            "dispatch_in_gateway": True,
+            "dispatch_interval_seconds": 1,
+            "auto_decompose": True,
+        }
+    }
+    with patch("hermes_cli.config.load_config", return_value=cfg), patch(
+        "gateway.kanban_watchers._acquire_singleton_lock",
+        return_value=(None, "unavailable"),
+    ), patch.object(kb, "kanban_home", return_value=tmp_path), patch.object(
+        kb, "reap_worker_zombies"
+    ) as reap, patch.object(kb, "dispatch_once") as dispatch, patch(
+        "asyncio.sleep", side_effect=fake_sleep
+    ):
+        await runner._kanban_dispatcher_watcher()
+
+    reap.assert_not_called()
+    dispatch.assert_not_called()
 
 
 def test_singleton_dispatcher_lock_is_exclusive(tmp_path):

@@ -95,7 +95,7 @@ def _normalize_source_name(value: object) -> str:
 def _looks_like_default_cli_title(row: dict[str, Any]) -> bool:
     """Return True when a CLI row looks like framework-generated metadata."""
     title = _safe_lower(row.get("title"))
-    if not title or title == "untitled":
+    if not title or title in {"untitled", "untitled session"}:
         return True
     if title in {"cli", "cli session"}:
         return True

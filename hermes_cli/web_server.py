@@ -10314,6 +10314,43 @@ def _find_cron_job_profile(job_id: str) -> Optional[str]:
     return None
 
 
+def _resolve_cron_fire_profile(
+    job_id: str,
+    authenticated_profile: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve an exact fire target without first-match cross-profile routing."""
+
+    if authenticated_profile is not None:
+        if not isinstance(authenticated_profile, str) or not authenticated_profile.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="invalid authenticated cron profile",
+            )
+        profile_name, _home = _cron_profile_home(authenticated_profile)
+        return (
+            profile_name
+            if _call_cron_for_profile(profile_name, "get_job", job_id)
+            else None
+        )
+
+    matches: List[str] = []
+    for profile in _cron_profile_dicts():
+        name = str(profile.get("name") or "")
+        if not name:
+            continue
+        if _call_cron_for_profile(name, "get_job", job_id):
+            matches.append(name)
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "cron job id exists in multiple profiles; the authenticated "
+                "fire token must include a profile claim"
+            ),
+        )
+    return matches[0] if matches else None
+
+
 def _list_cron_jobs_sync(profile: str = "all"):
     requested = (profile or "all").strip()
     if requested.lower() != "all":
@@ -10555,7 +10592,12 @@ def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "trigger_job", job_id)
+    from cron.admission import CronAdmissionClosed
+
+    try:
+        job = _call_cron_for_profile(selected, "trigger_job", job_id)
+    except CronAdmissionClosed as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -10584,7 +10626,57 @@ async def delete_cron_job(job_id: str, profile: Optional[str] = None):
     return await _run_cron_dashboard_io(_delete_cron_job_sync, job_id, profile)
 
 
-def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
+def _claim_cron_fire_for_profile(profile: str, job_id: str):
+    """Resolve the provider and durably claim before the webhook returns 202."""
+
+    _profile_name, home = _cron_profile_home(profile)
+    from cron import jobs as cron_jobs
+    from cron.scheduler import _claim_cron_dispatch
+    from cron.scheduler_provider import resolve_cron_scheduler
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(str(home))
+    try:
+        with cron_jobs.use_cron_store(home):
+            provider = resolve_cron_scheduler()
+            lease = _claim_cron_dispatch(
+                job_id,
+                source="chronos_dashboard_webhook",
+            )
+            return provider, lease
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _release_cron_fire_for_profile(profile: str, job_id: str, lease) -> None:
+    _profile_name, home = _cron_profile_home(profile)
+    from cron.scheduler import _release_cron_dispatch
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(str(home))
+    try:
+        _release_cron_dispatch(
+            job_id,
+            lease=lease,
+            profile_key=str(home.expanduser().resolve()),
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _fire_cron_job_for_profile(
+    profile: str,
+    job_id: str,
+    *,
+    provider=None,
+    admission_lease=None,
+) -> bool:
     """Run ONE due cron job end-to-end for ``profile`` via the resolved
     scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
 
@@ -10604,8 +10696,27 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     token = set_hermes_home_override(str(home))
     try:
         with cron_jobs.use_cron_store(home):
-            provider = resolve_cron_scheduler()
-            return bool(provider.fire_due(job_id, adapters=None, loop=None))
+            provider = provider or resolve_cron_scheduler()
+            try:
+                if admission_lease is None:
+                    return bool(
+                        provider.fire_due(job_id, adapters=None, loop=None)
+                    )
+                return bool(
+                    provider.fire_due(
+                        job_id,
+                        adapters=None,
+                        loop=None,
+                        admission_lease=admission_lease,
+                    )
+                )
+            finally:
+                if admission_lease is not None:
+                    _release_cron_fire_for_profile(
+                        profile,
+                        job_id,
+                        admission_lease,
+                    )
     finally:
         reset_hermes_home_override(token)
 
@@ -10652,20 +10763,54 @@ async def cron_fire_webhook(request: Request):
     if not job_id:
         return JSONResponse({"error": "missing job_id"}, status_code=400)
 
-    # _find_cron_job_profile walks every profile and lists its jobs (file
-    # I/O per profile) — run it off the event loop like the other cron
-    # dashboard endpoints.
-    profile = await _run_cron_dashboard_io(_find_cron_job_profile, job_id)
+    authenticated_profile = claims.get("profile")
+    try:
+        profile = await _run_cron_dashboard_io(
+            _resolve_cron_fire_profile,
+            job_id,
+            authenticated_profile,
+        )
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
     if not profile:
         # Job is gone (cancelled / completed) — nothing to fire. 200 so NAS
         # does not retry a fire that is intentionally absent.
         return JSONResponse({"status": "gone", "job_id": job_id}, status_code=200)
 
-    # Run in the background; the store CAS claim inside fire_due de-dupes a
-    # NAS/scheduler retry that arrives while this is in flight.
-    asyncio.create_task(
-        asyncio.to_thread(_fire_cron_job_for_profile, profile, job_id)
+    provider, admission_lease = await _run_cron_dashboard_io(
+        _claim_cron_fire_for_profile,
+        profile,
+        job_id,
     )
+    if admission_lease is None:
+        return JSONResponse(
+            {
+                "error": (
+                    "cron admission is closed or this job is already "
+                    "accepted; retry later"
+                )
+            },
+            status_code=503,
+        )
+
+    fire_coro = asyncio.to_thread(
+        _fire_cron_job_for_profile,
+        profile,
+        job_id,
+        provider=provider,
+        admission_lease=admission_lease,
+    )
+    try:
+        asyncio.create_task(fire_coro)
+    except BaseException:
+        fire_coro.close()
+        await _run_cron_dashboard_io(
+            _release_cron_fire_for_profile,
+            profile,
+            job_id,
+            admission_lease,
+        )
+        raise
     return JSONResponse({"status": "accepted", "job_id": job_id}, status_code=202)
 
 

@@ -201,3 +201,25 @@ def test_fire_due_no_rearm_when_claim_lost(chronos, monkeypatch):
 
     assert prov.fire_due("j1") is False
     assert fake.provisions == []
+
+
+def test_fire_due_forwards_supplied_lease_unchanged(chronos, monkeypatch):
+    prov, _fake = chronos
+    lease = type("Lease", (), {"job_id": "j1", "token": "exact-token"})()
+    observed = []
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.fire_due",
+        lambda self, jid, **kw: observed.append(kw["admission_lease"]) or False,
+    )
+    monkeypatch.setattr(
+        "cron.scheduler._claim_cron_dispatch",
+        lambda *_a, **_kw: pytest.fail("supplied lease must not be reacquired"),
+    )
+    monkeypatch.setattr(
+        "cron.scheduler._release_cron_dispatch",
+        lambda *_a, **_kw: pytest.fail("supplied lease is webhook-owned"),
+    )
+
+    assert prov.fire_due("j1", admission_lease=lease) is False
+    assert observed == [lease]

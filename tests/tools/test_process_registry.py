@@ -1,7 +1,9 @@
 """Tests for tools/process_registry.py — ProcessRegistry query methods, pruning, checkpoint."""
 
 import json
+import multiprocessing
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -18,6 +20,76 @@ from tools.process_registry import (
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
 )
+
+
+def _checkpoint_runtime_worker(
+    checkpoint_path: str,
+    session_id: str,
+    connection,
+) -> None:
+    """Drive one independent registry while keeping its owner process alive."""
+    from tools import process_registry as process_registry_module
+
+    process_registry_module.CHECKPOINT_PATH = Path(checkpoint_path)
+    worker_registry = ProcessRegistry()
+    session = ProcessSession(
+        id=session_id,
+        command=f"worker {session_id}",
+        pid=os.getpid(),
+        pid_scope="host",
+        host_start_time=ProcessRegistry._safe_host_start_time(os.getpid()),
+        started_at=time.time(),
+    )
+    while True:
+        command = connection.recv()
+        if command == "write":
+            worker_registry._running[session.id] = session
+            connection.send(worker_registry._write_checkpoint())
+        elif command == "clear":
+            worker_registry._running.clear()
+            connection.send(worker_registry._write_checkpoint())
+        elif command == "stop":
+            connection.close()
+            return
+
+
+def _checkpoint_crash_before_replace(
+    checkpoint_path: str,
+    session_id: str,
+) -> None:
+    """Crash after staging/fsync but before the authority-file replace."""
+    from tools import durable_state
+    from tools import process_registry as process_registry_module
+
+    process_registry_module.CHECKPOINT_PATH = Path(checkpoint_path)
+    worker_registry = ProcessRegistry()
+    worker_registry._running[session_id] = ProcessSession(
+        id=session_id,
+        command="crash writer",
+        pid=os.getpid(),
+        pid_scope="host",
+        host_start_time=ProcessRegistry._safe_host_start_time(os.getpid()),
+        started_at=time.time(),
+    )
+    durable_state.os.replace = lambda *_args, **_kwargs: os._exit(91)
+    worker_registry._write_checkpoint()
+    os._exit(92)
+
+
+def _spawn_admission_worker(
+    checkpoint_path: str,
+    connection,
+) -> None:
+    from tools import process_registry as process_registry_module
+
+    process_registry_module.CHECKPOINT_PATH = Path(checkpoint_path)
+    worker_registry = ProcessRegistry()
+    connection.send("ready")
+    session = worker_registry.spawn_local("sleep 30", cwd="/tmp")
+    connection.send({"session_id": session.id, "pid": session.pid})
+    if connection.recv() == "cleanup":
+        worker_registry.kill_process(session.id)
+    connection.close()
 
 
 @pytest.fixture()
@@ -63,6 +135,20 @@ def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool
             return True
         time.sleep(interval)
     return False
+
+
+def _write_private_checkpoint(path, payload) -> bytes:
+    """Write a checkpoint fixture with the production owner-only mode."""
+    encoded = json.dumps(payload).encode("utf-8")
+    path.write_bytes(encoded)
+    path.chmod(0o600)
+    return encoded
+
+
+def _exact_process_start_token(pid: int) -> str:
+    token = ProcessRegistry._safe_host_start_token(pid)
+    assert token is not None
+    return token
 
 
 def test_write_stdin_uses_str_for_windows_pty(monkeypatch, registry):
@@ -681,7 +767,7 @@ class TestSpawnEnvSanitization:
             patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
             patch("subprocess.Popen", side_effect=fake_popen), \
             patch("threading.Thread", return_value=fake_thread), \
-            patch.object(registry, "_write_checkpoint"):
+            patch.object(registry, "_write_checkpoint", return_value=True):
             registry.spawn_local(
                 "echo hello",
                 cwd="/tmp",
@@ -715,7 +801,7 @@ class TestSpawnEnvSanitization:
         fake_thread = MagicMock()
 
         with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
-            patch.object(registry, "_write_checkpoint"):
+            patch.object(registry, "_write_checkpoint", return_value=True):
             session = registry.spawn_via_env(env, "echo hello")
 
         bg_command = env.commands[0][0]
@@ -723,6 +809,9 @@ class TestSpawnEnvSanitization:
         assert "/data/data/com.termux/files/usr/tmp/hermes_bg_" in bg_command
         assert ".exit" in bg_command
         assert "rc=$?;" in bg_command
+        assert bg_command.startswith("set +m; ")
+        assert "command -v setsid" in bg_command
+        assert "nohup setsid bash -lc" in bg_command
         assert " > /tmp/hermes_bg_" not in bg_command
         assert "cat /tmp/hermes_bg_" not in bg_command
         fake_thread.start.assert_called_once()
@@ -740,7 +829,7 @@ class TestSpawnEnvSanitization:
         fake_thread = MagicMock()
 
         with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
-            patch.object(registry, "_write_checkpoint"):
+            patch.object(registry, "_write_checkpoint", return_value=True):
             session = registry.spawn_via_env(env, "echo hello")
 
         assert session.exited is True
@@ -767,7 +856,7 @@ class TestSpawnEnvSanitization:
         fake_thread = MagicMock()
 
         with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
-            patch.object(registry, "_write_checkpoint"):
+            patch.object(registry, "_write_checkpoint", return_value=True):
             registry.spawn_via_env(env, "echo hello")
 
         args, kwargs = env.commands[0]
@@ -803,7 +892,7 @@ class TestSpawnEnvSanitization:
             )
 
         assert env.commands[0][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
-        assert env.commands[1][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
+        assert env.commands[1][0] == "kill -0 -- -\"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
         assert env.commands[2][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
 
 
@@ -845,7 +934,7 @@ class TestPopenLeakOnSetupFailure:
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", side_effect=boom), \
              patch("os.getpgid", side_effect=ProcessLookupError), \
-             patch.object(registry, "_write_checkpoint"):
+             patch.object(registry, "_write_checkpoint", return_value=True):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
                 registry.spawn_local("echo hello", cwd="/tmp")
 
@@ -883,6 +972,67 @@ class TestPopenLeakOnSetupFailure:
 
         assert killed, "proc.kill() must be called when _write_checkpoint raises"
 
+    @pytest.mark.parametrize("receipt", [False, None, 1, "verified"])
+    def test_popen_killed_and_unregistered_when_checkpoint_is_not_durable(
+        self, registry, receipt
+    ):
+        """A false durability receipt must abort the just-created process."""
+        proc = MagicMock(pid=8877, stdout=iter([]), stdin=MagicMock())
+        proc.poll.return_value = None
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("subprocess.Popen", return_value=proc), \
+             patch("threading.Thread", return_value=MagicMock()), \
+             patch("os.getpgid", side_effect=ProcessLookupError), \
+             patch.object(registry, "_write_checkpoint", return_value=receipt):
+            with pytest.raises(RuntimeError, match="checkpoint"):
+                registry.spawn_local("echo hello", cwd="/tmp")
+
+        proc.kill.assert_called_once()
+        assert registry.count_running() == 0
+
+    @pytest.mark.skipif(os.name == "nt", reason="ptyprocess is POSIX-only")
+    def test_pty_killed_and_unregistered_when_checkpoint_is_not_durable(
+        self, registry
+    ):
+        """A PTY process must never fall through into a duplicate pipe spawn."""
+        pty_proc = MagicMock(pid=8866)
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("ptyprocess.PtyProcess.spawn", return_value=pty_proc), \
+             patch("threading.Thread", return_value=MagicMock()), \
+             patch("subprocess.Popen") as popen, \
+             patch.object(registry, "_write_checkpoint", return_value=False):
+            with pytest.raises(RuntimeError, match="checkpoint"):
+                registry.spawn_local("echo hello", cwd="/tmp", use_pty=True)
+
+        pty_proc.terminate.assert_called_once_with(force=True)
+        popen.assert_not_called()
+        assert registry.count_running() == 0
+
+    def test_env_process_killed_and_unregistered_when_checkpoint_is_not_durable(
+        self, registry
+    ):
+        """Sandbox launches also require a durable registry commit."""
+        env = MagicMock()
+        env.get_temp_dir.return_value = "/tmp"
+        env.execute.side_effect = [
+            {"output": "8855\n", "returncode": 0},
+            {"output": "", "returncode": 0},
+        ]
+
+        with patch("threading.Thread", return_value=MagicMock()), \
+             patch.object(registry, "_write_checkpoint", return_value=False):
+            with pytest.raises(RuntimeError, match="checkpoint"):
+                registry.spawn_via_env(env, "echo hello", cwd="/tmp")
+
+        rollback_commands = [call.args[0] for call in env.execute.call_args_list[1:]]
+        assert len(rollback_commands) == 1
+        assert "kill -TERM -- -8855" in rollback_commands[0]
+        assert "kill -KILL -- -8855" in rollback_commands[0]
+        assert "kill -0 -- -8855" in rollback_commands[0]
+        assert registry.count_running() == 0
+
     def test_popen_not_killed_on_success(self, registry):
         """Successful spawn must NOT kill the process."""
         killed = []
@@ -904,7 +1054,7 @@ class TestPopenLeakOnSetupFailure:
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", return_value=fake_thread), \
-             patch.object(registry, "_write_checkpoint"):
+             patch.object(registry, "_write_checkpoint", return_value=True):
             session = registry.spawn_local("echo hello", cwd="/tmp")
 
         assert not killed, "proc.kill() must NOT be called on successful spawn"
@@ -919,6 +1069,8 @@ class TestCheckpoint:
     def test_write_checkpoint(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
             s = _make_session()
+            s.pid = os.getpid()
+            s.pid_scope = "host"
             registry._running[s.id] = s
             registry._write_checkpoint()
 
@@ -926,18 +1078,279 @@ class TestCheckpoint:
             assert len(data) == 1
             assert data[0]["session_id"] == s.id
 
+    def test_write_checkpoint_rejects_permissive_existing_authority(
+        self, registry, tmp_path
+    ):
+        checkpoint = tmp_path / "processes.json"
+        checkpoint.write_text("[]", encoding="utf-8")
+        checkpoint.chmod(0o644)
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry._write_checkpoint() is False
+
+        assert checkpoint.read_text(encoding="utf-8") == "[]"
+        assert checkpoint.stat().st_mode & 0o777 == 0o644
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file locks")
+    def test_spawn_admission_lock_blocks_creation_until_retirement_releases(
+        self, tmp_path
+    ):
+        from tools import durable_state
+        from tools import process_registry as process_registry_module
+
+        checkpoint = tmp_path / "processes.json"
+        admission_anchor = checkpoint.with_name(
+            f"{checkpoint.name}.admission"
+        )
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe()
+        worker = context.Process(
+            target=_spawn_admission_worker,
+            args=(os.fspath(checkpoint), child),
+        )
+        try:
+            with durable_state.interprocess_authority_lock(admission_anchor):
+                worker.start()
+                assert parent.recv() == "ready"
+                assert not parent.poll(0.4)
+
+            spawned = parent.recv()
+            assert spawned["session_id"].startswith("proc_")
+            assert isinstance(spawned["pid"], int)
+            assert process_registry_module._process_admission_anchor(
+                checkpoint
+            ) == admission_anchor
+            lock_path = admission_anchor.with_name(
+                f".{admission_anchor.name}.lock"
+            )
+            assert lock_path.stat().st_mode & 0o777 == 0o600
+            parent.send("cleanup")
+            worker.join(timeout=10)
+            assert worker.exitcode == 0
+        finally:
+            if worker.is_alive():
+                worker.kill()
+                worker.join(timeout=5)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file locks")
+    def test_two_runtime_writers_merge_and_global_zero_is_authoritative(
+        self, tmp_path
+    ):
+        checkpoint = tmp_path / "processes.json"
+        context = multiprocessing.get_context("spawn")
+        parent_a, child_a = context.Pipe()
+        parent_b, child_b = context.Pipe()
+        worker_a = context.Process(
+            target=_checkpoint_runtime_worker,
+            args=(os.fspath(checkpoint), "proc_runtime_a", child_a),
+        )
+        worker_b = context.Process(
+            target=_checkpoint_runtime_worker,
+            args=(os.fspath(checkpoint), "proc_runtime_b", child_b),
+        )
+        worker_a.start()
+        worker_b.start()
+        try:
+            parent_a.send("write")
+            parent_b.send("write")
+            assert parent_a.recv() is True
+            assert parent_b.recv() is True
+
+            merged = json.loads(checkpoint.read_text(encoding="utf-8"))
+            assert {entry["session_id"] for entry in merged} == {
+                "proc_runtime_a",
+                "proc_runtime_b",
+            }
+            assert len({entry["checkpoint_owner_id"] for entry in merged}) == 2
+            assert all(entry["process_start_token"] for entry in merged)
+            assert checkpoint.stat().st_mode & 0o777 == 0o600
+            assert (
+                checkpoint.with_name(f".{checkpoint.name}.lock").stat().st_mode
+                & 0o777
+            ) == 0o600
+
+            parent_a.send("clear")
+            assert parent_a.recv() is True
+            remaining = json.loads(checkpoint.read_text(encoding="utf-8"))
+            assert [entry["session_id"] for entry in remaining] == [
+                "proc_runtime_b"
+            ]
+
+            parent_b.send("clear")
+            assert parent_b.recv() is True
+            assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+        finally:
+            for parent, worker in ((parent_a, worker_a), (parent_b, worker_b)):
+                if worker.is_alive():
+                    parent.send("stop")
+                worker.join(timeout=5)
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join(timeout=5)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file locks")
+    def test_live_writer_reconciles_dead_runtime_rows_to_global_zero(
+        self, tmp_path
+    ):
+        checkpoint = tmp_path / "processes.json"
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe()
+        crashed_runtime = context.Process(
+            target=_checkpoint_runtime_worker,
+            args=(os.fspath(checkpoint), "proc_dead_runtime", child),
+        )
+        crashed_runtime.start()
+        parent.send("write")
+        assert parent.recv() is True
+        parent.send("stop")
+        crashed_runtime.join(timeout=5)
+        assert crashed_runtime.exitcode == 0
+        assert json.loads(checkpoint.read_text(encoding="utf-8"))
+
+        survivor = ProcessRegistry()
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert survivor._write_checkpoint() is True
+
+        assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX crash injection")
+    def test_crash_before_replace_preserves_authority_and_next_writer_merges(
+        self, tmp_path
+    ):
+        checkpoint = tmp_path / "processes.json"
+        baseline = ProcessRegistry()
+        baseline._running["proc_baseline"] = ProcessSession(
+            id="proc_baseline",
+            command="baseline",
+            pid=os.getpid(),
+            pid_scope="host",
+            host_start_time=ProcessRegistry._safe_host_start_time(os.getpid()),
+            started_at=time.time(),
+        )
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert baseline._write_checkpoint() is True
+        before = checkpoint.read_bytes()
+
+        context = multiprocessing.get_context("spawn")
+        crashing = context.Process(
+            target=_checkpoint_crash_before_replace,
+            args=(os.fspath(checkpoint), "proc_crashing"),
+        )
+        crashing.start()
+        crashing.join(timeout=10)
+        assert crashing.exitcode == 91
+        assert checkpoint.read_bytes() == before
+
+        survivor = ProcessRegistry()
+        survivor._running["proc_survivor"] = ProcessSession(
+            id="proc_survivor",
+            command="survivor",
+            pid=os.getpid(),
+            pid_scope="host",
+            host_start_time=ProcessRegistry._safe_host_start_time(os.getpid()),
+            started_at=time.time(),
+        )
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert survivor._write_checkpoint() is True
+
+        merged = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert {entry["session_id"] for entry in merged} == {
+            "proc_baseline",
+            "proc_survivor",
+        }
+
     def test_recover_no_file(self, registry, tmp_path):
-        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "missing.json"):
+        checkpoint = tmp_path / "missing.json"
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             assert registry.recover_from_checkpoint() == 0
+            assert registry._write_checkpoint() is False
+            assert not checkpoint.exists()
+            snapshot = registry.completion_activity_snapshot()
+            assert snapshot["process_checkpoint_available"] is False
+            assert snapshot["process_checkpoint_reason"] == "missing"
+
+    def test_recover_valid_empty_checkpoint_proves_zero(self, registry, tmp_path):
+        checkpoint = tmp_path / "processes.json"
+        _write_private_checkpoint(checkpoint, [])
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 0
+
+        snapshot = registry.completion_activity_snapshot()
+        assert snapshot["process_checkpoint_available"] is True
+        assert snapshot["process_checkpoint_reason"] == "verified"
+
+    def test_recover_malformed_checkpoint_preserves_evidence(self, registry, tmp_path):
+        checkpoint = tmp_path / "processes.json"
+        original = b"{not-json"
+        checkpoint.write_bytes(original)
+        checkpoint.chmod(0o600)
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 0
+            assert registry._write_checkpoint() is False
+
+        assert checkpoint.read_bytes() == original
+        snapshot = registry.completion_activity_snapshot()
+        assert snapshot["process_checkpoint_available"] is False
+        assert snapshot["process_checkpoint_reason"] == "invalid"
+
+    def test_recover_permissive_checkpoint_preserves_evidence(self, registry, tmp_path):
+        checkpoint = tmp_path / "processes.json"
+        original = b"[]"
+        checkpoint.write_bytes(original)
+        checkpoint.chmod(0o644)
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 0
+
+        assert checkpoint.read_bytes() == original
+        assert checkpoint.stat().st_mode & 0o777 == 0o644
+        assert registry.completion_activity_snapshot()[
+            "process_checkpoint_available"
+        ] is False
+
+    def test_secure_read_rejects_post_read_mode_change(
+        self, registry, tmp_path
+    ):
+        from tools import durable_state
+
+        checkpoint = tmp_path / "processes.json"
+        _write_private_checkpoint(checkpoint, [])
+        original_lstat = os.lstat
+
+        def changed_mode(path):
+            observed = original_lstat(path)
+            if Path(path) != checkpoint:
+                return observed
+            values = list(observed)
+            values[0] = (values[0] & ~0o777) | 0o644
+            return os.stat_result(values)
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+             patch.object(durable_state.os, "lstat", side_effect=changed_mode):
+            with pytest.raises(ValueError, match="changed|private"):
+                registry._read_checkpoint_entries_secure()
+
+    def test_secure_read_rejects_missing_nofollow_support(
+        self, registry, tmp_path, monkeypatch
+    ):
+        checkpoint = tmp_path / "processes.json"
+        _write_private_checkpoint(checkpoint, [])
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            with pytest.raises(ValueError, match="O_NOFOLLOW"):
+                registry._read_checkpoint_entries_secure()
 
     def test_recover_dead_pid(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
-        checkpoint.write_text(json.dumps([{
+        _write_private_checkpoint(checkpoint, [{
             "session_id": "proc_dead",
             "command": "sleep 999",
             "pid": 999999999,  # almost certainly not running
             "task_id": "t1",
-        }]))
+        }])
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
@@ -945,6 +1358,8 @@ class TestCheckpoint:
     def test_write_checkpoint_includes_watcher_metadata(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
             s = _make_session()
+            s.pid = os.getpid()
+            s.pid_scope = "host"
             s.watcher_platform = "telegram"
             s.watcher_chat_id = "999"
             s.watcher_user_id = "u123"
@@ -965,7 +1380,7 @@ class TestCheckpoint:
 
     def test_recover_enqueues_watchers(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
-        checkpoint.write_text(json.dumps([{
+        _write_private_checkpoint(checkpoint, [{
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),  # current process — guaranteed alive
@@ -977,7 +1392,9 @@ class TestCheckpoint:
             "watcher_user_name": "alice",
             "watcher_thread_id": "42",
             "watcher_interval": 60,
-        }]))
+            "host_start_time": ProcessRegistry._safe_host_start_time(os.getpid()),
+            "process_start_token": _exact_process_start_token(os.getpid()),
+        }])
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 1
@@ -993,13 +1410,15 @@ class TestCheckpoint:
 
     def test_recover_skips_watcher_when_no_interval(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
-        checkpoint.write_text(json.dumps([{
+        _write_private_checkpoint(checkpoint, [{
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),
             "task_id": "t1",
             "watcher_interval": 0,
-        }]))
+            "host_start_time": ProcessRegistry._safe_host_start_time(os.getpid()),
+            "process_start_token": _exact_process_start_token(os.getpid()),
+        }])
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 1
@@ -1007,13 +1426,15 @@ class TestCheckpoint:
 
     def test_recovery_keeps_live_checkpoint_entries(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
-        checkpoint.write_text(json.dumps([{
+        _write_private_checkpoint(checkpoint, [{
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),
             "task_id": "t1",
             "session_key": "sk1",
-        }]))
+            "host_start_time": ProcessRegistry._safe_host_start_time(os.getpid()),
+            "process_start_token": _exact_process_start_token(os.getpid()),
+        }])
 
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
@@ -1035,26 +1456,30 @@ class TestCheckpoint:
             "task_id": "t1",
             "pid_scope": "sandbox",
         }]
-        checkpoint.write_text(json.dumps(original))
+        original_bytes = _write_private_checkpoint(checkpoint, original)
 
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
             assert registry.get("proc_remote") is None
 
-            data = json.loads(checkpoint.read_text())
-            assert data == []
+            assert checkpoint.read_bytes() == original_bytes
+            assert registry.completion_activity_snapshot()[
+                "process_checkpoint_available"
+            ] is False
 
     def test_detached_recovered_process_eventually_exits(self, registry, tmp_path):
         proc = _spawn_python_sleep(0.4)
         checkpoint = tmp_path / "procs.json"
-        checkpoint.write_text(json.dumps([{
+        _write_private_checkpoint(checkpoint, [{
             "session_id": "proc_live",
             "command": "python -c 'import time; time.sleep(0.4)'",
             "pid": proc.pid,
             "task_id": "t1",
             "session_key": "sk1",
-        }]))
+            "host_start_time": ProcessRegistry._safe_host_start_time(proc.pid),
+            "process_start_token": _exact_process_start_token(proc.pid),
+        }])
 
         try:
             with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
@@ -1382,7 +1807,10 @@ def test_drain_notifications_filters_async_delegation_by_session_key():
         })
 
         # Drain for session A — should only get deleg_session_a
-        results_a = process_registry.drain_notifications(session_key="telegram:dm:111:user_a")
+        results_a = process_registry.drain_notifications(
+            session_key="telegram:dm:111:user_a",
+            ack_async=False,
+        )
         assert len(results_a) == 1, (
             f"Expected 1 event for session A, got {len(results_a)}"
         )
@@ -1390,7 +1818,10 @@ def test_drain_notifications_filters_async_delegation_by_session_key():
         assert "done A" in results_a[0][1]
 
         # Session B's event should have been re-queued — drain for session B
-        results_b = process_registry.drain_notifications(session_key="telegram:dm:222:user_b")
+        results_b = process_registry.drain_notifications(
+            session_key="telegram:dm:222:user_b",
+            ack_async=False,
+        )
         assert len(results_b) == 1, (
             f"Expected 1 event for session B, got {len(results_b)}"
         )
@@ -1449,6 +1880,40 @@ def test_drain_notifications_no_filter_passes_all_async_delegation():
             process_registry.completion_queue.get_nowait()
 
 
+def test_drain_notifications_can_defer_async_ack_until_turn_commit(monkeypatch):
+    from tools.process_registry import process_registry
+    from tools import async_delegation
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    acked = []
+    monkeypatch.setattr(
+        async_delegation,
+        "mark_async_delegation_delivered",
+        lambda evt: acked.append(evt),
+    )
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_commit_boundary",
+        "session_key": "owner",
+        "goal": "task",
+        "status": "completed",
+        "summary": "done",
+        "api_calls": 1,
+        "duration_seconds": 0.1,
+    }
+    process_registry.completion_queue.put(event)
+
+    results = process_registry.drain_notifications(
+        session_key="owner",
+        ack_async=False,
+    )
+
+    assert results[0][0] == event
+    assert acked == []
+
+
 def test_drain_notifications_owns_event_callback_beats_key_equality():
     """The positive-proof ownership callback consumes ONLY approved events —
     including across a compression rotation where bare key equality would
@@ -1481,6 +1946,7 @@ def test_drain_notifications_owns_event_callback_beats_key_equality():
         results = process_registry.drain_notifications(
             session_key="new_child_key",
             owns_event=lambda e: e.get("session_key") in lineage,
+            ack_async=False,
         )
         assert [r[0]["delegation_id"] for r in results] == ["deleg_precompress"]
 
@@ -1737,16 +2203,16 @@ class TestPidReuseGuard:
 
     def test_recover_skips_recycled_pid(self, registry, tmp_path):
         """Checkpoint PID is alive but its start time changed → not adopted."""
-        wrong_start = (ProcessRegistry._safe_host_start_time(os.getpid()) or 0) + 999
         checkpoint = tmp_path / "procs.json"
-        checkpoint.write_text(json.dumps([{
+        _write_private_checkpoint(checkpoint, [{
             "session_id": "proc_recycled",
             "command": "sleep 999",
             "pid": os.getpid(),            # alive...
             "pid_scope": "host",
-            "host_start_time": wrong_start,  # ...but a different process now
+            "host_start_time": ProcessRegistry._safe_host_start_time(os.getpid()),
+            "process_start_token": "procfs:999999:999999",
             "task_id": "t1",
-        }]))
+        }])
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             assert registry.recover_from_checkpoint() == 0
             assert len(registry._running) == 0
@@ -1755,29 +2221,37 @@ class TestPidReuseGuard:
         """Checkpoint PID alive AND start time matches → adopted as before."""
         real_start = ProcessRegistry._safe_host_start_time(os.getpid())
         checkpoint = tmp_path / "procs.json"
-        checkpoint.write_text(json.dumps([{
+        _write_private_checkpoint(checkpoint, [{
             "session_id": "proc_match",
             "command": "sleep 999",
             "pid": os.getpid(),
             "pid_scope": "host",
             "host_start_time": real_start,
+            "process_start_token": _exact_process_start_token(os.getpid()),
             "task_id": "t1",
-        }]))
+        }])
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             assert registry.recover_from_checkpoint() == 1
 
-    def test_legacy_checkpoint_without_start_time_still_recovers(self, registry, tmp_path):
-        """Entries written before host_start_time existed degrade to liveness."""
+    def test_live_legacy_checkpoint_without_start_time_stays_unverified(
+        self, registry, tmp_path
+    ):
+        """A bare live PID is preserved because PID reuse cannot be excluded."""
         checkpoint = tmp_path / "procs.json"
-        checkpoint.write_text(json.dumps([{
+        original = _write_private_checkpoint(checkpoint, [{
             "session_id": "proc_legacy",
             "command": "sleep 999",
             "pid": os.getpid(),
             "pid_scope": "host",
             "task_id": "t1",
-        }]))
+        }])
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
-            assert registry.recover_from_checkpoint() == 1
+            assert registry.recover_from_checkpoint() == 0
+
+        assert checkpoint.read_bytes() == original
+        snapshot = registry.completion_activity_snapshot()
+        assert snapshot["process_checkpoint_available"] is False
+        assert snapshot["process_checkpoint_reason"] == "identity_unverified"
 
     def test_write_checkpoint_backfills_host_start_time(self, registry, tmp_path):
         """A host session is checkpointed with a kernel start time recorded."""
