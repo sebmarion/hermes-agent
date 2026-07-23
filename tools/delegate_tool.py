@@ -2770,6 +2770,8 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    route: Optional[str] = None,
+    model_tier: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2867,14 +2869,23 @@ def delegate_task(
             )
         task_list = list(tasks)
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [
-            {
-                "goal": goal,
-                "context": context,
-                "role": top_role,
-                "mode": "execute",
-            }
-        ]
+        single_task = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "mode": "execute",
+        }
+        # Propagate lane routing selectors into the single-task dict so
+        # single-task mode honors the same route/model_tier resolution as
+        # batch tasks. Without this, single-task delegation always defaults
+        # to mode_routes.execute (code_worker) and cannot be redirected to
+        # a different lane — the local_first controller then reroutes the
+        # code_worker lane to the degraded lane when Zeus is in recovery.
+        if route and isinstance(route, str) and route.strip():
+            single_task["route"] = route.strip()
+        if model_tier and isinstance(model_tier, str) and model_tier.strip():
+            single_task["model_tier"] = model_tier.strip()
+        task_list = [single_task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -4396,6 +4407,28 @@ DELEGATE_TASK_SCHEMA = {
                     "just continue working in the meantime. Setting this has no "
                     "effect; the parameter remains only for backward "
                     "compatibility."
+                ),
+            },
+            "route": {
+                "type": "string",
+                "description": (
+                    "Explicit lane name for per-task model routing in single-task "
+                    "mode. Must match a key in delegation.lanes in config.yaml. "
+                    "When set, the child uses that lane's provider/model/toolsets. "
+                    "Ignored when 'tasks' (batch) is provided — use per-task "
+                    "'route' in the batch array instead. Only effective when "
+                    "delegation.lanes is configured."
+                ),
+            },
+            "model_tier": {
+                "type": "string",
+                "description": (
+                    "Model tier hint for single-task mode (e.g. 'micro', 'small', "
+                    "'medium', 'large', 'security'). Mapped to a lane via "
+                    "delegation.tier_routes in config.yaml. Ignored when 'tasks' "
+                    "(batch) is provided — use per-task 'model_tier' in the batch "
+                    "array instead. Only effective when both delegation.lanes and "
+                    "delegation.tier_routes are configured. Otherwise ignored."
                 ),
             },
         },

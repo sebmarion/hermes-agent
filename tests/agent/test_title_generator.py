@@ -248,12 +248,38 @@ class TestAutoTitleSession:
         db.set_session_title.assert_called_once_with("sess-1", "Readable Session")
         assert seen == ["Readable Session"]
 
-    def test_skips_if_generation_fails(self):
+    def test_falls_back_to_user_message_when_generation_fails(self):
+        """When LLM title generation fails, derive a fallback from the
+        first user message instead of leaving the session untitled."""
         db = MagicMock()
         db.get_session_title.return_value = None
 
         with patch("agent.title_generator.generate_title", return_value=None):
-            auto_title_session(db, "sess-1", "hi", "hello")
+            auto_title_session(db, "sess-1", "How do I fix Docker?", "Let me check...")
+            db.set_session_title.assert_called_once_with("sess-1", "How do I fix Docker?")
+
+    def test_fallback_strips_skill_injection_blocks(self):
+        """Fallback title should strip [IMPORTANT: ...] wrappers from
+        skill-invoked first messages."""
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        user_msg = "[IMPORTANT: The user has invoked the bestplan skill.]\n\nWhat's the best plan for X?"
+
+        with patch("agent.title_generator.generate_title", return_value=None):
+            auto_title_session(db, "sess-1", user_msg, "response")
+            db.set_session_title.assert_called_once()
+            title = db.set_session_title.call_args[0][1]
+            assert "IMPORTANT" not in title
+            assert "best plan" in title.lower()
+
+    def test_fallback_skips_if_user_message_also_empty(self):
+        """If both LLM generation and fallback derivation produce nothing,
+        do not call set_session_title."""
+        db = MagicMock()
+        db.get_session_title.return_value = None
+
+        with patch("agent.title_generator.generate_title", return_value=None):
+            auto_title_session(db, "sess-1", "", "hello")
             db.set_session_title.assert_not_called()
 
 
