@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 
 import pytest
 
@@ -219,51 +220,44 @@ def test_subprocess_argv_preserves_safe_multiword_arguments(tmp_path):
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
-def test_systemctl_status_passes_through():
-    """Read-only systemctl probes (status/show/list-units) are fine."""
-    # Run with check=False so we don't fail on the gateway's exit code.
-    r = subprocess.run(
-        ["systemctl", "--user", "status", "hermes-gateway", "--no-pager"],
+def _run_harmless_systemctl_guard_probe(*args: str) -> subprocess.CompletedProcess:
+    """Exercise the command guard without requiring systemd on the host."""
+    return subprocess.run(
+        [sys.executable, "-c", "raise SystemExit(0)", "systemctl", *args],
         capture_output=True,
         text=True,
         check=False,
     )
-    assert r is not None  # Did not raise — the guard let it through.
+
+
+def test_systemctl_status_passes_through():
+    """Read-only systemctl probes (status/show/list-units) are fine."""
+    r = _run_harmless_systemctl_guard_probe(
+        "--user", "status", "hermes-gateway", "--no-pager"
+    )
+    assert r.returncode == 0  # Did not raise — the guard let it through.
 
 
 def test_systemctl_show_passes_through():
-    r = subprocess.run(
-        ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
-        capture_output=True,
-        text=True,
-        check=False,
+    r = _run_harmless_systemctl_guard_probe(
+        "--user", "show", "hermes-gateway", "--no-pager"
     )
-    assert r is not None
+    assert r.returncode == 0
 
 
 def test_systemctl_list_units_passes_through():
-    r = subprocess.run(
-        ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
-        capture_output=True,
-        text=True,
-        check=False,
+    r = _run_harmless_systemctl_guard_probe(
+        "--user", "list-units", "fake-not-real-unit*", "--no-pager"
     )
-    assert r is not None
+    assert r.returncode == 0
 
 
 def test_systemctl_unrelated_unit_passes_through():
     """systemctl restart of a non-hermes unit is allowed (we only protect hermes)."""
-    # Use --dry-run so we don't actually try to restart anything; just
-    # verify the guard doesn't block the call. systemctl supports
-    # --dry-run via the privileged API; on user scope it usually fails
-    # quickly without side effects.
-    r = subprocess.run(
-        ["systemctl", "--user", "show", "fake-not-real-unit"],
-        capture_output=True,
-        text=True,
-        check=False,
+    r = _run_harmless_systemctl_guard_probe(
+        "--user", "restart", "fake-not-real-unit"
     )
-    assert r is not None
+    assert r.returncode == 0
 
 
 def test_kill_own_subtree_passes_through():
