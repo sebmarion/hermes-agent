@@ -20475,6 +20475,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return response
 
 
+def _advance_shutdown_signal_classification(
+    *,
+    planned_shutdown_initiated: bool,
+    unexpected_shutdown_initiated: bool,
+    marker_classified_planned: bool,
+) -> tuple[bool, bool]:
+    """Advance shutdown classification without allowing later downgrades."""
+    if unexpected_shutdown_initiated:
+        return False, True
+    if planned_shutdown_initiated or marker_classified_planned:
+        return True, False
+    return False, True
+
+
 def _run_planned_stop_watcher(
     stop_event: threading.Event,
     runner,
@@ -20922,9 +20936,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # managers can revive the process. Planned stop paths write a marker
     # before signalling us so they can exit cleanly instead.
     _signal_initiated_shutdown = False
+    _planned_shutdown_initiated = False
 
     # Set up signal handlers
     def shutdown_signal_handler(received_signal=None):
+        nonlocal _planned_shutdown_initiated
         nonlocal _signal_initiated_shutdown
         # Planned --replace takeover check: when a sibling gateway is
         # taking over via --replace, it wrote a marker naming this PID
@@ -20971,7 +20987,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)
 
-        if planned_takeover:
+        (
+            _planned_shutdown_initiated,
+            _signal_initiated_shutdown,
+        ) = _advance_shutdown_signal_classification(
+            planned_shutdown_initiated=_planned_shutdown_initiated,
+            unexpected_shutdown_initiated=_signal_initiated_shutdown,
+            marker_classified_planned=planned_takeover or planned_stop,
+        )
+        runner._signal_initiated_shutdown = _signal_initiated_shutdown
+
+        if _signal_initiated_shutdown:
+            logger.info(
+                "Received %s — initiating shutdown",
+                _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
+            )
+        elif planned_takeover:
             logger.info(
                 "Received %s as a planned --replace takeover — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM",
@@ -20982,16 +21013,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
             )
         else:
-            _signal_initiated_shutdown = True
-            # Mirror onto the runner so _stop_impl can suppress the
-            # gateway_state=stopped persist for unexpected signals
-            # (container/s6 SIGTERM on restart, OOM, bare kill) — see
-            # issue #42675. Operator-initiated stops set a planned-stop
-            # marker first, land in the `planned_stop` branch above, and
-            # leave this flag False so they DO persist "stopped".
-            runner._signal_initiated_shutdown = True
             logger.info(
-                "Received %s — initiating shutdown",
+                "Received %s during an already planned gateway stop — "
+                "preserving clean-stop classification",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
             )
 

@@ -19,7 +19,10 @@ import time
 from unittest.mock import MagicMock
 
 
-from gateway.run import _run_planned_stop_watcher
+from gateway.run import (
+    _advance_shutdown_signal_classification,
+    _run_planned_stop_watcher,
+)
 from gateway import status as status_mod
 
 
@@ -47,6 +50,42 @@ class _FakeRunner:
     def __init__(self, *, running: bool = True, draining: bool = False):
         self._running = running
         self._draining = draining
+
+
+def test_duplicate_signal_cannot_downgrade_planned_shutdown():
+    planned, unexpected = _advance_shutdown_signal_classification(
+        planned_shutdown_initiated=False,
+        unexpected_shutdown_initiated=False,
+        marker_classified_planned=True,
+    )
+    assert planned is True
+    assert unexpected is False
+
+    planned, unexpected = _advance_shutdown_signal_classification(
+        planned_shutdown_initiated=planned,
+        unexpected_shutdown_initiated=unexpected,
+        marker_classified_planned=False,
+    )
+    assert planned is True
+    assert unexpected is False
+
+
+def test_late_planned_marker_cannot_erase_unexpected_shutdown():
+    planned, unexpected = _advance_shutdown_signal_classification(
+        planned_shutdown_initiated=False,
+        unexpected_shutdown_initiated=False,
+        marker_classified_planned=False,
+    )
+    assert planned is False
+    assert unexpected is True
+
+    planned, unexpected = _advance_shutdown_signal_classification(
+        planned_shutdown_initiated=planned,
+        unexpected_shutdown_initiated=unexpected,
+        marker_classified_planned=True,
+    )
+    assert planned is False
+    assert unexpected is True
 
 
 def _make_loop_capturing_calls():
