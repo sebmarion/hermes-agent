@@ -537,14 +537,20 @@ def _resolve_lane_credentials(agent: Any, lane: dict[str, Any]) -> dict[str, Any
     )
     provider = str(runtime.get("provider") or configured_provider).strip()
     model = str(runtime.get("model") or configured_model).strip()
-    if (
-        provider.lower() == "kimi-coding"
-        and configured_model.lower() == "k3"
-    ):
+    is_kimi_k3_request = (
+        configured_model.lower() == "k3"
+        and (
+            configured_provider.lower() == "kimi-coding"
+            or provider.lower() == "kimi-coding"
+        )
+    )
+    if is_kimi_k3_request:
         resolved_base_url = str(runtime.get("base_url") or "").strip().rstrip("/")
         resolved_api_mode = str(runtime.get("api_mode") or "").strip().lower()
         if (
-            resolved_base_url != "https://api.kimi.com/coding"
+            provider.lower() != "kimi-coding"
+            or model.lower() != "k3"
+            or resolved_base_url != "https://api.kimi.com/coding"
             or resolved_api_mode != "anthropic_messages"
             or configured_api_mode.lower() != "anthropic_messages"
         ):
