@@ -560,6 +560,7 @@ def test_run_bestplan_uses_resolved_lane_identity_and_truthful_receipt(
 
     assert result["status"] == "completed"
     assert [(item["provider"], item["model"], item["api_mode"]) for item in constructed] == [
+        ("resolved-openai-codex", "configured-sol-model", "codex_app_server"),
         ("resolved-configured-glm", "configured-glm-model", "chat_completions"),
         ("resolved-openai-codex", "configured-sol-model", "codex_app_server"),
         ("resolved-openai-codex", "configured-sol-model", "codex_app_server"),
@@ -631,8 +632,195 @@ def test_canonical_explorer_pool_cycles_in_order_and_uses_named_synthesizer(
         explorers[index % pool_size]["model"] for index in range(5)
     ]
     assert result["status"] == "completed"
-    assert constructed_models == [*expected_explorers, explorers[0]["model"]]
+    assert constructed_models == [
+        explorers[0]["model"],
+        *expected_explorers,
+        explorers[0]["model"],
+    ]
     assert result["runtime"]["lane"] == explorers[0]["name"]
+
+
+def test_synthesizer_resolution_failure_prevents_explorer_construction(
+    monkeypatch,
+):
+    import agent.bestplan_orchestrator as orchestrator
+
+    built = []
+    config = _canonical_config()
+
+    def resolve(_agent, explorer):
+        if explorer["name"] == config["synthesizer"]:
+            raise BestPlanUnavailable("synthetic preflight failure")
+        return _identity(explorer)
+
+    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", resolve)
+    monkeypatch.setattr(
+        orchestrator,
+        "_build_child_agent",
+        lambda parent, explorer, runtime: built.append(explorer["name"]),
+    )
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=3,
+        config=config,
+    )
+
+    assert result["status"] == "failed"
+    assert built == []
+
+
+def test_synthesizer_construction_failure_prevents_explorer_construction(
+    monkeypatch,
+):
+    import agent.bestplan_orchestrator as orchestrator
+
+    built = []
+    config = _canonical_config()
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, explorer: _identity(explorer),
+    )
+
+    def build(_parent, explorer, _runtime):
+        built.append(explorer["name"])
+        if explorer["name"] == config["synthesizer"]:
+            raise RuntimeError("synthetic construction failure")
+        raise AssertionError("explorer constructed before synth preflight")
+
+    monkeypatch.setattr(orchestrator, "_build_child_agent", build)
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=3,
+        config=config,
+    )
+
+    assert result["status"] == "failed"
+    assert built == [config["synthesizer"]]
+
+
+def test_unavailable_kimi_attempt_is_ordered_and_not_substituted(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    constructed = []
+    config = _canonical_config()
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs["model"])
+
+        def run_conversation(self, prompt):
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "final plan"}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    def resolve(_agent, explorer):
+        if explorer["name"] == "kimi-k3":
+            raise BestPlanUnavailable("synthetic Kimi outage")
+        return _identity(explorer)
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", resolve)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=3,
+        config=config,
+    )
+
+    assert result["status"] == "completed"
+    assert constructed == [
+        "configured-sol-model",
+        "configured-glm-model",
+        "configured-sol-model",
+        "configured-sol-model",
+    ]
+    assert [
+        (attempt["index"], attempt["explorer"], attempt["status"])
+        for attempt in result["attempts"]
+    ] == [
+        (0, "glm", "success"),
+        (1, "kimi-k3", "failed"),
+        (2, "sol", "success"),
+    ]
+    assert result["attempts"][1]["reason_code"] == "credential_unavailable"
+
+
+def test_out_of_order_completion_preserves_attempt_and_candidate_order(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    synth_prompts = []
+    delays = {
+        "configured-glm-model": 0.03,
+        "configured-kimi-model": 0.01,
+        "configured-sol-model": 0.02,
+    }
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+
+        def run_conversation(self, prompt):
+            if "active BestPlan synthesizer" in prompt:
+                synth_prompts.append(prompt)
+                return {"final_response": "final plan"}
+            time.sleep(delays[self.model])
+            return {"final_response": _candidate_text(self.model)}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, explorer: _identity(explorer),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=3,
+        config=_canonical_config(),
+    )
+
+    assert result["status"] == "completed"
+    assert [attempt["explorer"] for attempt in result["attempts"]] == [
+        "glm", "kimi-k3", "sol",
+    ]
+    packet = synth_prompts[0]
+    positions = [
+        packet.index(f'"summary": "{model}"')
+        for model in (
+            "configured-glm-model",
+            "configured-kimi-model",
+            "configured-sol-model",
+        )
+    ]
+    assert positions == sorted(positions)
 
 
 def test_lane_credential_resolution_uses_configured_provider_model_and_endpoint(
@@ -895,11 +1083,12 @@ def test_hostile_provider_cannot_block_bestplan_past_hard_teardown_deadline(
         assert result["status"] == "failed"
         assert result["cleanup_incomplete"] is True
         assert elapsed < 0.2
-        assert any(instance.active for instance in instances)
-        assert all(instance.request_aborted for instance in instances)
-        assert all(instance.sockets_forced for instance in instances)
-        assert all(instance.client_closed for instance in instances)
-        assert all(instance.codex_killed for instance in instances)
+        active_instances = [instance for instance in instances if instance.active]
+        assert active_instances
+        assert all(instance.request_aborted for instance in active_instances)
+        assert all(instance.sockets_forced for instance in active_instances)
+        assert all(instance.client_closed for instance in active_instances)
+        assert all(instance.codex_killed for instance in active_instances)
     finally:
         release.set()
         safety_release.cancel()
