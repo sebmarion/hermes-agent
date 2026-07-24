@@ -10,6 +10,7 @@ import json
 import pytest
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 from agent.bestplan_orchestrator import (
@@ -514,12 +515,81 @@ def test_legacy_lane_names_are_operator_defined():
 
 def test_receipt_has_canonical_markers_and_hash():
     body = "plan body"
-    receipt = make_receipt("run-1", model="gpt-5.6-sol", quorum="3/3", synth_status="success", body=body, lane="sol")
+    attempts = [
+        {
+            "index": index,
+            "strategy": f"strategy-{index}",
+            "explorer": f"explorer-{index}",
+            "configured": {"provider": "provider", "model": f"model-{index}"},
+            "resolved": {"provider": "provider", "model": f"model-{index}"},
+            "status": "success",
+            "reason_code": None,
+        }
+        for index in range(3)
+    ]
+    synthesizer = {
+        "name": "sol",
+        "configured": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "resolved": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "status": "success",
+        "reason_code": None,
+    }
+    receipt = make_receipt(
+        "run-1",
+        model="gpt-5.6-sol",
+        quorum="3/3",
+        synth_status="success",
+        body=body,
+        lane="sol",
+        requested_count=3,
+        effective_count=3,
+        quorum_required=2,
+        attempts=attempts,
+        synthesizer=synthesizer,
+    )
     assert receipt.startswith(RECEIPT_BEGIN)
     assert receipt.endswith(RECEIPT_END)
+    metadata = json.loads(receipt.splitlines()[1])
+    assert metadata["version"] == 2
     assert validate_receipt(receipt, body)
     assert not validate_receipt(receipt, body + "!")
     assert body_sha256(body)
+
+
+def test_checked_in_v1_receipt_fixture_remains_readable():
+    fixture = json.loads(
+        (Path(__file__).parents[1] / "fixtures" / "bestplan_receipt_v1.json").read_text()
+    )
+    assert validate_receipt(fixture["receipt"], fixture["body"])
+    assert not validate_receipt(fixture["receipt"], fixture["body"] + "!")
+
+
+def test_v1_empty_body_hash_and_malformed_v2_validation():
+    empty_hash = body_sha256("")
+    v1_metadata = {
+        "version": 1,
+        "run_id": "legacy-empty",
+        "body_sha256": empty_hash,
+    }
+    v1 = (
+        "<<<HERMES_BESTPLAN_RECEIPT_V1>>>\n"
+        + json.dumps(v1_metadata, sort_keys=True, separators=(",", ":"))
+        + "\n<<<END_HERMES_BESTPLAN_RECEIPT_V1>>>"
+    )
+    assert validate_receipt(v1, "")
+
+    malformed = (
+        RECEIPT_BEGIN
+        + "\n"
+        + json.dumps({
+            "version": 2,
+            "run_id": "truncated",
+            "body_sha256": body_sha256("body"),
+        }, sort_keys=True, separators=(",", ":"))
+        + "\n"
+        + RECEIPT_END
+    )
+    assert not validate_receipt(malformed, "body")
 
 
 def test_append_and_reconcile_is_idempotent(tmp_path):
@@ -566,15 +636,48 @@ def test_run_bestplan_uses_resolved_lane_identity_and_truthful_receipt(
         ("resolved-openai-codex", "configured-sol-model", "codex_app_server"),
     ]
     receipt_json = json.loads(result["final_response"].splitlines()[1])
-    assert receipt_json["provider"] == constructed[-1]["provider"]
-    assert receipt_json["model"] == constructed[-1]["model"]
-    assert receipt_json["api_mode"] == constructed[-1]["api_mode"]
+    assert set(receipt_json) == {
+        "version", "run_id", "requested_count", "effective_count",
+        "quorum_required", "attempts", "synthesizer", "status",
+        "reason_code", "body_sha256",
+    }
+    assert receipt_json["version"] == 2
+    assert receipt_json["status"] == "completed"
+    assert receipt_json["reason_code"] is None
+    assert [attempt["index"] for attempt in receipt_json["attempts"]] == [0, 1]
+    assert all(set(attempt) == {
+        "index", "strategy", "explorer", "configured", "resolved",
+        "status", "reason_code",
+    } for attempt in receipt_json["attempts"])
+    assert receipt_json["synthesizer"] == {
+        "name": "sol",
+        "configured": {
+            "provider": "openai-codex",
+            "model": "configured-sol-model",
+        },
+        "resolved": {
+            "provider": constructed[-1]["provider"],
+            "model": constructed[-1]["model"],
+        },
+        "status": "success",
+        "reason_code": None,
+    }
     durable = json.loads(
         (tmp_path / "bestplan" / "receipts.jsonl").read_text().splitlines()[-1]
     )
-    assert durable["provider"] == receipt_json["provider"]
-    assert durable["model"] == receipt_json["model"]
-    assert durable["api_mode"] == receipt_json["api_mode"]
+    assert durable == receipt_json
+
+    clamped = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=0,
+        config=_runtime_config(),
+    )
+    clamped_receipt = "\n".join(clamped["final_response"].splitlines()[:3])
+    clamped_metadata = json.loads(clamped_receipt.splitlines()[1])
+    assert clamped_metadata["requested_count"] == 0
+    assert clamped_metadata["effective_count"] == 2
+    assert validate_receipt(clamped_receipt, clamped["body"])
 
 
 @pytest.mark.parametrize("pool_size", [1, 2, 3, 5])

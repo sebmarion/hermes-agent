@@ -24,9 +24,11 @@ from typing import Any, Iterable
 
 from hermes_constants import parse_reasoning_effort
 
-RECEIPT_BEGIN = "<<<HERMES_BESTPLAN_RECEIPT_V1>>>"
-RECEIPT_END = "<<<END_HERMES_BESTPLAN_RECEIPT_V1>>>"
-RECEIPT_VERSION = 1
+RECEIPT_BEGIN_V1 = "<<<HERMES_BESTPLAN_RECEIPT_V1>>>"
+RECEIPT_END_V1 = "<<<END_HERMES_BESTPLAN_RECEIPT_V1>>>"
+RECEIPT_BEGIN = "<<<HERMES_BESTPLAN_RECEIPT_V2>>>"
+RECEIPT_END = "<<<END_HERMES_BESTPLAN_RECEIPT_V2>>>"
+RECEIPT_VERSION = 2
 
 # Host-owned heterogeneous explorer lanes. Each lane is an immutable model/
 # provider/api_mode triple.  The host alternates dispatch across lanes and picks
@@ -300,29 +302,113 @@ def make_receipt(
     lane: str | None = None,
     provider: str | None = None,
     api_mode: str | None = None,
+    requested_count: int,
+    effective_count: int,
+    quorum_required: int,
+    attempts: list[dict[str, Any]],
+    synthesizer: dict[str, Any],
+    status: str = "completed",
+    reason_code: str | None = None,
 ) -> str:
     metadata = {
         "version": RECEIPT_VERSION,
         "run_id": run_id,
-        "model": model,
-        "lane": lane,
-        "provider": provider,
-        "api_mode": api_mode,
-        "quorum": quorum,
-        "synth_status": synth_status,
-        "body_sha256": body_sha256(body),
+        "requested_count": requested_count,
+        "effective_count": effective_count,
+        "quorum_required": quorum_required,
+        "attempts": attempts,
+        "synthesizer": synthesizer,
+        "status": status,
+        "reason_code": reason_code,
+        "body_sha256": body_sha256(body) if body else None,
     }
     canonical = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
     return f"{RECEIPT_BEGIN}\n{canonical}\n{RECEIPT_END}"
 
 
+def _valid_v2_receipt_metadata(metadata: dict[str, Any], body: str) -> bool:
+    top_keys = {
+        "version", "run_id", "requested_count", "effective_count",
+        "quorum_required", "attempts", "synthesizer", "status",
+        "reason_code", "body_sha256",
+    }
+    attempt_keys = {
+        "index", "strategy", "explorer", "configured", "resolved",
+        "status", "reason_code",
+    }
+    synth_keys = {
+        "name", "configured", "resolved", "status", "reason_code",
+    }
+    identity_keys = {"provider", "model"}
+    if set(metadata) != top_keys or metadata.get("version") != 2:
+        return False
+    requested_count = metadata.get("requested_count")
+    if not isinstance(requested_count, int) or isinstance(requested_count, bool):
+        return False
+    for key in ("effective_count", "quorum_required"):
+        value = metadata.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            return False
+    if not 2 <= metadata["effective_count"] <= 5:
+        return False
+    if metadata["quorum_required"] != quorum_for(metadata["effective_count"]):
+        return False
+    attempts = metadata.get("attempts")
+    if not isinstance(attempts, list) or len(attempts) != metadata["effective_count"]:
+        return False
+    for expected_index, attempt in enumerate(attempts):
+        if not isinstance(attempt, dict) or set(attempt) != attempt_keys:
+            return False
+        if attempt.get("index") != expected_index:
+            return False
+        if attempt.get("status") not in {"success", "failed", "timeout"}:
+            return False
+        configured = attempt.get("configured")
+        resolved = attempt.get("resolved")
+        if not isinstance(configured, dict) or set(configured) != identity_keys:
+            return False
+        if resolved is not None and (
+            not isinstance(resolved, dict) or set(resolved) != identity_keys
+        ):
+            return False
+    synthesizer = metadata.get("synthesizer")
+    if not isinstance(synthesizer, dict) or set(synthesizer) != synth_keys:
+        return False
+    if synthesizer.get("status") not in {
+        "success", "failed", "timeout", "not_started",
+    }:
+        return False
+    for key in ("configured", "resolved"):
+        identity = synthesizer.get(key)
+        if identity is not None and (
+            not isinstance(identity, dict) or set(identity) != identity_keys
+        ):
+            return False
+    if metadata.get("status") not in {"completed", "failed"}:
+        return False
+    expected_hash = body_sha256(body) if body else None
+    if metadata["status"] == "completed":
+        expected_hash = body_sha256(body)
+    return metadata.get("body_sha256") == expected_hash
+
+
 def validate_receipt(receipt: str, body: str) -> bool:
     try:
         begin, canonical, end = receipt.strip().splitlines()
-        if begin != RECEIPT_BEGIN or end != RECEIPT_END:
+        marker_version = None
+        if begin == RECEIPT_BEGIN and end == RECEIPT_END:
+            marker_version = 2
+        elif begin == RECEIPT_BEGIN_V1 and end == RECEIPT_END_V1:
+            marker_version = 1
+        if marker_version is None:
             return False
         metadata = json.loads(canonical)
-        return metadata.get("version") == RECEIPT_VERSION and metadata.get("body_sha256") == body_sha256(body)
+        if marker_version == 1:
+            return (
+                metadata.get("version") == 1
+                and metadata.get("body_sha256") == body_sha256(body)
+            )
+        return _valid_v2_receipt_metadata(metadata, body)
     except (ValueError, TypeError, json.JSONDecodeError):
         return False
 
@@ -607,6 +693,10 @@ def run_bestplan(
             config = None
     resolved = validate_runtime(config, credentials_available=True)
     effective = normalize_count(count)
+    try:
+        requested_count = int(count)
+    except (TypeError, ValueError):
+        requested_count = 3
     run_id = uuid.uuid4().hex
     started_at = time.monotonic()
     overall_deadline = started_at + float(resolved["overall_timeout"])
@@ -898,6 +988,20 @@ def run_bestplan(
         }
 
     quorum_text = f"{len(successes)}/{effective}"
+    receipt_attempts = visible_attempts()
+    receipt_synthesizer = {
+        "name": synth_explorer["name"],
+        "configured": {
+            "provider": synth_explorer["provider"],
+            "model": synth_explorer["model"],
+        },
+        "resolved": {
+            "provider": synth_runtime["provider"],
+            "model": synth_runtime["model"],
+        },
+        "status": "success",
+        "reason_code": None,
+    }
     receipt = make_receipt(
         run_id,
         model=synth_runtime["model"],
@@ -907,18 +1011,13 @@ def run_bestplan(
         synth_status="success",
         body=body,
         lane=synth_explorer.get("name"),
+        requested_count=requested_count,
+        effective_count=effective,
+        quorum_required=quorum,
+        attempts=receipt_attempts,
+        synthesizer=receipt_synthesizer,
     )
-    receipt_record = {
-        "run_id": run_id,
-        "status": "completed",
-        "model": synth_runtime["model"],
-        "provider": synth_runtime["provider"],
-        "api_mode": synth_runtime["api_mode"],
-        "lane": synth_explorer.get("name"),
-        "quorum": quorum_text,
-        "synth_status": "success",
-        "body_sha256": body_sha256(body),
-    }
+    receipt_record = json.loads(receipt.splitlines()[1])
     try:
         home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
         append_receipt(home / "bestplan" / "receipts.jsonl", receipt_record)

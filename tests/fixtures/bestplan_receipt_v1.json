@@ -1,0 +1,4 @@
+{
+  "body": "legacy plan body",
+  "receipt": "<<<HERMES_BESTPLAN_RECEIPT_V1>>>\n{\"api_mode\":\"chat_completions\",\"body_sha256\":\"7397915d99340875976e2eac7c6851c2f2e6e14bc97657ffe254de21a4e769ef\",\"lane\":\"sol\",\"model\":\"legacy-model\",\"provider\":\"legacy-provider\",\"quorum\":\"2/2\",\"run_id\":\"legacy-run\",\"synth_status\":\"success\",\"version\":1}\n<<<END_HERMES_BESTPLAN_RECEIPT_V1>>>"
+}
