@@ -423,6 +423,21 @@ fragments and pass the body after `--` to `run argv`. Build the body only from
 bounded issue code/subject pairs and next-check time; do not include raw
 evidence, URLs, command output, or exception text.
 
+The fixed argv prefix is:
+
+```python
+[
+    "/usr/bin/osascript",
+    "-e", "on run argv",
+    "-e", (
+        'display notification (item 1 of argv) '
+        'with title "Hermes Health Sentinel"'
+    ),
+    "-e", "end run",
+    "--",
+]
+```
+
 - [ ] **Step 7: Write failing concurrency/deadline tests**
 
 Cover:
@@ -524,7 +539,11 @@ environment variables, log paths, or shell wrappers.
 - [ ] **Step 3: Validate artifacts without loading launchd**
 
 Run `plutil -lint` and `plutil -p` on the candidate. Parse it with `plistlib`
-in the focused test and verify the exact dictionary.
+in the focused test and verify the exact dictionary: canonical `Label`, exact
+four `ProgramArguments`, `RunAtLoad is True`, `StartInterval == 300`,
+`ProcessType == "Background"`, `Umask == 63`,
+`LimitLoadToSessionType == "Aqua"`, and absence of `KeepAlive`,
+`StartCalendarInterval`, `WorkingDirectory`, and `EnvironmentVariables`.
 
 - [ ] **Step 4: Return artifacts and receipt**
 
@@ -580,7 +599,9 @@ against backups with `diff -u`.
 
 Apply only the reviewed hunks. Preserve script owner and executable mode.
 Re-read hashes and compare with the reviewed candidates. Do not touch any
-existing LaunchAgent.
+existing LaunchAgent. “Install” in this step means writing the reviewed files
+to disk only: do not call `launchctl` and do not load the new plist until
+Task 6.
 
 - [ ] **Step 6: Run the pre-bootstrap sentinel observation**
 
