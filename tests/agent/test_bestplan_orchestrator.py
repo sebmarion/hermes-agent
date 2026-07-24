@@ -1184,6 +1184,61 @@ def test_lane_credential_resolution_uses_configured_provider_model_and_endpoint(
     assert identity["api_key"] == "resolved-secret"
 
 
+def test_kimi_k3_resolution_rejects_legacy_moonshot_endpoint(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    from hermes_cli import runtime_provider
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "kimi-coding",
+            "api_mode": "chat_completions",
+            "base_url": "https://api.moonshot.ai/v1",
+            "api_key": "legacy-secret",
+        },
+    )
+    lane = {
+        "name": "kimi-k3",
+        "provider": "kimi-coding",
+        "model": "k3",
+        "api_mode": "anthropic_messages",
+        "reasoning_effort": "max",
+    }
+
+    with pytest.raises(BestPlanUnavailable):
+        orchestrator._resolve_lane_credentials(SimpleNamespace(), lane)
+
+
+def test_kimi_k3_resolution_accepts_exact_coding_plan_endpoint(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    from hermes_cli import runtime_provider
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "kimi-coding",
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.kimi.com/coding",
+            "api_key": "sk-kimi-SENTINEL",
+        },
+    )
+    lane = {
+        "name": "kimi-k3",
+        "provider": "kimi-coding",
+        "model": "k3",
+        "api_mode": "anthropic_messages",
+        "reasoning_effort": "max",
+    }
+
+    identity = orchestrator._resolve_lane_credentials(SimpleNamespace(), lane)
+
+    assert identity["base_url"] == "https://api.kimi.com/coding"
+    assert identity["api_mode"] == "anthropic_messages"
+    assert identity["model"] == "k3"
+
+
 def test_parallel_explorers_build_sequentially_and_restore_tool_global(monkeypatch):
     import agent.bestplan_orchestrator as orchestrator
     import model_tools

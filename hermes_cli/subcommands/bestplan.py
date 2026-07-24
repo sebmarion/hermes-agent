@@ -21,10 +21,12 @@ def build_bestplan_parser(subparsers, *, cmd_bestplan: Callable) -> None:
         "bestplan",
         help="Inspect BestPlan SOTA lane configuration",
         description=(
-            "View and validate the heterogeneous intelligence lanes that "
+            "View and validate the configured BestPlan explorer pool and "
+            "named synthesizer that "
             "the /bestplan orchestration uses for explorer dispatch and "
-            "synthesis.  Lane definitions live in config.yaml under "
-            "'bestplan.lanes'.\n\n"
+            "synthesis. Explorer definitions live in config.yaml under "
+            "'bestplan.explorers', with 'bestplan.synthesizer' naming one "
+            "configured explorer.\n\n"
             "This is a read-only view — update config.yaml directly to "
             "change the active SOTA models."
         ),

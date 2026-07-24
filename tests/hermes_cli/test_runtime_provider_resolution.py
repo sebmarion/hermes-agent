@@ -3416,3 +3416,27 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     }
     assert resolved["api_key"] == "pooled-key"
     assert resolved["source"] == "pool:lmstudio-pool"
+
+
+def test_kimi_k3_uses_coding_plan_anthropic_messages_endpoint(monkeypatch):
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-SENTINEL")
+    monkeypatch.delenv("KIMI_CODING_API_KEY", raising=False)
+    monkeypatch.delenv("KIMI_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "kimi-coding", "default": "k3"},
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="kimi-coding",
+        target_model="k3",
+    )
+
+    assert resolved["provider"] == "kimi-coding"
+    assert resolved["base_url"] == "https://api.kimi.com/coding"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["api_key"] == "sk-kimi-SENTINEL"
+    assert resolved["base_url"] + "/v1/messages" == (
+        "https://api.kimi.com/coding/v1/messages"
+    )

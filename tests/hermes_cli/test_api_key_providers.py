@@ -1305,3 +1305,13 @@ class TestMinimaxOAuthProvider:
             "doesn't fire the 'No auxiliary LLM provider configured' warning "
             "for every minimax-oauth session."
         )
+
+
+def test_kimi_k3_catalog_is_coding_plan_only_and_preserves_default():
+    from hermes_cli.models import _PROVIDER_MODELS
+
+    coding_models = _PROVIDER_MODELS["kimi-coding"]
+    assert coding_models[0] == "kimi-k2.7-code"
+    assert coding_models[1] == "k3"
+    assert "k3" not in _PROVIDER_MODELS["kimi-coding-cn"]
+    assert "k3" not in _PROVIDER_MODELS["moonshot"]

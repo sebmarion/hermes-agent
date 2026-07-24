@@ -525,6 +525,19 @@ def _resolve_lane_credentials(agent: Any, lane: dict[str, Any]) -> dict[str, Any
         explicit_base_url=lane.get("base_url"),
         target_model=configured_model,
     )
+    if (
+        configured_provider.lower() == "kimi-coding"
+        and configured_model.lower() == "k3"
+    ):
+        resolved_base_url = str(runtime.get("base_url") or "").strip().rstrip("/")
+        resolved_api_mode = str(runtime.get("api_mode") or "").strip().lower()
+        if (
+            resolved_base_url != "https://api.kimi.com/coding"
+            or resolved_api_mode != "anthropic_messages"
+        ):
+            raise BestPlanUnavailable(
+                "BestPlan Kimi K3 requires the trusted Kimi Coding endpoint"
+            )
     provider = str(runtime.get("provider") or configured_provider).strip()
     model = str(runtime.get("model") or configured_model).strip()
     api_mode = configured_api_mode or str(runtime.get("api_mode") or "").strip()
