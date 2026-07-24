@@ -52,7 +52,7 @@ def cmd_bestplan(args) -> int:
 
     from hermes_cli.config import load_config
     from agent.bestplan_orchestrator import (
-        BestPlanUnavailable, DEFAULT_RUNTIME, validate_runtime,
+        BestPlanUnavailable, validate_runtime,
     )
 
     config = None
@@ -61,16 +61,19 @@ def cmd_bestplan(args) -> int:
     except Exception:
         pass
 
-    # Resolve lanes: config overrides default
-    resolved = dict(DEFAULT_RUNTIME)
-    if config:
-        resolved.update(config)
-
-    lanes = resolved.get("lanes") or DEFAULT_RUNTIME["lanes"]
-    synthesizer = resolved.get("synthesizer", "strongest")
     source = "config.yaml" if config else "DEFAULT (no bestplan config block)"
 
-    print(f"\n  BestPlan SOTA Lanes — source: {source}")
+    try:
+        resolved = validate_runtime(config)
+    except BestPlanUnavailable:
+        print(f"\n  BestPlan SOTA Explorers — source: {source}")
+        print("  Validation: FAIL — invalid BestPlan configuration\n")
+        return 1
+
+    lanes = resolved["explorers"]
+    synthesizer = resolved["synthesizer"]
+
+    print(f"\n  BestPlan SOTA Explorers — source: {source}")
     print(f"  {'Name':<8} {'Provider':<22} {'Model':<20} {'API Mode':<22} {'Reasoning':<12}")
     print(f"  {'─'*8} {'─'*22} {'─'*20} {'─'*22} {'─'*12}")
     for lane in lanes:
@@ -81,13 +84,6 @@ def cmd_bestplan(args) -> int:
             f"{lane.get('api_mode',''):<22} "
             f"{lane.get('reasoning_effort',''):<12}"
         )
-    print(f"\n  Synthesizer: {synthesizer} (strongest available lane)")
-
-    # Validate
-    try:
-        validate_runtime(config)
-        print("  Validation: PASS\n")
-        return 0
-    except BestPlanUnavailable as exc:
-        print(f"  Validation: FAIL — {exc}\n")
-        return 1
+    print(f"\n  Synthesizer: {synthesizer}")
+    print("  Validation: PASS\n")
+    return 0

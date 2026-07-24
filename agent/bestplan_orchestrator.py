@@ -69,6 +69,18 @@ _ALLOWED_API_MODES = frozenset({
 _ALLOWED_REASONING_EFFORTS = frozenset({
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 })
+_REASON_CODES = frozenset({
+    "credential_unavailable",
+    "runtime_invalid",
+    "construction_failed",
+    "provider_error",
+    "timeout",
+    "candidate_invalid",
+    "quorum_unavailable",
+    "synthesizer_failed",
+    "receipt_persistence_failed",
+    "overall_timeout",
+})
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +375,15 @@ def _valid_v2_receipt_metadata(metadata: dict[str, Any], body: str) -> bool:
             return False
         if attempt.get("status") not in {"success", "failed", "timeout"}:
             return False
+        if (
+            attempt["reason_code"] is not None
+            and attempt["reason_code"] not in _REASON_CODES
+        ):
+            return False
+        if attempt["status"] == "success" and attempt["reason_code"] is not None:
+            return False
+        if attempt["status"] != "success" and attempt["reason_code"] is None:
+            return False
         configured = attempt.get("configured")
         resolved = attempt.get("resolved")
         if not isinstance(configured, dict) or set(configured) != identity_keys:
@@ -378,6 +399,15 @@ def _valid_v2_receipt_metadata(metadata: dict[str, Any], body: str) -> bool:
         "success", "failed", "timeout", "not_started",
     }:
         return False
+    if (
+        synthesizer["reason_code"] is not None
+        and synthesizer["reason_code"] not in _REASON_CODES
+    ):
+        return False
+    if synthesizer["status"] == "success" and synthesizer["reason_code"] is not None:
+        return False
+    if synthesizer["status"] != "success" and synthesizer["reason_code"] is None:
+        return False
     for key in ("configured", "resolved"):
         identity = synthesizer.get(key)
         if identity is not None and (
@@ -385,6 +415,15 @@ def _valid_v2_receipt_metadata(metadata: dict[str, Any], body: str) -> bool:
         ):
             return False
     if metadata.get("status") not in {"completed", "failed"}:
+        return False
+    if (
+        metadata["reason_code"] is not None
+        and metadata["reason_code"] not in _REASON_CODES
+    ):
+        return False
+    if metadata["status"] == "completed" and metadata["reason_code"] is not None:
+        return False
+    if metadata["status"] == "failed" and metadata["reason_code"] is None:
         return False
     expected_hash = body_sha256(body) if body else None
     if metadata["status"] == "completed":

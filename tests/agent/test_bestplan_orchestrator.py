@@ -1039,6 +1039,108 @@ def test_synthesizer_provider_failure_persists_no_plan_body(
     assert receipt["body_sha256"] is None
 
 
+def test_terminal_failure_never_exposes_provider_exception_secret(
+    monkeypatch, tmp_path, caplog
+):
+    import agent.bestplan_orchestrator as orchestrator
+
+    sentinel = "SENTINEL_SECRET"
+
+    def fail_resolution(_agent, _explorer):
+        raise BestPlanUnavailable(f"credential rejected: {sentinel}")
+
+    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", fail_resolution)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with caplog.at_level("WARNING"):
+        result = run_bestplan(
+            SimpleNamespace(session_id="parent"),
+            "plan it",
+            count=3,
+            config=_canonical_config(),
+        )
+
+    durable = (tmp_path / "bestplan" / "receipts.jsonl").read_text()
+    assert sentinel not in json.dumps(result, sort_keys=True)
+    assert sentinel not in durable
+    assert sentinel not in caplog.text
+    assert result["reason_code"] == "credential_unavailable"
+
+
+def test_receipt_persistence_failure_never_logs_exception_secret(
+    monkeypatch, tmp_path, caplog
+):
+    import agent.bestplan_orchestrator as orchestrator
+
+    sentinel = "SENTINEL_SECRET"
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda *_args: (_ for _ in ()).throw(
+            BestPlanUnavailable(f"credential rejected: {sentinel}")
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "append_receipt",
+        lambda *_args: (_ for _ in ()).throw(OSError(sentinel)),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with caplog.at_level("ERROR"):
+        result = run_bestplan(
+            SimpleNamespace(session_id="parent"),
+            "plan it",
+            count=3,
+            config=_canonical_config(),
+        )
+
+    assert sentinel not in json.dumps(result, sort_keys=True)
+    assert sentinel not in caplog.text
+    assert result["reason_code"] == "receipt_persistence_failed"
+    assert result["receipt_persisted"] is False
+
+
+def test_v2_receipt_rejects_non_allowlisted_reason_code():
+    attempts = [
+        {
+            "index": index,
+            "strategy": "evidence-first",
+            "explorer": "glm",
+            "configured": {"provider": "zai", "model": "glm-5"},
+            "resolved": None,
+            "status": "failed",
+            "reason_code": "SENTINEL_SECRET",
+        }
+        for index in range(3)
+    ]
+    synthesizer = {
+        "name": "sol",
+        "configured": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "resolved": None,
+        "status": "not_started",
+        "reason_code": "SENTINEL_SECRET",
+    }
+    receipt = make_receipt(
+        "run-secret-reason",
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        api_mode="codex_app_server",
+        quorum="0/3",
+        synth_status="not_started",
+        body="",
+        requested_count=3,
+        effective_count=3,
+        quorum_required=2,
+        attempts=attempts,
+        synthesizer=synthesizer,
+        status="failed",
+        reason_code="SENTINEL_SECRET",
+    )
+
+    assert validate_receipt(receipt, "") is False
+
+
 def test_lane_credential_resolution_uses_configured_provider_model_and_endpoint(
     monkeypatch,
 ):
