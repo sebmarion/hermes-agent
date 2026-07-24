@@ -7,6 +7,7 @@ must hold regardless of which model names are configured.
 """
 
 import json
+import pytest
 import threading
 import time
 from types import SimpleNamespace
@@ -44,18 +45,365 @@ def _runtime_config(**overrides):
             },
             {
                 "name": "sol",
-                "provider": "configured-sol",
+                "provider": "openai-codex",
                 "model": "configured-sol-model",
                 "api_mode": "codex_app_server",
                 "reasoning_effort": "ultra",
             },
         ],
-        "explorer_timeout": 0.04,
-        "synthesizer_timeout": 0.04,
-        "overall_timeout": 0.12,
+        "explorer_timeout": 180,
+        "synthesizer_timeout": 180,
+        "overall_timeout": 540,
     }
     config.update(overrides)
     return config
+
+def _canonical_config(**overrides):
+    config = {
+        "explorers": [
+            {
+                "name": "glm",
+                "provider": "configured-glm",
+                "model": "configured-glm-model",
+                "api_mode": "chat_completions",
+                "reasoning_effort": "high",
+            },
+            {
+                "name": "kimi-k3",
+                "provider": "configured-kimi",
+                "model": "configured-kimi-model",
+                "api_mode": "anthropic_messages",
+                "reasoning_effort": "max",
+            },
+            {
+                "name": "sol",
+                "provider": "openai-codex",
+                "model": "configured-sol-model",
+                "api_mode": "codex_app_server",
+                "reasoning_effort": "ultra",
+            },
+        ],
+        "synthesizer": "sol",
+        "explorer_timeout": 180,
+        "synthesizer_timeout": 180,
+        "overall_timeout": 540,
+    }
+    config.update(overrides)
+    return config
+
+
+def _assert_valid_explorer(entry: dict) -> None:
+    required = ("name", "provider", "model", "api_mode", "reasoning_effort")
+    assert set(entry.keys()) == set(required)
+    assert all(isinstance(entry.get(k), str) for k in required)
+
+
+def _canonical_explorer(**overrides):
+    entry = {
+        "name": "configured-name",
+        "provider": "configured-provider",
+        "model": "configured-model",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "high",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _allow_subsecond_runtime_for_timing_tests(monkeypatch, orchestrator):
+    """Validate structure normally while preserving tiny runtime deadlines."""
+    original_validate = orchestrator.validate_runtime
+
+    def validate_for_test(config=None, *, credentials_available=True):
+        requested = dict(config or {})
+        safe = dict(requested)
+        timeout_keys = (
+            "explorer_timeout", "synthesizer_timeout", "overall_timeout",
+        )
+        for key in timeout_keys:
+            if key in safe:
+                safe[key] = max(1.0, safe[key])
+        resolved = original_validate(
+            safe if config is not None else None,
+            credentials_available=credentials_available,
+        )
+        for key in timeout_keys:
+            if key in requested:
+                resolved[key] = requested[key]
+        return resolved
+
+    monkeypatch.setattr(orchestrator, "validate_runtime", validate_for_test)
+
+
+# ---------------------------------------------------------------------------
+# Canonical schema tests
+# ---------------------------------------------------------------------------
+
+def test_canonical_config_requires_explorers_and_synthesizer():
+    """Without explorers or synthesizer in canonical form, validation must fail."""
+    try:
+        validate_runtime(_canonical_config(explorers=None))
+    except BestPlanUnavailable:
+        pass
+    else:
+        raise AssertionError("canonical config missing explorers was accepted")
+    try:
+        validate_runtime(_canonical_config(synthesizer=None))
+    except BestPlanUnavailable:
+        pass
+    else:
+        raise AssertionError("canonical config missing synthesizer was accepted")
+
+
+def test_one_through_five_explorers_validate():
+    """Between one and five distinct named explorers must validate."""
+    for size in range(1, 6):
+        explorers = [
+            _canonical_explorer(name=f"explorer-{i}")
+            for i in range(size)
+        ]
+        validate_runtime(_canonical_config(explorers=explorers, synthesizer="explorer-0"))
+
+
+def test_six_explorers_rejected():
+    """Six explorers must fail validation."""
+    explorers = [
+        _canonical_explorer(name=f"explorer-{i}")
+        for i in range(6)
+    ]
+    try:
+        validate_runtime(_canonical_config(explorers=explorers, synthesizer="explorer-0"))
+    except BestPlanUnavailable:
+        pass
+    else:
+        raise AssertionError("six explorers was accepted")
+
+
+def test_duplicate_normalized_names_rejected():
+    """Names are case-insensitive after normalization; duplicates must fail."""
+    explorers = [
+        _canonical_explorer(name="foo"),
+        _canonical_explorer(name="FOO"),
+        _canonical_explorer(name="  Foo  "),
+    ]
+    try:
+        validate_runtime(_canonical_config(explorers=explorers, synthesizer="foo"))
+    except BestPlanUnavailable:
+        pass
+    else:
+        raise AssertionError("duplicate explorer names were accepted")
+
+
+def test_unknown_explorer_keys_rejected():
+    """Extra keys on explorer entries must fail validation."""
+    explorers = [
+        _canonical_explorer(**{"name": "glm", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h", "bogus": "x"}),
+        _canonical_explorer(name="sol", provider="p", model="m", api_mode="codex_app_server", reasoning_effort="ultra"),
+    ]
+    try:
+        validate_runtime(_canonical_config(explorers=explorers, synthesizer="glm"))
+    except BestPlanUnavailable:
+        pass
+    else:
+        raise AssertionError("unknown explorer key was accepted")
+
+
+def test_empty_string_explorer_field_rejected():
+    """Every non-empty string explorer field must reject empty strings after trim."""
+    explorers = [
+        _canonical_explorer(name=""),
+        _canonical_explorer(provider=""),
+        _canonical_explorer(model=""),
+        _canonical_explorer(api_mode=""),
+        _canonical_explorer(reasoning_effort=""),
+    ]
+    for entry in explorers:
+        with pytest.raises(BestPlanUnavailable):
+            validate_runtime(_canonical_config(explorers=[entry], synthesizer="test"))
+
+
+def test_invalid_api_modes_rejected():
+    """api_mode must be one of the allowed enum values."""
+    for api_mode in ("", "INVALID", "chat_completions_extra", "responses"):
+        explorers = [
+            _canonical_explorer(api_mode=api_mode),
+        ]
+        try:
+            validate_runtime(_canonical_config(explorers=explorers, synthesizer=explorers[0]["name"]))
+        except BestPlanUnavailable:
+            pass
+        else:
+            raise AssertionError(f"api_mode '{api_mode}' was accepted")
+
+
+def test_invalid_reasoning_efforts_rejected():
+    """reasoning_effort must be one of the allowed enum values."""
+    for effort in ("", "INVALID", "超高", "maximum"):
+        explorers = [
+            _canonical_explorer(reasoning_effort=effort),
+        ]
+        try:
+            validate_runtime(_canonical_config(explorers=explorers, synthesizer=explorers[0]["name"]))
+        except BestPlanUnavailable:
+            pass
+        else:
+            raise AssertionError(f"reasoning_effort '{effort}' was accepted")
+
+
+def test_boolean_value_rejected_as_timeout():
+    """Timeouts must accept only numeric values, not booleans."""
+    for key in ("explorer_timeout", "synthesizer_timeout", "overall_timeout"):
+        try:
+            validate_runtime(_canonical_config(**{key: True}))
+        except BestPlanUnavailable:
+            pass
+        else:
+            raise AssertionError(f"boolean True for {key} was accepted")
+        try:
+            validate_runtime(_canonical_config(**{key: False}))
+        except BestPlanUnavailable:
+            pass
+        else:
+            raise AssertionError(f"boolean False for {key} was accepted")
+
+
+def test_out_of_range_timeouts_rejected():
+    """Timeouts must be finite and within documented bounds."""
+    # explorer and synthesizer timeouts must be in 1..3600; overall in 1..7200
+    # 0 and negative must fail; values above the max must fail
+    for key, bound in (("explorer_timeout", 3600), ("synthesizer_timeout", 3600), ("overall_timeout", 7200)):
+        try:
+            validate_runtime(_canonical_config(**{key: 0}))
+        except BestPlanUnavailable:
+            pass
+        else:
+            raise AssertionError(f"{key}=0 was accepted")
+        try:
+            validate_runtime(_canonical_config(**{key: -1}))
+        except BestPlanUnavailable:
+            pass
+        else:
+            raise AssertionError(f"{key}=-1 was accepted")
+        try:
+            validate_runtime(_canonical_config(**{key: bound + 1}))
+        except BestPlanUnavailable:
+            pass
+        else:
+            raise AssertionError(f"{key}={bound + 1} was accepted")
+        with pytest.raises(BestPlanUnavailable):
+            validate_runtime(_canonical_config(**{key: float("nan")}))
+        with pytest.raises(BestPlanUnavailable):
+            validate_runtime(_canonical_config(**{key: float("inf")}))
+
+
+def test_enabled_and_synthesizer_types_are_strict():
+    with pytest.raises(BestPlanUnavailable):
+        validate_runtime(_canonical_config(enabled=1))
+    with pytest.raises(BestPlanUnavailable):
+        validate_runtime(_canonical_config(synthesizer=7))
+    with pytest.raises(BestPlanUnavailable):
+        validate_runtime(_canonical_config(synthesizer="bad name"))
+
+
+def test_unknown_top_level_keys_rejected():
+    with pytest.raises(BestPlanUnavailable):
+        validate_runtime(_canonical_config(bogus=True))
+    with pytest.raises(BestPlanUnavailable):
+        validate_runtime({**_runtime_config(), "bogus": True})
+
+
+def test_ultra_requires_codex_app_server():
+    """reasoning_effort 'ultra' requires api_mode 'codex_app_server'."""
+    explorers = [
+        _canonical_explorer(name="test", api_mode="chat_completions", reasoning_effort="ultra"),
+    ]
+    try:
+        validate_runtime(_canonical_config(explorers=explorers, synthesizer="test"))
+    except BestPlanUnavailable:
+        pass
+    else:
+        raise AssertionError("ultra without codex_app_server was accepted")
+
+
+def test_codex_app_server_requires_openai_provider():
+    """api_mode 'codex_app_server' requires provider 'openai' or 'openai-codex'."""
+    for provider in ("custom:neuralwatt", "anthropic", "unknown"):
+        explorers = [
+            _canonical_explorer(name="test", provider=provider, api_mode="codex_app_server"),
+        ]
+        try:
+            validate_runtime(_canonical_config(explorers=explorers, synthesizer="test"))
+        except BestPlanUnavailable:
+            pass
+        else:
+            raise AssertionError(f"codex_app_server with provider '{provider}' was accepted")
+
+
+def test_both_explorers_and_lanes_rejected():
+    """When both `explorers` and `lanes` are present, validation must fail."""
+    try:
+        validate_runtime(_runtime_config(explorers=[
+            _canonical_explorer(name="test"),
+        ]))
+    except BestPlanUnavailable:
+        pass
+    else:
+        raise AssertionError("both explorers and lanes were accepted")
+
+
+def test_legacy_lanes_normalizes_order_and_last_entry_as_synthesizer():
+    """Legacy `lanes` normalizes to canonical `explorers`; last entry becomes synthesizer."""
+    lanes = [
+        {"name": "fast", "provider": "p", "model": "m", "api_mode": "chat_completions", "reasoning_effort": "high"},
+        {"name": "slow", "provider": "p", "model": "m", "api_mode": "chat_completions", "reasoning_effort": "high"},
+        {"name": "smart", "provider": "openai-codex", "model": "m", "api_mode": "codex_app_server", "reasoning_effort": "ultra"},
+    ]
+    cfg = validate_runtime({"lanes": lanes})
+    assert [e["name"] for e in cfg["explorers"]] == ["fast", "slow", "smart"]
+    assert cfg["synthesizer"] == "smart"
+
+
+def test_canonical_and_legacy_both_receive_defaults():
+    """When optional keys are omitted, documented defaults apply to both canonical and legacy."""
+    canonical_raw = _canonical_config()
+    legacy_raw = _runtime_config()
+    for key in ("explorer_timeout", "synthesizer_timeout", "overall_timeout"):
+        canonical_raw.pop(key)
+        legacy_raw.pop(key)
+    canon = validate_runtime(canonical_raw)
+    legacy = validate_runtime(legacy_raw)
+    for cfg in (canon, legacy):
+        assert cfg.get("enabled") is True
+        assert cfg["explorer_timeout"] == 180
+        assert cfg["synthesizer_timeout"] == 180
+        assert cfg["overall_timeout"] == 540
+        assert set(cfg) == {
+            "enabled", "explorers", "synthesizer", "explorer_timeout",
+            "synthesizer_timeout", "overall_timeout",
+        }
+
+
+def test_kimi_k3_entry_matches_spec_exactly():
+    """The supplied kimi-k3 explorer entry must match the spec exactly."""
+    kimi = {
+        "name": " KIMI-K3 ",
+        "provider": " kimi-coding ",
+        "model": " k3 ",
+        "api_mode": " ANTHROPIC_MESSAGES ",
+        "reasoning_effort": " MAX ",
+    }
+    cfg = validate_runtime(_canonical_config(
+        explorers=[kimi],
+        synthesizer=" KIMI-K3 ",
+    ))
+    kimi = next(e for e in cfg["explorers"] if e["name"] == "kimi-k3")
+    assert kimi == {
+        "name": "kimi-k3",
+        "provider": "kimi-coding",
+        "model": "k3",
+        "api_mode": "anthropic_messages",
+        "reasoning_effort": "max",
+    }
 
 
 def _identity(lane):
@@ -75,13 +423,13 @@ def test_count_and_quorum():
 
 
 def _default_lanes_by_name() -> dict:
-    return {lane["name"]: lane for lane in DEFAULT_RUNTIME["lanes"]}
+    return {lane["name"]: lane for lane in DEFAULT_RUNTIME["explorers"]}
 
 
 def test_default_runtime_has_two_validated_lanes():
     """DEFAULT_RUNTIME provides exactly two lanes named 'glm' and 'sol',
     each with all required keys."""
-    lanes = DEFAULT_RUNTIME["lanes"]
+    lanes = DEFAULT_RUNTIME["explorers"]
     assert len(lanes) == 2
     names = {lane["name"] for lane in lanes}
     assert names == {"glm", "sol"}
@@ -93,8 +441,9 @@ def test_default_runtime_has_two_validated_lanes():
 def test_validate_runtime_accepts_default_config():
     """validate_runtime() with no config must succeed (uses DEFAULT_RUNTIME)."""
     cfg = validate_runtime()
-    assert len(cfg["lanes"]) == 2
-    assert {lane["name"] for lane in cfg["lanes"]} == {"glm", "sol"}
+    assert len(cfg["explorers"]) == 2
+    assert {lane["name"] for lane in cfg["explorers"]} == {"glm", "sol"}
+    assert cfg["synthesizer"] == "sol"
 
 
 def test_validate_runtime_accepts_config_lanes_with_arbitrary_models():
@@ -107,8 +456,8 @@ def test_validate_runtime_accepts_config_lanes_with_arbitrary_models():
          "api_mode": "codex_app_server", "reasoning_effort": "ultra"},
     ]
     cfg = validate_runtime({"lanes": custom_lanes})
-    assert cfg["lanes"][0]["model"] == "glm-5.3-fast"
-    assert cfg["lanes"][1]["model"] == "gpt-6-sol"
+    assert cfg["explorers"][0]["model"] == "glm-5.3-fast"
+    assert cfg["explorers"][1]["model"] == "gpt-6-sol"
 
 
 def test_sol_ultra_requires_codex_app_server():
@@ -130,26 +479,13 @@ def test_sol_ultra_requires_codex_app_server():
 
 
 def test_invalid_lane_count_rejected():
-    """One lane or three lanes must raise BestPlanUnavailable."""
-    one_lane = [{"name": "glm", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h"}]
-    try:
-        validate_runtime({"lanes": one_lane})
-    except BestPlanUnavailable:
-        pass
-    else:
-        raise AssertionError("one lane was accepted")
-
-    three_lanes = [
-        {"name": "glm", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h"},
-        {"name": "sol", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h"},
-        {"name": "extra", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h"},
-    ]
-    try:
-        validate_runtime({"lanes": three_lanes})
-    except BestPlanUnavailable:
-        pass
-    else:
-        raise AssertionError("three lanes were accepted")
+    """Legacy lane pools must contain between one and five entries."""
+    with pytest.raises(BestPlanUnavailable):
+        validate_runtime({"lanes": []})
+    with pytest.raises(BestPlanUnavailable):
+        validate_runtime({"lanes": [
+            _canonical_explorer(name=f"lane-{index}") for index in range(6)
+        ]})
 
 
 def test_missing_required_lane_key_rejected():
@@ -166,18 +502,14 @@ def test_missing_required_lane_key_rejected():
     raise AssertionError("lane missing a required key was accepted")
 
 
-def test_wrong_lane_names_rejected():
-    """Lanes not named 'glm' and 'sol' must raise BestPlanUnavailable."""
-    wrong_names = [
-        {"name": "fast", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h"},
-        {"name": "slow", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h"},
+def test_legacy_lane_names_are_operator_defined():
+    lanes = [
+        _canonical_explorer(name="fast"),
+        _canonical_explorer(name="slow"),
     ]
-    try:
-        validate_runtime({"lanes": wrong_names})
-    except BestPlanUnavailable:
-        pass
-    else:
-        raise AssertionError("wrong lane names were accepted")
+    cfg = validate_runtime({"lanes": lanes})
+    assert [entry["name"] for entry in cfg["explorers"]] == ["fast", "slow"]
+    assert cfg["synthesizer"] == "slow"
 
 
 def test_receipt_has_canonical_markers_and_hash():
@@ -229,8 +561,8 @@ def test_run_bestplan_uses_resolved_lane_identity_and_truthful_receipt(
     assert result["status"] == "completed"
     assert [(item["provider"], item["model"], item["api_mode"]) for item in constructed] == [
         ("resolved-configured-glm", "configured-glm-model", "chat_completions"),
-        ("resolved-configured-sol", "configured-sol-model", "codex_app_server"),
-        ("resolved-configured-sol", "configured-sol-model", "codex_app_server"),
+        ("resolved-openai-codex", "configured-sol-model", "codex_app_server"),
+        ("resolved-openai-codex", "configured-sol-model", "codex_app_server"),
     ]
     receipt_json = json.loads(result["final_response"].splitlines()[1])
     assert receipt_json["provider"] == constructed[-1]["provider"]
@@ -242,6 +574,65 @@ def test_run_bestplan_uses_resolved_lane_identity_and_truthful_receipt(
     assert durable["provider"] == receipt_json["provider"]
     assert durable["model"] == receipt_json["model"]
     assert durable["api_mode"] == receipt_json["api_mode"]
+
+
+@pytest.mark.parametrize("pool_size", [1, 2, 3, 5])
+def test_canonical_explorer_pool_cycles_in_order_and_uses_named_synthesizer(
+    monkeypatch, tmp_path, pool_size
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    constructed_models = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            constructed_models.append(kwargs["model"])
+
+        def run_conversation(self, prompt):
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "final plan"}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    explorers = [
+        _canonical_explorer(
+            name=f"explorer-{index}",
+            provider=f"provider-{index}",
+            model=f"model-{index}",
+        )
+        for index in range(pool_size)
+    ]
+    config = _canonical_config(
+        explorers=explorers,
+        synthesizer=explorers[0]["name"],
+    )
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, lane: _identity(lane),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=5,
+        config=config,
+    )
+
+    expected_explorers = [
+        explorers[index % pool_size]["model"] for index in range(5)
+    ]
+    assert result["status"] == "completed"
+    assert constructed_models == [*expected_explorers, explorers[0]["model"]]
+    assert result["runtime"]["lane"] == explorers[0]["name"]
 
 
 def test_lane_credential_resolution_uses_configured_provider_model_and_endpoint(
@@ -359,6 +750,8 @@ def test_explorer_timeout_interrupts_and_closes_live_provider_call(monkeypatch):
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
     monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda agent, lane: _identity(lane))
+    _allow_subsecond_runtime_for_timing_tests(monkeypatch, orchestrator)
+
     started = time.monotonic()
 
     result = run_bestplan(
@@ -409,6 +802,7 @@ def test_explorer_timeout_joins_provider_unwind_before_return(monkeypatch):
         "_resolve_lane_credentials",
         lambda agent, lane: _identity(lane),
     )
+    _allow_subsecond_runtime_for_timing_tests(monkeypatch, orchestrator)
 
     result = run_bestplan(
         SimpleNamespace(session_id="parent"),
@@ -477,6 +871,7 @@ def test_hostile_provider_cannot_block_bestplan_past_hard_teardown_deadline(
         "_resolve_lane_credentials",
         lambda agent, lane: _identity(lane),
     )
+    _allow_subsecond_runtime_for_timing_tests(monkeypatch, orchestrator)
     monkeypatch.setattr(orchestrator, "_CHILD_CLEANUP_GRACE_SECONDS", 0.01)
     monkeypatch.setattr(
         orchestrator,
@@ -538,6 +933,7 @@ def test_synthesizer_timeout_interrupts_and_closes_live_provider_call(monkeypatc
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
     monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda agent, lane: _identity(lane))
+    _allow_subsecond_runtime_for_timing_tests(monkeypatch, orchestrator)
     started = time.monotonic()
 
     result = run_bestplan(
@@ -580,6 +976,7 @@ def test_overall_timeout_bounds_explorer_pool_without_shutdown_join(monkeypatch)
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
     monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda agent, lane: _identity(lane))
+    _allow_subsecond_runtime_for_timing_tests(monkeypatch, orchestrator)
     started = time.monotonic()
 
     result = run_bestplan(

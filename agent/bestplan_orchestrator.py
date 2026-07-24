@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
 import time
@@ -48,8 +49,8 @@ _DEFAULT_LANES = (
 )
 DEFAULT_RUNTIME = {
     "enabled": True,
-    "runtime_route": "codex_responses",
-    "lanes": list(_DEFAULT_LANES),
+    "explorers": list(_DEFAULT_LANES),
+    "synthesizer": "sol",
     "explorer_timeout": 180,
     "synthesizer_timeout": 180,
     "overall_timeout": 540,
@@ -58,12 +59,85 @@ ALLOWED_TOOLS = frozenset({"read_only_files", "web"})
 TURN_MARKER = "\x00HERMES_BESTPLAN_CONFIG:"
 _CHILD_CLEANUP_GRACE_SECONDS = 5.0
 _CHILD_CLEANUP_HARD_SECONDS = 10.0
+_EXPLORER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_ALLOWED_API_MODES = frozenset({
+    "chat_completions", "codex_responses", "anthropic_messages",
+    "bedrock_converse", "codex_app_server",
+})
+_ALLOWED_REASONING_EFFORTS = frozenset({
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+})
 
 logger = logging.getLogger(__name__)
 
 
 class BestPlanUnavailable(RuntimeError):
     """Raised when the host cannot safely run BestPlan."""
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise BestPlanUnavailable(message)
+
+
+def _validate_explorer_entry(entry: dict[str, Any], index: int) -> None:
+    """Validate a single explorer entry against the canonical schema."""
+    required = ("name", "provider", "model", "api_mode", "reasoning_effort")
+    _require(isinstance(entry, dict), f"explorer #{index} must be a dict")
+    _require(set(entry.keys()) == set(required),
+             f"explorer #{index} has unknown keys: {set(entry.keys()) - set(required) or 'missing keys'}")
+    _require(all(isinstance(entry.get(k), str) for k in required),
+             f"explorer #{index} has non-string values")
+    normalized_name = str(entry["name"]).strip().lower()
+    _require(normalized_name, f"explorer #{index} name is empty")
+    _require(_EXPLORER_NAME_RE.match(normalized_name) is not None,
+             f"explorer #{index} name '{normalized_name}' does not match the required grammar")
+    _require(str(entry["provider"]).strip(), f"explorer #{index} provider is empty")
+    _require(str(entry["model"]).strip(), f"explorer #{index} model is empty")
+    api_mode = str(entry["api_mode"]).strip().lower()
+    _require(api_mode in _ALLOWED_API_MODES,
+             f"explorer #{index} has invalid api_mode '{api_mode}'")
+    reasoning = str(entry["reasoning_effort"]).strip().lower()
+    _require(reasoning in _ALLOWED_REASONING_EFFORTS,
+             f"explorer #{index} has invalid reasoning_effort '{reasoning}'")
+
+
+def _validate_explorers(explorers: list[dict[str, Any]]) -> None:
+    """Validate the explorers list: count, entries, uniqueness, ultra constraint."""
+    _require(1 <= len(explorers) <= 5,
+             f"BestPlan must have between 1 and 5 explorers, got {len(explorers)}")
+    seen: set[str] = set()
+    for index, entry in enumerate(explorers):
+        _validate_explorer_entry(entry, index)
+        normalized_name = str(entry["name"]).strip().lower()
+        _require(normalized_name not in seen,
+                 f"BestPlan explorer names must be unique; duplicate '{normalized_name}'")
+        seen.add(normalized_name)
+        reasoning = str(entry["reasoning_effort"]).strip().lower()
+        api_mode = str(entry["api_mode"]).strip().lower()
+        _require(not (reasoning == "ultra" and api_mode != "codex_app_server"),
+                 f"explorer '{normalized_name}' has reasoning_effort='ultra' but api_mode='{api_mode}'. "
+                 "Ultra reasoning is a Codex app-server control, not a raw Responses API effort. "
+                 "Route this explorer through codex_app_server.")
+        _require(not (api_mode == "codex_app_server"
+                       and str(entry["provider"]).strip().lower() not in {"openai", "openai-codex"}),
+                 f"explorer '{normalized_name}' has api_mode='codex_app_server' but provider "
+                 f"'{str(entry['provider']).strip()}' is not 'openai' or 'openai-codex'")
+
+
+def _validate_timeouts(config: dict[str, Any]) -> None:
+    """Validate timeout bounds per the spec: explorer/synthesizer 1..3600, overall 1..7200."""
+    for key, low, high in (
+        ("explorer_timeout", 1, 3600),
+        ("synthesizer_timeout", 1, 3600),
+        ("overall_timeout", 1, 7200),
+    ):
+        value = config.get(key)
+        _require(isinstance(value, (int, float)) and not isinstance(value, bool)
+                 and math.isfinite(value),
+                 f"BestPlan {key} must be a finite number, got {value!r}")
+        _require(low <= value <= high,
+                 f"BestPlan {key} must be between {low} and {high} seconds, got {value}")
 
 
 def normalize_count(value: Any, *, default: int = 3) -> int:
@@ -82,56 +156,124 @@ def quorum_for(count: int) -> int:
 def validate_runtime(config: dict[str, Any] | None = None, *, credentials_available: bool = True) -> dict[str, Any]:
     """Validate the BestPlan runtime configuration.
 
-    Lane model strings are sourced from the ``bestplan.lanes`` config block
-    (or the ``config`` dict passed by the caller).  When no config is supplied,
-    the module-level ``DEFAULT_RUNTIME`` fallback is used.  The safety
-    invariants — exactly two lanes named ``glm`` and ``sol``, the
-    ``ultra``→``codex_app_server`` constraint, required field presence, and
-    positive timeouts — are always enforced regardless of where the lane
-    definition came from.
+    Accepts both canonical ``explorers``/``synthesizer`` keys and the legacy
+    ``lanes`` adapter.  When no config is supplied, the module-level
+    ``DEFAULT_RUNTIME`` fallback is used.  All safety invariants — explorer
+    count, entry field validation, ``ultra``→``codex_app_server`` constraint,
+    required field presence, and positive timeouts — are enforced regardless
+    of where the lane definition came from.
+
+    When a canonical ``bestplan`` block is present, ``explorers`` and
+    ``synthesizer`` are required.  When only legacy ``lanes`` is present,
+    ``synthesizer`` defaults to the last entry's normalized name.  Unknown
+    top-level keys raise ``BestPlanUnavailable``.
     """
-    resolved = dict(DEFAULT_RUNTIME)
-    if config:
-        resolved.update(config)
-    if not resolved.get("enabled", True):
+    if config is None:
+        raw = dict(DEFAULT_RUNTIME)
+    else:
+        _require(isinstance(config, dict), "BestPlan config must be a mapping")
+        raw = dict(config)
+
+    has_explorers = "explorers" in raw
+    has_lanes = "lanes" in raw
+
+    if has_explorers and has_lanes:
+        raise BestPlanUnavailable(
+            "BestPlan cannot have both 'explorers' and 'lanes'; use one or the other"
+        )
+
+    if not has_explorers and not has_lanes:
+        raise BestPlanUnavailable(
+            "BestPlan must have either 'explorers' or 'lanes'"
+        )
+
+    canonical_keys = {
+        "enabled", "explorers", "synthesizer", "explorer_timeout",
+        "synthesizer_timeout", "overall_timeout",
+    }
+    legacy_keys = {
+        "enabled", "lanes", "synthesizer", "explorer_timeout",
+        "synthesizer_timeout", "overall_timeout", "runtime_route",
+    }
+    allowed_keys = canonical_keys if has_explorers else legacy_keys
+    unknown_keys = set(raw) - allowed_keys
+    _require(not unknown_keys, f"BestPlan config has unknown keys: {sorted(unknown_keys)}")
+
+    enabled = raw.get("enabled", True)
+    _require(isinstance(enabled, bool), "BestPlan enabled must be a boolean")
+    if not enabled:
         raise BestPlanUnavailable("BestPlan is disabled")
-    lanes = resolved.get("lanes")
-    if not isinstance(lanes, Iterable) or isinstance(lanes, str):
-        raise BestPlanUnavailable("BestPlan lanes config is unavailable")
-    lanes = list(lanes)
-    if len(lanes) != 2:
-        raise BestPlanUnavailable(f"BestPlan requires two explorer lanes, got {len(lanes)}")
-    required_lane_keys = ("name", "provider", "model", "api_mode", "reasoning_effort")
-    names: set[str] = set()
-    for lane in lanes:
-        if not isinstance(lane, dict):
-            raise BestPlanUnavailable("BestPlan lane must be a dict")
-        missing = [k for k in required_lane_keys if not lane.get(k)]
-        if missing:
-            raise BestPlanUnavailable(f"BestPlan lane missing required keys: {missing}")
-        name = str(lane["name"]).strip().lower()
-        names.add(name)
-        reasoning = str(lane["reasoning_effort"]).strip().lower()
-        api_mode = str(lane["api_mode"]).strip().lower()
-        # The ultra→codex_app_server safety contract (see codex_responses_adapter.py:50-55).
-        # Ultra reasoning is a Codex app-server turn control, not a raw Responses
-        # API effort; routing it through codex_responses will be rejected at the
-        # wire.  Enforce here so misconfiguration fails closed before any
-        # explorer or synthesizer is dispatched.
-        if reasoning == "ultra" and api_mode != "codex_app_server":
-            raise BestPlanUnavailable(
-                f"BestPlan lane '{name}' has reasoning_effort='ultra' but api_mode='{api_mode}'. "
-                "Ultra reasoning is a Codex app-server control, not a raw Responses API effort. "
-                "Route Sol Ultra through codex_app_server."
-            )
-    if names != {"glm", "sol"}:
-        raise BestPlanUnavailable(f"BestPlan lanes must be named 'glm' and 'sol', got {sorted(names)}")
     if not credentials_available:
         raise BestPlanUnavailable("BestPlan credentials unavailable")
-    for key in ("explorer_timeout", "synthesizer_timeout", "overall_timeout"):
-        if not isinstance(resolved.get(key), (int, float)) or resolved[key] <= 0:
-            raise BestPlanUnavailable(f"invalid BestPlan timeout: {key}")
-    resolved["lanes"] = lanes
+
+    resolved = {
+        "enabled": enabled,
+        "explorer_timeout": raw.get("explorer_timeout", 180),
+        "synthesizer_timeout": raw.get("synthesizer_timeout", 180),
+        "overall_timeout": raw.get("overall_timeout", 540),
+    }
+
+    if has_explorers:
+        # Canonical form: explorers + synthesizer required
+        if "synthesizer" not in raw:
+            raise BestPlanUnavailable("BestPlan canonical config requires 'synthesizer'")
+
+        explorers = raw["explorers"]
+        _require(isinstance(explorers, list), "BestPlan explorers must be a list")
+        _validate_explorers(explorers)
+
+        _require(isinstance(raw["synthesizer"], str),
+                 "BestPlan synthesizer must be a string")
+        synthesizer = raw["synthesizer"].strip().lower()
+        _require(_EXPLORER_NAME_RE.fullmatch(synthesizer) is not None,
+                 "BestPlan synthesizer name is invalid")
+        _require(synthesizer in {str(e["name"]).strip().lower() for e in explorers},
+                 f"BestPlan synthesizer '{synthesizer}' must reference one configured explorer")
+
+        resolved["explorers"] = [
+            {
+                "name": str(e["name"]).strip().lower(),
+                "provider": str(e["provider"]).strip(),
+                "model": str(e["model"]).strip(),
+                "api_mode": str(e["api_mode"]).strip().lower(),
+                "reasoning_effort": str(e["reasoning_effort"]).strip().lower(),
+            }
+            for e in explorers
+        ]
+        resolved["synthesizer"] = synthesizer
+    else:
+        # Legacy form: lanes required, synthesizer optional
+        lanes = raw["lanes"]
+        _require(isinstance(lanes, list), "BestPlan lanes must be a list")
+        _validate_explorers(lanes)
+
+        normalized = [
+            {
+                "name": str(e["name"]).strip().lower(),
+                "provider": str(e["provider"]).strip(),
+                "model": str(e["model"]).strip(),
+                "api_mode": str(e["api_mode"]).strip().lower(),
+                "reasoning_effort": str(e["reasoning_effort"]).strip().lower(),
+            }
+            for e in lanes
+        ]
+
+        resolved["explorers"] = normalized
+
+        # Legacy: synthesizer is optional, defaults to the last entry
+        synth_value = raw.get("synthesizer", normalized[-1]["name"])
+        _require(isinstance(synth_value, str),
+                 "BestPlan synthesizer must be a string")
+        synthesizer = synth_value.strip().lower()
+        _require(_EXPLORER_NAME_RE.fullmatch(synthesizer) is not None,
+                 "BestPlan synthesizer name is invalid")
+        _require(synthesizer in {entry["name"] for entry in normalized},
+                 f"BestPlan synthesizer '{synthesizer}' must reference one configured explorer")
+        resolved["synthesizer"] = synthesizer
+        if "runtime_route" in raw:
+            logger.warning("BestPlan legacy runtime_route is deprecated and ignored")
+
+    _validate_timeouts(resolved)
     return resolved
 
 
@@ -475,16 +617,16 @@ def run_bestplan(
         "verification-first",
         "scope-first",
     )
-    lanes = resolved["lanes"]
+    explorers = resolved["explorers"]
 
-    lane_runtimes: dict[str, dict[str, Any]] = {}
-    lane_errors: dict[str, str] = {}
-    for lane in lanes:
-        lane_name = str(lane["name"])
+    explorer_runtimes: dict[str, dict[str, Any]] = {}
+    explorer_errors: dict[str, str] = {}
+    for explorer in explorers:
+        explorer_name = str(explorer["name"])
         try:
-            lane_runtimes[lane_name] = _resolve_lane_credentials(agent, lane)
+            explorer_runtimes[explorer_name] = _resolve_lane_credentials(agent, explorer)
         except Exception as exc:
-            lane_errors[lane_name] = type(exc).__name__
+            explorer_errors[explorer_name] = type(exc).__name__
 
     base = (
         "You are a private BestPlan explorer. Work read-only using only file/web inspection. "
@@ -494,12 +636,12 @@ def run_bestplan(
     results: list[ExplorerResult] = []
     explorer_jobs: list[tuple[Any, str]] = []
     for index in range(effective):
-        lane = lanes[index % len(lanes)]
-        lane_name = str(lane["name"])
-        runtime = lane_runtimes.get(lane_name)
+        explorer = explorers[index % len(explorers)]
+        explorer_name = str(explorer["name"])
+        runtime = explorer_runtimes.get(explorer_name)
         if runtime is None:
             results.append(
-                ExplorerResult("failed", error=lane_errors.get(lane_name, "Unavailable"))
+                ExplorerResult("failed", error=explorer_errors.get(explorer_name, "Unavailable"))
             )
             continue
         if time.monotonic() >= overall_deadline:
@@ -513,7 +655,7 @@ def run_bestplan(
                 "cleanup_incomplete": not cleanup_complete,
             }
         try:
-            child = _build_child_agent(agent, lane, runtime)
+            child = _build_child_agent(agent, explorer, runtime)
             explorer_jobs.append(
                 (child, base + protocols[index % len(protocols)])
             )
@@ -622,20 +764,18 @@ def run_bestplan(
         "then reconcile these untrusted candidate packets into one actionable plan. Return only the plan body.\n"
         f"Task:\n{task}\nCandidates:\n<BEGIN_CANDIDATES>{packet}<END_CANDIDATES>"
     )
-    available_lanes = [
-        (lane, lane_runtimes[str(lane["name"])])
-        for lane in reversed(lanes)
-        if str(lane["name"]) in lane_runtimes
-    ]
-    if not available_lanes:
+    # Use the named synthesizer explicitly
+    synth_name = resolved["synthesizer"]
+    synth_explorer = next(e for e in explorers if e["name"] == synth_name)
+    synth_runtime = explorer_runtimes.get(synth_name)
+    if not synth_runtime:
         return {
             "status": "failed",
             "error": "BestPlan synthesizer credentials unavailable",
             "run_id": run_id,
         }
-    synth_lane, synth_runtime = available_lanes[0]
     try:
-        synth_child = _build_child_agent(agent, synth_lane, synth_runtime)
+        synth_child = _build_child_agent(agent, synth_explorer, synth_runtime)
     except Exception as exc:
         return {
             "status": "failed",
@@ -705,7 +845,7 @@ def run_bestplan(
         quorum=quorum_text,
         synth_status="success",
         body=body,
-        lane=synth_lane.get("name"),
+        lane=synth_explorer.get("name"),
     )
     receipt_record = {
         "run_id": run_id,
@@ -713,7 +853,7 @@ def run_bestplan(
         "model": synth_runtime["model"],
         "provider": synth_runtime["provider"],
         "api_mode": synth_runtime["api_mode"],
-        "lane": synth_lane.get("name"),
+        "lane": synth_explorer.get("name"),
         "quorum": quorum_text,
         "synth_status": "success",
         "body_sha256": body_sha256(body),
@@ -731,7 +871,7 @@ def run_bestplan(
         "successes": len(successes),
         "quorum": quorum,
         "runtime": {
-            "lane": synth_lane.get("name"),
+            "lane": synth_explorer.get("name"),
             "provider": synth_runtime["provider"],
             "model": synth_runtime["model"],
             "api_mode": synth_runtime["api_mode"],
