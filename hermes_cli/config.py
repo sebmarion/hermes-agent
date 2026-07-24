@@ -2305,6 +2305,37 @@ DEFAULT_CONFIG = {
         "tier_routes": {},  # tier name → lane name, e.g. {"micro": "local_worker", "large": "smart_reviewer"}
     },
 
+    # ── BestPlan: dynamic SOTA lane config ────────────────────────────────────
+    # Host-owned /bestplan orchestration reads lane definitions from here. When
+    # this block is absent (or any lane is malformed), the orchestrator falls
+    # back to DEFAULT_RUNTIME hardcoded in agent/bestplan_orchestrator.py.
+    # Update the model strings here when SOTA models change; run
+    # `hermes bestplan lanes` to view and validate the active configuration.
+    "bestplan": {
+        "lanes": [
+            {
+                "name": "glm",
+                "provider": "custom:neuralwatt",
+                "model": "glm-5.2",
+                "api_mode": "chat_completions",
+                "reasoning_effort": "high",
+            },
+            {
+                "name": "sol",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "api_mode": "codex_app_server",
+                "reasoning_effort": "ultra",
+            },
+        ],
+        # Which lane synthesizes the final plan. "strongest" = Sol Ultra when
+        # Codex credentials are available, otherwise GLM.
+        "synthesizer": "strongest",
+        "explorer_timeout": 180,
+        "synthesizer_timeout": 180,
+        "overall_timeout": 540,
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.
@@ -5257,7 +5288,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+    "sessions", "streaming", "updates", "mcp_servers", "bestplan",
 }
 
 # Valid fields inside a custom_providers list entry

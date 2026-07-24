@@ -311,6 +311,7 @@ from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.memory import build_memory_parser
+from hermes_cli.subcommands.bestplan import build_bestplan_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
@@ -12651,6 +12652,12 @@ def _try_termux_fast_tui_launch() -> bool:
     return True
 
 
+def cmd_bestplan(args):
+    from hermes_cli.subcommands.bestplan import cmd_bestplan as _handler
+
+    return _handler(args)
+
+
 def cmd_memory(args):
     sub = getattr(args, "memory_command", None)
     if sub == "off":
@@ -13337,6 +13344,11 @@ def main():
     # memory command  (parser built in hermes_cli/subcommands/memory.py)
     # =========================================================================
     build_memory_parser(subparsers, cmd_memory=cmd_memory)
+
+    # =========================================================================
+    # bestplan command — SOTA lane inspection + validation
+    # =========================================================================
+    build_bestplan_parser(subparsers, cmd_bestplan=cmd_bestplan)
 
     # =========================================================================
     # tools command  (parser built in hermes_cli/subcommands/tools.py)
