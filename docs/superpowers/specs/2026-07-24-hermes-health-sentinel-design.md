@@ -66,8 +66,6 @@ All behavioral settings live in `~/.hermes/config.yaml`:
 ```yaml
 watchdog:
   sentinel:
-    global_timeout_seconds: 45
-    reminder_seconds: 3600
     maintenance_grace_seconds: 900
     ticker_max_age_seconds: 600
     required_jobs:
@@ -91,8 +89,12 @@ watchdog:
         max_lateness_seconds: 129600
 ```
 
-The sentinel cadence is deliberately not configurable in v1.
+The sentinel cadence, process deadline, reminder period, and clock-skew
+tolerance are deliberately not configurable in v1.
 `SENTINEL_INTERVAL_SECONDS = 300` and
+`SENTINEL_GLOBAL_TIMEOUT_SECONDS = 45`,
+`SENTINEL_REMINDER_SECONDS = 3600`,
+`SENTINEL_CLOCK_SKEW_SECONDS = 300`, and
 `SENTINEL_GATEWAY_LABEL = "ai.hermes.gateway"` are fixed script constants.
 The installed plist must carry the same 300-second interval, and sentinel mode
 checks its own loaded launchd definition. A mismatch reports
@@ -103,15 +105,18 @@ The `id` is authoritative. `name` is evidence for humans and a drift check,
 not a fallback selector. A missing or renamed ID is an alert rather than an
 instruction to guess another job.
 
-The sentinel validates that positive numeric thresholds are within hardcoded
-safe bounds. Invalid sentinel configuration produces a `CHECKER_BROKEN`
-report using the fixed five-minute cadence, so mandatory `next_check_at`
-remains computable; it never silently falls back to green.
+The sentinel validates that the remaining configured positive numeric
+thresholds are within hardcoded safe bounds. The fixed process-wide deadline
+is armed before configuration is read. Invalid sentinel configuration
+produces a `CHECKER_BROKEN` report using the fixed five-minute cadence, so
+mandatory `next_check_at` remains computable; it never silently falls back to
+green.
 
 ## Sentinel Checks
 
 `--mode sentinel` runs only the following checks. It does not perform provider
-API calls, deep database checks, broad log scans, or any repair.
+API calls outside loopback, deep database checks, broad log scans, or any
+repair.
 
 ### 1. Managed gateway ownership and health
 
@@ -144,6 +149,8 @@ itself.
   `~/.hermes/cron/ticker_last_success`.
 - Alert if either file is missing or older than
   `ticker_max_age_seconds`.
+- A timestamp more than `SENTINEL_CLOCK_SKEW_SECONDS` in the future reports
+  `CHECKER_BROKEN`; negative age is never accepted as fresh.
 
 The ten-minute default absorbs ordinary wake/login races while still detecting
 a scheduler that is registered but no longer completing ticks.
@@ -159,7 +166,8 @@ a scheduler that is registered but no longer completing ticks.
 - Measure maintenance age from the public symlink's `lstat` mtime. If the
   public path is a matching regular file rather than a symlink, use that
   file's mtime. A matching gate with no trustworthy mtime is
-  `CHECKER_BROKEN`.
+  `CHECKER_BROKEN`. An mtime more than `SENTINEL_CLOCK_SKEW_SECONDS` in the
+  future is also untrustworthy.
 - If the recognized gate is present, report
   `MAINTENANCE_ACTIVE` during the configured grace period and
   `MAINTENANCE_STALE` after it.
@@ -194,31 +202,39 @@ For every configured job:
   configured maximum lateness.
 
 `last_run_at` must be timezone-aware ISO-8601. Comparisons are made in UTC;
-naive or invalid timestamps report the job as malformed.
+naive, invalid, or more than `SENTINEL_CLOCK_SKEW_SECONDS` future-dated
+timestamps report the job as malformed.
 
 Failures are individually identified as missing, identity drift, inactive,
 failed, or stale. Disabled and paused jobs are not skipped.
 
 ### 6. OpenViking semantic health
 
-Run the existing
-`~/.hermes/scripts/openviking-health-watchdog.sh` with a bounded timeout:
+Sentinel mode does not execute
+`~/.hermes/scripts/openviking-health-watchdog.sh`. Instead it implements the
+same three semantic probes directly with the watchdog's existing bounded
+Python HTTP helper:
 
-- empty stdout and exit zero means healthy;
-- non-empty stdout and exit zero means `SUBJECT_DEGRADED`;
-- nonzero exit, timeout, or execution failure means `CHECKER_BROKEN`.
+- read at most 64 KiB from `~/.openviking/ov.conf`;
+- require the configured server and embedding URLs to resolve to loopback
+  hosts;
+- GET the OpenViking health endpoint and require its healthy contract;
+- GET the configured embedding models endpoint; and
+- POST one fixed health-probe input to the configured embedding endpoint,
+  requiring a non-empty vector of the configured dimension.
 
-This preserves the script's established “non-empty output is an alert”
-contract while preventing the cron job's green `last_status` from hiding a
-failed embedding dependency. The sentinel records a bounded excerpt and
-digest, not unbounded command output.
+Missing or malformed configuration, a non-loopback URL, or an internal probe
+exception reports `CHECKER_BROKEN`. A timeout, refused connection, non-success
+HTTP response, malformed service response, unhealthy response, or invalid
+embedding result from an otherwise valid local target reports
+`SUBJECT_DEGRADED`. Evidence contains only bounded, redacted response excerpts
+and digests.
 
-The invoked checker is part of the approved sentinel boundary and must remain
-observation-only: bounded loopback HTTP probes, configuration reads, and
-stdout reporting. Installation refuses the sentinel if the checker contains
-or invokes service lifecycle, cron mutation, release, deletion, or recovery
-operations. The sentinel never follows remediation text printed by the
-checker.
+The existing cron job and shell checker remain unchanged. Duplicating this
+small read-only probe in sentinel mode removes a repeatedly executed mutable
+shell dependency and makes the no-lifecycle/no-repair boundary enforceable:
+the sentinel performs only configuration reads and bounded loopback HTTP
+requests.
 
 ## State and Follow-Through
 
@@ -300,10 +316,13 @@ without probing or notifying while the lock is held.
 For every due alert or recovery notification, the runner:
 
 1. atomically persists a unique attempt ID, `pending` state,
-   `last_notification_attempt_at`, and the next hourly notification time;
-2. invokes `/usr/bin/osascript` with a five-second timeout, a fixed
-   `Hermes Health Sentinel` title, and a redacted body capped at 400
-   characters;
+   `last_notification_attempt_at`, and the next notification time computed
+   with `SENTINEL_REMINDER_SECONDS`;
+2. invokes `/usr/bin/osascript` with a five-second timeout and `shell=False`.
+   The AppleScript source and `Hermes Health Sentinel` title are fixed
+   literals; the redacted body, capped at 400 characters, is supplied as a
+   separate `run argv` value and is never interpolated into executable
+   AppleScript;
 3. atomically records `attempted` or `failed` for the same attempt ID.
 
 Persist-before-attempt prevents a crash after notification submission from
@@ -340,10 +359,12 @@ The plist supplies no inherited shell path, virtual environment, provider
 credential, or Hermes behavioral environment variable. The script uses
 absolute paths for external commands.
 
-Sentinel mode arms a 45-second process-wide deadline before probes begin. A
-deadline produces an error report when possible and exits nonzero. Because
-`KeepAlive` is absent, a failure cannot create a rapid restart loop; launchd
-tries again on the next interval.
+Sentinel mode arms the fixed
+`SENTINEL_GLOBAL_TIMEOUT_SECONDS` process-wide deadline before configuration
+or prior state is read and before probes begin. A deadline produces an error
+report when possible and exits nonzero. Because `KeepAlive` is absent, a
+failure cannot create a rapid restart loop; launchd tries again on the next
+interval.
 
 Launchd provides logged-in per-user supervision only. Sleep, logout, host
 power loss, launchd failure, local disk failure, and malicious same-UID
@@ -368,9 +389,17 @@ Installation is additive:
 3. Validate the plist with `plutil -lint`.
 4. Bootstrap only `com.seb.hermes-health-sentinel`.
 5. Verify `launchctl print` shows the canonical plist path, exact Python and
-   script arguments, Aqua domain, 300-second interval, and no `KeepAlive`.
+   script arguments, Aqua domain, 300-second interval, and no `KeepAlive`,
+   `StartCalendarInterval`, or `WorkingDirectory`.
 6. Wait for a fresh sentinel report, compare its timestamp and mode, and
    require the pre-install `SENTINEL_DEFINITION_DRIFT` issue to disappear.
+
+The pre-bootstrap manual run intentionally uses the normal notification
+policy, so it may attempt one real definition-drift alert. The first
+post-bootstrap run attempts a recovery notification only if no other active
+issues remain; otherwise the ordinary changed- or unchanged-fingerprint rule
+applies. This one-time install transition is part of validating the alert
+path, not a silent special case.
 
 The installation must not boot out, kickstart, terminate, or restart the
 gateway, WebUI, Hermes One, cron, OpenViking, or any existing service.
@@ -403,9 +432,12 @@ They must cover:
    `CRON_ADMISSION_STUCK`.
 4. Missing, paused, failed, stale, and wrong-name required jobs are each
    reported and are never skipped.
-5. Non-empty OpenViking stdout with exit zero reports
+5. A well-formed unhealthy OpenViking or embedding response reports
    `SUBJECT_DEGRADED`.
-6. OpenViking timeout/nonzero reports `CHECKER_BROKEN`.
+6. Invalid OpenViking config, non-loopback URLs, or an internal probe exception
+   reports `CHECKER_BROKEN`; timeout, malformed target response, or transport
+   failure reports `SUBJECT_DEGRADED`. No shell checker or lifecycle command is
+   executed.
 7. Two identical alert runs attempt one immediate notification; a reminder is
    attempted only after its due time.
 8. A fingerprint change notifies immediately.
@@ -422,14 +454,20 @@ They must cover:
     `SENTINEL_DEFINITION_DRIFT`.
 17. A pre-bootstrap manual run produces a valid report with the expected
     definition-drift issue; the first post-bootstrap report clears that issue.
+18. Job and ticker timestamps more than the fixed skew tolerance in the
+    future cannot produce green.
+19. Notification bodies containing quotes, newlines, or AppleScript tokens
+    remain a single data argument to fixed AppleScript source.
 
-Launchd acceptance uses the real disposable sentinel label and real script,
-but no real-service failure injection:
+Launchd acceptance installs and uses the fixed canonical sentinel label and
+real script, but performs no real-service failure injection. Definition-parser
+unit tests use captured `launchctl print` fixtures for mismatched identities;
+there is no alternate live label:
 
 - `plutil -lint` passes;
 - loaded definition matches the canonical plist and exact arguments;
 - two scheduled ticks produce fresh reports;
-- `KeepAlive` is absent;
+- `KeepAlive`, `StartCalendarInterval`, and `WorkingDirectory` are absent;
 - no gateway or WebUI PID changes during installation and observation;
 - public maintenance shim, paused verified-state job, and current OpenViking
   embedding degradation are detected when those live conditions still exist.
