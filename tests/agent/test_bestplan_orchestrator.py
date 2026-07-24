@@ -34,6 +34,12 @@ def _candidate_text(label="ok"):
     )
 
 
+def _latest_receipt_record(home: Path) -> dict:
+    return json.loads(
+        (home / "bestplan" / "receipts.jsonl").read_text().splitlines()[-1]
+    )
+
+
 def _runtime_config(**overrides):
     config = {
         "lanes": [
@@ -744,7 +750,7 @@ def test_canonical_explorer_pool_cycles_in_order_and_uses_named_synthesizer(
 
 
 def test_synthesizer_resolution_failure_prevents_explorer_construction(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ):
     import agent.bestplan_orchestrator as orchestrator
 
@@ -762,6 +768,7 @@ def test_synthesizer_resolution_failure_prevents_explorer_construction(
         "_build_child_agent",
         lambda parent, explorer, runtime: built.append(explorer["name"]),
     )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     result = run_bestplan(
         SimpleNamespace(session_id="parent"),
@@ -772,10 +779,16 @@ def test_synthesizer_resolution_failure_prevents_explorer_construction(
 
     assert result["status"] == "failed"
     assert built == []
+    receipt = _latest_receipt_record(tmp_path)
+    assert receipt["status"] == "failed"
+    assert receipt["reason_code"] == "credential_unavailable"
+    assert receipt["synthesizer"]["status"] == "not_started"
+    assert receipt["body_sha256"] is None
+    assert all(attempt["status"] == "failed" for attempt in receipt["attempts"])
 
 
 def test_synthesizer_construction_failure_prevents_explorer_construction(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ):
     import agent.bestplan_orchestrator as orchestrator
 
@@ -795,6 +808,7 @@ def test_synthesizer_construction_failure_prevents_explorer_construction(
         raise AssertionError("explorer constructed before synth preflight")
 
     monkeypatch.setattr(orchestrator, "_build_child_agent", build)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     result = run_bestplan(
         SimpleNamespace(session_id="parent"),
@@ -805,6 +819,9 @@ def test_synthesizer_construction_failure_prevents_explorer_construction(
 
     assert result["status"] == "failed"
     assert built == [config["synthesizer"]]
+    receipt = _latest_receipt_record(tmp_path)
+    assert receipt["reason_code"] == "construction_failed"
+    assert receipt["synthesizer"]["status"] == "not_started"
 
 
 def test_unavailable_kimi_attempt_is_ordered_and_not_substituted(
@@ -924,6 +941,102 @@ def test_out_of_order_completion_preserves_attempt_and_candidate_order(
         )
     ]
     assert positions == sorted(positions)
+
+
+def test_quorum_failure_persists_terminal_v2_receipt(monkeypatch, tmp_path):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+
+        def run_conversation(self, prompt):
+            return {"final_response": _candidate_text(self.model)}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    def resolve(_agent, explorer):
+        if explorer["name"] != "sol":
+            raise BestPlanUnavailable("synthetic outage")
+        return _identity(explorer)
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", resolve)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=3,
+        config=_canonical_config(),
+    )
+
+    assert result["status"] == "failed"
+    assert "body" not in result
+    receipt = _latest_receipt_record(tmp_path)
+    assert receipt["reason_code"] == "quorum_unavailable"
+    assert receipt["synthesizer"]["status"] == "not_started"
+    assert receipt["synthesizer"]["reason_code"] == "quorum_unavailable"
+    assert [attempt["status"] for attempt in receipt["attempts"]] == [
+        "failed", "failed", "success",
+    ]
+
+
+def test_synthesizer_provider_failure_persists_no_plan_body(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    synth_runs = 0
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, prompt):
+            nonlocal synth_runs
+            if "active BestPlan synthesizer" in prompt:
+                synth_runs += 1
+                raise RuntimeError("synthetic provider failure")
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, explorer: _identity(explorer),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=3,
+        config=_canonical_config(),
+    )
+
+    assert synth_runs == 1
+    assert result["status"] == "failed"
+    assert "body" not in result
+    assert "final_response" not in result
+    receipt = _latest_receipt_record(tmp_path)
+    assert receipt["status"] == "failed"
+    assert receipt["reason_code"] == "synthesizer_failed"
+    assert receipt["synthesizer"]["status"] == "failed"
+    assert receipt["synthesizer"]["reason_code"] == "provider_error"
+    assert receipt["body_sha256"] is None
 
 
 def test_lane_credential_resolution_uses_configured_provider_model_and_endpoint(

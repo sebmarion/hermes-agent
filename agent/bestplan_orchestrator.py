@@ -711,31 +711,148 @@ def run_bestplan(
 
     synth_name = resolved["synthesizer"]
     synth_explorer = next(e for e in explorers if e["name"] == synth_name)
+    attempts: list[dict[str, Any]] = []
+    for index in range(effective):
+        explorer = explorers[index % len(explorers)]
+        attempts.append({
+            "index": index,
+            "strategy": protocols[index % len(protocols)],
+            "explorer": str(explorer["name"]),
+            "configured": {
+                "provider": explorer["provider"],
+                "model": explorer["model"],
+            },
+            "resolved": None,
+            "status": "pending",
+            "reason_code": None,
+            "_candidate": None,
+        })
+
+    def visible_attempts() -> list[dict[str, Any]]:
+        return [
+            {key: value for key, value in attempt.items() if not key.startswith("_")}
+            for attempt in attempts
+        ]
+
+    synth_configured = {
+        "provider": synth_explorer["provider"],
+        "model": synth_explorer["model"],
+    }
+    synth_runtime: dict[str, Any] | None = None
+
+    def fail_terminal(
+        *,
+        error: str,
+        reason_code: str,
+        synthesizer_status: str = "not_started",
+        synthesizer_reason_code: str | None = None,
+        attempt_reason_code: str | None = None,
+        cleanup_incomplete: bool = False,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        terminal_attempt_reason = attempt_reason_code or reason_code
+        for attempt in attempts:
+            if attempt["status"] == "pending":
+                attempt["status"] = (
+                    "timeout"
+                    if terminal_attempt_reason in {"timeout", "overall_timeout"}
+                    else "failed"
+                )
+                attempt["reason_code"] = terminal_attempt_reason
+        receipt_attempts = visible_attempts()
+        receipt_synthesizer = {
+            "name": synth_explorer["name"],
+            "configured": synth_configured,
+            "resolved": (
+                {
+                    "provider": synth_runtime["provider"],
+                    "model": synth_runtime["model"],
+                }
+                if synth_runtime is not None
+                else None
+            ),
+            "status": synthesizer_status,
+            "reason_code": synthesizer_reason_code or reason_code,
+        }
+        receipt = make_receipt(
+            run_id,
+            model=(
+                synth_runtime["model"]
+                if synth_runtime is not None
+                else synth_explorer["model"]
+            ),
+            provider=(
+                synth_runtime["provider"]
+                if synth_runtime is not None
+                else synth_explorer["provider"]
+            ),
+            api_mode=(
+                synth_runtime["api_mode"]
+                if synth_runtime is not None
+                else synth_explorer["api_mode"]
+            ),
+            quorum=f"0/{effective}",
+            synth_status=synthesizer_status,
+            body="",
+            lane=synth_explorer.get("name"),
+            requested_count=requested_count,
+            effective_count=effective,
+            quorum_required=quorum_for(effective),
+            attempts=receipt_attempts,
+            synthesizer=receipt_synthesizer,
+            status="failed",
+            reason_code=reason_code,
+        )
+        receipt_record = json.loads(receipt.splitlines()[1])
+        receipt_persisted = True
+        try:
+            home = Path(
+                os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+            )
+            append_receipt(home / "bestplan" / "receipts.jsonl", receipt_record)
+        except Exception:
+            receipt_persisted = False
+            logger.error("BestPlan terminal receipt persistence failed")
+        payload: dict[str, Any] = {
+            "status": "failed",
+            "error": error,
+            "reason_code": (
+                reason_code if receipt_persisted else "receipt_persistence_failed"
+            ),
+            "run_id": run_id,
+            "attempts": receipt_attempts,
+            "receipt": receipt,
+        }
+        if cleanup_incomplete:
+            payload["cleanup_incomplete"] = True
+        if not receipt_persisted:
+            payload["receipt_persisted"] = False
+        if extra:
+            payload.update(extra)
+        return payload
+
     try:
         synth_runtime = _resolve_lane_credentials(agent, synth_explorer)
     except Exception:
-        return {
-            "status": "failed",
-            "error": "BestPlan synthesizer credentials unavailable",
-            "run_id": run_id,
-        }
+        return fail_terminal(
+            error="BestPlan synthesizer credentials unavailable",
+            reason_code="credential_unavailable",
+        )
     try:
         synth_preflight_child = _build_child_agent(
             agent, synth_explorer, synth_runtime
         )
     except Exception:
-        return {
-            "status": "failed",
-            "error": "BestPlan synthesizer construction failed",
-            "run_id": run_id,
-        }
+        return fail_terminal(
+            error="BestPlan synthesizer construction failed",
+            reason_code="construction_failed",
+        )
     if not _stop_child_agents([synth_preflight_child]):
-        return {
-            "status": "failed",
-            "error": "BestPlan synthesizer preflight teardown failed",
-            "run_id": run_id,
-            "cleanup_incomplete": True,
-        }
+        return fail_terminal(
+            error="BestPlan synthesizer preflight teardown failed",
+            reason_code="runtime_invalid",
+            cleanup_incomplete=True,
+        )
 
     explorer_runtimes: dict[str, dict[str, Any]] = {synth_name: synth_runtime}
     explorer_errors: dict[str, str] = {}
@@ -748,38 +865,14 @@ def run_bestplan(
         except Exception:
             explorer_errors[explorer_name] = "credential_unavailable"
 
-    attempts: list[dict[str, Any]] = []
-    for index in range(effective):
-        explorer = explorers[index % len(explorers)]
-        explorer_name = str(explorer["name"])
+    for attempt in attempts:
+        explorer_name = attempt["explorer"]
         runtime = explorer_runtimes.get(explorer_name)
-        attempts.append({
-            "index": index,
-            "strategy": protocols[index % len(protocols)],
-            "explorer": explorer_name,
-            "configured": {
-                "provider": explorer["provider"],
-                "model": explorer["model"],
-            },
-            "resolved": (
+        attempt["resolved"] = (
                 {"provider": runtime["provider"], "model": runtime["model"]}
                 if runtime is not None
                 else None
-            ),
-            "status": "pending",
-            "reason_code": None,
-            "_candidate": None,
-        })
-
-    def visible_attempts() -> list[dict[str, Any]]:
-        return [
-            {key: value for key, value in attempt.items() if not key.startswith("_")}
-            for attempt in attempts
-        ]
-
-    def fail_before_synthesis(payload: dict[str, Any]) -> dict[str, Any]:
-        payload["attempts"] = visible_attempts()
-        return payload
+            )
 
     base = (
         "You are a private BestPlan explorer. Work read-only using only file/web inspection. "
@@ -805,13 +898,11 @@ def run_bestplan(
             cleanup_complete = _stop_child_agents(
                 child for child, _prompt, _index in explorer_jobs
             )
-            return {
-                "status": "failed",
-                "error": "BestPlan overall timeout during explorer construction",
-                "run_id": run_id,
-                "cleanup_incomplete": not cleanup_complete,
-                "attempts": visible_attempts(),
-            }
+            return fail_terminal(
+                error="BestPlan overall timeout during explorer construction",
+                reason_code="overall_timeout",
+                cleanup_incomplete=not cleanup_complete,
+            )
         try:
             child = _build_child_agent(agent, explorer, runtime)
             explorer_jobs.append(
@@ -872,22 +963,20 @@ def run_bestplan(
         pool.shutdown(wait=False, cancel_futures=True)
 
     if not explorer_cleanup_complete:
-        return fail_before_synthesis({
-            "status": "failed",
-            "error": (
+        return fail_terminal(
+            error=(
                 "BestPlan provider teardown exceeded its hard deadline; "
                 "the unkillable daemon worker was quarantined"
             ),
-            "run_id": run_id,
-            "cleanup_incomplete": True,
-        })
+            reason_code="provider_error",
+            cleanup_incomplete=True,
+        )
 
     if pending and overall_limited_explorers:
-        return fail_before_synthesis({
-            "status": "failed",
-            "error": "BestPlan overall timeout during explorers",
-            "run_id": run_id,
-        })
+        return fail_terminal(
+            error="BestPlan overall timeout during explorers",
+            reason_code="overall_timeout",
+        )
 
     successes = [
         attempt["_candidate"]
@@ -901,20 +990,17 @@ def run_bestplan(
             if pending
             else "BestPlan quorum unavailable"
         )
-        return fail_before_synthesis({
-            "status": "failed",
-            "error": error,
-            "run_id": run_id,
-            "successes": len(successes),
-            "quorum": quorum,
-        })
+        return fail_terminal(
+            error=error,
+            reason_code="quorum_unavailable",
+            extra={"successes": len(successes), "quorum": quorum},
+        )
 
     if time.monotonic() >= overall_deadline:
-        return fail_before_synthesis({
-            "status": "failed",
-            "error": "BestPlan overall timeout before synthesizer",
-            "run_id": run_id,
-        })
+        return fail_terminal(
+            error="BestPlan overall timeout before synthesizer",
+            reason_code="overall_timeout",
+        )
 
     packet = json.dumps(successes, sort_keys=True)
     synth_prompt = (
@@ -925,12 +1011,12 @@ def run_bestplan(
     try:
         synth_child = _build_child_agent(agent, synth_explorer, synth_runtime)
     except Exception:
-        return {
-            "status": "failed",
-            "error": "BestPlan synthesizer construction failed",
-            "run_id": run_id,
-            "attempts": visible_attempts(),
-        }
+        return fail_terminal(
+            error="BestPlan synthesizer construction failed",
+            reason_code="synthesizer_failed",
+            synthesizer_status="failed",
+            synthesizer_reason_code="construction_failed",
+        )
     synth_pool = DaemonThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="bestplan-synthesizer",
@@ -956,36 +1042,49 @@ def run_bestplan(
         synth_pool.shutdown(wait=False, cancel_futures=True)
 
     if not synth_cleanup_complete:
-        return {
-            "status": "failed",
-            "error": (
+        return fail_terminal(
+            error=(
                 "BestPlan synthesizer teardown exceeded its hard deadline; "
                 "the unkillable daemon worker was quarantined"
             ),
-            "run_id": run_id,
-            "cleanup_incomplete": True,
-            "attempts": visible_attempts(),
-        }
+            reason_code="synthesizer_failed",
+            synthesizer_status="failed",
+            synthesizer_reason_code="provider_error",
+            cleanup_incomplete=True,
+        )
 
     if synth_error is not None:
-        timed_out_overall = synth_deadline == overall_deadline
-        return {
-            "status": "failed",
-            "error": (
-                "BestPlan overall timeout during synthesizer"
-                if timed_out_overall
-                else "BestPlan synthesizer timeout"
-            ),
-            "run_id": run_id,
-            "attempts": visible_attempts(),
-        }
+        if isinstance(synth_error, TimeoutError):
+            timed_out_overall = synth_deadline == overall_deadline
+            return fail_terminal(
+                error=(
+                    "BestPlan overall timeout during synthesizer"
+                    if timed_out_overall
+                    else "BestPlan synthesizer timeout"
+                ),
+                reason_code=(
+                    "overall_timeout"
+                    if timed_out_overall
+                    else "synthesizer_failed"
+                ),
+                synthesizer_status="timeout",
+                synthesizer_reason_code=(
+                    "overall_timeout" if timed_out_overall else "timeout"
+                ),
+            )
+        return fail_terminal(
+            error="BestPlan synthesizer provider failed",
+            reason_code="synthesizer_failed",
+            synthesizer_status="failed",
+            synthesizer_reason_code="provider_error",
+        )
     if not body.strip():
-        return {
-            "status": "failed",
-            "error": "BestPlan synthesizer empty",
-            "run_id": run_id,
-            "attempts": visible_attempts(),
-        }
+        return fail_terminal(
+            error="BestPlan synthesizer empty",
+            reason_code="synthesizer_failed",
+            synthesizer_status="failed",
+            synthesizer_reason_code="synthesizer_failed",
+        )
 
     quorum_text = f"{len(successes)}/{effective}"
     receipt_attempts = visible_attempts()
