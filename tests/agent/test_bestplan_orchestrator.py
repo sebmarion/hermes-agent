@@ -1152,8 +1152,15 @@ def test_synthesizer_provider_failure_persists_no_plan_body(
     assert receipt["body_sha256"] is None
 
 
-def test_explorer_provider_failure_uses_provider_error_reason(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    ("failure_type", "expected_status", "expected_reason"),
+    [
+        (RuntimeError, "failed", "provider_error"),
+        (TimeoutError, "timeout", "timeout"),
+    ],
+)
+def test_explorer_provider_failure_uses_stable_reason(
+    monkeypatch, tmp_path, failure_type, expected_status, expected_reason
 ):
     import agent.bestplan_orchestrator as orchestrator
     import run_agent
@@ -1166,7 +1173,7 @@ def test_explorer_provider_failure_uses_provider_error_reason(
             if "active BestPlan synthesizer" in prompt:
                 return {"final_response": "final plan"}
             if self.model == "configured-kimi-model":
-                raise RuntimeError("SENTINEL_SECRET")
+                raise failure_type("SENTINEL_SECRET")
             return {"final_response": _candidate_text(self.model)}
 
         def interrupt(self, *_args, **_kwargs):
@@ -1191,8 +1198,8 @@ def test_explorer_provider_failure_uses_provider_error_reason(
     )
 
     assert result["status"] == "completed"
-    assert result["attempts"][1]["status"] == "failed"
-    assert result["attempts"][1]["reason_code"] == "provider_error"
+    assert result["attempts"][1]["status"] == expected_status
+    assert result["attempts"][1]["reason_code"] == expected_reason
     assert "SENTINEL_SECRET" not in json.dumps(result, sort_keys=True)
 
 

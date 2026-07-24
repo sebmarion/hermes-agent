@@ -1008,6 +1008,10 @@ def run_bestplan(
                 attempt = attempts[attempt_index]
                 try:
                     raw_candidate = future.result()
+                except TimeoutError:
+                    attempt["status"] = "timeout"
+                    attempt["reason_code"] = "timeout"
+                    continue
                 except Exception:
                     attempt["status"] = "failed"
                     attempt["reason_code"] = "provider_error"
