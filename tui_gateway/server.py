@@ -3875,6 +3875,21 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             _child_mirrors.pop(child_key, None)
 
 
+def _clarify_timeout() -> int:
+    """Clarify response timeout for the TUI/desktop path.
+
+    Mirrors ``tools.clarify_gateway.get_clarify_timeout`` — defaults to 3600s
+    (1 hour) so a user who steps away still finds a live entry when they
+    answer.  The old 300s ``_block`` default evicted the entry mid-think: a
+    late tap landed on a dead entry, ``clarify.respond`` returned 4009, and
+    the desktop panel stayed visible as a zombie (#32762)."""
+    try:
+        from tools.clarify_gateway import get_clarify_timeout
+        return get_clarify_timeout()
+    except Exception:
+        return 3600
+
+
 def _agent_cbs(sid: str) -> dict:
     return {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
@@ -3919,7 +3934,8 @@ def _agent_cbs(sid: str) -> dict:
             "notification.clear", sid, {"key": key}
         ),
         "clarify_callback": lambda q, c: _block(
-            "clarify.request", sid, {"question": q, "choices": c}
+            "clarify.request", sid, {"question": q, "choices": c},
+            timeout=_clarify_timeout(),
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.

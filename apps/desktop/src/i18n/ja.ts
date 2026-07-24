@@ -2262,6 +2262,7 @@ export const ja = defineLocale({
       notReady: '明確化リクエストはまだ準備できていません',
       gatewayDisconnected: 'Hermes ゲートウェイが接続されていません',
       sendFailed: '明確化応答を送信できませんでした',
+      expired: '質問の有効期限が切れました — エージェントは続行しました',
       loadingQuestion: '質問を読み込み中…',
       other: 'その他（回答を入力）',
       placeholder: '回答を入力…',

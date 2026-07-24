@@ -2482,6 +2482,7 @@ export const zh: Translations = {
       notReady: '澄清请求尚未就绪',
       gatewayDisconnected: 'Hermes 网关未连接',
       sendFailed: '无法发送澄清响应',
+      expired: '问题已过期 — 代理已继续执行',
       loadingQuestion: '正在加载问题…',
       other: '其他 (输入你的答案)',
       placeholder: '输入你的答案…',

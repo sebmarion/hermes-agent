@@ -1946,6 +1946,7 @@ export interface Translations {
       notReady: string
       gatewayDisconnected: string
       sendFailed: string
+      expired: string
       loadingQuestion: string
       other: string
       placeholder: string

@@ -1,15 +1,30 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
 import type { ReactNode } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+// Mock useAuiState to return true (message is running) so ClarifyToolLive
+// renders ClarifyToolPending instead of falling back to ToolFallback.
+vi.mock('@assistant-ui/react', async () => {
+  const actual = await vi.importActual('@assistant-ui/react')
+  return {
+    ...actual,
+    useAuiState: vi.fn((selector?: (s: unknown) => unknown) =>
+      typeof selector === 'function' ? selector({ thread: { isRunning: true }, message: { status: { type: 'running' } } }) : true
+    )
+  }
+})
 
 import { I18nProvider } from '@/i18n'
+import { $gateway } from '@/store/gateway'
+import { notifyError } from '@/store/notifications'
+import { $activeSessionId } from '@/store/session'
+import { $clarifyRequest, $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
 
 import { ClarifyTool, readClarifyResult } from './clarify-tool'
 
-afterEach(() => {
-  cleanup()
-})
+vi.mock('@/lib/haptics', () => ({ triggerHaptic: vi.fn() }))
+vi.mock('@/store/notifications', () => ({ notifyError: vi.fn() }))
 
 function renderClarify(ui: ReactNode) {
   return render(
@@ -78,6 +93,10 @@ describe('readClarifyResult', () => {
 })
 
 describe('ClarifyTool settled view', () => {
+  afterEach(() => {
+    cleanup()
+  })
+
   it('keeps the question and answer visible after the tool completes', () => {
     renderClarify(
       <ClarifyTool
@@ -108,5 +127,111 @@ describe('ClarifyTool settled view', () => {
 
     expect(screen.getByText('Anything else?')).toBeTruthy()
     expect(screen.getByText('Skipped')).toBeTruthy()
+  })
+})
+
+describe('ClarifyTool auto-dismiss on expiry', () => {
+  beforeEach(() => {
+    $activeSessionId.set('s1')
+    $clarifyRequests.set({})
+    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+  })
+
+  afterEach(() => {
+    cleanup()
+    clearClarifyRequest()
+    $activeSessionId.set(null)
+    $gateway.set(null)
+    vi.clearAllMocks()
+  })
+
+  it('dismisses the panel when clarify.respond fails with "no pending answer request"', async () => {
+    const rejectError = new Error('RPC failed: no pending answer request')
+    const request = vi.fn().mockRejectedValue(rejectError)
+    $gateway.set({ request } as never)
+
+    $clarifyRequests.set({
+      s1: {
+        requestId: 'req-1',
+        question: 'Pick one',
+        choices: ['A', 'B'],
+        sessionId: 's1'
+      }
+    })
+
+    renderClarify(
+      <ClarifyTool
+        {...({
+          addResult: vi.fn(),
+          args: { question: 'Pick one', choices: ['A', 'B'] },
+          argsText: JSON.stringify({ question: 'Pick one', choices: ['A', 'B'] }),
+          isError: false,
+          result: undefined,
+          resume: vi.fn(),
+          status: { type: 'running' },
+          toolCallId: 'tc-1',
+          toolName: 'clarify',
+          type: 'tool-call'
+        } as ToolCallMessagePartProps)}
+      />
+    )
+
+    await waitFor(() => expect(screen.getByText('Pick one')).toBeTruthy())
+
+    const choiceButton = document.querySelector('[data-choice]') as HTMLElement
+    expect(choiceButton).toBeTruthy()
+    fireEvent.click(choiceButton)
+
+    const continueButton = screen.getByRole('button', { name: /Continue/ })
+    fireEvent.click(continueButton)
+
+    await waitFor(() => {
+      expect($clarifyRequest.get()).toBeNull()
+    })
+    expect(notifyError).toHaveBeenCalledWith(rejectError, expect.stringContaining('expired'))
+  })
+
+  it('keeps the panel visible on non-expiry errors (e.g. gateway disconnected)', async () => {
+    const rejectError = new Error('gateway not connected')
+    const request = vi.fn().mockRejectedValue(rejectError)
+    $gateway.set({ request } as never)
+
+    $clarifyRequests.set({
+      s1: {
+        requestId: 'req-1',
+        question: 'Pick one',
+        choices: ['A', 'B'],
+        sessionId: 's1'
+      }
+    })
+
+    renderClarify(
+      <ClarifyTool
+        {...({
+          addResult: vi.fn(),
+          args: { question: 'Pick one', choices: ['A', 'B'] },
+          argsText: JSON.stringify({ question: 'Pick one', choices: ['A', 'B'] }),
+          isError: false,
+          result: undefined,
+          resume: vi.fn(),
+          status: { type: 'running' },
+          toolCallId: 'tc-1',
+          toolName: 'clarify',
+          type: 'tool-call'
+        } as ToolCallMessagePartProps)}
+      />
+    )
+
+    await waitFor(() => expect(screen.getByText('Pick one')).toBeTruthy())
+
+    const choiceButton = document.querySelector('[data-choice]') as HTMLElement
+    fireEvent.click(choiceButton)
+
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => expect(request).toHaveBeenCalled())
+
+    expect($clarifyRequest.get()).not.toBeNull()
+    expect(notifyError).toHaveBeenCalledWith(rejectError, expect.not.stringContaining('expired'))
   })
 })

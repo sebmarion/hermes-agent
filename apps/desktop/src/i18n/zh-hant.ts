@@ -2193,6 +2193,7 @@ export const zhHant = defineLocale({
       notReady: '澄清請求尚未就緒',
       gatewayDisconnected: 'Hermes 閘道未連線',
       sendFailed: '無法傳送澄清回應',
+      expired: '問題已過期 — 代理已繼續執行',
       loadingQuestion: '正在載入問題…',
       other: '其他（輸入您的答案）',
       placeholder: '輸入您的答案…',

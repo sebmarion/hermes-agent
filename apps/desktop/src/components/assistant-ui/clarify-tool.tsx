@@ -19,6 +19,7 @@ import { Kbd } from '@/components/ui/kbd'
 import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
+import { isMissingPendingPromptRequest } from '@/lib/gateway-rpc'
 import { CircleLetterA, Loader2, MessageQuestion } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $clarifyRequest, clearClarifyRequest } from '@/store/clarify'
@@ -247,11 +248,20 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
         clearClarifyRequest(matchingRequest.requestId, matchingRequest.sessionId)
         // tool.complete lands next → ClarifyToolSettled.
       } catch (error) {
-        notifyError(error, copy.sendFailed)
-        setSubmitting(false)
+        // The backend entry already expired or was cleared (timeout, interrupt,
+        // session switch).  Dismiss the zombie panel instead of leaving it
+        // visible with an error toast — the agent has already moved on and any
+        // further taps would keep hitting 4009.
+        if (isMissingPendingPromptRequest(error, 'answer')) {
+          clearClarifyRequest(matchingRequest.requestId, matchingRequest.sessionId)
+          notifyError(error, copy.expired)
+        } else {
+          notifyError(error, copy.sendFailed)
+          setSubmitting(false)
+        }
       }
     },
-    [copy.gatewayDisconnected, copy.notReady, copy.sendFailed, gateway, matchingRequest, ready]
+    [copy.gatewayDisconnected, copy.notReady, copy.sendFailed, copy.expired, gateway, matchingRequest, ready]
   )
 
   const trimmedDraft = draft.trim()
