@@ -1096,7 +1096,7 @@ def test_quorum_failure_persists_terminal_v2_receipt(monkeypatch, tmp_path):
     assert receipt["synthesizer"]["status"] == "not_started"
     assert receipt["synthesizer"]["reason_code"] == "quorum_unavailable"
     assert [attempt["status"] for attempt in receipt["attempts"]] == [
-        "failed", "failed", "success",
+        "failed", "failed", "failed",
     ]
 
 
@@ -1265,7 +1265,7 @@ def test_receipt_persistence_failure_never_logs_exception_secret(
     assert result["receipt_persisted"] is False
 
 
-def test_success_receipt_persistence_failure_fails_closed_without_plan(
+def test_success_receipt_persistence_failure_returns_plan_with_warning(
     monkeypatch, tmp_path
 ):
     import agent.bestplan_orchestrator as orchestrator
@@ -1277,7 +1277,7 @@ def test_success_receipt_persistence_failure_fails_closed_without_plan(
 
         def run_conversation(self, prompt):
             if "active BestPlan synthesizer" in prompt:
-                return {"final_response": "unsigned plan must not escape"}
+                return {"final_response": "valid synthesized plan"}
             return {"final_response": _candidate_text()}
 
         def interrupt(self, *_args, **_kwargs):
@@ -1286,15 +1286,12 @@ def test_success_receipt_persistence_failure_fails_closed_without_plan(
         def close(self):
             pass
 
-    real_append = orchestrator.append_receipt
     append_calls = 0
 
-    def fail_once_then_append(path, record):
+    def fail_append(_path, _record):
         nonlocal append_calls
         append_calls += 1
-        if append_calls == 1:
-            raise OSError("SENTINEL_SECRET")
-        real_append(path, record)
+        raise OSError("SENTINEL_SECRET")
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
     monkeypatch.setattr(
@@ -1302,7 +1299,7 @@ def test_success_receipt_persistence_failure_fails_closed_without_plan(
         "_resolve_lane_credentials",
         lambda _agent, explorer: _identity(explorer),
     )
-    monkeypatch.setattr(orchestrator, "append_receipt", fail_once_then_append)
+    monkeypatch.setattr(orchestrator, "append_receipt", fail_append)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     result = run_bestplan(
@@ -1312,17 +1309,14 @@ def test_success_receipt_persistence_failure_fails_closed_without_plan(
         config=_canonical_config(),
     )
 
-    assert append_calls == 2
-    assert result["status"] == "failed"
-    assert result["reason_code"] == "receipt_persistence_failed"
-    assert "body" not in result
-    assert "final_response" not in result
-    receipt = _latest_receipt_record(tmp_path)
-    assert receipt["status"] == "failed"
-    assert receipt["reason_code"] == "receipt_persistence_failed"
-    assert receipt["synthesizer"]["status"] == "success"
-    assert receipt["synthesizer"]["reason_code"] is None
-    assert receipt["body_sha256"] is None
+    assert append_calls == 1
+    assert result["status"] == "completed"
+    assert result["body"] == "valid synthesized plan"
+    assert "valid synthesized plan" in result["final_response"]
+    assert result["receipt_persisted"] is False
+    assert result["warning_reason_code"] == "receipt_persistence_failed"
+    assert "SENTINEL_SECRET" not in json.dumps(result, sort_keys=True)
+    assert not (tmp_path / "bestplan" / "receipts.jsonl").exists()
 
 
 def test_v2_receipt_rejects_non_allowlisted_reason_code():
@@ -1430,7 +1424,7 @@ def test_kimi_k3_resolution_rejects_legacy_moonshot_endpoint(monkeypatch):
         "reasoning_effort": "max",
     }
 
-    with pytest.raises(BestPlanUnavailable):
+    with pytest.raises(orchestrator.BestPlanRuntimeInvalid):
         orchestrator._resolve_lane_credentials(SimpleNamespace(), lane)
 
 
@@ -1461,6 +1455,171 @@ def test_kimi_k3_resolution_accepts_exact_coding_plan_endpoint(monkeypatch):
     assert identity["base_url"] == "https://api.kimi.com/coding"
     assert identity["api_mode"] == "anthropic_messages"
     assert identity["model"] == "k3"
+
+
+def test_kimi_k3_resolution_rejects_configured_chat_mode(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    from hermes_cli import runtime_provider
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "kimi-coding",
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.kimi.com/coding",
+            "api_key": "sk-kimi-SENTINEL",
+        },
+    )
+    lane = {
+        "name": "kimi-k3",
+        "provider": "kimi-coding",
+        "model": "k3",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "max",
+    }
+
+    with pytest.raises(orchestrator.BestPlanRuntimeInvalid):
+        orchestrator._resolve_lane_credentials(SimpleNamespace(), lane)
+
+
+def test_kimi_k3_runtime_drift_records_runtime_invalid_attempt(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, prompt):
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "final plan"}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    def resolve(_agent, explorer):
+        if explorer["name"] == "kimi-k3":
+            raise orchestrator.BestPlanRuntimeInvalid("SENTINEL_SECRET")
+        return _identity(explorer)
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", resolve)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=3,
+        config=_canonical_config(),
+    )
+
+    assert result["status"] == "completed"
+    assert result["attempts"][1]["status"] == "failed"
+    assert result["attempts"][1]["reason_code"] == "runtime_invalid"
+    assert "SENTINEL_SECRET" not in json.dumps(result, sort_keys=True)
+
+
+def test_only_scheduled_explorers_and_named_synthesizer_are_resolved(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    config = _canonical_config()
+    config["explorers"].insert(
+        2,
+        {
+            "name": "unused",
+            "provider": "configured-unused",
+            "model": "configured-unused-model",
+            "api_mode": "chat_completions",
+            "reasoning_effort": "high",
+        },
+    )
+    resolved_names = []
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, prompt):
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "final plan"}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    def resolve(_agent, explorer):
+        resolved_names.append(explorer["name"])
+        return _identity(explorer)
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", resolve)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=2,
+        config=config,
+    )
+
+    assert result["status"] == "completed"
+    assert resolved_names == ["sol", "glm", "kimi-k3"]
+    assert "unused" not in resolved_names
+
+
+def test_impossible_quorum_stops_before_explorer_construction(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+
+    built = []
+
+    def resolve(_agent, explorer):
+        if explorer["name"] != "sol":
+            raise BestPlanUnavailable("SENTINEL_SECRET")
+        return _identity(explorer)
+
+    class PreflightChild:
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    def build(_parent, explorer, _runtime):
+        built.append(explorer["name"])
+        return PreflightChild()
+
+    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", resolve)
+    monkeypatch.setattr(orchestrator, "_build_child_agent", build)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=3,
+        config=_canonical_config(),
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "quorum_unavailable"
+    assert built == ["sol"]
+    assert [attempt["status"] for attempt in result["attempts"]] == [
+        "failed", "failed", "failed",
+    ]
 
 
 def test_parallel_explorers_build_sequentially_and_restore_tool_global(monkeypatch):

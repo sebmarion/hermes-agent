@@ -89,6 +89,10 @@ class BestPlanUnavailable(RuntimeError):
     """Raised when the host cannot safely run BestPlan."""
 
 
+class BestPlanRuntimeInvalid(BestPlanUnavailable):
+    """Raised when resolved runtime identity violates a BestPlan invariant."""
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise BestPlanUnavailable(message)
@@ -540,15 +544,16 @@ def _resolve_lane_credentials(agent: Any, lane: dict[str, Any]) -> dict[str, Any
         if (
             resolved_base_url != "https://api.kimi.com/coding"
             or resolved_api_mode != "anthropic_messages"
+            or configured_api_mode.lower() != "anthropic_messages"
         ):
-            raise BestPlanUnavailable(
+            raise BestPlanRuntimeInvalid(
                 "BestPlan Kimi K3 requires the trusted Kimi Coding endpoint"
             )
     provider = str(runtime.get("provider") or configured_provider).strip()
     model = str(runtime.get("model") or configured_model).strip()
     api_mode = configured_api_mode or str(runtime.get("api_mode") or "").strip()
     if not provider or not model or not api_mode:
-        raise BestPlanUnavailable(
+        raise BestPlanRuntimeInvalid(
             f"BestPlan lane {lane.get('name')!r} resolved an incomplete runtime identity"
         )
     return {
@@ -895,6 +900,11 @@ def run_bestplan(
 
     try:
         synth_runtime = _resolve_lane_credentials(agent, synth_explorer)
+    except BestPlanRuntimeInvalid:
+        return fail_terminal(
+            error="BestPlan synthesizer runtime invalid",
+            reason_code="runtime_invalid",
+        )
     except Exception:
         return fail_terminal(
             error="BestPlan synthesizer credentials unavailable",
@@ -916,14 +926,18 @@ def run_bestplan(
             cleanup_incomplete=True,
         )
 
+    scheduled_names = {str(attempt["explorer"]) for attempt in attempts}
+    scheduled_names.add(synth_name)
     explorer_runtimes: dict[str, dict[str, Any]] = {synth_name: synth_runtime}
     explorer_errors: dict[str, str] = {}
     for explorer in explorers:
         explorer_name = str(explorer["name"])
-        if explorer_name == synth_name:
+        if explorer_name == synth_name or explorer_name not in scheduled_names:
             continue
         try:
             explorer_runtimes[explorer_name] = _resolve_lane_credentials(agent, explorer)
+        except BestPlanRuntimeInvalid:
+            explorer_errors[explorer_name] = "runtime_invalid"
         except Exception:
             explorer_errors[explorer_name] = "credential_unavailable"
 
@@ -935,6 +949,22 @@ def run_bestplan(
                 if runtime is not None
                 else None
             )
+        if runtime is None:
+            attempt["status"] = "failed"
+            attempt["reason_code"] = explorer_errors.get(
+                explorer_name, "credential_unavailable"
+            )
+
+    quorum = quorum_for(effective)
+    possible_successes = sum(
+        attempt["status"] == "pending" for attempt in attempts
+    )
+    if possible_successes < quorum:
+        return fail_terminal(
+            error="BestPlan quorum unavailable",
+            reason_code="quorum_unavailable",
+            extra={"successes": 0, "quorum": quorum},
+        )
 
     base = (
         "You are a private BestPlan explorer. Work read-only using only file/web inspection. "
@@ -947,10 +977,6 @@ def run_bestplan(
         explorer_name = str(explorer["name"])
         runtime = explorer_runtimes.get(explorer_name)
         if runtime is None:
-            attempt["status"] = "failed"
-            attempt["reason_code"] = explorer_errors.get(
-                explorer_name, "credential_unavailable"
-            )
             continue
         if time.monotonic() >= overall_deadline:
             for pending_attempt in attempts:
@@ -1056,7 +1082,6 @@ def run_bestplan(
         for attempt in attempts
         if attempt["status"] == "success" and attempt["_candidate"]
     ]
-    quorum = quorum_for(effective)
     if len(successes) < quorum:
         error = (
             "BestPlan explorer timeout; quorum unavailable"
@@ -1190,19 +1215,23 @@ def run_bestplan(
         synthesizer=receipt_synthesizer,
     )
     receipt_record = json.loads(receipt.splitlines()[1])
+    receipt_persisted = True
     try:
         home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
         append_receipt(home / "bestplan" / "receipts.jsonl", receipt_record)
     except Exception:
-        return fail_terminal(
-            error="BestPlan receipt persistence failed",
-            reason_code="receipt_persistence_failed",
-            synthesizer_status="success",
+        receipt_persisted = False
+        logger.error("BestPlan completed receipt persistence failed")
+    final_response = f"{receipt}\n\n{body}"
+    if not receipt_persisted:
+        final_response += (
+            "\n\nBestPlan warning: receipt persistence failed; "
+            "the plan is valid but its durable audit record was not written."
         )
-    return {
+    result = {
         "status": "completed",
         "run_id": run_id,
-        "final_response": f"{receipt}\n\n{body}",
+        "final_response": final_response,
         "body": body,
         "successes": len(successes),
         "quorum": quorum,
@@ -1214,6 +1243,10 @@ def run_bestplan(
             "api_mode": synth_runtime["api_mode"],
         },
     }
+    if not receipt_persisted:
+        result["receipt_persisted"] = False
+        result["warning_reason_code"] = "receipt_persistence_failed"
+    return result
 
 
 __all__ = [

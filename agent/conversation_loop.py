@@ -565,6 +565,31 @@ def _bestplan_receipt_metadata(outcome: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _run_bestplan_host_branch(
+    agent: Any,
+    user_message: str,
+    bestplan_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run the BestPlan branch without exposing configuration exceptions."""
+    from agent.bestplan_orchestrator import BestPlanUnavailable, run_bestplan
+
+    try:
+        return run_bestplan(agent, user_message, **bestplan_config)
+    except BestPlanUnavailable:
+        return {
+            "status": "failed",
+            "error": "BestPlan configuration invalid",
+            "reason_code": "runtime_invalid",
+        }
+    except Exception:
+        logger.error("BestPlan host branch failed before run initialization")
+        return {
+            "status": "failed",
+            "error": "BestPlan configuration invalid",
+            "reason_code": "runtime_invalid",
+        }
+
+
 def _run_conversation(
     agent,
     user_message: str,
@@ -665,8 +690,9 @@ def _run_conversation(
     # before ordinary app-server/MoA/model execution. The parent model and
     # toolset are never mutated; only the synthesized response is finalized.
     if bestplan_config is not None:
-        from agent.bestplan_orchestrator import run_bestplan
-        outcome = run_bestplan(agent, user_message, **bestplan_config)
+        outcome = _run_bestplan_host_branch(
+            agent, user_message, bestplan_config
+        )
         response = outcome.get("final_response") or (
             "BestPlan unavailable: " + str(outcome.get("error", "unknown error"))
         )
