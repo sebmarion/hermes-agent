@@ -65,19 +65,21 @@ class TestCustomReasoningWireShape:
         assert tl == {}
 
     @pytest.mark.parametrize(
-        "effort", ["minimal", "low", "medium", "high", "xhigh", "max"]
+        "effort", ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
     )
     def test_enabled_effort_goes_top_level(self, custom_profile, effort):
-        """enabled + effort → TOP-LEVEL reasoning_effort, passed through verbatim.
+        """enabled + effort → TOP-LEVEL reasoning_effort.
 
         GLM-5.2/ARK and OpenAI-compatible reasoning APIs read reasoning_effort
         as a top-level string, not nested in extra_body. ``max`` is GLM's
-        native deep-reasoning level and must survive.
+        native deep-reasoning level and must survive; ``ultra`` (a Hermes/Sol
+        mode) is collapsed to ``max`` so it never 400s on these endpoints.
         """
         eb, tl = custom_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": effort}, model="glm-5.2"
         )
-        assert tl == {"reasoning_effort": effort}
+        expected_effort = "max" if effort == "ultra" else effort
+        assert tl == {"reasoning_effort": expected_effort}
         assert "reasoning_effort" not in eb
         assert "think" not in eb
 
