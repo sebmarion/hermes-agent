@@ -824,7 +824,11 @@ def run_bestplan(
                 else None
             ),
             "status": synthesizer_status,
-            "reason_code": synthesizer_reason_code or reason_code,
+            "reason_code": (
+                None
+                if synthesizer_status == "success"
+                else synthesizer_reason_code or reason_code
+            ),
         }
         receipt = make_receipt(
             run_id,
@@ -1173,7 +1177,11 @@ def run_bestplan(
         home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
         append_receipt(home / "bestplan" / "receipts.jsonl", receipt_record)
     except Exception:
-        pass
+        return fail_terminal(
+            error="BestPlan receipt persistence failed",
+            reason_code="receipt_persistence_failed",
+            synthesizer_status="success",
+        )
     return {
         "status": "completed",
         "run_id": run_id,

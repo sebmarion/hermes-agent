@@ -1101,6 +1101,66 @@ def test_receipt_persistence_failure_never_logs_exception_secret(
     assert result["receipt_persisted"] is False
 
 
+def test_success_receipt_persistence_failure_fails_closed_without_plan(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, prompt):
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "unsigned plan must not escape"}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    real_append = orchestrator.append_receipt
+    append_calls = 0
+
+    def fail_once_then_append(path, record):
+        nonlocal append_calls
+        append_calls += 1
+        if append_calls == 1:
+            raise OSError("SENTINEL_SECRET")
+        real_append(path, record)
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, explorer: _identity(explorer),
+    )
+    monkeypatch.setattr(orchestrator, "append_receipt", fail_once_then_append)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=3,
+        config=_canonical_config(),
+    )
+
+    assert append_calls == 2
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "receipt_persistence_failed"
+    assert "body" not in result
+    assert "final_response" not in result
+    receipt = _latest_receipt_record(tmp_path)
+    assert receipt["status"] == "failed"
+    assert receipt["reason_code"] == "receipt_persistence_failed"
+    assert receipt["synthesizer"]["status"] == "success"
+    assert receipt["synthesizer"]["reason_code"] is None
+    assert receipt["body_sha256"] is None
+
+
 def test_v2_receipt_rejects_non_allowlisted_reason_code():
     attempts = [
         {
