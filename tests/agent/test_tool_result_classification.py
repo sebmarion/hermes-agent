@@ -4,6 +4,7 @@ import json
 
 from agent.tool_result_classification import (
     file_mutation_result_landed,
+    file_mutation_result_proves_change,
 )
 
 
@@ -30,6 +31,44 @@ def test_top_level_file_mutation_error_does_not_count_as_landed():
     result = json.dumps({"success": True, "error": "post-write verification failed"})
 
     assert file_mutation_result_landed("patch", result) is False
+
+
+def test_non_empty_patch_diff_proves_material_change():
+    result = json.dumps({
+        "success": True,
+        "diff": "--- a/tmp.py\n+++ b/tmp.py\n@@\n-old\n+new\n",
+    })
+
+    assert file_mutation_result_proves_change("patch", result) is True
+
+
+def test_empty_or_whitespace_patch_diff_does_not_prove_material_change():
+    empty = json.dumps({"success": True, "diff": ""})
+    whitespace = json.dumps({"success": True, "diff": " \n\t"})
+
+    assert file_mutation_result_proves_change("patch", empty) is False
+    assert file_mutation_result_proves_change("patch", whitespace) is False
+
+
+def test_patch_error_or_malformed_result_does_not_prove_material_change():
+    errored = json.dumps({
+        "success": True,
+        "diff": "--- a/tmp.py\n+++ b/tmp.py\n",
+        "error": "post-write verification failed",
+    })
+
+    assert file_mutation_result_proves_change("patch", errored) is False
+    assert file_mutation_result_proves_change("patch", "{not-json") is False
+    assert file_mutation_result_proves_change("patch", None) is False
+
+
+def test_current_write_file_metadata_does_not_prove_material_change():
+    result = json.dumps({
+        "bytes_written": 12,
+        "files_modified": ["/tmp/example.py"],
+    })
+
+    assert file_mutation_result_proves_change("write_file", result) is False
 
 
 def test_side_effect_classification_keeps_session_mutations():

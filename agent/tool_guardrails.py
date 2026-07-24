@@ -14,7 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from utils import safe_json_loads
-from agent.tool_result_classification import file_mutation_result_landed
+from agent.tool_result_classification import (
+    file_mutation_result_landed,
+    file_mutation_result_proves_change,
+)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -438,6 +441,10 @@ class ToolCallGuardrailController:
         for policy in self._schema_retry_policies.values():
             if policy.get("remediation_signature") == signature:
                 policy["remediation_satisfied"] = True
+
+        if file_mutation_result_proves_change(tool_name, result):
+            self._exact_failure_counts.clear()
+            self._same_tool_failure_counts.clear()
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)

@@ -188,6 +188,59 @@ def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution
     assert "repeated_exact_failure_block" in messages[0]["content"]
 
 
+def test_verified_patch_allows_runtime_retry_of_prior_exact_failure():
+    agent = _make_agent("patch", "terminal", config=_hard_stop_config())
+    terminal_args = {"command": "run-focused-test"}
+    _seed_exact_failures(agent, "terminal", terminal_args)
+    messages = []
+    executed = []
+
+    patch_call = _mock_tool_call(
+        "patch",
+        json.dumps({"patch": "*** Begin Patch\n*** End Patch"}),
+        "c-patch",
+    )
+    terminal_call = _mock_tool_call(
+        "terminal",
+        json.dumps(terminal_args),
+        "c-retry",
+    )
+    patch_message = SimpleNamespace(content="", tool_calls=[patch_call])
+    terminal_message = SimpleNamespace(content="", tool_calls=[terminal_call])
+
+    def fake_handle(name, call_args, task_id, **kwargs):
+        kwargs["on_authorized"](call_args)
+        executed.append((name, call_args, kwargs["tool_call_id"]))
+        if name == "patch":
+            return json.dumps({
+                "success": True,
+                "diff": "--- a/example.py\n+++ b/example.py\n@@\n-old\n+new\n",
+            })
+        return json.dumps({"exit_code": 0, "output": "passed"})
+
+    with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        agent._execute_tool_calls_sequential(patch_message, messages, "task-1")
+        agent._execute_tool_calls_sequential(terminal_message, messages, "task-1")
+
+    assert executed == [
+        (
+            "patch",
+            {"patch": "*** Begin Patch\n*** End Patch"},
+            "c-patch",
+        ),
+        ("terminal", terminal_args, "c-retry"),
+    ]
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-patch",
+        "c-retry",
+    ]
+    assert json.loads(messages[1]["content"]) == {
+        "exit_code": 0,
+        "output": "passed",
+    }
+    assert agent._tool_guardrail_halt_decision is None
+
+
 def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_messages():
     agent = _make_agent("web_search")
     args = {"query": "same"}
