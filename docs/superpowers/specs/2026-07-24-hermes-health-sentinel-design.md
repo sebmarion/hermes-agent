@@ -2,7 +2,8 @@
 
 **Date:** 2026-07-24
 
-**Status:** Approved design under spec review
+**Status:** Three adversarial review passes completed; findings addressed;
+awaiting user review
 
 ## Goal
 
@@ -61,7 +62,7 @@ state is projection and reminder state only; it never authorizes an effect.
 
 ## Configuration
 
-All behavioral settings live in `~/.hermes/config.yaml`:
+All configurable behavioral settings live in `~/.hermes/config.yaml`:
 
 ```yaml
 watchdog:
@@ -138,6 +139,8 @@ evidence. It does not reload or restart the job.
   gui/<uid>/com.seb.hermes-health-sentinel`.
 - Require the loaded label, canonical plist path, Python executable, script
   path, Aqua session type, and 300-second run interval to match this contract.
+- Require `KeepAlive`, `StartCalendarInterval`, and `WorkingDirectory` to be
+  absent from the loaded definition as well as the source plist.
 - Any mismatch reports `SENTINEL_DEFINITION_DRIFT`.
 
 This check is evidence only. It never bootstraps, reloads, or kickstarts
@@ -218,6 +221,8 @@ Python HTTP helper:
 - read at most 64 KiB from `~/.openviking/ov.conf`;
 - require the configured server and embedding URLs to resolve to loopback
   hosts;
+- reject redirects without following them, so a loopback URL cannot redirect
+  the probe outside the approved boundary;
 - GET the OpenViking health endpoint and require its healthy contract;
 - GET the configured embedding models endpoint; and
 - POST one fixed health-probe input to the configured embedding endpoint,
@@ -424,8 +429,9 @@ only when the launch contract itself changes.
 Focused tests use temporary Hermes homes and stubbed subprocess/HTTP probes.
 They must cover:
 
-1. Healthy gateway, fresh ticker, open admission, healthy required jobs, and
-   empty OpenViking output produce green with a finite `next_check_at`.
+1. Healthy gateway, fresh ticker, open admission, healthy required jobs,
+   healthy loopback OpenViking responses, and a correctly sized embedding
+   vector produce green with a finite `next_check_at`.
 2. A maintenance shim within grace reports `MAINTENANCE_ACTIVE`; after grace
    it reports `MAINTENANCE_STALE`, using the defined public-link mtime.
 3. Closed admission outside active maintenance reports
@@ -458,6 +464,8 @@ They must cover:
     future cannot produce green.
 19. Notification bodies containing quotes, newlines, or AppleScript tokens
     remain a single data argument to fixed AppleScript source.
+20. A loopback OpenViking URL that returns a redirect is not followed and
+    cannot produce green.
 
 Launchd acceptance installs and uses the fixed canonical sentinel label and
 real script, but performs no real-service failure injection. Definition-parser
