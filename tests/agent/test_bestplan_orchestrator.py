@@ -1483,6 +1483,32 @@ def test_kimi_k3_resolution_rejects_configured_chat_mode(monkeypatch):
         orchestrator._resolve_lane_credentials(SimpleNamespace(), lane)
 
 
+def test_kimi_k3_alias_resolution_cannot_bypass_chat_mode_guard(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    from hermes_cli import runtime_provider
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "kimi-coding",
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.kimi.com/coding",
+            "api_key": "sk-kimi-SENTINEL",
+        },
+    )
+    lane = {
+        "name": "kimi-k3",
+        "provider": "kimi",
+        "model": "k3",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "max",
+    }
+
+    with pytest.raises(orchestrator.BestPlanRuntimeInvalid):
+        orchestrator._resolve_lane_credentials(SimpleNamespace(), lane)
+
+
 def test_kimi_k3_runtime_drift_records_runtime_invalid_attempt(
     monkeypatch, tmp_path
 ):
