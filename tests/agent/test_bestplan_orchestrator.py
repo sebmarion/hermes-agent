@@ -562,6 +562,119 @@ def test_receipt_has_canonical_markers_and_hash():
     assert body_sha256(body)
 
 
+def test_v2_completed_receipt_requires_successful_synthesizer():
+    body = "plan body"
+    attempts = [
+        {
+            "index": index,
+            "strategy": "evidence-first",
+            "explorer": "glm",
+            "configured": {"provider": "zai", "model": "glm-5"},
+            "resolved": {"provider": "zai", "model": "glm-5"},
+            "status": "success",
+            "reason_code": None,
+        }
+        for index in range(3)
+    ]
+    synthesizer = {
+        "name": "sol",
+        "configured": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "resolved": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "status": "failed",
+        "reason_code": "provider_error",
+    }
+    receipt = make_receipt(
+        "run-failed-synth",
+        model="gpt-5.6-sol",
+        quorum="3/3",
+        synth_status="failed",
+        body=body,
+        requested_count=3,
+        effective_count=3,
+        quorum_required=2,
+        attempts=attempts,
+        synthesizer=synthesizer,
+    )
+
+    assert validate_receipt(receipt, body) is False
+
+
+def test_v2_completed_receipt_requires_explorer_quorum():
+    body = "plan body"
+    attempts = [
+        {
+            "index": index,
+            "strategy": "evidence-first",
+            "explorer": "glm",
+            "configured": {"provider": "zai", "model": "glm-5"},
+            "resolved": {"provider": "zai", "model": "glm-5"},
+            "status": "success" if index == 0 else "failed",
+            "reason_code": None if index == 0 else "provider_error",
+        }
+        for index in range(3)
+    ]
+    synthesizer = {
+        "name": "sol",
+        "configured": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "resolved": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "status": "success",
+        "reason_code": None,
+    }
+    receipt = make_receipt(
+        "run-no-quorum",
+        model="gpt-5.6-sol",
+        quorum="1/3",
+        synth_status="success",
+        body=body,
+        requested_count=3,
+        effective_count=3,
+        quorum_required=2,
+        attempts=attempts,
+        synthesizer=synthesizer,
+    )
+
+    assert validate_receipt(receipt, body) is False
+
+
+def test_v2_failed_receipt_rejects_plan_body_hash():
+    body = "plan body that must not exist on failure"
+    attempts = [
+        {
+            "index": index,
+            "strategy": "evidence-first",
+            "explorer": "glm",
+            "configured": {"provider": "zai", "model": "glm-5"},
+            "resolved": None,
+            "status": "failed",
+            "reason_code": "provider_error",
+        }
+        for index in range(3)
+    ]
+    synthesizer = {
+        "name": "sol",
+        "configured": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "resolved": None,
+        "status": "not_started",
+        "reason_code": "quorum_unavailable",
+    }
+    receipt = make_receipt(
+        "run-failed-with-body",
+        model="gpt-5.6-sol",
+        quorum="0/3",
+        synth_status="not_started",
+        body=body,
+        requested_count=3,
+        effective_count=3,
+        quorum_required=2,
+        attempts=attempts,
+        synthesizer=synthesizer,
+        status="failed",
+        reason_code="quorum_unavailable",
+    )
+
+    assert validate_receipt(receipt, body) is False
+
+
 def test_checked_in_v1_receipt_fixture_remains_readable():
     fixture = json.loads(
         (Path(__file__).parents[1] / "fixtures" / "bestplan_receipt_v1.json").read_text()
@@ -1037,6 +1150,50 @@ def test_synthesizer_provider_failure_persists_no_plan_body(
     assert receipt["synthesizer"]["status"] == "failed"
     assert receipt["synthesizer"]["reason_code"] == "provider_error"
     assert receipt["body_sha256"] is None
+
+
+def test_explorer_provider_failure_uses_provider_error_reason(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+
+        def run_conversation(self, prompt):
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "final plan"}
+            if self.model == "configured-kimi-model":
+                raise RuntimeError("SENTINEL_SECRET")
+            return {"final_response": _candidate_text(self.model)}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, explorer: _identity(explorer),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=3,
+        config=_canonical_config(),
+    )
+
+    assert result["status"] == "completed"
+    assert result["attempts"][1]["status"] == "failed"
+    assert result["attempts"][1]["reason_code"] == "provider_error"
+    assert "SENTINEL_SECRET" not in json.dumps(result, sort_keys=True)
 
 
 def test_terminal_failure_never_exposes_provider_exception_secret(

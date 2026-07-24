@@ -553,6 +553,18 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _bestplan_receipt_metadata(outcome: Dict[str, Any]) -> Dict[str, Any]:
+    """Project the current host-owned BestPlan receipt identity onto a turn."""
+    from agent.bestplan_orchestrator import RECEIPT_VERSION, body_sha256
+
+    body = outcome.get("body")
+    return {
+        "bestplan_receipt_version": RECEIPT_VERSION,
+        "run_id": outcome.get("run_id"),
+        "body_sha256": body_sha256(body) if body else None,
+    }
+
+
 def _run_conversation(
     agent,
     user_message: str,
@@ -658,11 +670,7 @@ def _run_conversation(
         response = outcome.get("final_response") or (
             "BestPlan unavailable: " + str(outcome.get("error", "unknown error"))
         )
-        agent._bestplan_receipt_metadata = {
-            "bestplan_receipt_version": 1,
-            "run_id": outcome.get("run_id"),
-            "body_sha256": outcome.get("body") and __import__("hashlib").sha256(outcome["body"].encode()).hexdigest(),
-        }
+        agent._bestplan_receipt_metadata = _bestplan_receipt_metadata(outcome)
         from agent.turn_finalizer import finalize_turn
         return finalize_turn(
             agent,

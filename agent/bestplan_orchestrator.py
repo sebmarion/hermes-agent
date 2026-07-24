@@ -425,10 +425,16 @@ def _valid_v2_receipt_metadata(metadata: dict[str, Any], body: str) -> bool:
         return False
     if metadata["status"] == "failed" and metadata["reason_code"] is None:
         return False
-    expected_hash = body_sha256(body) if body else None
     if metadata["status"] == "completed":
-        expected_hash = body_sha256(body)
-    return metadata.get("body_sha256") == expected_hash
+        successful_attempts = sum(
+            attempt["status"] == "success" for attempt in attempts
+        )
+        if synthesizer["status"] != "success":
+            return False
+        if successful_attempts < metadata["quorum_required"]:
+            return False
+        return metadata.get("body_sha256") == body_sha256(body)
+    return not body and metadata.get("body_sha256") is None
 
 
 def validate_receipt(receipt: str, body: str) -> bool:
@@ -1001,11 +1007,18 @@ def run_bestplan(
                 _child, attempt_index = future_to_job[future]
                 attempt = attempts[attempt_index]
                 try:
-                    attempt["_candidate"] = _candidate_from_text(future.result())
-                    attempt["status"] = "success"
+                    raw_candidate = future.result()
+                except Exception:
+                    attempt["status"] = "failed"
+                    attempt["reason_code"] = "provider_error"
+                    continue
+                try:
+                    attempt["_candidate"] = _candidate_from_text(raw_candidate)
                 except Exception:
                     attempt["status"] = "failed"
                     attempt["reason_code"] = "candidate_invalid"
+                else:
+                    attempt["status"] = "success"
         for future in pending:
             _child, attempt_index = future_to_job[future]
             attempts[attempt_index]["status"] = "timeout"
