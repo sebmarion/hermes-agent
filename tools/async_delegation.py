@@ -88,6 +88,11 @@ _DEFAULT_MAX_STORE_BYTES = 250 * 1024 * 1024
 _CLEANUP_INTERVAL_SECONDS = 15 * 60
 _last_cleanup_at = 0.0
 _persist_lock = threading.Lock()
+# Deterministic dispatch IDs are admitted under a stable striped lock. This
+# serializes the full intent→scheduled→running acceptance handshake for one ID
+# without retaining an unbounded lock per historical delegation.
+_DISPATCH_ADMISSION_LOCKS = tuple(threading.RLock() for _ in range(64))
+_RUNNING_CHECKPOINT_TIMEOUT_SECONDS = 10.0
 _recovery_attempted = False
 _replayed_persisted_ids: set[tuple[str, str]] = set()
 _PERSISTENCE_VERSION = 1
@@ -349,11 +354,11 @@ def _persist_record(
     result: Optional[Dict[str, Any]] = None,
     event: Optional[Dict[str, Any]] = None,
     delivery_status: Optional[str] = None,
-) -> None:
-    """Best-effort durable checkpoint for one async delegation record."""
+) -> bool:
+    """Checkpoint one record and report whether the durable write succeeded."""
     delegation_id = str(record.get("delegation_id") or "")
     if not delegation_id:
-        return
+        return False
     now = time.time()
     entry = {
         "delegation_id": delegation_id,
@@ -387,8 +392,10 @@ def _persist_record(
             data["records"][delegation_id] = merged
             _cleanup_persisted_data_locked(data, now=now)
             _write_persisted_unlocked(data, tracker_path)
+        return True
     except Exception as exc:
         logger.warning("Failed to persist async delegation %s: %s", delegation_id, exc)
+        return False
 
 
 def _mark_persisted_delivery(
@@ -956,6 +963,51 @@ def dispatch_async_delegation_batch(
     bestplan_plan_id: str = "",
     resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    """Atomically admit one deterministic-ID batch dispatch."""
+    resolved_id = str(delegation_id or _new_delegation_id())
+    admission_lock = _DISPATCH_ADMISSION_LOCKS[
+        hash(resolved_id) % len(_DISPATCH_ADMISSION_LOCKS)
+    ]
+    with admission_lock:
+        return _dispatch_async_delegation_batch_admitted(
+            goals=goals,
+            context=context,
+            toolsets=toolsets,
+            role=role,
+            model=model,
+            session_key=session_key,
+            parent_session_id=parent_session_id,
+            runner=runner,
+            origin_ui_session_id=origin_ui_session_id,
+            interrupt_fn=interrupt_fn,
+            max_async_children=max_async_children,
+            delegation_id=resolved_id,
+            origin_profile=origin_profile,
+            origin_tracker_path=origin_tracker_path,
+            bestplan_plan_id=bestplan_plan_id,
+            resolved_runtimes=resolved_runtimes,
+        )
+
+
+def _dispatch_async_delegation_batch_admitted(
+    *,
+    goals: List[str],
+    context: Optional[str],
+    toolsets: Optional[List[str]],
+    role: str,
+    model: Optional[str],
+    session_key: str,
+    parent_session_id: Optional[str] = None,
+    runner: Callable[[], Dict[str, Any]],
+    origin_ui_session_id: str = "",
+    interrupt_fn: Optional[Callable[[], None]] = None,
+    max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    delegation_id: Optional[str] = None,
+    origin_profile: str = "",
+    origin_tracker_path: str = "",
+    bestplan_plan_id: str = "",
+    resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
     Unlike ``dispatch_async_delegation`` (which backs a single subagent),
@@ -979,6 +1031,14 @@ def dispatch_async_delegation_batch(
     if not origin_tracker_path:
         _recover_once()
     delegation_id = str(delegation_id or _new_delegation_id())
+    with _records_lock:
+        local_existing = _records.get(delegation_id)
+        if local_existing and local_existing.get("acceptance_aborted"):
+            return {
+                "status": "rejected",
+                "delegation_id": delegation_id,
+                "error": "previous strict dispatch acceptance was aborted before execution",
+            }
     if origin_tracker_path:
         with _persist_lock:
             persisted = _read_persisted_unlocked(origin_tracker_path)
@@ -987,8 +1047,24 @@ def dispatch_async_delegation_batch(
             phase = str(existing.get("status") or (existing.get("record") or {}).get("status") or "")
             if phase in {"scheduled", "running"}:
                 owner_pid = (existing.get("record") or {}).get("owner_pid")
-                if phase == "scheduled" and not _owner_pid_alive(owner_pid):
+                owner_live = _owner_pid_alive(owner_pid)
+                if phase == "scheduled" and not owner_live:
                     phase = "intent"
+                elif phase == "running" and not owner_live:
+                    # Running means side effects may have begun. A dead owner is
+                    # terminally ambiguous: recover it as lost, never retry or
+                    # falsely ACK it as a live idempotent dispatch.
+                    recover_async_delegations(origin_tracker_path)
+                    with _persist_lock:
+                        recovered = _read_persisted_unlocked(origin_tracker_path)
+                        existing = (recovered.get("records") or {}).get(
+                            delegation_id, existing
+                        )
+                    phase = str(
+                        existing.get("status")
+                        or (existing.get("record") or {}).get("status")
+                        or "lost"
+                    )
                 else:
                     return {
                         "status": "dispatched",
@@ -1009,6 +1085,9 @@ def dispatch_async_delegation_batch(
     combined_goal = (
         goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
     )
+    from agent.bestplan_state import sanitize_runtime_metadata
+
+    safe_resolved_runtimes = sanitize_runtime_metadata(resolved_runtimes or [])
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "goal": combined_goal,
@@ -1023,7 +1102,7 @@ def dispatch_async_delegation_batch(
         "origin_tracker_path": origin_tracker_path,
         "parent_session_id": parent_session_id,
         "bestplan_plan_id": bestplan_plan_id,
-        "resolved_runtimes": list(resolved_runtimes or []),
+        "resolved_runtimes": safe_resolved_runtimes,
         "status": "intent",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -1065,6 +1144,28 @@ def dispatch_async_delegation_batch(
     executor = _get_executor(max_async_children)
     start_gate = threading.Event()
     abort_gate = threading.Event()
+    running_checkpoint_ready = threading.Event()
+    execute_gate = threading.Event()
+    running_checkpoint = {"ok": not bool(origin_tracker_path), "error": ""}
+
+    def _repair_pre_execution_intent(reason: str) -> bool:
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is None:
+                return False
+            live["status"] = "intent"
+            live["delivery_status"] = "intent"
+            # Keep retries rejected until the durable intent repair succeeds.
+            live["acceptance_aborted"] = True
+            live["last_error"] = reason
+            repaired = dict(live)
+        persisted = _persist_record(repaired, delivery_status="intent")
+        if persisted:
+            with _records_lock:
+                live = _records.get(delegation_id)
+                if live is not None and live.get("status") == "intent":
+                    live["acceptance_aborted"] = False
+        return persisted
 
     def _worker() -> None:
         start_gate.wait()
@@ -1077,7 +1178,28 @@ def dispatch_async_delegation_batch(
             live["status"] = "running"
             live["delivery_status"] = "running"
             running_record = dict(live)
-        _persist_record(running_record, delivery_status="running")
+        running_persisted = _persist_record(
+            running_record, delivery_status="running"
+        )
+        if origin_tracker_path:
+            if not running_persisted:
+                repaired = _repair_pre_execution_intent(
+                    "durable running checkpoint failed before execution"
+                )
+                running_checkpoint["error"] = (
+                    "strict async running checkpoint could not be persisted"
+                    + ("" if repaired else "; intent repair also failed")
+                )
+                running_checkpoint_ready.set()
+                return
+            running_checkpoint["ok"] = True
+            running_checkpoint_ready.set()
+            execute_gate.wait()
+            if abort_gate.is_set():
+                _repair_pre_execution_intent(
+                    "dispatch acceptance timed out before execution"
+                )
+                return
         combined: Dict[str, Any] = {}
         status = "error"
         try:
@@ -1155,11 +1277,37 @@ def dispatch_async_delegation_batch(
             "error": "strict async scheduled phase could not be persisted",
         }
 
+    start_gate.set()
+    if origin_tracker_path:
+        if not running_checkpoint_ready.wait(
+            timeout=_RUNNING_CHECKPOINT_TIMEOUT_SECONDS
+        ):
+            with _records_lock:
+                live = _records.get(delegation_id)
+                if live is not None:
+                    live["acceptance_aborted"] = True
+                    live["last_error"] = (
+                        "strict async running checkpoint timed out before execution"
+                    )
+            abort_gate.set()
+            execute_gate.set()
+            return {
+                "status": "rejected",
+                "error": "strict async running checkpoint timed out before execution",
+            }
+        if not running_checkpoint["ok"]:
+            abort_gate.set()
+            execute_gate.set()
+            return {
+                "status": "rejected",
+                "error": running_checkpoint["error"],
+            }
+
     heartbeat_stop = _start_heartbeat_thread(delegation_id)
     with _records_lock:
         if delegation_id in _records:
             _records[delegation_id]["heartbeat_stop"] = heartbeat_stop
-    start_gate.set()
+    execute_gate.set()
 
     logger.info(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",

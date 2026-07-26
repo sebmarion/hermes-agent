@@ -3444,6 +3444,24 @@ def delegate_task(
             return json.dumps(_sync_result, ensure_ascii=False)
 
         _session_key = get_current_session_key(default="")
+        _origin_ui_session_id = ""
+        _parent_session_id = getattr(parent_agent, "session_id", None)
+        try:
+            from gateway.session_context import get_session_env
+
+            _source = get_session_env("HERMES_SESSION_SOURCE", "")
+            _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+            # Desktop/TUI routes by the live durable AIAgent session id. Context
+            # compression can rotate it during this turn while the approval
+            # context still holds the stale parent. Gateway chats keep their
+            # platform conversation key and are pinned separately by
+            # parent_session_id.
+            if _source == "tui":
+                _live_session_id = str(_parent_session_id or "")
+                if _live_session_id:
+                    _session_key = _live_session_id
+        except Exception:
+            _origin_ui_session_id = ""
         _child_agents = [c for (_, _, c) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the
@@ -3486,6 +3504,8 @@ def delegate_task(
             # Per-child routing is already fixed on each built child.
             model=_async_batch_model_label(child_models),
             session_key=_session_key,
+            parent_session_id=_parent_session_id,
+            origin_ui_session_id=_origin_ui_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
@@ -3493,13 +3513,7 @@ def delegate_task(
             origin_profile=str((_bestplan_meta or {}).get("origin_profile") or ""),
             origin_tracker_path=str((_bestplan_meta or {}).get("origin_tracker_path") or ""),
             bestplan_plan_id=str((_bestplan_meta or {}).get("plan_id") or ""),
-            resolved_runtimes=[
-                {
-                    key: value for key, value in runtime.items()
-                    if key not in {"api_key", "credential", "token", "secret"}
-                }
-                for runtime in (_resolved_runtimes or [])
-            ],
+            resolved_runtimes=_nonsecret_runtime_value(_resolved_runtimes or []),
         )
 
         if dispatch.get("status") == "dispatched":
@@ -4235,17 +4249,9 @@ def _endpoint_identity(value: Any) -> str:
 
 
 def _nonsecret_runtime_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): _nonsecret_runtime_value(item)
-            for key, item in sorted(value.items())
-            if not any(marker in str(key).casefold() for marker in ("key", "token", "secret", "credential", "password"))
-        }
-    if isinstance(value, (list, tuple)):
-        return [_nonsecret_runtime_value(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
+    from agent.bestplan_state import sanitize_runtime_metadata
+
+    return sanitize_runtime_metadata(value)
 
 
 def _effective_bestplan_toolsets(task: Dict[str, Any], runtime: Dict[str, Any]) -> list[str]:

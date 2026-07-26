@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from agent.execution_plan import ExecutionPlan, PlanValidationError, compile_execution_plan
 
@@ -28,6 +29,12 @@ BESTPLAN_HOST_CAPABILITY_VERSION = 1
 _ENVELOPE_RE = re.compile(
     re.escape(BESTPLAN_ENVELOPE_START)
     + r"\s*(?P<payload>\{.*?\})\s*"
+    + re.escape(BESTPLAN_ENVELOPE_END),
+    re.DOTALL,
+)
+_ENVELOPE_BLOCK_RE = re.compile(
+    re.escape(BESTPLAN_ENVELOPE_START)
+    + r".*?"
     + re.escape(BESTPLAN_ENVELOPE_END),
     re.DOTALL,
 )
@@ -145,6 +152,85 @@ def _active_profile() -> str:
 
 def _canonical_workspace(workspace: str) -> str:
     return str(Path(workspace or os.getcwd()).expanduser().resolve())
+
+
+_RUNTIME_SECRET_CONTAINERS = {"auth", "cookies", "extra_headers", "headers"}
+_RUNTIME_SECRET_PARTS = {
+    "api_key", "authorization", "bearer", "cookie", "credential",
+    "key", "password", "secret", "token", "tokens",
+}
+_RUNTIME_NONSECRET_TOKEN_KEYS = {"max_output_tokens", "max_tokens"}
+_RUNTIME_URL_KEYS = {"api_base", "base_url", "endpoint", "endpoint_url", "url"}
+_RUNTIME_SECRET_VALUE_RE = re.compile(
+    r"(?i)(?:\b(?:bearer|basic)\s+\S+|"
+    r"(?:api[-_]?key|authorization|password|secret|token)\s*[=:]\s*[^\s&]+)"
+)
+
+
+def _normalized_runtime_key(key: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(key).casefold()).strip("_")
+
+
+def _runtime_key_is_sensitive(key: Any) -> bool:
+    normalized = _normalized_runtime_key(key)
+    if normalized in _RUNTIME_NONSECRET_TOKEN_KEYS:
+        return False
+    if normalized in _RUNTIME_SECRET_CONTAINERS:
+        return True
+    parts = set(normalized.split("_"))
+    return bool(parts & _RUNTIME_SECRET_PARTS) or normalized.endswith("api_key")
+
+
+def _sanitize_runtime_string(value: str, *, key: Any = "") -> str:
+    normalized = _normalized_runtime_key(key)
+    if normalized in _RUNTIME_URL_KEYS:
+        try:
+            schemeless = "://" not in value and not value.startswith(("/", "./", "../"))
+            parsed = urlsplit(f"//{value}" if schemeless else value)
+            if parsed.hostname:
+                host = parsed.hostname.casefold()
+                if ":" in host and not host.startswith("["):
+                    host = f"[{host}]"
+                netloc = host
+                if parsed.port is not None:
+                    netloc += f":{parsed.port}"
+                if schemeless:
+                    return f"{netloc}{parsed.path or ''}"
+                return urlunsplit(
+                    (parsed.scheme.casefold(), netloc, parsed.path or "", "", "")
+                )
+        except (TypeError, ValueError):
+            return "<redacted-url>"
+        return value.split("?", 1)[0].split("#", 1)[0]
+    if _RUNTIME_SECRET_VALUE_RE.search(value):
+        return "<redacted>"
+    return value
+
+
+def sanitize_runtime_metadata(value: Any, *, _key: Any = "") -> Any:
+    """Return JSON-safe runtime identity data with credential surfaces removed."""
+    if isinstance(value, dict):
+        return {
+            str(key): sanitize_runtime_metadata(item, _key=key)
+            for key, item in sorted(value.items())
+            if not _runtime_key_is_sensitive(key)
+        }
+    if isinstance(value, (list, tuple)):
+        return [sanitize_runtime_metadata(item, _key=_key) for item in value]
+    if isinstance(value, str):
+        return _sanitize_runtime_string(value, key=_key)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _strip_bestplan_envelope(value: Any) -> str:
+    visible = _ENVELOPE_BLOCK_RE.sub("", str(value or ""))
+    start = visible.find(BESTPLAN_ENVELOPE_START)
+    if start >= 0:
+        # A missing end sentinel makes the remainder untrusted machine payload.
+        visible = visible[:start]
+    return visible.replace(BESTPLAN_ENVELOPE_END, "").strip()
 
 
 def compute_baseline_fingerprint(workspace: str) -> str:
@@ -524,30 +610,59 @@ class BestplanStore:
                 record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
                 phase = str(entry.get("status") or record.get("status") or "")
                 event = entry.get("event") if isinstance(entry.get("event"), dict) else None
-                if phase in {"scheduled", "running"} and row["state"] == PlanState.RUNNING:
-                    owner_live = True
-                    if phase == "scheduled":
-                        try:
-                            owner_pid = int(record.get("owner_pid"))
-                            if owner_pid <= 0:
-                                raise ValueError("invalid owner pid")
-                            os.kill(owner_pid, 0)
-                        except (ProcessLookupError, TypeError, ValueError):
-                            owner_live = False
-                        except PermissionError:
-                            owner_live = True
+                if phase in {"scheduled", "running"}:
+                    try:
+                        owner_pid = int(record.get("owner_pid"))
+                        if owner_pid <= 0:
+                            raise ValueError("invalid owner pid")
+                        os.kill(owner_pid, 0)
+                        owner_live = True
+                    except (ProcessLookupError, TypeError, ValueError):
+                        owner_live = False
+                    except PermissionError:
+                        owner_live = True
                     if owner_live:
                         changed += conn.execute(
                             "UPDATE bestplan_plans SET state=?, dispatch_state='scheduled', "
                             "dispatch_updated_at=? WHERE plan_id=? AND state=?",
                             (PlanState.WAITING, time.time(), row["plan_id"], PlanState.RUNNING),
                         ).rowcount
-                    else:
+                    elif phase == "scheduled":
                         changed += conn.execute(
-                            "UPDATE bestplan_plans SET dispatch_state='intent', dispatch_owner=NULL, "
-                            "dispatch_updated_at=?, error='recovered_pre_run_schedule' "
-                            "WHERE plan_id=? AND state=?",
-                            (time.time(), row["plan_id"], PlanState.RUNNING),
+                            "UPDATE bestplan_plans SET state=?, dispatch_state='intent', "
+                            "dispatch_owner=NULL, dispatch_updated_at=?, "
+                            "error='recovered_pre_run_schedule' "
+                            "WHERE plan_id=? AND state IN (?, ?)",
+                            (
+                                PlanState.RUNNING,
+                                time.time(),
+                                row["plan_id"],
+                                PlanState.RUNNING,
+                                PlanState.WAITING,
+                            ),
+                        ).rowcount
+                    else:
+                        evidence = {
+                            "delegation_id": delegation_id,
+                            "status": "lost",
+                            "error": "async delegation owner exited during running phase",
+                        }
+                        now = time.time()
+                        changed += conn.execute(
+                            "UPDATE bestplan_plans SET state=?, dispatch_state='terminal', "
+                            "evidence_json=?, completed_at=COALESCE(completed_at, ?), "
+                            "dispatch_updated_at=?, error=? "
+                            "WHERE plan_id=? AND state IN (?, ?)",
+                            (
+                                PlanState.COMPLETED_UNVERIFIED,
+                                json.dumps(evidence, sort_keys=True),
+                                now,
+                                now,
+                                evidence["error"],
+                                row["plan_id"],
+                                PlanState.RUNNING,
+                                PlanState.WAITING,
+                            ),
                         ).rowcount
                 elif phase in {"completed", "error", "failed", "lost", "interrupted"} or event:
                     evidence = event or {
@@ -740,13 +855,7 @@ class BestplanStore:
     ) -> Optional[dict[str, Any]]:
         """Atomically approve and persist the deterministic dispatch outbox."""
         dispatch_id = f"bestplan-{plan_id}"
-        safe_runtimes = [
-            {
-                key: value for key, value in runtime.items()
-                if key not in {"api_key", "credential", "token", "secret"}
-            }
-            for runtime in resolved_runtimes
-        ]
+        safe_runtimes = sanitize_runtime_metadata(resolved_runtimes)
 
         def prepare(conn):
             row = conn.execute(
@@ -930,7 +1039,8 @@ def capture_bestplan_response(
             "\n\n[Bestplan status: non-executable — the response did not contain "
             f"one valid machine envelope ({exc}).]"
         )
-        return PlanCapture(False, str(response or "") + suffix, error=str(exc))
+        visible = _strip_bestplan_envelope(response)
+        return PlanCapture(False, visible + suffix, error=str(exc))
     digest = _manifest_digest(manifest)
     try:
         store = store or BestplanStore()
@@ -939,10 +1049,10 @@ def capture_bestplan_response(
             baseline_fingerprint=baseline_fingerprint, raw_envelope=raw_envelope,
         )
     except BaselineFingerprintError as exc:
-        visible = _ENVELOPE_RE.sub("", str(response or "")).strip()
+        visible = _strip_bestplan_envelope(response)
         suffix = f"\n\n[Bestplan status: non-executable — {exc}.]"
         return PlanCapture(False, visible + suffix, error=str(exc))
-    advisory = _ENVELOPE_RE.sub("", str(response or "")).strip()
+    advisory = _strip_bestplan_envelope(response)
     authority = _render_authoritative_manifest(
         plan, workspace=workspace, digest=digest,
     )
@@ -1021,7 +1131,7 @@ def unsupported_host_bestplan_after_model(
     """Remove executable authority from a /bestplan answer on unsupported hosts."""
     if not is_bestplan_invocation(invocation_message) or not isinstance(result, dict):
         return result
-    visible = _ENVELOPE_RE.sub("", str(result.get("final_response") or "")).strip()
+    visible = _strip_bestplan_envelope(result.get("final_response"))
     suffix = (
         f"[BestPlan status: planning-only on {host_name}; no executable manifest "
         "was persisted and bare `go` cannot dispatch this plan here.]"

@@ -190,7 +190,22 @@ def test_capture_requires_explicit_valid_envelope(tmp_path):
         store=store,
     )
     assert malformed.executable is False
+    assert BESTPLAN_ENVELOPE_START not in malformed.response
+    assert BESTPLAN_ENVELOPE_END not in malformed.response
     assert store.list_for_session("s1") == []
+
+    unterminated = capture_bestplan_response(
+        f"Advisory prose.\n{BESTPLAN_ENVELOPE_START}\n{{bad json}}",
+        session_id="s1",
+        profile="coder",
+        workspace="/tmp/work",
+        baseline_fingerprint="base-1",
+        store=store,
+    )
+    assert unterminated.executable is False
+    assert unterminated.response.startswith("Advisory prose.")
+    assert BESTPLAN_ENVELOPE_START not in unterminated.response
+    assert "{bad json}" not in unterminated.response
 
 
 def test_capture_stores_immutable_raw_envelope_and_validated_manifest(tmp_path):
@@ -334,7 +349,26 @@ def test_runtime_is_resolved_once_before_durable_intent_and_reused_by_dispatch(t
     def resolver(tasks, parent_agent):
         calls.append(("resolve", store.get_plan(capture.plan_id)["state"]))
         assert parent_agent is not None
-        return [{"route": "code_worker", "provider": "test", "model": "coder"}]
+        return [{
+            "route": "code_worker",
+            "provider": "test",
+            "model": "coder",
+            "api_key": "top-level-secret",
+            "base_url": (
+                "https://user:pass@example.test/v1"
+                "?token=url-secret#fragment"
+            ),
+            "endpoint_url": (
+                "user:secret@example.test:8443/v1?token=schemeless-secret"
+            ),
+            "request_overrides": {
+                "headers": {
+                    "Authorization": "Bearer nested-secret",
+                    "X-Api-Key": "nested-key-secret",
+                },
+                "temperature": 0.2,
+            },
+        }]
 
     def dispatcher(**kwargs):
         row = store.get_plan(capture.plan_id)
@@ -354,9 +388,20 @@ def test_runtime_is_resolved_once_before_durable_intent_and_reused_by_dispatch(t
     dispatch_kwargs = calls[1][2]
     assert dispatch_kwargs["dispatch_id"] == f"bestplan-{capture.plan_id}"
     assert dispatch_kwargs["resolved_runtimes"][0]["model"] == "coder"
+    assert dispatch_kwargs["resolved_runtimes"][0]["api_key"] == "top-level-secret"
+    assert (
+        dispatch_kwargs["resolved_runtimes"][0]["request_overrides"]["headers"]
+        ["Authorization"]
+        == "Bearer nested-secret"
+    )
     row = store.get_plan(capture.plan_id)
     assert row["dispatch_state"] == "scheduled"
-    assert json.loads(row["resolved_runtime_json"])[0]["provider"] == "test"
+    persisted_runtime = json.loads(row["resolved_runtime_json"])[0]
+    assert persisted_runtime["provider"] == "test"
+    assert persisted_runtime["base_url"] == "https://example.test/v1"
+    assert persisted_runtime["endpoint_url"] == "example.test:8443/v1"
+    assert persisted_runtime["request_overrides"] == {"temperature": 0.2}
+    assert "secret" not in row["resolved_runtime_json"]
 
 
 def test_unknown_dispatch_outcome_is_durable_and_never_claimed_not_started(tmp_path):
@@ -407,6 +452,95 @@ def test_recovery_only_reclaims_demonstrably_dead_dispatch_owner(tmp_path):
     assert store.get_plan(capture.plan_id)["dispatch_state"] == "unknown"
 
 
+@pytest.mark.parametrize("post_admission", [False, True])
+def test_reconcile_dead_running_tracker_marks_plan_lost_not_waiting(
+    tmp_path, post_admission,
+):
+    store = _store(tmp_path)
+    capture = _capture(store)
+    store.prepare_dispatch_intent(
+        capture.plan_id,
+        "base-1",
+        resolved_runtimes=[{
+            "route": "code_worker", "provider": "test", "model": "coder",
+        }],
+        session_id="s1",
+        profile="coder",
+        workspace="/tmp/work",
+    )
+    delegation_id = f"bestplan-{capture.plan_id}"
+    if post_admission:
+        assert store.record_dispatch(
+            capture.plan_id,
+            delegation_ids=[delegation_id],
+        )
+        assert store.get_plan(capture.plan_id)["state"] == PlanState.WAITING
+    tracker = tmp_path / "async_delegations.json"
+    tracker.write_text(
+        json.dumps({
+            "version": 1,
+            "records": {
+                delegation_id: {
+                    "delegation_id": delegation_id,
+                    "status": "running",
+                    "delivery_status": "running",
+                    "record": {
+                        "delegation_id": delegation_id,
+                        "status": "running",
+                        "owner_pid": 99_999_999,
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    assert store.reconcile_async_tracker() == 1
+    row = store.get_plan(capture.plan_id)
+    assert row["state"] == PlanState.COMPLETED_UNVERIFIED
+    assert row["dispatch_state"] == "terminal"
+    evidence = json.loads(row["evidence_json"])
+    assert evidence["status"] == "lost"
+
+
+def test_reconcile_dead_scheduled_waiting_reopens_retryable_intent(tmp_path):
+    store = _store(tmp_path)
+    capture = _capture(store)
+    store.prepare_dispatch_intent(
+        capture.plan_id,
+        "base-1",
+        resolved_runtimes=[{
+            "route": "code_worker", "provider": "test", "model": "coder",
+        }],
+        session_id="s1",
+        profile="coder",
+        workspace="/tmp/work",
+    )
+    delegation_id = f"bestplan-{capture.plan_id}"
+    assert store.record_dispatch(capture.plan_id, delegation_ids=[delegation_id])
+    (tmp_path / "async_delegations.json").write_text(
+        json.dumps({
+            "version": 1,
+            "records": {
+                delegation_id: {
+                    "status": "scheduled",
+                    "record": {
+                        "delegation_id": delegation_id,
+                        "status": "scheduled",
+                        "owner_pid": 99_999_999,
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    assert store.reconcile_async_tracker() == 1
+    row = store.get_plan(capture.plan_id)
+    assert row["state"] == PlanState.RUNNING
+    assert row["dispatch_state"] == "intent"
+
+
 def test_strict_child_tools_resolve_inside_isolated_worktree(tmp_path):
     from agent.runtime_cwd import resolve_agent_cwd
     from tools.delegate_tool import _run_single_child
@@ -415,6 +549,9 @@ def test_strict_child_tools_resolve_inside_isolated_worktree(tmp_path):
     child = MagicMock()
     child._credential_pool = None
     child._bestplan_workspace = str(tmp_path)
+    # Current-main execution/review children must prove successful tool use.
+    # This test isolates task-local cwd propagation, so use the reasoning lane.
+    child._delegate_mode = "reason"
     child.get_activity_summary.return_value = {
         "current_tool": None,
         "api_call_count": 0,
