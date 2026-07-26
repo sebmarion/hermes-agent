@@ -254,6 +254,79 @@ class TestDiscoveryShape:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
 
+    def test_current_session_archived_match_is_returned_without_active_leakage(self, db):
+        db.create_session("s_current", source="cli")
+        archived_ids = [
+            db.append_message("s_current", role="user", content="needle archived goal"),
+            db.append_message("s_current", role="assistant", content="needle archived answer"),
+            db.append_message("s_current", role="user", content="needle archived close"),
+        ]
+        db.archive_and_compact(
+            "s_current",
+            [{"role": "assistant", "content": "active compacted summary"}],
+        )
+
+        result = json.loads(session_search(
+            query="needle",
+            current_session_id="s_current",
+            db=db,
+        ))
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        hit = result["results"][0]
+        assert hit["session_id"] == "s_current"
+        returned = hit["bookend_start"] + hit["messages"] + hit["bookend_end"]
+        assert {m["id"] for m in returned}.issubset(set(archived_ids))
+        assert hit["match_message_id"] in {m["id"] for m in hit["messages"]}
+        assert "active compacted summary" not in json.dumps(hit)
+
+    def test_current_session_title_match_returns_only_archived_history(self, db):
+        db.create_session("s_current_title", source="cli")
+        db.set_session_title("s_current_title", "Archived Mission Control")
+        archived_ids = [
+            db.append_message("s_current_title", "user", "old operational context"),
+            db.append_message("s_current_title", "assistant", "old operational answer"),
+        ]
+        db.archive_and_compact(
+            "s_current_title",
+            [{"role": "assistant", "content": "active compacted summary"}],
+        )
+
+        result = json.loads(session_search(
+            query="Archived Mission Control",
+            db=db,
+            current_session_id="s_current_title",
+        ))
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        hit = result["results"][0]
+        assert hit["session_id"] == "s_current_title"
+        assert hit["archived"] is True
+        visible_ids = {
+            message["id"]
+            for key in ("bookend_start", "messages", "bookend_end")
+            for message in hit[key]
+        }
+        assert visible_ids == set(archived_ids)
+        assert "active compacted summary" not in json.dumps(hit)
+
+    def test_discovery_keeps_compression_ancestor_of_current_session(self, db):
+        db.create_session("s_parent", source="cli")
+        db.append_message("s_parent", role="user", content="ancestor needle")
+        db.create_session("s_current", source="cli", parent_session_id="s_parent")
+        db.append_message("s_current", role="assistant", content="current continuation")
+
+        result = json.loads(session_search(
+            query="ancestor needle",
+            current_session_id="s_current",
+            db=db,
+        ))
+
+        assert result["success"] is True
+        assert [hit["session_id"] for hit in result["results"]] == ["s_parent"]
+
 
 class TestDiscoverySort:
     def test_sort_newest_orders_by_recency(self, db):
@@ -376,19 +449,145 @@ class TestScrollShape:
         ))
         assert result["success"] is False
 
-    def test_scroll_rejects_current_session_lineage(self, db):
+    def test_scroll_current_active_message_redirects_without_tool_failure(self, db):
         _seed_modpack_sessions(db)
-        # Grab some valid id from s_oldest
         disc = json.loads(session_search(query="modpack", limit=3, db=db))
         match = [r for r in disc["results"] if r["session_id"] == "s_oldest"]
-        if match:
-            mid = match[0]["match_message_id"]
-            result = json.loads(session_search(
-                session_id="s_oldest", around_message_id=mid, db=db,
-                current_session_id="s_oldest",
-            ))
-            assert result["success"] is False
-            assert "current session" in result.get("error", "").lower()
+        assert match
+
+        result = json.loads(session_search(
+            session_id="s_oldest",
+            around_message_id=match[0]["match_message_id"],
+            db=db,
+            current_session_id="s_oldest",
+        ))
+
+        assert result["success"] is True
+        assert result["mode"] == "scroll"
+        assert result["redundant"] is True
+        assert result["messages"] == []
+        assert "active context" in result["message"].lower()
+
+    def test_scroll_current_archived_window_never_leaks_active_rows(self, db):
+        db.create_session("s_current", source="cli")
+        archived_ids = [
+            db.append_message("s_current", role="user", content="archived goal"),
+            db.append_message("s_current", role="assistant", content="archived answer"),
+            db.append_message("s_current", role="user", content="archived follow-up"),
+        ]
+        db.archive_and_compact(
+            "s_current",
+            [{"role": "assistant", "content": "active compacted summary"}],
+        )
+
+        result = json.loads(session_search(
+            session_id="s_current",
+            around_message_id=archived_ids[1],
+            window=20,
+            db=db,
+            current_session_id="s_current",
+        ))
+
+        assert result["success"] is True
+        assert result["archived"] is True
+        assert {m["id"] for m in result["messages"]} == set(archived_ids)
+        assert all("active compacted summary" not in (m.get("content") or "") for m in result["messages"])
+
+    def test_scroll_current_rewound_message_is_unavailable_without_content(self, db):
+        db.create_session("s_current", source="cli")
+        rewound_id = db.append_message("s_current", role="user", content="taken back secret")
+        db._conn.execute(
+            "UPDATE messages SET active = 0, compacted = 0 WHERE id = ?",
+            (rewound_id,),
+        )
+        db._conn.commit()
+
+        result = json.loads(session_search(
+            session_id="s_current",
+            around_message_id=rewound_id,
+            db=db,
+            current_session_id="s_current",
+        ))
+
+        assert result["success"] is True
+        assert result["unavailable"] is True
+        assert result["reason"] == "rewound"
+        assert result["messages"] == []
+        assert "taken back secret" not in json.dumps(result)
+
+    def test_scroll_rebinds_to_actual_owner_before_current_state_policy(self, db):
+        db.create_session("s_parent", source="cli")
+        db.create_session("s_current", source="cli", parent_session_id="s_parent")
+        archived_id = db.append_message("s_current", role="user", content="archived child detail")
+        db.archive_and_compact(
+            "s_current",
+            [{"role": "assistant", "content": "active child summary"}],
+        )
+
+        result = json.loads(session_search(
+            session_id="s_parent",
+            around_message_id=archived_id,
+            window=20,
+            db=db,
+            current_session_id="s_current",
+        ))
+
+        assert result["success"] is True
+        assert result["session_id"] == "s_current"
+        assert result["archived"] is True
+        assert [m["content"] for m in result["messages"]] == ["archived child detail"]
+        assert "active child summary" not in json.dumps(result)
+        assert "rebound" in result["warning"]
+
+    def test_scroll_compression_ancestor_is_not_treated_as_active_context(self, db):
+        db.create_session("s_parent", source="cli")
+        parent_id = db.append_message("s_parent", role="user", content="ancestor detail")
+        db.create_session("s_current", source="cli", parent_session_id="s_parent")
+        db.append_message("s_current", role="assistant", content="current continuation")
+
+        result = json.loads(session_search(
+            session_id="s_parent",
+            around_message_id=parent_id,
+            db=db,
+            current_session_id="s_current",
+        ))
+
+        assert result["success"] is True
+        assert result.get("redundant") is not True
+        assert [m["content"] for m in result["messages"]] == ["ancestor detail"]
+
+    def test_scroll_sibling_or_delegate_lineage_is_not_active_context(self, db):
+        db.create_session("s_root", source="cli")
+        db.create_session("s_current", source="cli", parent_session_id="s_root")
+        db.create_session("s_sibling", source="cli", parent_session_id="s_root")
+        sibling_id = db.append_message("s_sibling", role="assistant", content="sibling evidence")
+
+        result = json.loads(session_search(
+            session_id="s_sibling",
+            around_message_id=sibling_id,
+            db=db,
+            current_session_id="s_current",
+        ))
+
+        assert result["success"] is True
+        assert [m["content"] for m in result["messages"]] == ["sibling evidence"]
+
+    def test_scroll_active_row_with_compacted_flag_is_still_redundant(self, db):
+        db.create_session("s_current", source="cli")
+        message_id = db.append_message("s_current", role="assistant", content="restored summary")
+        db._conn.execute("UPDATE messages SET compacted = 1 WHERE id = ?", (message_id,))
+        db._conn.commit()
+
+        result = json.loads(session_search(
+            session_id="s_current",
+            around_message_id=message_id,
+            db=db,
+            current_session_id="s_current",
+        ))
+
+        assert result["success"] is True
+        assert result["redundant"] is True
+        assert result["messages"] == []
 
     def test_scroll_invalid_around_message_id_errors(self, db):
         _seed_modpack_sessions(db)

@@ -192,6 +192,7 @@ from agent.tool_guardrails import (
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
     file_mutation_result_landed,
+    tool_may_have_side_effect,
 )
 from agent.trajectory import (
     convert_scratchpad_to_think,
@@ -5658,9 +5659,105 @@ class AIAgent:
         )
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
-        """Record the first guardrail decision that should stop this turn."""
-        if decision.should_halt and self._tool_guardrail_halt_decision is None:
+        """Record terminal guardrail decisions in deterministic call order."""
+        if not decision.should_halt:
+            return
+        recorded = getattr(self, "_tool_guardrail_halt_decisions", None)
+        if not isinstance(recorded, list):
+            recorded = []
+            self._tool_guardrail_halt_decisions = recorded
+        identity = (
+            decision.code,
+            decision.tool_name,
+            decision.signature.args_hash if decision.signature else "",
+        )
+        if all(
+            (
+                item.code,
+                item.tool_name,
+                item.signature.args_hash if item.signature else "",
+            ) != identity
+            for item in recorded
+        ):
+            recorded.append(decision)
+        if self._tool_guardrail_halt_decision is None:
             self._tool_guardrail_halt_decision = decision
+
+    def _try_start_tool_guardrail_recovery(self, api_call_count: int) -> str:
+        """Start one no-effect pivot without granting any extra iteration."""
+        decision = self._tool_guardrail_halt_decision
+        if decision is None:
+            return "none"
+        candidates = list(
+            getattr(self, "_tool_guardrail_halt_decisions", None) or [decision]
+        )
+        terminal_tools = {item.tool_name for item in candidates if item.tool_name}
+        if len(terminal_tools) != 1:
+            replacement = ToolGuardrailDecision(
+                action="halt",
+                code="multiple_guardrail_thresholds_halt",
+                message=(
+                    "Multiple tools reached terminal guardrail thresholds in "
+                    "the same assistant batch; automatic recovery is unsafe."
+                ),
+                tool_name=decision.tool_name,
+                count=decision.count,
+                signature=decision.signature,
+            )
+            self._tool_guardrail_halt_decision = replacement
+            self._tool_guardrail_halt_decisions = [replacement]
+            return "multiple"
+        if tool_may_have_side_effect(decision.tool_name):
+            return "effectful"
+        if (
+            api_call_count >= self.max_iterations
+            or self.iteration_budget.remaining <= 0
+        ):
+            replacement = ToolGuardrailDecision(
+                action="halt",
+                code="recovery_budget_exhausted",
+                message=(
+                    f"Could not recover {decision.tool_name}: no ordinary model "
+                    "iteration remained for a safe no-effect pivot."
+                ),
+                tool_name=decision.tool_name,
+                count=decision.count,
+                signature=decision.signature,
+            )
+            self._tool_guardrail_halt_decision = replacement
+            self._tool_guardrail_halt_decisions = [replacement]
+            self._tool_guardrail_recovery_metadata = {
+                "state": "budget_exhausted",
+                "quarantined_tool": decision.tool_name,
+                "trigger": decision.to_metadata(),
+            }
+            return "budget_exhausted"
+        if not self._tool_guardrails.start_recovery(decision):
+            return "ineligible"
+        self._tool_guardrail_recovery_metadata = {
+            "state": "pending",
+            "quarantined_tool": decision.tool_name,
+            "trigger": decision.to_metadata(),
+        }
+        self._tool_guardrail_halt_decision = None
+        self._tool_guardrail_halt_decisions = []
+        return "started"
+
+    def _record_tool_guardrail_recovery_halt(
+        self,
+        decision: ToolGuardrailDecision,
+    ) -> None:
+        self._set_tool_guardrail_halt(decision)
+        metadata = getattr(self, "_tool_guardrail_recovery_metadata", None)
+        if isinstance(metadata, dict):
+            metadata["state"] = "failed"
+            metadata["outcome"] = decision.to_metadata()
+
+    def _fail_tool_guardrail_recovery(self) -> ToolGuardrailDecision | None:
+        decision = self._tool_guardrails.finish_recovery_epoch([], [])
+        if decision is not None:
+            self._record_tool_guardrail_recovery_halt(decision)
+        return decision
 
     def _set_required_policy_halt(self, block) -> None:
         """Record the first typed required-policy infrastructure failure."""
@@ -5672,6 +5769,14 @@ class AIAgent:
             and self._required_policy_halt_block is None
         ):
             self._required_policy_halt_block = block
+            # Required-policy infrastructure failure is authoritative. Any
+            # guardrail/recovery decision produced by the same assistant batch
+            # is secondary and must not surface as the turn's stop reason.
+            self._tool_guardrail_halt_decision = None
+            self._tool_guardrail_halt_decisions = []
+            recovery = getattr(self, "_tool_guardrail_recovery_metadata", None)
+            if isinstance(recovery, dict):
+                recovery["state"] = "superseded_by_required_policy"
 
     @staticmethod
     def _required_policy_controlled_halt_response(block) -> str:
@@ -5711,7 +5816,12 @@ class AIAgent:
         return function_result
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
-        self._set_tool_guardrail_halt(decision)
+        if decision.code not in {
+            "recovery_quarantined_tool_block",
+            "recovery_effectful_tool_block",
+            "recovery_malformed_arguments_block",
+        }:
+            self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:

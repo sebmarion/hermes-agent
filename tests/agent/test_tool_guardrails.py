@@ -5,6 +5,7 @@ import json
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
+    ToolCallObservation,
     ToolCallSignature,
     canonical_tool_args,
     classify_tool_failure,
@@ -186,6 +187,252 @@ def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
     assert third.action == "halt"
     assert third.code == "same_tool_failure_halt"
     assert third.count == 3
+
+
+def test_parallel_failures_in_one_assistant_batch_count_as_one_epoch():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_warn_after=99,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=99,
+            same_tool_failure_halt_after=2,
+        )
+    )
+    observations = [
+        ToolCallObservation(
+            "session_search",
+            {"query": f"q-{index}"},
+            '{"error":"boom"}',
+            failed=True,
+        )
+        for index in range(4)
+    ]
+
+    first = controller.after_batch(observations)
+
+    assert len(first) == 4
+    assert {decision.count for decision in first} == {1}
+    assert controller.raw_call_counts == {"session_search": 4}
+    assert controller.halt_decision is None
+
+    second = controller.after_batch(observations)
+
+    assert {decision.code for decision in second} == {"same_tool_failure_halt"}
+    assert {decision.count for decision in second} == {2}
+    assert controller.raw_call_counts == {"session_search": 8}
+    assert controller.halt_decision is not None
+    assert controller.halt_decision.count == 2
+
+
+def test_parallel_exact_signature_failures_increment_once_per_epoch():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_warn_after=99,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    observation = ToolCallObservation(
+        "session_search",
+        {"query": "same"},
+        '{"error":"boom"}',
+        failed=True,
+    )
+
+    controller.after_batch([observation, observation, observation, observation])
+    assert controller.before_call("session_search", {"query": "same"}).action == "allow"
+
+    controller.after_batch([observation, observation])
+    blocked = controller.before_call("session_search", {"query": "same"})
+    assert blocked.code == "repeated_exact_failure_block"
+    assert blocked.count == 2
+
+
+def test_no_progress_result_set_is_independent_of_worker_completion_order():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(no_progress_warn_after=2)
+    )
+    args = {"query": "same"}
+    first = [
+        ToolCallObservation("web_search", args, '{"value":"a"}', failed=False),
+        ToolCallObservation("web_search", args, '{"value":"b"}', failed=False),
+    ]
+    second = list(reversed(first))
+
+    assert {decision.action for decision in controller.after_batch(first)} == {"allow"}
+    decisions = controller.after_batch(second)
+
+    assert {decision.code for decision in decisions} == {"idempotent_no_progress_warning"}
+    assert {decision.count for decision in decisions} == {2}
+
+
+def test_mixed_success_and_failure_in_one_epoch_resets_failure_and_no_progress_state():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    args = {"query": "same"}
+    controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
+    controller.after_call("web_search", args, '{"value":"same"}', failed=False)
+    controller.after_batch([
+        ToolCallObservation("web_search", args, '{"error":"boom"}', failed=True),
+        ToolCallObservation("web_search", args, '{"value":"same"}', failed=False),
+    ])
+
+    assert controller.before_call("web_search", args).action == "allow"
+    assert controller.halt_decision is None
+
+
+def _trigger_no_effect_recovery(controller, tool_name="session_search"):
+    first = controller.after_call(
+        tool_name,
+        {"query": "first"},
+        '{"error":"boom"}',
+        failed=True,
+    )
+    assert first.should_halt is False
+    trigger = controller.after_call(
+        tool_name,
+        {"query": "second"},
+        '{"error":"boom"}',
+        failed=True,
+    )
+    assert trigger.code == "same_tool_failure_halt"
+    assert controller.start_recovery(trigger) is True
+    return trigger
+
+
+def test_recovery_pending_blocks_quarantined_and_effect_capable_calls_only():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_warn_after=99,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=99,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=99,
+        )
+    )
+    _trigger_no_effect_recovery(controller)
+
+    quarantined = controller.before_call("session_search", {"query": "again"})
+    effectful = controller.before_call("terminal", {"command": "pwd"})
+    unknown = controller.before_call("mcp_unknown_reader", {"path": "/tmp/x"})
+    alternative = controller.before_call("read_file", {"path": "/tmp/x"})
+
+    assert quarantined.code == "recovery_quarantined_tool_block"
+    assert quarantined.allows_execution is False
+    assert effectful.code == "recovery_effectful_tool_block"
+    assert effectful.allows_execution is False
+    assert unknown.code == "recovery_effectful_tool_block"
+    assert unknown.allows_execution is False
+    assert alternative.action == "allow"
+    assert controller.halt_decision is None
+
+
+def test_successful_no_effect_alternative_resolves_recovery_but_keeps_quarantine():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_warn_after=99,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=99,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=99,
+        )
+    )
+    _trigger_no_effect_recovery(controller)
+    observations = [
+        ToolCallObservation(
+            "session_search",
+            {"query": "again"},
+            '{"error":"quarantined"}',
+            failed=True,
+            executed=False,
+        ),
+        ToolCallObservation(
+            "terminal",
+            {"command": "pwd"},
+            '{"error":"effectful blocked"}',
+            failed=True,
+            executed=False,
+        ),
+        ToolCallObservation(
+            "read_file",
+            {"path": "/tmp/x"},
+            "contents",
+            failed=False,
+            executed=True,
+        ),
+    ]
+
+    decisions = controller.after_batch(observations)
+    assert controller.finish_recovery_epoch(observations, decisions) is None
+    assert controller.recovery_state == "recovered"
+    assert controller.raw_call_counts == {"session_search": 2, "read_file": 1}
+    assert controller.halt_decision is None
+    assert controller.before_call(
+        "session_search",
+        {"query": "later"},
+    ).code == "quarantined_tool_block"
+
+
+def test_recovery_with_only_quarantined_retry_halts_deterministically():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=99,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=99,
+        )
+    )
+    _trigger_no_effect_recovery(controller)
+    observations = [ToolCallObservation(
+        "session_search",
+        {"query": "again"},
+        '{"error":"quarantined"}',
+        failed=True,
+        executed=False,
+    )]
+
+    decisions = controller.after_batch(observations)
+    halt = controller.finish_recovery_epoch(observations, decisions)
+
+    assert halt is not None
+    assert halt.code == "recovery_quarantined_only_halt"
+    assert controller.recovery_state == "failed"
+
+
+def test_recovery_halts_when_every_safe_alternative_fails():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=99,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=99,
+        )
+    )
+    _trigger_no_effect_recovery(controller)
+    observations = [ToolCallObservation(
+        "read_file",
+        {"path": "/tmp/x"},
+        '{"error":"missing"}',
+        failed=True,
+        executed=True,
+    )]
+
+    decisions = controller.after_batch(observations)
+    halt = controller.finish_recovery_epoch(observations, decisions)
+
+    assert halt is not None
+    assert halt.code == "recovery_alternative_failed_halt"
+    assert controller.recovery_state == "failed"
 
 
 def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_default():

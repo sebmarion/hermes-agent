@@ -4411,11 +4411,21 @@ class SessionDB:
             result.append(msg)
         return result
 
+    def get_message_state(self, message_id: int) -> Optional[Dict[str, Any]]:
+        """Return the owning session and visibility flags for one message row."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, session_id, active, compacted FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def get_messages_around(
         self,
         session_id: str,
         around_message_id: int,
         window: int = 5,
+        state_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Load a window of messages anchored on a specific message id.
 
@@ -4438,10 +4448,19 @@ class SessionDB:
         """
         if window < 0:
             window = 0
+        state_clauses = {
+            None: "",
+            "discoverable": " AND (active = 1 OR compacted = 1)",
+            "archived_compacted": " AND active = 0 AND compacted = 1",
+        }
+        if state_filter not in state_clauses:
+            raise ValueError(f"unknown message state filter: {state_filter}")
+        state_clause = state_clauses[state_filter]
         with self._lock:
-            # Confirm the anchor exists in this session.
+            # Confirm the anchor exists in this session and requested state.
             anchor_exists = self._conn.execute(
-                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                "SELECT 1 FROM messages WHERE id = ? AND session_id = ?"
+                f"{state_clause} LIMIT 1",
                 (around_message_id, session_id),
             ).fetchone()
             if not anchor_exists:
@@ -4451,14 +4470,14 @@ class SessionDB:
             # (ASC, take window). Final order is id ASC.
             before_rows = self._conn.execute(
                 "SELECT * FROM messages "
-                "WHERE session_id = ? AND id <= ? "
-                "ORDER BY id DESC LIMIT ?",
+                "WHERE session_id = ? AND id <= ?"
+                f"{state_clause} ORDER BY id DESC LIMIT ?",
                 (session_id, around_message_id, window + 1),
             ).fetchall()
             after_rows = self._conn.execute(
                 "SELECT * FROM messages "
-                "WHERE session_id = ? AND id > ? "
-                "ORDER BY id ASC LIMIT ?",
+                "WHERE session_id = ? AND id > ?"
+                f"{state_clause} ORDER BY id ASC LIMIT ?",
                 (session_id, around_message_id, window),
             ).fetchall()
 
@@ -4496,6 +4515,7 @@ class SessionDB:
         window: int = 5,
         bookend: int = 3,
         keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant"),
+        state_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Return an anchored window plus session bookends.
 
@@ -4529,7 +4549,10 @@ class SessionDB:
         # Reuse the primitive — handles anchor-existence, content decoding,
         # tool_calls deserialisation, and boundary counts.
         primitive = self.get_messages_around(
-            session_id, around_message_id, window=window
+            session_id,
+            around_message_id,
+            window=window,
+            state_filter=state_filter,
         )
         window_rows = primitive["window"]
         if not window_rows:
@@ -4562,6 +4585,11 @@ class SessionDB:
         bookend_end_rows: List[Any] = []
         if bookend > 0:
             with self._lock:
+                state_clause = {
+                    None: "",
+                    "discoverable": " AND (active = 1 OR compacted = 1)",
+                    "archived_compacted": " AND active = 0 AND compacted = 1",
+                }[state_filter]
                 role_clause = ""
                 role_params: list = []
                 if keep_roles is not None:
@@ -4571,7 +4599,7 @@ class SessionDB:
 
                 bookend_start_rows = self._conn.execute(
                     f"SELECT * FROM messages "
-                    f"WHERE session_id = ? AND id < ?{role_clause} "
+                    f"WHERE session_id = ? AND id < ?{state_clause}{role_clause} "
                     f"AND length(content) > 0 "
                     f"ORDER BY id ASC LIMIT ?",
                     (session_id, window_min_id, *role_params, bookend),
@@ -4579,7 +4607,7 @@ class SessionDB:
 
                 bookend_end_rows = self._conn.execute(
                     f"SELECT * FROM messages "
-                    f"WHERE session_id = ? AND id > ?{role_clause} "
+                    f"WHERE session_id = ? AND id > ?{state_clause}{role_clause} "
                     f"AND length(content) > 0 "
                     f"ORDER BY id DESC LIMIT ?",
                     (session_id, window_max_id, *role_params, bookend),
@@ -5232,6 +5260,8 @@ class SessionDB:
                 m.content,
                 m.timestamp,
                 m.tool_name,
+                m.active,
+                m.compacted,
                 s.source,
                 s.model,
                 s.started_at AS session_started
@@ -5304,6 +5334,8 @@ class SessionDB:
                         m.content,
                         m.timestamp,
                         m.tool_name,
+                        m.active,
+                        m.compacted,
                         s.source,
                         s.model,
                         s.started_at AS session_started
@@ -5343,6 +5375,8 @@ class SessionDB:
                     )
                     like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
                 like_where = [f"({' OR '.join(token_clauses)})"]
+                if not include_inactive:
+                    like_where.append("(m.active = 1 OR m.compacted = 1)")
                 if source_filter is not None:
                     like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                     like_params.extend(source_filter)
@@ -5358,6 +5392,7 @@ class SessionDB:
                                   max(1, instr(m.content, ?) - 40),
                                   120) AS snippet,
                            m.content, m.timestamp, m.tool_name,
+                           m.active, m.compacted,
                            s.source, s.model, s.started_at AS session_started
                     FROM messages m
                     JOIN sessions s ON s.id = m.session_id

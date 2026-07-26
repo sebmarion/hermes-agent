@@ -14,7 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from utils import safe_json_loads
-from agent.tool_result_classification import file_mutation_result_landed
+from agent.tool_result_classification import (
+    file_mutation_result_landed,
+    tool_may_have_side_effect,
+)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -142,6 +145,17 @@ class ToolCallSignature:
 
 
 @dataclass(frozen=True)
+class ToolCallObservation:
+    """One requested tool call as observed after an assistant batch completes."""
+
+    tool_name: str
+    args: Mapping[str, Any] | None
+    result: str | None
+    failed: bool | None = None
+    executed: bool = True
+
+
+@dataclass(frozen=True)
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
 
@@ -232,7 +246,123 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._raw_call_counts: dict[str, int] = {}
+        self._observation_epochs = 0
+        self._recovery_state = "normal"
+        self._recovery_tool: str | None = None
+        self._recovery_trigger: ToolGuardrailDecision | None = None
         self._halt_decision: ToolGuardrailDecision | None = None
+
+    @property
+    def raw_call_counts(self) -> dict[str, int]:
+        return dict(self._raw_call_counts)
+
+    @property
+    def observation_epochs(self) -> int:
+        return self._observation_epochs
+
+    @property
+    def recovery_state(self) -> str:
+        return self._recovery_state
+
+    @property
+    def recovery_tool(self) -> str | None:
+        return self._recovery_tool
+
+    def start_recovery(self, decision: ToolGuardrailDecision) -> bool:
+        """Quarantine one proven no-effect tool for exactly one pivot epoch."""
+        if (
+            self._recovery_state != "normal"
+            or not decision.should_halt
+            or decision.code != "same_tool_failure_halt"
+            or not decision.tool_name
+            or tool_may_have_side_effect(decision.tool_name)
+        ):
+            return False
+        self._recovery_state = "pending"
+        self._recovery_tool = decision.tool_name
+        self._recovery_trigger = decision
+        self._halt_decision = None
+        return True
+
+    def finish_recovery_epoch(
+        self,
+        observations: list[ToolCallObservation] | tuple[ToolCallObservation, ...],
+        decisions: list[ToolGuardrailDecision] | tuple[ToolGuardrailDecision, ...],
+    ) -> ToolGuardrailDecision | None:
+        """Resolve a pending pivot after its complete assistant batch."""
+        if self._recovery_state != "pending":
+            return None
+
+        for decision in decisions:
+            if decision.should_halt:
+                self._recovery_state = "failed"
+                self._halt_decision = decision
+                return decision
+
+        alternatives: list[tuple[ToolCallObservation, bool]] = []
+        for observation in observations:
+            if (
+                not observation.executed
+                or observation.tool_name == self._recovery_tool
+                or tool_may_have_side_effect(observation.tool_name)
+            ):
+                continue
+            failed = observation.failed
+            if failed is None:
+                failed, _ = classify_tool_failure(
+                    observation.tool_name,
+                    observation.result,
+                )
+            alternatives.append((observation, bool(failed)))
+
+        if any(not failed for _observation, failed in alternatives):
+            self._recovery_state = "recovered"
+            self._halt_decision = None
+            return None
+
+        only_quarantined = bool(observations) and all(
+            observation.tool_name == self._recovery_tool
+            for observation in observations
+        )
+        if only_quarantined:
+            code = "recovery_quarantined_only_halt"
+            message = (
+                f"Stopped recovery: {self._recovery_tool} is quarantined for "
+                "this turn and the model retried only that tool."
+            )
+        elif alternatives:
+            code = "recovery_alternative_failed_halt"
+            message = (
+                f"Stopped recovery for {self._recovery_tool}: every safe "
+                "no-effect alternative failed."
+            )
+        else:
+            code = "recovery_no_safe_alternative_halt"
+            message = (
+                f"Stopped recovery for {self._recovery_tool}: the model did "
+                "not provide an executable no-effect alternative."
+            )
+        trigger = self._recovery_trigger
+        decision = ToolGuardrailDecision(
+            action="halt",
+            code=code,
+            message=message,
+            tool_name=self._recovery_tool or "",
+            count=trigger.count if trigger is not None else 0,
+            signature=trigger.signature if trigger is not None else None,
+        )
+        self._recovery_state = "failed"
+        self._halt_decision = decision
+        return decision
+
+    def resolve_recovery_with_final_text(self) -> bool:
+        """Treat a visible no-tool assistant response as a successful pivot."""
+        if self._recovery_state != "pending":
+            return False
+        self._recovery_state = "recovered"
+        self._halt_decision = None
+        return True
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -240,6 +370,41 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        if self._recovery_tool and tool_name == self._recovery_tool:
+            pending = self._recovery_state == "pending"
+            decision = ToolGuardrailDecision(
+                action="block",
+                code=(
+                    "recovery_quarantined_tool_block"
+                    if pending
+                    else "quarantined_tool_block"
+                ),
+                message=(
+                    f"Blocked {tool_name}: it is quarantined for this turn after "
+                    "repeated non-progress. Use a different no-effect tool or the "
+                    "evidence already available."
+                ),
+                tool_name=tool_name,
+                count=self._recovery_trigger.count if self._recovery_trigger else 0,
+                signature=signature,
+            )
+            if not pending:
+                self._halt_decision = decision
+            return decision
+
+        if self._recovery_state == "pending" and tool_may_have_side_effect(tool_name):
+            return ToolGuardrailDecision(
+                action="block",
+                code="recovery_effectful_tool_block",
+                message=(
+                    f"Blocked {tool_name} during guardrail recovery because it "
+                    "may have side effects. Recovery may execute only known "
+                    "no-effect tools."
+                ),
+                tool_name=tool_name,
+                signature=signature,
+            )
+
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -282,6 +447,23 @@ class ToolCallGuardrailController:
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
+    def recovery_malformed_arguments_block(
+        self,
+        tool_name: str,
+    ) -> ToolGuardrailDecision:
+        signature = ToolCallSignature.from_call(tool_name, {})
+        return ToolGuardrailDecision(
+            action="block",
+            code="recovery_malformed_arguments_block",
+            signature=signature,
+            tool_name=tool_name,
+            count=1,
+            message=(
+                f"Blocked malformed arguments for {tool_name} during bounded "
+                "guardrail recovery. The tool was not executed."
+            ),
+        )
+
     def after_call(
         self,
         tool_name: str,
@@ -290,89 +472,211 @@ class ToolCallGuardrailController:
         *,
         failed: bool | None = None,
     ) -> ToolGuardrailDecision:
-        args = _coerce_args(args)
-        signature = ToolCallSignature.from_call(tool_name, args)
-        if failed is None:
-            failed, _ = classify_tool_failure(tool_name, result)
+        """Compatibility wrapper treating one call as one assistant epoch."""
+        return self.after_batch([
+            ToolCallObservation(
+                tool_name=tool_name,
+                args=args,
+                result=result,
+                failed=failed,
+                executed=True,
+            )
+        ])[0]
 
-        if failed:
-            exact_count = self._exact_failure_counts.get(signature, 0) + 1
-            self._exact_failure_counts[signature] = exact_count
-            self._no_progress.pop(signature, None)
+    def after_batch(
+        self,
+        observations: list[ToolCallObservation] | tuple[ToolCallObservation, ...],
+    ) -> list[ToolGuardrailDecision]:
+        """Finalize one complete assistant tool batch in assistant call order.
 
-            same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
-            self._same_tool_failure_counts[tool_name] = same_count
-
-            if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
-                decision = ToolGuardrailDecision(
-                    action="halt",
-                    code="same_tool_failure_halt",
-                    message=(
-                        f"Stopped {tool_name}: it failed {same_count} times this turn. "
-                        "Stop retrying the same failing tool path and choose a different approach."
-                    ),
-                    tool_name=tool_name,
-                    count=same_count,
-                    signature=signature,
+        Failure and no-progress streaks advance at most once per signature/tool
+        in this epoch. Synthetic policy or guardrail results pass
+        ``executed=False`` and remain visible in raw transcripts without being
+        mistaken for another failed execution.
+        """
+        normalized: list[tuple[ToolCallObservation, ToolCallSignature, bool]] = []
+        for observation in observations:
+            args = _coerce_args(observation.args)
+            signature = ToolCallSignature.from_call(observation.tool_name, args)
+            failed = observation.failed
+            if failed is None:
+                failed, _ = classify_tool_failure(
+                    observation.tool_name,
+                    observation.result,
                 )
-                self._halt_decision = decision
-                return decision
+            normalized.append((observation, signature, bool(failed)))
+            if observation.executed:
+                self._raw_call_counts[observation.tool_name] = (
+                    self._raw_call_counts.get(observation.tool_name, 0) + 1
+                )
 
-            if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
-                return ToolGuardrailDecision(
-                    action="warn",
-                    code="repeated_exact_failure_warning",
-                    message=(
-                        f"{tool_name} has failed {exact_count} times with identical arguments. "
-                        "This looks like a loop; inspect the error and change strategy "
-                        "instead of retrying it unchanged."
-                    ),
-                    tool_name=tool_name,
+        executed = [item for item in normalized if item[0].executed]
+        if executed:
+            self._observation_epochs += 1
+
+        by_signature: dict[
+            ToolCallSignature,
+            list[tuple[ToolCallObservation, bool]],
+        ] = {}
+        by_tool: dict[str, list[bool]] = {}
+        for observation, signature, failed in executed:
+            by_signature.setdefault(signature, []).append((observation, failed))
+            by_tool.setdefault(observation.tool_name, []).append(failed)
+
+        for signature, signature_observations in by_signature.items():
+            failures = [failed for _observation, failed in signature_observations]
+            any_success = any(not failed for failed in failures)
+            any_failure = any(failures)
+            if any_success:
+                self._exact_failure_counts.pop(signature, None)
+            elif any_failure:
+                self._exact_failure_counts[signature] = (
+                    self._exact_failure_counts.get(signature, 0) + 1
+                )
+
+            if not self._is_idempotent(signature.tool_name):
+                self._no_progress.pop(signature, None)
+                continue
+
+            if any_success and any_failure:
+                self._no_progress.pop(signature, None)
+            elif any_failure:
+                self._no_progress.pop(signature, None)
+            elif signature_observations:
+                result_hash = _result_set_hash(
+                    observation.result
+                    for observation, _failed in signature_observations
+                )
+                previous = self._no_progress.get(signature)
+                repeat_count = 1
+                if previous is not None and previous[0] == result_hash:
+                    repeat_count = previous[1] + 1
+                self._no_progress[signature] = (result_hash, repeat_count)
+
+        for tool_name, failures in by_tool.items():
+            if any(not failed for failed in failures):
+                self._same_tool_failure_counts.pop(tool_name, None)
+            elif any(failures):
+                self._same_tool_failure_counts[tool_name] = (
+                    self._same_tool_failure_counts.get(tool_name, 0) + 1
+                )
+
+        decisions: list[ToolGuardrailDecision] = []
+        for observation, signature, failed in normalized:
+            if not observation.executed:
+                decisions.append(ToolGuardrailDecision(
+                    tool_name=observation.tool_name,
+                    signature=signature,
+                ))
+                continue
+
+            if failed:
+                exact_count = self._exact_failure_counts.get(signature, 0)
+                same_count = self._same_tool_failure_counts.get(
+                    observation.tool_name,
+                    0,
+                )
+                if (
+                    self.config.hard_stop_enabled
+                    and same_count >= self.config.same_tool_failure_halt_after
+                ):
+                    decision = ToolGuardrailDecision(
+                        action="halt",
+                        code="same_tool_failure_halt",
+                        message=(
+                            f"Stopped {observation.tool_name}: it failed {same_count} "
+                            "assistant tool batches this turn. Stop retrying the "
+                            "same failing tool path and choose a different approach."
+                        ),
+                        tool_name=observation.tool_name,
+                        count=same_count,
+                        signature=signature,
+                    )
+                    if self._halt_decision is None:
+                        self._halt_decision = decision
+                    decisions.append(decision)
+                    continue
+
+                if (
+                    self.config.warnings_enabled
+                    and exact_count >= self.config.exact_failure_warn_after
+                ):
+                    decisions.append(ToolGuardrailDecision(
+                        action="warn",
+                        code="repeated_exact_failure_warning",
+                        message=(
+                            f"{observation.tool_name} has failed {exact_count} "
+                            "assistant tool batches with identical arguments. "
+                            "This looks like a loop; inspect the error and change "
+                            "strategy instead of retrying it unchanged."
+                        ),
+                        tool_name=observation.tool_name,
+                        count=exact_count,
+                        signature=signature,
+                    ))
+                    continue
+
+                if (
+                    self.config.warnings_enabled
+                    and same_count >= self.config.same_tool_failure_warn_after
+                ):
+                    decisions.append(ToolGuardrailDecision(
+                        action="warn",
+                        code="same_tool_failure_warning",
+                        message=_tool_failure_recovery_hint(
+                            observation.tool_name,
+                            same_count,
+                        ),
+                        tool_name=observation.tool_name,
+                        count=same_count,
+                        signature=signature,
+                    ))
+                    continue
+
+                decisions.append(ToolGuardrailDecision(
+                    tool_name=observation.tool_name,
                     count=exact_count,
                     signature=signature,
-                )
+                ))
+                continue
 
-            if self.config.warnings_enabled and same_count >= self.config.same_tool_failure_warn_after:
-                return ToolGuardrailDecision(
-                    action="warn",
-                    code="same_tool_failure_warning",
-                    message=_tool_failure_recovery_hint(tool_name, same_count),
-                    tool_name=tool_name,
-                    count=same_count,
+            self._exact_failure_counts.pop(signature, None)
+            if not self._is_idempotent(observation.tool_name):
+                decisions.append(ToolGuardrailDecision(
+                    tool_name=observation.tool_name,
                     signature=signature,
-                )
+                ))
+                continue
 
-            return ToolGuardrailDecision(tool_name=tool_name, count=exact_count, signature=signature)
-
-        self._exact_failure_counts.pop(signature, None)
-        self._same_tool_failure_counts.pop(tool_name, None)
-
-        if not self._is_idempotent(tool_name):
-            self._no_progress.pop(signature, None)
-            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
-
-        result_hash = _result_hash(result)
-        previous = self._no_progress.get(signature)
-        repeat_count = 1
-        if previous is not None and previous[0] == result_hash:
-            repeat_count = previous[1] + 1
-        self._no_progress[signature] = (result_hash, repeat_count)
-
-        if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
-            return ToolGuardrailDecision(
-                action="warn",
-                code="idempotent_no_progress_warning",
-                message=(
-                    f"{tool_name} returned the same result {repeat_count} times. "
-                    "Use the result already provided or change the query instead of "
-                    "repeating it unchanged."
-                ),
-                tool_name=tool_name,
-                count=repeat_count,
-                signature=signature,
+            _result_hash_value, repeat_count = self._no_progress.get(
+                signature,
+                ("", 0),
             )
+            if (
+                self.config.warnings_enabled
+                and repeat_count >= self.config.no_progress_warn_after
+            ):
+                decisions.append(ToolGuardrailDecision(
+                    action="warn",
+                    code="idempotent_no_progress_warning",
+                    message=(
+                        f"{observation.tool_name} returned the same result set "
+                        f"for {repeat_count} assistant tool batches. Use the "
+                        "result already provided or change the query instead of "
+                        "repeating it unchanged."
+                    ),
+                    tool_name=observation.tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                ))
+            else:
+                decisions.append(ToolGuardrailDecision(
+                    tool_name=observation.tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                ))
 
-        return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
+        return decisions
 
     def _is_idempotent(self, tool_name: str) -> bool:
         if tool_name in self.config.mutating_tools:
@@ -443,6 +747,12 @@ def _result_hash(result: str | None) -> str:
     else:
         canonical = result or ""
     return _sha256(canonical)
+
+
+def _result_set_hash(results) -> str:
+    """Hash a deduplicated result set independent of worker completion order."""
+    members = sorted({_result_hash(result) for result in results})
+    return _sha256(json.dumps(members, separators=(",", ":")))
 
 
 def _as_bool(value: Any, default: bool) -> bool:
