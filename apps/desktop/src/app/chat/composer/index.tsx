@@ -14,6 +14,7 @@ import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } f
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
 import { removeQueuedPrompt } from '@/store/composer-queue'
 import { $activeSessionAwaitingInput } from '@/store/prompts'
+import { $submitInFlight } from '@/app/session/hooks/use-prompt-actions/utils'
 import { toggleReview } from '@/store/review'
 import { $gatewayState, $messages } from '@/store/session'
 import { $threadScrolledUp } from '@/store/thread-scroll'
@@ -91,6 +92,8 @@ export function ChatBar({
   // prompt owns its own dismissal (Skip, Reject, dialog close).
   const awaitingInput = useStore($activeSessionAwaitingInput)
   const activeQueueSessionKey = queueSessionKey || sessionId || null
+  const submitInFlightKeys = useStore($submitInFlight)
+  const submitting = !!activeQueueSessionKey && submitInFlightKeys.has(activeQueueSessionKey)
 
   // Status items (subagents, background processes) are keyed by the RUNTIME
   // session id — gateway events and process.list both speak that id. Only the
@@ -224,7 +227,8 @@ export function ChatBar({
     queuedPrompts,
     sessionId,
     setComposerText,
-    stashAt
+    stashAt,
+    submitting
   })
 
   // Resting / reconnecting / starting placeholder text, re-rolled only on a real
@@ -571,7 +575,7 @@ export function ChatBar({
         return
       }
 
-      if (!busy && !hasLivePayload && queuedPrompts.length > 0) {
+      if (!busy && !submitting && !hasLivePayload && queuedPrompts.length > 0) {
         void drainNextQueued()
 
         return
@@ -582,7 +586,7 @@ export function ChatBar({
       // Gate on the live DOM payload (not the render-lagged composer state) so a
       // message typed fast / via IME while busy still reaches submitDraft() and
       // gets queued instead of being mistaken for an empty Enter.
-      if (busy && !hasLivePayload) {
+      if ((busy || submitting) && !hasLivePayload) {
         return
       }
 
@@ -702,6 +706,7 @@ export function ChatBar({
       onSteer={steerDraft}
       onToggleAutoSpeak={handleToggleAutoSpeak}
       state={state}
+      submitting={submitting}
       voiceStatus={voiceStatus}
     />
   )

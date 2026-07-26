@@ -1670,6 +1670,7 @@ export const en: Translations = {
     steer: 'Steer the current run',
     stop: 'Stop',
     send: 'Send',
+    sending: 'Sending…',
     speaking: 'Speaking',
     transcribing: 'Transcribing',
     thinking: 'Thinking',

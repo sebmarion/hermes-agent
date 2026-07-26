@@ -1379,6 +1379,7 @@ export interface Translations {
     steer: string
     stop: string
     send: string
+    sending: string
     speaking: string
     transcribing: string
     thinking: string

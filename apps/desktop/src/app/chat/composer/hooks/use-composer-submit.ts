@@ -35,6 +35,7 @@ interface UseComposerSubmitArgs {
   sessionId: string | null | undefined
   setComposerText: (value: string) => void
   stashAt: (scope: string | null, text?: string, attachments?: ComposerAttachment[]) => void
+  submitting: boolean
 }
 
 /**
@@ -69,7 +70,8 @@ export function useComposerSubmit({
   queuedPrompts,
   sessionId,
   setComposerText,
-  stashAt
+  stashAt,
+  submitting
 }: UseComposerSubmitArgs) {
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-load + re-stash the draft so the words survive.
@@ -136,7 +138,7 @@ export function useComposerSubmit({
 
     if (queueEdit) {
       exitQueuedEdit('save')
-    } else if (busy) {
+    } else if (busy || submitting) {
       // Slash commands should execute immediately even while the agent is
       // busy — they're client-side operations (/yolo, /skin, /new, /help,
       // etc.) or self-contained gateway RPCs (/status, /compress).  onSubmit
@@ -144,13 +146,21 @@ export function useComposerSubmit({
       // busy guard for commands that genuinely need an idle session (skill
       // /send directives).  Queuing them would make every slash command wait
       // for the current turn to finish, which is how the TUI never behaves.
+      //
+      // `submitting` (a prompt.submit is already in-flight for this session)
+      // is treated like `busy`: queue the draft so it auto-drains when the
+      // current submit completes. Without this, the second Enter hits the
+      // _submitInFlight lock, onSubmit returns false, and dispatchSubmit
+      // restores the draft — the "text stays in input, can't resend" bug.
+      // Slash commands are exempt: they don't go through prompt.submit and
+      // shouldn't queue behind a pending submit.
       if (!attachments.length && SLASH_COMMAND_RE.test(text.trim())) {
         triggerHaptic('submit')
         clearDraft()
         dispatchSubmit(text)
       } else if (payloadPresent) {
         queueCurrentDraft()
-      } else {
+      } else if (busy) {
         // Stop button (the only way to reach here while busy with an empty
         // composer — empty Enter is short-circuited in the keydown handler).
         triggerHaptic('cancel')

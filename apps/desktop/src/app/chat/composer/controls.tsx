@@ -49,6 +49,7 @@ export function ComposerControls({
   disabled,
   hasComposerPayload,
   state,
+  submitting = false,
   voiceStatus,
   onDictate,
   onSteer,
@@ -64,6 +65,7 @@ export function ComposerControls({
   disabled: boolean
   hasComposerPayload: boolean
   state: ChatBarState
+  submitting?: boolean
   voiceStatus: VoiceStatus
   onDictate: () => void
   onSteer: () => void
@@ -127,14 +129,16 @@ export function ComposerControls({
           </Button>
         </Tip>
       ) : (
-        <Tip label={busy ? (busyAction === 'queue' ? c.queueMessage : c.stop) : c.send}>
+        <Tip label={submitting ? c.sending : busy ? (busyAction === 'queue' ? c.queueMessage : c.stop) : c.send}>
           <Button
-            aria-label={busy ? (busyAction === 'queue' ? c.queueMessage : c.stop) : c.send}
+            aria-label={submitting ? c.sending : busy ? (busyAction === 'queue' ? c.queueMessage : c.stop) : c.send}
             className={PRIMARY_ICON_BTN}
-            disabled={disabled || !canSubmit}
+            disabled={submitting || disabled || !canSubmit}
             type="submit"
           >
-            {busy ? (
+            {submitting ? (
+              <Loader2 className={cn('animate-spin', iconSize.sm)} />
+            ) : busy ? (
               busyAction === 'queue' ? (
                 <Layers3 className={iconSize.sm} />
               ) : (

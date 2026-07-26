@@ -1,4 +1,5 @@
 import type { AppendMessage } from '@assistant-ui/react'
+import { atom } from 'nanostores'
 
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
@@ -103,7 +104,62 @@ export async function withSessionBusyRetry<T>(call: () => Promise<T>): Promise<T
 // through submitPromptText. Without this, a stalled turn (e.g. a context-bloated
 // session whose first call hangs) let the SAME prompt launch several real turns
 // at once (the "message stacked 5×" bug). Keyed by stored/active session id.
-export const _submitInFlight = new Set<string>()
+//
+// TTL: prompt.submit is fire-and-forget from the gateway's perspective — the
+// RPC ack timeout is 30 min (PROMPT_SUBMIT_REQUEST_TIMEOUT_MS). If the ack is
+// delayed that long, a stale lock would silently block every resubmit for the
+// entire wait (the "text stays in input, can't resend" bug). The TTL bounds
+// this: a lock older than the ceiling is treated as stale and evicted, so the
+// user's retry lands instead of silently false-returning. The ceiling is well
+// above any legitimate ack latency (seconds) and well below the 30-min RPC
+// timeout, so a genuinely-stuck RPC still surfaces eventually.
+const SUBMIT_LOCK_TTL_MS = 30_000
+const _submitInFlightMap = new Map<string, number>()
+
+// Reactive mirror so the UI (send button, composer) can show a "still sending"
+// state while a submit lock is held — without this, a slow gateway ack leaves
+// the user staring at an idle composer with no feedback that their message is
+// still in flight (the "text stays in input, can't resend" confusion).
+// Keyed by session lock key (storedSessionId || runtimeId || '__pending_new__').
+export const $submitInFlight = atom<ReadonlySet<string>>(new Set())
+
+function notifySubmitInFlight() {
+  $submitInFlight.set(new Set(_submitInFlightMap.keys()))
+}
+
+/** Check whether a submit lock is held for the given key, evicting stale entries. */
+export function _submitInFlightHas(key: string): boolean {
+  const acquiredAt = _submitInFlightMap.get(key)
+
+  if (acquiredAt === undefined) {
+    return false
+  }
+
+  if (Date.now() - acquiredAt > SUBMIT_LOCK_TTL_MS) {
+    // Stale lock — the gateway ack never landed within the TTL window.
+    // Evict so the next submit attempt isn't silently blocked.
+    _submitInFlightMap.delete(key)
+    notifySubmitInFlight()
+
+    return false
+  }
+
+  return true
+}
+
+/** Acquire a submit lock for the given key. Caller MUST release via
+ *  `_submitInFlightDelete` on success, failure, or abort. */
+export function _submitInFlightAdd(key: string): void {
+  _submitInFlightMap.set(key, Date.now())
+  notifySubmitInFlight()
+}
+
+/** Release a submit lock. Safe to call multiple times (idempotent). */
+export function _submitInFlightDelete(key: string): void {
+  if (_submitInFlightMap.delete(key)) {
+    notifySubmitInFlight()
+  }
+}
 
 export function base64FromDataUrl(dataUrl: string): string {
   const comma = dataUrl.indexOf(',')

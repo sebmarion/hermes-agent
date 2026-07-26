@@ -18,7 +18,9 @@ import { setAwaitingResponse, setBusy, setMessages } from '@/store/session'
 import type { ClientSessionState } from '../../../types'
 
 import {
-  _submitInFlight,
+  _submitInFlightAdd,
+  _submitInFlightDelete,
+  _submitInFlightHas,
   type GatewayRequest,
   inlineErrorMessage,
   isGatewayTimeoutError,
@@ -132,17 +134,17 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // stalled turn can't stack the same prompt into multiple real turns.
       const submitLockKey = startingStoredSessionId || startingActiveSessionId || '__pending_new__'
 
-      if (_submitInFlight.has(submitLockKey)) {
+      if (_submitInFlightHas(submitLockKey)) {
         return false
       }
 
-      _submitInFlight.add(submitLockKey)
+      _submitInFlightAdd(submitLockKey)
       let submitLockReleased = false
 
       const releaseSubmitLock = () => {
         if (!submitLockReleased) {
           submitLockReleased = true
-          _submitInFlight.delete(submitLockKey)
+          _submitInFlightDelete(submitLockKey)
         }
       }
 
