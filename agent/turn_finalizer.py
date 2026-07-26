@@ -22,6 +22,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 
 from __future__ import annotations
 
+import copy
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -201,11 +202,36 @@ def finalize_turn(
     # are surfaced on the result dict via ``cleanup_errors`` rather than
     # killing the turn.
     _cleanup_errors = []
+    from agent.bestplan_state import (
+        BESTPLAN_ENVELOPE_END,
+        BESTPLAN_ENVELOPE_START,
+        BESTPLAN_RECEIPT_END,
+        BESTPLAN_RECEIPT_START,
+        sanitize_bestplan_response_for_external_sink,
+        strip_bestplan_envelopes_for_persistence,
+    )
+
+    _raw_final_response = str(final_response or "")
+    _has_bestplan_envelope = (
+        BESTPLAN_ENVELOPE_START in _raw_final_response
+        or BESTPLAN_ENVELOPE_END in _raw_final_response
+        or BESTPLAN_RECEIPT_START in _raw_final_response
+        or BESTPLAN_RECEIPT_END in _raw_final_response
+    )
+    _external_final_response = (
+        sanitize_bestplan_response_for_external_sink(final_response)
+    )
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        _trajectory_messages = copy.deepcopy(messages)
+        strip_bestplan_envelopes_for_persistence(_trajectory_messages)
+        agent._save_trajectory(
+            _trajectory_messages,
+            _summarize_user_message_for_log(user_message),
+            completed,
+        )
     except Exception as _save_err:
         _cleanup_errors.append(f"save_trajectory: {_save_err}")
         logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
@@ -261,6 +287,8 @@ def finalize_turn(
             if _tail_role != "assistant":
                 messages.append({"role": "assistant", "content": final_response})
 
+        strip_bestplan_envelopes_for_persistence(messages)
+        strip_bestplan_envelopes_for_persistence(conversation_history)
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
@@ -401,6 +429,12 @@ def finalize_turn(
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
+    # Footers and completion explanations above may have changed the response.
+    # Refresh the external-safe view without changing the raw machine response
+    # that the WebUI host still needs for BestPlan validation/capture.
+    _external_final_response = (
+        sanitize_bestplan_response_for_external_sink(final_response)
+    )
     _response_transformed = False
 
     # Plugin hook: transform_llm_output
@@ -417,7 +451,7 @@ def finalize_turn(
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
                 "transform_llm_output",
-                response_text=final_response,
+                response_text=_external_final_response,
                 session_id=agent.session_id or "",
                 turn_id=turn_id or "",
                 model=agent.model,
@@ -425,8 +459,10 @@ def finalize_turn(
             )
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
-                    final_response = _hook_result
-                    _response_transformed = True
+                    _external_final_response = _hook_result
+                    if not _has_bestplan_envelope:
+                        final_response = _hook_result
+                        _response_transformed = True
                     break  # First non-empty string wins
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
@@ -444,7 +480,7 @@ def finalize_turn(
                 task_id=effective_task_id,
                 turn_id=turn_id,
                 user_message=original_user_message,
-                assistant_response=final_response,
+                assistant_response=_external_final_response,
                 conversation_history=list(messages),
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
@@ -549,7 +585,7 @@ def finalize_turn(
     if not _required_policy_halt:
         agent._sync_external_memory_for_turn(
             original_user_message=original_user_message,
-            final_response=final_response,
+            final_response=_external_final_response,
             interrupted=interrupted,
             messages=messages,
         )

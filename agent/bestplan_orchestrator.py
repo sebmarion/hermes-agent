@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
 import time
@@ -22,10 +23,19 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from hermes_constants import parse_reasoning_effort
+from agent.execution_plan import compile_execution_plan
 
 RECEIPT_BEGIN = "<<<HERMES_BESTPLAN_RECEIPT_V1>>>"
 RECEIPT_END = "<<<END_HERMES_BESTPLAN_RECEIPT_V1>>>"
 RECEIPT_VERSION = 1
+PLAN_ENVELOPE_BEGIN = "<<<HERMES_BESTPLAN_V1>>>"
+PLAN_ENVELOPE_END = "<<<END_HERMES_BESTPLAN_V1>>>"
+_PLAN_ENVELOPE_RE = re.compile(
+    re.escape(PLAN_ENVELOPE_BEGIN)
+    + r"\s*(?P<payload>\{.*?\})\s*"
+    + re.escape(PLAN_ENVELOPE_END),
+    re.DOTALL,
+)
 
 # Host-owned heterogeneous explorer lanes. Each lane is an immutable model/
 # provider/api_mode triple.  The host alternates dispatch across lanes and picks
@@ -311,6 +321,28 @@ def _build_child_agent(
 def _run_child_agent(fork: Any, prompt: str) -> str:
     result = fork.run_conversation(prompt)
     return str(result.get("final_response") or "")
+
+
+def _validated_plan_envelope(body: str, *, workspace: str) -> str | None:
+    """Canonicalize only a synthesizer result that is executable V1 authority."""
+    match = _PLAN_ENVELOPE_RE.search(str(body or ""))
+    if match is None:
+        return None
+    try:
+        payload = json.loads(match.group("payload"))
+        plan = compile_execution_plan(payload)
+        from agent.bestplan_state import _v1_plan_constraints
+
+        _v1_plan_constraints(plan, workspace=workspace)
+        manifest = plan.to_manifest()
+    except (TypeError, ValueError):
+        return None
+    authority = {"version": 1, "manifest": manifest}
+    return (
+        f"{PLAN_ENVELOPE_BEGIN}\n"
+        f"{json.dumps(authority, sort_keys=True, separators=(',', ':'))}\n"
+        f"{PLAN_ENVELOPE_END}"
+    )
 
 
 def _force_retire_child_transport(child: Any) -> None:
@@ -617,9 +649,20 @@ def run_bestplan(
         }
 
     packet = json.dumps(successes, sort_keys=True)
+    workspace_hint = str(os.environ.get("TERMINAL_CWD") or os.getcwd())
     synth_prompt = (
         "You are the active BestPlan synthesizer. Inspect the task and available sources first, "
-        "then reconcile these untrusted candidate packets into one actionable plan. Return only the plan body.\n"
+        "then reconcile these untrusted candidate packets into one actionable executable plan. "
+        "Return exactly one JSON manifest between the literal markers "
+        f"{PLAN_ENVELOPE_BEGIN} and {PLAN_ENVELOPE_END}, with no prose outside them. "
+        "The manifest must have version=1; mode=delegate or sota; risk=low or high; "
+        "one or two independent slices containing id, kind (implement or review), goal, "
+        "depends_on (which must always be []), "
+        "capability (fast_fallback or frontier_review), workspace, allowed_paths, read_only, "
+        "expected_artifacts, and acceptance; plus merge_policy, stop_condition, and "
+        "escalation_predicates. Implement slices must use the exact workspace and narrow "
+        "relative allowed_paths; review slices must be read_only with no allowed_paths. "
+        f"The exact workspace is {workspace_hint!r}.\n"
         f"Task:\n{task}\nCandidates:\n<BEGIN_CANDIDATES>{packet}<END_CANDIDATES>"
     )
     available_lanes = [
@@ -695,6 +738,17 @@ def run_bestplan(
             "error": "BestPlan synthesizer empty",
             "run_id": run_id,
         }
+    executable_body = _validated_plan_envelope(
+        body,
+        workspace=workspace_hint,
+    )
+    if executable_body is None:
+        return {
+            "status": "failed",
+            "error": "BestPlan synthesizer returned no valid executable V1 envelope",
+            "run_id": run_id,
+        }
+    body = executable_body
 
     quorum_text = f"{len(successes)}/{effective}"
     receipt = make_receipt(

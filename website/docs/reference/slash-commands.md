@@ -135,6 +135,40 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/<skill-name>` | Load any installed skill as an on-demand command. Example: `/gif-search`, `/github-pr-workflow`, `/excalidraw`. |
 | `/skills ...` | Search, browse, inspect, install, audit, publish, and configure skills from registries and the official optional-skills catalog. |
 
+#### Executing an approved `/bestplan` with `go`
+
+`/bestplan` remains an installed dynamic skill rather than a built-in command. A
+bestplan response is executable only when it contains the validated
+`HERMES_BESTPLAN_V1` machine envelope emitted by that skill. After reviewing
+such a plan, a bare `go` atomically claims the one plan bound to the current
+session, profile, workspace, and Git baseline, then delegates each step through
+the configured `code_worker` or `smart_reviewer` lane. Invalid, changed, or
+ambiguous plans fail closed; ordinary conversational uses of “go” still reach
+the model when no pending plan exists.
+
+This host-side execution path is off by default. Enable it with exactly:
+
+```bash
+hermes config set autonomy.go_enabled true
+```
+
+The executable host ingress is currently supported by the classic CLI and the
+coordinated Hermes WebUI integration. The TUI/desktop and messaging gateway do
+not claim this bare-`go` execution contract yet; on those surfaces `/bestplan`
+is planning-only, executable envelopes are stripped, and a follow-up bare
+`go` associated with that plan is rejected before the model. An unrelated bare
+`go` with no BestPlan context remains an ordinary model turn.
+
+V1 execution also requires an enforceable host filesystem sandbox. macOS uses
+`/usr/bin/sandbox-exec` when a live capability probe succeeds. Other platforms,
+and managed environments where the probe is denied, fail closed before claim
+or dispatch; there is no cwd/chmod/prose fallback.
+
+Before enabling it, configure `delegation.lanes.code_worker.provider` and
+`.model` for implementation plans, and
+`delegation.lanes.smart_reviewer.provider` and `.model` for review plans. A
+missing required lane fails before the plan is claimed or dispatched.
+
 ### Quick Commands
 
 User-defined quick commands map a short slash command to either a shell command or another slash command. Configure them in `~/.hermes/config.yaml`:

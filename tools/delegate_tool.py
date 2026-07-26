@@ -23,6 +23,10 @@ import re
 
 logger = logging.getLogger(__name__)
 import os
+import subprocess
+import hashlib
+import sys
+from urllib.parse import urlsplit, urlunsplit
 import threading
 import time
 from concurrent.futures import (
@@ -30,6 +34,7 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 from toolsets import TOOLSETS
 
@@ -1115,6 +1120,7 @@ def _build_child_agent(
     inherit_parent_fallback: bool = True,
     # Explicit lanes own their credential boundary independently of fallback.
     inherit_parent_credentials: bool = True,
+    workspace_override: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1202,7 +1208,7 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    workspace_hint = str(workspace_override or "").strip() or _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -2167,11 +2173,23 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            return child.run_conversation(
-                user_message=goal,
-                task_id=child_task_id,
-                stream_callback=_relay_child_text,
-            )
+            workspace = getattr(child, "_bestplan_workspace", None)
+            cwd_token = None
+            if workspace:
+                from agent.runtime_cwd import set_session_cwd
+
+                cwd_token = set_session_cwd(str(workspace))
+            try:
+                return child.run_conversation(
+                    user_message=goal,
+                    task_id=child_task_id,
+                    stream_callback=_relay_child_text,
+                )
+            finally:
+                if cwd_token is not None:
+                    from agent.runtime_cwd import reset_session_cwd
+
+                    reset_session_cwd(cwd_token)
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
@@ -2756,6 +2774,11 @@ def delegate_task(
     parent_agent=None,
     route: Optional[str] = None,
     model_tier: Optional[str] = None,
+    _resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
+    _strict_async: bool = False,
+    _dispatch_id: Optional[str] = None,
+    _bestplan_meta: Optional[Dict[str, Any]] = None,
+    _workspace_override: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2913,14 +2936,24 @@ def delegate_task(
     # This prevents task N's broken lane/toolset from leaving tasks 0..N-1
     # partially spawned.
     task_specs = []
+    if _resolved_runtimes is not None and len(_resolved_runtimes) != len(task_list):
+        return tool_error("resolved runtime count does not match task count")
     for task_index, t in enumerate(task_list):
         lane_name = None
         task_creds = None
         try:
-            lane_name = _resolve_lane_for_task(t, cfg)
-            task_creds = _resolve_delegation_credentials_for_task(
-                cfg, parent_agent, t
-            )
+            if _resolved_runtimes is not None:
+                task_creds = dict(_resolved_runtimes[task_index])
+                lane_name = str(task_creds.get("route") or "") or None
+                if lane_name != str(t.get("route") or ""):
+                    raise ValueError(
+                        "resolved runtime route does not match prepared task"
+                    )
+            else:
+                lane_name = _resolve_lane_for_task(t, cfg)
+                task_creds = _resolve_delegation_credentials_for_task(
+                    cfg, parent_agent, t
+                )
             lane_toolsets = _normalize_lane_toolsets(task_creds.get("toolsets"))
             _preflight_lane_toolsets(
                 parent_agent,
@@ -2996,6 +3029,7 @@ def delegate_task(
                     role=effective_role,
                     inherit_parent_fallback=False,
                     inherit_parent_credentials=False,
+                    workspace_override=_workspace_override,
                 )
             except Exception as exc:
                 logger.warning(
@@ -3066,6 +3100,9 @@ def delegate_task(
                     failed_credentials=task_creds,
                     task_specs=task_specs,
                 )
+            if _workspace_override:
+                child.terminal_cwd = str(_workspace_override)
+                child._bestplan_workspace = str(_workspace_override)
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             child._delegate_mode = t["mode"]
@@ -3366,18 +3403,29 @@ def delegate_task(
         _parent_session_id = ""
         try:
             from gateway.session_context import (
+                async_delivery_capability_version,
                 async_delivery_supported,
                 get_session_env,
             )
             _async_ok = async_delivery_supported()
+            if _strict_async:
+                _async_ok = (
+                    _async_ok
+                    and async_delivery_capability_version() >= 1
+                )
             _origin_ui_session_id = get_session_env(
                 "HERMES_UI_SESSION_ID",
                 "",
             )
             _parent_session_id = get_session_env("HERMES_SESSION_ID", "")
         except Exception:
-            _async_ok = True
+            _async_ok = not _strict_async
         if not _async_ok:
+            if _strict_async:
+                return json.dumps({
+                    "status": "rejected",
+                    "error": "strict async delivery capability/version handshake failed",
+                })
             logger.info(
                 "delegate_task: async delivery unsupported on this session "
                 "(stateless HTTP API); running the batch synchronously instead."
@@ -3401,6 +3449,28 @@ def delegate_task(
             if isinstance(_parent_session_key, str)
             else ""
         ) or get_current_session_key(default="")
+        _parent_session_id = (
+            _parent_session_key.strip()
+            if isinstance(_parent_session_key, str)
+            else ""
+        ) or (
+            _parent_session_id.strip()
+            if isinstance(_parent_session_id, str)
+            else ""
+        ) or None
+        try:
+            _source = get_session_env("HERMES_SESSION_SOURCE", "")
+            # Desktop/TUI routes by the live durable AIAgent session id. Context
+            # compression can rotate it during this turn while the approval
+            # context still holds the stale parent. Gateway chats keep their
+            # platform conversation key and are pinned separately by
+            # parent_session_id.
+            if _source == "tui":
+                _live_session_id = str(_parent_session_id or "")
+                if _live_session_id:
+                    _session_key = _live_session_id
+        except Exception:
+            pass
         _child_agents = [c for (_, _, c) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the
@@ -3448,6 +3518,11 @@ def delegate_task(
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
+            delegation_id=_dispatch_id,
+            origin_profile=str((_bestplan_meta or {}).get("origin_profile") or ""),
+            origin_tracker_path=str((_bestplan_meta or {}).get("origin_tracker_path") or ""),
+            bestplan_plan_id=str((_bestplan_meta or {}).get("plan_id") or ""),
+            resolved_runtimes=_nonsecret_runtime_value(_resolved_runtimes or []),
         )
 
         if dispatch.get("status") == "dispatched":
@@ -3477,6 +3552,8 @@ def delegate_task(
         # Pool at capacity / schedule failure — children are still attached
         # (we detach above only on the parent list, but the async unit was
         # never accepted, so re-attaching isn't needed: we just run inline).
+        if _strict_async:
+            return json.dumps(dispatch, ensure_ascii=False)
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",
@@ -4124,6 +4201,344 @@ def _load_config() -> dict:
         return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
+
+
+def resolve_bestplan_runtime_specs(
+    tasks: List[Dict[str, Any]],
+    parent_agent,
+    *,
+    expected: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Resolve trusted BestPlan lanes once through the real child resolver."""
+    cfg = _load_config()
+    resolved: List[Dict[str, Any]] = []
+    for index, task in enumerate(tasks):
+        lane = _resolve_lane_for_task(task, cfg)
+        if lane is None or lane != str(task.get("route") or ""):
+            raise ValueError(f"BestPlan task {index} requires an explicit configured route")
+        runtime = _resolve_delegation_credentials_for_task(cfg, parent_agent, task)
+        runtime = dict(runtime)
+        runtime["route"] = lane
+        if not str(runtime.get("provider") or "").strip():
+            raise ValueError(f"delegation lane {lane} resolved without a provider")
+        if not str(runtime.get("model") or "").strip():
+            raise ValueError(f"delegation lane {lane} resolved without a model")
+        runtime.update(_bestplan_runtime_identity(task, runtime))
+        if expected and index < len(expected):
+            wanted = str((expected[index] or {}).get("runtime_fingerprint") or "")
+            if not wanted:
+                raise ValueError(
+                    f"delegation lane {lane} has a legacy/incomplete runtime identity; "
+                    "strict BestPlan replay is disabled"
+                )
+            if runtime["runtime_fingerprint"] != wanted:
+                raise ValueError(
+                    f"delegation lane {lane} changed since approval: runtime fingerprint "
+                    f"expected {wanted!r}, resolved {runtime['runtime_fingerprint']!r}"
+                )
+        resolved.append(runtime)
+    return resolved
+
+
+def _endpoint_identity(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("/"):
+        return raw
+    has_explicit_scheme = "://" in raw
+    parsed = urlsplit(raw if has_explicit_scheme else f"//{raw}")
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    path = parsed.path.rstrip("/")
+    if not has_explicit_scheme:
+        return f"{host.lower()}{path}"
+    return urlunsplit((parsed.scheme.lower(), host.lower(), path, "", ""))
+
+
+def _nonsecret_runtime_value(value: Any) -> Any:
+    from agent.bestplan_state import sanitize_runtime_metadata
+
+    return sanitize_runtime_metadata(value)
+
+
+def _effective_bestplan_toolsets(task: Dict[str, Any], runtime: Dict[str, Any]) -> list[str]:
+    if bool(task.get("_bestplan_read_only")):
+        # Review slices must not even receive a write-capable tool schema.
+        return ["read_only_files"]
+    return _normalize_lane_toolsets(runtime.get("toolsets")) or ["terminal", "file"]
+
+
+def _bestplan_runtime_identity(task: Dict[str, Any], runtime: Dict[str, Any]) -> Dict[str, Any]:
+    from agent.bestplan_sandbox import sandbox_backend_identity
+
+    workspace = str(task.get("_bestplan_workspace") or task.get("workspace") or "")
+    if not workspace:
+        context = str(task.get("context") or "")
+        for line in context.splitlines():
+            if line.startswith("Workspace: "):
+                workspace = line.removeprefix("Workspace: ").strip()
+                break
+    sandbox = sandbox_backend_identity(
+        workspace=workspace,
+        allowed_paths=task.get("_bestplan_leases") or [],
+        read_only=bool(task.get("_bestplan_read_only")),
+    )
+    if sandbox["backend"] == "unavailable":
+        raise ValueError(
+            "strict BestPlan execution has no enforceable OS sandbox backend on this host"
+        )
+    identity = {
+        "route": str(runtime.get("route") or task.get("route") or ""),
+        "provider": str(runtime.get("provider") or ""),
+        "model": str(runtime.get("model") or ""),
+        "endpoint": _endpoint_identity(runtime.get("base_url") or runtime.get("endpoint")),
+        "api_mode": str(runtime.get("api_mode") or ""),
+        "toolsets": sorted(_effective_bestplan_toolsets(task, runtime)),
+        "command": str(runtime.get("command") or runtime.get("acp_command") or ""),
+        "args": [str(item) for item in (runtime.get("args") or runtime.get("acp_args") or [])],
+        "max_output_tokens": runtime.get("max_output_tokens"),
+        "request_overrides": _nonsecret_runtime_value(runtime.get("request_overrides") or {}),
+        "sandbox_backend": sandbox["backend"],
+        "sandbox_policy_digest": sandbox["policy_digest"],
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "runtime_identity": identity,
+        "runtime_fingerprint": fingerprint,
+        "sandbox_backend": sandbox["backend"],
+        "sandbox_policy_digest": sandbox["policy_digest"],
+        "bestplan_toolsets": identity["toolsets"],
+    }
+
+
+def _bestplan_sandbox_workspace(workspace: str, plan_id: str) -> Path:
+    """Create/reuse a detached worktree preserving the approved cwd."""
+    canonical = Path(workspace).expanduser().resolve()
+    root = Path(subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=canonical,
+        capture_output=True, text=True, timeout=10, check=True,
+    ).stdout.strip()).resolve()
+    try:
+        workspace_relative = canonical.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("BestPlan workspace is outside its Git repository root") from exc
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=root, capture_output=True, text=True, timeout=10, check=True,
+    ).stdout
+    if dirty:
+        raise ValueError(
+            "BestPlan isolated execution requires a clean Git workspace; "
+            "the approved dirty baseline cannot be reproduced safely in a worktree"
+        )
+    from hermes_constants import get_hermes_home
+
+    sandbox_root = Path(get_hermes_home()) / "bestplan" / "worktrees"
+    sandbox_root.mkdir(parents=True, exist_ok=True)
+    sandbox = sandbox_root / plan_id.replace("/", "_")
+    if sandbox.exists():
+        probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"], cwd=sandbox,
+            capture_output=True, text=True, timeout=10,
+        )
+        if probe.returncode != 0 or probe.stdout.strip() != "true":
+            raise ValueError(f"BestPlan sandbox path exists but is not a worktree: {sandbox}")
+    else:
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(sandbox), "HEAD"],
+            cwd=root, capture_output=True, text=True, timeout=30, check=True,
+        )
+    sandbox_workspace = (sandbox / workspace_relative).resolve()
+    if not sandbox_workspace.is_dir():
+        raise ValueError(
+            "BestPlan approved workspace subdirectory is absent from the detached worktree"
+        )
+    return sandbox_workspace
+
+
+def _dispatch_bestplan_tasks_async_impl(
+    *,
+    tasks: List[Dict[str, Any]],
+    parent_agent,
+    dispatch_id: str,
+    plan_id: str,
+    workspace: str,
+    resolved_runtimes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Strict async-only dispatch whose children are OS-sandboxed processes."""
+    from agent.bestplan_sandbox import create_bestplan_sandbox_launch
+    from tools.async_delegation import dispatch_async_delegation_batch
+
+    try:
+        from gateway.session_context import get_delivery_context_identity
+        identity = get_delivery_context_identity()
+    except Exception:
+        identity = {}
+    if int(identity.get("capability_version") or 0) < 1:
+        return {
+            "status": "rejected",
+            "error": "strict async delivery capability/version handshake failed",
+        }
+    sandbox = _bestplan_sandbox_workspace(workspace, plan_id)
+    if len(tasks) != len(resolved_runtimes):
+        raise ValueError("BestPlan task/runtime count mismatch")
+
+    launches = []
+    payloads = []
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    for index, (task, runtime) in enumerate(zip(tasks, resolved_runtimes)):
+        runtime = dict(runtime)
+        expected_identity = _bestplan_runtime_identity(task, runtime)
+        if runtime.get("runtime_fingerprint") != expected_identity["runtime_fingerprint"]:
+            raise ValueError(f"BestPlan runtime fingerprint mismatch for slice {index}")
+        runtime_dir = sandbox / ".bestplan-runtime" / f"slice-{index}"
+        launch = create_bestplan_sandbox_launch(
+            workspace=sandbox,
+            allowed_paths=task.get("_bestplan_leases") or [],
+            read_only=bool(task.get("_bestplan_read_only")),
+            runtime_dir=runtime_dir,
+        )
+        if launch.policy_digest != runtime.get("sandbox_policy_digest"):
+            launch.close()
+            raise ValueError(f"BestPlan sandbox policy changed for slice {index}")
+        launches.append(launch)
+        system_prompt = _build_child_system_prompt(
+            str(task.get("goal") or ""),
+            "\n".join([
+                f"OS-enforced isolated worktree: {sandbox}",
+                f"Normalized write leases: {', '.join(task.get('_bestplan_leases') or []) or 'none'}",
+                f"Expected artifacts: {', '.join(task.get('_bestplan_expected_artifacts') or []) or 'none'}",
+                str(task.get("context") or ""),
+            ]),
+            workspace_path=str(sandbox),
+            role="leaf",
+            max_spawn_depth=1,
+            child_depth=1,
+        )
+        payloads.append({
+            "goal": str(task.get("goal") or ""),
+            "system_prompt": system_prompt,
+            "workspace": str(sandbox),
+            "runtime_home": str(runtime_dir),
+            "runtime": runtime,
+            "max_iterations": int(_load_config().get("max_iterations", DEFAULT_MAX_ITERATIONS)),
+            "task_id": f"{dispatch_id}-{index}",
+        })
+
+    def runner() -> Dict[str, Any]:
+        started = time.monotonic()
+        results = []
+        try:
+            for launch, payload in zip(launches, payloads):
+                env = dict(os.environ)
+                env["PYTHONPATH"] = os.pathsep.join(
+                    part for part in (repo_root, env.get("PYTHONPATH", "")) if part
+                )
+                env["HERMES_HOME"] = payload["runtime_home"]
+                env["HERMES_PROFILE"] = str(identity.get("profile") or "")
+                process = launch.popen(
+                    [sys.executable, "-m", "agent.bestplan_worker"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                    start_new_session=True,
+                )
+                try:
+                    stdout, stderr = process.communicate(
+                        json.dumps(payload, ensure_ascii=False),
+                        timeout=_get_child_timeout() or None,
+                    )
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, 9)
+                    except OSError:
+                        process.kill()
+                    stdout, stderr = process.communicate()
+                    results.append({
+                        "status": "error", "summary": "",
+                        "error": "BestPlan sandbox worker timed out",
+                        "api_calls": 0,
+                    })
+                    continue
+                marker = "HERMES_BESTPLAN_RESULT="
+                line = next(
+                    (item for item in reversed(stdout.splitlines()) if item.startswith(marker)),
+                    "",
+                )
+                if not line:
+                    results.append({
+                        "status": "error", "summary": "",
+                        "error": f"BestPlan worker protocol failed (exit={process.returncode}): {stderr[-1000:]}",
+                        "api_calls": 0,
+                    })
+                else:
+                    results.append(json.loads(line.removeprefix(marker)))
+        finally:
+            for launch in launches:
+                launch.close()
+        return {
+            "results": results,
+            "total_duration_seconds": round(time.monotonic() - started, 2),
+        }
+
+    result = dispatch_async_delegation_batch(
+        goals=[str(task.get("goal") or "") for task in tasks],
+        context="OS-sandboxed BestPlan execution",
+        toolsets=None,
+        role="leaf",
+        model="mixed" if len(resolved_runtimes) > 1 else str(resolved_runtimes[0].get("model") or ""),
+        session_key=str(identity.get("session_key") or ""),
+        origin_ui_session_id=str(identity.get("ui_session_id") or ""),
+        parent_session_id=str(identity.get("session_id") or ""),
+        runner=runner,
+        max_async_children=_get_max_async_children(),
+        delegation_id=dispatch_id,
+        origin_profile=str(identity.get("profile") or ""),
+        origin_tracker_path=str(identity.get("tracker_path") or ""),
+        bestplan_plan_id=plan_id,
+        resolved_runtimes=[
+            _nonsecret_runtime_value(runtime)
+            for runtime in resolved_runtimes
+        ],
+    )
+    if result.get("status") != "dispatched":
+        for launch in launches:
+            launch.close()
+    result["sandbox_workspace"] = str(sandbox)
+    return result
+
+
+def dispatch_bestplan_tasks_async(
+    *,
+    tasks: List[Dict[str, Any]],
+    parent_agent,
+    dispatch_id: str,
+    plan_id: str,
+    workspace: str,
+    resolved_runtimes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Fail closed without claiming that pre-submit setup was scheduled."""
+    try:
+        return _dispatch_bestplan_tasks_async_impl(
+            tasks=tasks,
+            parent_agent=parent_agent,
+            dispatch_id=dispatch_id,
+            plan_id=plan_id,
+            workspace=workspace,
+            resolved_runtimes=resolved_runtimes,
+        )
+    except Exception as exc:
+        logger.warning("strict BestPlan dispatch rejected before acceptance", exc_info=True)
+        return {
+            "status": "rejected",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 # ---------------------------------------------------------------------------

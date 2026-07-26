@@ -99,6 +99,11 @@ def _lstat_private_identity(
     return FileIdentity.from_stat(state)
 
 
+def _same_file_object(first: os.stat_result, second: os.stat_result) -> bool:
+    """Compare stable file identity without treating metadata updates as swaps."""
+    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+
 def _fsync_parent(parent: Path) -> None:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     descriptor = os.open(parent, flags)
@@ -159,7 +164,7 @@ def interprocess_authority_lock(path: Path) -> Iterator[None]:
         _validate_private_regular(opened)
         path_state = os.lstat(lock_path)
         _validate_private_regular(path_state)
-        if FileIdentity.from_stat(opened) != FileIdentity.from_stat(path_state):
+        if not _same_file_object(opened, path_state):
             raise ValueError("durable authority lock path identity changed")
         if created:
             os.fsync(descriptor)
@@ -168,7 +173,9 @@ def interprocess_authority_lock(path: Path) -> Iterator[None]:
         try:
             locked = os.fstat(descriptor)
             current = os.lstat(lock_path)
-            if FileIdentity.from_stat(locked) != FileIdentity.from_stat(current):
+            _validate_private_regular(locked)
+            _validate_private_regular(current)
+            if not _same_file_object(locked, current):
                 raise ValueError("durable authority lock changed while waiting")
             yield
         finally:

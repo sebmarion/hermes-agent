@@ -94,9 +94,14 @@ _DEFAULT_MAX_STORE_BYTES = 250 * 1024 * 1024
 _CLEANUP_INTERVAL_SECONDS = 15 * 60
 _last_cleanup_at = 0.0
 _persist_lock = threading.Lock()
+# Deterministic dispatch IDs are admitted under a stable striped lock. This
+# serializes the full intent→scheduled→running acceptance handshake for one ID
+# without retaining an unbounded lock per historical delegation.
+_DISPATCH_ADMISSION_LOCKS = tuple(threading.RLock() for _ in range(64))
+_RUNNING_CHECKPOINT_TIMEOUT_SECONDS = 10.0
 _recovery_attempted = False
 _replay_ids_lock = threading.Lock()
-_replayed_persisted_ids: set[str] = set()
+_replayed_persisted_ids: set[tuple[str, str]] = set()
 _runtime_owner_lock = threading.Lock()
 _runtime_owner_id = ""
 _runtime_owner_pid = 0
@@ -106,11 +111,13 @@ _MAX_PERSISTENCE_BYTES = 512 * 1024 * 1024
 _UNSPECIFIED_IDENTITY = object()
 _DELIVERY_STATUS_RANK = {
     "": 0,
-    "running": 1,
-    "finalizing": 2,
-    "pending": 3,
-    "queued": 4,
-    "delivered": 5,
+    "intent": 1,
+    "scheduled": 2,
+    "running": 3,
+    "finalizing": 4,
+    "pending": 5,
+    "queued": 6,
+    "delivered": 7,
 }
 # Lightweight liveness ping for status consumers (/agents, TUI/Desktop
 # delegation.status). Completion delivery still rides the shared process queue;
@@ -122,16 +129,23 @@ _HEARTBEAT_INTERVAL_SECONDS = 30.0
 _HEARTBEAT_STALE_SECONDS = _HEARTBEAT_INTERVAL_SECONDS * 3
 
 
-def _publish_completion_once(process_registry: Any, delegation_id: str, evt: dict) -> bool:
+def _publish_completion_once(
+    process_registry: Any,
+    delegation_id: str,
+    evt: dict,
+    *,
+    replay_scope: str = "runtime",
+) -> bool:
     """Publish one durable event at most once in this process."""
+    replay_identity = (replay_scope, delegation_id)
     with _replay_ids_lock:
-        if delegation_id in _replayed_persisted_ids:
+        if replay_identity in _replayed_persisted_ids:
             return False
-        _replayed_persisted_ids.add(delegation_id)
+        _replayed_persisted_ids.add(replay_identity)
         try:
             process_registry.completion_queue.put(evt)
         except Exception:
-            _replayed_persisted_ids.discard(delegation_id)
+            _replayed_persisted_ids.discard(replay_identity)
             raise
     return True
 
@@ -161,7 +175,7 @@ def active_count() -> int:
         return sum(
             1
             for record in _records.values()
-            if record.get("status") == "running"
+            if record.get("status") in {"scheduled", "running"}
             or record.get("delivery_status") == "finalizing"
         )
 
@@ -244,7 +258,9 @@ def _prune_completed_locked() -> None:
         _records.pop(rid, None)
 
 
-def _persistence_path() -> Path:
+def _persistence_path(explicit: str | Path | None = None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
     try:
         from hermes_cli.config import get_hermes_home
 
@@ -337,8 +353,9 @@ def _validate_persisted_data(raw: object) -> Dict[str, Any]:
 
 
 def _read_persisted_snapshot_unlocked(
+    path: str | Path | None = None,
 ) -> tuple[Dict[str, Any], Optional[FileIdentity]]:
-    path = _persistence_path()
+    path = _persistence_path() if path is None else _persistence_path(path)
     raw, identity = read_private_json(
         path,
         max_bytes=_MAX_PERSISTENCE_BYTES,
@@ -349,21 +366,24 @@ def _read_persisted_snapshot_unlocked(
     return _validate_persisted_data(raw), identity
 
 
-def _read_persisted_unlocked() -> Dict[str, Any]:
-    data, _identity = _read_persisted_snapshot_unlocked()
+def _read_persisted_unlocked(
+    path: str | Path | None = None,
+) -> Dict[str, Any]:
+    data, _identity = _read_persisted_snapshot_unlocked(path)
     return data
 
 
 def _write_persisted_unlocked(
     data: Dict[str, Any],
+    path: str | Path | None = None,
     *,
     expected: object = _UNSPECIFIED_IDENTITY,
 ) -> None:
-    path = _persistence_path()
+    path = _persistence_path() if path is None else _persistence_path(path)
     validated = _validate_persisted_data(data)
     if expected is _UNSPECIFIED_IDENTITY:
         with interprocess_authority_lock(path):
-            _current, current_identity = _read_persisted_snapshot_unlocked()
+            _current, current_identity = _read_persisted_snapshot_unlocked(path)
             atomic_write_private_json(
                 path,
                 validated,
@@ -573,7 +593,7 @@ def _persist_record(
     event: Optional[Dict[str, Any]] = None,
     delivery_status: Optional[str] = None,
 ) -> bool:
-    """Durably merge one async delegation record into the global authority."""
+    """Durably merge one record and report whether the write succeeded."""
     delegation_id = str(record.get("delegation_id") or "")
     if not delegation_id:
         return False
@@ -596,22 +616,38 @@ def _persist_record(
             entry["delivered_at"] = now
     try:
         with _persist_lock:
-            with interprocess_authority_lock(_persistence_path()):
-                data, expected = _read_persisted_snapshot_unlocked()
+            tracker_path = record.get("origin_tracker_path") or None
+            authority_path = (
+                _persistence_path()
+                if tracker_path is None
+                else _persistence_path(tracker_path)
+            )
+            with interprocess_authority_lock(authority_path):
+                data, expected = _read_persisted_snapshot_unlocked(tracker_path)
                 existing = data["records"].get(delegation_id)
                 data["records"][delegation_id] = _merge_persisted_entry(
                     existing,
                     entry,
                 )
                 _cleanup_persisted_data_locked(data, now=now)
-                _write_persisted_unlocked(data, expected=expected)
+                _write_persisted_unlocked(
+                    data,
+                    tracker_path,
+                    expected=expected,
+                )
         return True
     except Exception as exc:
         logger.warning("Failed to persist async delegation %s: %s", delegation_id, exc)
         return False
 
 
-def _mark_persisted_delivery(delegation_id: str, status: str) -> bool:
+def _mark_persisted_delivery(
+    delegation_id: str,
+    status: str,
+    *,
+    tracker_path: str | Path | None = None,
+    raise_on_error: bool = False,
+) -> bool:
     if (
         not delegation_id
         or status not in _DELIVERY_STATUS_RANK
@@ -621,8 +657,13 @@ def _mark_persisted_delivery(delegation_id: str, status: str) -> bool:
     now = time.time()
     try:
         with _persist_lock:
-            with interprocess_authority_lock(_persistence_path()):
-                data, expected = _read_persisted_snapshot_unlocked()
+            authority_path = (
+                _persistence_path()
+                if tracker_path is None
+                else _persistence_path(tracker_path)
+            )
+            with interprocess_authority_lock(authority_path):
+                data, expected = _read_persisted_snapshot_unlocked(tracker_path)
                 entry = data["records"].get(delegation_id)
                 if not isinstance(entry, dict):
                     return False
@@ -638,9 +679,21 @@ def _mark_persisted_delivery(delegation_id: str, status: str) -> bool:
                     candidate,
                 )
                 _cleanup_persisted_data_locked(data, now=now)
-                _write_persisted_unlocked(data, expected=expected)
-        return True
+                _write_persisted_unlocked(
+                    data,
+                    tracker_path,
+                    expected=expected,
+                )
+            verify = _read_persisted_unlocked(tracker_path)
+            stored = (verify.get("records") or {}).get(delegation_id) or {}
+            if stored.get("delivery_status") != status:
+                raise OSError("async delegation ACK verification failed")
+            return True
     except Exception as exc:
+        if raise_on_error:
+            raise OSError(
+                f"Failed to update async delegation delivery {delegation_id}: {exc}"
+            ) from exc
         logger.warning("Failed to update async delegation delivery %s: %s", delegation_id, exc)
         return False
 
@@ -652,7 +705,17 @@ def mark_async_delegation_delivered(evt: Dict[str, Any]) -> bool:
     delegation_id = str(evt.get("delegation_id") or "")
     if not delegation_id:
         return False
-    if not _mark_persisted_delivery(delegation_id, "delivered"):
+    tracker_path = str(evt.get("origin_tracker_path") or "") or None
+    if not _mark_persisted_delivery(
+        delegation_id,
+        "delivered",
+        tracker_path=tracker_path,
+        raise_on_error=tracker_path is not None,
+    ):
+        if tracker_path is not None:
+            raise KeyError(
+                f"async delegation tracker record not found: {delegation_id}"
+            )
         return False
     with _records_lock:
         record = _records.get(delegation_id)
@@ -680,6 +743,11 @@ def _event_for_lost_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "type": "async_delegation",
         "delegation_id": delegation_id,
         "session_key": record.get("session_key") or "",
+        "origin_ui_session_id": record.get("origin_ui_session_id") or "",
+        "origin_profile": record.get("origin_profile") or "",
+        "origin_tracker_path": record.get("origin_tracker_path") or "",
+        "parent_session_id": record.get("parent_session_id"),
+        "bestplan_plan_id": record.get("bestplan_plan_id") or "",
         "goal": record.get("goal") or "background delegation",
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -692,7 +760,9 @@ def _event_for_lost_record(record: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def recover_async_delegations() -> Dict[str, Any]:
+def recover_async_delegations(
+    tracker_path: str | Path | None = None,
+) -> Dict[str, Any]:
     """Replay undelivered completions and mark previous-process runners lost."""
     global _recovery_attempted
     queued = 0
@@ -705,10 +775,18 @@ def recover_async_delegations() -> Dict[str, Any]:
         return {"queued": 0, "lost": 0, "error": str(exc)}
     try:
         with _persist_lock:
-            with interprocess_authority_lock(_persistence_path()):
-                data, expected = _read_persisted_snapshot_unlocked()
+            authority_path = (
+                _persistence_path()
+                if tracker_path is None
+                else _persistence_path(tracker_path)
+            )
+            with interprocess_authority_lock(authority_path):
+                data, expected = _read_persisted_snapshot_unlocked(tracker_path)
                 records = data["records"]
-                for rid, entry in records.items():
+                for rid, entry in list(records.items()):
+                    if not isinstance(entry, dict):
+                        records.pop(rid, None)
+                        continue
                     record = (
                         entry.get("record")
                         if isinstance(entry.get("record"), dict)
@@ -725,6 +803,22 @@ def recover_async_delegations() -> Dict[str, Any]:
                         if isinstance(entry.get("event"), dict)
                         else None
                     )
+                    if (
+                        status == "scheduled"
+                        and not _persistence_owner_is_live(record)
+                    ):
+                        # The durable worker gate opens only after this phase
+                        # is stored. A fresh process cannot own that queued
+                        # Future, so retry from the persisted intent.
+                        record = dict(record)
+                        record["status"] = "intent"
+                        record["delivery_status"] = "intent"
+                        entry["record"] = record
+                        entry["status"] = "intent"
+                        entry["delivery_status"] = "intent"
+                        entry["updated_at"] = now
+                        status = "intent"
+                        delivery_status = "intent"
                     if status == "running":
                         owner_values = (
                             record.get("runtime_owner_id"),
@@ -775,14 +869,24 @@ def recover_async_delegations() -> Dict[str, Any]:
                         restored["delivery_status"] = "queued"
                         to_publish.append((rid, dict(event), restored))
                 _cleanup_persisted_data_locked(data, now=now)
-                _write_persisted_unlocked(data, expected=expected)
+                _write_persisted_unlocked(
+                    data,
+                    tracker_path,
+                    expected=expected,
+                )
     except Exception as exc:
         logger.warning("Failed to recover async delegation authority: %s", exc)
         return {"queued": 0, "lost": 0, "error": str(exc)}
 
     published = 0
+    replay_scope = str(authority_path)
     for rid, event, restored in to_publish:
-        if not _publish_completion_once(process_registry, rid, event):
+        if not _publish_completion_once(
+            process_registry,
+            rid,
+            event,
+            replay_scope=replay_scope,
+        ):
             continue
         published += 1
         with _records_lock:
@@ -1184,7 +1288,12 @@ def _push_completion_event(
                 live["queued_at"] = time.time()
         # Publish only after the durable record says queued, so a fast
         # consumer cannot ACK a completion whose persistence still says pending.
-        _publish_completion_once(process_registry, delegation_id, evt)
+        _publish_completion_once(
+            process_registry,
+            delegation_id,
+            evt,
+            replay_scope=str(_persistence_path()),
+        )
     except Exception as exc:  # pragma: no cover
         delegation_id = str(record.get("delegation_id") or "")
         _mark_persisted_delivery(delegation_id, "pending")
@@ -1212,6 +1321,56 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    delegation_id: Optional[str] = None,
+    origin_profile: str = "",
+    origin_tracker_path: str = "",
+    bestplan_plan_id: str = "",
+    resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Atomically admit one deterministic-ID batch dispatch."""
+    resolved_id = str(delegation_id or _new_delegation_id())
+    admission_lock = _DISPATCH_ADMISSION_LOCKS[
+        hash(resolved_id) % len(_DISPATCH_ADMISSION_LOCKS)
+    ]
+    with admission_lock:
+        return _dispatch_async_delegation_batch_admitted(
+            goals=goals,
+            context=context,
+            toolsets=toolsets,
+            role=role,
+            model=model,
+            session_key=session_key,
+            parent_session_id=parent_session_id,
+            runner=runner,
+            origin_ui_session_id=origin_ui_session_id,
+            interrupt_fn=interrupt_fn,
+            max_async_children=max_async_children,
+            delegation_id=resolved_id,
+            origin_profile=origin_profile,
+            origin_tracker_path=origin_tracker_path,
+            bestplan_plan_id=bestplan_plan_id,
+            resolved_runtimes=resolved_runtimes,
+        )
+
+
+def _dispatch_async_delegation_batch_admitted(
+    *,
+    goals: List[str],
+    context: Optional[str],
+    toolsets: Optional[List[str]],
+    role: str,
+    model: Optional[str],
+    session_key: str,
+    parent_session_id: Optional[str] = None,
+    runner: Callable[[], Dict[str, Any]],
+    origin_ui_session_id: str = "",
+    interrupt_fn: Optional[Callable[[], None]] = None,
+    max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    delegation_id: Optional[str] = None,
+    origin_profile: str = "",
+    origin_tracker_path: str = "",
+    bestplan_plan_id: str = "",
+    resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1233,9 +1392,83 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
-    _recover_once()
-
-    delegation_id = _new_delegation_id()
+    if not origin_tracker_path:
+        _recover_once()
+    delegation_id = str(delegation_id or _new_delegation_id())
+    with _records_lock:
+        local_existing = _records.get(delegation_id)
+        locally_aborted = bool(
+            local_existing and local_existing.get("acceptance_aborted")
+        )
+    if locally_aborted:
+        durable_retryable = False
+        if origin_tracker_path:
+            with _persist_lock:
+                persisted = _read_persisted_unlocked(origin_tracker_path)
+                durable = (persisted.get("records") or {}).get(delegation_id)
+            durable_retryable = (
+                isinstance(durable, dict)
+                and str(
+                    durable.get("status")
+                    or (durable.get("record") or {}).get("status")
+                    or ""
+                )
+                == "intent"
+            )
+        if durable_retryable:
+            with _records_lock:
+                local_existing = _records.get(delegation_id)
+                if (
+                    local_existing is not None
+                    and local_existing.get("status") == "intent"
+                ):
+                    local_existing["acceptance_aborted"] = False
+        else:
+            return {
+                "status": "rejected",
+                "delegation_id": delegation_id,
+                "error": "previous strict dispatch acceptance was aborted before execution",
+            }
+    if origin_tracker_path:
+        with _persist_lock:
+            persisted = _read_persisted_unlocked(origin_tracker_path)
+            existing = (persisted.get("records") or {}).get(delegation_id)
+        if isinstance(existing, dict):
+            phase = str(existing.get("status") or (existing.get("record") or {}).get("status") or "")
+            if phase in {"scheduled", "running"}:
+                owner_record = existing.get("record") or {}
+                owner_live = _persistence_owner_is_live(owner_record)
+                if phase == "scheduled" and not owner_live:
+                    phase = "intent"
+                elif phase == "running" and not owner_live:
+                    # Running means side effects may have begun. A dead owner is
+                    # terminally ambiguous: recover it as lost, never retry or
+                    # falsely ACK it as a live idempotent dispatch.
+                    recover_async_delegations(origin_tracker_path)
+                    with _persist_lock:
+                        recovered = _read_persisted_unlocked(origin_tracker_path)
+                        existing = (recovered.get("records") or {}).get(
+                            delegation_id, existing
+                        )
+                    phase = str(
+                        existing.get("status")
+                        or (existing.get("record") or {}).get("status")
+                        or "lost"
+                    )
+                else:
+                    return {
+                        "status": "dispatched",
+                        "delegation_id": delegation_id,
+                        "phase": phase,
+                        "idempotent_replay": True,
+                    }
+            if phase not in {"", "intent"}:
+                return {
+                    "status": "terminal",
+                    "phase": phase,
+                    "delegation_id": delegation_id,
+                    "idempotent_replay": True,
+                }
     dispatched_at = time.time()
     try:
         owner_id, owner_pid, owner_start_token = _runtime_persistence_owner()
@@ -1251,6 +1484,9 @@ def dispatch_async_delegation_batch(
     combined_goal = (
         goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
     )
+    from agent.bestplan_state import sanitize_runtime_metadata
+
+    safe_resolved_runtimes = sanitize_runtime_metadata(resolved_runtimes or [])
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "goal": combined_goal,
@@ -1261,22 +1497,27 @@ def dispatch_async_delegation_batch(
         "model": model,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
+        "origin_profile": origin_profile,
+        "origin_tracker_path": origin_tracker_path,
         "parent_session_id": parent_session_id,
-        "status": "running",
+        "bestplan_plan_id": bestplan_plan_id,
+        "resolved_runtimes": safe_resolved_runtimes,
+        "status": "intent",
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "last_heartbeat_at": dispatched_at,
         "heartbeat_count": 0,
-        "delivery_status": "running",
+        "delivery_status": "intent",
         "runtime_owner_id": owner_id,
         "runtime_owner_pid": owner_pid,
         "runtime_owner_start_token": owner_start_token,
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
+        "owner_pid": os.getpid(),
     }
     with _records_lock:
         running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
+            1 for r in _records.values() if r.get("status") in {"scheduled", "running"}
         )
         if running >= max_async_children:
             return {
@@ -1289,22 +1530,84 @@ def dispatch_async_delegation_batch(
                 ),
             }
         _records[delegation_id] = record
-    if not _persist_record(record, delivery_status="running"):
+    if not _persist_record(record, delivery_status="intent"):
         with _records_lock:
             _records.pop(delegation_id, None)
         return {
             "status": "rejected",
             "error": "Async delegation durable dispatch could not be committed.",
         }
-
-    heartbeat_stop = _start_heartbeat_thread(delegation_id)
-    with _records_lock:
-        if delegation_id in _records:
-            _records[delegation_id]["heartbeat_stop"] = heartbeat_stop
+    if origin_tracker_path:
+        with _persist_lock:
+            verify = _read_persisted_unlocked(origin_tracker_path)
+            durable = (verify.get("records") or {}).get(delegation_id)
+        if not isinstance(durable, dict):
+            with _records_lock:
+                _records.pop(delegation_id, None)
+            return {
+                "status": "rejected",
+                "error": "strict async dispatch intent could not be persisted",
+            }
 
     executor = _get_executor(max_async_children)
+    start_gate = threading.Event()
+    abort_gate = threading.Event()
+    running_checkpoint_ready = threading.Event()
+    execute_gate = threading.Event()
+    running_checkpoint = {"ok": not bool(origin_tracker_path), "error": ""}
+
+    def _repair_pre_execution_intent(reason: str) -> bool:
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is None:
+                return False
+            live["status"] = "intent"
+            live["delivery_status"] = "intent"
+            # Keep retries rejected until the durable intent repair succeeds.
+            live["acceptance_aborted"] = True
+            live["last_error"] = reason
+            repaired = dict(live)
+        persisted = _persist_record(repaired, delivery_status="intent")
+        if persisted:
+            with _records_lock:
+                live = _records.get(delegation_id)
+                if live is not None and live.get("status") == "intent":
+                    live["acceptance_aborted"] = False
+        return persisted
 
     def _worker() -> None:
+        start_gate.wait()
+        if abort_gate.is_set():
+            return
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is None or live.get("status") != "scheduled":
+                return
+            live["status"] = "running"
+            live["delivery_status"] = "running"
+            running_record = dict(live)
+        running_persisted = _persist_record(
+            running_record, delivery_status="running"
+        )
+        if origin_tracker_path:
+            if not running_persisted:
+                repaired = _repair_pre_execution_intent(
+                    "durable running checkpoint failed before execution"
+                )
+                running_checkpoint["error"] = (
+                    "strict async running checkpoint could not be persisted"
+                    + ("" if repaired else "; intent repair also failed")
+                )
+                running_checkpoint_ready.set()
+                return
+            running_checkpoint["ok"] = True
+            running_checkpoint_ready.set()
+            execute_gate.wait()
+            if abort_gate.is_set():
+                _repair_pre_execution_intent(
+                    "dispatch acceptance timed out before execution"
+                )
+                return
         combined: Dict[str, Any] = {}
         status = "error"
         try:
@@ -1331,18 +1634,88 @@ def dispatch_async_delegation_batch(
 
     try:
         # Propagate the dispatching profile to the detached batch children.
-        executor.submit(propagate_context_to_thread(_worker))
+        future = executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
         with _records_lock:
-            failed_record = _records.pop(delegation_id, None)
-        if failed_record:
-            hb_stop = failed_record.get("heartbeat_stop")
-            if hasattr(hb_stop, "set"):
-                hb_stop.set()
+            failed_record = _records.get(delegation_id)
+            if failed_record is not None:
+                failed_record["status"] = "intent"
+                failed_record["delivery_status"] = "intent"
+                failed_record["last_error"] = str(exc)
+                failed_snapshot = dict(failed_record)
+            else:
+                failed_snapshot = record
+        _persist_record(failed_snapshot, delivery_status="intent")
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
+
+    with _records_lock:
+        live = _records.get(delegation_id)
+        if live is not None:
+            live["status"] = "scheduled"
+            live["delivery_status"] = "scheduled"
+            scheduled_record = dict(live)
+        else:
+            scheduled_record = None
+    if scheduled_record is not None:
+        _persist_record(scheduled_record, delivery_status="scheduled")
+    durable_scheduled = True
+    if origin_tracker_path:
+        with _persist_lock:
+            verified = _read_persisted_unlocked(origin_tracker_path)
+            durable = (verified.get("records") or {}).get(delegation_id) or {}
+        durable_scheduled = str(durable.get("status") or "") == "scheduled"
+    if not durable_scheduled:
+        abort_gate.set()
+        start_gate.set()
+        future.cancel()
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None:
+                live["status"] = "intent"
+                live["delivery_status"] = "intent"
+                repaired = dict(live)
+            else:
+                repaired = record
+        _persist_record(repaired, delivery_status="intent")
+        return {
+            "status": "rejected",
+            "error": "strict async scheduled phase could not be persisted",
+        }
+
+    start_gate.set()
+    if origin_tracker_path:
+        if not running_checkpoint_ready.wait(
+            timeout=_RUNNING_CHECKPOINT_TIMEOUT_SECONDS
+        ):
+            with _records_lock:
+                live = _records.get(delegation_id)
+                if live is not None:
+                    live["acceptance_aborted"] = True
+                    live["last_error"] = (
+                        "strict async running checkpoint timed out before execution"
+                    )
+            abort_gate.set()
+            execute_gate.set()
+            return {
+                "status": "rejected",
+                "error": "strict async running checkpoint timed out before execution",
+            }
+        if not running_checkpoint["ok"]:
+            abort_gate.set()
+            execute_gate.set()
+            return {
+                "status": "rejected",
+                "error": running_checkpoint["error"],
+            }
+
+    heartbeat_stop = _start_heartbeat_thread(delegation_id)
+    with _records_lock:
+        if delegation_id in _records:
+            _records[delegation_id]["heartbeat_stop"] = heartbeat_stop
+    execute_gate.set()
 
     logger.info(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
@@ -1388,7 +1761,11 @@ def _finalize_batch(
         "delegation_id": delegation_id,
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
+        "origin_profile": event_record.get("origin_profile", ""),
+        "origin_tracker_path": event_record.get("origin_tracker_path", ""),
         "parent_session_id": event_record.get("parent_session_id"),
+        "bestplan_plan_id": event_record.get("bestplan_plan_id", ""),
+        "resolved_runtimes": event_record.get("resolved_runtimes") or [],
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
@@ -1405,6 +1782,23 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    plan_id = str(event_record.get("bestplan_plan_id") or "")
+    tracker_path = str(event_record.get("origin_tracker_path") or "")
+    if plan_id and tracker_path:
+        try:
+            from agent.bestplan_state import BestplanStore
+
+            plan_store = BestplanStore(db_path=Path(tracker_path).parent / "state.db")
+            try:
+                plan_store.mark_completed_unverified(plan_id, evt)
+            finally:
+                plan_store.close()
+        except Exception:
+            logger.warning(
+                "BestPlan completion evidence persistence failed for %s",
+                plan_id,
+                exc_info=True,
+            )
     try:
         if not _persist_record(
             event_record,
@@ -1413,7 +1807,11 @@ def _finalize_batch(
             delivery_status="pending",
         ):
             raise OSError("async delegation batch completion persistence failed")
-        if not _mark_persisted_delivery(delegation_id, "queued"):
+        if not _mark_persisted_delivery(
+            delegation_id,
+            "queued",
+            tracker_path=tracker_path or None,
+        ):
             raise OSError(
                 "async delegation batch queued state persistence failed"
             )
@@ -1422,9 +1820,24 @@ def _finalize_batch(
             if live is not None:
                 live["delivery_status"] = "queued"
                 live["queued_at"] = time.time()
-        _publish_completion_once(process_registry, delegation_id, evt)
+        replay_path = (
+            _persistence_path()
+            if not tracker_path
+            else _persistence_path(tracker_path)
+        )
+        _publish_completion_once(
+            process_registry,
+            delegation_id,
+            evt,
+            replay_scope=str(replay_path),
+        )
     except Exception as exc:  # pragma: no cover
-        _mark_persisted_delivery(delegation_id, "pending")
+        try:
+            _mark_persisted_delivery(
+                delegation_id, "pending", tracker_path=tracker_path or None,
+            )
+        except Exception:
+            logger.warning("failed to retain async delegation pending marker", exc_info=True)
         with _records_lock:
             live = _records.get(delegation_id)
             if live is not None:

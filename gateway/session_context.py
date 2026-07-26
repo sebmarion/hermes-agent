@@ -36,7 +36,7 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Any
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -113,6 +113,10 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # setting ``supports_async_delivery = False`` on the adapter class; the gateway
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
+_SESSION_ASYNC_DELIVERY_VERSION: ContextVar = ContextVar(
+    "HERMES_SESSION_ASYNC_DELIVERY_VERSION", default=_UNSET,
+)
+_SESSION_HERMES_HOME: ContextVar = ContextVar("HERMES_SESSION_HERMES_HOME", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -148,6 +152,52 @@ def set_current_session_id(session_id: str) -> None:
     overwrite that process-global fallback.
     """
     _SESSION_ID.set(session_id)
+
+
+def bind_delivery_context(
+    *,
+    session_key: str,
+    session_id: str,
+    ui_session_id: str = "",
+    async_delivery: bool,
+    profile: str = "",
+    hermes_home: str = "",
+    capability_version: int = 0,
+) -> tuple[tuple[ContextVar, Token], ...]:
+    """Bind only the context needed to route detached completions.
+
+    Unlike :func:`set_session_vars`, this helper deliberately leaves platform,
+    chat, user, message, and cwd context untouched. It binds the immutable
+    origin profile/home needed for durable delivery. The returned tokens are
+    stack-scoped: pass them to :func:`reset_delivery_context` in a ``finally``
+    block to restore the exact prior values, including ``_UNSET``.
+    """
+    global _session_context_engaged
+    _session_context_engaged = True
+    return (
+        (_SESSION_KEY, _SESSION_KEY.set(str(session_key or ""))),
+        (_SESSION_ID, _SESSION_ID.set(str(session_id or ""))),
+        (
+            _SESSION_UI_SESSION_ID,
+            _SESSION_UI_SESSION_ID.set(str(ui_session_id or "")),
+        ),
+        (
+            _SESSION_ASYNC_DELIVERY,
+            _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        ),
+        (_SESSION_PROFILE, _SESSION_PROFILE.set(str(profile or ""))),
+        (_SESSION_HERMES_HOME, _SESSION_HERMES_HOME.set(str(hermes_home or ""))),
+        (
+            _SESSION_ASYNC_DELIVERY_VERSION,
+            _SESSION_ASYNC_DELIVERY_VERSION.set(int(capability_version or 0)),
+        ),
+    )
+
+
+def reset_delivery_context(tokens: tuple[tuple[ContextVar, Token], ...]) -> None:
+    """Restore a binding returned by :func:`bind_delivery_context`."""
+    for var, token in reversed(tuple(tokens or ())):
+        var.reset(token)
 
 
 def set_session_vars(
@@ -241,6 +291,8 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_ASYNC_DELIVERY_VERSION.set(_UNSET)
+    _SESSION_HERMES_HOME.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -340,3 +392,43 @@ def async_delivery_supported() -> bool:
     if value is _UNSET:
         return True
     return bool(value)
+
+
+def async_delivery_capability_version() -> int:
+    """Return the explicit durable-host async delivery contract version."""
+    value = _SESSION_ASYNC_DELIVERY_VERSION.get()
+    if value is _UNSET:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_delivery_context_identity() -> dict[str, str | int]:
+    """Return immutable origin identity for durable detached completions."""
+    import os
+    from pathlib import Path
+
+    home_value = _SESSION_HERMES_HOME.get()
+    if home_value is _UNSET or not str(home_value or "").strip():
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    else:
+        home = Path(str(home_value))
+    profile_value = _SESSION_PROFILE.get()
+    profile = (
+        os.environ.get("HERMES_PROFILE", "")
+        if profile_value is _UNSET else str(profile_value or "")
+    )
+    return {
+        "profile": profile,
+        "hermes_home": str(home.expanduser().resolve()),
+        "tracker_path": str((home.expanduser().resolve() / "async_delegations.json")),
+        "session_key": str(_SESSION_KEY.get() if _SESSION_KEY.get() is not _UNSET else ""),
+        "session_id": str(_SESSION_ID.get() if _SESSION_ID.get() is not _UNSET else ""),
+        "ui_session_id": str(
+            _SESSION_UI_SESSION_ID.get()
+            if _SESSION_UI_SESSION_ID.get() is not _UNSET else ""
+        ),
+        "capability_version": async_delivery_capability_version(),
+    }

@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from agent.turn_finalizer import finalize_turn
@@ -31,6 +32,8 @@ class FakeAgent:
         self._iters_since_skill = 0
         self.valid_tool_names = []
         self.persisted_messages = None
+        self.trajectory_messages = None
+        self.external_memory_kwargs = None
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -41,8 +44,8 @@ class FakeAgent:
     def _safe_print(self, *_args, **_kwargs):
         pass
 
-    def _save_trajectory(self, *_args, **_kwargs):
-        pass
+    def _save_trajectory(self, messages, *_args, **_kwargs):
+        self.trajectory_messages = list(messages)
 
     def _cleanup_task_resources(self, *_args, **_kwargs):
         pass
@@ -65,8 +68,8 @@ class FakeAgent:
     def clear_interrupt(self):
         pass
 
-    def _sync_external_memory_for_turn(self, **_kwargs):
-        pass
+    def _sync_external_memory_for_turn(self, **kwargs):
+        self.external_memory_kwargs = kwargs
 
 
 def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
@@ -110,3 +113,57 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert result["messages"][-1] == {"role": "assistant", "content": "Done."}
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
+
+
+def test_bestplan_envelope_is_removed_before_first_persistence(monkeypatch):
+    hook_calls = []
+
+    def capture_hook(name, **kwargs):
+        hook_calls.append((name, kwargs))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture_hook)
+    agent = FakeAgent()
+    envelope = (
+        "<<<HERMES_BESTPLAN_RECEIPT_V1>>>\n"
+        '{"version":1,"body_sha256":"host-validates-authority"}\n'
+        "<<<END_HERMES_BESTPLAN_RECEIPT_V1>>>\n"
+        "Plan narrative.\n"
+        "<<<HERMES_BESTPLAN_V1>>>\n"
+        '{"version":1,"manifest":{"slices":[]}}\n'
+        "<<<END_HERMES_BESTPLAN_V1>>>"
+    )
+    messages = [
+        {"role": "user", "content": "/bestplan test"},
+        {"role": "assistant", "content": envelope},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=envelope,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="/bestplan test",
+        original_user_message="/bestplan test",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response",
+    )
+
+    persisted = agent.persisted_messages[-1]["content"]
+    assert persisted == "Plan narrative."
+    assert "HERMES_BESTPLAN" not in persisted
+    assert agent.trajectory_messages[-1]["content"] == "Plan narrative."
+    assert "HERMES_BESTPLAN" not in json.dumps(
+        agent.external_memory_kwargs, sort_keys=True
+    )
+    assert all(
+        "HERMES_BESTPLAN" not in json.dumps(kwargs, sort_keys=True)
+        for _name, kwargs in hook_calls
+    )
+    # Host capture still receives the raw response after this first write.
+    assert result["final_response"] == envelope

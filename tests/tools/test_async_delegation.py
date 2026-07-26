@@ -13,6 +13,7 @@ import queue
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -137,10 +138,39 @@ def _wait_for_async_idle(timeout=5.0):
 
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch, tmp_path):
+    # These tests exercise the persistent background-delivery path. The current
+    # host contract requires that capability to be explicit rather than inferred
+    # from whichever session ContextVar a prior test left behind.
+    from gateway import session_context
+    from tools import delegate_tool
+
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        session_context,
+        "async_delivery_capability_version",
+        lambda: 1,
+    )
+    # This module tests the async registry, not lane-schema validation. Isolate
+    # it from the operator's live routing config with a complete synthetic lane
+    # map that satisfies current-main's fail-closed mode contract.
+    test_lane = {"provider": "test", "model": "test-model"}
+    monkeypatch.setattr(
+        delegate_tool,
+        "_load_config",
+        lambda: {
+            "lanes": {
+                "code_worker": dict(test_lane),
+                "smart_reviewer": dict(test_lane),
+                "local_worker": dict(test_lane),
+            }
+        },
+    )
     monkeypatch.setattr(
         ad,
         "_persistence_path",
-        lambda: tmp_path / "async_delegations.json",
+        lambda explicit=None: (
+            explicit if explicit is not None else tmp_path / "async_delegations.json"
+        ),
     )
     _wait_for_async_idle()
     ad._reset_for_tests()
@@ -163,6 +193,368 @@ def _drain_one(timeout=5.0, delegation_id=None):
             continue
         time.sleep(0.02)
     return None
+
+
+def test_explicit_tracker_ack_is_verified_and_profile_isolated(tmp_path):
+    coder = tmp_path / "coder" / "async_delegations.json"
+    other = tmp_path / "other" / "async_delegations.json"
+    coder.parent.mkdir(mode=0o700)
+    other.parent.mkdir(mode=0o700)
+    record = {
+        "delegation_id": "bestplan-1",
+        "status": "completed",
+        "origin_tracker_path": str(coder),
+    }
+    ad._persist_record(record, delivery_status="pending")
+
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "bestplan-1",
+        "origin_tracker_path": str(coder),
+    }
+    assert ad.mark_async_delegation_delivered(evt) is True
+    assert ad._read_persisted_unlocked(coder)["records"]["bestplan-1"]["delivery_status"] == "delivered"
+    assert ad._read_persisted_unlocked(other)["records"] == {}
+
+    wrong = {**evt, "origin_tracker_path": str(other)}
+    with pytest.raises(KeyError):
+        ad.mark_async_delegation_delivered(wrong)
+
+
+def test_deterministic_batch_dispatch_id_is_idempotent(tmp_path):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    tracker.parent.mkdir(mode=0o700)
+    gate = threading.Event()
+    calls = []
+
+    def runner():
+        calls.append("run")
+        gate.wait(timeout=5)
+        return {"results": [{"status": "completed", "summary": "done"}]}
+
+    kwargs = dict(
+        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=runner, max_async_children=2,
+        delegation_id="bestplan-fixed", origin_tracker_path=str(tracker),
+        origin_profile="coder", bestplan_plan_id="bp-1",
+        resolved_runtimes=[{
+            "provider": "test",
+            "model": "m",
+            "request_overrides": {
+                "headers": {"Authorization": "Bearer tracker-secret"},
+                "temperature": 0.2,
+            },
+        }],
+    )
+    first = ad.dispatch_async_delegation_batch(**kwargs)
+    second = ad.dispatch_async_delegation_batch(**kwargs)
+    assert first["delegation_id"] == second["delegation_id"] == "bestplan-fixed"
+    assert second["idempotent_replay"] is True
+    persisted_text = json.dumps(ad._read_persisted_unlocked(tracker), sort_keys=True)
+    assert "tracker-secret" not in persisted_text
+    assert "Authorization" not in persisted_text
+    assert '"temperature": 0.2' in persisted_text
+    gate.set()
+    assert _drain_one(delegation_id="bestplan-fixed") is not None
+    assert calls == ["run"]
+
+
+def test_concurrent_same_dispatch_id_has_one_admission_and_one_runner(
+    tmp_path, monkeypatch,
+):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    tracker.parent.mkdir(mode=0o700)
+    runner_gate = threading.Event()
+    first_intent = threading.Event()
+    release_first = threading.Event()
+    calls_lock = threading.Lock()
+    intent_calls = 0
+    runner_calls = 0
+    real_persist = ad._persist_record
+
+    def delayed_intent(record, **kwargs):
+        nonlocal intent_calls
+        if (
+            record.get("delegation_id") == "bestplan-concurrent"
+            and record.get("status") == "intent"
+        ):
+            with calls_lock:
+                intent_calls += 1
+                ordinal = intent_calls
+            if ordinal == 1:
+                first_intent.set()
+                release_first.wait(timeout=0.3)
+            else:
+                release_first.set()
+        return real_persist(record, **kwargs)
+
+    def runner():
+        nonlocal runner_calls
+        with calls_lock:
+            runner_calls += 1
+        runner_gate.wait(timeout=5)
+        return {"results": [{"status": "completed", "summary": "done"}]}
+
+    monkeypatch.setattr(ad, "_persist_record", delayed_intent)
+    kwargs = dict(
+        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=runner, max_async_children=2,
+        delegation_id="bestplan-concurrent", origin_tracker_path=str(tracker),
+        origin_profile="coder", bestplan_plan_id="bp-concurrent",
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(ad.dispatch_async_delegation_batch, **kwargs)
+        assert first_intent.wait(timeout=1)
+        second = pool.submit(ad.dispatch_async_delegation_batch, **kwargs)
+        results = [first.result(timeout=5), second.result(timeout=5)]
+
+    assert intent_calls == 1
+    assert sum(bool(result.get("idempotent_replay")) for result in results) == 1
+    runner_gate.set()
+    assert _drain_one(delegation_id="bestplan-concurrent") is not None
+    assert runner_calls == 1
+
+
+def test_dead_owner_running_dispatch_is_lost_not_idempotently_live(tmp_path):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    tracker.parent.mkdir(mode=0o700)
+    delegation_id = "bestplan-dead-running"
+    ad._persist_record(
+        {
+            "delegation_id": delegation_id,
+            "goal": "work",
+            "status": "running",
+            "delivery_status": "running",
+            "owner_pid": 99_999_999,
+            "runtime_owner_id": "dead-runtime",
+            "runtime_owner_pid": 99_999_999,
+            "runtime_owner_start_token": "dead-start-token",
+            "origin_tracker_path": str(tracker),
+            "origin_profile": "coder",
+            "session_key": "s",
+            "model": "m",
+        },
+        delivery_status="running",
+    )
+    runner_called = threading.Event()
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=lambda: runner_called.set() or {"results": []},
+        max_async_children=1, delegation_id=delegation_id,
+        origin_tracker_path=str(tracker), origin_profile="coder",
+        bestplan_plan_id="bp-dead-running",
+    )
+
+    assert result["status"] == "terminal"
+    assert result["phase"] == "lost"
+    assert runner_called.is_set() is False
+    persisted = ad._read_persisted_unlocked(tracker)["records"][delegation_id]
+    assert persisted["status"] == "lost"
+    assert _drain_one(delegation_id=delegation_id) is not None
+
+
+def test_scheduled_pid_reuse_is_retryable_intent(tmp_path, monkeypatch):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    tracker.parent.mkdir(mode=0o700)
+    delegation_id = "bestplan-stale-scheduled-owner"
+    ad._persist_record(
+        {
+            "delegation_id": delegation_id,
+            "status": "scheduled",
+            "delivery_status": "scheduled",
+            "owner_pid": os.getpid(),
+            "runtime_owner_id": "old-runtime",
+            "runtime_owner_pid": os.getpid(),
+            "runtime_owner_start_token": "stale-start-token",
+            "origin_tracker_path": str(tracker),
+            "origin_profile": "coder",
+            "session_key": "s",
+        },
+        delivery_status="scheduled",
+    )
+    monkeypatch.setattr(
+        ad, "_safe_process_start_token", lambda _pid: "current-start-token"
+    )
+
+    recovered = ad.recover_async_delegations(tracker)
+    assert recovered == {"lost": 0, "queued": 0}
+    persisted = ad._read_persisted_unlocked(tracker)["records"][delegation_id]
+    assert persisted["status"] == "intent"
+    assert persisted["record"]["status"] == "intent"
+
+
+def test_submit_failure_repairs_intent_and_retry_schedules_once(tmp_path, monkeypatch):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    tracker.parent.mkdir(mode=0o700)
+    calls = []
+
+    class BrokenExecutor:
+        def submit(self, _fn):
+            raise RuntimeError("submit failed")
+
+    real_get_executor = ad._get_executor
+    monkeypatch.setattr(ad, "_get_executor", lambda _workers: BrokenExecutor())
+    kwargs = dict(
+        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=lambda: calls.append("run") or {"results": []},
+        max_async_children=1, delegation_id="bestplan-submit",
+        origin_tracker_path=str(tracker), origin_profile="coder",
+        bestplan_plan_id="bp-submit",
+    )
+    failed = ad.dispatch_async_delegation_batch(**kwargs)
+    assert failed["status"] == "rejected"
+    entry = ad._read_persisted_unlocked(tracker)["records"]["bestplan-submit"]
+    assert entry["status"] == "intent"
+    assert calls == []
+
+    monkeypatch.setattr(ad, "_get_executor", real_get_executor)
+    retried = ad.dispatch_async_delegation_batch(**kwargs)
+    assert retried["status"] == "dispatched"
+    assert _drain_one(delegation_id="bestplan-submit") is not None
+    assert calls == ["run"]
+
+
+def test_strict_dispatch_never_runs_without_durable_running_checkpoint(
+    tmp_path, monkeypatch,
+):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    tracker.parent.mkdir(mode=0o700)
+    runner_called = threading.Event()
+    real_persist = ad._persist_record
+
+    def fail_running_checkpoint(record, **kwargs):
+        if record.get("status") == "running":
+            return False
+        return real_persist(record, **kwargs)
+
+    monkeypatch.setattr(ad, "_persist_record", fail_running_checkpoint)
+    result = ad.dispatch_async_delegation_batch(
+        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s",
+        runner=lambda: runner_called.set() or {"results": []},
+        max_async_children=1,
+        delegation_id="bestplan-running-checkpoint",
+        origin_tracker_path=str(tracker),
+        origin_profile="coder",
+        bestplan_plan_id="bp-running-checkpoint",
+    )
+
+    assert result["status"] == "rejected"
+    assert "running checkpoint" in result["error"]
+    assert runner_called.wait(timeout=0.5) is False
+    persisted = ad._read_persisted_unlocked(tracker)["records"][
+        "bestplan-running-checkpoint"
+    ]
+    assert persisted["status"] == "intent"
+
+
+def test_running_checkpoint_timeout_never_false_acks_retry(tmp_path, monkeypatch):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    tracker.parent.mkdir(mode=0o700)
+    running_write_entered = threading.Event()
+    release_running_write = threading.Event()
+    runner_called = threading.Event()
+    real_persist = ad._persist_record
+
+    def block_running_checkpoint(record, **kwargs):
+        if (
+            record.get("delegation_id") == "bestplan-running-timeout"
+            and record.get("status") == "running"
+            and not release_running_write.is_set()
+        ):
+            running_write_entered.set()
+            release_running_write.wait(timeout=1)
+        return real_persist(record, **kwargs)
+
+    monkeypatch.setattr(ad, "_RUNNING_CHECKPOINT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(ad, "_persist_record", block_running_checkpoint)
+    kwargs = dict(
+        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=lambda: runner_called.set() or {"results": []},
+        max_async_children=1, delegation_id="bestplan-running-timeout",
+        origin_tracker_path=str(tracker), origin_profile="coder",
+        bestplan_plan_id="bp-running-timeout",
+    )
+
+    first = ad.dispatch_async_delegation_batch(**kwargs)
+    assert running_write_entered.is_set()
+    assert first["status"] == "rejected"
+    retry_while_aborting = ad.dispatch_async_delegation_batch(**kwargs)
+    assert retry_while_aborting["status"] == "rejected"
+    assert not retry_while_aborting.get("idempotent_replay")
+
+    release_running_write.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        persisted = ad._read_persisted_unlocked(tracker)["records"].get(
+            "bestplan-running-timeout", {}
+        )
+        if persisted.get("status") == "intent":
+            break
+        time.sleep(0.01)
+    assert persisted["status"] == "intent"
+
+    accepted = ad.dispatch_async_delegation_batch(**kwargs)
+    assert accepted["status"] == "dispatched"
+    assert runner_called.wait(timeout=1)
+    assert _drain_one(delegation_id="bestplan-running-timeout") is not None
+
+
+def test_crash_before_submit_leaves_intent_retryable(tmp_path):
+    tracker = tmp_path / "profile" / "async_delegations.json"
+    tracker.parent.mkdir(mode=0o700)
+    delegation_id = "bestplan-crash-before-submit"
+    ad._write_persisted_unlocked(
+        {
+            "version": 1,
+            "records": {
+                delegation_id: {
+                    "status": "intent",
+                    "delivery_status": "intent",
+                    "record": {
+                        "delegation_id": delegation_id,
+                        "status": "intent",
+                        "delivery_status": "intent",
+                        "owner_pid": 99999999,
+                    },
+                },
+            },
+        },
+        tracker,
+    )
+    calls = []
+    result = ad.dispatch_async_delegation_batch(
+        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=lambda: calls.append("run") or {"results": []},
+        max_async_children=1, delegation_id=delegation_id,
+        origin_tracker_path=str(tracker), origin_profile="coder",
+        bestplan_plan_id="bp-crash-before-submit",
+    )
+    assert result["status"] == "dispatched"
+    assert _drain_one(delegation_id=delegation_id) is not None
+    assert calls == ["run"]
+
+
+def test_profile_replay_identity_includes_canonical_tracker_path(tmp_path):
+    first = tmp_path / "p1" / "async_delegations.json"
+    second = tmp_path / "p2" / "async_delegations.json"
+    first.parent.mkdir(mode=0o700)
+    second.parent.mkdir(mode=0o700)
+    for tracker, profile in ((first, "p1"), (second, "p2")):
+        record = {
+            "delegation_id": "same-id", "status": "completed",
+            "origin_profile": profile, "origin_tracker_path": str(tracker),
+            "session_key": profile,
+        }
+        event = {
+            "type": "async_delegation", "delegation_id": "same-id",
+            "origin_profile": profile, "origin_tracker_path": str(tracker),
+            "session_key": profile,
+        }
+        ad._persist_record(record, event=event, delivery_status="pending")
+    assert ad.recover_async_delegations(first)["queued"] == 1
+    assert ad.recover_async_delegations(second)["queued"] == 1
 
 
 def test_dispatch_returns_immediately_without_blocking():
@@ -877,8 +1269,12 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
+    parent.enabled_toolsets = ["terminal", "file"]
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
+    fake_child._delegate_lane = "code_worker"
+    fake_child._delegate_provider = "test"
+    fake_child._delegate_model = "m"
     fake_child._subagent_id = "s1"
 
     gate = threading.Event()
@@ -953,6 +1349,7 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
+    parent.enabled_toolsets = ["terminal", "file"]
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
 
@@ -1017,6 +1414,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
+    parent.enabled_toolsets = ["terminal", "file"]
 
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
@@ -1177,9 +1575,19 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     parent.session_id = "sess"
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
+    parent.enabled_toolsets = ["terminal", "file"]
+    parent._memory_manager = None
+    parent.context_compressor = None
+    parent.session_estimated_cost_usd = 0.0
+    parent._current_turn_id = ""
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
+    fake_child._delegate_lane = "code_worker"
+    fake_child._delegate_provider = "test"
+    fake_child._delegate_model = "m"
+    fake_child._delegate_mode = "execute"
     fake_child._subagent_id = "s1"
+    fake_child.session_id = "child-sess"
 
     gate = threading.Event()
 
@@ -1207,14 +1615,13 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
          patch.object(dt, "_resolve_lane_for_task", return_value="code_worker"), \
          patch.object(dt, "_preflight_lane_toolsets", return_value=None):
         out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
-
-    import json
-    parsed_bg = json.loads(out)
-    assert parsed_bg["status"] == "dispatched"
-    # Child detached immediately at dispatch, while it is still running.
-    assert fake_child not in parent._active_children
-    gate.set()
-    assert _drain_one(delegation_id=parsed_bg["delegation_id"]) is not None
+        import json
+        parsed_bg = json.loads(out)
+        assert parsed_bg["status"] == "dispatched"
+        # Child detached immediately at dispatch, while it is still running.
+        assert fake_child not in parent._active_children
+        gate.set()
+        assert _drain_one(delegation_id=parsed_bg["delegation_id"]) is not None
 
 
 def test_concurrent_dispatch_respects_capacity():

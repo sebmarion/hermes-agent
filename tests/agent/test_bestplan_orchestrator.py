@@ -32,6 +32,34 @@ def _candidate_text(label="ok"):
     )
 
 
+def _synth_plan_envelope():
+    manifest = {
+        "version": 1,
+        "mode": "delegate",
+        "risk": "low",
+        "slices": [{
+            "id": "implement",
+            "kind": "implement",
+            "goal": "Implement the requested change.",
+            "depends_on": [],
+            "capability": "fast_fallback",
+            "workspace": "/tmp/work",
+            "allowed_paths": ["src/"],
+            "read_only": False,
+            "expected_artifacts": ["src/result.txt"],
+            "acceptance": ["The requested change is verified."],
+        }],
+        "merge_policy": "Verify before integration.",
+        "stop_condition": "Acceptance passes.",
+        "escalation_predicates": ["security_sensitive_request"],
+    }
+    return (
+        "<<<HERMES_BESTPLAN_V1>>>\n"
+        + json.dumps(manifest, sort_keys=True)
+        + "\n<<<END_HERMES_BESTPLAN_V1>>>"
+    )
+
+
 def _runtime_config(**overrides):
     config = {
         "lanes": [
@@ -190,6 +218,32 @@ def test_receipt_has_canonical_markers_and_hash():
     assert body_sha256(body)
 
 
+def test_synthesizer_envelope_must_pass_exact_v1_capture_constraints():
+    import agent.bestplan_orchestrator as orchestrator
+
+    manifest = json.loads(
+        _synth_plan_envelope().splitlines()[1]
+    )
+    second = dict(manifest["slices"][0])
+    second.update(
+        {
+            "id": "dependent",
+            "goal": "Run after the first slice.",
+            "depends_on": ["implement"],
+        }
+    )
+    manifest["slices"].append(second)
+    body = (
+        "<<<HERMES_BESTPLAN_V1>>>\n"
+        + json.dumps(manifest)
+        + "\n<<<END_HERMES_BESTPLAN_V1>>>"
+    )
+
+    assert orchestrator._validated_plan_envelope(
+        body, workspace="/tmp/work"
+    ) is None
+
+
 def test_append_and_reconcile_is_idempotent(tmp_path):
     path = tmp_path / "receipts.jsonl"
     append_receipt(path, {"run_id": "run-1", "status": "running"})
@@ -211,7 +265,7 @@ def test_run_bestplan_uses_resolved_lane_identity_and_truthful_receipt(
 
         def run_conversation(self, prompt):
             if "active BestPlan synthesizer" in prompt:
-                return {"final_response": "final plan"}
+                return {"final_response": _synth_plan_envelope()}
             return {"final_response": _candidate_text()}
 
         def interrupt(self, *_args, **_kwargs):
@@ -223,6 +277,7 @@ def test_run_bestplan_uses_resolved_lane_identity_and_truthful_receipt(
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
     monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda agent, lane: _identity(lane))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
 
     result = run_bestplan(SimpleNamespace(session_id="parent"), "plan it", count=2, config=_runtime_config())
 
@@ -242,6 +297,19 @@ def test_run_bestplan_uses_resolved_lane_identity_and_truthful_receipt(
     assert durable["provider"] == receipt_json["provider"]
     assert durable["model"] == receipt_json["model"]
     assert durable["api_mode"] == receipt_json["api_mode"]
+    from agent.bestplan_state import BestplanStore, capture_bestplan_response
+
+    capture = capture_bestplan_response(
+        result["final_response"],
+        session_id="webui-session",
+        profile="coder",
+        workspace="/tmp/work",
+        baseline_fingerprint="base",
+        store=BestplanStore(db_path=tmp_path / "authority.db"),
+    )
+    assert capture.executable is True
+    assert "Authoritative executable manifest" in capture.response
+    assert "HERMES_BESTPLAN" not in capture.response
 
 
 def test_lane_credential_resolution_uses_configured_provider_model_and_endpoint(
@@ -311,7 +379,7 @@ def test_parallel_explorers_build_sequentially_and_restore_tool_global(monkeypat
 
         def run_conversation(self, prompt):
             if "active BestPlan synthesizer" in prompt:
-                return {"final_response": "final plan"}
+                return {"final_response": _synth_plan_envelope()}
             return {"final_response": _candidate_text()}
 
         def interrupt(self, *_args, **_kwargs):
@@ -322,6 +390,7 @@ def test_parallel_explorers_build_sequentially_and_restore_tool_global(monkeypat
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
     monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda agent, lane: _identity(lane))
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
 
     result = run_bestplan(SimpleNamespace(session_id="parent"), "plan it", count=2, config=_runtime_config())
 
