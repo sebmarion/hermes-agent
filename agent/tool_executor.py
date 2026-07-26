@@ -31,9 +31,11 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import (
+    FAILURE_STREAK_GUARDRAIL_CODES,
     ToolCallObservation,
     ToolGuardrailDecision,
     append_toolguard_guidance,
+    observation_proves_verified_file_progress,
 )
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
@@ -115,12 +117,38 @@ def _resolve_concurrent_tool_timeout() -> float | None:
     return value
 
 
+def _clear_stale_failure_halts_after_verified_progress(agent) -> None:
+    """Drop only agent-level halts invalidated by a material patch."""
+    recorded = getattr(agent, "_tool_guardrail_halt_decisions", None)
+    survivors = [
+        decision
+        for decision in (recorded if isinstance(recorded, list) else [])
+        if decision.code not in FAILURE_STREAK_GUARDRAIL_CODES
+    ]
+    agent._tool_guardrail_halt_decisions = survivors
+    current = getattr(agent, "_tool_guardrail_halt_decision", None)
+    if (
+        current is not None
+        and current.code in FAILURE_STREAK_GUARDRAIL_CODES
+    ):
+        agent._tool_guardrail_halt_decision = next(
+            (decision for decision in survivors if decision.should_halt),
+            None,
+        )
+
+
 def _finalize_guardrail_observations(
     agent,
     observations: list[ToolCallObservation],
 ) -> list[ToolGuardrailDecision]:
     """Finalize one assistant tool batch and retain its first terminal decision."""
+    verified_progress = any(
+        observation_proves_verified_file_progress(observation)
+        for observation in observations
+    )
     decisions = agent._tool_guardrails.after_batch(observations)
+    if verified_progress:
+        _clear_stale_failure_halts_after_verified_progress(agent)
     for decision in decisions:
         if decision.should_halt:
             agent._set_tool_guardrail_halt(decision)
@@ -483,6 +511,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Keep both audit-original args and request-middleware output. Execution
     # middleware may rewrite the effective args again inside the worker.
     parsed_calls = []
+    guardrail_signatures = []
     for tool_call in tool_calls:
         function_name = tool_call.function.name
 
@@ -502,6 +531,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     False,
                 )
             )
+            guardrail_signatures.append(None)
             continue
 
         # Reset nudge counters only for a structurally valid invocation.
@@ -562,6 +592,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
         blocked_by_guardrail = False
+        guardrail_signature = None
         if _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
@@ -609,6 +640,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             else:
                 guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+                guardrail_signature = guardrail_decision.signature
                 if not guardrail_decision.allows_execution:
                     block_result = agent._guardrail_block_result(guardrail_decision)
                     blocked_by_guardrail = True
@@ -636,6 +668,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 blocked_by_guardrail,
             )
         )
+        guardrail_signatures.append(guardrail_signature)
 
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(name for _, name, _, _, _, _, _ in parsed_calls)
@@ -1042,6 +1075,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     ),
                     failed=True,
                     executed=result_index in authorized_snapshot,
+                    guardrail_signature=guardrail_signatures[result_index],
                 ),
             ))
             continue
@@ -1066,6 +1100,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 ),
                 failed=observed_failed,
                 executed=not observed_blocked,
+                guardrail_signature=guardrail_signatures[result_index],
             ),
         ))
     guardrail_decisions = _finalize_guardrail_observations(
@@ -1418,8 +1453,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
+        guardrail_signature = None
         if _block_msg is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+            guardrail_signature = guardrail_decision.signature
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
 
@@ -1881,6 +1918,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ),
             failed=_is_error_result,
             executed=not _execution_blocked,
+            guardrail_signature=guardrail_signature,
         ))
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (

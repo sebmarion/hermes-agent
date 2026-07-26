@@ -289,6 +289,583 @@ def test_mixed_success_and_failure_in_one_epoch_resets_failure_and_no_progress_s
     assert controller.halt_decision is None
 
 
+def test_verified_patch_resets_prior_exact_failure_streak_across_tools():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    terminal_args = {"command": "run-focused-test"}
+    patch_result = json.dumps({
+        "success": True,
+        "diff": "--- a/example.py\n+++ b/example.py\n@@\n-old\n+new\n",
+    })
+
+    controller.after_call(
+        "terminal",
+        terminal_args,
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    controller.after_call(
+        "terminal",
+        terminal_args,
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    controller.after_call(
+        "patch",
+        {"patch": "*** Begin Patch\n*** End Patch"},
+        patch_result,
+        failed=False,
+    )
+
+    assert controller.before_call("terminal", terminal_args).action == "allow"
+    controller.after_call(
+        "terminal",
+        terminal_args,
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    assert controller.before_call("terminal", terminal_args).action == "allow"
+
+
+def test_verified_patch_resets_prior_same_tool_varying_argument_failure_streak():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=2,
+            same_tool_failure_halt_after=3,
+        )
+    )
+    controller.after_call(
+        "terminal",
+        {"command": "bad-1"},
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    controller.after_call(
+        "terminal",
+        {"command": "bad-2"},
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    controller.after_call(
+        "patch",
+        {"patch": "*** Begin Patch\n*** End Patch"},
+        json.dumps({
+            "success": True,
+            "diff": "--- a/example.py\n+++ b/example.py\n@@\n-old\n+new\n",
+        }),
+        failed=False,
+    )
+
+    decision = controller.after_call(
+        "terminal",
+        {"command": "bad-3"},
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+
+    assert decision.action == "allow"
+    assert decision.count == 1
+    assert controller.halt_decision is None
+
+
+def test_empty_patch_diff_does_not_reset_prior_failure_streak():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    terminal_args = {"command": "still-broken"}
+    for _ in range(2):
+        controller.after_call(
+            "terminal",
+            terminal_args,
+            json.dumps({"exit_code": 1}),
+            failed=True,
+        )
+
+    controller.after_call(
+        "patch",
+        {"patch": "*** Begin Patch\n*** End Patch"},
+        json.dumps({"success": True, "diff": " \n\t"}),
+        failed=False,
+    )
+
+    blocked = controller.before_call("terminal", terminal_args)
+    assert blocked.action == "block"
+    assert blocked.code == "repeated_exact_failure_block"
+
+
+def test_write_file_metadata_does_not_reset_prior_failure_streak():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    terminal_args = {"command": "still-broken"}
+    for _ in range(2):
+        controller.after_call(
+            "terminal",
+            terminal_args,
+            json.dumps({"exit_code": 1}),
+            failed=True,
+        )
+
+    controller.after_call(
+        "write_file",
+        {"path": "/tmp/example.py", "content": "same"},
+        json.dumps({
+            "bytes_written": 4,
+            "files_modified": ["/tmp/example.py"],
+        }),
+        failed=False,
+    )
+
+    blocked = controller.before_call("terminal", terminal_args)
+    assert blocked.action == "block"
+    assert blocked.code == "repeated_exact_failure_block"
+
+
+def test_verified_patch_preserves_typed_schema_and_idempotent_guardrail_state():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=99,
+            same_tool_failure_halt_after=99,
+            no_progress_block_after=2,
+        )
+    )
+    skill_args = {"name": "unavailable", "action": "patch"}
+    controller.after_call(
+        "skill_manage",
+        skill_args,
+        json.dumps({
+            "success": False,
+            "error": "wrong active profile",
+            "error_code": "skill_profile_mismatch",
+            "error_class": "capability",
+        }),
+        failed=True,
+    )
+    schema_args = {"pattern": "*.spec.ts", "target": "content"}
+    controller.after_call(
+        "search_files",
+        schema_args,
+        json.dumps({
+            "error": "file glob used as content regex",
+            "error_code": "search_files_glob_used_as_content_regex",
+            "error_class": "schema_correctable",
+            "retry_policy": {"max_corrected_retries": 1},
+        }),
+        failed=True,
+    )
+    read_args = {"path": "/tmp/same.txt"}
+    controller.after_call("read_file", read_args, "same", failed=False)
+    controller.after_call("read_file", read_args, "same", failed=False)
+
+    controller.after_call(
+        "patch",
+        {"patch": "*** Begin Patch\n*** End Patch"},
+        json.dumps({
+            "success": True,
+            "diff": "--- a/example.py\n+++ b/example.py\n@@\n-old\n+new\n",
+        }),
+        failed=False,
+    )
+
+    typed = controller.before_call("skill_manage", skill_args)
+    schema = controller.before_call("search_files", schema_args)
+    no_progress = controller.before_call("read_file", read_args)
+    assert typed.action == "deny"
+    assert typed.code == "typed_permanent_failure_no_retry"
+    assert schema.action == "deny"
+    assert schema.code == "schema_retry_requires_changed_arguments"
+    assert no_progress.action == "block"
+    assert no_progress.code == "idempotent_no_progress_block"
+
+
+def test_same_argument_schema_retry_requires_matching_remediation_then_runs_once():
+    controller = ToolCallGuardrailController()
+    write_args = {
+        "action": "patch",
+        "name": "reviewed",
+        "old_string": "before",
+        "new_string": "after",
+    }
+    typed_error = json.dumps(
+        {
+            "success": False,
+            "error": "load the current skill before writing",
+            "error_code": "skill_view_required",
+            "error_class": "schema_correctable",
+            "retry_policy": {
+                "max_corrected_retries": 1,
+                "requires_argument_change": False,
+                "remediation": {
+                    "tool_name": "skill_view",
+                    "arguments": {"name": "reviewed"},
+                },
+            },
+        }
+    )
+
+    controller.after_call("skill_manage", write_args, typed_error, failed=True)
+
+    before_view = controller.before_call("skill_manage", write_args)
+    assert before_view.action == "deny"
+    assert before_view.code == "schema_retry_requires_remediation"
+
+    controller.after_call(
+        "skill_view",
+        {"name": "different-skill"},
+        json.dumps({"success": True, "content_revision": "wrong"}),
+        failed=False,
+    )
+    still_blocked = controller.before_call("skill_manage", write_args)
+    assert still_blocked.action == "deny"
+    assert still_blocked.code == "schema_retry_requires_remediation"
+
+    controller.after_call(
+        "skill_view",
+        {"name": "reviewed"},
+        json.dumps({"success": True, "content_revision": "current"}),
+        failed=False,
+    )
+    allowed = controller.before_call("skill_manage", write_args)
+    assert allowed.allows_execution is True
+    controller.after_call(
+        "skill_manage",
+        write_args,
+        json.dumps({"success": False, "error": "another schema error"}),
+        failed=True,
+    )
+
+    exhausted = controller.before_call("skill_manage", write_args)
+    assert exhausted.action == "deny"
+    assert exhausted.code == "schema_corrected_retry_exhausted"
+
+
+def test_typed_failures_and_verified_patch_share_one_epoch_without_state_loss():
+    controller = ToolCallGuardrailController()
+    skill_args = {"name": "unavailable", "action": "patch"}
+    schema_args = {"pattern": "*.spec.ts", "target": "content"}
+
+    controller.after_batch([
+        ToolCallObservation(
+            "patch",
+            {"path": "/tmp/example.py"},
+            json.dumps({"success": True, "diff": "-old\n+new"}),
+            failed=False,
+        ),
+        ToolCallObservation(
+            "skill_manage",
+            skill_args,
+            json.dumps({
+                "success": False,
+                "error": "wrong active profile",
+                "error_code": "skill_profile_mismatch",
+                "error_class": "capability",
+            }),
+            failed=True,
+        ),
+        ToolCallObservation(
+            "search_files",
+            schema_args,
+            json.dumps({
+                "error": "file glob used as content regex",
+                "error_code": "search_files_glob_used_as_content_regex",
+                "error_class": "schema_correctable",
+                "retry_policy": {"max_corrected_retries": 1},
+            }),
+            failed=True,
+        ),
+    ])
+
+    assert controller.before_call("skill_manage", skill_args).code == (
+        "typed_permanent_failure_no_retry"
+    )
+    assert controller.before_call("search_files", schema_args).code == (
+        "schema_retry_requires_changed_arguments"
+    )
+    assert controller.observation_epochs == 1
+
+
+def test_schema_remediation_in_one_epoch_follows_model_order():
+    write_args = {
+        "action": "patch",
+        "name": "reviewed",
+        "old_string": "before",
+        "new_string": "after",
+    }
+    typed_error = json.dumps({
+        "success": False,
+        "error": "load the current skill before writing",
+        "error_code": "skill_view_required",
+        "error_class": "schema_correctable",
+        "retry_policy": {
+            "max_corrected_retries": 1,
+            "requires_argument_change": False,
+            "remediation": {
+                "tool_name": "skill_view",
+                "arguments": {"name": "reviewed"},
+            },
+        },
+    })
+    failure = ToolCallObservation(
+        "skill_manage",
+        write_args,
+        typed_error,
+        failed=True,
+    )
+    remediation = ToolCallObservation(
+        "skill_view",
+        {"name": "reviewed"},
+        json.dumps({"success": True, "content_revision": "current"}),
+        failed=False,
+    )
+
+    remediated = ToolCallGuardrailController()
+    remediated.after_batch([failure, remediation])
+    assert remediated.before_call("skill_manage", write_args).allows_execution
+
+    not_yet_remediated = ToolCallGuardrailController()
+    not_yet_remediated.after_batch([remediation, failure])
+    assert not_yet_remediated.before_call("skill_manage", write_args).code == (
+        "schema_retry_requires_remediation"
+    )
+
+
+def test_invalid_same_argument_remediation_metadata_fails_closed():
+    write_args = {"action": "patch", "name": "reviewed"}
+    for remediation in (None, {"tool_name": "skill_view", "arguments": "bad"}):
+        retry_policy = {
+            "max_corrected_retries": 1,
+            "requires_argument_change": False,
+        }
+        if remediation is not None:
+            retry_policy["remediation"] = remediation
+        controller = ToolCallGuardrailController()
+        controller.after_call(
+            "skill_manage",
+            write_args,
+            json.dumps({
+                "success": False,
+                "error": "load current skill before writing",
+                "error_code": "skill_view_required",
+                "error_class": "schema_correctable",
+                "retry_policy": retry_policy,
+            }),
+            failed=True,
+        )
+
+        same_args = controller.before_call("skill_manage", write_args)
+        assert same_args.code == "schema_retry_requires_changed_arguments"
+        changed_args = controller.before_call(
+            "skill_manage",
+            {**write_args, "old_string": "before", "new_string": "after"},
+        )
+        assert changed_args.allows_execution
+
+
+def test_nonexecuted_corrected_retry_releases_reservation_without_consuming_it():
+    controller = ToolCallGuardrailController()
+    failed_args = {"pattern": "*.spec.ts", "target": "content"}
+    controller.after_call(
+        "search_files",
+        failed_args,
+        json.dumps({
+            "error": "file glob used as content regex",
+            "error_code": "search_files_glob_used_as_content_regex",
+            "error_class": "schema_correctable",
+            "retry_policy": {"max_corrected_retries": 1},
+        }),
+        failed=True,
+    )
+    first_corrected = {"pattern": "*.spec.ts", "target": "files"}
+    second_corrected = {"pattern": "*.test.ts", "target": "files"}
+
+    first_decision = controller.before_call(
+        "search_files",
+        first_corrected,
+    )
+    assert first_decision.allows_execution
+    assert controller.before_call(
+        "search_files",
+        second_corrected,
+    ).code == "schema_corrected_retry_reserved"
+
+    controller.after_batch([
+        ToolCallObservation(
+            "search_files",
+            {**first_corrected, "stage": "execution-rewrite"},
+            json.dumps({"error": "blocked by required policy"}),
+            failed=True,
+            executed=False,
+            guardrail_signature=first_decision.signature,
+        )
+    ])
+
+    assert controller.before_call(
+        "search_files",
+        second_corrected,
+    ).allows_execution
+
+
+def _verified_patch_observation(*, executed=True, diff="-old\n+new"):
+    return ToolCallObservation(
+        "patch",
+        {"path": "/tmp/example.py"},
+        json.dumps({"success": True, "diff": diff}),
+        failed=False,
+        executed=executed,
+    )
+
+
+def test_verified_patch_resets_historical_failures_before_current_epoch():
+    old_args = {"command": "still-broken"}
+    current_failure = ToolCallObservation(
+        "terminal",
+        {"command": "new-check"},
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    for observations in (
+        [_verified_patch_observation(), current_failure],
+        [current_failure, _verified_patch_observation()],
+    ):
+        controller = ToolCallGuardrailController(
+            ToolCallGuardrailConfig(
+                hard_stop_enabled=True,
+                exact_failure_warn_after=99,
+                exact_failure_block_after=2,
+                same_tool_failure_warn_after=99,
+                same_tool_failure_halt_after=3,
+            )
+        )
+        old_failure = ToolCallObservation(
+            "terminal",
+            old_args,
+            json.dumps({"exit_code": 1}),
+            failed=True,
+        )
+        controller.after_batch([old_failure])
+        controller.after_batch([old_failure])
+        assert controller.before_call("terminal", old_args).code == (
+            "repeated_exact_failure_block"
+        )
+
+        decisions = controller.after_batch(observations)
+        terminal_decision = next(
+            decision
+            for decision in decisions
+            if decision.tool_name == "terminal"
+        )
+
+        assert terminal_decision.action == "allow"
+        assert terminal_decision.count == 1
+        assert controller.before_call("terminal", old_args).action == "allow"
+        assert controller.halt_decision is None
+        assert controller.raw_call_counts == {"terminal": 3, "patch": 1}
+        assert controller.observation_epochs == 3
+
+
+def test_unverified_or_synthetic_mutations_do_not_reset_failure_streaks():
+    old_args = {"command": "still-broken"}
+    candidates = [
+        _verified_patch_observation(diff=" \n\t"),
+        ToolCallObservation(
+            "patch",
+            {"path": "/tmp/example.py"},
+            "patch succeeded",
+            failed=False,
+        ),
+        _verified_patch_observation(executed=False),
+        ToolCallObservation(
+            "write_file",
+            {"path": "/tmp/example.py", "content": "new"},
+            json.dumps({"bytes_written": 3}),
+            failed=False,
+        ),
+    ]
+    for candidate in candidates:
+        controller = ToolCallGuardrailController(
+            ToolCallGuardrailConfig(
+                hard_stop_enabled=True,
+                exact_failure_block_after=2,
+                same_tool_failure_halt_after=99,
+            )
+        )
+        failure = ToolCallObservation(
+            "terminal",
+            old_args,
+            json.dumps({"exit_code": 1}),
+            failed=True,
+        )
+        controller.after_batch([failure])
+        controller.after_batch([failure])
+        controller.after_batch([candidate])
+
+        blocked = controller.before_call("terminal", old_args)
+        assert blocked.code == "repeated_exact_failure_block"
+        assert blocked.count == 2
+
+
+def test_verified_patch_keeps_no_progress_and_monotonic_epoch_state():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=99,
+            no_progress_block_after=2,
+        )
+    )
+    terminal_args = {"command": "old-failure"}
+    read_args = {"path": "/tmp/same.txt"}
+    failure = ToolCallObservation(
+        "terminal",
+        terminal_args,
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    unchanged_read = ToolCallObservation(
+        "read_file",
+        read_args,
+        "same contents",
+        failed=False,
+    )
+    controller.after_batch([failure])
+    controller.after_batch([failure])
+    controller.after_batch([unchanged_read])
+    controller.after_batch([unchanged_read])
+    assert controller.before_call("read_file", read_args).code == (
+        "idempotent_no_progress_block"
+    )
+
+    controller.after_batch([_verified_patch_observation()])
+
+    assert controller.before_call("terminal", terminal_args).action == "allow"
+    assert controller.before_call("read_file", read_args).code == (
+        "idempotent_no_progress_block"
+    )
+    assert controller.halt_decision.code == "idempotent_no_progress_block"
+    assert controller.raw_call_counts == {
+        "terminal": 2,
+        "read_file": 2,
+        "patch": 1,
+    }
+    assert controller.observation_epochs == 5
+
+
 def _trigger_no_effect_recovery(controller, tool_name="session_search"):
     first = controller.after_call(
         tool_name,

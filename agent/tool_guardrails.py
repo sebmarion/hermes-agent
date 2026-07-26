@@ -11,11 +11,13 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import (
     file_mutation_result_landed,
+    file_mutation_result_proves_change,
     tool_may_have_side_effect,
 )
 
@@ -61,6 +63,11 @@ MUTATING_TOOL_NAMES = frozenset(
         "process",
     }
 )
+
+FAILURE_STREAK_GUARDRAIL_CODES = frozenset({
+    "repeated_exact_failure_block",
+    "same_tool_failure_halt",
+})
 
 
 @dataclass(frozen=True)
@@ -146,20 +153,21 @@ class ToolCallSignature:
 
 @dataclass(frozen=True)
 class ToolCallObservation:
-    """One requested tool call as observed after an assistant batch completes."""
+    """A model-visible tool result tied to its guardrail authorization identity."""
 
     tool_name: str
     args: Mapping[str, Any] | None
     result: str | None
     failed: bool | None = None
     executed: bool = True
+    guardrail_signature: ToolCallSignature | None = None
 
 
 @dataclass(frozen=True)
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
 
-    action: str = "allow"  # allow | warn | block | halt
+    action: str = "allow"  # allow | warn | deny | block | halt
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
@@ -235,17 +243,42 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     return False, ""
 
 
+def observation_proves_verified_file_progress(
+    observation: ToolCallObservation,
+) -> bool:
+    """Return True for an executed successful patch with a material diff."""
+    if not observation.executed:
+        return False
+    failed = observation.failed
+    if failed is None:
+        failed, _ = classify_tool_failure(
+            observation.tool_name,
+            observation.result,
+        )
+    return not failed and file_mutation_result_proves_change(
+        observation.tool_name,
+        observation.result,
+    )
+
+
 class ToolCallGuardrailController:
     """Per-turn controller for repeated failed/non-progressing tool calls."""
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
+        self._state_lock = RLock()
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._typed_permanent_by_tool: dict[str, tuple[str, str]] = {}
+        self._typed_permanent_by_signature: dict[
+            ToolCallSignature,
+            tuple[str, str],
+        ] = {}
+        self._schema_retry_policies: dict[tuple[str, str], dict[str, Any]] = {}
         self._raw_call_counts: dict[str, int] = {}
         self._observation_epochs = 0
         self._recovery_state = "normal"
@@ -368,6 +401,171 @@ class ToolCallGuardrailController:
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
 
+    def _typed_retry_before_call(
+        self,
+        tool_name: str,
+        signature: ToolCallSignature,
+    ) -> ToolGuardrailDecision | None:
+        """Authorize one typed/schema retry and reserve it until observation."""
+        with self._state_lock:
+            permanent = self._typed_permanent_by_tool.get(tool_name)
+            if permanent is None:
+                permanent = self._typed_permanent_by_signature.get(signature)
+            if permanent is not None:
+                error_code, error_class = permanent
+                return ToolGuardrailDecision(
+                    action="deny",
+                    code="typed_permanent_failure_no_retry",
+                    message=(
+                        f"Denied {tool_name}: its prior {error_class} failure "
+                        f"({error_code}) is non-retryable in this turn. Change "
+                        "capability, credentials, permissions, or strategy instead."
+                    ),
+                    tool_name=tool_name,
+                    count=1,
+                    signature=signature,
+                )
+
+            for (policy_tool, error_code), policy in (
+                self._schema_retry_policies.items()
+            ):
+                if policy_tool != tool_name:
+                    continue
+                failed_signatures = policy["failed_signatures"]
+                if signature in failed_signatures:
+                    if policy["requires_argument_change"]:
+                        return ToolGuardrailDecision(
+                            action="deny",
+                            code="schema_retry_requires_changed_arguments",
+                            message=(
+                                f"Denied {tool_name}: retrying the same arguments "
+                                f"cannot correct schema failure {error_code}. "
+                                "Apply the typed correction before retrying."
+                            ),
+                            tool_name=tool_name,
+                            count=1,
+                            signature=signature,
+                        )
+                    remediation = policy.get("remediation_signature")
+                    if (
+                        remediation is not None
+                        and not policy["remediation_satisfied"]
+                    ):
+                        return ToolGuardrailDecision(
+                            action="deny",
+                            code="schema_retry_requires_remediation",
+                            message=(
+                                f"Denied {tool_name}: retrying schema failure "
+                                f"{error_code} requires one successful "
+                                f"{remediation.tool_name} call with the requested "
+                                "arguments first."
+                            ),
+                            tool_name=tool_name,
+                            count=1,
+                            signature=signature,
+                        )
+                elif not policy["requires_argument_change"]:
+                    # A different call is unrelated to this external-precondition
+                    # retry and must not consume its one allowed attempt.
+                    continue
+                if policy["corrected_retry_used"]:
+                    return ToolGuardrailDecision(
+                        action="deny",
+                        code="schema_corrected_retry_exhausted",
+                        message=(
+                            f"Denied {tool_name}: the single corrected retry for "
+                            f"schema failure {error_code} was already used. Stop "
+                            "guessing and choose a different strategy."
+                        ),
+                        tool_name=tool_name,
+                        count=2,
+                        signature=signature,
+                    )
+                if policy.get("corrected_retry_pending") is not None:
+                    return ToolGuardrailDecision(
+                        action="deny",
+                        code="schema_corrected_retry_reserved",
+                        message=(
+                            f"Denied {tool_name}: the single corrected retry for "
+                            f"schema failure {error_code} is already reserved by "
+                            "another call awaiting an execution result."
+                        ),
+                        tool_name=tool_name,
+                        count=1,
+                        signature=signature,
+                    )
+                policy["corrected_retry_pending"] = signature
+                break
+        return None
+
+    def _record_typed_observations(
+        self,
+        normalized: list[
+            tuple[ToolCallObservation, ToolCallSignature, bool]
+        ],
+    ) -> None:
+        """Commit typed retry state from one model-ordered observation batch."""
+        with self._state_lock:
+            for (policy_tool, _error_code), policy in (
+                self._schema_retry_policies.items()
+            ):
+                pending = policy.get("corrected_retry_pending")
+                if pending is None:
+                    continue
+                matches = [
+                    observation
+                    for observation, signature, _failed in normalized
+                    if observation.tool_name == policy_tool and signature == pending
+                ]
+                if not matches:
+                    continue
+                if any(observation.executed for observation in matches):
+                    policy["corrected_retry_used"] = True
+                policy["corrected_retry_pending"] = None
+
+            for observation, signature, failed in normalized:
+                if not observation.executed:
+                    continue
+                if failed:
+                    error_class, error_code = _typed_tool_error_policy(
+                        observation.result,
+                    )
+                    if error_class in {"auth", "capability", "permanent"}:
+                        self._typed_permanent_by_tool[observation.tool_name] = (
+                            error_code,
+                            error_class,
+                        )
+                    elif error_class == "permission":
+                        self._typed_permanent_by_signature[signature] = (
+                            error_code,
+                            error_class,
+                        )
+                    elif error_class == "schema_correctable":
+                        retry_policy = _typed_schema_retry_policy(
+                            observation.result,
+                        )
+                        policy = self._schema_retry_policies.setdefault(
+                            (observation.tool_name, error_code),
+                            {
+                                "failed_signatures": set(),
+                                "corrected_retry_used": False,
+                                "corrected_retry_pending": None,
+                                **retry_policy,
+                            },
+                        )
+                        policy["failed_signatures"].add(signature)
+                    continue
+
+                for policy in self._schema_retry_policies.values():
+                    if policy.get("remediation_signature") == signature:
+                        policy["remediation_satisfied"] = True
+                for key in [
+                    key
+                    for key in self._schema_retry_policies
+                    if key[0] == observation.tool_name
+                ]:
+                    self._schema_retry_policies.pop(key, None)
+
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
         if self._recovery_tool and tool_name == self._recovery_tool:
@@ -404,6 +602,10 @@ class ToolCallGuardrailController:
                 tool_name=tool_name,
                 signature=signature,
             )
+
+        typed_retry_decision = self._typed_retry_before_call(tool_name, signature)
+        if typed_retry_decision is not None:
+            return typed_retry_decision
 
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
@@ -497,7 +699,10 @@ class ToolCallGuardrailController:
         normalized: list[tuple[ToolCallObservation, ToolCallSignature, bool]] = []
         for observation in observations:
             args = _coerce_args(observation.args)
-            signature = ToolCallSignature.from_call(observation.tool_name, args)
+            signature = (
+                observation.guardrail_signature
+                or ToolCallSignature.from_call(observation.tool_name, args)
+            )
             failed = observation.failed
             if failed is None:
                 failed, _ = classify_tool_failure(
@@ -511,6 +716,22 @@ class ToolCallGuardrailController:
                 )
 
         executed = [item for item in normalized if item[0].executed]
+        self._record_typed_observations(normalized)
+
+        if any(
+            observation_proves_verified_file_progress(observation)
+            for observation, _signature, _failed in executed
+        ):
+            # A verified material patch establishes a new failure epoch. Clear
+            # only historical execution-failure streaks; no-progress, schema,
+            # recovery, raw-call, and epoch state remain authoritative.
+            self._exact_failure_counts.clear()
+            self._same_tool_failure_counts.clear()
+            if (
+                self._halt_decision is not None
+                and self._halt_decision.code in FAILURE_STREAK_GUARDRAIL_CODES
+            ):
+                self._halt_decision = None
         if executed:
             self._observation_epochs += 1
 
@@ -753,6 +974,60 @@ def _result_set_hash(results) -> str:
     """Hash a deduplicated result set independent of worker completion order."""
     members = sorted({_result_hash(result) for result in results})
     return _sha256(json.dumps(members, separators=(",", ":")))
+
+
+def _typed_tool_error_policy(result: str | None) -> tuple[str, str]:
+    """Extract a stable retry class/code from a typed tool error envelope."""
+    parsed = safe_json_loads(result or "")
+    if not isinstance(parsed, dict) and isinstance(result, str):
+        # Guardrail guidance may be appended after a JSON result. Preserve the
+        # envelope's typed policy by decoding only its first JSON value.
+        try:
+            parsed, _end = json.JSONDecoder().raw_decode(result.lstrip())
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+    if not isinstance(parsed, dict):
+        return "", ""
+    error_class = str(parsed.get("error_class") or "").strip().lower()
+    error_code = str(parsed.get("error_code") or "typed_tool_failure").strip()
+    return error_class, error_code
+
+
+def _typed_schema_retry_policy(result: str | None) -> dict[str, Any]:
+    """Extract narrowly-scoped schema retry controls from a typed error."""
+    parsed = safe_json_loads(result or "")
+    if not isinstance(parsed, dict) and isinstance(result, str):
+        try:
+            parsed, _end = json.JSONDecoder().raw_decode(result.lstrip())
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+    raw = parsed.get("retry_policy") if isinstance(parsed, dict) else None
+    if not isinstance(raw, Mapping):
+        raw = {}
+
+    same_argument_retry_requested = (
+        raw.get("requires_argument_change") is False
+    )
+    remediation_signature = None
+    remediation = raw.get("remediation")
+    if same_argument_retry_requested and isinstance(remediation, Mapping):
+        remediation_tool = str(remediation.get("tool_name") or "").strip()
+        remediation_args = remediation.get("arguments")
+        if remediation_tool and isinstance(remediation_args, Mapping):
+            remediation_signature = ToolCallSignature.from_call(
+                remediation_tool,
+                remediation_args,
+            )
+    # Same-argument retries are safe only behind a valid exact remediation.
+    # Missing or malformed metadata falls back to changed arguments.
+    requires_argument_change = not (
+        same_argument_retry_requested and remediation_signature is not None
+    )
+    return {
+        "requires_argument_change": requires_argument_change,
+        "remediation_signature": remediation_signature,
+        "remediation_satisfied": remediation_signature is None,
+    }
 
 
 def _as_bool(value: Any, default: bool) -> bool:

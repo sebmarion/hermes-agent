@@ -6,6 +6,10 @@ from threading import Barrier, Event, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.tool_guardrails import (
+    ToolCallGuardrailController,
+    ToolCallObservation,
+)
 from run_agent import AIAgent
 
 
@@ -224,6 +228,284 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert started_events == [("tool.started", "web_search", allowed_args, {})]
     assert len(completed_events) == 1
     assert completed_events[0][1] == "web_search"
+
+
+def test_typed_capability_failure_is_not_executed_twice_even_without_hard_stop():
+    guardrails = ToolCallGuardrailController()
+    args = {"name": "skill-in-another-profile", "action": "patch"}
+    result = json.dumps({
+        "success": False,
+        "error": "wrong active profile",
+        "error_code": "skill_profile_mismatch",
+        "error_class": "capability",
+    })
+
+    first = guardrails.before_call("skill_manage", args)
+    assert first.allows_execution is True
+    guardrails.after_call("skill_manage", args, result, failed=True)
+    second = guardrails.before_call("skill_manage", args)
+
+    assert second.action == "deny"
+    assert second.code == "typed_permanent_failure_no_retry"
+    assert second.allows_execution is False
+    assert second.should_halt is False
+
+
+def test_schema_correctable_failure_allows_one_changed_retry_only():
+    guardrails = ToolCallGuardrailController()
+    first_args = {"pattern": "*.spec.ts", "target": "content"}
+    typed_error = json.dumps({
+        "error": "file glob used as content regex",
+        "error_code": "search_files_glob_used_as_content_regex",
+        "error_class": "schema_correctable",
+        "retry_policy": {"max_corrected_retries": 1},
+    })
+    guardrails.after_call("search_files", first_args, typed_error, failed=True)
+
+    unchanged = guardrails.before_call("search_files", first_args)
+    assert unchanged.action == "deny"
+    assert unchanged.code == "schema_retry_requires_changed_arguments"
+
+    corrected_args = {"pattern": "*.spec.ts", "target": "files"}
+    corrected = guardrails.before_call("search_files", corrected_args)
+    assert corrected.allows_execution is True
+    guardrails.after_call("search_files", corrected_args, typed_error, failed=True)
+
+    third_args = {"pattern": "*.test.ts", "target": "files"}
+    exhausted = guardrails.before_call("search_files", third_args)
+    assert exhausted.action == "deny"
+    assert exhausted.code == "schema_corrected_retry_exhausted"
+
+
+def test_parallel_corrected_retries_reserve_exactly_one_execution():
+    guardrails = ToolCallGuardrailController()
+    guardrails.after_call(
+        "search_files",
+        {"pattern": "*.spec.ts", "target": "content"},
+        json.dumps({
+            "error": "file glob used as content regex",
+            "error_code": "search_files_glob_used_as_content_regex",
+            "error_class": "schema_correctable",
+            "retry_policy": {"max_corrected_retries": 1},
+        }),
+        failed=True,
+    )
+    barrier = Barrier(3)
+    decisions = []
+    candidates = [
+        {"pattern": "*.spec.ts", "target": "files"},
+        {"pattern": "*.test.ts", "target": "files"},
+    ]
+
+    def authorize(args):
+        barrier.wait(timeout=2)
+        decisions.append((args, guardrails.before_call("search_files", args)))
+
+    threads = [Thread(target=authorize, args=(args,)) for args in candidates]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=2)
+    for thread in threads:
+        thread.join(timeout=2)
+
+    allowed = [item for item in decisions if item[1].allows_execution]
+    denied = [item for item in decisions if not item[1].allows_execution]
+    assert len(allowed) == 1
+    assert len(denied) == 1
+    assert denied[0][1].code == "schema_corrected_retry_reserved"
+
+    guardrails.after_batch([
+        ToolCallObservation(
+            "search_files",
+            allowed[0][0],
+            json.dumps({"error": "blocked by required policy"}),
+            failed=True,
+            executed=False,
+        )
+    ])
+    assert guardrails.before_call(
+        "search_files",
+        {"pattern": "*.other.ts", "target": "files"},
+    ).allows_execution
+
+
+def test_execution_rewrite_preserves_guardrail_retry_identity_in_both_paths():
+    failed_args = {"pattern": "*.spec.ts", "target": "content"}
+    corrected_args = {"pattern": "*.spec.ts", "target": "files"}
+    typed_error = json.dumps({
+        "error": "file glob used as content regex",
+        "error_code": "search_files_glob_used_as_content_regex",
+        "error_class": "schema_correctable",
+        "retry_policy": {"max_corrected_retries": 1},
+    })
+
+    for executor_name in (
+        "_execute_tool_calls_sequential",
+        "_execute_tool_calls_concurrent",
+    ):
+        agent = _make_agent("search_files")
+        agent._tool_guardrails.after_call(
+            "search_files",
+            failed_args,
+            typed_error,
+            failed=True,
+        )
+        tool_call = _mock_tool_call(
+            "search_files",
+            json.dumps(corrected_args),
+            f"rewrite-{executor_name}",
+        )
+        assistant = SimpleNamespace(content="", tool_calls=[tool_call])
+        messages = []
+
+        def fake_handle(name, call_args, task_id, **kwargs):
+            kwargs["on_authorized"]({**call_args, "stage": "execution"})
+            return typed_error
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            getattr(agent, executor_name)(assistant, messages, "task-1")
+
+        next_decision = agent._tool_guardrails.before_call(
+            "search_files",
+            {"pattern": "*.other.ts", "target": "files"},
+        )
+        assert next_decision.code == "schema_corrected_retry_exhausted"
+
+
+def test_verified_patch_allows_runtime_retry_of_prior_exact_failure():
+    agent = _make_agent("patch", "terminal", config=_hard_stop_config())
+    terminal_args = {"command": "run-focused-test"}
+    _seed_exact_failures(agent, "terminal", terminal_args)
+    messages = []
+    executed = []
+
+    patch_call = _mock_tool_call(
+        "patch",
+        json.dumps({"patch": "*** Begin Patch\n*** End Patch"}),
+        "c-patch",
+    )
+    terminal_call = _mock_tool_call(
+        "terminal",
+        json.dumps(terminal_args),
+        "c-retry",
+    )
+    patch_message = SimpleNamespace(content="", tool_calls=[patch_call])
+    terminal_message = SimpleNamespace(content="", tool_calls=[terminal_call])
+
+    def fake_handle(name, call_args, task_id, **kwargs):
+        kwargs["on_authorized"](call_args)
+        executed.append((name, call_args, kwargs["tool_call_id"]))
+        if name == "patch":
+            return json.dumps({
+                "success": True,
+                "diff": "--- a/example.py\n+++ b/example.py\n@@\n-old\n+new\n",
+            })
+        return json.dumps({"exit_code": 0, "output": "passed"})
+
+    with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        agent._execute_tool_calls_sequential(patch_message, messages, "task-1")
+        agent._execute_tool_calls_sequential(terminal_message, messages, "task-1")
+
+    assert executed == [
+        (
+            "patch",
+            {"patch": "*** Begin Patch\n*** End Patch"},
+            "c-patch",
+        ),
+        ("terminal", terminal_args, "c-retry"),
+    ]
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-patch",
+        "c-retry",
+    ]
+    assert json.loads(messages[1]["content"]) == {
+        "exit_code": 0,
+        "output": "passed",
+    }
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def _run_blocked_terminal_with_patch_result(patch_result):
+    agent = _make_agent("terminal", "patch", config=_hard_stop_config())
+    terminal_args = {"command": "run-focused-test"}
+    _seed_exact_failures(agent, "terminal", terminal_args)
+    calls = [
+        _mock_tool_call("terminal", json.dumps(terminal_args), "c-blocked"),
+        _mock_tool_call(
+            "patch",
+            json.dumps({
+                "mode": "replace",
+                "path": "/tmp/example.py",
+                "old_string": "old",
+                "new_string": "new",
+            }),
+            "c-patch",
+        ),
+    ]
+    messages = []
+    executed = []
+
+    def fake_handle(name, args, task_id, **kwargs):
+        kwargs["on_authorized"](args)
+        executed.append((name, kwargs["tool_call_id"]))
+        return patch_result
+
+    with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=calls),
+            messages,
+            "task-1",
+        )
+    return agent, messages, executed, terminal_args
+
+
+def test_verified_patch_clears_stale_agent_halt_from_same_batch():
+    agent, messages, executed, terminal_args = (
+        _run_blocked_terminal_with_patch_result(
+            json.dumps({
+                "success": True,
+                "diff": "--- a/example.py\n+++ b/example.py\n@@\n-old\n+new\n",
+            })
+        )
+    )
+
+    assert executed == [("patch", "c-patch")]
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-blocked",
+        "c-patch",
+    ]
+    assert "repeated_exact_failure_block" in messages[0]["content"]
+    assert json.loads(messages[1]["content"])["success"] is True
+    assert agent._tool_guardrail_halt_decision is None
+    assert agent._tool_guardrail_halt_decisions == []
+    assert agent._tool_guardrails.before_call(
+        "terminal",
+        terminal_args,
+    ).action == "allow"
+    assert agent._tool_guardrails.raw_call_counts == {"terminal": 2, "patch": 1}
+    assert agent._tool_guardrails.observation_epochs == 3
+
+
+def test_unverified_patch_keeps_stale_agent_halt_from_same_batch():
+    agent, messages, executed, terminal_args = (
+        _run_blocked_terminal_with_patch_result(
+            json.dumps({"success": True, "diff": ""})
+        )
+    )
+
+    assert executed == [("patch", "c-patch")]
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-blocked",
+        "c-patch",
+    ]
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == (
+        "repeated_exact_failure_block"
+    )
+    assert agent._tool_guardrails.before_call(
+        "terminal",
+        terminal_args,
+    ).code == "repeated_exact_failure_block"
 
 
 def test_concurrent_failures_finalize_once_per_assistant_batch():
