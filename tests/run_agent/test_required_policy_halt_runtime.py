@@ -10,6 +10,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
 from hermes_cli.tool_policy import PolicyDecisionCode, ToolPolicyBlock
 from run_agent import AIAgent
 
@@ -283,6 +284,55 @@ def test_abandoned_worker_block_is_not_eligible_for_policy_halt():
     tool_results = [m for m in result["messages"] if m.get("role") == "tool"]
     assert [m["tool_call_id"] for m in tool_results] == ["call-hung", "call-ok"]
     assert "timed out" in tool_results[0]["content"]
+
+
+def test_required_policy_halt_supersedes_pending_no_effect_recovery():
+    agent = _make_agent("web_search", "read_file", max_iterations=8)
+    agent._tool_guardrails = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_warn_after=99,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=99,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=99,
+        )
+    )
+    block = _infrastructure_block("required_policy_plugin_missing")
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            finish_reason="tool_calls",
+            tool_calls=[_tool_call("web_search", {"query": "one"}, "call-1")],
+        ),
+        _response(
+            finish_reason="tool_calls",
+            tool_calls=[_tool_call("web_search", {"query": "two"}, "call-2")],
+        ),
+        _response(
+            finish_reason="tool_calls",
+            tool_calls=[_tool_call("read_file", {"path": "evidence.txt"}, "call-policy")],
+        ),
+    ]
+
+    def authorize(policy_input):
+        return block if policy_input.tool_name == "read_file" else None
+
+    with (
+        patch("hermes_cli.plugins.get_plugin_manager", return_value=_plugin_manager_without_middleware()),
+        patch("hermes_cli.plugins.authorize_required_tool_policies", side_effect=authorize),
+        patch("model_tools.registry.dispatch", return_value=json.dumps({"error": "boom"})) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("recover until policy fails")
+
+    assert dispatch.call_count == 2
+    assert result["api_calls"] == 3
+    assert result["turn_exit_reason"] == "required_policy_halt"
+    assert result["required_policy"] == block.to_result()
+    assert "guardrail" not in result
+    assert result["guardrail_recovery"]["state"] == "superseded_by_required_policy"
 
 
 def test_explicit_policy_block_is_recoverable_and_allows_next_model_round():

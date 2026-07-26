@@ -4544,6 +4544,53 @@ def _run_conversation(
                     if tc.function.name not in agent.valid_tool_names
                 ]
                 if invalid_tool_calls:
+                    if agent._tool_guardrails.recovery_state == "pending":
+                        # The recovery iteration is bounded. Unknown tool names
+                        # are effect-capable by default and must be answered
+                        # synthetically without entering the normal correction
+                        # retry loop.
+                        assistant_msg = agent._build_assistant_message(
+                            assistant_message,
+                            finish_reason,
+                        )
+                        messages.append(assistant_msg)
+                        for tc in assistant_message.tool_calls:
+                            if tc.function.name not in agent.valid_tool_names:
+                                block_decision = agent._tool_guardrails.before_call(
+                                    tc.function.name,
+                                    {},
+                                )
+                                content = agent._guardrail_block_result(
+                                    block_decision
+                                )
+                            else:
+                                content = (
+                                    "Skipped without execution: another call in "
+                                    "this bounded recovery batch used an unknown "
+                                    "tool name."
+                                )
+                            messages.append({
+                                "role": "tool",
+                                "name": tc.function.name,
+                                "tool_call_id": tc.id,
+                                "content": content,
+                            })
+                        decision = agent._fail_tool_guardrail_recovery()
+                        if decision is not None:
+                            final_response = agent._toolguard_controlled_halt_response(
+                                decision
+                            )
+                            messages.append({
+                                "role": "assistant",
+                                "content": final_response,
+                            })
+                            _turn_exit_reason = "guardrail_halt"
+                            agent._emit_status(
+                                f"⚠️ Tool guardrail halted {decision.tool_name}: "
+                                f"{decision.code}"
+                            )
+                            break
+
                     # Track retries for invalid tool calls
                     agent._invalid_tool_retries += 1
 
@@ -4628,6 +4675,54 @@ def _run_conversation(
                         invalid_json_args.append((tc.function.name, str(e)))
                 
                 if invalid_json_args:
+                    if agent._tool_guardrails.recovery_state == "pending":
+                        # Malformed arguments cannot be classified or dispatched
+                        # safely inside the one-shot recovery iteration.
+                        recovery_assistant = agent._build_assistant_message(
+                            assistant_message,
+                            finish_reason,
+                        )
+                        messages.append(recovery_assistant)
+                        invalid_names = {name for name, _ in invalid_json_args}
+                        for tc in assistant_message.tool_calls:
+                            if tc.function.name in invalid_names:
+                                block_decision = (
+                                    agent._tool_guardrails
+                                    .recovery_malformed_arguments_block(
+                                        tc.function.name
+                                    )
+                                )
+                                content = agent._guardrail_block_result(
+                                    block_decision
+                                )
+                            else:
+                                content = (
+                                    "Skipped without execution: another call in "
+                                    "this bounded recovery batch had malformed "
+                                    "arguments."
+                                )
+                            messages.append({
+                                "role": "tool",
+                                "name": tc.function.name,
+                                "tool_call_id": tc.id,
+                                "content": content,
+                            })
+                        decision = agent._fail_tool_guardrail_recovery()
+                        if decision is not None:
+                            final_response = agent._toolguard_controlled_halt_response(
+                                decision
+                            )
+                            messages.append({
+                                "role": "assistant",
+                                "content": final_response,
+                            })
+                            _turn_exit_reason = "guardrail_halt"
+                            agent._emit_status(
+                                f"⚠️ Tool guardrail halted {decision.tool_name}: "
+                                f"{decision.code}"
+                            )
+                            break
+
                     # Check if the invalid JSON is due to truncation rather
                     # than a model formatting mistake.  Routers sometimes
                     # rewrite finish_reason from "length" to "tool_calls",
@@ -4814,27 +4909,61 @@ def _run_conversation(
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:
-                    decision = agent._tool_guardrail_halt_decision
-                    _turn_exit_reason = "guardrail_halt"
-                    final_response = agent._toolguard_controlled_halt_response(decision)
-                    agent._emit_status(
-                        f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
+                    recovery_status = agent._try_start_tool_guardrail_recovery(
+                        api_call_count
                     )
-                    messages.append({"role": "assistant", "content": final_response})
-                    # Emit the halt message to the client so it's not
-                    # indistinguishable from a crash.  The stream display
-                    # was flushed (callback(None)) before tool execution,
-                    # but the callback is still alive — fire the text
-                    # through it so SSE/TUI clients see the explanation.
-                    if final_response:
-                        agent._safe_print(f"\n{final_response}\n")
-                        if agent.stream_delta_callback:
-                            try:
-                                agent.stream_delta_callback(final_response)
-                                agent.stream_delta_callback(None)
-                            except Exception:
-                                pass
-                    break
+                    if recovery_status == "started":
+                        recovery = agent._tool_guardrail_recovery_metadata or {}
+                        quarantined_tool = recovery.get(
+                            "quarantined_tool",
+                            "a no-effect tool",
+                        )
+                        recovery_guidance = (
+                            "\n\n[Guardrail recovery: "
+                            f"{quarantined_tool} is quarantined for this turn. "
+                            "On the next ordinary iteration, pivot through a "
+                            "different known no-effect tool. Effect-capable, "
+                            "unknown, MCP, plugin, and terminal calls will be "
+                            "blocked without execution.]"
+                        )
+                        for recovery_message in reversed(messages):
+                            if recovery_message.get("role") != "tool":
+                                continue
+                            if isinstance(recovery_message.get("content"), str):
+                                recovery_message["content"] += recovery_guidance
+                            break
+                        agent._emit_status(
+                            "↻ Tool guardrail quarantined "
+                            f"{quarantined_tool} "
+                            "for this turn; the next ordinary iteration may pivot "
+                            "through known no-effect tools only."
+                        )
+                    else:
+                        decision = agent._tool_guardrail_halt_decision
+                        _turn_exit_reason = (
+                            "recovery_budget_exhausted"
+                            if decision.code == "recovery_budget_exhausted"
+                            else "guardrail_halt"
+                        )
+                        final_response = agent._toolguard_controlled_halt_response(decision)
+                        agent._emit_status(
+                            f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
+                        )
+                        messages.append({"role": "assistant", "content": final_response})
+                        # Emit the halt message to the client so it's not
+                        # indistinguishable from a crash.  The stream display
+                        # was flushed (callback(None)) before tool execution,
+                        # but the callback is still alive — fire the text
+                        # through it so SSE/TUI clients see the explanation.
+                        if final_response:
+                            agent._safe_print(f"\n{final_response}\n")
+                            if agent.stream_delta_callback:
+                                try:
+                                    agent.stream_delta_callback(final_response)
+                                    agent.stream_delta_callback(None)
+                                except Exception:
+                                    pass
+                        break
 
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
@@ -4919,6 +5048,39 @@ def _run_conversation(
                 # prior housekeeping tool turn and should not silence the
                 # final response path.
                 agent._mute_post_response = False
+
+                # Recovery is bounded to exactly this ordinary model iteration.
+                # An empty/thinking-only response is not a pivot and must not
+                # enter the generic synthetic-user retry path.
+                if (
+                    agent._tool_guardrails.recovery_state == "pending"
+                    and not agent._has_content_after_think_block(final_response)
+                ):
+                    decision = agent._fail_tool_guardrail_recovery()
+                    if decision is not None:
+                        final_response = agent._toolguard_controlled_halt_response(
+                            decision
+                        )
+                        assistant_msg = agent._build_assistant_message(
+                            assistant_message,
+                            finish_reason,
+                        )
+                        assistant_msg["content"] = final_response
+                        messages.append(assistant_msg)
+                        _turn_exit_reason = "guardrail_halt"
+                        agent._emit_status(
+                            f"⚠️ Tool guardrail halted {decision.tool_name}: "
+                            f"{decision.code}"
+                        )
+                        if final_response:
+                            agent._safe_print(f"\n{final_response}\n")
+                            if agent.stream_delta_callback:
+                                try:
+                                    agent.stream_delta_callback(final_response)
+                                    agent.stream_delta_callback(None)
+                                except Exception:
+                                    pass
+                        break
                 
                 # Check if response only has think block with no actual content after it
                 if not agent._has_content_after_think_block(final_response):
@@ -5250,6 +5412,16 @@ def _run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+
+                if agent._tool_guardrails.resolve_recovery_with_final_text():
+                    recovery = getattr(
+                        agent,
+                        "_tool_guardrail_recovery_metadata",
+                        None,
+                    )
+                    if isinstance(recovery, dict):
+                        recovery["state"] = "recovered"
+                        recovery["outcome"] = "final_text"
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
@@ -5377,7 +5549,6 @@ def _run_conversation(
                     continue
 
                 messages.append(final_msg)
-                
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")

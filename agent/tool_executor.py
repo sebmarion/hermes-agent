@@ -30,7 +30,13 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
-from agent.tool_guardrails import ToolGuardrailDecision
+from agent.tool_guardrails import (
+    FAILURE_STREAK_GUARDRAIL_CODES,
+    ToolCallObservation,
+    ToolGuardrailDecision,
+    append_toolguard_guidance,
+    observation_proves_verified_file_progress,
+)
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -109,6 +115,64 @@ def _resolve_concurrent_tool_timeout() -> float | None:
     if value <= 0:
         return None
     return value
+
+
+def _clear_stale_failure_halts_after_verified_progress(agent) -> None:
+    """Drop only agent-level halts invalidated by a material patch."""
+    recorded = getattr(agent, "_tool_guardrail_halt_decisions", None)
+    survivors = [
+        decision
+        for decision in (recorded if isinstance(recorded, list) else [])
+        if decision.code not in FAILURE_STREAK_GUARDRAIL_CODES
+    ]
+    agent._tool_guardrail_halt_decisions = survivors
+    current = getattr(agent, "_tool_guardrail_halt_decision", None)
+    if (
+        current is not None
+        and current.code in FAILURE_STREAK_GUARDRAIL_CODES
+    ):
+        agent._tool_guardrail_halt_decision = next(
+            (decision for decision in survivors if decision.should_halt),
+            None,
+        )
+
+
+def _finalize_guardrail_observations(
+    agent,
+    observations: list[ToolCallObservation],
+) -> list[ToolGuardrailDecision]:
+    """Finalize one assistant tool batch and retain its first terminal decision."""
+    verified_progress = any(
+        observation_proves_verified_file_progress(observation)
+        for observation in observations
+    )
+    decisions = agent._tool_guardrails.after_batch(observations)
+    if verified_progress:
+        _clear_stale_failure_halts_after_verified_progress(agent)
+    for decision in decisions:
+        if decision.should_halt:
+            agent._set_tool_guardrail_halt(decision)
+    recovery_halt = agent._tool_guardrails.finish_recovery_epoch(
+        observations,
+        decisions,
+    )
+    if recovery_halt is not None:
+        agent._record_tool_guardrail_recovery_halt(recovery_halt)
+    elif agent._tool_guardrails.recovery_state == "recovered":
+        metadata = getattr(agent, "_tool_guardrail_recovery_metadata", None)
+        if isinstance(metadata, dict):
+            metadata["state"] = "recovered"
+    return decisions
+
+
+def _snapshot_concurrent_results(results: list) -> list:
+    """Freeze the outcomes that both guardrails and the model will observe.
+
+    Timed-out daemon workers may still finish after the executor returns from
+    its deadline wait. A single snapshot prevents a late write from changing
+    the transcript after guardrail accounting has recorded a timeout.
+    """
+    return list(results)
 
 
 def _flush_session_db_after_tool_progress(
@@ -447,6 +511,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Keep both audit-original args and request-middleware output. Execution
     # middleware may rewrite the effective args again inside the worker.
     parsed_calls = []
+    guardrail_signatures = []
     for tool_call in tool_calls:
         function_name = tool_call.function.name
 
@@ -466,6 +531,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     False,
                 )
             )
+            guardrail_signatures.append(None)
             continue
 
         # Reset nudge counters only for a structurally valid invocation.
@@ -526,6 +592,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
         blocked_by_guardrail = False
+        guardrail_signature = None
         if _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
@@ -573,6 +640,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             else:
                 guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+                guardrail_signature = guardrail_decision.signature
                 if not guardrail_decision.allows_execution:
                     block_result = agent._guardrail_block_result(guardrail_decision)
                     blocked_by_guardrail = True
@@ -600,6 +668,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 blocked_by_guardrail,
             )
         )
+        guardrail_signatures.append(guardrail_signature)
 
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(name for _, name, _, _, _, _, _ in parsed_calls)
@@ -626,6 +695,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
+    authorized_indices: set[int] = set()
+    authorized_indices_lock = threading.Lock()
     for i, (
         tc,
         name,
@@ -675,6 +746,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if start_marked:
                 return
             start_marked = True
+            with authorized_indices_lock:
+                authorized_indices.add(index)
             _mark_authorized_tool_start(
                 agent,
                 function_name=function_name,
@@ -852,7 +925,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                     result,
                                     0.0,
                                     True,
-                                    False,
+                                    True,
                                     middleware_trace,
                                 )
                         break
@@ -965,6 +1038,96 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             total_dur = sum(r[3] for r in results if r is not None)
             spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
+    # Finalize guardrail state once for the complete assistant batch, in the
+    # model's original call order rather than worker completion order. Freeze
+    # the result vector first: abandoned workers can still write to `results`,
+    # but guardrails and the model must observe the same immutable outcomes.
+    observed_results = _snapshot_concurrent_results(results)
+    guardrail_slots: list[tuple[int, ToolCallObservation]] = []
+    with authorized_indices_lock:
+        authorized_snapshot = set(authorized_indices)
+    for result_index, result_tuple in enumerate(observed_results):
+        if result_tuple is None:
+            if result_index not in timed_out_indices:
+                continue
+            (
+                _tc,
+                observed_name,
+                _original_args,
+                observed_args,
+                _middleware_trace,
+                _block_result,
+                _blocked_by_guardrail,
+            ) = parsed_calls[result_index]
+            suffix = (
+                f"{timeout_s:.1f}s"
+                if timeout_s is not None
+                else "the configured timeout"
+            )
+            guardrail_slots.append((
+                result_index,
+                ToolCallObservation(
+                    tool_name=observed_name,
+                    args=observed_args,
+                    result=(
+                        f"Error executing tool '{observed_name}': "
+                        f"timed out after {suffix}"
+                    ),
+                    failed=True,
+                    executed=result_index in authorized_snapshot,
+                    guardrail_signature=guardrail_signatures[result_index],
+                ),
+            ))
+            continue
+        (
+            observed_name,
+            observed_args,
+            observed_result,
+            _duration,
+            observed_failed,
+            observed_blocked,
+            _middleware_trace,
+        ) = result_tuple
+        guardrail_slots.append((
+            result_index,
+            ToolCallObservation(
+                tool_name=observed_name,
+                args=observed_args,
+                result=(
+                    observed_result
+                    if isinstance(observed_result, str)
+                    else _multimodal_text_summary(observed_result)
+                ),
+                failed=observed_failed,
+                executed=not observed_blocked,
+                guardrail_signature=guardrail_signatures[result_index],
+            ),
+        ))
+    guardrail_decisions = _finalize_guardrail_observations(
+        agent,
+        [observation for _index, observation in guardrail_slots],
+    )
+    guardrail_decisions_by_index = {
+        result_index: decision
+        for (result_index, _observation), decision in zip(
+            guardrail_slots,
+            guardrail_decisions,
+        )
+    }
+    for (result_index, _observation), decision in zip(
+        guardrail_slots,
+        guardrail_decisions,
+    ):
+        result_tuple = observed_results[result_index]
+        if (
+            result_tuple is not None
+            and decision.action in {"warn", "halt"}
+            and isinstance(result_tuple[2], str)
+        ):
+            updated = list(result_tuple)
+            updated[2] = append_toolguard_guidance(updated[2], decision)
+            observed_results[result_index] = tuple(updated)
+
     # ── Post-execution: display per-tool results ─────────────────────
     for i, (
         tc,
@@ -975,16 +1138,24 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         block_result,
         blocked_by_guardrail,
     ) in enumerate(parsed_calls):
-        r = results[i]
+        r = observed_results[i]
         blocked = False
-        # A worker can finish and write results[i] in the window between the
-        # deadline snapshot (timed_out_indices, taken from not_done) and this
-        # loop. Prefer that real result over a fabricated timeout message — the
-        # tool genuinely succeeded, just slightly late.
+        # A worker may finish after the deadline snapshot. Only results that
+        # landed before `observed_results` was frozen are visible; later writes
+        # stay detached so transcript and guardrail accounting cannot diverge.
         effect_disposition = None
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
+            timeout_decision = guardrail_decisions_by_index.get(i)
+            if (
+                timeout_decision is not None
+                and timeout_decision.action in {"warn", "halt"}
+            ):
+                function_result = append_toolguard_guidance(
+                    function_result,
+                    timeout_decision,
+                )
             effect_disposition = "unknown"
             _emit_terminal_post_tool_call(
                 agent,
@@ -1037,14 +1208,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             args = function_args
             if blocked:
                 effect_disposition = "none"
-
-            if not blocked:
-                function_result = agent._append_guardrail_observation(
-                    function_name,
-                    function_args,
-                    function_result,
-                    failed=is_error,
-                )
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
@@ -1189,6 +1352,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    guardrail_observations: list[ToolCallObservation] = []
+    guardrail_message_indices: list[int] = []
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
@@ -1288,8 +1453,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
+        guardrail_signature = None
         if _block_msg is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+            guardrail_signature = guardrail_decision.signature
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
 
@@ -1741,13 +1908,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 duration_ms=int(tool_duration * 1000),
                 middleware_trace=list(middleware_trace),
             )
-        if not _execution_blocked:
-            function_result = agent._append_guardrail_observation(
-                function_name,
-                function_args,
-                function_result,
-                failed=_is_error_result,
-            )
+        guardrail_observations.append(ToolCallObservation(
+            tool_name=function_name,
+            args=function_args,
+            result=(
+                function_result
+                if isinstance(function_result, str)
+                else _multimodal_text_summary(function_result)
+            ),
+            failed=_is_error_result,
+            executed=not _execution_blocked,
+            guardrail_signature=guardrail_signature,
+        ))
+        if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
@@ -1826,6 +1999,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             effect_disposition="none" if _execution_blocked else None,
         )
         messages.append(tool_message)
+        guardrail_message_indices.append(len(messages) - 1)
         from hermes_cli.middleware import mark_required_policy_block_appended
 
         mark_required_policy_block_appended(
@@ -1910,6 +2084,33 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if agent.tool_delay > 0 and i < len(assistant_message.tool_calls):
             time.sleep(agent.tool_delay)
+
+    # Finalize the observation epoch only after every sequential call requested
+    # by this assistant message has either run or produced a synthetic result.
+    guardrail_decisions = _finalize_guardrail_observations(
+        agent,
+        guardrail_observations,
+    )
+    guardrail_guidance_added = False
+    for message_index, decision in zip(
+        guardrail_message_indices,
+        guardrail_decisions,
+    ):
+        if decision.action not in {"warn", "halt"}:
+            continue
+        content = messages[message_index].get("content")
+        if isinstance(content, str):
+            messages[message_index]["content"] = append_toolguard_guidance(
+                content,
+                decision,
+            )
+            guardrail_guidance_added = True
+    if guardrail_guidance_added:
+        _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage="assistant tool-batch guardrail finalization",
+        )
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools_seq = len(assistant_message.tool_calls)

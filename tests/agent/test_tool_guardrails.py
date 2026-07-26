@@ -5,6 +5,7 @@ import json
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
+    ToolCallObservation,
     ToolCallSignature,
     canonical_tool_args,
     classify_tool_failure,
@@ -130,6 +131,162 @@ def test_success_resets_exact_signature_failure_streak():
     assert controller.before_call("web_search", args).action == "allow"
     controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
     assert controller.before_call("web_search", args).action == "allow"
+
+
+def test_file_mutation_lint_error_result_is_not_a_tool_failure():
+    write_result = json.dumps({
+        "bytes_written": 12,
+        "lint": {"status": "error", "output": "SyntaxError: invalid syntax"},
+    })
+    patch_result = json.dumps({
+        "success": True,
+        "diff": "--- a/tmp.py\n+++ b/tmp.py\n",
+        "lsp_diagnostics": "<diagnostics>ERROR [1:1] type mismatch</diagnostics>",
+    })
+
+    assert classify_tool_failure("write_file", write_result) == (False, "")
+    assert classify_tool_failure("patch", patch_result) == (False, "")
+
+
+def test_same_tool_varying_args_warns_by_default_without_halting():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(same_tool_failure_warn_after=2, same_tool_failure_halt_after=3)
+    )
+
+    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
+    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
+    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
+    fourth = controller.after_call("terminal", {"command": "cmd-4"}, '{"exit_code":1}', failed=True)
+
+    assert first.action == "allow"
+    assert [second.action, third.action, fourth.action] == ["warn", "warn", "warn"]
+    assert {second.code, third.code, fourth.code} == {"same_tool_failure_warning"}
+    assert "Do not switch to text-only replies" in second.message
+    assert "keep using tools" in second.message
+    assert "diagnose before retrying" in second.message
+    assert "different tool" in second.message
+    assert controller.halt_decision is None
+
+
+def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=2,
+            same_tool_failure_halt_after=3,
+        )
+    )
+
+    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
+    assert first.action == "allow"
+    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
+    assert second.action == "warn"
+    assert second.code == "same_tool_failure_warning"
+    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
+    assert third.action == "halt"
+    assert third.code == "same_tool_failure_halt"
+    assert third.count == 3
+
+
+def test_parallel_failures_in_one_assistant_batch_count_as_one_epoch():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_warn_after=99,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=99,
+            same_tool_failure_halt_after=2,
+        )
+    )
+    observations = [
+        ToolCallObservation(
+            "session_search",
+            {"query": f"q-{index}"},
+            '{"error":"boom"}',
+            failed=True,
+        )
+        for index in range(4)
+    ]
+
+    first = controller.after_batch(observations)
+
+    assert len(first) == 4
+    assert {decision.count for decision in first} == {1}
+    assert controller.raw_call_counts == {"session_search": 4}
+    assert controller.halt_decision is None
+
+    second = controller.after_batch(observations)
+
+    assert {decision.code for decision in second} == {"same_tool_failure_halt"}
+    assert {decision.count for decision in second} == {2}
+    assert controller.raw_call_counts == {"session_search": 8}
+    assert controller.halt_decision is not None
+    assert controller.halt_decision.count == 2
+
+
+def test_parallel_exact_signature_failures_increment_once_per_epoch():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_warn_after=99,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    observation = ToolCallObservation(
+        "session_search",
+        {"query": "same"},
+        '{"error":"boom"}',
+        failed=True,
+    )
+
+    controller.after_batch([observation, observation, observation, observation])
+    assert controller.before_call("session_search", {"query": "same"}).action == "allow"
+
+    controller.after_batch([observation, observation])
+    blocked = controller.before_call("session_search", {"query": "same"})
+    assert blocked.code == "repeated_exact_failure_block"
+    assert blocked.count == 2
+
+
+def test_no_progress_result_set_is_independent_of_worker_completion_order():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(no_progress_warn_after=2)
+    )
+    args = {"query": "same"}
+    first = [
+        ToolCallObservation("web_search", args, '{"value":"a"}', failed=False),
+        ToolCallObservation("web_search", args, '{"value":"b"}', failed=False),
+    ]
+    second = list(reversed(first))
+
+    assert {decision.action for decision in controller.after_batch(first)} == {"allow"}
+    decisions = controller.after_batch(second)
+
+    assert {decision.code for decision in decisions} == {"idempotent_no_progress_warning"}
+    assert {decision.count for decision in decisions} == {2}
+
+
+def test_mixed_success_and_failure_in_one_epoch_resets_failure_and_no_progress_state():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    args = {"query": "same"}
+    controller.after_call("web_search", args, '{"error":"boom"}', failed=True)
+    controller.after_call("web_search", args, '{"value":"same"}', failed=False)
+    controller.after_batch([
+        ToolCallObservation("web_search", args, '{"error":"boom"}', failed=True),
+        ToolCallObservation("web_search", args, '{"value":"same"}', failed=False),
+    ])
+
+    assert controller.before_call("web_search", args).action == "allow"
+    assert controller.halt_decision is None
 
 
 def test_verified_patch_resets_prior_exact_failure_streak_across_tools():
@@ -398,60 +555,461 @@ def test_same_argument_schema_retry_requires_matching_remediation_then_runs_once
     assert exhausted.code == "schema_corrected_retry_exhausted"
 
 
-def test_file_mutation_lint_error_result_is_not_a_tool_failure():
-    write_result = json.dumps({
-        "bytes_written": 12,
-        "lint": {"status": "error", "output": "SyntaxError: invalid syntax"},
+def test_typed_failures_and_verified_patch_share_one_epoch_without_state_loss():
+    controller = ToolCallGuardrailController()
+    skill_args = {"name": "unavailable", "action": "patch"}
+    schema_args = {"pattern": "*.spec.ts", "target": "content"}
+
+    controller.after_batch([
+        ToolCallObservation(
+            "patch",
+            {"path": "/tmp/example.py"},
+            json.dumps({"success": True, "diff": "-old\n+new"}),
+            failed=False,
+        ),
+        ToolCallObservation(
+            "skill_manage",
+            skill_args,
+            json.dumps({
+                "success": False,
+                "error": "wrong active profile",
+                "error_code": "skill_profile_mismatch",
+                "error_class": "capability",
+            }),
+            failed=True,
+        ),
+        ToolCallObservation(
+            "search_files",
+            schema_args,
+            json.dumps({
+                "error": "file glob used as content regex",
+                "error_code": "search_files_glob_used_as_content_regex",
+                "error_class": "schema_correctable",
+                "retry_policy": {"max_corrected_retries": 1},
+            }),
+            failed=True,
+        ),
+    ])
+
+    assert controller.before_call("skill_manage", skill_args).code == (
+        "typed_permanent_failure_no_retry"
+    )
+    assert controller.before_call("search_files", schema_args).code == (
+        "schema_retry_requires_changed_arguments"
+    )
+    assert controller.observation_epochs == 1
+
+
+def test_schema_remediation_in_one_epoch_follows_model_order():
+    write_args = {
+        "action": "patch",
+        "name": "reviewed",
+        "old_string": "before",
+        "new_string": "after",
+    }
+    typed_error = json.dumps({
+        "success": False,
+        "error": "load the current skill before writing",
+        "error_code": "skill_view_required",
+        "error_class": "schema_correctable",
+        "retry_policy": {
+            "max_corrected_retries": 1,
+            "requires_argument_change": False,
+            "remediation": {
+                "tool_name": "skill_view",
+                "arguments": {"name": "reviewed"},
+            },
+        },
     })
-    patch_result = json.dumps({
-        "success": True,
-        "diff": "--- a/tmp.py\n+++ b/tmp.py\n",
-        "lsp_diagnostics": "<diagnostics>ERROR [1:1] type mismatch</diagnostics>",
-    })
-
-    assert classify_tool_failure("write_file", write_result) == (False, "")
-    assert classify_tool_failure("patch", patch_result) == (False, "")
-
-
-def test_same_tool_varying_args_warns_by_default_without_halting():
-    controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(same_tool_failure_warn_after=2, same_tool_failure_halt_after=3)
+    failure = ToolCallObservation(
+        "skill_manage",
+        write_args,
+        typed_error,
+        failed=True,
+    )
+    remediation = ToolCallObservation(
+        "skill_view",
+        {"name": "reviewed"},
+        json.dumps({"success": True, "content_revision": "current"}),
+        failed=False,
     )
 
-    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
-    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
-    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
-    fourth = controller.after_call("terminal", {"command": "cmd-4"}, '{"exit_code":1}', failed=True)
+    remediated = ToolCallGuardrailController()
+    remediated.after_batch([failure, remediation])
+    assert remediated.before_call("skill_manage", write_args).allows_execution
 
-    assert first.action == "allow"
-    assert [second.action, third.action, fourth.action] == ["warn", "warn", "warn"]
-    assert {second.code, third.code, fourth.code} == {"same_tool_failure_warning"}
-    assert "Do not switch to text-only replies" in second.message
-    assert "keep using tools" in second.message
-    assert "diagnose before retrying" in second.message
-    assert "different tool" in second.message
+    not_yet_remediated = ToolCallGuardrailController()
+    not_yet_remediated.after_batch([remediation, failure])
+    assert not_yet_remediated.before_call("skill_manage", write_args).code == (
+        "schema_retry_requires_remediation"
+    )
+
+
+def test_invalid_same_argument_remediation_metadata_fails_closed():
+    write_args = {"action": "patch", "name": "reviewed"}
+    for remediation in (None, {"tool_name": "skill_view", "arguments": "bad"}):
+        retry_policy = {
+            "max_corrected_retries": 1,
+            "requires_argument_change": False,
+        }
+        if remediation is not None:
+            retry_policy["remediation"] = remediation
+        controller = ToolCallGuardrailController()
+        controller.after_call(
+            "skill_manage",
+            write_args,
+            json.dumps({
+                "success": False,
+                "error": "load current skill before writing",
+                "error_code": "skill_view_required",
+                "error_class": "schema_correctable",
+                "retry_policy": retry_policy,
+            }),
+            failed=True,
+        )
+
+        same_args = controller.before_call("skill_manage", write_args)
+        assert same_args.code == "schema_retry_requires_changed_arguments"
+        changed_args = controller.before_call(
+            "skill_manage",
+            {**write_args, "old_string": "before", "new_string": "after"},
+        )
+        assert changed_args.allows_execution
+
+
+def test_nonexecuted_corrected_retry_releases_reservation_without_consuming_it():
+    controller = ToolCallGuardrailController()
+    failed_args = {"pattern": "*.spec.ts", "target": "content"}
+    controller.after_call(
+        "search_files",
+        failed_args,
+        json.dumps({
+            "error": "file glob used as content regex",
+            "error_code": "search_files_glob_used_as_content_regex",
+            "error_class": "schema_correctable",
+            "retry_policy": {"max_corrected_retries": 1},
+        }),
+        failed=True,
+    )
+    first_corrected = {"pattern": "*.spec.ts", "target": "files"}
+    second_corrected = {"pattern": "*.test.ts", "target": "files"}
+
+    first_decision = controller.before_call(
+        "search_files",
+        first_corrected,
+    )
+    assert first_decision.allows_execution
+    assert controller.before_call(
+        "search_files",
+        second_corrected,
+    ).code == "schema_corrected_retry_reserved"
+
+    controller.after_batch([
+        ToolCallObservation(
+            "search_files",
+            {**first_corrected, "stage": "execution-rewrite"},
+            json.dumps({"error": "blocked by required policy"}),
+            failed=True,
+            executed=False,
+            guardrail_signature=first_decision.signature,
+        )
+    ])
+
+    assert controller.before_call(
+        "search_files",
+        second_corrected,
+    ).allows_execution
+
+
+def _verified_patch_observation(*, executed=True, diff="-old\n+new"):
+    return ToolCallObservation(
+        "patch",
+        {"path": "/tmp/example.py"},
+        json.dumps({"success": True, "diff": diff}),
+        failed=False,
+        executed=executed,
+    )
+
+
+def test_verified_patch_resets_historical_failures_before_current_epoch():
+    old_args = {"command": "still-broken"}
+    current_failure = ToolCallObservation(
+        "terminal",
+        {"command": "new-check"},
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    for observations in (
+        [_verified_patch_observation(), current_failure],
+        [current_failure, _verified_patch_observation()],
+    ):
+        controller = ToolCallGuardrailController(
+            ToolCallGuardrailConfig(
+                hard_stop_enabled=True,
+                exact_failure_warn_after=99,
+                exact_failure_block_after=2,
+                same_tool_failure_warn_after=99,
+                same_tool_failure_halt_after=3,
+            )
+        )
+        old_failure = ToolCallObservation(
+            "terminal",
+            old_args,
+            json.dumps({"exit_code": 1}),
+            failed=True,
+        )
+        controller.after_batch([old_failure])
+        controller.after_batch([old_failure])
+        assert controller.before_call("terminal", old_args).code == (
+            "repeated_exact_failure_block"
+        )
+
+        decisions = controller.after_batch(observations)
+        terminal_decision = next(
+            decision
+            for decision in decisions
+            if decision.tool_name == "terminal"
+        )
+
+        assert terminal_decision.action == "allow"
+        assert terminal_decision.count == 1
+        assert controller.before_call("terminal", old_args).action == "allow"
+        assert controller.halt_decision is None
+        assert controller.raw_call_counts == {"terminal": 3, "patch": 1}
+        assert controller.observation_epochs == 3
+
+
+def test_unverified_or_synthetic_mutations_do_not_reset_failure_streaks():
+    old_args = {"command": "still-broken"}
+    candidates = [
+        _verified_patch_observation(diff=" \n\t"),
+        ToolCallObservation(
+            "patch",
+            {"path": "/tmp/example.py"},
+            "patch succeeded",
+            failed=False,
+        ),
+        _verified_patch_observation(executed=False),
+        ToolCallObservation(
+            "write_file",
+            {"path": "/tmp/example.py", "content": "new"},
+            json.dumps({"bytes_written": 3}),
+            failed=False,
+        ),
+    ]
+    for candidate in candidates:
+        controller = ToolCallGuardrailController(
+            ToolCallGuardrailConfig(
+                hard_stop_enabled=True,
+                exact_failure_block_after=2,
+                same_tool_failure_halt_after=99,
+            )
+        )
+        failure = ToolCallObservation(
+            "terminal",
+            old_args,
+            json.dumps({"exit_code": 1}),
+            failed=True,
+        )
+        controller.after_batch([failure])
+        controller.after_batch([failure])
+        controller.after_batch([candidate])
+
+        blocked = controller.before_call("terminal", old_args)
+        assert blocked.code == "repeated_exact_failure_block"
+        assert blocked.count == 2
+
+
+def test_verified_patch_keeps_no_progress_and_monotonic_epoch_state():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=2,
+            same_tool_failure_halt_after=99,
+            no_progress_block_after=2,
+        )
+    )
+    terminal_args = {"command": "old-failure"}
+    read_args = {"path": "/tmp/same.txt"}
+    failure = ToolCallObservation(
+        "terminal",
+        terminal_args,
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    unchanged_read = ToolCallObservation(
+        "read_file",
+        read_args,
+        "same contents",
+        failed=False,
+    )
+    controller.after_batch([failure])
+    controller.after_batch([failure])
+    controller.after_batch([unchanged_read])
+    controller.after_batch([unchanged_read])
+    assert controller.before_call("read_file", read_args).code == (
+        "idempotent_no_progress_block"
+    )
+
+    controller.after_batch([_verified_patch_observation()])
+
+    assert controller.before_call("terminal", terminal_args).action == "allow"
+    assert controller.before_call("read_file", read_args).code == (
+        "idempotent_no_progress_block"
+    )
+    assert controller.halt_decision.code == "idempotent_no_progress_block"
+    assert controller.raw_call_counts == {
+        "terminal": 2,
+        "read_file": 2,
+        "patch": 1,
+    }
+    assert controller.observation_epochs == 5
+
+
+def _trigger_no_effect_recovery(controller, tool_name="session_search"):
+    first = controller.after_call(
+        tool_name,
+        {"query": "first"},
+        '{"error":"boom"}',
+        failed=True,
+    )
+    assert first.should_halt is False
+    trigger = controller.after_call(
+        tool_name,
+        {"query": "second"},
+        '{"error":"boom"}',
+        failed=True,
+    )
+    assert trigger.code == "same_tool_failure_halt"
+    assert controller.start_recovery(trigger) is True
+    return trigger
+
+
+def test_recovery_pending_blocks_quarantined_and_effect_capable_calls_only():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_warn_after=99,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=99,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=99,
+        )
+    )
+    _trigger_no_effect_recovery(controller)
+
+    quarantined = controller.before_call("session_search", {"query": "again"})
+    effectful = controller.before_call("terminal", {"command": "pwd"})
+    unknown = controller.before_call("mcp_unknown_reader", {"path": "/tmp/x"})
+    alternative = controller.before_call("read_file", {"path": "/tmp/x"})
+
+    assert quarantined.code == "recovery_quarantined_tool_block"
+    assert quarantined.allows_execution is False
+    assert effectful.code == "recovery_effectful_tool_block"
+    assert effectful.allows_execution is False
+    assert unknown.code == "recovery_effectful_tool_block"
+    assert unknown.allows_execution is False
+    assert alternative.action == "allow"
     assert controller.halt_decision is None
 
 
-def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
+def test_successful_no_effect_alternative_resolves_recovery_but_keeps_quarantine():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_warn_after=99,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=99,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=99,
+        )
+    )
+    _trigger_no_effect_recovery(controller)
+    observations = [
+        ToolCallObservation(
+            "session_search",
+            {"query": "again"},
+            '{"error":"quarantined"}',
+            failed=True,
+            executed=False,
+        ),
+        ToolCallObservation(
+            "terminal",
+            {"command": "pwd"},
+            '{"error":"effectful blocked"}',
+            failed=True,
+            executed=False,
+        ),
+        ToolCallObservation(
+            "read_file",
+            {"path": "/tmp/x"},
+            "contents",
+            failed=False,
+            executed=True,
+        ),
+    ]
+
+    decisions = controller.after_batch(observations)
+    assert controller.finish_recovery_epoch(observations, decisions) is None
+    assert controller.recovery_state == "recovered"
+    assert controller.raw_call_counts == {"session_search": 2, "read_file": 1}
+    assert controller.halt_decision is None
+    assert controller.before_call(
+        "session_search",
+        {"query": "later"},
+    ).code == "quarantined_tool_block"
+
+
+def test_recovery_with_only_quarantined_retry_halts_deterministically():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(
             hard_stop_enabled=True,
             exact_failure_block_after=99,
-            same_tool_failure_warn_after=2,
-            same_tool_failure_halt_after=3,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=99,
         )
     )
+    _trigger_no_effect_recovery(controller)
+    observations = [ToolCallObservation(
+        "session_search",
+        {"query": "again"},
+        '{"error":"quarantined"}',
+        failed=True,
+        executed=False,
+    )]
 
-    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
-    assert first.action == "allow"
-    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
-    assert second.action == "warn"
-    assert second.code == "same_tool_failure_warning"
-    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
-    assert third.action == "halt"
-    assert third.code == "same_tool_failure_halt"
-    assert third.count == 3
+    decisions = controller.after_batch(observations)
+    halt = controller.finish_recovery_epoch(observations, decisions)
+
+    assert halt is not None
+    assert halt.code == "recovery_quarantined_only_halt"
+    assert controller.recovery_state == "failed"
+
+
+def test_recovery_halts_when_every_safe_alternative_fails():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=99,
+            same_tool_failure_halt_after=2,
+            no_progress_block_after=99,
+        )
+    )
+    _trigger_no_effect_recovery(controller)
+    observations = [ToolCallObservation(
+        "read_file",
+        {"path": "/tmp/x"},
+        '{"error":"missing"}',
+        failed=True,
+        executed=True,
+    )]
+
+    decisions = controller.after_batch(observations)
+    halt = controller.finish_recovery_epoch(observations, decisions)
+
+    assert halt is not None
+    assert halt.code == "recovery_alternative_failed_halt"
+    assert controller.recovery_state == "failed"
 
 
 def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_default():

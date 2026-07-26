@@ -507,6 +507,10 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    if getattr(agent, "_tool_guardrail_recovery_metadata", None) is not None:
+        result["guardrail_recovery"] = dict(
+            agent._tool_guardrail_recovery_metadata
+        )
     if _required_policy_halt:
         result["required_policy"] = agent._required_policy_halt_block.to_result()
     # Surface any post-loop cleanup failures so the caller can distinguish a

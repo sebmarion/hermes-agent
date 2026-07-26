@@ -2,11 +2,15 @@
 
 import json
 import uuid
+from threading import Barrier, Event, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.tool_guardrails import (
+    ToolCallGuardrailController,
+    ToolCallObservation,
+)
 from run_agent import AIAgent
-from agent.tool_guardrails import ToolCallGuardrailController
 
 
 def _make_tool_defs(*names: str) -> list[dict]:
@@ -117,53 +121,6 @@ def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_e
     assert agent._tool_guardrail_halt_decision is None
 
 
-def test_typed_capability_failure_is_not_executed_twice_even_without_hard_stop():
-    guardrails = ToolCallGuardrailController()
-    args = {"name": "skill-in-another-profile", "action": "patch"}
-    result = json.dumps({
-        "success": False,
-        "error": "wrong active profile",
-        "error_code": "skill_profile_mismatch",
-        "error_class": "capability",
-    })
-
-    first = guardrails.before_call("skill_manage", args)
-    assert first.allows_execution is True
-    guardrails.after_call("skill_manage", args, result, failed=True)
-    second = guardrails.before_call("skill_manage", args)
-
-    assert second.action == "deny"
-    assert second.code == "typed_permanent_failure_no_retry"
-    assert second.allows_execution is False
-    assert second.should_halt is False
-
-
-def test_schema_correctable_failure_allows_one_changed_retry_only():
-    guardrails = ToolCallGuardrailController()
-    first_args = {"pattern": "*.spec.ts", "target": "content"}
-    typed_error = json.dumps({
-        "error": "file glob used as content regex",
-        "error_code": "search_files_glob_used_as_content_regex",
-        "error_class": "schema_correctable",
-        "retry_policy": {"max_corrected_retries": 1},
-    })
-    guardrails.after_call("search_files", first_args, typed_error, failed=True)
-
-    unchanged = guardrails.before_call("search_files", first_args)
-    assert unchanged.action == "deny"
-    assert unchanged.code == "schema_retry_requires_changed_arguments"
-
-    corrected_args = {"pattern": "*.spec.ts", "target": "files"}
-    corrected = guardrails.before_call("search_files", corrected_args)
-    assert corrected.allows_execution is True
-    guardrails.after_call("search_files", corrected_args, typed_error, failed=True)
-
-    third_args = {"pattern": "*.test.ts", "target": "files"}
-    exhausted = guardrails.before_call("search_files", third_args)
-    assert exhausted.action == "deny"
-    assert exhausted.code == "schema_corrected_retry_exhausted"
-
-
 def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution():
     agent = _make_agent("web_search", config=_hard_stop_config())
     args = {"query": "same"}
@@ -186,59 +143,6 @@ def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution
     assert messages[0]["role"] == "tool"
     assert messages[0]["tool_call_id"] == "c-block"
     assert "repeated_exact_failure_block" in messages[0]["content"]
-
-
-def test_verified_patch_allows_runtime_retry_of_prior_exact_failure():
-    agent = _make_agent("patch", "terminal", config=_hard_stop_config())
-    terminal_args = {"command": "run-focused-test"}
-    _seed_exact_failures(agent, "terminal", terminal_args)
-    messages = []
-    executed = []
-
-    patch_call = _mock_tool_call(
-        "patch",
-        json.dumps({"patch": "*** Begin Patch\n*** End Patch"}),
-        "c-patch",
-    )
-    terminal_call = _mock_tool_call(
-        "terminal",
-        json.dumps(terminal_args),
-        "c-retry",
-    )
-    patch_message = SimpleNamespace(content="", tool_calls=[patch_call])
-    terminal_message = SimpleNamespace(content="", tool_calls=[terminal_call])
-
-    def fake_handle(name, call_args, task_id, **kwargs):
-        kwargs["on_authorized"](call_args)
-        executed.append((name, call_args, kwargs["tool_call_id"]))
-        if name == "patch":
-            return json.dumps({
-                "success": True,
-                "diff": "--- a/example.py\n+++ b/example.py\n@@\n-old\n+new\n",
-            })
-        return json.dumps({"exit_code": 0, "output": "passed"})
-
-    with patch("run_agent.handle_function_call", side_effect=fake_handle):
-        agent._execute_tool_calls_sequential(patch_message, messages, "task-1")
-        agent._execute_tool_calls_sequential(terminal_message, messages, "task-1")
-
-    assert executed == [
-        (
-            "patch",
-            {"patch": "*** Begin Patch\n*** End Patch"},
-            "c-patch",
-        ),
-        ("terminal", terminal_args, "c-retry"),
-    ]
-    assert [message["tool_call_id"] for message in messages] == [
-        "c-patch",
-        "c-retry",
-    ]
-    assert json.loads(messages[1]["content"]) == {
-        "exit_code": 0,
-        "output": "passed",
-    }
-    assert agent._tool_guardrail_halt_decision is None
 
 
 def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_messages():
@@ -326,6 +230,489 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert completed_events[0][1] == "web_search"
 
 
+def test_typed_capability_failure_is_not_executed_twice_even_without_hard_stop():
+    guardrails = ToolCallGuardrailController()
+    args = {"name": "skill-in-another-profile", "action": "patch"}
+    result = json.dumps({
+        "success": False,
+        "error": "wrong active profile",
+        "error_code": "skill_profile_mismatch",
+        "error_class": "capability",
+    })
+
+    first = guardrails.before_call("skill_manage", args)
+    assert first.allows_execution is True
+    guardrails.after_call("skill_manage", args, result, failed=True)
+    second = guardrails.before_call("skill_manage", args)
+
+    assert second.action == "deny"
+    assert second.code == "typed_permanent_failure_no_retry"
+    assert second.allows_execution is False
+    assert second.should_halt is False
+
+
+def test_schema_correctable_failure_allows_one_changed_retry_only():
+    guardrails = ToolCallGuardrailController()
+    first_args = {"pattern": "*.spec.ts", "target": "content"}
+    typed_error = json.dumps({
+        "error": "file glob used as content regex",
+        "error_code": "search_files_glob_used_as_content_regex",
+        "error_class": "schema_correctable",
+        "retry_policy": {"max_corrected_retries": 1},
+    })
+    guardrails.after_call("search_files", first_args, typed_error, failed=True)
+
+    unchanged = guardrails.before_call("search_files", first_args)
+    assert unchanged.action == "deny"
+    assert unchanged.code == "schema_retry_requires_changed_arguments"
+
+    corrected_args = {"pattern": "*.spec.ts", "target": "files"}
+    corrected = guardrails.before_call("search_files", corrected_args)
+    assert corrected.allows_execution is True
+    guardrails.after_call("search_files", corrected_args, typed_error, failed=True)
+
+    third_args = {"pattern": "*.test.ts", "target": "files"}
+    exhausted = guardrails.before_call("search_files", third_args)
+    assert exhausted.action == "deny"
+    assert exhausted.code == "schema_corrected_retry_exhausted"
+
+
+def test_parallel_corrected_retries_reserve_exactly_one_execution():
+    guardrails = ToolCallGuardrailController()
+    guardrails.after_call(
+        "search_files",
+        {"pattern": "*.spec.ts", "target": "content"},
+        json.dumps({
+            "error": "file glob used as content regex",
+            "error_code": "search_files_glob_used_as_content_regex",
+            "error_class": "schema_correctable",
+            "retry_policy": {"max_corrected_retries": 1},
+        }),
+        failed=True,
+    )
+    barrier = Barrier(3)
+    decisions = []
+    candidates = [
+        {"pattern": "*.spec.ts", "target": "files"},
+        {"pattern": "*.test.ts", "target": "files"},
+    ]
+
+    def authorize(args):
+        barrier.wait(timeout=2)
+        decisions.append((args, guardrails.before_call("search_files", args)))
+
+    threads = [Thread(target=authorize, args=(args,)) for args in candidates]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=2)
+    for thread in threads:
+        thread.join(timeout=2)
+
+    allowed = [item for item in decisions if item[1].allows_execution]
+    denied = [item for item in decisions if not item[1].allows_execution]
+    assert len(allowed) == 1
+    assert len(denied) == 1
+    assert denied[0][1].code == "schema_corrected_retry_reserved"
+
+    guardrails.after_batch([
+        ToolCallObservation(
+            "search_files",
+            allowed[0][0],
+            json.dumps({"error": "blocked by required policy"}),
+            failed=True,
+            executed=False,
+        )
+    ])
+    assert guardrails.before_call(
+        "search_files",
+        {"pattern": "*.other.ts", "target": "files"},
+    ).allows_execution
+
+
+def test_execution_rewrite_preserves_guardrail_retry_identity_in_both_paths():
+    failed_args = {"pattern": "*.spec.ts", "target": "content"}
+    corrected_args = {"pattern": "*.spec.ts", "target": "files"}
+    typed_error = json.dumps({
+        "error": "file glob used as content regex",
+        "error_code": "search_files_glob_used_as_content_regex",
+        "error_class": "schema_correctable",
+        "retry_policy": {"max_corrected_retries": 1},
+    })
+
+    for executor_name in (
+        "_execute_tool_calls_sequential",
+        "_execute_tool_calls_concurrent",
+    ):
+        agent = _make_agent("search_files")
+        agent._tool_guardrails.after_call(
+            "search_files",
+            failed_args,
+            typed_error,
+            failed=True,
+        )
+        tool_call = _mock_tool_call(
+            "search_files",
+            json.dumps(corrected_args),
+            f"rewrite-{executor_name}",
+        )
+        assistant = SimpleNamespace(content="", tool_calls=[tool_call])
+        messages = []
+
+        def fake_handle(name, call_args, task_id, **kwargs):
+            kwargs["on_authorized"]({**call_args, "stage": "execution"})
+            return typed_error
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            getattr(agent, executor_name)(assistant, messages, "task-1")
+
+        next_decision = agent._tool_guardrails.before_call(
+            "search_files",
+            {"pattern": "*.other.ts", "target": "files"},
+        )
+        assert next_decision.code == "schema_corrected_retry_exhausted"
+
+
+def test_verified_patch_allows_runtime_retry_of_prior_exact_failure():
+    agent = _make_agent("patch", "terminal", config=_hard_stop_config())
+    terminal_args = {"command": "run-focused-test"}
+    _seed_exact_failures(agent, "terminal", terminal_args)
+    messages = []
+    executed = []
+
+    patch_call = _mock_tool_call(
+        "patch",
+        json.dumps({"patch": "*** Begin Patch\n*** End Patch"}),
+        "c-patch",
+    )
+    terminal_call = _mock_tool_call(
+        "terminal",
+        json.dumps(terminal_args),
+        "c-retry",
+    )
+    patch_message = SimpleNamespace(content="", tool_calls=[patch_call])
+    terminal_message = SimpleNamespace(content="", tool_calls=[terminal_call])
+
+    def fake_handle(name, call_args, task_id, **kwargs):
+        kwargs["on_authorized"](call_args)
+        executed.append((name, call_args, kwargs["tool_call_id"]))
+        if name == "patch":
+            return json.dumps({
+                "success": True,
+                "diff": "--- a/example.py\n+++ b/example.py\n@@\n-old\n+new\n",
+            })
+        return json.dumps({"exit_code": 0, "output": "passed"})
+
+    with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        agent._execute_tool_calls_sequential(patch_message, messages, "task-1")
+        agent._execute_tool_calls_sequential(terminal_message, messages, "task-1")
+
+    assert executed == [
+        (
+            "patch",
+            {"patch": "*** Begin Patch\n*** End Patch"},
+            "c-patch",
+        ),
+        ("terminal", terminal_args, "c-retry"),
+    ]
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-patch",
+        "c-retry",
+    ]
+    assert json.loads(messages[1]["content"]) == {
+        "exit_code": 0,
+        "output": "passed",
+    }
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def _run_blocked_terminal_with_patch_result(patch_result):
+    agent = _make_agent("terminal", "patch", config=_hard_stop_config())
+    terminal_args = {"command": "run-focused-test"}
+    _seed_exact_failures(agent, "terminal", terminal_args)
+    calls = [
+        _mock_tool_call("terminal", json.dumps(terminal_args), "c-blocked"),
+        _mock_tool_call(
+            "patch",
+            json.dumps({
+                "mode": "replace",
+                "path": "/tmp/example.py",
+                "old_string": "old",
+                "new_string": "new",
+            }),
+            "c-patch",
+        ),
+    ]
+    messages = []
+    executed = []
+
+    def fake_handle(name, args, task_id, **kwargs):
+        kwargs["on_authorized"](args)
+        executed.append((name, kwargs["tool_call_id"]))
+        return patch_result
+
+    with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=calls),
+            messages,
+            "task-1",
+        )
+    return agent, messages, executed, terminal_args
+
+
+def test_verified_patch_clears_stale_agent_halt_from_same_batch():
+    agent, messages, executed, terminal_args = (
+        _run_blocked_terminal_with_patch_result(
+            json.dumps({
+                "success": True,
+                "diff": "--- a/example.py\n+++ b/example.py\n@@\n-old\n+new\n",
+            })
+        )
+    )
+
+    assert executed == [("patch", "c-patch")]
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-blocked",
+        "c-patch",
+    ]
+    assert "repeated_exact_failure_block" in messages[0]["content"]
+    assert json.loads(messages[1]["content"])["success"] is True
+    assert agent._tool_guardrail_halt_decision is None
+    assert agent._tool_guardrail_halt_decisions == []
+    assert agent._tool_guardrails.before_call(
+        "terminal",
+        terminal_args,
+    ).action == "allow"
+    assert agent._tool_guardrails.raw_call_counts == {"terminal": 2, "patch": 1}
+    assert agent._tool_guardrails.observation_epochs == 3
+
+
+def test_unverified_patch_keeps_stale_agent_halt_from_same_batch():
+    agent, messages, executed, terminal_args = (
+        _run_blocked_terminal_with_patch_result(
+            json.dumps({"success": True, "diff": ""})
+        )
+    )
+
+    assert executed == [("patch", "c-patch")]
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-blocked",
+        "c-patch",
+    ]
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == (
+        "repeated_exact_failure_block"
+    )
+    assert agent._tool_guardrails.before_call(
+        "terminal",
+        terminal_args,
+    ).code == "repeated_exact_failure_block"
+
+
+def test_concurrent_failures_finalize_once_per_assistant_batch():
+    agent = _make_agent(
+        "web_search",
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    calls = [
+        _mock_tool_call(
+            "web_search",
+            json.dumps({"query": f"q-{index}"}),
+            f"c-{index}",
+        )
+        for index in range(4)
+    ]
+    msg = SimpleNamespace(content="", tool_calls=calls)
+    messages = []
+
+    def fail(name, args, task_id, **kwargs):
+        kwargs["on_authorized"](args)
+        return json.dumps({"error": "boom"})
+
+    with patch("run_agent.handle_function_call", side_effect=fail) as mock_hfc:
+        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+        assert mock_hfc.call_count == 4
+        assert agent._tool_guardrail_halt_decision is None
+        assert len(messages) == 4
+
+        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+
+    assert mock_hfc.call_count == 8
+    assert len(messages) == 8
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "same_tool_failure_halt"
+    assert agent._tool_guardrail_halt_decision.count == 2
+
+
+def test_concurrent_completion_order_does_not_change_model_call_order():
+    agent = _make_agent(
+        "web_search",
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    calls = [
+        _mock_tool_call(
+            "web_search",
+            json.dumps({"query": f"q-{index}"}),
+            f"c-order-{index}",
+        )
+        for index in range(4)
+    ]
+    msg = SimpleNamespace(content="", tool_calls=calls)
+    messages = []
+    completed = []
+    barrier = Barrier(5)
+    release = [Event() for _ in range(4)]
+    acknowledged = [Event() for _ in range(4)]
+
+    def reverse_completion(name, args, task_id, **kwargs):
+        kwargs["on_authorized"](args)
+        index = int(args["query"].split("-")[-1])
+        barrier.wait(timeout=2)
+        assert release[index].wait(timeout=2)
+        completed.append(index)
+        acknowledged[index].set()
+        return json.dumps({"error": f"boom-{index}"})
+
+    def release_in_reverse_order():
+        barrier.wait(timeout=2)
+        for index in (3, 2, 1, 0):
+            release[index].set()
+            assert acknowledged[index].wait(timeout=2)
+
+    coordinator = Thread(target=release_in_reverse_order, daemon=True)
+    coordinator.start()
+    with patch("run_agent.handle_function_call", side_effect=reverse_completion):
+        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+    coordinator.join(timeout=2)
+
+    assert not coordinator.is_alive()
+    assert completed == [3, 2, 1, 0]
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-order-0",
+        "c-order-1",
+        "c-order-2",
+        "c-order-3",
+    ]
+    assert agent._tool_guardrails.raw_call_counts == {"web_search": 4}
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def test_concurrent_timeout_snapshot_keeps_transcript_and_guardrail_consistent(monkeypatch):
+    agent = _make_agent("web_search")
+    blocker = Event()
+    tc = _mock_tool_call(
+        "web_search",
+        json.dumps({"query": "slow"}),
+        "c-timeout-snapshot",
+    )
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.05")
+
+    def blocked_handle(name, args, task_id, **kwargs):
+        kwargs["on_authorized"](args)
+        blocker.wait(5)
+        return "late-real-result"
+
+    def snapshot_then_simulate_late_write(results):
+        snapshot = list(results)
+        assert snapshot == [None]
+        results[0] = (
+            "web_search",
+            {"query": "slow"},
+            "late-real-result",
+            0.06,
+            False,
+            False,
+            [],
+        )
+        return snapshot
+
+    try:
+        with (
+            patch("run_agent.handle_function_call", side_effect=blocked_handle),
+            patch(
+                "agent.tool_executor._snapshot_concurrent_results",
+                side_effect=snapshot_then_simulate_late_write,
+            ),
+        ):
+            agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+    finally:
+        blocker.set()
+
+    assert len(messages) == 1
+    assert messages[0]["tool_call_id"] == "c-timeout-snapshot"
+    assert "timed out after" in messages[0]["content"]
+    assert "late-real-result" not in messages[0]["content"]
+    assert agent._tool_guardrails.raw_call_counts == {"web_search": 1}
+    assert agent._tool_guardrails._same_tool_failure_counts == {"web_search": 1}
+
+
+def test_sequential_failures_finalize_once_per_assistant_batch():
+    agent = _make_agent(
+        "terminal",
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    calls = [
+        _mock_tool_call(
+            "terminal",
+            json.dumps({"command": f"bad-{index}"}),
+            f"c-seq-{index}",
+        )
+        for index in range(4)
+    ]
+    msg = SimpleNamespace(content="", tool_calls=calls)
+    messages = []
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"exit_code": 1}),
+    ) as mock_hfc:
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+        assert mock_hfc.call_count == 4
+        assert agent._tool_guardrail_halt_decision is None
+
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    assert mock_hfc.call_count == 8
+    assert len(messages) == 8
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "same_tool_failure_halt"
+    assert agent._tool_guardrail_halt_decision.count == 2
+
+
 def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     agent = _make_agent("web_search")
     args = {"query": "same"}
@@ -342,6 +729,436 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     mock_hfc.assert_not_called()
     assert "plugin policy" in messages[0]["content"]
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
+
+
+def test_run_conversation_recovers_via_safe_no_effect_pivot_without_dispatching_effectful_calls():
+    agent = _make_agent(
+        "web_search",
+        "read_file",
+        "terminal",
+        "mcp_unknown_reader",
+        max_iterations=8,
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"one"}', "c-1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"two"}', "c-2")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("web_search", '{"query":"again"}', "c-quarantine"),
+                _mock_tool_call("terminal", '{"command":"touch /tmp/never"}', "c-effect"),
+                _mock_tool_call("mcp_unknown_reader", '{"path":"/tmp/never"}', "c-unknown"),
+                _mock_tool_call("read_file", '{"path":"/tmp/evidence"}', "c-safe"),
+            ],
+        ),
+        _mock_response(content="recovered safely", finish_reason="stop"),
+    ]
+    dispatched = []
+
+    def dispatch(name, args, task_id, **kwargs):
+        kwargs["on_authorized"](args)
+        dispatched.append(name)
+        if name == "web_search":
+            return json.dumps({"error": "boom"})
+        if name == "read_file":
+            return "evidence"
+        raise AssertionError(f"effect-capable tool executed during recovery: {name}")
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=dispatch),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("recover automatically")
+
+    assert dispatched == ["web_search", "web_search", "read_file"]
+    assert result["final_response"] == "recovered safely"
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["guardrail_recovery"]["state"] == "recovered"
+    assert result["guardrail_recovery"]["quarantined_tool"] == "web_search"
+    assert "guardrail" not in result
+    by_id = {
+        message["tool_call_id"]: message["content"]
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    }
+    assert "recovery_quarantined_tool_block" in by_id["c-quarantine"]
+    assert "recovery_effectful_tool_block" in by_id["c-effect"]
+    assert "recovery_effectful_tool_block" in by_id["c-unknown"]
+    assert by_id["c-safe"] == "evidence"
+
+
+def test_final_text_on_recovery_iteration_resolves_without_another_tool_call():
+    agent = _make_agent(
+        "web_search",
+        max_iterations=6,
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"one"}', "c-1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"two"}', "c-2")],
+        ),
+        _mock_response(content="resolved from existing evidence", finish_reason="stop"),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("answer without retrying")
+
+    assert dispatch.call_count == 2
+    assert result["api_calls"] == 3
+    assert result["final_response"] == "resolved from existing evidence"
+    assert result["guardrail_recovery"]["state"] == "recovered"
+    assert result["guardrail_recovery"]["outcome"] == "final_text"
+    assert "guardrail" not in result
+
+
+def test_empty_recovery_response_halts_without_synthetic_user_retry():
+    agent = _make_agent(
+        "web_search",
+        max_iterations=6,
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"one"}', "c-1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"two"}', "c-2")],
+        ),
+        _mock_response(content="", finish_reason="stop"),
+        AssertionError("recovery must not mint an empty-response retry"),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do not synthesize recovery users")
+
+    assert dispatch.call_count == 2
+    assert result["api_calls"] == 3
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "recovery_no_safe_alternative_halt"
+    assert result["guardrail_recovery"]["state"] == "failed"
+    assert not any(
+        message.get("_empty_recovery_synthetic")
+        for message in result["messages"]
+        if isinstance(message, dict)
+    )
+
+
+def test_invalid_tool_during_recovery_is_blocked_once_without_model_retry():
+    agent = _make_agent(
+        "web_search",
+        max_iterations=6,
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"one"}', "c-1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"two"}', "c-2")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("mcp_unknown_reader", '{}', "c-unknown")],
+        ),
+        AssertionError("invalid recovery calls must not get another model iteration"),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do not retry unknown recovery calls")
+
+    assert dispatch.call_count == 2
+    assert result["api_calls"] == 3
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "recovery_no_safe_alternative_halt"
+    unknown_result = next(
+        message for message in result["messages"]
+        if message.get("tool_call_id") == "c-unknown"
+    )
+    assert "recovery_effectful_tool_block" in unknown_result["content"]
+
+
+def test_malformed_recovery_arguments_are_blocked_once_without_dispatch():
+    agent = _make_agent(
+        "web_search",
+        "read_file",
+        max_iterations=6,
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"one"}', "c-1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"two"}', "c-2")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("read_file", '{"path":', "c-bad-json")],
+        ),
+        AssertionError("malformed recovery calls must not get another model iteration"),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do not dispatch malformed recovery calls")
+
+    assert dispatch.call_count == 2
+    assert result["api_calls"] == 3
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "recovery_no_safe_alternative_halt"
+    malformed_result = next(
+        message for message in result["messages"]
+        if message.get("tool_call_id") == "c-bad-json"
+    )
+    assert "recovery_malformed_arguments_block" in malformed_result["content"]
+
+
+def test_no_effect_recovery_does_not_bypass_iteration_budget():
+    agent = _make_agent(
+        "web_search",
+        max_iterations=2,
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"one"}', "c-1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", '{"query":"two"}', "c-2")],
+        ),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("recover with no budget")
+
+    assert dispatch.call_count == 2
+    assert agent.client.chat.completions.create.call_count == 2
+    assert result["api_calls"] == 2
+    assert result["turn_exit_reason"] == "recovery_budget_exhausted"
+    assert result["guardrail"]["code"] == "recovery_budget_exhausted"
+    assert result["guardrail_recovery"]["state"] == "budget_exhausted"
+
+
+def test_effect_capable_tool_threshold_stays_fail_closed_without_recovery():
+    agent = _make_agent(
+        "terminal",
+        max_iterations=6,
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("terminal", '{"command":"bad-1"}', "c-1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("terminal", '{"command":"bad-2"}', "c-2")],
+        ),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"exit_code": 1})) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do not recover mutations")
+
+    assert dispatch.call_count == 2
+    assert result["api_calls"] == 2
+    assert result["guardrail"]["code"] == "same_tool_failure_halt"
+    assert "guardrail_recovery" not in result
+
+
+def test_multiple_no_effect_thresholds_halt_instead_of_guessing_a_pivot():
+    agent = _make_agent(
+        "web_search",
+        "read_file",
+        max_iterations=6,
+        config=_hard_stop_config(
+            warn_after={
+                "exact_failure": 99,
+                "same_tool_failure": 99,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("web_search", '{"query":"one"}', "c-w1"),
+                _mock_tool_call("read_file", '{"path":"/tmp/one"}', "c-r1"),
+            ],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("web_search", '{"query":"two"}', "c-w2"),
+                _mock_tool_call("read_file", '{"path":"/tmp/two"}', "c-r2"),
+            ],
+        ),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("two broken readers")
+
+    assert dispatch.call_count == 4
+    assert result["api_calls"] == 2
+    assert result["guardrail"]["code"] == "multiple_guardrail_thresholds_halt"
+    assert "guardrail_recovery" not in result
 
 
 def test_default_run_conversation_warns_without_guardrail_halt():
@@ -404,6 +1221,7 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
     assert "stopped retrying" in result["final_response"]
     assert result["guardrail"]["code"] == "repeated_exact_failure_block"
     assert result["guardrail"]["tool_name"] == "web_search"
+    assert "guardrail_recovery" not in result
 
     assistant_tool_calls = [m for m in result["messages"] if m.get("role") == "assistant" and m.get("tool_calls")]
     for assistant_msg in assistant_tool_calls:

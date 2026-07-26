@@ -330,16 +330,72 @@ def _scroll(
             window = 5
     window = max(1, min(window, 20))
 
-    # Reject scrolling inside the active session lineage — those messages are
-    # already in context.
-    if current_session_id:
-        a_root = _resolve_to_parent(db, session_id)
-        c_root = _resolve_to_parent(db, current_session_id)
-        if a_root and c_root and a_root == c_root:
-            return tool_error(
-                "scroll rejected: anchor lives in the current session lineage (already in your active context)",
-                success=False,
-            )
+    try:
+        anchor_state = db.get_message_state(around_message_id)
+    except Exception as e:
+        logging.debug("message-state lookup failed for %s: %s", around_message_id, e, exc_info=True)
+        anchor_state = None
+
+    rebind_warning = None
+    owning_session_id = anchor_state.get("session_id") if anchor_state else None
+    if owning_session_id and owning_session_id != session_id:
+        requested_session_id = session_id
+        session_id = str(owning_session_id)
+        rebind_warning = (
+            f"around_message_id {around_message_id} lives in {session_id}; "
+            f"rebound transparently from {requested_session_id}"
+        )
+
+    if (
+        anchor_state
+        and current_session_id
+        and anchor_state.get("session_id") == current_session_id
+        and bool(anchor_state.get("active"))
+    ):
+        return json.dumps({
+            "success": True,
+            "mode": "scroll",
+            "session_id": current_session_id,
+            "around_message_id": around_message_id,
+            "window": window,
+            "messages": [],
+            "messages_before": 0,
+            "messages_after": 0,
+            "redundant": True,
+            "message": (
+                "The requested message is already available in the active context; "
+                "use it directly instead of scrolling session history."
+            ),
+        }, ensure_ascii=False)
+
+    current_archived = bool(
+        anchor_state
+        and current_session_id
+        and anchor_state.get("session_id") == current_session_id
+        and not bool(anchor_state.get("active"))
+        and bool(anchor_state.get("compacted"))
+    )
+    current_rewound = bool(
+        anchor_state
+        and current_session_id
+        and anchor_state.get("session_id") == current_session_id
+        and not bool(anchor_state.get("active"))
+        and not bool(anchor_state.get("compacted"))
+    )
+    if current_rewound:
+        return json.dumps({
+            "success": True,
+            "mode": "scroll",
+            "session_id": current_session_id,
+            "around_message_id": around_message_id,
+            "window": window,
+            "messages": [],
+            "messages_before": 0,
+            "messages_after": 0,
+            "unavailable": True,
+            "reason": "rewound",
+            "message": "The requested message was removed by rewind and is unavailable to session search.",
+        }, ensure_ascii=False)
 
     # Session existence check
     try:
@@ -352,50 +408,17 @@ def _scroll(
 
     # Fetch the window
     try:
-        view = db.get_messages_around(session_id, around_message_id, window=window)
+        view = db.get_messages_around(
+            session_id,
+            around_message_id,
+            window=window,
+            state_filter="archived_compacted" if current_archived else "discoverable",
+        )
     except Exception as e:
         logging.error("get_messages_around failed: %s", e, exc_info=True)
         return tool_error(f"failed to load messages: {e}", success=False)
 
     messages = view.get("window") or []
-
-    # Lineage rebind: caller may have paired a parent session_id with a
-    # message id that lives in a descendant (compaction / delegation creates
-    # child sessions). Locate the real owning session and refetch.
-    rebind_warning = None
-    if not messages:
-        owning = None
-        try:
-            conn = getattr(db, "_conn", None)
-            if conn is not None:
-                row = conn.execute(
-                    "SELECT session_id FROM messages WHERE id = ?",
-                    (around_message_id,),
-                ).fetchone()
-                owning = row[0] if row else None
-        except Exception as e:
-            logging.debug("owning-session lookup failed: %s", e, exc_info=True)
-            owning = None
-        if owning and owning != session_id:
-            a_root = _resolve_to_parent(db, session_id)
-            o_root = _resolve_to_parent(db, owning)
-            if a_root and o_root and a_root == o_root:
-                try:
-                    rebind_view = db.get_messages_around(owning, around_message_id, window=window)
-                    messages = rebind_view.get("window") or []
-                    if messages:
-                        view = rebind_view
-                        rebind_warning = (
-                            f"around_message_id {around_message_id} lives in {owning} "
-                            f"(child of {session_id}); rebound transparently"
-                        )
-                        try:
-                            session_meta = db.get_session(owning) or session_meta
-                        except Exception:
-                            pass
-                        session_id = owning
-                except Exception as e:
-                    logging.debug("rebind get_messages_around failed: %s", e, exc_info=True)
 
     if not messages:
         return tool_error(
@@ -419,6 +442,8 @@ def _scroll(
         "messages_before": view.get("messages_before", 0),
         "messages_after": view.get("messages_after", 0),
     }
+    if current_archived:
+        response["archived"] = True
     if rebind_warning:
         response["warning"] = rebind_warning
     return json.dumps(response, ensure_ascii=False)
@@ -432,7 +457,7 @@ def _normalize_title_query(query: str) -> str:
 def _title_match_result(
     db,
     query: str,
-    current_lineage_root: Optional[str],
+    current_session_id: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -448,8 +473,9 @@ def _title_match_result(
         return None
 
     lineage_root = _resolve_to_parent(db, session_id)
-    if current_lineage_root and lineage_root == current_lineage_root:
-        return None
+    current_archived = bool(
+        current_session_id and session_id == current_session_id
+    )
 
     try:
         session_meta = db.get_session(lineage_root) or db.get_session(session_id) or {}
@@ -460,15 +486,37 @@ def _title_match_result(
         return None
 
     try:
-        messages = db.get_messages(session_id)
+        messages = db.get_messages(
+            session_id,
+            include_inactive=current_archived,
+        )
     except Exception:
         logging.debug("get_messages failed for title match %s", session_id, exc_info=True)
         messages = []
+    if current_archived:
+        messages = [
+            message
+            for message in messages
+            if not bool(message.get("active"))
+            and bool(message.get("compacted"))
+        ]
+        if not messages:
+            return None
 
     anchor_id = messages[0].get("id") if messages else None
     if anchor_id is not None:
         try:
-            view = db.get_anchored_view(session_id, anchor_id, window=5, bookend=3)
+            view = db.get_anchored_view(
+                session_id,
+                anchor_id,
+                window=5,
+                bookend=3,
+                state_filter=(
+                    "archived_compacted"
+                    if current_archived
+                    else "discoverable"
+                ),
+            )
         except Exception:
             logging.debug("get_anchored_view failed for title match %s/%s", session_id, anchor_id, exc_info=True)
             view = {}
@@ -493,6 +541,8 @@ def _title_match_result(
     }
     if lineage_root and lineage_root != session_id:
         entry["parent_session_id"] = lineage_root
+    if current_archived:
+        entry["archived"] = True
     return entry
 
 
@@ -506,8 +556,7 @@ def _discover(
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
-    current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    title_result = _title_match_result(db, query, current_session_id)
 
     try:
         raw_results = db.search_messages(
@@ -557,11 +606,12 @@ def _discover(
             break
         raw_sid = r["session_id"]
         resolved_sid = _resolve_to_parent(db, raw_sid)
-        # Skip the current session lineage
-        if current_lineage_root and resolved_sid == current_lineage_root:
-            continue
         if current_session_id and raw_sid == current_session_id:
-            continue
+            is_current_archive = (
+                not bool(r.get("active")) and bool(r.get("compacted"))
+            )
+            if not is_current_archive:
+                continue
         if resolved_sid not in seen_sessions:
             row = dict(r)
             row["_lineage_root"] = resolved_sid
@@ -575,7 +625,17 @@ def _discover(
         hit_sid = match_info.get("session_id") or lineage_root
         msg_id = match_info.get("id")
         try:
-            view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
+            view = db.get_anchored_view(
+                hit_sid,
+                msg_id,
+                window=5,
+                bookend=3,
+                state_filter=(
+                    "archived_compacted"
+                    if current_session_id and hit_sid == current_session_id
+                    else "discoverable"
+                ),
+            )
         except Exception as e:
             logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
             continue
