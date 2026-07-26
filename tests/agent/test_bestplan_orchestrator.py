@@ -139,6 +139,30 @@ def test_validate_runtime_accepts_config_lanes_with_arbitrary_models():
     assert cfg["lanes"][1]["model"] == "gpt-6-sol"
 
 
+def test_validate_runtime_accepts_legacy_keyed_lane_mapping():
+    """Existing config.yaml files may key lane definitions by lane name."""
+    keyed_lanes = {
+        "glm": {
+            "provider": "neuralwatt",
+            "model": "glm-5.2",
+            "api_mode": "chat_completions",
+            "reasoning_effort": "high",
+        },
+        "sol": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "api_mode": "codex_app_server",
+            "reasoning_effort": "ultra",
+        },
+    }
+
+    cfg = validate_runtime({"lanes": keyed_lanes})
+
+    assert [lane["name"] for lane in cfg["lanes"]] == ["glm", "sol"]
+    assert cfg["lanes"][0]["provider"] == "neuralwatt"
+    assert cfg["lanes"][1]["model"] == "gpt-5.6-sol"
+
+
 def test_sol_ultra_requires_codex_app_server():
     """If a lane has reasoning_effort='ultra' but api_mode != 'codex_app_server',
     validate_runtime must raise BestPlanUnavailable — the ultra→codex_app_server

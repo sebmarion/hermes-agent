@@ -106,9 +106,19 @@ def validate_runtime(config: dict[str, Any] | None = None, *, credentials_availa
     if not resolved.get("enabled", True):
         raise BestPlanUnavailable("BestPlan is disabled")
     lanes = resolved.get("lanes")
-    if not isinstance(lanes, Iterable) or isinstance(lanes, str):
+    if isinstance(lanes, dict):
+        normalized_lanes = []
+        for lane_name, lane in lanes.items():
+            if not isinstance(lane, dict):
+                raise BestPlanUnavailable("BestPlan lane must be a dict")
+            normalized_lane = dict(lane)
+            normalized_lane.setdefault("name", str(lane_name))
+            normalized_lanes.append(normalized_lane)
+        lanes = normalized_lanes
+    elif not isinstance(lanes, Iterable) or isinstance(lanes, str):
         raise BestPlanUnavailable("BestPlan lanes config is unavailable")
-    lanes = list(lanes)
+    else:
+        lanes = list(lanes)
     if len(lanes) != 2:
         raise BestPlanUnavailable(f"BestPlan requires two explorer lanes, got {len(lanes)}")
     required_lane_keys = ("name", "provider", "model", "api_mode", "reasoning_effort")
