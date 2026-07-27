@@ -134,6 +134,42 @@ class TestCodexAppServerModule:
         assert ok is False
         assert "not found" in msg.lower() or "no such" in msg.lower()
 
+    def test_default_binary_resolves_user_local_install_for_minimal_daemon_path(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        codex = tmp_path / ".local" / "bin" / "codex"
+        codex.parent.mkdir(parents=True)
+        codex.write_text("#!/bin/sh\n")
+        codex.chmod(0o755)
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = cmd
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+
+        client = cas.CodexAppServerClient()
+        client._closed = True
+
+        assert captured["cmd"][:2] == [str(codex), "app-server"]
+
     def test_codex_error_class_is_runtimeerror(self) -> None:
         from agent.transports.codex_app_server import CodexAppServerError
 
