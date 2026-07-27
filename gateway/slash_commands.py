@@ -39,7 +39,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
+from hermes_cli.config import atomic_config_write, cfg_get
 from utils import (
     atomic_json_write,
     atomic_roundtrip_yaml_updates,
@@ -1437,8 +1437,7 @@ class GatewaySlashCommandsMixin:
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
-        from gateway.run import _hermes_home, _load_gateway_config
-        import yaml
+        from gateway.run import _load_gateway_config
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_flags,
             resolve_persist_behavior,
@@ -1459,6 +1458,25 @@ class GatewaySlashCommandsMixin:
         ) = parse_model_flags(raw_args)
         persist_global = resolve_persist_behavior(is_global_flag, is_session)
 
+        def _persist_global_route(switch_result) -> tuple[bool, str]:
+            try:
+                from hermes_cli.config import persist_main_model_assignment
+
+                persist_main_model_assignment(
+                    provider=switch_result.target_provider,
+                    model=switch_result.new_model,
+                    base_url=switch_result.base_url or None,
+                    api_mode=switch_result.api_mode or None,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist global model route: %s", exc)
+                return (
+                    False,
+                    "⚠️ Model switched for this session, but the global model "
+                    f"route was not saved: {exc}",
+                )
+            return True, ""
+
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
             try:
@@ -1474,7 +1492,6 @@ class GatewaySlashCommandsMixin:
         current_api_key = ""
         user_provs = None
         custom_provs = None
-        config_path = _hermes_home / "config.yaml"
         try:
             cfg = _load_gateway_config()
             if cfg:
@@ -1677,32 +1694,10 @@ class GatewaySlashCommandsMixin:
                         # Persist to config (default) unless --session opted out,
                         # mirroring the text /model command path above so a picked
                         # model survives across sessions like a typed one (#49066).
+                        saved_global = False
+                        save_warning = ""
                         if persist_global:
-                            try:
-                                if config_path.exists():
-                                    with open(config_path, encoding="utf-8") as f:
-                                        _persist_cfg = yaml.safe_load(f) or {}
-                                else:
-                                    _persist_cfg = {}
-                                _raw_model = _persist_cfg.get("model")
-                                if isinstance(_raw_model, dict):
-                                    _persist_model_cfg = _raw_model
-                                elif isinstance(_raw_model, str) and _raw_model.strip():
-                                    _persist_model_cfg = {"default": _raw_model.strip()}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                else:
-                                    _persist_model_cfg = {}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
-                                if result.base_url:
-                                    _persist_model_cfg["base_url"] = result.base_url
-                                if str(result.target_provider or "").strip().lower() != "custom":
-                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
-                                from hermes_cli.config import save_config
-                                save_config(_persist_cfg)
-                            except Exception as e:
-                                logger.warning("Failed to persist model switch: %s", e)
+                            saved_global, save_warning = _persist_global_route(result)
 
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
@@ -1737,8 +1732,10 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
-                        if persist_global:
+                        if saved_global:
                             lines.append(t("gateway.model.saved_global"))
+                        elif persist_global:
+                            lines.append(save_warning)
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
                         return "\n".join(lines)
@@ -1922,38 +1919,10 @@ class GatewaySlashCommandsMixin:
             self._evict_cached_agent(session_key)
 
             # Persist to config (default) unless --session opted out
+            saved_global = False
+            save_warning = ""
             if persist_global:
-                try:
-                    if config_path.exists():
-                        with open(config_path, encoding="utf-8") as f:
-                            cfg = yaml.safe_load(f) or {}
-                    else:
-                        cfg = {}
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                    # scalar and the next assignment raises
-                    # ``TypeError: 'str' object does not support item assignment``.
-                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                    # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
-                    if isinstance(raw_model, dict):
-                        model_cfg = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
-                    else:
-                        model_cfg = {}
-                        cfg["model"] = model_cfg
-                    model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
-                    if result.base_url:
-                        model_cfg["base_url"] = result.base_url
-                    if str(result.target_provider or "").strip().lower() != "custom":
-                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
-                    from hermes_cli.config import save_config
-                    save_config(cfg)
-                except Exception as e:
-                    logger.warning("Failed to persist model switch: %s", e)
+                saved_global, save_warning = _persist_global_route(result)
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
@@ -2001,8 +1970,10 @@ class GatewaySlashCommandsMixin:
             if result.warning_message:
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
 
-            if persist_global:
+            if saved_global:
                 lines.append(t("gateway.model.saved_global"))
+            elif persist_global:
+                lines.append(save_warning)
             else:
                 lines.append(t("gateway.model.session_only_hint"))
 

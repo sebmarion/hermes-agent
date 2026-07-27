@@ -7974,10 +7974,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if result.warning_message:
             _cprint(f"    ⚠ {result.warning_message}")
         if persist_global:
-            save_config_value("model.default", result.new_model)
-            if result.provider_changed:
-                save_config_value("model.provider", result.target_provider)
-            _cprint("    Saved to config.yaml (--global)")
+            try:
+                from hermes_cli.config import persist_main_model_assignment
+
+                persist_main_model_assignment(
+                    provider=result.target_provider,
+                    model=result.new_model,
+                    base_url=result.base_url or None,
+                    api_mode=result.api_mode or None,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist global model route: %s", exc)
+                _cprint(
+                    "    ⚠ Model switched for this session, but the global "
+                    f"model route was not saved: {exc}"
+                )
+            else:
+                _cprint("    Saved to config.yaml (--global)")
         else:
             _cprint("    (session only — add --global to persist)")
 
@@ -8291,10 +8304,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Persistence
         if persist_global:
-            save_config_value("model.default", result.new_model)
-            if result.provider_changed:
-                save_config_value("model.provider", result.target_provider)
-            _cprint("    Saved to config.yaml")
+            try:
+                from hermes_cli.config import persist_main_model_assignment
+
+                persist_main_model_assignment(
+                    provider=result.target_provider,
+                    model=result.new_model,
+                    base_url=result.base_url or None,
+                    api_mode=result.api_mode or None,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist global model route: %s", exc)
+                _cprint(
+                    "    ⚠ Model switched for this session, but the global "
+                    f"model route was not saved: {exc}"
+                )
+            else:
+                _cprint("    Saved to config.yaml")
         else:
             _cprint("    (session only — add --global to persist)")
 

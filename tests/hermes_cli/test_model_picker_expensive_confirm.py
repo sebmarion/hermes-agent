@@ -148,3 +148,78 @@ def test_prompt_toolkit_model_picker_defers_confirmation_off_key_handler(monkeyp
     assert captured["daemon"] is True
     assert captured["args"] == (result, True)
     assert "ran_inline" not in captured
+
+
+def test_typed_global_switch_warns_when_atomic_route_save_fails(monkeypatch):
+    import cli as cli_mod
+    import hermes_cli.config as config_mod
+
+    result = ModelSwitchResult(
+        success=True,
+        new_model="gpt-5.4",
+        target_provider="openai-codex",
+        provider_changed=True,
+        api_key="resolved-runtime-secret",
+        base_url="",
+        api_mode="codex_responses",
+        provider_label="ChatGPT Codex",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_kwargs: result,
+    )
+    picker_context = SimpleNamespace(
+        user_providers=None,
+        custom_providers=None,
+    )
+    picker_context.with_overrides = lambda **_kwargs: picker_context
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: picker_context,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        config_mod,
+        "persist_main_model_assignment",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("read-only filesystem")),
+        raising=False,
+    )
+
+    lines = []
+    legacy_calls = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda value, *a, **k: lines.append(str(value)))
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda *args, **kwargs: legacy_calls.append((args, kwargs)),
+    )
+
+    self_ = SimpleNamespace(
+        agent=None,
+        conversation_history=[],
+        provider="custom",
+        requested_provider="custom",
+        model="old-model",
+        base_url="https://old.example/v1",
+        api_key="old-secret",
+        api_mode="chat_completions",
+        _explicit_api_key="old-secret",
+        _explicit_base_url="https://old.example/v1",
+        _confirm_expensive_model_switch=lambda _result: True,
+        _pending_model_switch_note="",
+    )
+
+    _bound(cli_mod.HermesCLI._handle_model_switch, self_)(
+        "/model gpt-5.4 --provider openai-codex --global"
+    )
+
+    assert self_.model == "gpt-5.4"
+    assert legacy_calls == []
+    assert any("Model switched" in line for line in lines)
+    assert any(
+        "not saved" in line.lower() and "global" in line.lower() for line in lines
+    )
+    assert not any("Saved to config.yaml" in line for line in lines)

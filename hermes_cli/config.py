@@ -6851,6 +6851,121 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
         ) from exc
 
 
+_MAIN_MODEL_ROUTE_PATHS = frozenset(
+    {
+        "model",
+        "model.provider",
+        "model.default",
+        "model.base_url",
+        "model.api_mode",
+        "model.api_key",
+        "model.api",
+    }
+)
+
+
+def persist_main_model_assignment(
+    provider: str,
+    model: str,
+    *,
+    base_url: Optional[str] = None,
+    api_mode: Optional[str] = None,
+) -> None:
+    """Persist one complete interactive main-model route transaction.
+
+    Runtime-resolved credentials are intentionally not accepted here. Existing
+    on-disk endpoint credentials survive only when
+    :func:`apply_main_model_assignment` says the endpoint identity is unchanged.
+    Every changed/deleted route field is committed by one comment-preserving
+    atomic YAML update.
+
+    Raises ``RuntimeError`` when the existing config cannot be read or parsed,
+    the installation is fully managed, or any route leaf is pinned by managed
+    scope. Callers may keep an already-successful session switch, but must
+    report that the global route was not saved.
+    """
+    config_path = get_config_path()
+
+    if is_managed():
+        raise RuntimeError(
+            format_managed_message("save the global model route")
+        )
+
+    from hermes_cli import managed_scope
+
+    managed_keys = managed_scope.managed_config_keys()
+    managed_route_keys = sorted(managed_keys & _MAIN_MODEL_ROUTE_PATHS)
+    if managed_route_keys:
+        managed_dir = managed_scope.get_managed_dir()
+        source = (
+            str(managed_dir / "config.yaml")
+            if managed_dir is not None
+            else "the managed scope"
+        )
+        raise RuntimeError(
+            "Cannot save the global model route: managed setting(s) "
+            f"{', '.join(managed_route_keys)} are pinned by {source}."
+        )
+
+    require_readable_config_before_write(config_path)
+
+    raw_config: Dict[str, Any] = {}
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8-sig") as f:
+                loaded = fast_safe_load(f)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Refusing to update {config_path}: existing config.yaml is "
+                f"invalid or cannot be parsed ({exc})."
+            ) from exc
+        if loaded is None:
+            raw_config = {}
+        elif isinstance(loaded, dict):
+            raw_config = loaded
+        else:
+            raise RuntimeError(
+                f"Refusing to update {config_path}: existing config.yaml root "
+                "must be a mapping."
+            )
+
+    raw_model = raw_config.get("model")
+    assigned = apply_main_model_assignment(
+        copy.deepcopy(raw_model),
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_mode=api_mode,
+    )
+
+    persisted_fields = (
+        "provider",
+        "default",
+        "base_url",
+        "api_mode",
+        "api_key",
+        "api",
+    )
+    updates = {
+        f"model.{field}": assigned[field]
+        for field in persisted_fields
+        if field in assigned
+    }
+    delete_paths = tuple(
+        f"model.{field}"
+        for field in (*persisted_fields, "context_length")
+        if field not in assigned
+    )
+
+    import utils
+
+    utils.atomic_roundtrip_yaml_updates(
+        config_path,
+        updates,
+        delete_paths=delete_paths,
+    )
+
+
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """Fail-closed atomic write for ``config.yaml``.
 
