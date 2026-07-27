@@ -6864,6 +6864,16 @@ _MAIN_MODEL_ROUTE_PATHS = frozenset(
     }
 )
 
+_MAIN_MODEL_ROUTE_ALIAS_PATHS = (
+    "provider",
+    "base_url",
+    "api_base",
+    "context_length",
+    "model.api_base",
+    "model.model",
+    "model.name",
+)
+
 
 def persist_main_model_assignment(
     provider: str,
@@ -6937,7 +6947,8 @@ def persist_main_model_assignment(
                 "must be a mapping."
             )
 
-    raw_model = raw_config.get("model")
+    normalized_raw_config = _normalize_root_model_keys(copy.deepcopy(raw_config))
+    raw_model = normalized_raw_config.get("model")
     assigned = apply_main_model_assignment(
         copy.deepcopy(raw_model),
         provider=provider,
@@ -6963,7 +6974,7 @@ def persist_main_model_assignment(
         f"model.{field}"
         for field in (*persisted_fields, "context_length")
         if field not in assigned
-    )
+    ) + _MAIN_MODEL_ROUTE_ALIAS_PATHS
 
     import utils
 

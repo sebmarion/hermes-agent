@@ -77,6 +77,79 @@ def test_custom_to_codex_removes_stale_endpoint_fields_and_preserves_comments(
     assert len(calls) == 1
 
 
+def test_legacy_route_aliases_are_removed_atomically_and_cannot_reappear_on_reload(
+    config_home, monkeypatch
+):
+    path = config_home / "config.yaml"
+    path.write_text(
+        "# unrelated root comment\n"
+        "provider: custom\n"
+        "base_url: https://root-stale.example/v1\n"
+        "api_base: https://root-alias-stale.example/v1\n"
+        "context_length: 131072\n"
+        "model:\n"
+        "  model: stale-model-alias\n"
+        "  name: stale-name-alias\n"
+        "  api_base: https://nested-alias-stale.example/v1\n"
+        "  api_mode: anthropic_messages\n"
+        "  api_key: stored-old-key\n"
+        "  api: stored-legacy-key\n"
+        "  sibling: keep-me  # sibling comment\n"
+        "other: keep-root  # root sibling comment\n",
+        encoding="utf-8",
+    )
+    calls = _spy_atomic_updates(monkeypatch)
+
+    _persist(provider="openai-codex", model="gpt-5.4")
+
+    written_text = path.read_text(encoding="utf-8")
+    written = yaml.safe_load(written_text)
+    assert written["model"] == {
+        "provider": "openai-codex",
+        "default": "gpt-5.4",
+        "sibling": "keep-me",
+    }
+    assert written["other"] == "keep-root"
+    assert all(
+        key not in written
+        for key in ("provider", "base_url", "api_base", "context_length")
+    )
+    assert all(
+        key not in written["model"]
+        for key in (
+            "model",
+            "name",
+            "api_base",
+            "base_url",
+            "context_length",
+            "api_mode",
+            "api_key",
+            "api",
+        )
+    )
+    assert "# unrelated root comment" in written_text
+    assert "# sibling comment" in written_text
+    assert "# root sibling comment" in written_text
+    assert len(calls) == 1
+
+    reloaded_model = config_mod.load_config()["model"]
+    assert reloaded_model["provider"] == "openai-codex"
+    assert reloaded_model["default"] == "gpt-5.4"
+    assert all(
+        key not in reloaded_model
+        for key in (
+            "model",
+            "name",
+            "api_base",
+            "base_url",
+            "context_length",
+            "api_mode",
+            "api_key",
+            "api",
+        )
+    )
+
+
 def test_custom_switch_persists_complete_route_without_accepting_runtime_api_key(
     config_home
 ):
