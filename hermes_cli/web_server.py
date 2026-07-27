@@ -54,6 +54,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from hermes_cli import __version__, __release_date__
 from hermes_cli.config import (
+    apply_main_model_assignment as _apply_main_model_assignment,
     cfg_get,
     DEFAULT_CONFIG,
     OPTIONAL_ENV_VARS,
@@ -1130,62 +1131,6 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
             _log.debug("model normalization failed for %s/%s", prov_in, model_in, exc_info=True)
 
     return prov_in, model_in
-
-
-def _apply_main_model_assignment(
-    model_cfg: "Any", provider: str, model: str, base_url: str = "", api_key: str = ""
-) -> dict:
-    """Apply a main-slot model assignment to a ``model`` config dict in place.
-
-    Sets ``provider``/``default``, then reconciles ``base_url``:
-
-    - An explicitly supplied ``base_url`` is always persisted (covers
-      ``custom``/local endpoints and any provider whose key is bound to a
-      non-default host).
-    - Otherwise, a stale ``base_url`` is cleared ONLY when switching to a
-      *different* provider — that URL belonged to the old provider. When the
-      provider is unchanged and no new URL is supplied, the existing
-      ``base_url`` is preserved. This keeps a user's custom endpoint (e.g. a
-      Xiaomi MiMo Token Plan host, ``https://token-plan-*.xiaomimimo.com/v1``)
-      alive when they merely re-pick a model under the same provider — picking
-      a model previously wiped it, forcing the registry default and breaking
-      Token Plan keys.
-
-    The runtime resolver reads ``model.base_url`` from config (it ignores
-    ``OPENAI_BASE_URL``) and only honors it when the configured provider matches
-    and the pool entry is on the registry default, so preserving it here is what
-    lets the override actually route. The hardcoded ``context_length`` override
-    is always dropped since the new model may have a different context window.
-
-    Returns the same dict (coerced to a fresh dict if the input wasn't one) so
-    callers can assign it straight back onto the model config.
-    """
-    if not isinstance(model_cfg, dict):
-        model_cfg = {}
-    prev_provider = str(model_cfg.get("provider") or "").strip().lower()
-    new_provider = provider.strip().lower()
-    model_cfg["provider"] = provider
-    model_cfg["default"] = model
-    if base_url.strip():
-        model_cfg["base_url"] = base_url.strip()
-    elif model_cfg.get("base_url") and new_provider != prev_provider:
-        # Switching providers: the old URL belonged to the old provider, drop
-        # it so the new provider's default endpoint is used. Same-provider
-        # re-assignment keeps the user's configured base_url intact.
-        model_cfg["base_url"] = ""
-    # The endpoint key follows the same lifecycle as base_url: an explicit key
-    # is always persisted; an existing key is dropped only when switching to a
-    # different provider (it belonged to the old endpoint), and preserved on a
-    # same-provider re-pick so re-selecting a model doesn't wipe the key.
-    if api_key.strip():
-        model_cfg["api_key"] = api_key.strip()
-        model_cfg.pop("api", None)
-    elif model_cfg.get("api_key") and new_provider != prev_provider:
-        clear_model_endpoint_credentials(model_cfg, clear_api_mode=False)
-    if new_provider != prev_provider:
-        clear_model_endpoint_credentials(model_cfg, clear_api_key=False)
-    model_cfg.pop("context_length", None)
-    return model_cfg
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")

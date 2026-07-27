@@ -3425,7 +3425,7 @@ class TestWebServerEndpoints:
             "anthropic/claude-opus-4.8",
         )
         assert out["provider"] == "openrouter"
-        assert out["base_url"] == ""
+        assert "base_url" not in out
 
         # Same provider, no new base_url → existing custom endpoint preserved.
         # Regression: picking a different MiMo model under xiaomi must NOT wipe a
@@ -3452,7 +3452,7 @@ class TestWebServerEndpoints:
         out = _apply_main_model_assignment(
             {"provider": "openrouter", "base_url": "http://stale:1/v1"}, "custom", "m"
         )
-        assert out["base_url"] == ""
+        assert "base_url" not in out
 
         # Non-dict input is coerced to a fresh dict (never raises).
         out = _apply_main_model_assignment("not-a-dict", "custom", "m", "http://x/v1")
