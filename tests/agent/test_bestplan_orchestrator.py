@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 from agent.bestplan_orchestrator import (
     BestPlanUnavailable, DEFAULT_RUNTIME, RECEIPT_BEGIN, RECEIPT_END, append_receipt,
+    _V1_SYNTHESIS_CONTRACT,
+    _synthesis_repair_prompt,
     _candidate_from_text, body_sha256, make_receipt, normalize_count, quorum_for,
     reconcile_bestplan_receipts, run_bestplan, validate_receipt, validate_runtime,
 )
@@ -86,6 +88,23 @@ def _runtime_config(**overrides):
     return config
 
 
+def test_v1_synthesis_prompts_state_review_only_host_invariants():
+    assert "Review-only" in _V1_SYNTHESIS_CONTRACT
+    assert "mode=sota" in _V1_SYNTHESIS_CONTRACT
+    assert "risk=high" in _V1_SYNTHESIS_CONTRACT
+    assert "frontier_review" in _V1_SYNTHESIS_CONTRACT
+    assert "read_only=true" in _V1_SYNTHESIS_CONTRACT
+    assert "allowed_paths=[]" in _V1_SYNTHESIS_CONTRACT
+
+    repair_prompt = _synthesis_repair_prompt(
+        task="adversarial review plan",
+        workspace="/tmp/work",
+        candidates=[json.loads(_candidate_text().split("\n", 1)[1])],
+        invalid_output="invalid review envelope",
+        validation_error="review-only manifest rejected",
+    )
+
+    assert _V1_SYNTHESIS_CONTRACT in repair_prompt
 def _identity(lane):
     return {
         "provider": f"resolved-{lane['provider']}",
@@ -293,12 +312,14 @@ def test_run_bestplan_uses_resolved_lane_identity_and_truthful_receipt(
     import run_agent
 
     constructed = []
+    prompts = []
 
     class FakeAgent:
         def __init__(self, **kwargs):
             constructed.append(kwargs)
 
         def run_conversation(self, prompt):
+            prompts.append(prompt)
             if "active BestPlan synthesizer" in prompt:
                 return {"final_response": _synth_plan_envelope()}
             return {"final_response": _candidate_text()}
@@ -317,6 +338,10 @@ def test_run_bestplan_uses_resolved_lane_identity_and_truthful_receipt(
     result = run_bestplan(SimpleNamespace(session_id="parent"), "plan it", count=2, config=_runtime_config())
 
     assert result["status"] == "completed"
+    synthesis_prompt = next(
+        prompt for prompt in prompts if "active BestPlan synthesizer" in prompt
+    )
+    assert _V1_SYNTHESIS_CONTRACT in synthesis_prompt
     assert [(item["provider"], item["model"], item["api_mode"]) for item in constructed] == [
         ("resolved-configured-glm", "configured-glm-model", "chat_completions"),
         ("resolved-configured-sol", "configured-sol-model", "codex_app_server"),

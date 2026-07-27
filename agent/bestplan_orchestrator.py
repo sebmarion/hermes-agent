@@ -80,6 +80,16 @@ _SYNTHESIS_REPAIR_MIN_REMAINING_SECONDS = 1.0
 _SYNTHESIS_REPAIR_TASK_MAX_CHARS = 16_000
 _SYNTHESIS_REPAIR_CANDIDATES_MAX_CHARS = 16_000
 _SYNTHESIS_REPAIR_INVALID_OUTPUT_MAX_CHARS = 12_000
+_V1_SYNTHESIS_CONTRACT = (
+    "V1 host invariants: use one independent wave and set depends_on=[] for every "
+    "slice; never mix implement and review slices. An implementation plan must use "
+    "mode=delegate, kind=implement, capability=fast_fallback, read_only=false, the "
+    "exact workspace, and one or two slices with non-empty narrow relative "
+    "allowed_paths. A Review-only plan must use mode=sota, risk=high, exactly one "
+    "kind=review slice with capability=frontier_review, read_only=true, "
+    "allowed_paths=[], the exact workspace, and at least one escalation predicate. "
+    "Every slice needs non-empty expected_artifacts and acceptance."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -553,7 +563,8 @@ def _synthesis_repair_prompt(
         "workspace, allowed_paths, read_only, expected_artifacts, and acceptance; "
         "plus merge_policy, stop_condition, and escalation_predicates. Implement "
         "slices must use the exact workspace and narrow relative allowed_paths; "
-        "review slices must be read_only with no allowed_paths.\n"
+        "review slices must be read_only with no allowed_paths. "
+        f"{_V1_SYNTHESIS_CONTRACT}\n"
         f"Repair packet:\n{json.dumps(packet, ensure_ascii=True, separators=(',', ':'))}"
     )
 
@@ -919,6 +930,7 @@ def run_bestplan(
         "expected_artifacts, and acceptance; plus merge_policy, stop_condition, and "
         "escalation_predicates. Implement slices must use the exact workspace and narrow "
         "relative allowed_paths; review slices must be read_only with no allowed_paths. "
+        f"{_V1_SYNTHESIS_CONTRACT} "
         f"The exact workspace is {workspace_hint!r}.\n"
         f"Task:\n{planning_task}\nCandidates:\n<BEGIN_CANDIDATES>{packet}<END_CANDIDATES>"
     )
