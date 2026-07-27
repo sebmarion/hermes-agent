@@ -4664,33 +4664,48 @@ def apply_main_model_assignment(
 
     Endpoint settings belong to the provider route that supplied them. A
     provider change therefore drops any settings the target route did not
-    explicitly supply, while a same-provider model change preserves them.
+    explicitly supply, while a same-provider model change preserves them. An
+    explicit change to ``base_url`` also changes endpoint identity, so old
+    credentials and API mode are removed before target values are applied.
+
+    A dict input is mutated in place and returned. Scalar or ``None`` input is
+    replaced with a fresh dict.
     """
     if not isinstance(model_cfg, dict):
         model_cfg = {}
 
     previous_provider = str(model_cfg.get("provider") or "").strip().lower()
-    new_provider = provider.strip().lower()
+    previous_base_url = str(model_cfg.get("base_url") or "").strip()
+    normalized_provider = str(provider or "").strip()
+    normalized_model = str(model or "").strip()
+    normalized_base_url = str(base_url or "").strip()
+    normalized_api_key = str(api_key or "").strip()
+    normalized_api_mode = str(api_mode or "").strip()
+
+    new_provider = normalized_provider.lower()
     provider_changed = new_provider != previous_provider
+    endpoint_changed = (
+        bool(normalized_base_url) and normalized_base_url != previous_base_url
+    )
 
     if provider_changed:
-        for field in ("base_url", "api_mode", "api_key", "api"):
-            model_cfg.pop(field, None)
+        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
+    elif endpoint_changed:
+        clear_model_endpoint_credentials(model_cfg)
 
-    model_cfg["provider"] = provider
-    model_cfg["default"] = model
+    model_cfg["provider"] = normalized_provider
+    model_cfg["default"] = normalized_model
 
     endpoint_values = (
-        ("base_url", base_url),
-        ("api_mode", api_mode),
-        ("api_key", api_key),
+        ("base_url", normalized_base_url),
+        ("api_mode", normalized_api_mode),
+        ("api_key", normalized_api_key),
     )
     for field, value in endpoint_values:
-        normalized = str(value or "").strip()
-        if normalized:
-            model_cfg[field] = normalized
+        if value:
+            model_cfg[field] = value
 
-    if str(api_key or "").strip():
+    if normalized_api_key:
         model_cfg.pop("api", None)
 
     model_cfg.pop("context_length", None)

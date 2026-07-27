@@ -90,6 +90,27 @@ def test_same_provider_preserves_endpoint_fields_not_explicitly_replaced():
     }
 
 
+def test_same_provider_url_change_drops_old_endpoint_credentials():
+    result = config.apply_main_model_assignment(
+        {
+            "provider": "custom",
+            "base_url": "https://old.example/v1",
+            "api_mode": "anthropic_messages",
+            "api_key": "old-secret",
+            "api": "legacy-secret",
+        },
+        provider="custom",
+        model="new-model",
+        base_url="https://new.example/v1",
+    )
+
+    assert result == {
+        "provider": "custom",
+        "default": "new-model",
+        "base_url": "https://new.example/v1",
+    }
+
+
 def test_explicit_endpoint_fields_replace_same_provider_values_and_key_alias():
     result = config.apply_main_model_assignment(
         {
@@ -112,19 +133,55 @@ def test_explicit_endpoint_fields_replace_same_provider_values_and_key_alias():
     assert "api" not in result
 
 
-def test_assignment_always_drops_model_context_and_preserves_other_siblings():
+def test_explicit_same_normalized_url_preserves_endpoint_credentials():
     result = config.apply_main_model_assignment(
         {
-            "provider": "openrouter",
-            "default": "old-model",
-            "context_length": 8192,
-            "temperature": 0.2,
-            "fallbacks": ["backup-model"],
+            "provider": "custom",
+            "base_url": "https://same.example/v1",
+            "api_mode": "anthropic_messages",
+            "api_key": "same-secret",
         },
+        provider="custom",
+        model="new-model",
+        base_url="  https://same.example/v1  ",
+    )
+
+    assert result["base_url"] == "https://same.example/v1"
+    assert result["api_mode"] == "anthropic_messages"
+    assert result["api_key"] == "same-secret"
+
+
+def test_assignment_strips_provider_and_model_values():
+    result = config.apply_main_model_assignment(
+        None,
+        provider="  custom  ",
+        model="  local-model  ",
+        base_url="  https://endpoint.example/v1  ",
+    )
+
+    assert result == {
+        "provider": "custom",
+        "default": "local-model",
+        "base_url": "https://endpoint.example/v1",
+    }
+
+
+def test_assignment_always_drops_model_context_and_preserves_other_siblings():
+    current = {
+        "provider": "openrouter",
+        "default": "old-model",
+        "context_length": 8192,
+        "temperature": 0.2,
+        "fallbacks": ["backup-model"],
+    }
+
+    result = config.apply_main_model_assignment(
+        current,
         provider="openrouter",
         model="new-model",
     )
 
+    assert result is current
     assert "context_length" not in result
     assert result["temperature"] == 0.2
     assert result["fallbacks"] == ["backup-model"]
