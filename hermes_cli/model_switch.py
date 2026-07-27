@@ -359,8 +359,8 @@ def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool]:
 
     ``is_global`` and ``is_session`` are independent flag presences; the
     *effective* persistence decision is resolved by
-    :func:`resolve_persist_behavior`, with ``--session`` taking precedence
-    when both flags are supplied.
+    :func:`resolve_persist_behavior` so the config-gated default
+    (``model.persist_switch_by_default``) is applied in one place.
 
     Examples::
 
@@ -387,7 +387,7 @@ def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool]:
         is_global = True
         raw_args = raw_args.replace("--global", "").strip()
 
-    # Extract --session (explicit session-only; wins over --global)
+    # Extract --session (explicit session-only; overrides the persist default)
     if "--session" in raw_args:
         is_session = True
         raw_args = raw_args.replace("--session", "").strip()

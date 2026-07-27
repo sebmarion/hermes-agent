@@ -7762,7 +7762,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         lines.append(('class:approval-border', '╰' + ('─' * box_width) + '╯\n'))
         return lines
 
-    def _open_model_picker(self, providers: list, current_model: str, current_provider: str, user_provs=None, custom_provs=None) -> None:
+    def _open_model_picker(
+        self,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        user_provs=None,
+        custom_provs=None,
+        persist_global: bool = False,
+    ) -> None:
         """Open prompt_toolkit-native /model picker modal."""
         self._capture_modal_input_snapshot()
         default_idx = next((i for i, p in enumerate(providers) if p.get("is_current")), 0)
@@ -7774,6 +7782,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "current_provider": current_provider,
             "user_provs": user_provs,
             "custom_provs": custom_provs,
+            "persist_global": persist_global,
         }
         self._invalidate(min_interval=0.0)
 
@@ -7972,10 +7981,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         else:
             _cprint("    (session only — add --global to persist)")
 
-    def _handle_model_picker_selection(self, persist_global: bool = False) -> None:
+    def _handle_model_picker_selection(
+        self, persist_global: Optional[bool] = None
+    ) -> None:
         state = self._model_picker_state
         if not state:
             return
+        if persist_global is None:
+            persist_global = bool(state.get("persist_global", False))
         selected = state.get("selected", 0)
         stage = state.get("stage")
         if stage == "provider":
@@ -8139,6 +8152,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 provider_display,
                 user_provs=user_provs,
                 custom_provs=custom_provs,
+                persist_global=persist_global,
             )
             return
 
@@ -13530,13 +13544,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # --- /model picker modal ---
             if self._model_picker_state:
                 try:
-                    # Picker selections persist by default (same default as
-                    # /model <name>); honour model.persist_switch_by_default.
-                    from hermes_cli.model_switch import resolve_persist_behavior
-
-                    self._handle_model_picker_selection(
-                        persist_global=resolve_persist_behavior(False, False)
-                    )
+                    # Reuse the persistence intent resolved when /model opened
+                    # the picker; bare and --session stay session-only.
+                    self._handle_model_picker_selection()
                 except Exception as _exc:
                     _cprint(f"  ✗ Model selection failed: {_exc}")
                     self._close_model_picker()
