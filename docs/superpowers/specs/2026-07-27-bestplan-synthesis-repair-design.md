@@ -54,6 +54,20 @@ timeout is the smaller of 45 seconds and that remaining deadline.
 4. If no ordinary result validates and sufficient deadline remains, the host
    sends the bounded repair prompt to one resolved lane with tools disabled.
 5. The normal envelope validator accepts or rejects the repair output.
+
+### Live-proof amendment: no-tools runtime fallback
+
+The originating synthesis lane remains the preferred repair runtime. When that
+runtime is `codex_app_server`, however, Hermes cannot prove that native Codex
+tools are absent. In that one case, the repair request uses the first already
+resolved synthesis lane whose runtime can enforce an empty toolset. The invalid
+output remains the exact last non-empty ordinary synthesis response; only the
+representation-only repair runtime changes. If no such lane exists, repair is
+skipped and BestPlan fails closed.
+
+The accepted plan receipt records the runtime that actually performed the
+repair. The one-attempt limit, deadline, exact workspace, bounded prompt,
+ordinary validator, compiler, baseline, and proof gates remain unchanged.
 6. Accepted output follows the existing capture, baseline, persistence, and
    later `Go` execution path unchanged.
 

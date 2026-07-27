@@ -1108,7 +1108,7 @@ def test_synthesis_repair_is_skipped_with_less_than_one_second_remaining(
     assert not any("BestPlan envelope repair" in prompt for prompt in prompts)
 
 
-def test_synthesis_repair_fails_closed_for_codex_app_server_lane(monkeypatch):
+def test_synthesis_repair_falls_back_from_codex_to_no_tools_lane(monkeypatch):
     import agent.bestplan_orchestrator as orchestrator
     import run_agent
 
@@ -1147,6 +1147,67 @@ def test_synthesis_repair_fails_closed_for_codex_app_server_lane(monkeypatch):
         "plan it",
         count=2,
         config=_runtime_config(overall_timeout=2.0),
+    )
+
+    assert result["status"] == "completed"
+    repair_calls = [
+        (model, prompt)
+        for model, prompt in calls
+        if "BestPlan envelope repair" in prompt
+    ]
+    assert len(repair_calls) == 1
+    repair_model, repair_prompt = repair_calls[0]
+    assert repair_model == "configured-glm-model"
+    assert "invalid SOL synthesis" in repair_prompt
+    assert result["runtime"] == {
+        "lane": "glm",
+        "provider": "resolved-configured-glm",
+        "model": "configured-glm-model",
+        "api_mode": "chat_completions",
+    }
+
+
+def test_synthesis_repair_fails_closed_without_a_no_tools_lane(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    calls = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, prompt):
+            calls.append((self.kwargs["model"], prompt))
+            if "BestPlan envelope repair" in prompt:
+                return {"final_response": _synth_plan_envelope()}
+            if "active BestPlan synthesizer" in prompt:
+                if self.kwargs["model"] == "configured-sol-model":
+                    return {"final_response": "invalid SOL synthesis"}
+                return {"final_response": ""}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, lane: _identity(lane),
+    )
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+    config = _runtime_config(overall_timeout=2.0)
+    config["lanes"][0]["api_mode"] = "codex_app_server"
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=2,
+        config=config,
     )
 
     assert result["status"] == "failed"

@@ -6,6 +6,12 @@
 
 **Architecture:** `run_bestplan` continues to own explorer quorum, ordinary synthesis, validation, and teardown. It records only the last non-empty invalid ordinary synthesis result and its exact lane/runtime. If at least one second remains, a new no-tools child receives bounded untrusted inputs and gets at most 45 seconds for one representation-only repair; its response passes through `_validated_plan_envelope` and the existing downstream capture path unchanged.
 
+**Live-proof amendment:** Prefer the originating synthesis runtime for repair.
+If it is `codex_app_server`, select the first already-resolved synthesis runtime
+that can enforce an empty toolset, while preserving the exact invalid output as
+untrusted repair input. Fail closed when no eligible runtime exists. Record the
+runtime that actually performed the repair.
+
 **Tech Stack:** Python, existing `AIAgent`, `DaemonThreadPoolExecutor`, pytest through `scripts/run_tests.sh`
 
 ---

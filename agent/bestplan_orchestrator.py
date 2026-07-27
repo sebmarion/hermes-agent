@@ -1028,19 +1028,41 @@ def run_bestplan(
         synth_runtime = candidate_runtime
         break
 
+    repair_lane = invalid_synth_lane
+    repair_runtime = invalid_synth_runtime
+    if (
+        repair_runtime is not None
+        and str(repair_runtime.get("api_mode") or "").strip()
+        == "codex_app_server"
+    ):
+        repair_choice = next(
+            (
+                (candidate_lane, candidate_runtime)
+                for candidate_lane, candidate_runtime in available_lanes
+                if str(candidate_runtime.get("api_mode") or "").strip()
+                != "codex_app_server"
+            ),
+            None,
+        )
+        if repair_choice is None:
+            repair_lane = None
+            repair_runtime = None
+        else:
+            repair_lane, repair_runtime = repair_choice
+
     repair_remaining = overall_deadline - time.monotonic()
     if (
         synth_lane is None
         and invalid_synth_body
-        and invalid_synth_lane is not None
-        and invalid_synth_runtime is not None
+        and repair_lane is not None
+        and repair_runtime is not None
         and repair_remaining >= _SYNTHESIS_REPAIR_MIN_REMAINING_SECONDS
     ):
         try:
             repair_child = _build_repair_agent(
                 agent,
-                invalid_synth_lane,
-                invalid_synth_runtime,
+                repair_lane,
+                repair_runtime,
             )
         except Exception:
             repair_child = None
@@ -1114,8 +1136,8 @@ def run_bestplan(
                 )
                 if executable_body is not None:
                     body = executable_body
-                    synth_lane = invalid_synth_lane
-                    synth_runtime = invalid_synth_runtime
+                    synth_lane = repair_lane
+                    synth_runtime = repair_runtime
 
     if synth_lane is None or synth_runtime is None:
         return {
