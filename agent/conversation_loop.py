@@ -654,7 +654,9 @@ def _run_conversation(
     # toolset are never mutated; only the synthesized response is finalized.
     if bestplan_config is not None:
         from agent.bestplan_orchestrator import run_bestplan
-        outcome = run_bestplan(agent, user_message, **bestplan_config)
+        bestplan_kwargs = dict(bestplan_config)
+        bestplan_kwargs["conversation_history"] = messages[:current_turn_user_idx]
+        outcome = run_bestplan(agent, user_message, **bestplan_kwargs)
         response = outcome.get("final_response") or (
             "BestPlan unavailable: " + str(outcome.get("error", "unknown error"))
         )
