@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.model_switch import ModelSwitchResult
 
 
@@ -41,6 +43,7 @@ class _StubCLI:
     _explicit_base_url = ""
     api_mode = ""
     _pending_model_switch_note = ""
+    conversation_history = []
 
 
 def _run_display(monkeypatch, result):
@@ -169,3 +172,114 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
         cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
 
     assert ("model.context_length", None) in writes
+
+def test_picker_runtime_switch_failure_performs_zero_config_writes(monkeypatch):
+    import cli as cli_mod
+    import hermes_cli.config as config_mod
+
+    class _FailingAgent:
+        _config_context_length = None
+
+        def switch_model(self, **_kwargs):
+            raise RuntimeError("client rebuild failed")
+
+    result = ModelSwitchResult(
+        success=True,
+        new_model="gpt-5.4",
+        target_provider="openai-codex",
+        provider_changed=True,
+        api_key="runtime-secret",
+        base_url="",
+        api_mode="codex_responses",
+        provider_label="ChatGPT Codex",
+    )
+    cli = _StubCLI()
+    cli.agent = _FailingAgent()
+    cli.model = "old-model"
+    cli.provider = "custom"
+    cli.requested_provider = "custom"
+    cli.base_url = "https://old.example/v1"
+    cli.api_key = "old-secret"
+    cli.api_mode = "chat_completions"
+    cli._explicit_api_key = "old-secret"
+    cli._explicit_base_url = "https://old.example/v1"
+    calls = []
+    lines = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda value, *a, **k: lines.append(str(value)))
+    monkeypatch.setattr(
+        "hermes_cli.context_switch_guard.merge_preflight_compression_warning",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        config_mod,
+        "persist_main_model_assignment",
+        lambda **kwargs: calls.append(kwargs),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda *a, **k: pytest.fail("legacy dotted writes must not run"),
+    )
+
+    cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
+
+    assert calls == []
+    assert cli.model == "old-model"
+    assert any("failed" in line and "staying on old-model" in line for line in lines)
+
+
+def test_picker_persistence_failure_keeps_session_switch_and_warns_unsaved(
+    monkeypatch
+):
+    import cli as cli_mod
+    import hermes_cli.config as config_mod
+
+    result = ModelSwitchResult(
+        success=True,
+        new_model="gpt-5.4",
+        target_provider="openai-codex",
+        provider_changed=True,
+        api_key="runtime-secret",
+        base_url="",
+        api_mode="codex_responses",
+        provider_label="ChatGPT Codex",
+    )
+    cli = _StubCLI()
+    cli.agent = None
+    cli.model = "old-model"
+    cli.provider = "custom"
+    cli.requested_provider = "custom"
+    cli.base_url = "https://old.example/v1"
+    cli.api_key = "old-secret"
+    cli.api_mode = "chat_completions"
+    cli._explicit_api_key = "old-secret"
+    cli._explicit_base_url = "https://old.example/v1"
+    lines = []
+    legacy_calls = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda value, *a, **k: lines.append(str(value)))
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        config_mod,
+        "persist_main_model_assignment",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda *args, **kwargs: legacy_calls.append((args, kwargs)),
+    )
+
+    cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
+
+    assert cli.model == "gpt-5.4"
+    assert legacy_calls == []
+    assert any("Model switched" in line for line in lines)
+    assert any(
+        "not saved" in line.lower() and "global" in line.lower() for line in lines
+    )
+    assert not any("Saved to config.yaml" in line for line in lines)

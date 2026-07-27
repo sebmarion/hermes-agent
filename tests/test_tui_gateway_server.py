@@ -6728,7 +6728,7 @@ def test_config_set_model_global_persists(monkeypatch):
         warning_message="",
     )
     seen = {}
-    saved_values = {}
+    persist_calls = []
 
     def _switch_model(**kwargs):
         seen.update(kwargs)
@@ -6738,9 +6738,11 @@ def test_config_set_model_global_persists(monkeypatch):
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", _switch_model)
     monkeypatch.setattr(server, "_restart_slash_worker", lambda sid, session: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
-    # _persist_model_switch uses targeted save_config_value writes (#48305) so it
-    # preserves sibling model.* keys instead of rewriting the whole block.
-    monkeypatch.setattr("cli.save_config_value", lambda key, value: saved_values.__setitem__(key, value) or True)
+    monkeypatch.setattr(
+        "hermes_cli.config.persist_main_model_assignment",
+        lambda **kwargs: persist_calls.append(kwargs),
+        raising=False,
+    )
 
     resp = server.handle_request(
         {
@@ -6756,9 +6758,72 @@ def test_config_set_model_global_persists(monkeypatch):
 
     assert resp["result"]["value"] == "anthropic/claude-sonnet-4.6"
     assert seen["is_global"] is True
-    assert saved_values["model.default"] == "anthropic/claude-sonnet-4.6"
-    assert saved_values["model.provider"] == "anthropic"
-    assert saved_values["model.base_url"] == "https://api.anthropic.com"
+    assert persist_calls == [
+        {
+            "provider": "anthropic",
+            "model": "anthropic/claude-sonnet-4.6",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
+        }
+    ]
+    assert "api_key" not in persist_calls[0]
+
+
+def test_config_set_model_global_save_failure_warns_but_keeps_session_switch(
+    monkeypatch
+):
+    class _Agent:
+        provider = "openrouter"
+        model = "old/model"
+        base_url = ""
+        api_key = "sk-old"
+
+        def switch_model(self, **kwargs):
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+
+    result = types.SimpleNamespace(
+        success=True,
+        new_model="anthropic/claude-sonnet-4.6",
+        target_provider="anthropic",
+        api_key="resolved-runtime-secret",
+        base_url="https://api.anthropic.com",
+        api_mode="anthropic_messages",
+        warning_message="",
+        model_info=None,
+        error_message="",
+    )
+    agent = _Agent()
+    server._sessions["sid"] = _session(agent=agent)
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kwargs: result)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.persist_main_model_assignment",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        raising=False,
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.set",
+            "params": {
+                "session_id": "sid",
+                "key": "model",
+                "value": "anthropic/claude-sonnet-4.6 --global",
+            },
+        }
+    )
+
+    assert resp["result"]["value"] == "anthropic/claude-sonnet-4.6"
+    assert agent.model == "anthropic/claude-sonnet-4.6"
+    assert "not saved" in resp["result"]["warning"].lower()
+    assert "global" in resp["result"]["warning"].lower()
 
 
 def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatch):
@@ -15245,7 +15310,6 @@ def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch
     targeted save_config_value writes instead of rewriting the whole block."""
     import types
     import yaml
-    import cli
 
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(
@@ -15265,9 +15329,12 @@ def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch
     monkeypatch.setattr(cli, "_hermes_home", tmp_path)
 
     result = types.SimpleNamespace(
-        new_model="new-model", target_provider="anthropic", base_url=None
+        new_model="new-model",
+        target_provider="anthropic",
+        base_url=None,
+        api_mode=None,
     )
-    server._persist_model_switch(result)
+    assert server._persist_model_switch(result) is True
     saved = yaml.safe_load(cfg_path.read_text())
 
     # The switched fields updated...
@@ -15285,7 +15352,6 @@ def test_persist_model_switch_clears_stale_base_url(tmp_path, monkeypatch):
     pointing at the old host."""
     import types
     import yaml
-    import cli
 
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(
@@ -15299,15 +15365,17 @@ def test_persist_model_switch_clears_stale_base_url(tmp_path, monkeypatch):
 
     # Switch to a native provider with no base_url.
     result = types.SimpleNamespace(
-        new_model="claude-haiku", target_provider="anthropic", base_url=None
+        new_model="claude-haiku",
+        target_provider="anthropic",
+        base_url=None,
+        api_mode=None,
     )
-    server._persist_model_switch(result)
+    assert server._persist_model_switch(result) is True
     saved = yaml.safe_load(cfg_path.read_text())
 
     assert saved["model"]["default"] == "claude-haiku"
     assert saved["model"]["provider"] == "anthropic"
-    # Stale custom base_url must be cleared (null coalesces to absent on read).
-    assert not saved["model"].get("base_url"), saved["model"].get("base_url")
+    assert "base_url" not in saved["model"]
 
 
 # ---------------------------------------------------------------------------

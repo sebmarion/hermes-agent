@@ -4266,24 +4266,16 @@ def _restart_slash_worker(sid: str, session: dict):
     _attach_worker(sid, session, new_worker)
 
 
-def _persist_model_switch(result) -> None:
-    # Use targeted, atomic key writes (comment/ordering-preserving) instead of
-    # rewriting the whole `model:` block. A full-block rewrite via save_config()
-    # destroys sibling keys the user set under `model:` — `model_slots`,
-    # `model_fallback`, etc. — when switching models from the TUI (#48305).
-    from cli import save_config_value
+def _persist_model_switch(result) -> bool:
+    from hermes_cli.config import persist_main_model_assignment
 
-    save_config_value("model.default", result.new_model)
-    save_config_value("model.provider", result.target_provider)
-    if result.base_url:
-        save_config_value("model.base_url", result.base_url)
-    else:
-        # Clear any stale base_url when switching to a provider that doesn't use
-        # one (e.g. custom endpoint -> native provider). Reads coalesce null to
-        # absent (`model_cfg.get("base_url") or ""`), so a null is equivalent to
-        # removal without needing a key-delete. Leaving the old value would
-        # route the new model at the previous custom host (#48305).
-        save_config_value("model.base_url", None)
+    persist_main_model_assignment(
+        provider=result.target_provider,
+        model=result.new_model,
+        base_url=result.base_url or None,
+        api_mode=result.api_mode or None,
+    )
+    return True
 
 
 def _snapshot_agent_model_runtime(agent) -> dict:
@@ -4526,11 +4518,24 @@ def _apply_model_switch(
             "api_key": result.api_key,
             "api_mode": result.api_mode,
         }
+    persistence_warning = ""
     if persist_global:
-        _persist_model_switch(result)
+        try:
+            _persist_model_switch(result)
+        except Exception as exc:
+            logger.warning("Failed to persist global model route: %s", exc)
+            persistence_warning = (
+                "Model switched for this session, but the global model route "
+                f"was not saved: {exc}"
+            )
+    result_warning = result.warning_message or ""
+    if persistence_warning:
+        result_warning = "\n".join(
+            part for part in (result_warning, persistence_warning) if part
+        )
     return {
         "value": result.new_model,
-        "warning": result.warning_message or "",
+        "warning": result_warning,
         "confirm_required": False,
         "scope": "once" if one_turn else ("global" if persist_global else "session"),
     }

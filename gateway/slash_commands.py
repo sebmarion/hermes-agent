@@ -40,7 +40,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
+from hermes_cli.config import atomic_config_write, cfg_get
 from utils import (
     atomic_json_write,
     base_url_host_matches,
@@ -1716,6 +1716,25 @@ class GatewaySlashCommandsMixin:
             explicit_provider=explicit_provider,
         )
 
+        def _persist_global_route(switch_result) -> tuple[bool, str]:
+            try:
+                from hermes_cli.config import persist_main_model_assignment
+
+                persist_main_model_assignment(
+                    provider=switch_result.target_provider,
+                    model=switch_result.new_model,
+                    base_url=switch_result.base_url or None,
+                    api_mode=switch_result.api_mode or None,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist global model route: %s", exc)
+                return (
+                    False,
+                    "⚠️ Model switched for this session, but the global model "
+                    f"route was not saved: {exc}",
+                )
+            return True, ""
+
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
             try:
@@ -1952,61 +1971,10 @@ class GatewaySlashCommandsMixin:
                         # Persist to config (default) unless --session opted out,
                         # mirroring the text /model command path above so a picked
                         # model survives across sessions like a typed one (#49066).
+                        saved_global = False
+                        save_warning = ""
                         if persist_global:
-                            try:
-                                # Write-back round-trip: raw read is correct
-                                # (merged defaults must not be persisted).
-                                from hermes_cli.config import read_user_config_raw
-                                _persist_cfg = read_user_config_raw(config_path)
-                                _raw_model = _persist_cfg.get("model")
-                                if isinstance(_raw_model, dict):
-                                    _persist_model_cfg = _raw_model
-                                elif isinstance(_raw_model, str) and _raw_model.strip():
-                                    _persist_model_cfg = {"default": _raw_model.strip()}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                else:
-                                    _persist_model_cfg = {}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                try:
-                                    from hermes_cli.route_identity import should_clear_context_pin_async
-
-                                    if await should_clear_context_pin_async(
-                                        _persist_model_cfg.get("default")
-                                        or _persist_model_cfg.get("model"),
-                                        result.new_model,
-                                        _persist_model_cfg.get("base_url"),
-                                        result.base_url,
-                                        _persist_model_cfg.get("provider"),
-                                        result.target_provider,
-                                    ):
-                                        _persist_model_cfg.pop("context_length", None)
-                                except Exception:
-                                    _persist_model_cfg.pop("context_length", None)
-                                _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
-                                # Named providers always resolve base_url/api_mode fresh,
-                                # so any leftover is cleared unconditionally below. Custom
-                                # providers have no registry entry to re-derive from, so
-                                # they need an explicit set-or-clear here — the previous
-                                # lone `if result.base_url:` left a stale base_url behind
-                                # when switching to a custom provider whose resolver
-                                # returned an empty base_url (#25107).
-                                _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
-                                if result.base_url:
-                                    _persist_model_cfg["base_url"] = result.base_url
-                                elif _is_custom_target:
-                                    _persist_model_cfg.pop("base_url", None)
-                                if _is_custom_target:
-                                    if result.api_mode:
-                                        _persist_model_cfg["api_mode"] = result.api_mode
-                                    else:
-                                        _persist_model_cfg.pop("api_mode", None)
-                                else:
-                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
-                                from hermes_cli.config import save_config
-                                save_config(_persist_cfg)
-                            except Exception as e:
-                                logger.warning("Failed to persist model switch: %s", e)
+                            saved_global, save_warning = _persist_global_route(result)
 
                         # Build confirmation text.  Use display form so opaque
                         # Palantir IDs (ri.language-model-service..*) get
@@ -2052,8 +2020,10 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
-                        if persist_global:
+                        if saved_global:
                             lines.append(t("gateway.model.saved_global"))
+                        elif persist_global:
+                            lines.append(save_warning)
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
                         return "\n".join(lines)
@@ -2277,61 +2247,10 @@ class GatewaySlashCommandsMixin:
             self._evict_cached_agent(session_key)
 
             # Persist to config (default) unless --session opted out
+            saved_global = False
+            save_warning = ""
             if persist_global:
-                try:
-                    # Write-back round-trip: raw read is correct (merged
-                    # defaults must not be persisted back to the user's file).
-                    from hermes_cli.config import read_user_config_raw
-                    cfg = read_user_config_raw(config_path)
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                    # scalar and the next assignment raises
-                    # ``TypeError: 'str' object does not support item assignment``.
-                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                    # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
-                    if isinstance(raw_model, dict):
-                        model_cfg = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
-                    else:
-                        model_cfg = {}
-                        cfg["model"] = model_cfg
-                    try:
-                        from hermes_cli.route_identity import should_clear_context_pin_async
-
-                        if await should_clear_context_pin_async(
-                            model_cfg.get("default") or model_cfg.get("model"),
-                            result.new_model,
-                            model_cfg.get("base_url"),
-                            result.base_url,
-                            model_cfg.get("provider"),
-                            result.target_provider,
-                        ):
-                            model_cfg.pop("context_length", None)
-                    except Exception:
-                        model_cfg.pop("context_length", None)
-                    model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
-                    # See the picker handler above for why custom providers need an
-                    # explicit set-or-clear instead of the old lone truthy check (#25107).
-                    _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
-                    if result.base_url:
-                        model_cfg["base_url"] = result.base_url
-                    elif _is_custom_target:
-                        model_cfg.pop("base_url", None)
-                    if _is_custom_target:
-                        if result.api_mode:
-                            model_cfg["api_mode"] = result.api_mode
-                        else:
-                            model_cfg.pop("api_mode", None)
-                    else:
-                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
-                    from hermes_cli.config import save_config
-                    save_config(cfg)
-                except Exception as e:
-                    logger.warning("Failed to persist model switch: %s", e)
+                saved_global, save_warning = _persist_global_route(result)
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
@@ -2388,10 +2307,12 @@ class GatewaySlashCommandsMixin:
             if result.warning_message:
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
 
-            if persist_global:
+            if saved_global:
                 lines.append(t("gateway.model.saved_global"))
             elif one_turn:
                 lines.append("    (next turn only — restores after one response)")
+            elif persist_global:
+                lines.append(save_warning)
             else:
                 lines.append(t("gateway.model.session_only_hint"))
 

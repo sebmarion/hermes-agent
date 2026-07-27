@@ -195,10 +195,36 @@ async def test_picker_tap_global_flag_persists(tmp_path, monkeypatch, seed_model
     )
     assert written["model"]["default"] == "gpt-5.5"
     assert written["model"]["provider"] == "openrouter"
-    assert "base_url" not in written["model"]
+    assert written["model"]["base_url"] == "https://openrouter.ai/api/v1"
+    assert written["model"]["api_mode"] == "chat_completions"
     assert "api_key" not in written["model"]
-    assert "api_mode" not in written["model"]
     assert "context_length" not in written["model"]
+
+
+@pytest.mark.asyncio
+async def test_picker_tap_without_flags_does_not_persist(tmp_path, monkeypatch):
+    """A bare picker choice ignores the legacy persist-by-default setting."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {
+            "default": "old-model",
+            "provider": "openai-codex",
+            "persist_switch_by_default": True,
+        },
+    )
+    runner = _make_runner(adapter)
+
+    confirmation = await _drive_picker(runner, _make_event("/model"))
+
+    assert confirmation is not None
+    assert "gpt-5.5" in confirmation
+    assert runner._session_model_overrides, "session override should be set"
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "old-model"
+    assert written["model"]["provider"] == "openai-codex"
+    assert written["model"]["persist_switch_by_default"] is True
 
 
 @pytest.mark.asyncio
@@ -253,3 +279,107 @@ async def test_multiplex_picker_global_persists_only_named_profile(
     assert written["marker"] == "named"
     assert written["model"]["default"] == "gpt-5.5"
     assert written["model"]["provider"] == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
+    """``/model --session`` then a picker tap stays in-memory only — config
+    untouched, but the in-memory session override must still be applied (the
+    switch worked, it just wasn't persisted)."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    runner = _make_runner(adapter)
+
+    confirmation = await _drive_picker(runner, _make_event("/model --session"))
+
+    assert confirmation is not None
+    assert "gpt-5.5" in confirmation
+    # The session override IS applied in-memory (proves the path didn't no-op).
+    assert runner._session_model_overrides, "session override should be set"
+    assert any(
+        ov.get("model") == "gpt-5.5"
+        for ov in runner._session_model_overrides.values()
+    )
+    # But config.yaml is untouched — the override is in-memory only.
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "old-model"
+    assert written["model"]["provider"] == "openai-codex"
+
+
+@pytest.mark.asyncio
+async def test_picker_global_custom_route_persists_endpoint_but_not_runtime_secret(
+    tmp_path, monkeypatch
+):
+    """A resolved picker credential is runtime-only; the route saves atomically."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {
+            "default": "old-model",
+            "provider": "openai-codex",
+            "sibling": "keep-me",
+        },
+    )
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **kwargs: ModelSwitchResult(
+            success=True,
+            new_model="neuralwatt-v2",
+            target_provider="custom",
+            provider_changed=True,
+            api_key="resolved-runtime-secret",
+            base_url="https://neuralwatt.example/v1",
+            api_mode="chat_completions",
+            provider_label="NeuralWatt",
+            is_global=True,
+        ),
+    )
+
+    confirmation = await _drive_picker(
+        _make_runner(adapter), _make_event("/model --global")
+    )
+
+    assert confirmation is not None
+    assert "Saved to config.yaml" in confirmation
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"] == {
+        "default": "neuralwatt-v2",
+        "provider": "custom",
+        "sibling": "keep-me",
+        "base_url": "https://neuralwatt.example/v1",
+        "api_mode": "chat_completions",
+    }
+
+
+@pytest.mark.asyncio
+async def test_picker_global_save_failure_warns_and_never_claims_saved(
+    tmp_path, monkeypatch
+):
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+    before = cfg_path.read_bytes()
+    monkeypatch.setattr(
+        "hermes_cli.config.persist_main_model_assignment",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        raising=False,
+    )
+
+    confirmation = await _drive_picker(
+        _make_runner(adapter), _make_event("/model --global")
+    )
+
+    assert confirmation is not None
+    assert "gpt-5.5" in confirmation
+    assert "not saved" in confirmation.lower()
+    assert "global" in confirmation.lower()
+    assert "Saved to config.yaml" not in confirmation
+    assert cfg_path.read_bytes() == before

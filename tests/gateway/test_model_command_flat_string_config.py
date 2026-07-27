@@ -102,7 +102,9 @@ async def test_model_global_persists_when_config_has_flat_string_model(tmp_path,
     )
     assert written["model"]["default"] == "gpt-5.5"
     assert written["model"]["provider"] == "openrouter"
-    assert "base_url" not in written["model"]
+    assert written["model"]["base_url"] == "https://openrouter.ai/api/v1"
+    assert written["model"]["api_mode"] == "chat_completions"
+    assert "api_key" not in written["model"]
 
 
 @pytest.mark.asyncio
@@ -137,3 +139,134 @@ async def test_model_global_persists_when_config_has_missing_model(tmp_path, mon
     assert written["model"]["provider"] == "openrouter"
 
 
+@pytest.mark.asyncio
+async def test_model_global_persists_when_config_has_proper_dict_model(tmp_path, monkeypatch):
+    """Already-correct nested dict must still work — no regression on the
+    common case.
+    """
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5 --global")
+    )
+
+    assert result is not None
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "gpt-5.5"
+    assert written["model"]["provider"] == "openrouter"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model_yaml_value",
+    [
+        _MISSING,
+        {
+            "default": "old-model",
+            "provider": "openai-codex",
+            "persist_switch_by_default": True,
+        },
+        "deepseek-v4-flash",
+    ],
+    ids=["missing", "mapping-with-legacy-true", "flat-string"],
+)
+async def test_model_no_flag_is_session_only_for_all_config_shapes(
+    tmp_path, monkeypatch, model_yaml_value
+):
+    """A plain ``/model X`` never writes config, regardless of its shape."""
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, model_yaml_value)
+    before = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5")
+    )
+
+    assert result is not None
+    assert "gpt-5.5" in result
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written == before
+
+
+@pytest.mark.asyncio
+async def test_model_session_flag_does_not_persist(tmp_path, monkeypatch):
+    """``/model X --session`` remains session-only."""
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5 --session")
+    )
+
+    assert result is not None
+    assert "gpt-5.5" in result
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    # Config untouched — the session override is in-memory only.
+    assert written["model"]["default"] == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_model_global_uses_shared_route_transaction_without_runtime_api_key(
+    tmp_path, monkeypatch
+):
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+    calls = []
+    monkeypatch.setattr(
+        "hermes_cli.config.persist_main_model_assignment",
+        lambda **kwargs: calls.append(kwargs),
+        raising=False,
+    )
+
+    message = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5 --global")
+    )
+
+    assert calls == [
+        {
+            "provider": "openrouter",
+            "model": "gpt-5.5",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        }
+    ]
+    assert "api_key" not in calls[0]
+    assert message is not None
+    assert "Saved to config.yaml" in message
+
+
+@pytest.mark.asyncio
+async def test_model_global_save_failure_warns_session_switched_not_saved(
+    tmp_path, monkeypatch
+):
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+    before = cfg_path.read_bytes()
+    monkeypatch.setattr(
+        "hermes_cli.config.persist_main_model_assignment",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("read-only filesystem")),
+        raising=False,
+    )
+
+    message = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5 --global")
+    )
+
+    assert message is not None
+    assert "gpt-5.5" in message
+    assert "not saved" in message.lower()
+    assert "global" in message.lower()
+    assert "Saved to config.yaml" not in message
+    assert cfg_path.read_bytes() == before
