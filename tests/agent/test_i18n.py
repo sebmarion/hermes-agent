@@ -92,10 +92,14 @@ def test_model_switch_policy_is_explicit_in_every_catalog(lang: str):
     assert "--session" in model["usage_switch_model"], (
         f"{lang}.yaml bare/session usage must document --session"
     )
-    assert "--session" in model["session_only_hint"], (
-        f"{lang}.yaml session hint must document --session conflict precedence"
+    hint_flags = {
+        flag
+        for flag in ("--session", "--global")
+        if flag in model["session_only_hint"]
+    }
+    assert hint_flags == {"--session", "--global"}, (
+        f"{lang}.yaml session hint must expose both persistence flags"
     )
-    assert "--global" in model["session_only_hint"]
     assert "--global" in model["usage_persist"]
     assert "--global" in model["saved_global"]
 

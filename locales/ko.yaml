@@ -34,7 +34,7 @@ gateway:
     prompt_caching_enabled: "프롬프트 캐싱: 활성화됨"
     warning_prefix:         "경고: {warning}"
     saved_global:           "config.yaml에 저장됨 (`--global`)"
-    session_only_hint:      "_(이 세션에만 적용 — `--session`은 세션 전용을 유지하며 `--global`보다 우선합니다)_"
+    session_only_hint:      "_(이 세션에만 적용 — 저장하려면 `--global`을 추가하세요; `--session`은 명시적으로 세션 전용을 유지하며 `--global`보다 우선합니다)_"
     current_label:          "현재: `{model}` ({provider})"
     current_tag:            " (현재)"
     more_models_suffix:     " (+{count}개 더 있음)"

@@ -34,7 +34,7 @@ gateway:
     prompt_caching_enabled: "提示词缓存：已启用"
     warning_prefix:         "警告：{warning}"
     saved_global:           "已保存到 config.yaml（`--global`）"
-    session_only_hint:      "_（仅本次会话有效 — `--session` 保持仅会话生效，并在与 `--global` 同时使用时优先）_"
+    session_only_hint:      "_（仅本次会话有效 — 添加 `--global` 可保存；`--session` 明确保留为仅会话生效，并在与 `--global` 同时使用时优先）_"
     current_label:          "当前：`{model}`（{provider}）"
     current_tag:            "（当前）"
     more_models_suffix:     "（还有 {count} 个）"

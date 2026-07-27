@@ -34,7 +34,7 @@ gateway:
     prompt_caching_enabled: "提示快取：已啟用"
     warning_prefix:         "警告：{warning}"
     saved_global:           "已儲存到 config.yaml（`--global`）"
-    session_only_hint:      "_（僅本次工作階段有效 — `--session` 保持僅限工作階段，並在與 `--global` 同時使用時優先）_"
+    session_only_hint:      "_（僅本次工作階段有效 — 加上 `--global` 可儲存；`--session` 明確保持僅限工作階段，並在與 `--global` 同時使用時優先）_"
     current_label:          "目前：`{model}`（{provider}）"
     current_tag:            "（目前）"
     more_models_suffix:     "（還有 {count} 個）"

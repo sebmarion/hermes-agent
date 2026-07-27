@@ -19,9 +19,19 @@ classic CLI or gateway session overrides. Inspect only the Model section:
 paste or share the full output because it can contain unrelated local details.
 Never share API keys, OAuth tokens, cookies, or auth files.
 
-Check the current session model and route indicator separately in the active UI
-or session. Compare that session state with the persisted Model section to
-identify whether the mismatch is temporary or saved.
+Check the active session separately using the surface that is actually
+available:
+
+- In the classic CLI, run `/config`. Its Model section shows the active model
+  and Base URL.
+- In a gateway chat, run `/model` with no arguments. It shows the active model
+  and provider.
+
+These are partial views. Gateway `/model` does not show the endpoint or
+`api_mode`, and neither surface is a complete
+provider/model/endpoint/`api_mode` diagnostic. Compare the fields each surface
+does show with the persisted Model section to identify whether the mismatch is
+temporary or saved.
 
 Recover by assigning a complete known-provider route explicitly:
 

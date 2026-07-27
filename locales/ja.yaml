@@ -34,7 +34,7 @@ gateway:
     prompt_caching_enabled: "プロンプトキャッシュ: 有効"
     warning_prefix:         "警告: {warning}"
     saved_global:           "config.yaml に保存しました (`--global`)"
-    session_only_hint:      "_(このセッションのみ — `--session` はセッション限定を維持し、`--global` と併用時に優先)_"
+    session_only_hint:      "_(このセッションのみ — 保存するには `--global` を追加；`--session` は明示的にセッション限定のまま、`--global` と併用時に優先)_"
     current_label:          "現在: `{model}` ({provider})"
     current_tag:            " (現在)"
     more_models_suffix:     " (他 {count} 件)"

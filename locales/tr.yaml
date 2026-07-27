@@ -34,7 +34,7 @@ gateway:
     prompt_caching_enabled: "Prompt önbelleği: etkin"
     warning_prefix:         "Uyarı: {warning}"
     saved_global:           "config.yaml'a kaydedildi (`--global`)"
-    session_only_hint:      "_(yalnızca bu oturum — `--session` değişikliği oturumla sınırlar ve `--global` seçeneğine üstün gelir)_"
+    session_only_hint:      "_(yalnızca bu oturum — kaydetmek için `--global` ekleyin; `--session` değişikliği açıkça oturumla sınırlar ve `--global` seçeneğine üstün gelir)_"
     current_label:          "Geçerli: `{model}` ({provider})"
     current_tag:            " (geçerli)"
     more_models_suffix:     " (+{count} tane daha)"

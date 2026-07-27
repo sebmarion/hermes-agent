@@ -34,7 +34,7 @@ gateway:
     prompt_caching_enabled: "Prompt-kasing: geaktiveer"
     warning_prefix:         "Waarskuwing: {warning}"
     saved_global:           "Gestoor in config.yaml (`--global`)"
-    session_only_hint:      "_(slegs vir hierdie sessie — `--session` hou die verandering sessiegebonde en wen bo `--global`)_"
+    session_only_hint:      "_(slegs vir hierdie sessie — voeg `--global` by om te stoor; `--session` hou dit uitdruklik sessiegebonde en wen bo `--global`)_"
     current_label:          "Huidig: `{model}` op {provider}"
     current_tag:            " (huidig)"
     more_models_suffix:     " (+{count} meer)"

@@ -34,7 +34,7 @@ gateway:
     prompt_caching_enabled: "Cache de prompts: ativado"
     warning_prefix:         "Aviso: {warning}"
     saved_global:           "Guardado em config.yaml (`--global`)"
-    session_only_hint:      "_(apenas para esta sessão — `--session` mantém a alteração na sessão e prevalece sobre `--global`)_"
+    session_only_hint:      "_(apenas para esta sessão — adiciona `--global` para guardar; `--session` mantém explicitamente a alteração na sessão e prevalece sobre `--global`)_"
     current_label:          "Atual: `{model}` em {provider}"
     current_tag:            " (atual)"
     more_models_suffix:     " (+{count} mais)"

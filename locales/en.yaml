@@ -49,7 +49,7 @@ gateway:
     prompt_caching_enabled: "Prompt caching: enabled"
     warning_prefix:         "Warning: {warning}"
     saved_global:           "Saved to config.yaml (`--global`)"
-    session_only_hint:      "_(session only — `--session` keeps it session-only and wins over `--global`)_"
+    session_only_hint:      "_(session only — add `--global` to save; `--session` explicitly stays session-only and wins over `--global`)_"
     current_label:          "Current: `{model}` on {provider}"
     current_tag:            " (current)"
     more_models_suffix:     " (+{count} more)"

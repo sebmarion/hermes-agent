@@ -34,7 +34,7 @@ gateway:
     prompt_caching_enabled: "Кеширование промптов: включено"
     warning_prefix:         "Предупреждение: {warning}"
     saved_global:           "Сохранено в config.yaml (`--global`)"
-    session_only_hint:      "_(только для этого сеанса — `--session` сохраняет изменение в сеансе и имеет приоритет над `--global`)_"
+    session_only_hint:      "_(только для этого сеанса — добавьте `--global`, чтобы сохранить; `--session` явно оставляет изменение в сеансе и имеет приоритет над `--global`)_"
     current_label:          "Текущая: `{model}` на {provider}"
     current_tag:            " (текущая)"
     more_models_suffix:     " (+ещё {count})"
