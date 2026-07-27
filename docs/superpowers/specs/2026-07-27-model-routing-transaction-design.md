@@ -66,11 +66,13 @@ adding a new abstraction or changing runtime switching.
 
 1. `--session` returns session-only.
 2. `--global` returns persistent.
-3. An explicit `model.persist_switch_by_default` value is honored for backward
-   compatibility.
-4. If the setting is absent or malformed, the built-in default is session-only.
+3. With neither flag, the switch is session-only.
 
-CLI help and success text must describe the new default accurately.
+If both flags are supplied, `--session` continues to win, matching the existing
+precedence. The legacy `model.persist_switch_by_default` setting no longer
+controls interactive model switches because that would violate the explicit
+`--global` requirement. CLI help and success text must describe the new default
+accurately.
 
 ### Atomic route assignment
 
@@ -109,9 +111,11 @@ and managed-config protections remain authoritative.
 
 Focused tests will prove:
 
-- No flags default to session-only when the config key is absent or malformed.
-- Explicit `True`, explicit `False`, `--global`, and `--session` retain their
-  documented precedence.
+- No flags default to session-only regardless of legacy config shape or value.
+- The legacy `model.persist_switch_by_default` value cannot make an unqualified
+  switch persistent.
+- `--global`, `--session`, and the existing `--session`-wins conflict behavior
+  retain their documented precedence.
 - The interactive picker uses the same persistence resolution.
 - A global custom/NeuralWatt-to-Codex switch does not retain the old base URL,
   API mode, or inline credential.
