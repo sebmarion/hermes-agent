@@ -906,6 +906,448 @@ def test_synthesizer_timeout_falls_back_to_next_available_lane(monkeypatch):
     }
 
 
+def test_repairs_last_nonempty_invalid_synthesis_without_tools(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    constructed = []
+    instances = []
+    calls = []
+    candidate_tail = "CANDIDATE_TAIL_TOKEN|" * 2_000
+    invalid_tail = "INVALID_TAIL_TOKEN|" * 2_000
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.tools = (
+                [{"function": {"name": "kanban_complete"}}]
+                if (
+                    kwargs.get("enabled_toolsets") == []
+                    and orchestrator.os.environ.get("HERMES_KANBAN_TASK")
+                )
+                else []
+            )
+            self.valid_tool_names = {
+                tool["function"]["name"] for tool in self.tools
+            }
+            self._kanban_worker_guidance = (
+                "mutating kanban guidance" if self.tools else ""
+            )
+            constructed.append(kwargs)
+            instances.append(self)
+
+        def run_conversation(self, prompt):
+            calls.append((self.kwargs["model"], prompt))
+            if "BestPlan envelope repair" in prompt:
+                return {"final_response": _synth_plan_envelope()}
+            if "active BestPlan synthesizer" in prompt:
+                if self.kwargs["model"] == "configured-sol-model":
+                    return {"final_response": "invalid SOL synthesis"}
+                return {
+                    "final_response": (
+                        "invalid GLM synthesis " + invalid_tail
+                    )
+                }
+            return {
+                "final_response": _candidate_text(
+                    f"candidate from {self.kwargs['model']} {candidate_tail}"
+                )
+            }
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, lane: _identity(lane),
+    )
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-under-test")
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "repair the cache-stable delegated prefix",
+        count=2,
+        config=_runtime_config(overall_timeout=2.0),
+    )
+
+    assert result["status"] == "completed"
+    repair_calls = [
+        (model, prompt)
+        for model, prompt in calls
+        if "BestPlan envelope repair" in prompt
+    ]
+    assert len(repair_calls) == 1
+    repair_model, repair_prompt = repair_calls[0]
+    assert repair_model == "configured-glm-model"
+    assert constructed[-1]["provider"] == "resolved-configured-glm"
+    assert constructed[-1]["api_mode"] == "chat_completions"
+    assert constructed[-1]["enabled_toolsets"] == []
+    assert instances[-1].tools == []
+    assert instances[-1].valid_tool_names == set()
+    assert instances[-1]._kanban_worker_guidance == ""
+    assert "repair the cache-stable delegated prefix" in repair_prompt
+    assert "The exact workspace is \"/tmp/work\"" in repair_prompt
+    assert "candidate from configured-glm-model" in repair_prompt
+    assert "candidate from configured-sol-model" in repair_prompt
+    assert "invalid GLM synthesis" in repair_prompt
+    assert "invalid SOL synthesis" not in repair_prompt
+    assert (
+        "BestPlan synthesizer returned no valid executable V1 envelope"
+        in repair_prompt
+    )
+    assert "Do not use tools" in repair_prompt
+    assert "Do not inspect files or the web" in repair_prompt
+    assert repair_prompt.count("CANDIDATE_TAIL_TOKEN|") < 2_000
+    assert repair_prompt.count("INVALID_TAIL_TOKEN|") < 2_000
+    assert result["runtime"]["lane"] == "glm"
+
+
+def test_invalid_synthesis_repair_fails_closed_after_one_attempt(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    calls = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, prompt):
+            calls.append((self.kwargs["model"], prompt))
+            if "BestPlan envelope repair" in prompt:
+                return {"final_response": "still not an envelope"}
+            if "active BestPlan synthesizer" in prompt:
+                return {
+                    "final_response": (
+                        f"invalid ordinary synthesis from {self.kwargs['model']}"
+                    )
+                }
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, lane: _identity(lane),
+    )
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=2,
+        config=_runtime_config(overall_timeout=2.0),
+    )
+
+    repair_calls = [
+        (model, prompt)
+        for model, prompt in calls
+        if "BestPlan envelope repair" in prompt
+    ]
+    assert result["status"] == "failed"
+    assert "synthesizer" in result["error"].lower()
+    assert "envelope" in result["error"].lower()
+    assert len(repair_calls) == 1
+    assert "final_response" not in result
+    assert "body" not in result
+
+
+def test_synthesis_repair_is_skipped_with_less_than_one_second_remaining(
+    monkeypatch,
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    prompts = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, prompt):
+            prompts.append(prompt)
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "invalid ordinary synthesis"}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, lane: _identity(lane),
+    )
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=2,
+        config=_runtime_config(overall_timeout=0.5),
+    )
+
+    assert result["status"] == "failed"
+    assert "envelope" in result["error"].lower()
+    assert not any("BestPlan envelope repair" in prompt for prompt in prompts)
+
+
+def test_synthesis_repair_fails_closed_for_codex_app_server_lane(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    calls = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, prompt):
+            calls.append((self.kwargs["model"], prompt))
+            if "BestPlan envelope repair" in prompt:
+                return {"final_response": _synth_plan_envelope()}
+            if "active BestPlan synthesizer" in prompt:
+                if self.kwargs["model"] == "configured-sol-model":
+                    return {"final_response": "invalid SOL synthesis"}
+                return {"final_response": ""}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, lane: _identity(lane),
+    )
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=2,
+        config=_runtime_config(overall_timeout=2.0),
+    )
+
+    assert result["status"] == "failed"
+    assert not any("BestPlan envelope repair" in prompt for _, prompt in calls)
+
+
+def test_synthesis_repair_rechecks_remaining_time_after_construction(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    prompts = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, prompt):
+            prompts.append(prompt)
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "invalid ordinary synthesis"}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, lane: _identity(lane),
+    )
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+    real_builder = orchestrator._build_repair_agent
+
+    def delayed_builder(*args, **kwargs):
+        time.sleep(0.2)
+        return real_builder(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_build_repair_agent", delayed_builder)
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=2,
+        config=_runtime_config(overall_timeout=1.1),
+    )
+
+    assert result["status"] == "failed"
+    assert not any("BestPlan envelope repair" in prompt for prompt in prompts)
+
+
+def test_synthesis_repair_timeout_interrupts_and_closes_provider(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    instances = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.stop = threading.Event()
+            self.active = False
+            instances.append(self)
+
+        def run_conversation(self, prompt):
+            if "BestPlan envelope repair" in prompt:
+                self.active = True
+                self.stop.wait(0.4)
+                self.active = False
+                return {"final_response": _synth_plan_envelope()}
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "invalid ordinary synthesis"}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            self.stop.set()
+
+        def close(self):
+            self.stop.set()
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, lane: _identity(lane),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_SYNTHESIS_REPAIR_TIMEOUT_SECONDS",
+        0.03,
+    )
+    started = time.monotonic()
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=2,
+        config=_runtime_config(overall_timeout=2.0),
+    )
+
+    assert time.monotonic() - started < 0.3
+    assert result["status"] == "failed"
+    assert all(not instance.active for instance in instances)
+    assert all(instance.stop.is_set() for instance in instances)
+
+
+def test_synthesis_repair_hostile_provider_is_force_retired(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    release = threading.Event()
+    repair_instances = []
+
+    class HostileAgent:
+        def __init__(self, **kwargs):
+            self.is_repair = kwargs.get("enabled_toolsets") == []
+            self.active = False
+            self.request_aborted = False
+            self.sockets_forced = False
+            self.client_closed = False
+            self.codex_killed = False
+
+            owner = self
+
+            class _HttpClient:
+                def close(self):
+                    owner.client_closed = True
+
+            class _CodexClient:
+                def close(self, timeout=0):
+                    owner.codex_killed = True
+
+            self.client = _HttpClient()
+            self._codex_session = SimpleNamespace(_client=_CodexClient())
+            self._active_request_abort = lambda reason: setattr(
+                self, "request_aborted", True
+            )
+            self._force_close_tcp_sockets = lambda client: setattr(
+                self, "sockets_forced", True
+            )
+            if self.is_repair:
+                repair_instances.append(self)
+
+        def run_conversation(self, prompt):
+            if "BestPlan envelope repair" in prompt:
+                self.active = True
+                release.wait()
+                self.active = False
+                return {"final_response": _synth_plan_envelope()}
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "invalid ordinary synthesis"}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", HostileAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, lane: _identity(lane),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_SYNTHESIS_REPAIR_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(orchestrator, "_CHILD_CLEANUP_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(orchestrator, "_CHILD_CLEANUP_HARD_SECONDS", 0.05)
+    safety_release = threading.Timer(0.8, release.set)
+    safety_release.daemon = True
+    safety_release.start()
+    started = time.monotonic()
+    try:
+        result = run_bestplan(
+            SimpleNamespace(session_id="parent"),
+            "plan it",
+            count=2,
+            config=_runtime_config(overall_timeout=2.0),
+        )
+
+        assert time.monotonic() - started < 0.3
+        assert result["status"] == "failed"
+        assert result["cleanup_incomplete"] is True
+        assert len(repair_instances) == 1
+        repair = repair_instances[0]
+        assert repair.active is True
+        assert repair.request_aborted is True
+        assert repair.sockets_forced is True
+        assert repair.client_closed is True
+        assert repair.codex_killed is True
+    finally:
+        release.set()
+        safety_release.cancel()
+
+
 def test_overall_timeout_bounds_explorer_pool_without_shutdown_join(monkeypatch):
     import agent.bestplan_orchestrator as orchestrator
     import run_agent
