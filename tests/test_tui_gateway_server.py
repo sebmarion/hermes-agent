@@ -6769,6 +6769,101 @@ def test_config_set_model_global_persists(monkeypatch):
     assert "api_key" not in persist_calls[0]
 
 
+def test_config_set_model_global_persists_only_to_session_profile(
+    monkeypatch, tmp_path
+):
+    import yaml
+
+    launch_home = tmp_path / "launch-home"
+    profile_home = tmp_path / "profiles" / "worker"
+    launch_home.mkdir()
+    profile_home.mkdir(parents=True)
+    launch_path = launch_home / "config.yaml"
+    profile_path = profile_home / "config.yaml"
+    launch_path.write_text(
+        "model:\n  provider: openrouter\n  default: launch/model\n",
+        encoding="utf-8",
+    )
+    profile_path.write_text(
+        "model:\n  provider: custom\n  default: profile-old\n"
+        "  base_url: https://profile-old.example/v1\n",
+        encoding="utf-8",
+    )
+    launch_before = launch_path.read_bytes()
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+
+    class _Agent:
+        provider = "custom"
+        model = "profile-old"
+        base_url = "https://profile-old.example/v1"
+        api_key = "runtime-only-key"
+
+        def switch_model(self, **kwargs):
+            self.provider = kwargs["new_provider"]
+            self.model = kwargs["new_model"]
+            self.base_url = kwargs["base_url"]
+
+    result = types.SimpleNamespace(
+        success=True,
+        new_model="gpt-5.4",
+        target_provider="openai-codex",
+        api_key="runtime-only-key",
+        base_url="",
+        api_mode="codex_responses",
+        warning_message="",
+        model_info=None,
+        error_message="",
+    )
+    agent = _Agent()
+    server._sessions["profile-sid"] = _session(
+        agent=agent,
+        profile_home=str(profile_home),
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kwargs: result)
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server, "_persist_live_session_runtime", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        server, "_persist_live_session_system_prompt", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        server, "_append_model_switch_marker", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "profile-switch",
+                "method": "config.set",
+                "params": {
+                    "session_id": "profile-sid",
+                    "key": "model",
+                    "value": "gpt-5.4 --provider openai-codex --global",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("profile-sid", None)
+
+    assert resp["result"]["value"] == "gpt-5.4"
+    assert resp["result"]["warning"] == ""
+    assert launch_path.read_bytes() == launch_before
+    assert yaml.safe_load(profile_path.read_text(encoding="utf-8"))["model"] == {
+        "provider": "openai-codex",
+        "default": "gpt-5.4",
+        "api_mode": "codex_responses",
+    }
+    from hermes_constants import get_hermes_home
+
+    assert get_hermes_home() == launch_home
+
+
 def test_config_set_model_global_save_failure_warns_but_keeps_session_switch(
     monkeypatch
 ):

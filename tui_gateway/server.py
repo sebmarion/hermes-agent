@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import functools
 import hashlib
 import inspect
 import json
@@ -4314,6 +4315,26 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
+def _session_profile_scoped_model_switch(handler):
+    """Bind a session's profile home around one complete model switch."""
+
+    @functools.wraps(handler)
+    def wrapper(sid: str, session: dict, *args, **kwargs):
+        profile_home = (
+            session.get("profile_home") if isinstance(session, dict) else None
+        )
+        if not profile_home:
+            return handler(sid, session, *args, **kwargs)
+        token = set_hermes_home_override(profile_home)
+        try:
+            return handler(sid, session, *args, **kwargs)
+        finally:
+            reset_hermes_home_override(token)
+
+    return wrapper
+
+
+@_session_profile_scoped_model_switch
 def _apply_model_switch(
     sid: str,
     session: dict,
