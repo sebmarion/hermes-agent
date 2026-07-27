@@ -658,6 +658,57 @@ def test_synthesizer_timeout_interrupts_and_closes_live_provider_call(monkeypatc
     assert all(instance.stop.is_set() for instance in instances)
 
 
+def test_synthesizer_timeout_falls_back_to_next_available_lane(monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    synth_models = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self.stop = threading.Event()
+
+        def run_conversation(self, prompt):
+            if "active BestPlan synthesizer" not in prompt:
+                return {"final_response": _candidate_text()}
+            synth_models.append(self.model)
+            if self.model == "configured-sol-model":
+                self.stop.wait(0.4)
+                return {"final_response": "late plan"}
+            return {"final_response": _synth_plan_envelope()}
+
+        def interrupt(self, *_args, **_kwargs):
+            self.stop.set()
+
+        def close(self):
+            self.stop.set()
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda agent, lane: _identity(lane),
+    )
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        count=2,
+        config=_runtime_config(synthesizer_timeout=0.03, overall_timeout=0.2),
+    )
+
+    assert result["status"] == "completed"
+    assert synth_models == ["configured-sol-model", "configured-glm-model"]
+    assert result["runtime"] == {
+        "lane": "glm",
+        "provider": "resolved-configured-glm",
+        "model": "configured-glm-model",
+        "api_mode": "chat_completions",
+    }
+
+
 def test_overall_timeout_bounds_explorer_pool_without_shutdown_join(monkeypatch):
     import agent.bestplan_orchestrator as orchestrator
     import run_agent

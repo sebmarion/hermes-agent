@@ -690,79 +690,96 @@ def run_bestplan(
             "error": "BestPlan synthesizer credentials unavailable",
             "run_id": run_id,
         }
-    synth_lane, synth_runtime = available_lanes[0]
-    try:
-        synth_child = _build_child_agent(agent, synth_lane, synth_runtime)
-    except Exception as exc:
-        return {
-            "status": "failed",
-            "error": f"BestPlan synthesizer construction failed: {type(exc).__name__}",
-            "run_id": run_id,
-        }
-
-    synth_pool = DaemonThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="bestplan-synthesizer",
-    )
-    synth_future = synth_pool.submit(_run_child_agent, synth_child, synth_prompt)
-    synth_deadline = min(
-        overall_deadline,
-        time.monotonic() + float(resolved["synthesizer_timeout"]),
-    )
     body = ""
-    synth_error: Exception | None = None
-    synth_cleanup_complete = True
-    try:
-        remaining = max(0.0, synth_deadline - time.monotonic())
-        body = synth_future.result(timeout=remaining)
-    except TimeoutError as exc:
-        synth_error = exc
-        synth_future.cancel()
-    except Exception as exc:
-        synth_error = exc
-    finally:
-        synth_cleanup_complete = _stop_child_agents([synth_child], [synth_future])
-        synth_pool.shutdown(wait=False, cancel_futures=True)
+    synth_lane = None
+    synth_runtime = None
+    synth_failure = "BestPlan synthesizer unavailable"
+    for candidate_lane, candidate_runtime in available_lanes:
+        if time.monotonic() >= overall_deadline:
+            synth_failure = "BestPlan overall timeout during synthesizer"
+            break
+        try:
+            synth_child = _build_child_agent(
+                agent,
+                candidate_lane,
+                candidate_runtime,
+            )
+        except Exception as exc:
+            synth_failure = (
+                f"BestPlan synthesizer construction failed: {type(exc).__name__}"
+            )
+            continue
 
-    if not synth_cleanup_complete:
-        return {
-            "status": "failed",
-            "error": (
-                "BestPlan synthesizer teardown exceeded its hard deadline; "
-                "the unkillable daemon worker was quarantined"
-            ),
-            "run_id": run_id,
-            "cleanup_incomplete": True,
-        }
+        synth_pool = DaemonThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="bestplan-synthesizer",
+        )
+        synth_future = synth_pool.submit(
+            _run_child_agent,
+            synth_child,
+            synth_prompt,
+        )
+        synth_deadline = min(
+            overall_deadline,
+            time.monotonic() + float(resolved["synthesizer_timeout"]),
+        )
+        candidate_body = ""
+        synth_error: Exception | None = None
+        try:
+            remaining = max(0.0, synth_deadline - time.monotonic())
+            candidate_body = synth_future.result(timeout=remaining)
+        except TimeoutError as exc:
+            synth_error = exc
+            synth_future.cancel()
+        except Exception as exc:
+            synth_error = exc
+        finally:
+            synth_cleanup_complete = _stop_child_agents(
+                [synth_child],
+                [synth_future],
+            )
+            synth_pool.shutdown(wait=False, cancel_futures=True)
 
-    if synth_error is not None:
-        timed_out_overall = synth_deadline == overall_deadline
-        return {
-            "status": "failed",
-            "error": (
+        if not synth_cleanup_complete:
+            return {
+                "status": "failed",
+                "error": (
+                    "BestPlan synthesizer teardown exceeded its hard deadline; "
+                    "the unkillable daemon worker was quarantined"
+                ),
+                "run_id": run_id,
+                "cleanup_incomplete": True,
+            }
+        if synth_error is not None:
+            synth_failure = (
                 "BestPlan overall timeout during synthesizer"
-                if timed_out_overall
+                if synth_deadline == overall_deadline
                 else "BestPlan synthesizer timeout"
-            ),
-            "run_id": run_id,
-        }
-    if not body.strip():
+            )
+            continue
+        if not candidate_body.strip():
+            synth_failure = "BestPlan synthesizer empty"
+            continue
+        executable_body = _validated_plan_envelope(
+            candidate_body,
+            workspace=workspace_hint,
+        )
+        if executable_body is None:
+            synth_failure = (
+                "BestPlan synthesizer returned no valid executable V1 envelope"
+            )
+            continue
+        body = executable_body
+        synth_lane = candidate_lane
+        synth_runtime = candidate_runtime
+        break
+
+    if synth_lane is None or synth_runtime is None:
         return {
             "status": "failed",
-            "error": "BestPlan synthesizer empty",
+            "error": synth_failure,
             "run_id": run_id,
         }
-    executable_body = _validated_plan_envelope(
-        body,
-        workspace=workspace_hint,
-    )
-    if executable_body is None:
-        return {
-            "status": "failed",
-            "error": "BestPlan synthesizer returned no valid executable V1 envelope",
-            "run_id": run_id,
-        }
-    body = executable_body
 
     quorum_text = f"{len(successes)}/{effective}"
     receipt = make_receipt(
