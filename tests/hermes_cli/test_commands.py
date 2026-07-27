@@ -73,6 +73,14 @@ class TestCommandRegistry:
         for cmd in COMMAND_REGISTRY:
             assert cmd.category in valid_categories, f"{cmd.name} has invalid category '{cmd.category}'"
 
+    def test_model_description_exposes_session_only_policy(self):
+        model = resolve_command("model")
+        assert model is not None
+        assert (
+            model.description
+            == "Switch model for this session; use --global to save the route"
+        )
+
     def test_reasoning_subcommands_are_in_logical_order(self):
         reasoning = next(cmd for cmd in COMMAND_REGISTRY if cmd.name == "reasoning")
         assert reasoning.subcommands[:8] == (
