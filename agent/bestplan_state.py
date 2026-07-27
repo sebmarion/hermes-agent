@@ -321,9 +321,11 @@ def sanitize_bestplan_response_for_external_sink(value: Any) -> str:
 
 
 def strip_bestplan_envelopes_for_persistence(
-    messages: list[dict[str, Any]],
+    messages: list[dict[str, Any]] | None,
 ) -> None:
     """Remove internal plan envelopes before any transcript persistence."""
+    if messages is None:
+        return
     for item in messages:
         if not isinstance(item, dict) or item.get("role") != "assistant":
             continue

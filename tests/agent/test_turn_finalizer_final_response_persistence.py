@@ -55,6 +55,7 @@ class FakeAgent:
 
     def _persist_session(self, messages, conversation_history):
         self.persisted_messages = list(messages)
+        self.persisted_conversation_history = conversation_history
 
     def _file_mutation_verifier_enabled(self):
         return False
@@ -167,3 +168,36 @@ def test_bestplan_envelope_is_removed_before_first_persistence(monkeypatch):
     )
     # Host capture still receives the raw response after this first write.
     assert result["final_response"] == envelope
+
+
+def test_absent_conversation_history_does_not_break_persistence(monkeypatch):
+    """Fresh private BestPlan lanes pass no prior conversation history."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "inspect read-only"},
+        {"role": "assistant", "content": "Plan narrative."},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="Plan narrative.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=None,
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="inspect read-only",
+        original_user_message="inspect read-only",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response",
+    )
+
+    assert not any(
+        error.startswith("persist_session:")
+        for error in result.get("cleanup_errors", [])
+    )
+    assert agent.persisted_messages == messages
+    assert agent.persisted_conversation_history is None
