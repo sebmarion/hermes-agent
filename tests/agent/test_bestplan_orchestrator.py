@@ -13,8 +13,8 @@ from types import SimpleNamespace
 
 from agent.bestplan_orchestrator import (
     BestPlanUnavailable, DEFAULT_RUNTIME, RECEIPT_BEGIN, RECEIPT_END, append_receipt,
-    body_sha256, make_receipt, normalize_count, quorum_for, reconcile_bestplan_receipts,
-    run_bestplan, validate_receipt, validate_runtime,
+    _candidate_from_text, body_sha256, make_receipt, normalize_count, quorum_for,
+    reconcile_bestplan_receipts, run_bestplan, validate_receipt, validate_runtime,
 )
 
 _REQUIRED_LANE_KEYS = ("name", "provider", "model", "api_mode", "reasoning_effort")
@@ -100,6 +100,17 @@ def test_count_and_quorum():
     assert normalize_count(1) == 2
     assert normalize_count(9) == 5
     assert [quorum_for(n) for n in range(2, 6)] == [2, 2, 3, 4]
+
+
+def test_candidate_parser_ignores_trailing_prose_with_braces():
+    candidate = _candidate_text("live lane")
+
+    parsed = _candidate_from_text(
+        candidate
+        + "\n\nVerification note: inspect the resulting mapping {after approval}."
+    )
+
+    assert parsed["summary"] == "live lane"
 
 
 def _default_lanes_by_name() -> dict:

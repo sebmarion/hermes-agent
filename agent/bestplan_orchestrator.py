@@ -259,10 +259,11 @@ def _candidate_from_text(text: str) -> dict[str, Any]:
     marker = "HERMES_BESTPLAN_CANDIDATE_V1"
     if marker in text:
         text = text.split(marker, 1)[1]
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
+    start = text.find("{")
+    if start < 0:
         raise ValueError("candidate JSON missing")
-    return validate_candidate(json.loads(text[start : end + 1]))
+    candidate, _end = json.JSONDecoder().raw_decode(text, idx=start)
+    return validate_candidate(candidate)
 
 
 def _resolve_lane_credentials(agent: Any, lane: dict[str, Any]) -> dict[str, Any]:
@@ -530,8 +531,11 @@ def run_bestplan(
 
     base = (
         "You are a private BestPlan explorer. Work read-only using only file/web inspection. "
-        "Return exactly one JSON object prefixed HERMES_BESTPLAN_CANDIDATE_V1 with keys "
-        "schema,summary,steps,risks,verification. Task:\n" + task + "\nStrategy: "
+        "Return exactly one JSON object prefixed HERMES_BESTPLAN_CANDIDATE_V1. "
+        "The schema value must be exactly HERMES_BESTPLAN_CANDIDATE_V1, and the object "
+        "must contain non-empty summary, steps, risks, and verification values. Task:\n"
+        + task
+        + "\nStrategy: "
     )
     results: list[ExplorerResult] = []
     explorer_jobs: list[tuple[Any, str]] = []
