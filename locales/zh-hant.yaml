@@ -34,13 +34,13 @@ gateway:
     prompt_caching_enabled: "提示快取：已啟用"
     warning_prefix:         "警告：{warning}"
     saved_global:           "已儲存到 config.yaml（`--global`）"
-    session_only_hint:      "_（僅本次工作階段有效 — 加上 `--global` 可永久儲存）_"
+    session_only_hint:      "_（僅本次工作階段有效 — `--session` 保持僅限工作階段，並在與 `--global` 同時使用時優先）_"
     current_label:          "目前：`{model}`（{provider}）"
     current_tag:            "（目前）"
     more_models_suffix:     "（還有 {count} 個）"
-    usage_switch_model:     "`/model <name>` — 切換模型"
+    usage_switch_model:     "`/model <name>` — 僅為本次工作階段切換模型\n`/model <name> --session` — 明確僅限工作階段；與 `--global` 同時使用時優先"
     usage_switch_provider:  "`/model <name> --provider <slug>` — 切換提供方"
-    usage_persist:          "`/model <name> --global` — 永久儲存"
+    usage_persist:          "`/model <name> --global` — 將供應商/模型/端點路由儲存到 config.yaml"
 
   agents:
     header:                "🤖 **作用中的代理與任務**"

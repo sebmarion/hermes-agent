@@ -34,13 +34,13 @@ gateway:
     prompt_caching_enabled: "Кеширование промптов: включено"
     warning_prefix:         "Предупреждение: {warning}"
     saved_global:           "Сохранено в config.yaml (`--global`)"
-    session_only_hint:      "_(только для этого сеанса — добавьте `--global`, чтобы сохранить)_"
+    session_only_hint:      "_(только для этого сеанса — `--session` сохраняет изменение в сеансе и имеет приоритет над `--global`)_"
     current_label:          "Текущая: `{model}` на {provider}"
     current_tag:            " (текущая)"
     more_models_suffix:     " (+ещё {count})"
-    usage_switch_model:     "`/model <name>` — сменить модель"
+    usage_switch_model:     "`/model <name>` — сменить модель только для этого сеанса\n`/model <name> --session` — явно только для сеанса; имеет приоритет над `--global`"
     usage_switch_provider:  "`/model <name> --provider <slug>` — сменить провайдера"
-    usage_persist:          "`/model <name> --global` — сохранить навсегда"
+    usage_persist:          "`/model <name> --global` — сохранить маршрут провайдер/модель/endpoint в config.yaml"
 
   agents:
     header:                "🤖 **Активные агенты и задачи**"

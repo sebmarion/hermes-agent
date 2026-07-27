@@ -74,6 +74,35 @@ def test_catalog_placeholders_match_english(lang: str):
         )
 
 
+@pytest.mark.parametrize("lang", list(i18n.SUPPORTED_LANGUAGES))
+def test_model_switch_policy_is_explicit_in_every_catalog(lang: str):
+    """Model help must expose the same persistence policy in every language."""
+    model = (_load_raw(lang).get("gateway") or {}).get("model") or {}
+    policy_keys = (
+        "saved_global",
+        "session_only_hint",
+        "usage_switch_model",
+        "usage_persist",
+    )
+    for key in policy_keys:
+        assert isinstance(model.get(key), str) and model[key].strip(), (
+            f"{lang}.yaml gateway.model.{key} must be non-empty"
+        )
+
+    assert "--session" in model["usage_switch_model"], (
+        f"{lang}.yaml bare/session usage must document --session"
+    )
+    assert "--session" in model["session_only_hint"], (
+        f"{lang}.yaml session hint must document --session conflict precedence"
+    )
+    assert "--global" in model["session_only_hint"]
+    assert "--global" in model["usage_persist"]
+    assert "--global" in model["saved_global"]
+
+    policy_text = "\n".join(model[key] for key in policy_keys).lower()
+    assert "persists by default" not in policy_text
+
+
 # ---------------------------------------------------------------------------
 # Language resolution
 # ---------------------------------------------------------------------------

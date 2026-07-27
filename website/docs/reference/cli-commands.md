@@ -209,7 +209,7 @@ By default, `/model` changes apply **to the current session only**. Add `--globa
 If you've only configured OpenRouter, `/model` will only show OpenRouter models. To add another provider (Anthropic, DeepSeek, Copilot, etc.), exit your session and run `hermes model` from the terminal.
 :::
 
-Provider and base URL changes are persisted to `config.yaml` automatically. When switching away from a custom endpoint, the stale base URL is cleared to prevent it leaking into other providers.
+Only `--global` saves the provider/model/base URL route to `config.yaml`. A successful global provider change updates that route atomically and clears stale endpoint fields from the previous provider.
 
 ## `hermes gateway`
 

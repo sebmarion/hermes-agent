@@ -263,6 +263,10 @@ Make sure the key matches the provider. An OpenAI key won't work with OpenRouter
 
 **Cause:** The model identifier is incorrect or not available on your provider.
 
+If the model exists but requests return HTTP 404 or "Model not found", compare
+the saved provider/model/endpoint route with the active session route. See
+[Model routing troubleshooting](https://github.com/NousResearch/hermes-agent/blob/main/docs/troubleshooting.md).
+
 **Solution:**
 ```bash
 # List available models for your provider

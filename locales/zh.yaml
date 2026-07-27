@@ -34,13 +34,13 @@ gateway:
     prompt_caching_enabled: "提示词缓存：已启用"
     warning_prefix:         "警告：{warning}"
     saved_global:           "已保存到 config.yaml（`--global`）"
-    session_only_hint:      "_（仅本次会话有效 — 添加 `--global` 可永久保存）_"
+    session_only_hint:      "_（仅本次会话有效 — `--session` 保持仅会话生效，并在与 `--global` 同时使用时优先）_"
     current_label:          "当前：`{model}`（{provider}）"
     current_tag:            "（当前）"
     more_models_suffix:     "（还有 {count} 个）"
-    usage_switch_model:     "`/model <name>` — 切换模型"
+    usage_switch_model:     "`/model <name>` — 仅为本次会话切换模型\n`/model <name> --session` — 明确仅限会话；与 `--global` 同时使用时优先"
     usage_switch_provider:  "`/model <name> --provider <slug>` — 切换提供方"
-    usage_persist:          "`/model <name> --global` — 永久保存"
+    usage_persist:          "`/model <name> --global` — 将提供商/模型/端点路由保存到 config.yaml"
 
   agents:
     header:                "🤖 **活跃代理与任务**"

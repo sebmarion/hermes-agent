@@ -34,13 +34,13 @@ gateway:
     prompt_caching_enabled: "프롬프트 캐싱: 활성화됨"
     warning_prefix:         "경고: {warning}"
     saved_global:           "config.yaml에 저장됨 (`--global`)"
-    session_only_hint:      "_(세션 한정 — 영구 저장하려면 `--global`을 추가하세요)_"
+    session_only_hint:      "_(이 세션에만 적용 — `--session`은 세션 전용을 유지하며 `--global`보다 우선합니다)_"
     current_label:          "현재: `{model}` ({provider})"
     current_tag:            " (현재)"
     more_models_suffix:     " (+{count}개 더 있음)"
-    usage_switch_model:     "`/model <name>` — 모델 전환"
+    usage_switch_model:     "`/model <name>` — 이 세션에서만 모델 전환\n`/model <name> --session` — 명시적 세션 전용; `--global`보다 우선"
     usage_switch_provider:  "`/model <name> --provider <slug>` — 제공자 전환"
-    usage_persist:          "`/model <name> --global` — 영구 저장"
+    usage_persist:          "`/model <name> --global` — 공급자/모델/엔드포인트 경로를 config.yaml에 저장"
 
   agents:
     header:                "🤖 **활성 에이전트 및 작업**"

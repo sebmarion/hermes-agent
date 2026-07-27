@@ -7,15 +7,21 @@ service. For example, `provider: openai-codex` combined with a stale custom
 `model.base_url` can produce HTTP 404 or "Model not found" even though the
 model and credentials are valid.
 
-Inspect the active non-secret routing fields with:
+Inspect the persisted configured state with:
 
 ```bash
 hermes config show
 ```
 
-Check `model.default`, `model.provider`, `model.base_url`, and
-`model.api_mode` as one route. Do not paste API keys, OAuth tokens, cookies, or
-auth files into logs or support requests.
+This command reports configuration saved in `config.yaml`; it does not show
+classic CLI or gateway session overrides. Inspect only the Model section:
+`model.provider`, `model.default`, `model.base_url`, and `model.api_mode`. Do not
+paste or share the full output because it can contain unrelated local details.
+Never share API keys, OAuth tokens, cookies, or auth files.
+
+Check the current session model and route indicator separately in the active UI
+or session. Compare that session state with the persisted Model section to
+identify whether the mismatch is temporary or saved.
 
 Recover by assigning a complete known-provider route explicitly:
 
@@ -40,7 +46,7 @@ endpoint fields left by the old provider. If the global save fails, Hermes
 keeps the working session switch but reports that the global route was not
 saved.
 
-Bare `/model <name>` switches and bare picker choices are safe and
-session-only. Use `--session` as the explicit session-only override; it wins
-over `--global` if both are present. Only `--global` saves a
-provider/model/endpoint route to `config.yaml`.
+Bare `/model <name>` switches and bare picker choices are non-persistent and
+session-only. Use `--session` as the explicit session-only override; it wins over
+`--global` if both are present. Only `--global` saves a provider/model/endpoint
+route to `config.yaml`.
