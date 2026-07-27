@@ -61,6 +61,15 @@ async def test_handle_model_command_lists_saved_custom_provider(tmp_path, monkey
     assert "Local (127.0.0.1:4141)" in result
     assert "custom:local-(127.0.0.1:4141)" in result
     assert "rotator-openrouter-coding" in result
+    assert "`/model <name>` — switch for this session only" in result
+    assert (
+        "`/model <name> --session` — explicit session-only override; "
+        "wins over `--global`" in result
+    )
+    assert (
+        "`/model <name> --global` — save provider/model/endpoint route "
+        "to config.yaml" in result
+    )
 
 
 @pytest.mark.asyncio

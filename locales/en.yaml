@@ -53,9 +53,9 @@ gateway:
     current_label:          "Current: `{model}` on {provider}"
     current_tag:            " (current)"
     more_models_suffix:     " (+{count} more)"
-    usage_switch_model:     "`/model <name>` — switch model"
+    usage_switch_model:     "`/model <name>` — switch for this session only\n`/model <name> --session` — explicit session-only override; wins over `--global`"
     usage_switch_provider:  "`/model <name> --provider <slug>` — switch provider"
-    usage_persist:          "`/model <name> --global` — persist"
+    usage_persist:          "`/model <name> --global` — save provider/model/endpoint route to config.yaml"
 
   agents:
     header:                "🤖 **Active Agents & Tasks**"

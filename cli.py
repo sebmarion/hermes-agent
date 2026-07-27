@@ -8073,14 +8073,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         Supports:
           /model                              — show current model + usage hints
-          /model <name>                       — switch model (persists by default)
-          /model <name> --session             — switch for this session only
-          /model <name> --global              — switch and persist (explicit)
+          /model <name>                       — switch for this session only
+          /model <name> --session             — explicit session-only override
+          /model <name> --global              — save the route to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
 
-        Persistence defaults to on (``model.persist_switch_by_default`` in
-        config.yaml, default True). Use ``--session`` for a one-off switch.
+        Bare switches and picker choices are session-only. ``--global`` is
+        required to save the provider/model/endpoint route to ``config.yaml``.
+        ``--session`` is an explicit session-only alias and wins if both
+        persistence flags are supplied. The legacy
+        ``model.persist_switch_by_default`` key does not control interactive
+        switches.
         """
         from hermes_cli.model_switch import (
             switch_model,
@@ -8101,10 +8105,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             force_refresh,
             is_session,
         ) = parse_model_flags(raw_args)
-        # Resolve the effective persistence once: --session overrides the
-        # config-gated default, --global forces persist, otherwise defer to
-        # model.persist_switch_by_default (defaults to True so /model survives
-        # across sessions).
+        # Resolve persistence once: --session wins, --global saves the route,
+        # and a bare interactive switch remains session-only.
         persist_global = resolve_persist_behavior(is_global_flag, is_session)
 
         # --refresh: wipe the on-disk picker cache before building the
@@ -8153,12 +8155,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if not providers:
                 _cprint("  No authenticated providers found.")
                 _cprint("")
-                _cprint("  /model <name>                        switch model (persists)")
-                _cprint("  /model <name> --session              switch for this session only")
+                _cprint("  /model <name>                        switch for this session only")
+                _cprint("  /model <name> --session              explicit session-only override")
+                _cprint("                                          (--session wins over --global)")
+                _cprint("  /model <name> --global               save provider/model/endpoint route to config.yaml")
                 _cprint("  /model --provider <slug>             switch provider")
                 _cprint("  /model --refresh                     re-fetch live model lists")
                 return
 
+            if persist_global:
+                _cprint(
+                    "  Picker choice will save the provider/model/endpoint "
+                    "route to config.yaml (--global)."
+                )
+            else:
+                _cprint("  Picker choices are session-only.")
+                _cprint(
+                    "  --session is the explicit session-only override; "
+                    "--session wins over --global."
+                )
             self._open_model_picker(
                 providers,
                 model_display,

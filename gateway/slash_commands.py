@@ -1431,11 +1431,15 @@ class GatewaySlashCommandsMixin:
 
         Supports:
           /model                              — interactive picker (Telegram/Discord) or text list
-          /model <name>                       — switch model (persists by default)
-          /model <name> --session             — switch for this session only
-          /model <name> --global              — switch and persist (explicit)
+          /model <name>                       — switch for this session only
+          /model <name> --session             — explicit session-only override
+          /model <name> --global              — save the route to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
+
+        ``--session`` wins if both persistence flags are supplied. Bare
+        commands and picker choices are session-only; ``--global`` is required
+        to save the provider/model/endpoint route to ``config.yaml``.
         """
         from gateway.run import _load_gateway_config
         from hermes_cli.model_switch import (
@@ -1691,9 +1695,8 @@ class GatewaySlashCommandsMixin:
                         # stale cache signature to trigger a rebuild.
                         _self._evict_cached_agent(_session_key)
 
-                        # Persist to config (default) unless --session opted out,
-                        # mirroring the text /model command path above so a picked
-                        # model survives across sessions like a typed one (#49066).
+                        # Save the route only for an explicit --global request.
+                        # Bare and --session picker choices remain session-only.
                         saved_global = False
                         save_warning = ""
                         if persist_global:
@@ -1918,7 +1921,7 @@ class GatewaySlashCommandsMixin:
             # override rather than relying on cache signature mismatch detection.
             self._evict_cached_agent(session_key)
 
-            # Persist to config (default) unless --session opted out
+            # Save the route only for an explicit --global request.
             saved_global = False
             save_warning = ""
             if persist_global:

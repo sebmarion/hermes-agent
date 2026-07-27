@@ -357,10 +357,11 @@ def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool]:
 
     Returns ``(model_input, explicit_provider, is_global, force_refresh, is_session)``.
 
-    ``is_global`` and ``is_session`` are independent flag presences; the
-    *effective* persistence decision is resolved by
-    :func:`resolve_persist_behavior` so the config-gated default
-    (``model.persist_switch_by_default``) is applied in one place.
+    ``is_global`` and ``is_session`` are independent flag presences. The
+    effective decision is resolved by :func:`resolve_persist_behavior`:
+    ``--session`` wins, ``--global`` saves the route, and an unqualified
+    interactive switch remains session-only. The legacy
+    ``model.persist_switch_by_default`` key does not control this policy.
 
     Examples::
 
@@ -387,7 +388,7 @@ def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool]:
         is_global = True
         raw_args = raw_args.replace("--global", "").strip()
 
-    # Extract --session (explicit session-only; overrides the persist default)
+    # Extract --session (explicit session-only; wins over --global)
     if "--session" in raw_args:
         is_session = True
         raw_args = raw_args.replace("--session", "").strip()
@@ -817,7 +818,7 @@ def switch_model(
         current_model: The currently active model name.
         current_base_url: The currently active base URL.
         current_api_key: The currently active API key.
-        is_global: Whether to persist the switch.
+        is_global: Whether the caller explicitly requested a global route save.
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.

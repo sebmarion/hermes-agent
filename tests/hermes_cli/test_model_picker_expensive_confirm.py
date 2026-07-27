@@ -23,6 +23,12 @@ def test_prompt_toolkit_model_picker_preserves_command_persistence_intent(
 ):
     import cli as cli_mod
 
+    help_lines = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_cprint",
+        lambda value, *args, **kwargs: help_lines.append(str(value)),
+    )
     result = ModelSwitchResult(
         success=True,
         new_model="openai/gpt-5.5",
@@ -89,6 +95,51 @@ def test_prompt_toolkit_model_picker_preserves_command_persistence_intent(
 
     assert switch_calls[0]["is_global"] is expected_persist_global
     assert applied == [(result, expected_persist_global)]
+    picker_help = "\n".join(help_lines)
+    if expected_persist_global:
+        assert (
+            "Picker choice will save the provider/model/endpoint route "
+            "to config.yaml (--global)." in picker_help
+        )
+    else:
+        assert "Picker choices are session-only." in picker_help
+        assert "--session is the explicit session-only override" in picker_help
+        assert "--session wins over --global" in picker_help
+
+
+def test_model_text_help_describes_explicit_persistence_policy(monkeypatch):
+    """The no-provider fallback still exposes the complete persistence policy."""
+    import cli as cli_mod
+
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: (_ for _ in ()).throw(RuntimeError("no inventory")),
+    )
+    monkeypatch.setattr("hermes_cli.providers.get_label", lambda provider: provider)
+    lines = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_cprint",
+        lambda value, *args, **kwargs: lines.append(str(value)),
+    )
+    self_ = SimpleNamespace(
+        agent=None,
+        provider="openrouter",
+        model="openai/gpt-5.4",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-test",
+    )
+
+    _bound(cli_mod.HermesCLI._handle_model_switch, self_)("/model")
+
+    help_text = "\n".join(lines)
+    assert "/model <name>" in help_text
+    assert "switch for this session only" in help_text
+    assert "--session" in help_text
+    assert "explicit session-only override" in help_text
+    assert "--session wins over --global" in help_text
+    assert "--global" in help_text
+    assert "save provider/model/endpoint route to config.yaml" in help_text
 
 
 def test_prompt_toolkit_model_picker_defers_confirmation_off_key_handler(monkeypatch):
