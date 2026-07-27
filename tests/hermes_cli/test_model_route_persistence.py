@@ -188,6 +188,103 @@ def test_managed_route_key_rejects_entire_transaction_with_zero_writes(
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize(
+    "managed_body",
+    [
+        "provider: managed-provider\n",
+        "base_url: https://managed.example/v1\n",
+        "context_length: 123456\n",
+        "api_base: https://managed-alias.example/v1\n",
+        "model:\n  api_base: https://managed-model-alias.example/v1\n",
+        "model:\n  model: managed-model-alias\n",
+        "model:\n  name: managed-name-alias\n",
+        "model: managed-scalar-model\n",
+    ],
+    ids=[
+        "root-provider",
+        "root-base-url",
+        "root-context-length",
+        "root-api-base",
+        "model-api-base",
+        "model-model",
+        "model-name",
+        "root-model-scalar",
+    ],
+)
+def test_managed_route_alias_rejects_entire_transaction_with_zero_writes(
+    config_home, monkeypatch, tmp_path, managed_body
+):
+    path = config_home / "config.yaml"
+    path.write_text(
+        "model:\n"
+        "  provider: custom\n"
+        "  default: old\n"
+        "  base_url: https://old.example/v1\n"
+        "  context_length: 64000\n",
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / "config.yaml").write_text(managed_body, encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    managed_scope.invalidate_managed_cache()
+    calls = _spy_atomic_updates(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="managed"):
+        _persist(provider="openai-codex", model="gpt-5.4")
+
+    assert calls == []
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("managed_key", "managed_value"),
+    [
+        ("provider", "managed-provider"),
+        ("default", "managed-model"),
+        ("base_url", "https://managed.example/v1"),
+        ("api_mode", "managed_mode"),
+        ("api_key", "managed-key"),
+        ("api", "managed-legacy-key"),
+        ("context_length", 123456),
+    ],
+    ids=[
+        "model-provider",
+        "model-default",
+        "model-base-url",
+        "model-api-mode",
+        "model-api-key",
+        "model-api",
+        "model-context-length",
+    ],
+)
+def test_managed_nested_touched_key_rejects_with_zero_writes(
+    config_home, monkeypatch, tmp_path, managed_key, managed_value
+):
+    path = config_home / "config.yaml"
+    path.write_text(
+        "model:\n  provider: custom\n  default: old\n",
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / "config.yaml").write_text(
+        yaml.safe_dump({"model": {managed_key: managed_value}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    managed_scope.invalidate_managed_cache()
+    calls = _spy_atomic_updates(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="managed"):
+        _persist(provider="openai-codex", model="gpt-5.4")
+
+    assert calls == []
+    assert path.read_bytes() == before
+
+
 def test_fully_managed_install_rejects_with_zero_writes(
     config_home, monkeypatch
 ):

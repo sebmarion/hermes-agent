@@ -6860,6 +6860,7 @@ _MAIN_MODEL_ROUTE_PATHS = frozenset(
         "model.api_mode",
         "model.api_key",
         "model.api",
+        "model.context_length",
     }
 )
 
@@ -6893,7 +6894,14 @@ def persist_main_model_assignment(
 
     from hermes_cli import managed_scope
 
-    managed_keys = managed_scope.managed_config_keys()
+    managed_config = managed_scope.load_managed_config()
+    normalized_managed = _normalize_root_model_keys(copy.deepcopy(managed_config))
+    if isinstance(normalized_managed.get("model"), str):
+        normalized_managed = dict(normalized_managed)
+        normalized_managed["model"] = {"default": normalized_managed["model"]}
+    managed_keys = managed_scope.managed_config_keys() | {
+        ".".join(path) for path in _explicit_config_paths(normalized_managed)
+    }
     managed_route_keys = sorted(managed_keys & _MAIN_MODEL_ROUTE_PATHS)
     if managed_route_keys:
         managed_dir = managed_scope.get_managed_dir()
