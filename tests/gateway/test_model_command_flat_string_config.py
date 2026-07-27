@@ -20,6 +20,9 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
 
+_MISSING = object()
+
+
 def _make_runner():
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
@@ -61,8 +64,11 @@ def _setup_isolated_home(tmp_path, monkeypatch, model_yaml_value):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
     cfg_path = hermes_home / "config.yaml"
+    config = {"providers": {}}
+    if model_yaml_value is not _MISSING:
+        config["model"] = model_yaml_value
     cfg_path.write_text(
-        yaml.safe_dump({"model": model_yaml_value, "providers": {}}),
+        yaml.safe_dump(config),
         encoding="utf-8",
     )
 
@@ -159,17 +165,25 @@ async def test_model_global_persists_when_config_has_proper_dict_model(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_model_no_flag_persists_by_default(tmp_path, monkeypatch):
-    """A plain ``/model X`` (no --global) now persists to config.yaml.
-
-    This is the user-facing fix: switching models in one session survives
-    into the next without re-typing the switch every time.
-    """
-    cfg_path = _setup_isolated_home(
-        tmp_path,
-        monkeypatch,
-        {"default": "old-model", "provider": "openai-codex"},
-    )
+@pytest.mark.parametrize(
+    "model_yaml_value",
+    [
+        _MISSING,
+        {
+            "default": "old-model",
+            "provider": "openai-codex",
+            "persist_switch_by_default": True,
+        },
+        "deepseek-v4-flash",
+    ],
+    ids=["missing", "mapping-with-legacy-true", "flat-string"],
+)
+async def test_model_no_flag_is_session_only_for_all_config_shapes(
+    tmp_path, monkeypatch, model_yaml_value
+):
+    """A plain ``/model X`` never writes config, regardless of its shape."""
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, model_yaml_value)
+    before = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
 
     result = await _make_runner()._handle_model_command(
         _make_event("/model gpt-5.5")
@@ -178,12 +192,12 @@ async def test_model_no_flag_persists_by_default(tmp_path, monkeypatch):
     assert result is not None
     assert "gpt-5.5" in result
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    assert written["model"]["default"] == "gpt-5.5"
+    assert written == before
 
 
 @pytest.mark.asyncio
 async def test_model_session_flag_does_not_persist(tmp_path, monkeypatch):
-    """``/model X --session`` opts out of persistence even under the new default."""
+    """``/model X --session`` remains session-only."""
     cfg_path = _setup_isolated_home(
         tmp_path,
         monkeypatch,

@@ -1,11 +1,11 @@
-"""Tests for persist-by-default model switching.
+"""Tests for explicit model-switch persistence.
 
 Covers:
 - ``parse_model_flags`` recognises ``--session`` (and keeps ``--global``).
-- ``resolve_persist_behavior`` applies the config-gated default and the
-  ``--session`` / ``--global`` overrides.
-- The default (no flags) persists, which is the user-facing fix: a plain
-  ``/model <name>`` survives across sessions.
+- ``resolve_persist_behavior`` persists only for an explicit ``--global``.
+- ``--session`` wins when both persistence flags are supplied.
+- Legacy ``model.persist_switch_by_default`` values no longer affect
+  interactive switching.
 """
 
 from unittest.mock import patch
@@ -64,35 +64,37 @@ class TestParseModelFlagsSession:
 
 class TestResolvePersistBehavior:
     def test_session_flag_always_session_only(self):
-        # --session opts out even if the config default is True.
+        # --session opts out even if the legacy config default is True.
         with _config({"model": {"persist_switch_by_default": True}}):
             assert resolve_persist_behavior(False, True) is False
 
     def test_global_flag_always_persists(self):
-        # --global forces persist even if the config default is False.
+        # --global explicitly requests persistence.
         with _config({"model": {"persist_switch_by_default": False}}):
             assert resolve_persist_behavior(True, False) is True
 
-    def test_default_persists_when_config_missing(self):
-        # No model section at all → built-in default (True).
+    def test_no_flags_are_session_only_when_config_missing(self):
         with _config({}):
-            assert resolve_persist_behavior(False, False) is True
+            assert resolve_persist_behavior(False, False) is False
 
-    def test_default_persists_when_key_true(self):
+    def test_no_flags_are_session_only_for_mapping_config(self):
+        with _config({"model": {"default": "old-model"}}):
+            assert resolve_persist_behavior(False, False) is False
+
+    def test_legacy_persist_switch_by_default_true_is_ignored(self):
         with _config({"model": {"persist_switch_by_default": True}}):
-            assert resolve_persist_behavior(False, False) is True
+            assert resolve_persist_behavior(False, False) is False
 
-    def test_default_session_only_when_key_false(self):
+    def test_legacy_persist_switch_by_default_false_remains_session_only(self):
         with _config({"model": {"persist_switch_by_default": False}}):
             assert resolve_persist_behavior(False, False) is False
 
-    def test_default_when_model_is_flat_string(self):
-        # Fresh install: ``model: ""`` (not a dict) → built-in default True.
+    def test_no_flags_are_session_only_when_model_is_flat_string(self):
         with _config({"model": ""}):
-            assert resolve_persist_behavior(False, False) is True
+            assert resolve_persist_behavior(False, False) is False
 
     def test_session_overrides_global_when_both_set(self):
-        # --session is the explicit opt-out and wins over --global.
+        # --session wins over --global when both flags are supplied.
         with _config({"model": {"persist_switch_by_default": True}}):
             assert resolve_persist_behavior(True, True) is False
 
@@ -103,7 +105,7 @@ class TestResolvePersistBehavior:
 
 
 class _config:
-    """Context manager that patches ``load_config`` to return a fixed dict."""
+    """Patch the legacy config loader and prove the resolver does not read it."""
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -113,10 +115,10 @@ class _config:
             "hermes_cli.config.load_config",
             return_value=self.cfg,
         )
-        # resolve_persist_behavior imports load_config lazily inside the
-        # function, so patching the source module is sufficient.
-        self._patch.start()
+        self.load_config = self._patch.start()
         return self
 
     def __exit__(self, *exc):
+        if not exc:
+            self.load_config.assert_not_called()
         self._patch.stop()
