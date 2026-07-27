@@ -15,6 +15,7 @@ def _bound(fn, instance):
         ("/model", False),
         ("/model --session", False),
         ("/model --global", True),
+        ("/model --global --session", False),
     ],
 )
 def test_prompt_toolkit_model_picker_preserves_command_persistence_intent(

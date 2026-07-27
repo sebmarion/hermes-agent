@@ -10,6 +10,8 @@ Covers:
 
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.model_switch import parse_model_flags, resolve_persist_behavior
 
 
@@ -118,7 +120,22 @@ class _config:
         self.load_config = self._patch.start()
         return self
 
-    def __exit__(self, *exc):
-        if not exc:
-            self.load_config.assert_not_called()
-        self._patch.stop()
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is None:
+                self.load_config.assert_not_called()
+        finally:
+            self._patch.stop()
+
+
+def test_config_helper_enforces_no_load_on_successful_exit():
+    with pytest.raises(AssertionError):
+        with _config({}) as config:
+            config.load_config()
+
+
+def test_config_helper_preserves_original_exception():
+    with pytest.raises(RuntimeError, match="original failure"):
+        with _config({}) as config:
+            config.load_config()
+            raise RuntimeError("original failure")
