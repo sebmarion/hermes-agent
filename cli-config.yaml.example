@@ -375,6 +375,11 @@ browser:
 tool_loop_guardrails:
   warnings_enabled: true
   hard_stop_enabled: false
+  # Optional release-lite mode: terminal commands with different exact
+  # request signatures may continue within max_iterations instead of tripping
+  # the broad same-tool halt. Identical failed commands still block normally.
+  # Set false to restore the legacy broad terminal halt.
+  terminal_exact_failure_only: false
   warn_after:
     exact_failure: 2
     same_tool_failure: 3

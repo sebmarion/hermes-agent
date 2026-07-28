@@ -1348,6 +1348,7 @@ For unattended gateway / server deployments, enable hard stops so a stuck agent 
 tool_loop_guardrails:
   warnings_enabled: true       # inject warnings into tool results (default: true)
   hard_stop_enabled: false     # also BLOCK the call past the hard-stop threshold (default: false)
+  terminal_exact_failure_only: false  # allow distinct failed terminal signatures to keep recovering
   warn_after:
     exact_failure: 2           # identical failing call repeated N times
     same_tool_failure: 3       # same tool failing N times (different args)
@@ -1359,6 +1360,15 @@ tool_loop_guardrails:
 ```
 
 `hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
+
+`terminal_exact_failure_only` is a default-off rollout switch for terminal
+recovery. When it is `true`, failed `terminal` calls with different exact
+request signatures continue within the existing global iteration budget
+instead of triggering the broad same-tool hard stop. Repeating an identical
+failed command still warns and blocks at the configured `exact_failure`
+thresholds. Terminal warnings remain enabled, and policy, authorization,
+mutation safety, other tools, and maximum iterations are unchanged. Set the
+option back to `false` to restore the legacy broad terminal halt.
 
 ## TTS Configuration
 
