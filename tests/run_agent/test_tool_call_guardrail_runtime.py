@@ -714,7 +714,10 @@ def test_sequential_failures_finalize_once_per_assistant_batch():
 
 
 def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
-    agent = _make_agent("web_search")
+    agent = _make_agent(
+        "web_search",
+        config=_hard_stop_config(terminal_exact_failure_only=True),
+    )
     args = {"query": "same"}
     tc = _mock_tool_call("web_search", json.dumps(args), "c-plugin")
     msg = SimpleNamespace(content="", tool_calls=[tc])
@@ -1189,6 +1192,156 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert result["final_response"] == "done"
     tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
+
+
+def test_terminal_exact_failure_mode_continues_distinct_failed_commands():
+    agent = _make_agent(
+        "terminal",
+        max_iterations=10,
+        config=_hard_stop_config(
+            terminal_exact_failure_only=True,
+            warn_after={
+                "exact_failure": 2,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+            hard_stop_after={
+                "exact_failure": 3,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "terminal",
+                    json.dumps({"command": f"bad-{index}"}),
+                    f"c-{index}",
+                )
+            ],
+        )
+        for index in range(4)
+    ]
+    responses.append(_mock_response(content="recovered", finish_reason="stop"))
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"exit_code": 127, "output": "missing"}),
+        ) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("try distinct terminal recovery commands")
+
+    assert dispatch.call_count == 4
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"] == "recovered"
+    assert "guardrail" not in result
+    tool_contents = [
+        message["content"]
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    ]
+    assert any("same_tool_failure_warning" in content for content in tool_contents)
+
+
+def test_terminal_exact_failure_mode_returns_structured_exact_and_broad_counts():
+    agent = _make_agent(
+        "terminal",
+        max_iterations=10,
+        config=_hard_stop_config(
+            terminal_exact_failure_only=True,
+            hard_stop_after={
+                "exact_failure": 3,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    same_args = {"command": "same"}
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("terminal", json.dumps(same_args), f"c-{index}")
+            ],
+        )
+        for index in range(4)
+    ]
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"exit_code": 1}),
+        ) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("repeat one failing command")
+
+    assert dispatch.call_count == 3
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "repeated_exact_failure_block"
+    assert result["guardrail"]["tool_name"] == "terminal"
+    assert result["guardrail"]["exact_count"] == 3
+    assert result["guardrail"]["broad_count"] == 3
+
+
+def test_terminal_exact_failure_mode_keeps_global_iteration_budget():
+    agent = _make_agent(
+        "terminal",
+        max_iterations=2,
+        config=_hard_stop_config(
+            terminal_exact_failure_only=True,
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 2,
+                "idempotent_no_progress": 99,
+            },
+        ),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "terminal",
+                    json.dumps({"command": f"bad-{index}"}),
+                    f"c-{index}",
+                )
+            ],
+        )
+        for index in range(2)
+    ] + [_mock_response(content="iteration summary", finish_reason="stop")]
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"exit_code": 1}),
+        ) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do not exceed the iteration budget")
+
+    assert dispatch.call_count == 2
+    # The two budgeted loop calls are followed by the existing out-of-band
+    # max-iteration summary request.
+    assert agent.client.chat.completions.create.call_count == 3
+    assert result["api_calls"] == 2
+    assert result["turn_exit_reason"].startswith("max_iterations_reached")
+    assert "guardrail" not in result
 
 
 def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
