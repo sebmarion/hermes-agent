@@ -81,6 +81,7 @@ class ToolCallGuardrailConfig:
 
     warnings_enabled: bool = True
     hard_stop_enabled: bool = False
+    terminal_exact_failure_only: bool = False
     exact_failure_warn_after: int = 2
     exact_failure_block_after: int = 5
     same_tool_failure_warn_after: int = 3
@@ -107,6 +108,10 @@ class ToolCallGuardrailConfig:
         return cls(
             warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
             hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
+            terminal_exact_failure_only=_as_bool(
+                data.get("terminal_exact_failure_only"),
+                defaults.terminal_exact_failure_only,
+            ),
             exact_failure_warn_after=_positive_int(
                 warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
                 defaults.exact_failure_warn_after,
