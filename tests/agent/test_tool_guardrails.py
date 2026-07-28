@@ -209,6 +209,146 @@ def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
     assert third.count == 3
 
 
+def _terminal_exact_failure_controller() -> ToolCallGuardrailController:
+    return ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            terminal_exact_failure_only=True,
+            exact_failure_warn_after=2,
+            exact_failure_block_after=3,
+            same_tool_failure_warn_after=2,
+            same_tool_failure_halt_after=2,
+        )
+    )
+
+
+def test_terminal_exact_failure_mode_warns_but_does_not_halt_distinct_commands():
+    controller = _terminal_exact_failure_controller()
+
+    decisions = [
+        controller.after_call(
+            "terminal",
+            {"command": f"cmd-{index}"},
+            '{"exit_code":1}',
+            failed=True,
+        )
+        for index in range(4)
+    ]
+
+    assert decisions[0].action == "allow"
+    assert [decision.action for decision in decisions[1:]] == [
+        "warn",
+        "warn",
+        "warn",
+    ]
+    assert {decision.code for decision in decisions[1:]} == {
+        "same_tool_failure_warning"
+    }
+    assert controller.halt_decision is None
+
+
+def test_terminal_exact_failure_mode_still_blocks_identical_command():
+    controller = _terminal_exact_failure_controller()
+    args = {"command": "same"}
+
+    for _ in range(3):
+        assert controller.before_call("terminal", args).allows_execution
+        controller.after_call(
+            "terminal",
+            args,
+            '{"exit_code":1}',
+            failed=True,
+        )
+
+    blocked = controller.before_call("terminal", args)
+
+    assert blocked.action == "block"
+    assert blocked.code == "repeated_exact_failure_block"
+    assert blocked.exact_count == 3
+    assert blocked.broad_count == 3
+    metadata = blocked.to_metadata()
+    assert metadata["tool_name"] == "terminal"
+    assert metadata["exact_count"] == 3
+    assert metadata["broad_count"] == 3
+    assert "args" not in metadata
+
+
+def test_terminal_exact_failure_count_survives_interleaved_commands():
+    controller = _terminal_exact_failure_controller()
+    repeated = {"command": "repeat"}
+
+    for args in [
+        repeated,
+        {"command": "other-1"},
+        repeated,
+        {"command": "other-2"},
+        repeated,
+    ]:
+        controller.after_call(
+            "terminal",
+            args,
+            '{"exit_code":1}',
+            failed=True,
+        )
+
+    blocked = controller.before_call("terminal", repeated)
+    assert blocked.code == "repeated_exact_failure_block"
+    assert blocked.exact_count == 3
+    assert blocked.broad_count == 5
+
+
+def test_terminal_exact_failure_mode_does_not_change_other_tool_broad_halt():
+    controller = _terminal_exact_failure_controller()
+
+    controller.after_call(
+        "web_search",
+        {"query": "first"},
+        '{"error":"boom"}',
+        failed=True,
+    )
+    halted = controller.after_call(
+        "web_search",
+        {"query": "second"},
+        '{"error":"boom"}',
+        failed=True,
+    )
+
+    assert halted.action == "halt"
+    assert halted.code == "same_tool_failure_halt"
+    assert halted.exact_count == 1
+    assert halted.broad_count == 2
+
+
+def test_gate_off_keeps_existing_broad_terminal_halt_and_structured_counts():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            terminal_exact_failure_only=False,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=99,
+            same_tool_failure_halt_after=2,
+        )
+    )
+
+    controller.after_call(
+        "terminal",
+        {"command": "first"},
+        '{"exit_code":1}',
+        failed=True,
+    )
+    halted = controller.after_call(
+        "terminal",
+        {"command": "second"},
+        '{"exit_code":1}',
+        failed=True,
+    )
+
+    assert halted.code == "same_tool_failure_halt"
+    assert halted.exact_count == 1
+    assert halted.broad_count == 2
+    assert halted.to_metadata()["broad_count"] == 2
+
+
 def test_parallel_failures_in_one_assistant_batch_count_as_one_epoch():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(

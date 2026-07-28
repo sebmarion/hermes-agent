@@ -49,11 +49,15 @@ def _response(*, content="", finish_reason="stop", tool_calls=None):
     )
 
 
-def _make_agent(*tool_names: str, max_iterations: int = 8) -> AIAgent:
+def _make_agent(
+    *tool_names: str,
+    max_iterations: int = 8,
+    config: dict | None = None,
+) -> AIAgent:
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
         patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("hermes_cli.config.load_config", return_value={}),
+        patch("hermes_cli.config.load_config", return_value=config or {}),
         patch("run_agent.OpenAI"),
     ):
         agent = AIAgent(
@@ -166,7 +170,16 @@ def test_infrastructure_block_halts_after_one_model_call_and_bypasses_rewriters(
 
 
 def test_sequential_terminal_block_closes_unstarted_tool_call_ids():
-    agent = _make_agent("terminal")
+    agent = _make_agent(
+        "terminal",
+        config={
+            "tool_loop_guardrails": {
+                "warnings_enabled": True,
+                "hard_stop_enabled": True,
+                "terminal_exact_failure_only": True,
+            }
+        },
+    )
     block = _infrastructure_block("required_policy_config_invalid")
     agent.client.chat.completions.create.return_value = _response(
         finish_reason="tool_calls",

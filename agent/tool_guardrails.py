@@ -178,6 +178,8 @@ class ToolGuardrailDecision:
     tool_name: str = ""
     count: int = 0
     signature: ToolCallSignature | None = None
+    exact_count: int | None = None
+    broad_count: int | None = None
 
     @property
     def allows_execution(self) -> bool:
@@ -197,6 +199,10 @@ class ToolGuardrailDecision:
         }
         if self.signature is not None:
             data["signature"] = self.signature.to_metadata()
+        if self.exact_count is not None:
+            data["exact_count"] = self.exact_count
+        if self.broad_count is not None:
+            data["broad_count"] = self.broad_count
         return data
 
 
@@ -617,6 +623,7 @@ class ToolCallGuardrailController:
 
         exact_count = self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.config.exact_failure_block_after:
+            broad_count = self._same_tool_failure_counts.get(tool_name, 0)
             decision = ToolGuardrailDecision(
                 action="block",
                 code="repeated_exact_failure_block",
@@ -628,6 +635,8 @@ class ToolCallGuardrailController:
                 tool_name=tool_name,
                 count=exact_count,
                 signature=signature,
+                exact_count=exact_count,
+                broad_count=broad_count,
             )
             self._halt_decision = decision
             return decision
@@ -804,6 +813,7 @@ class ToolCallGuardrailController:
                 )
                 if (
                     self.config.hard_stop_enabled
+                    and self._same_tool_halt_applies(observation.tool_name)
                     and same_count >= self.config.same_tool_failure_halt_after
                 ):
                     decision = ToolGuardrailDecision(
@@ -817,6 +827,8 @@ class ToolCallGuardrailController:
                         tool_name=observation.tool_name,
                         count=same_count,
                         signature=signature,
+                        exact_count=exact_count,
+                        broad_count=same_count,
                     )
                     if self._halt_decision is None:
                         self._halt_decision = decision
@@ -839,6 +851,8 @@ class ToolCallGuardrailController:
                         tool_name=observation.tool_name,
                         count=exact_count,
                         signature=signature,
+                        exact_count=exact_count,
+                        broad_count=same_count,
                     ))
                     continue
 
@@ -856,6 +870,8 @@ class ToolCallGuardrailController:
                         tool_name=observation.tool_name,
                         count=same_count,
                         signature=signature,
+                        exact_count=exact_count,
+                        broad_count=same_count,
                     ))
                     continue
 
@@ -863,6 +879,8 @@ class ToolCallGuardrailController:
                     tool_name=observation.tool_name,
                     count=exact_count,
                     signature=signature,
+                    exact_count=exact_count,
+                    broad_count=same_count,
                 ))
                 continue
 
@@ -908,6 +926,12 @@ class ToolCallGuardrailController:
         if tool_name in self.config.mutating_tools:
             return False
         return tool_name in self.config.idempotent_tools
+
+    def _same_tool_halt_applies(self, tool_name: str) -> bool:
+        return not (
+            self.config.terminal_exact_failure_only
+            and tool_name == "terminal"
+        )
 
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
