@@ -201,6 +201,33 @@ class ManagedAsyncDelegationRecoveryReceipt:
     manifest_generation: str = ""
     manifest_source_digest: str = ""
     record_classifications: tuple[tuple[str, str], ...] = ()
+    event_postconditions: tuple["ManagedAsyncEventPostcondition", ...] = ()
+    verification_sha256: str = ""
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ManagedAsyncEventPostcondition:
+    event_id: str
+    kind: str
+    state: str
+    row_sha256: str
+    event_sha256: str
+    immutable_sha256: str
+    created_at: Optional[float]
+    last_replay_epoch: str
+
+
+@dataclass(frozen=True)
+class ManagedAsyncDelegationVerificationReceipt:
+    outcome: ManagedAsyncDelegationRecoveryOutcome
+    tracker_hashes: tuple[tuple[str, Optional[str]], ...] = ()
+    tracker_identities: tuple[tuple[str, Optional[dict]], ...] = ()
+    outbox_hash: Optional[str] = None
+    delegation_ids: tuple[str, ...] = ()
+    event_ids: tuple[str, ...] = ()
+    queue_event_ids: tuple[str, ...] = ()
+    record_classifications: tuple[tuple[str, str], ...] = ()
     errors: tuple[str, ...] = ()
 
 
@@ -800,6 +827,25 @@ def _managed_v2_runtime() -> tuple[int, str, str, str]:
     return process_pid, process_token, runtime_generation, epoch
 
 
+def _managed_v2_runtime_current() -> Optional[tuple[int, str, str, str]]:
+    """Read the existing runtime epoch without initializing one."""
+    pid = os.getpid()
+    token = _safe_process_start_token(pid)
+    with _runtime_owner_lock:
+        if (
+            token is None
+            or _runtime_owner_pid != pid
+            or _runtime_owner_start_token != token
+            or not _runtime_owner_id
+        ):
+            return None
+        epoch = (
+            f"{pid}:{hashlib.sha256(token.encode()).hexdigest()[:24]}"
+            f":{_runtime_owner_id}"
+        )
+        return pid, token, _runtime_owner_id, epoch
+
+
 def _managed_v2_event_id(
     profile_id: str,
     generation: str,
@@ -1043,7 +1089,58 @@ def _managed_v2_receipt(
     )
 
 
-def _managed_v2_authorities(paths: Sequence[Path]) -> ExitStack:
+def _managed_event_postconditions(
+    outbox: Dict[str, Any],
+) -> tuple[ManagedAsyncEventPostcondition, ...]:
+    result = []
+    immutable_fields = (
+        "event_id", "delegation_id", "profile_id", "manifest_generation",
+        "manifest_source_digest", "tracker_path", "tracker_hash",
+        "tracker_identity", "event", "created_at", "last_replay_epoch",
+    )
+    for event_id, row in sorted(outbox["events"].items()):
+        immutable = {name: row[name] for name in immutable_fields}
+        result.append(
+            ManagedAsyncEventPostcondition(
+                event_id=event_id,
+                kind="event",
+                state=row["state"],
+                row_sha256=_managed_json_hash(row),
+                event_sha256=_managed_json_hash(row["event"]),
+                immutable_sha256=_managed_json_hash(immutable),
+                created_at=float(row["created_at"]),
+                last_replay_epoch=row["last_replay_epoch"],
+            )
+        )
+    for event_id, row in sorted(outbox["tombstones"].items()):
+        result.append(
+            ManagedAsyncEventPostcondition(
+                event_id=event_id,
+                kind="tombstone",
+                state="tombstoned",
+                row_sha256=_managed_json_hash(row),
+                event_sha256=row["payload_hash"],
+                immutable_sha256=_managed_json_hash(row),
+                created_at=None,
+                last_replay_epoch="",
+            )
+        )
+    return tuple(result)
+
+
+def _managed_recovery_receipt_digest(
+    receipt: ManagedAsyncDelegationRecoveryReceipt,
+) -> str:
+    value = asdict(receipt)
+    value["verification_sha256"] = ""
+    return _managed_json_hash(value)
+
+
+def _managed_v2_authorities(
+    paths: Sequence[Path],
+    *,
+    create_locks: bool = True,
+) -> ExitStack:
     stack = ExitStack()
     held_by_parent = {}
     for path in paths:
@@ -1053,7 +1150,9 @@ def _managed_v2_authorities(paths: Sequence[Path]) -> ExitStack:
             )
     stack.held_by_parent = held_by_parent  # type: ignore[attr-defined]
     for path in sorted(paths, key=os.fspath):
-        stack.enter_context(held_by_parent[path.parent].lock(path))
+        stack.enter_context(
+            held_by_parent[path.parent].lock(path, create=create_locks)
+        )
     return stack
 
 
@@ -1445,12 +1544,298 @@ def recover_managed_async_delegations_exact(
         deduped=deduped,
         transitions=transitions,
     )
-    return _managed_v2_receipt(
+    result = _managed_v2_receipt(
         base,
         runtime=runtime,
         manifest_generation=manifest.generation,
         manifest_source_digest=manifest.source_digest,
         classifications=classifications,
+    )
+    result = replace(
+        result,
+        event_postconditions=_managed_event_postconditions(
+            outbox_after[0] if outbox_after is not None else {
+                "events": {},
+                "tombstones": {},
+            }
+        ),
+    )
+    return replace(
+        result,
+        verification_sha256=_managed_recovery_receipt_digest(result),
+    )
+
+
+def verify_managed_async_delegations_exact(
+    receipt: ManagedAsyncDelegationRecoveryReceipt,
+    manifest: ManagedAsyncDelegationProfileManifest,
+    *,
+    completion_queue: Any,
+) -> ManagedAsyncDelegationVerificationReceipt:
+    """Read-only proof of tracker, outbox, queue, ACK, manifest, and epoch state."""
+    tracker_hashes: list[tuple[str, Optional[str]]] = []
+    tracker_identities: list[tuple[str, Optional[dict]]] = []
+    outbox_hash = None
+    delegation_ids: list[str] = []
+    event_ids: list[str] = []
+    queue_event_ids: list[str] = []
+    classifications: list[tuple[str, str]] = []
+    errors: list[str] = []
+    outcome = ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    try:
+        if type(receipt) is not ManagedAsyncDelegationRecoveryReceipt:
+            raise ValueError("managed async verification receipt type is invalid")
+        if (
+            not receipt.verification_sha256
+            or receipt.verification_sha256
+            != _managed_recovery_receipt_digest(receipt)
+        ):
+            raise ValueError("managed async verification receipt digest mismatch")
+        profiles, outbox = _managed_v2_manifest(
+            manifest, Path(receipt.outbox_path)
+        )
+        tracker_paths = tuple(Path(profile.tracker_path) for profile in profiles)
+        if (
+            tuple(map(os.fspath, tracker_paths)) != receipt.tracker_paths
+            or receipt.manifest_generation != manifest.generation
+            or receipt.manifest_source_digest != manifest.source_digest
+        ):
+            raise ValueError("managed async verification manifest mismatch")
+        _managed_v2_runtime_current()
+        expected_hashes = dict(receipt.tracker_hashes_after)
+        expected_identities = dict(receipt.tracker_identities_after)
+        if (
+            set(expected_hashes) != set(receipt.tracker_paths)
+            or set(expected_identities) != set(receipt.tracker_paths)
+        ):
+            raise ValueError("managed async verification receipt tracker mismatch")
+
+        with _managed_v2_authorities(
+            (*tracker_paths, outbox), create_locks=False
+        ) as authorities:
+            held_by_parent = authorities.held_by_parent  # type: ignore[attr-defined]
+            outbox_data, outbox_identity = _managed_v2_read_outbox(
+                held_by_parent[outbox.parent], outbox
+            )
+            outbox_hash = _managed_json_hash(outbox_data)
+            outbox_changed = outbox_hash != receipt.outbox_hash_after
+            tracker_changed = False
+            postconditions = {
+                item.event_id: item for item in receipt.event_postconditions
+            }
+            if (
+                len(postconditions) != len(receipt.event_postconditions)
+                or set(postconditions)
+                != set(outbox_data["events"]) | set(outbox_data["tombstones"])
+            ):
+                raise ValueError(
+                    "managed async verification receipt event set mismatch"
+                )
+            tracker_data: dict[str, tuple[Dict[str, Any], Optional[FileIdentity]]] = {}
+            aggregate_bytes = outbox_identity.size if outbox_identity else 0
+            for profile in profiles:
+                path = Path(profile.tracker_path)
+                remaining = _MAX_MANAGED_AGGREGATE_BYTES - aggregate_bytes
+                if remaining <= 0:
+                    raise ValueError("managed async verification authority budget exceeded")
+                data, identity = _managed_v2_tracker(
+                    held_by_parent[path.parent],
+                    profile,
+                    manifest.generation,
+                    max_bytes=min(_MAX_PERSISTENCE_BYTES, remaining),
+                )
+                digest = _managed_json_hash(data)
+                identity_value = _managed_identity(identity)
+                tracker_hashes.append((os.fspath(path), digest))
+                tracker_identities.append((os.fspath(path), identity_value))
+                if (
+                    digest != expected_hashes[os.fspath(path)]
+                    or identity_value != expected_identities[os.fspath(path)]
+                ):
+                    tracker_changed = True
+                tracker_data[profile.profile_id] = (data, identity)
+                aggregate_bytes += identity.size if identity else 0
+
+            records_by_id: dict[str, Dict[str, Any]] = {}
+            for profile in profiles:
+                data, _identity = tracker_data[profile.profile_id]
+                for delegation_id, entry in data["records"].items():
+                    if delegation_id in records_by_id:
+                        raise ValueError(
+                            "managed async verification delegation identity collision"
+                        )
+                    records_by_id[delegation_id] = entry
+                    delegation_ids.append(delegation_id)
+            if tuple(sorted(delegation_ids)) != tuple(sorted(receipt.delegation_ids)):
+                raise ValueError("managed async verification delegation mismatch")
+
+            with completion_queue.mutex:
+                queue_snapshot = tuple(completion_queue.queue)
+            queued_by_id: dict[str, Dict[str, Any]] = {}
+            for event in queue_snapshot:
+                if not isinstance(event, dict):
+                    continue
+                event_id = event.get("managed_event_id")
+                if not isinstance(event_id, str):
+                    continue
+                if event_id in queued_by_id:
+                    raise ValueError(
+                        "managed async verification queue identity collision"
+                    )
+                queued_by_id[event_id] = event
+
+            missing_queue = False
+            for event_id, row in sorted(outbox_data["events"].items()):
+                event_ids.append(event_id)
+                postcondition = postconditions[event_id]
+                immutable = {
+                    name: row[name]
+                    for name in (
+                        "event_id", "delegation_id", "profile_id",
+                        "manifest_generation", "manifest_source_digest",
+                        "tracker_path", "tracker_hash", "tracker_identity",
+                        "event", "created_at", "last_replay_epoch",
+                    )
+                }
+                unchanged = (
+                    postcondition.kind == "event"
+                    and _managed_json_hash(row) == postcondition.row_sha256
+                )
+                exact_ack = (
+                    postcondition.kind == "event"
+                    and postcondition.state in {"intent", "enqueued"}
+                    and row["state"] == "delivered"
+                    and _managed_json_hash(row["event"])
+                    == postcondition.event_sha256
+                    and _managed_json_hash(immutable)
+                    == postcondition.immutable_sha256
+                    and row["created_at"] == postcondition.created_at
+                    and row["last_replay_epoch"]
+                    == postcondition.last_replay_epoch
+                )
+                if not unchanged and not exact_ack:
+                    raise ValueError(
+                        "managed async verification event successor is invalid"
+                    )
+                delegation_id = row["delegation_id"]
+                entry = records_by_id.get(delegation_id)
+                if entry is None:
+                    raise ValueError(
+                        "managed async verification outbox lacks tracker"
+                    )
+                profile_data, profile_identity = tracker_data[row["profile_id"]]
+                if (
+                    row["tracker_current_hash"]
+                    != _managed_json_hash(profile_data)
+                    or row["tracker_current_identity"]
+                    != _managed_identity(profile_identity)
+                ):
+                    raise ValueError(
+                        "managed async verification tracker binding mismatch"
+                    )
+                if row["state"] == "delivered":
+                    if entry.get("delivery_status") != "delivered":
+                        raise ValueError(
+                            "managed async verification ACK state mismatch"
+                        )
+                    classifications.append((delegation_id, "delivered"))
+                    continue
+                queued = queued_by_id.get(event_id)
+                if queued is None:
+                    missing_queue = True
+                    classifications.append((delegation_id, "queue_missing"))
+                elif queued != row["event"]:
+                    raise ValueError(
+                        "managed async verification queued payload mismatch"
+                    )
+                else:
+                    queue_event_ids.append(event_id)
+                    classifications.append((delegation_id, "queued_exact"))
+                if entry.get("delivery_status") != "queued":
+                    raise ValueError(
+                        "managed async verification tracker queue state mismatch"
+                    )
+            for event_id, tombstone in sorted(outbox_data["tombstones"].items()):
+                postcondition = postconditions[event_id]
+                if postcondition.kind == "tombstone":
+                    valid_tombstone = (
+                        _managed_json_hash(tombstone)
+                        == postcondition.row_sha256
+                    )
+                else:
+                    valid_tombstone = (
+                        postcondition.kind == "event"
+                        and tombstone["payload_hash"]
+                        == postcondition.event_sha256
+                    )
+                if not valid_tombstone:
+                    raise ValueError(
+                        "managed async verification tombstone successor is invalid"
+                    )
+                matching = [
+                    delegation_id
+                    for delegation_id in records_by_id
+                    if _managed_v2_event_id(
+                        records_by_id[delegation_id]["profile_id"],
+                        manifest.generation,
+                        delegation_id,
+                    )
+                    == event_id
+                ]
+                if len(matching) != 1:
+                    raise ValueError(
+                        "managed async verification tombstone tracker mismatch"
+                    )
+                delegation_id = matching[0]
+                if records_by_id[delegation_id].get("delivery_status") != "delivered":
+                    raise ValueError(
+                        "managed async verification tombstone ACK mismatch"
+                    )
+                classifications.append((delegation_id, "tombstoned"))
+
+            receipt_events = set(receipt.event_ids)
+            current_events = set(event_ids) | set(outbox_data["tombstones"])
+            if not receipt_events.issubset(current_events):
+                raise ValueError("managed async verification receipt event mismatch")
+            if outbox_changed or tracker_changed:
+                advanced = any(
+                    (
+                        postconditions[event_id].kind == "event"
+                        and (
+                            event_id in outbox_data["tombstones"]
+                            or outbox_data["events"][event_id]["state"]
+                            == "delivered"
+                        )
+                    )
+                    for event_id in postconditions
+                )
+                if not advanced:
+                    raise ValueError(
+                        "managed async verification authority changed"
+                    )
+            if missing_queue:
+                outcome = ManagedAsyncDelegationRecoveryOutcome.PARTIAL
+            elif (
+                receipt.outcome is ManagedAsyncDelegationRecoveryOutcome.ABSENT
+                and not delegation_ids
+                and not current_events
+            ):
+                outcome = ManagedAsyncDelegationRecoveryOutcome.ABSENT
+            else:
+                outcome = ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+    except Exception as exc:
+        errors.append(str(exc))
+        outcome = ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    return ManagedAsyncDelegationVerificationReceipt(
+        outcome=outcome,
+        tracker_hashes=tuple(sorted(tracker_hashes)),
+        tracker_identities=tuple(sorted(tracker_identities)),
+        outbox_hash=outbox_hash,
+        delegation_ids=tuple(sorted(delegation_ids)),
+        event_ids=tuple(sorted(event_ids)),
+        queue_event_ids=tuple(sorted(queue_event_ids)),
+        record_classifications=tuple(sorted(classifications)),
+        errors=tuple(errors),
     )
 
 

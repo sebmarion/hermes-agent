@@ -4,6 +4,7 @@ import os
 import queue
 import threading
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -83,6 +84,18 @@ def _worker(manifest, outbox, boundary):
         if observed == boundary
         else None,
     )
+
+
+def _verify_restart_worker(manifest, outbox, receipt, output):
+    import queue as queue_module
+    from tools import async_delegation as worker_ad
+
+    result = worker_ad.verify_managed_async_delegations_exact(
+        receipt,
+        manifest,
+        completion_queue=queue_module.Queue(),
+    )
+    output.put(result.outcome.value)
 
 
 def test_manifest_is_authoritative_and_runtime_epoch_is_internal(tmp_path):
@@ -476,3 +489,257 @@ def test_unknown_terminal_status_fails_closed(tmp_path):
         completion_queue=queue.Queue(),
     )
     assert receipt.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+
+
+def test_managed_async_verifier_is_read_only(tmp_path, monkeypatch):
+    manifest = _manifest(tmp_path)
+    delegation_id = _delegation_id()
+    tracker = manifest.profiles[0].tracker_path
+    outbox = tmp_path / "outbox.json"
+    _write_tracker(tracker, "default", delegation_id)
+    completion_queue = queue.Queue()
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest, outbox_path=outbox, completion_queue=completion_queue
+    )
+    before_files = (tracker.read_bytes(), outbox.read_bytes())
+    with completion_queue.mutex:
+        before_queue = tuple(completion_queue.queue)
+
+    monkeypatch.setattr(
+        ad,
+        "atomic_write_private_json",
+        lambda *_a, **_k: pytest.fail("verifier must not write"),
+    )
+    monkeypatch.setattr(
+        ad,
+        "_managed_queue_event_once",
+        lambda *_a, **_k: pytest.fail("verifier must not enqueue"),
+    )
+    monkeypatch.setattr(
+        completion_queue,
+        "put",
+        lambda *_a, **_k: pytest.fail("verifier must not enqueue"),
+    )
+
+    verified = ad.verify_managed_async_delegations_exact(
+        receipt, manifest, completion_queue=completion_queue
+    )
+
+    assert verified.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+    assert (tracker.read_bytes(), outbox.read_bytes()) == before_files
+    with completion_queue.mutex:
+        assert tuple(completion_queue.queue) == before_queue
+
+
+def test_managed_async_verifier_detects_partial_and_tamper(tmp_path):
+    manifest = _manifest(tmp_path)
+    delegation_id = _delegation_id()
+    tracker = manifest.profiles[0].tracker_path
+    outbox = tmp_path / "outbox.json"
+    _write_tracker(tracker, "default", delegation_id)
+    completion_queue = queue.Queue()
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest, outbox_path=outbox, completion_queue=completion_queue
+    )
+    tampered_receipt = replace(receipt, event_postconditions=())
+    assert (
+        ad.verify_managed_async_delegations_exact(
+            tampered_receipt, manifest, completion_queue=completion_queue
+        ).outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    )
+    completion_queue.get_nowait()
+    assert (
+        ad.verify_managed_async_delegations_exact(
+            receipt, manifest, completion_queue=completion_queue
+        ).outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.PARTIAL
+    )
+
+    durable = json.loads(outbox.read_text())
+    row = next(iter(durable["events"].values()))
+    row["event"]["status"] = "tampered"
+    outbox.write_text(json.dumps(durable), encoding="utf-8")
+    outbox.chmod(0o600)
+    assert (
+        ad.verify_managed_async_delegations_exact(
+            receipt, manifest, completion_queue=completion_queue
+        ).outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    )
+
+
+def test_managed_async_verifier_rejects_receipt_manifest_and_runtime_mismatch(
+    tmp_path, monkeypatch
+):
+    manifest = _manifest(tmp_path)
+    delegation_id = _delegation_id()
+    _write_tracker(
+        manifest.profiles[0].tracker_path, "default", delegation_id
+    )
+    completion_queue = queue.Queue()
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest,
+        outbox_path=tmp_path / "outbox.json",
+        completion_queue=completion_queue,
+    )
+    wrong_receipt = replace(receipt, manifest_source_digest="b" * 64)
+    assert (
+        ad.verify_managed_async_delegations_exact(
+            wrong_receipt, manifest, completion_queue=completion_queue
+        ).outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    )
+    wrong_manifest = replace(manifest, source_digest="b" * 64)
+    assert (
+        ad.verify_managed_async_delegations_exact(
+            receipt, wrong_manifest, completion_queue=completion_queue
+        ).outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    )
+    runtime = ad._managed_v2_runtime()
+    monkeypatch.setattr(
+        ad,
+        "_managed_v2_runtime_current",
+        lambda: (runtime[0], runtime[1], "foreign-generation", "foreign-epoch"),
+    )
+    assert (
+        ad.verify_managed_async_delegations_exact(
+            receipt, manifest, completion_queue=completion_queue
+        ).outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+    )
+
+
+def test_managed_async_verifier_accepts_exact_terminal_ack(tmp_path):
+    manifest = _manifest(tmp_path)
+    delegation_id = _delegation_id()
+    _write_tracker(
+        manifest.profiles[0].tracker_path, "default", delegation_id
+    )
+    completion_queue = queue.Queue()
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest,
+        outbox_path=tmp_path / "outbox.json",
+        completion_queue=completion_queue,
+    )
+    event = completion_queue.get_nowait()
+    ack = ad.mark_managed_async_delegation_delivered_exact(event)
+    assert ack.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+
+    verified = ad.verify_managed_async_delegations_exact(
+        receipt, manifest, completion_queue=completion_queue
+    )
+
+    assert verified.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+
+
+def test_managed_async_verifier_rejects_byte_identical_duplicate_queue_event(
+    tmp_path,
+):
+    manifest = _manifest(tmp_path)
+    delegation_id = _delegation_id()
+    _write_tracker(
+        manifest.profiles[0].tracker_path, "default", delegation_id
+    )
+    completion_queue = queue.Queue()
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest,
+        outbox_path=tmp_path / "outbox.json",
+        completion_queue=completion_queue,
+    )
+    with completion_queue.mutex:
+        duplicate = dict(completion_queue.queue[0])
+        completion_queue.queue.append(duplicate)
+
+    verified = ad.verify_managed_async_delegations_exact(
+        receipt, manifest, completion_queue=completion_queue
+    )
+
+    assert (
+        verified.outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    )
+
+
+def test_managed_async_verifier_rejects_arbitrary_ack_edit(tmp_path):
+    manifest = _manifest(tmp_path)
+    delegation_id = _delegation_id()
+    _write_tracker(
+        manifest.profiles[0].tracker_path, "default", delegation_id
+    )
+    outbox = tmp_path / "outbox.json"
+    completion_queue = queue.Queue()
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest, outbox_path=outbox, completion_queue=completion_queue
+    )
+    event = completion_queue.get_nowait()
+    ad.mark_managed_async_delegation_delivered_exact(event)
+    durable = json.loads(outbox.read_text())
+    durable["events"][event["managed_event_id"]]["created_at"] += 1
+    outbox.write_text(json.dumps(durable), encoding="utf-8")
+    outbox.chmod(0o600)
+
+    assert (
+        ad.verify_managed_async_delegations_exact(
+            receipt, manifest, completion_queue=completion_queue
+        ).outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    )
+
+
+def test_managed_async_verifier_never_creates_missing_lock(
+    tmp_path, monkeypatch
+):
+    manifest = _manifest(tmp_path)
+    delegation_id = _delegation_id()
+    _write_tracker(
+        manifest.profiles[0].tracker_path, "default", delegation_id
+    )
+    outbox = tmp_path / "outbox.json"
+    completion_queue = queue.Queue()
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest, outbox_path=outbox, completion_queue=completion_queue
+    )
+    monkeypatch.setattr(ad, "_runtime_owner_id", "")
+    assert (
+        ad.verify_managed_async_delegations_exact(
+            receipt, manifest, completion_queue=completion_queue
+        ).outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+    )
+    assert ad._runtime_owner_id == ""
+
+    lock_path = tmp_path / ".outbox.json.lock"
+    lock_path.unlink()
+    before = tuple(sorted(path.name for path in tmp_path.iterdir()))
+
+    verified = ad.verify_managed_async_delegations_exact(
+        receipt, manifest, completion_queue=completion_queue
+    )
+
+    assert verified.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    assert tuple(sorted(path.name for path in tmp_path.iterdir())) == before
+
+
+
+def test_managed_async_verifier_restart_reports_partial(tmp_path):
+    manifest = _manifest(tmp_path)
+    delegation_id = _delegation_id()
+    _write_tracker(
+        manifest.profiles[0].tracker_path, "default", delegation_id
+    )
+    outbox = tmp_path / "outbox.json"
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest, outbox_path=outbox, completion_queue=queue.Queue()
+    )
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    child = context.Process(
+        target=_verify_restart_worker,
+        args=(manifest, str(outbox), receipt, output),
+    )
+    child.start()
+    child.join(10)
+    assert child.exitcode == 0
+    assert output.get(timeout=2) == "PARTIAL"

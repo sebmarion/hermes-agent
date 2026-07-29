@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import threading
 import time
+from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
@@ -12,6 +13,7 @@ from tools import process_registry as process_registry_module
 from tools.process_registry import (
     ManagedProcessRecoveryAmbiguous,
     ManagedProcessRecoveryOutcome,
+    ManagedProcessVerificationOutcome,
     ProcessRegistry,
 )
 
@@ -70,6 +72,18 @@ def _real_crash_recovery_worker(
         if observed == boundary
         else None
     )
+
+
+def _verify_restart_worker(checkpoint_path, notifications_path, receipt, output):
+    from pathlib import Path
+    from tools import process_registry as module
+    from tools.process_registry import ProcessRegistry
+
+    module.CHECKPOINT_PATH = Path(checkpoint_path)
+    module.NOTIFICATIONS_PATH = Path(notifications_path)
+    registry = ProcessRegistry()
+    registry._safe_host_start_token = lambda pid: f"token:{pid}"
+    output.put(registry.verify_managed_startup_exact(receipt).outcome.value)
 
 
 @pytest.fixture
@@ -620,8 +634,126 @@ def test_record_and_byte_bounds_fail_closed(
     monkeypatch.setattr(process_registry_module, "MAX_MANAGED_RECOVERY_RECORDS", 0)
     with pytest.raises(ManagedProcessRecoveryAmbiguous):
         exact_registry.recover_managed_startup_exact()
-
     monkeypatch.setattr(process_registry_module, "MAX_MANAGED_RECOVERY_RECORDS", 4096)
     monkeypatch.setattr(process_registry_module, "MAX_CHECKPOINT_BYTES", 2)
     with pytest.raises(ManagedProcessRecoveryAmbiguous):
         exact_registry.recover_managed_startup_exact()
+
+
+def test_managed_startup_verifier_is_read_only(
+    exact_registry, authorities, monkeypatch
+):
+    checkpoint, notifications = authorities
+    _write_private(checkpoint, [_checkpoint_entry()])
+    _write_private(notifications, _outbox())
+    receipt = exact_registry.recover_managed_startup_exact()
+    before_files = (checkpoint.read_bytes(), notifications.read_bytes())
+    before_running = dict(exact_registry._running)
+    before_replayed = set(exact_registry._completion_outbox_replayed)
+    with exact_registry.completion_queue.mutex:
+        before_queue = tuple(exact_registry.completion_queue.queue)
+
+    monkeypatch.setattr(
+        process_registry_module,
+        "_process_authority_atomic_write",
+        lambda *_a, **_k: pytest.fail("verifier must not write"),
+    )
+    monkeypatch.setattr(
+        exact_registry,
+        "_write_checkpoint",
+        lambda *_a, **_k: pytest.fail("verifier must not write"),
+    )
+    monkeypatch.setattr(
+        exact_registry.completion_queue,
+        "put",
+        lambda *_a, **_k: pytest.fail("verifier must not enqueue"),
+    )
+
+    verified = exact_registry.verify_managed_startup_exact(receipt)
+
+    assert verified.outcome is ManagedProcessVerificationOutcome.COMPLETE
+    assert (checkpoint.read_bytes(), notifications.read_bytes()) == before_files
+    assert exact_registry._running == before_running
+    assert exact_registry._completion_outbox_replayed == before_replayed
+    with exact_registry.completion_queue.mutex:
+        assert tuple(exact_registry.completion_queue.queue) == before_queue
+
+
+def test_managed_startup_verifier_rejects_tamper_receipt_and_foreign_epoch(
+    exact_registry, authorities
+):
+    checkpoint, notifications = authorities
+    _write_private(checkpoint, [_checkpoint_entry()])
+    _write_private(notifications, _outbox())
+    receipt = exact_registry.recover_managed_startup_exact()
+
+    tampered_receipt = replace(receipt, post_snapshot_sha256="0" * 64)
+    assert (
+        exact_registry.verify_managed_startup_exact(tampered_receipt).outcome
+        is ManagedProcessVerificationOutcome.AMBIGUOUS
+    )
+
+    checkpoint.write_text("[]", encoding="utf-8")
+    checkpoint.chmod(0o600)
+    assert (
+        exact_registry.verify_managed_startup_exact(receipt).outcome
+        is ManagedProcessVerificationOutcome.AMBIGUOUS
+    )
+def test_managed_startup_verifier_rejects_duplicate_or_forged_queue_event(
+    exact_registry, authorities
+):
+    checkpoint, notifications = authorities
+    _write_private(checkpoint, [_checkpoint_entry()])
+    _write_private(notifications, _outbox())
+    receipt = exact_registry.recover_managed_startup_exact()
+    with exact_registry.completion_queue.mutex:
+        event = dict(exact_registry.completion_queue.queue[0])
+        exact_registry.completion_queue.queue.append(dict(event))
+    assert (
+        exact_registry.verify_managed_startup_exact(receipt).outcome
+        is ManagedProcessVerificationOutcome.AMBIGUOUS
+    )
+    with exact_registry.completion_queue.mutex:
+        exact_registry.completion_queue.queue.clear()
+        event["output"] = "forged"
+        exact_registry.completion_queue.queue.append(event)
+    assert (
+        exact_registry.verify_managed_startup_exact(receipt).outcome
+        is ManagedProcessVerificationOutcome.AMBIGUOUS
+    )
+
+
+def test_managed_startup_verifier_restart_reports_effect_absent(
+    exact_registry, authorities
+):
+    checkpoint, notifications = authorities
+    _write_private(checkpoint, [_checkpoint_entry()])
+    _write_private(notifications, _outbox())
+    receipt = exact_registry.recover_managed_startup_exact()
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    child = context.Process(
+        target=_verify_restart_worker,
+        args=(str(checkpoint), str(notifications), receipt, output),
+    )
+    child.start()
+    child.join(10)
+    assert child.exitcode == 0
+    assert output.get(timeout=2) == "ABSENT"
+
+
+def test_managed_startup_verifier_never_creates_missing_lifecycle_lock(
+    exact_registry, authorities
+):
+    checkpoint, notifications = authorities
+    _write_private(checkpoint, [_checkpoint_entry()])
+    _write_private(notifications, _outbox())
+    receipt = exact_registry.recover_managed_startup_exact()
+    lifecycle_lock = checkpoint.parent / ".processes.json.admission.lock"
+    lifecycle_lock.unlink()
+    before = tuple(sorted(path.name for path in checkpoint.parent.iterdir()))
+
+    verified = exact_registry.verify_managed_startup_exact(receipt)
+
+    assert verified.outcome is ManagedProcessVerificationOutcome.AMBIGUOUS
+    assert tuple(sorted(path.name for path in checkpoint.parent.iterdir())) == before

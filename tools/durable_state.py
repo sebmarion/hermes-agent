@@ -471,26 +471,35 @@ class HeldPrivateAuthorityDirectory:
                     pass
 
     @contextmanager
-    def lock(self, path: Path) -> Iterator[None]:
+    def lock(self, path: Path, *, create: bool = True) -> Iterator[None]:
         self.assert_current()
         leaf = self._leaf(path)
         lock_leaf = f".{leaf}.lock"
         flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | _nofollow_flag()
         created = False
         try:
-            descriptor = os.open(
-                lock_leaf,
-                flags | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=self.descriptor,
-            )
-            created = True
-            if os.name == "nt":
-                os.write(descriptor, b"\0")
+            if not create:
+                descriptor = os.open(
+                    lock_leaf, flags, dir_fd=self.descriptor
+                )
+                created = False
             else:
-                os.fchmod(descriptor, 0o600)
+                descriptor = os.open(
+                    lock_leaf,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=self.descriptor,
+                )
+                created = True
+                if os.name == "nt":
+                    os.write(descriptor, b"\0")
+                else:
+                    os.fchmod(descriptor, 0o600)
         except FileExistsError:
-            descriptor = os.open(lock_leaf, flags, dir_fd=self.descriptor)
+            descriptor = os.open(
+                lock_leaf, flags, dir_fd=self.descriptor
+            )
+            created = False
         try:
             opened = os.fstat(descriptor)
             _validate_private_regular(opened)

@@ -105,6 +105,13 @@ class ManagedProcessRecoveryOutcome(str, Enum):
     PROVED_ABSENT = "proved-absent"
 
 
+class ManagedProcessVerificationOutcome(str, Enum):
+    COMPLETE = "COMPLETE"
+    ABSENT = "ABSENT"
+    PARTIAL = "PARTIAL"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
 class ManagedProcessRecoveryAmbiguous(RuntimeError):
     """Managed startup could not prove an exact recovery postcondition."""
 
@@ -137,6 +144,20 @@ class ManagedProcessRecoveryReceipt:
     queued_completion_event_ids: tuple[str, ...]
     deduped_completion_event_ids: tuple[str, ...]
     post_snapshot_sha256: str
+
+
+@dataclass(frozen=True)
+class ManagedProcessVerificationReceipt:
+    outcome: ManagedProcessVerificationOutcome
+    checkpoint_identity: Optional[FileIdentity] = None
+    checkpoint_sha256: Optional[str] = None
+    notifications_identity: Optional[FileIdentity] = None
+    notifications_sha256: Optional[str] = None
+    registry_process_ids: tuple[str, ...] = ()
+    durable_event_ids: tuple[str, ...] = ()
+    queue_event_ids: tuple[str, ...] = ()
+    activity: tuple[tuple[str, Any], ...] = ()
+    errors: tuple[str, ...] = ()
 
 
 def _canonical_authority_path(path: Path) -> Path:
@@ -304,6 +325,57 @@ def _process_lifecycle_fenced(method):
                 return _run_process_lifecycle_fenced(method, args, kwargs)
             finally:
                 _PROCESS_AUTHORITY_CONTEXT.lifecycle_depth = 0
+
+    return fenced
+
+
+def _process_lifecycle_verification_fenced(method):
+    """Run read-only verification under pre-existing lifecycle authorities."""
+    @wraps(method)
+    def fenced(*args, **kwargs):
+        try:
+            global _PROCESS_LIFECYCLE_FENCE, _PROCESS_LIFECYCLE_FENCE_PID
+            current_pid = os.getpid()
+            if _PROCESS_LIFECYCLE_FENCE_PID != current_pid:
+                raise ManagedProcessRecoveryAmbiguous(
+                    "managed verification cannot initialize a foreign lifecycle"
+                )
+            with _PROCESS_LIFECYCLE_FENCE:
+                if _IS_WINDOWS:
+                    raise ManagedProcessRecoveryAmbiguous(
+                        "managed verification requires held POSIX authority"
+                    )
+                with ExitStack() as stack:
+                    held_by_parent = {}
+                    for authority_path in (CHECKPOINT_PATH, NOTIFICATIONS_PATH):
+                        parent = Path(authority_path).parent
+                        if parent not in held_by_parent:
+                            held_by_parent[parent] = stack.enter_context(
+                                hold_private_authority_directory(authority_path)
+                            )
+                    previous = getattr(
+                        _PROCESS_AUTHORITY_CONTEXT, "held_by_parent", None
+                    )
+                    _PROCESS_AUTHORITY_CONTEXT.held_by_parent = held_by_parent
+                    try:
+                        admission = held_by_parent[Path(CHECKPOINT_PATH).parent]
+                        with admission.lock(
+                            _process_admission_anchor(), create=False
+                        ):
+                            return method(*args, **kwargs)
+                    finally:
+                        if previous is None:
+                            try:
+                                del _PROCESS_AUTHORITY_CONTEXT.held_by_parent
+                            except AttributeError:
+                                pass
+                        else:
+                            _PROCESS_AUTHORITY_CONTEXT.held_by_parent = previous
+        except Exception as exc:
+            return ManagedProcessVerificationReceipt(
+                outcome=ManagedProcessVerificationOutcome.AMBIGUOUS,
+                errors=(str(exc),),
+            )
 
     return fenced
 
@@ -3962,6 +4034,298 @@ class ProcessRegistry:
             queued_tuple,
             deduped_event_tuple,
             hashlib.sha256(canonical).hexdigest(),
+        )
+
+    @_process_lifecycle_verification_fenced
+    def verify_managed_startup_exact(
+        self,
+        receipt: ManagedProcessRecoveryReceipt,
+    ) -> ManagedProcessVerificationReceipt:
+        """Read-only proof that one recovery receipt still describes all authorities."""
+        checkpoint_identity = None
+        checkpoint_sha = None
+        notifications_identity = None
+        notifications_sha = None
+        registry_ids: tuple[str, ...] = ()
+        durable_ids: tuple[str, ...] = ()
+        queue_ids: tuple[str, ...] = ()
+        activity: tuple[tuple[str, Any], ...] = ()
+        errors: list[str] = []
+        outcome = ManagedProcessVerificationOutcome.AMBIGUOUS
+        try:
+            if type(receipt) is not ManagedProcessRecoveryReceipt:
+                raise ManagedProcessRecoveryAmbiguous(
+                    "managed process verification receipt type is invalid"
+                )
+            checkpoint_path = _canonical_authority_path(CHECKPOINT_PATH)
+            notifications_path = _canonical_authority_path(NOTIFICATIONS_PATH)
+            if (
+                receipt.checkpoint_path != os.fspath(checkpoint_path)
+                or receipt.notifications_path != os.fspath(notifications_path)
+            ):
+                raise ManagedProcessRecoveryAmbiguous(
+                    "managed process verification authority mismatch"
+                )
+            current_token = self._safe_host_start_token(os.getpid())
+            epoch = getattr(self, "_managed_process_recovery_epoch", None)
+            same_epoch = (
+                epoch
+                == (
+                    receipt.process_pid,
+                    receipt.process_start_token,
+                    receipt.registry_epoch,
+                )
+            ) and (
+                receipt.process_pid == os.getpid()
+                and current_token == receipt.process_start_token
+            )
+            if not isinstance(current_token, str) or not current_token:
+                raise ManagedProcessRecoveryAmbiguous(
+                    "managed process verification current identity unavailable"
+                )
+            canonical = json.dumps(
+                {
+                    "checkpoint_path": receipt.checkpoint_path,
+                    "checkpoint_before": (
+                        receipt.checkpoint_before_identity.__dict__
+                        if receipt.checkpoint_before_identity is not None
+                        else None
+                    ),
+                    "checkpoint_before_sha256": receipt.checkpoint_before_sha256,
+                    "checkpoint_after": (
+                        receipt.checkpoint_after_identity.__dict__
+                        if receipt.checkpoint_after_identity is not None
+                        else None
+                    ),
+                    "checkpoint_after_sha256": receipt.checkpoint_after_sha256,
+                    "notifications_path": receipt.notifications_path,
+                    "notifications": (
+                        receipt.notifications_identity.__dict__
+                        if receipt.notifications_identity is not None
+                        else None
+                    ),
+                    "notifications_sha256": receipt.notifications_sha256,
+                    "process_pid": receipt.process_pid,
+                    "process_start_token": receipt.process_start_token,
+                    "registry_epoch": receipt.registry_epoch,
+                    "classifications": receipt.record_classifications,
+                    "recovered": receipt.recovered_process_ids,
+                    "deduped_processes": receipt.deduped_process_ids,
+                    "completion_events": receipt.completion_event_ids,
+                    "queued_events": receipt.queued_completion_event_ids,
+                    "deduped_events": receipt.deduped_completion_event_ids,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if hashlib.sha256(canonical).hexdigest() != receipt.post_snapshot_sha256:
+                raise ManagedProcessRecoveryAmbiguous(
+                    "managed process verification receipt digest mismatch"
+                )
+
+            with self._completion_outbox_lock:
+                with self._checkpoint_io_lock:
+                    with _process_authority_lock(checkpoint_path):
+                        checkpoint = _read_private_json_receipt(
+                            checkpoint_path,
+                            max_bytes=MAX_CHECKPOINT_BYTES,
+                            missing_ok=True,
+                        )
+                    with _process_authority_lock(notifications_path):
+                        notifications = _read_private_json_receipt(
+                            notifications_path,
+                            max_bytes=MAX_COMPLETION_OUTBOX_BYTES,
+                            missing_ok=True,
+                        )
+                    checkpoint_identity = checkpoint.identity
+                    checkpoint_sha = checkpoint.sha256
+                    notifications_identity = notifications.identity
+                    notifications_sha = notifications.sha256
+                    if (
+                        checkpoint.identity != receipt.checkpoint_after_identity
+                        or checkpoint.sha256 != receipt.checkpoint_after_sha256
+                        or notifications.identity != receipt.notifications_identity
+                        or notifications.sha256 != receipt.notifications_sha256
+                    ):
+                        raise ManagedProcessRecoveryAmbiguous(
+                            "managed process verification authority changed"
+                        )
+                    entries = (
+                        []
+                        if checkpoint.identity is None
+                        else self._validate_checkpoint_entries(checkpoint.value)
+                    )
+                    for entry in entries:
+                        self._validate_managed_checkpoint_entry(entry)
+                    raw_notifications = (
+                        {"version": COMPLETION_OUTBOX_VERSION, "events": {}}
+                        if notifications.identity is None
+                        else notifications.value
+                    )
+                    if (
+                        not isinstance(raw_notifications, dict)
+                        or set(raw_notifications) != {"version", "events"}
+                        or raw_notifications.get("version")
+                        != COMPLETION_OUTBOX_VERSION
+                        or not isinstance(raw_notifications.get("events"), dict)
+                    ):
+                        raise ManagedProcessRecoveryAmbiguous(
+                            "managed process verification outbox schema is invalid"
+                        )
+                    events = {
+                        event_id: self._validate_completion_record(event_id, row)
+                        for event_id, row in raw_notifications["events"].items()
+                    }
+                    for row in events.values():
+                        self._validate_managed_completion_record(row)
+                    durable_ids = tuple(
+                        sorted(
+                            event_id
+                            for event_id, row in events.items()
+                            if row.get("delivered") is not True
+                        )
+                    )
+                    if durable_ids != receipt.completion_event_ids:
+                        raise ManagedProcessRecoveryAmbiguous(
+                            "managed process verification durable event mismatch"
+                        )
+                    with self._lock:
+                        registry_ids = tuple(sorted(self._running))
+                        expected_registry = {
+                            session_id
+                            for session_id, classification
+                            in receipt.record_classifications
+                            if classification == "eligible_recovered"
+                        }
+                        if (
+                            expected_registry
+                            != set(receipt.recovered_process_ids)
+                            | set(receipt.deduped_process_ids)
+                        ):
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed process verification receipt partition mismatch"
+                            )
+                        entry_by_id = {
+                            entry["session_id"]: entry for entry in entries
+                        }
+                        present_registry = set()
+                        for session_id in expected_registry:
+                            session = self._running.get(session_id)
+                            entry = entry_by_id.get(session_id)
+                            if session is None:
+                                continue
+                            if (
+                                entry is None
+                                or session.pid != entry["pid"]
+                                or session.process_start_token
+                                != entry["process_start_token"]
+                            ):
+                                raise ManagedProcessRecoveryAmbiguous(
+                                    "managed process verification registry mismatch"
+                                )
+                            present_registry.add(session_id)
+                        foreign = self._foreign_owner_active
+                        finalizing = len(self._finalizing)
+                    with self.completion_queue.mutex:
+                        queue_events = tuple(self.completion_queue.queue)
+                    missing_queue = set()
+                    exact_queue_ids = []
+                    for event_id in durable_ids:
+                        matching = [
+                            event
+                            for event in queue_events
+                            if isinstance(event, dict)
+                            and event.get("event_id") == event_id
+                        ]
+                        if not matching:
+                            missing_queue.add(event_id)
+                            continue
+                        if (
+                            len(matching) != 1
+                            or matching[0]
+                            != self._public_completion_event(events[event_id])
+                        ):
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed process verification queue payload "
+                                "or cardinality mismatch"
+                            )
+                        exact_queue_ids.append(event_id)
+                    queue_ids = tuple(sorted(exact_queue_ids))
+                    replayed_ids = {
+                        event_id
+                        for event_id in durable_ids
+                        if event_id in self._completion_outbox_replayed
+                    }
+                    if same_epoch and any(
+                        event_id not in self._completion_outbox_replayed
+                        for event_id in durable_ids
+                    ):
+                        raise ManagedProcessRecoveryAmbiguous(
+                            "managed process verification replay identity mismatch"
+                        )
+                    activity = tuple(
+                        sorted(
+                            {
+                                "running_processes": len(self._running) + foreign,
+                                "foreign_owner_active_processes": foreign,
+                                "finalizing_processes": finalizing,
+                                "durable_undelivered_completions": len(durable_ids),
+                                "process_completion_activity_available":
+                                    self._completion_outbox_available,
+                                "process_checkpoint_available":
+                                    self._process_checkpoint_available,
+                                "process_checkpoint_reason":
+                                    self._process_checkpoint_reason,
+                            }.items()
+                        )
+                    )
+                    if same_epoch and (
+                        self._process_checkpoint_available is not True
+                        or self._process_checkpoint_reason != "verified"
+                        or self._completion_outbox_available is not True
+                    ):
+                        raise ManagedProcessRecoveryAmbiguous(
+                            "managed process verification activity is unavailable"
+                        )
+                    if not same_epoch:
+                        effect_count = len(present_registry) + len(queue_ids)
+                        expected_effect_count = (
+                            len(expected_registry) + len(durable_ids)
+                        )
+                        if effect_count == 0 and not replayed_ids:
+                            outcome = ManagedProcessVerificationOutcome.ABSENT
+                        elif (
+                            effect_count == expected_effect_count
+                            and not missing_queue
+                            and replayed_ids == set(durable_ids)
+                        ):
+                            outcome = ManagedProcessVerificationOutcome.COMPLETE
+                        else:
+                            outcome = ManagedProcessVerificationOutcome.PARTIAL
+                    elif missing_queue:
+                        outcome = ManagedProcessVerificationOutcome.PARTIAL
+                    elif receipt.outcome is ManagedProcessRecoveryOutcome.PROVED_ABSENT:
+                        if entries or events or registry_ids:
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed process verification absent mismatch"
+                            )
+                        outcome = ManagedProcessVerificationOutcome.ABSENT
+                    else:
+                        outcome = ManagedProcessVerificationOutcome.COMPLETE
+        except Exception as exc:
+            errors.append(str(exc))
+            outcome = ManagedProcessVerificationOutcome.AMBIGUOUS
+        return ManagedProcessVerificationReceipt(
+            outcome=outcome,
+            checkpoint_identity=checkpoint_identity,
+            checkpoint_sha256=checkpoint_sha,
+            notifications_identity=notifications_identity,
+            notifications_sha256=notifications_sha,
+            registry_process_ids=registry_ids,
+            durable_event_ids=durable_ids,
+            queue_event_ids=queue_ids,
+            activity=activity,
+            errors=tuple(errors),
         )
 
 
