@@ -26,6 +26,18 @@ def test_darwin_uses_pbcopy():
     assert run.call_args[1]["input"] == b"hello"
 
 
+def test_windows_uses_powershell_base64():
+    with patch.object(clip.sys, "platform", "win32"), \
+         patch.object(clip.subprocess, "run", return_value=_completed()) as run:
+        assert clip.write_clipboard_text("héllo 🎉") is True
+    argv = run.call_args[0][0]
+    assert argv[0] == "powershell"
+    script = argv[-1]
+    b64 = base64.b64encode("héllo 🎉".encode("utf-8")).decode("ascii")
+    assert b64 in script
+    assert "Set-Clipboard" in script
+
+
 def test_linux_falls_through_backends_until_success():
     calls = []
 
@@ -43,12 +55,7 @@ def test_linux_falls_through_backends_until_success():
     assert calls == ["xclip", "xsel"]
 
 
-
-
-
-
-
-
+ 
 class TestOsc52MultiplexerWrapping:
     """CLI _write_osc52_clipboard must wrap for tmux/screen passthrough
     (mirrors ui-tui/src/lib/osc52.ts wrapForMultiplexer)."""
@@ -78,3 +85,19 @@ class TestOsc52MultiplexerWrapping:
         assert seq.endswith("\x1b\\")
 
 
+def test_returns_false_when_all_backends_fail():
+    with patch.object(clip.sys, "platform", "linux"), \
+         patch.object(clip, "_is_wsl", return_value=False), \
+         patch.object(clip.os.environ, "get", lambda k, d=None: None), \
+         patch.object(clip.subprocess, "run", side_effect=FileNotFoundError):
+        assert clip.write_clipboard_text("x") is False
+
+
+def test_wayland_prefers_wl_copy():
+    with patch.object(clip.sys, "platform", "linux"), \
+         patch.object(clip, "_is_wsl", return_value=False), \
+         patch.object(clip.os.environ, "get",
+                      lambda k, d=None: ":0" if k == "WAYLAND_DISPLAY" else None), \
+         patch.object(clip.subprocess, "run", return_value=_completed()) as run:
+        assert clip.write_clipboard_text("x") is True
+    assert run.call_args[0][0][0] == "wl-copy"
