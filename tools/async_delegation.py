@@ -2678,8 +2678,9 @@ def recover_async_delegations() -> Dict[str, Any]:
                         restored = dict(record)
                         restored["delivery_status"] = "queued"
                         to_publish.append((rid, dict(event), restored))
-                _cleanup_persisted_data_locked(data, now=now)
-                _write_persisted_unlocked(data, expected=expected)
+                removed = _cleanup_persisted_data_locked(data, now=now)
+                if lost or queued or removed:
+                    _write_persisted_unlocked(data, expected=expected)
     except Exception as exc:
         logger.warning("Failed to recover async delegation authority: %s", exc)
         return {"queued": 0, "lost": 0, "error": str(exc)}
@@ -2764,7 +2765,8 @@ def cleanup_async_delegations() -> Dict[str, Any]:
             persisted_before = len(data["records"])
             persisted_removed = _cleanup_persisted_data_locked(data, now=now)
             persisted_after = len(data["records"])
-            _write_persisted_unlocked(data, expected=expected)
+            if persisted_removed:
+                _write_persisted_unlocked(data, expected=expected)
     return {
         "removed": removed,
         "before": before,

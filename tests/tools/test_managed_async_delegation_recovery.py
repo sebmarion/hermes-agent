@@ -634,6 +634,52 @@ def test_managed_async_verifier_accepts_exact_terminal_ack(tmp_path):
     assert verified.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.COMPLETE
 
 
+def test_legacy_noop_recovery_preserves_managed_tracker_identity(
+    tmp_path, monkeypatch
+):
+    manifest = _manifest(tmp_path)
+    delegation_id = _delegation_id()
+    tracker = manifest.profiles[0].tracker_path
+    _write_tracker(
+        tracker,
+        "default",
+        delegation_id,
+        delivery="delivered",
+    )
+    durable = json.loads(tracker.read_text(encoding="utf-8"))
+    durable["records"][delegation_id]["updated_at"] = ad.time.time()
+    tracker.write_text(json.dumps(durable), encoding="utf-8")
+    tracker.chmod(0o600)
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest,
+        outbox_path=tmp_path / "outbox.json",
+        completion_queue=queue.Queue(),
+    )
+    before = tracker.stat()
+    monkeypatch.setattr(ad, "_persistence_path", lambda: tracker)
+
+    result = ad.recover_async_delegations()
+
+    after = tracker.stat()
+    assert result == {"queued": 0, "lost": 0}
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    cleanup = ad.cleanup_async_delegations()
+    after_cleanup = tracker.stat()
+    assert cleanup["persisted_removed"] == 0
+    assert (after_cleanup.st_dev, after_cleanup.st_ino) == (
+        before.st_dev,
+        before.st_ino,
+    )
+    assert (
+        ad.verify_managed_async_delegations_exact(
+            receipt,
+            manifest,
+            completion_queue=queue.Queue(),
+        ).outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+    )
+
+
 def test_managed_async_verifier_rejects_byte_identical_duplicate_queue_event(
     tmp_path,
 ):
