@@ -1552,6 +1552,7 @@ class TestKillProcess:
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
+        s.process_start_token = "token:424242"
         registry._running[s.id] = s
 
         terminate_calls = []
@@ -1575,6 +1576,8 @@ class TestKillProcess:
             # SIGKILL-escalation step (grace=0) so it doesn't call
             # ``psutil.wait_procs`` on the FakeProcess.
             with patch("gateway.status._pid_exists", return_value=True), \
+                 patch.object(ProcessRegistry, "_safe_host_start_token",
+                              return_value="token:424242"), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
@@ -2392,12 +2395,20 @@ class TestSigkillEscalation:
             "sys.stdout.write(' '.join(str(k.pid) for k in kids)+'\\n'); sys.stdout.flush();"
             "[time.sleep(0.2) for _ in iter(int,1)]"
         )
-        parent = subprocess.Popen([sys.executable, "-c", parent_src],
-                                  stdout=subprocess.PIPE, text=True)
+        parent = subprocess.Popen(
+            [sys.executable, "-c", parent_src],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
         child_pids = [int(x) for x in parent.stdout.readline().split()]
         all_pids = [parent.pid] + child_pids
         try:
-            ProcessRegistry._terminate_host_pid(parent.pid)
+            exact_start = ProcessRegistry._safe_host_start_time(parent.pid)
+            assert exact_start is not None
+            ProcessRegistry._terminate_host_pid(
+                parent.pid, expected_start=exact_start
+            )
 
             def _pid_dead(p: int) -> bool:
                 # A pid is "dead" for our purposes if it no longer exists OR
@@ -2430,6 +2441,71 @@ class TestSigkillEscalation:
             for p in all_pids:
                 try:
                     os.kill(p, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            parent.wait()
+
+    @pytest.mark.live_system_guard_bypass
+    def test_owned_process_group_escalation_catches_child_spawned_during_term(
+        self, monkeypatch, tmp_path
+    ):
+        """The exact owned process group closes the snapshot-to-signal gap."""
+        import psutil
+
+        monkeypatch.setattr(
+            ProcessRegistry,
+            "_daemon_term_grace_seconds",
+            staticmethod(lambda: 0.5),
+        )
+        pid_file = tmp_path / "late-child.pid"
+        child = (
+            "import signal,time;"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+            "[time.sleep(0.2) for _ in iter(int,1)]"
+        )
+        parent_src = (
+            "import signal,subprocess,sys,time\n"
+            f"pid_file={str(pid_file)!r}\n"
+            f"child={child!r}\n"
+            "def on_term(*_):\n"
+            " p=subprocess.Popen([sys.executable,'-c',child])\n"
+            " open(pid_file,'w').write(str(p.pid))\n"
+            " signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+            "signal.signal(signal.SIGTERM,on_term)\n"
+            "print('ready',flush=True)\n"
+            "[time.sleep(0.2) for _ in iter(int,1)]"
+        )
+        parent = subprocess.Popen(
+            [sys.executable, "-c", parent_src],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        late_pid = None
+        try:
+            assert parent.stdout.readline().strip() == "ready"
+            exact_start = ProcessRegistry._safe_host_start_time(parent.pid)
+            assert exact_start is not None
+            ProcessRegistry._terminate_host_pid(
+                parent.pid, expected_start=exact_start
+            )
+            assert _wait_until(pid_file.exists, timeout=2)
+            late_pid = int(pid_file.read_text())
+            def late_child_dead():
+                try:
+                    return not ProcessRegistry._proc_alive(
+                        psutil.Process(late_pid)
+                    )
+                except psutil.NoSuchProcess:
+                    return True
+
+            assert _wait_until(late_child_dead, timeout=3)
+        finally:
+            for target in (late_pid, parent.pid):
+                if target is None:
+                    continue
+                try:
+                    os.kill(target, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
             parent.wait()

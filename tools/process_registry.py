@@ -29,8 +29,10 @@ Usage:
     process_registry.kill(session.id)
 """
 
+import hashlib
 import json
 import logging
+import math
 import os
 import platform
 import shlex
@@ -40,6 +42,9 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import ExitStack
+from functools import wraps
+from enum import Enum
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -52,7 +57,9 @@ from hermes_cli.config import get_hermes_home
 from tools.durable_state import (
     FileIdentity,
     atomic_write_private_json,
+    hold_private_authority_directory,
     interprocess_authority_lock,
+    platform_neutral_lifecycle_lock,
     read_private_json,
 )
 
@@ -69,6 +76,7 @@ MAX_COMPLETION_OUTBOX_RECORDS = 4096
 COMPLETION_OUTBOX_DELIVERED_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_COMPLETION_OUTBOX_BYTES = 16 * 1024 * 1024
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
+MAX_MANAGED_RECOVERY_RECORDS = 4096
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -92,6 +100,147 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
+class ManagedProcessRecoveryOutcome(str, Enum):
+    PROVED_COMPLETE = "proved-complete"
+    PROVED_ABSENT = "proved-absent"
+
+
+class ManagedProcessRecoveryAmbiguous(RuntimeError):
+    """Managed startup could not prove an exact recovery postcondition."""
+
+
+@dataclass(frozen=True)
+class _PrivateJsonReceipt:
+    value: object
+    identity: Optional[FileIdentity]
+    sha256: Optional[str]
+
+
+@dataclass(frozen=True)
+class ManagedProcessRecoveryReceipt:
+    outcome: ManagedProcessRecoveryOutcome
+    checkpoint_path: str
+    checkpoint_before_identity: Optional[FileIdentity]
+    checkpoint_before_sha256: Optional[str]
+    checkpoint_after_identity: Optional[FileIdentity]
+    checkpoint_after_sha256: Optional[str]
+    notifications_path: str
+    notifications_identity: Optional[FileIdentity]
+    notifications_sha256: Optional[str]
+    process_pid: int
+    process_start_token: str
+    registry_epoch: str
+    record_classifications: tuple[tuple[str, str], ...]
+    recovered_process_ids: tuple[str, ...]
+    deduped_process_ids: tuple[str, ...]
+    completion_event_ids: tuple[str, ...]
+    queued_completion_event_ids: tuple[str, ...]
+    deduped_completion_event_ids: tuple[str, ...]
+    post_snapshot_sha256: str
+
+
+def _canonical_authority_path(path: Path) -> Path:
+    path = Path(path)
+    raw = os.fspath(path)
+    if (
+        not path.is_absolute()
+        or raw != str(path)
+        or Path(os.path.normpath(raw)) != path
+        or path == Path("/")
+    ):
+        raise ManagedProcessRecoveryAmbiguous(
+            "managed recovery authority path is not canonical"
+        )
+    return path
+
+
+def _read_private_json_receipt(
+    path: Path,
+    *,
+    max_bytes: int,
+    missing_ok: bool,
+) -> _PrivateJsonReceipt:
+    """Bind parsed JSON to the exact private file bytes used for its hash."""
+    path = _canonical_authority_path(path)
+    try:
+        held = _active_process_authority(path)
+        if held is not None:
+            try:
+                value, identity, payload = held.read_json(
+                    path,
+                    max_bytes=max_bytes,
+                    missing_ok=missing_ok,
+                )
+            except Exception as exc:
+                raise ManagedProcessRecoveryAmbiguous(
+                    "managed recovery authority is unreadable or malformed"
+                ) from exc
+            return _PrivateJsonReceipt(
+                value,
+                identity,
+                hashlib.sha256(payload).hexdigest()
+                if payload is not None
+                else None,
+            )
+        value, identity = read_private_json(
+            path,
+            max_bytes=max_bytes,
+            missing_ok=missing_ok,
+        )
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        raise ManagedProcessRecoveryAmbiguous(
+            "managed recovery authority is unreadable or malformed"
+        ) from exc
+    if identity is None:
+        return _PrivateJsonReceipt(value, None, None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(nofollow, int) or nofollow == 0:
+        raise ManagedProcessRecoveryAmbiguous(
+            "managed recovery requires O_NOFOLLOW"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = FileIdentity.from_stat(os.fstat(handle.fileno()))
+            payload = handle.read(max_bytes + 1)
+            after = FileIdentity.from_stat(os.fstat(handle.fileno()))
+        current = FileIdentity.from_stat(os.lstat(path))
+    except OSError as exc:
+        raise ManagedProcessRecoveryAmbiguous(
+            "managed recovery authority changed while hashing"
+        ) from exc
+    if (
+        len(payload) > max_bytes
+        or opened != identity
+        or after != identity
+        or current != identity
+    ):
+        raise ManagedProcessRecoveryAmbiguous(
+            "managed recovery authority changed while hashing"
+        )
+    return _PrivateJsonReceipt(
+        value,
+        identity,
+        hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def _authority_receipt_is_current(
+    path: Path,
+    receipt: _PrivateJsonReceipt,
+) -> bool:
+    try:
+        current = FileIdentity.from_stat(os.lstat(path))
+    except FileNotFoundError:
+        return receipt.identity is None
+    except OSError:
+        return False
+    return receipt.identity == current
+
+
 def _process_admission_anchor(
     checkpoint_path: Optional[Path] = None,
 ) -> Path:
@@ -100,6 +249,87 @@ def _process_admission_anchor(
         CHECKPOINT_PATH if checkpoint_path is None else checkpoint_path
     )
     return authority.with_name(f"{authority.name}.admission")
+
+
+_PROCESS_LIFECYCLE_FENCE = threading.RLock()
+_PROCESS_LIFECYCLE_FENCE_PID = os.getpid()
+_PROCESS_AUTHORITY_CONTEXT = threading.local()
+
+
+def _active_process_authority(path: Path):
+    held_by_parent = getattr(_PROCESS_AUTHORITY_CONTEXT, "held_by_parent", {})
+    return held_by_parent.get(Path(path).parent)
+
+
+def _process_authority_lock(path: Path):
+    held = _active_process_authority(path)
+    return held.lock(path) if held is not None else interprocess_authority_lock(path)
+
+
+def _process_authority_read_json(path: Path, *, max_bytes: int, missing_ok=False):
+    held = _active_process_authority(path)
+    if held is None:
+        return read_private_json(path, max_bytes=max_bytes, missing_ok=missing_ok)
+    value, identity, _payload = held.read_json(
+        path,
+        max_bytes=max_bytes,
+        missing_ok=missing_ok,
+    )
+    return value, identity
+
+
+def _process_authority_atomic_write(path: Path, value: Any, **kwargs):
+    held = _active_process_authority(path)
+    if held is None:
+        return atomic_write_private_json(path, value, **kwargs)
+    return held.atomic_write_json(path, value, **kwargs)
+
+
+def _process_lifecycle_fenced(method):
+    """Serialize spawn, managed recovery, and finalization through one cut."""
+    @wraps(method)
+    def fenced(*args, **kwargs):
+        global _PROCESS_LIFECYCLE_FENCE, _PROCESS_LIFECYCLE_FENCE_PID
+        current_pid = os.getpid()
+        if _PROCESS_LIFECYCLE_FENCE_PID != current_pid:
+            # A lock inherited while held across fork can never be released in
+            # the child. Establish a child-local lifecycle fence before use.
+            _PROCESS_LIFECYCLE_FENCE = threading.RLock()
+            _PROCESS_LIFECYCLE_FENCE_PID = current_pid
+        with _PROCESS_LIFECYCLE_FENCE:
+            if getattr(_PROCESS_AUTHORITY_CONTEXT, "lifecycle_depth", 0):
+                return method(*args, **kwargs)
+            _PROCESS_AUTHORITY_CONTEXT.lifecycle_depth = 1
+            try:
+                return _run_process_lifecycle_fenced(method, args, kwargs)
+            finally:
+                _PROCESS_AUTHORITY_CONTEXT.lifecycle_depth = 0
+
+    return fenced
+
+
+def _run_process_lifecycle_fenced(method, args, kwargs):
+    """Run one outermost lifecycle cut under its platform authority."""
+    if _IS_WINDOWS:
+        # dir_fd-bound authorities are POSIX-only. Legacy Windows lifecycle
+        # operations retain a platform file lock.
+        with platform_neutral_lifecycle_lock(_process_admission_anchor()):
+            return method(*args, **kwargs)
+    with ExitStack() as stack:
+        held_by_parent = {}
+        for authority_path in (CHECKPOINT_PATH, NOTIFICATIONS_PATH):
+            parent = Path(authority_path).parent
+            if parent not in held_by_parent:
+                held_by_parent[parent] = stack.enter_context(
+                    hold_private_authority_directory(authority_path)
+                )
+        _PROCESS_AUTHORITY_CONTEXT.held_by_parent = held_by_parent
+        try:
+            admission = held_by_parent[Path(CHECKPOINT_PATH).parent]
+            with admission.lock(_process_admission_anchor()):
+                return method(*args, **kwargs)
+        finally:
+            _PROCESS_AUTHORITY_CONTEXT.held_by_parent = {}
 
 
 def format_uptime_short(seconds: int) -> str:
@@ -212,6 +442,7 @@ class ProcessRegistry:
         self._checkpoint_owner_id = ""
         self._checkpoint_owner_pid = 0
         self._checkpoint_owner_start_token = ""
+        self._foreign_owner_active = 0
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -258,7 +489,15 @@ class ProcessRegistry:
         self.on_close = None
 
     @staticmethod
-    def _completion_event_id(session_id: str) -> str:
+    def _completion_event_id(
+        session_id: str,
+        process_start_token: Optional[str] = None,
+    ) -> str:
+        if process_start_token:
+            generation = hashlib.sha256(
+                process_start_token.encode("utf-8")
+            ).hexdigest()[:24]
+            return f"process:{session_id}:{generation}:completion"
         return f"process:{session_id}:completion"
 
     @staticmethod
@@ -267,8 +506,24 @@ class ProcessRegistry:
             raise ValueError("process completion record identity is invalid")
         if raw.get("type") != "completion":
             raise ValueError("process completion record type is invalid")
-        session_id = str(raw.get("session_id") or "")
-        if not session_id or event_id != ProcessRegistry._completion_event_id(session_id):
+        session_id = raw.get("session_id")
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or len(session_id.encode("utf-8")) > 512
+            or len(event_id.encode("utf-8")) > 1024
+        ):
+            raise ValueError("process completion identity is unbounded")
+        process_start_token = raw.get("process_start_token")
+        if process_start_token is not None and (
+            not isinstance(process_start_token, str) or not process_start_token
+        ):
+            raise ValueError("process completion generation is invalid")
+        expected_event_id = ProcessRegistry._completion_event_id(
+            session_id,
+            process_start_token,
+        )
+        if event_id != expected_event_id:
             raise ValueError("process completion session identity is invalid")
         if not isinstance(raw.get("delivered"), bool):
             raise ValueError("process completion delivery state is invalid")
@@ -284,7 +539,7 @@ class ProcessRegistry:
         self,
     ) -> tuple[Dict[str, Dict[str, Any]], Optional[FileIdentity]]:
         try:
-            raw, identity = read_private_json(
+            raw, identity = _process_authority_read_json(
                 NOTIFICATIONS_PATH,
                 max_bytes=MAX_COMPLETION_OUTBOX_BYTES,
             )
@@ -307,7 +562,7 @@ class ProcessRegistry:
 
     def _ensure_completion_outbox_loaded_locked(self) -> None:
         try:
-            with interprocess_authority_lock(NOTIFICATIONS_PATH):
+            with _process_authority_lock(NOTIFICATIONS_PATH):
                 events, _identity = self._read_completion_outbox_snapshot_locked()
         except Exception:
             self._completion_outbox_available = False
@@ -351,7 +606,7 @@ class ProcessRegistry:
             for event_id, record in self._completion_outbox.items()
         }
         try:
-            with interprocess_authority_lock(NOTIFICATIONS_PATH):
+            with _process_authority_lock(NOTIFICATIONS_PATH):
                 current, expected_identity = (
                     self._read_completion_outbox_snapshot_locked()
                 )
@@ -383,7 +638,7 @@ class ProcessRegistry:
 
                 self._completion_outbox = merged
                 self._prune_completion_outbox_locked()
-                atomic_write_private_json(
+                _process_authority_atomic_write(
                     NOTIFICATIONS_PATH,
                     {
                         "version": COMPLETION_OUTBOX_VERSION,
@@ -416,9 +671,14 @@ class ProcessRegistry:
                 else ""
             )
             return {
-                "event_id": self._completion_event_id(session.id),
+                "event_id": self._completion_event_id(
+                    session.id,
+                    session.process_start_token,
+                ),
                 "type": "completion",
                 "session_id": session.id,
+                "process_pid": session.pid,
+                "process_start_token": session.process_start_token,
                 "session_key": session.session_key,
                 "platform": session.watcher_platform,
                 "chat_id": session.watcher_chat_id,
@@ -435,6 +695,42 @@ class ProcessRegistry:
                 "delivered": False,
                 "delivered_at": None,
             }
+
+    def _build_recovered_terminal_record(
+        self,
+        entry: Dict[str, Any],
+        classification: str,
+    ) -> Dict[str, Any]:
+        """Build a retry-stable event before removing dead checkpoint evidence."""
+        session_id = entry["session_id"]
+        process_token = entry["process_start_token"]
+        reason = (
+            "already_exited"
+            if classification == "process_absent"
+            else "lost"
+        )
+        return {
+            "event_id": self._completion_event_id(session_id, process_token),
+            "type": "completion",
+            "session_id": session_id,
+            "process_pid": entry["pid"],
+            "process_start_token": process_token,
+            "session_key": entry.get("session_key", ""),
+            "platform": entry.get("watcher_platform", ""),
+            "chat_id": entry.get("watcher_chat_id", ""),
+            "user_id": entry.get("watcher_user_id", ""),
+            "user_name": entry.get("watcher_user_name", ""),
+            "thread_id": entry.get("watcher_thread_id", ""),
+            "message_id": entry.get("watcher_message_id", ""),
+            "command": entry.get("command", "unknown"),
+            "exit_code": None,
+            "completion_reason": reason,
+            "termination_source": "startup_recovery",
+            "output": "",
+            "created_at": float(entry.get("started_at") or 0.0),
+            "delivered": False,
+            "delivered_at": None,
+        }
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -767,7 +1063,14 @@ class ProcessRegistry:
         # Identity-aware liveness: a recycled PID (alive but a different process
         # than we spawned) must be treated as "our process exited", so it is
         # moved to finished and can never be tree-killed by a later kill().
-        if self._host_pid_is_ours(session.pid, session.host_start_time):
+        if (
+            isinstance(session.process_start_token, str)
+            and session.process_start_token
+            and self._host_pid_matches_exact_token(
+                session.pid,
+                session.process_start_token,
+            )
+        ):
             return session
 
         with session._lock:
@@ -883,6 +1186,14 @@ class ProcessRegistry:
             return
 
         import psutil
+        owned_process_group = None
+        if expected_start is not None:
+            try:
+                candidate_group = os.getpgid(pid)
+                if candidate_group == pid:
+                    owned_process_group = candidate_group
+            except (OSError, ProcessLookupError, PermissionError):
+                pass
         try:
             parent = psutil.Process(pid)
         except psutil.NoSuchProcess:
@@ -901,13 +1212,19 @@ class ProcessRegistry:
             targets = []
         targets.append(parent)
 
-        for proc in targets:
+        if owned_process_group is not None:
             try:
-                proc.terminate()
-            except psutil.NoSuchProcess:
-                pass
-            except (psutil.AccessDenied, OSError):
-                pass
+                os.killpg(owned_process_group, signal.SIGTERM)
+            except (OSError, ProcessLookupError, PermissionError):
+                owned_process_group = None
+        if owned_process_group is None:
+            for proc in targets:
+                try:
+                    proc.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+                except (psutil.AccessDenied, OSError):
+                    pass
 
         # Escalate to SIGKILL for anything that ignored SIGTERM within the
         # grace window — a daemon stalled in its signal handler would otherwise
@@ -927,6 +1244,24 @@ class ProcessRegistry:
             if not any(cls._proc_alive(_p) for _p in targets):
                 break
             time.sleep(0.05)
+        group_still_owned = False
+        if owned_process_group is not None:
+            for proc in targets:
+                try:
+                    if (
+                        cls._proc_alive(proc)
+                        and os.getpgid(proc.pid) == owned_process_group
+                    ):
+                        group_still_owned = True
+                        break
+                except (OSError, ProcessLookupError, PermissionError):
+                    continue
+        if group_still_owned:
+            try:
+                os.killpg(owned_process_group, signal.SIGKILL)
+                return
+            except (OSError, ProcessLookupError, PermissionError):
+                pass
         for proc in targets:
             try:
                 if not cls._proc_alive(proc):
@@ -990,6 +1325,7 @@ class ProcessRegistry:
             )
         return verified
 
+    @_process_lifecycle_fenced
     def spawn_local(
         self,
         command: str,
@@ -1000,15 +1336,14 @@ class ProcessRegistry:
         use_pty: bool = False,
     ) -> ProcessSession:
         """Admit and durably register one local process as one transaction."""
-        with interprocess_authority_lock(_process_admission_anchor()):
-            return self._spawn_local_admitted(
-                command,
-                cwd=cwd,
-                task_id=task_id,
-                session_key=session_key,
-                env_vars=env_vars,
-                use_pty=use_pty,
-            )
+        return self._spawn_local_admitted(
+            command,
+            cwd=cwd,
+            task_id=task_id,
+            session_key=session_key,
+            env_vars=env_vars,
+            use_pty=use_pty,
+        )
 
     def _spawn_local_admitted(
         self,
@@ -1182,6 +1517,7 @@ class ProcessRegistry:
 
         return session
 
+    @_process_lifecycle_fenced
     def spawn_via_env(
         self,
         env: Any,
@@ -1192,15 +1528,14 @@ class ProcessRegistry:
         timeout: int = 10,
     ) -> ProcessSession:
         """Admit and durably register one sandbox process as one transaction."""
-        with interprocess_authority_lock(_process_admission_anchor()):
-            return self._spawn_via_env_admitted(
-                env,
-                command,
-                cwd=cwd,
-                task_id=task_id,
-                session_key=session_key,
-                timeout=timeout,
-            )
+        return self._spawn_via_env_admitted(
+            env,
+            command,
+            cwd=cwd,
+            task_id=task_id,
+            session_key=session_key,
+            timeout=timeout,
+        )
 
     def _spawn_via_env_admitted(
         self,
@@ -1476,6 +1811,7 @@ class ProcessRegistry:
             session.completion_reason = "exited"
         self._move_to_finished(session)
 
+    @_process_lifecycle_fenced
     def _move_to_finished(self, session: ProcessSession) -> bool:
         """Move a session from running to finished.
 
@@ -1508,6 +1844,28 @@ class ProcessRegistry:
                             raise
                         record = proposed
                     else:
+                        durable_payload = {
+                            key: value
+                            for key, value in previous.items()
+                            if key not in {
+                                "created_at",
+                                "delivered",
+                                "delivered_at",
+                            }
+                        }
+                        proposed_payload = {
+                            key: value
+                            for key, value in proposed.items()
+                            if key not in {
+                                "created_at",
+                                "delivered",
+                                "delivered_at",
+                            }
+                        }
+                        if durable_payload != proposed_payload:
+                            raise ValueError(
+                                "process completion event identity collision"
+                            )
                         record = previous
                     if record.get("delivered") is not True:
                         event = self._public_completion_event(record)
@@ -1552,22 +1910,50 @@ class ProcessRegistry:
         with self._lock:
             return session_id in self._completion_consumed
 
+    @_process_lifecycle_fenced
     def mark_completion_consumed(self, event_or_session_id: object) -> bool:
         """Durably ACK one completion after a consumer owns its continuation."""
         if isinstance(event_or_session_id, dict):
             session_id = str(event_or_session_id.get("session_id") or "")
             event_id = str(event_or_session_id.get("event_id") or "")
+            expected_event_id = self._completion_event_id(
+                session_id,
+                event_or_session_id.get("process_start_token"),
+            )
+            if not session_id or event_id != expected_event_id:
+                return False
         else:
             session_id = str(event_or_session_id or "")
-            event_id = self._completion_event_id(session_id) if session_id else ""
-        if not session_id or event_id != self._completion_event_id(session_id):
+            event_id = ""
+        if not session_id:
             return False
 
         with self._completion_outbox_lock:
             try:
                 self._ensure_completion_outbox_loaded_locked()
+                if not event_id:
+                    matches = [
+                        candidate_id
+                        for candidate_id, candidate in self._completion_outbox.items()
+                        if candidate.get("session_id") == session_id
+                        and candidate.get("delivered") is not True
+                    ]
+                    if len(matches) > 1:
+                        return False
+                    event_id = (
+                        matches[0]
+                        if matches
+                        else self._completion_event_id(session_id)
+                    )
                 record = self._completion_outbox.get(event_id)
+                if isinstance(event_or_session_id, dict) and record is None:
+                    return False
                 if record is not None and record.get("delivered") is not True:
+                    public_record = self._public_completion_event(record)
+                    if isinstance(event_or_session_id, dict) and (
+                        public_record != event_or_session_id
+                    ):
+                        return False
                     updated = dict(record)
                     updated["delivered"] = True
                     updated["delivered_at"] = time.time()
@@ -1605,10 +1991,25 @@ class ProcessRegistry:
         if event_type == "async_delegation":
             if committed:
                 try:
-                    from tools.async_delegation import mark_async_delegation_delivered
+                    if event.get("managed_delivery") is not None:
+                        from tools.async_delegation import (
+                            ManagedAsyncDelegationRecoveryOutcome,
+                            mark_managed_async_delegation_delivered_exact,
+                        )
 
-                    if mark_async_delegation_delivered(event) is True:
-                        return True
+                        receipt = mark_managed_async_delegation_delivered_exact(event)
+                        if (
+                            receipt.outcome
+                            is ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+                        ):
+                            return True
+                    else:
+                        from tools.async_delegation import (
+                            mark_async_delegation_delivered,
+                        )
+
+                        if mark_async_delegation_delivered(event) is True:
+                            return True
                     logger.warning(
                         "Async delegation delivery ACK was not persisted; requeueing"
                     )
@@ -1621,6 +2022,7 @@ class ProcessRegistry:
             return False
         return bool(committed)
 
+    @_process_lifecycle_fenced
     def recover_completion_notifications(self) -> int:
         """Replay each durable undelivered completion once in this process."""
         with self._completion_outbox_lock:
@@ -1658,7 +2060,8 @@ class ProcessRegistry:
     def completion_activity_snapshot(self) -> Dict[str, Any]:
         """Return fail-closed process and durable completion barrier state."""
         with self._lock:
-            running = len(self._running)
+            foreign_owner_active = self._foreign_owner_active
+            running = len(self._running) + foreign_owner_active
             finalizing = len(self._finalizing)
         with self._completion_outbox_lock:
             try:
@@ -1676,6 +2079,7 @@ class ProcessRegistry:
             checkpoint_reason = self._process_checkpoint_reason
         return {
             "running_processes": running,
+            "foreign_owner_active_processes": foreign_owner_active,
             "finalizing_processes": finalizing,
             "durable_undelivered_completions": int(undelivered),
             "process_completion_activity_available": bool(available),
@@ -1796,9 +2200,30 @@ class ProcessRegistry:
                 results.append((evt, text))
                 if evt.get("type") == "async_delegation" and ack_async:
                     try:
-                        from tools.async_delegation import mark_async_delegation_delivered
+                        if evt.get("managed_delivery") is not None:
+                            from tools.async_delegation import (
+                                ManagedAsyncDelegationRecoveryOutcome,
+                                mark_managed_async_delegation_delivered_exact,
+                            )
 
-                        if mark_async_delegation_delivered(evt) is not True:
+                            receipt = (
+                                mark_managed_async_delegation_delivered_exact(
+                                    evt
+                                )
+                            )
+                            acked = (
+                                receipt.outcome
+                                is ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+                            )
+                        else:
+                            from tools.async_delegation import (
+                                mark_async_delegation_delivered,
+                            )
+
+                            acked = (
+                                mark_async_delegation_delivered(evt) is True
+                            )
+                        if not acked:
                             requeue.append(evt)
                     except Exception:
                         logger.debug("Failed to ACK async delegation delivery", exc_info=True)
@@ -2058,6 +2483,7 @@ class ProcessRegistry:
             result["timeout_note"] = f"Waited {effective_timeout}s, process still running"
         return result
 
+    @_process_lifecycle_fenced
     def kill_process(self, session_id: str, *, source: str = "process.kill") -> dict:
         """Kill a background process."""
         session = self.get(session_id)
@@ -2098,7 +2524,14 @@ class ProcessRegistry:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as
                 # exited and never tree-kill the stranger.
-                if not self._host_pid_is_ours(session.pid, session.host_start_time):
+                if (
+                    not isinstance(session.process_start_token, str)
+                    or not session.process_start_token
+                    or not self._host_pid_matches_exact_token(
+                        session.pid,
+                        session.process_start_token,
+                    )
+                ):
                     with session._lock:
                         session.exited = True
                         session.exit_code = None
@@ -2107,6 +2540,11 @@ class ProcessRegistry:
                         "status": "already_exited",
                         "exit_code": session.exit_code,
                     }
+                live_token = self._safe_host_start_token(session.pid)
+                if live_token != session.process_start_token:
+                    raise RuntimeError(
+                        "Recovered process identity changed before termination"
+                    )
                 self._terminate_host_pid(session.pid, session.host_start_time)
             else:
                 return {
@@ -2121,7 +2559,6 @@ class ProcessRegistry:
             session.completion_reason = "killed"
             session.termination_source = source
             self._move_to_finished(session)
-            self._write_checkpoint()
             return {
                 "status": "killed",
                 "session_id": session.id,
@@ -2502,7 +2939,7 @@ class ProcessRegistry:
                         if not session.exited
                     ]
 
-                with interprocess_authority_lock(CHECKPOINT_PATH):
+                with _process_authority_lock(CHECKPOINT_PATH):
                     existing, expected = self._read_checkpoint_snapshot_secure(
                         missing_ok=True
                     )
@@ -2529,7 +2966,7 @@ class ProcessRegistry:
                         [*foreign, *local_entries],
                         key=lambda entry: entry["session_id"],
                     )
-                    atomic_write_private_json(
+                    _process_authority_atomic_write(
                         CHECKPOINT_PATH,
                         merged,
                         expected=expected,
@@ -2629,7 +3066,7 @@ class ProcessRegistry:
         *,
         missing_ok: bool,
     ) -> tuple[List[Dict[str, Any]], Optional[FileIdentity]]:
-        raw, identity = read_private_json(
+        raw, identity = _process_authority_read_json(
             CHECKPOINT_PATH,
             max_bytes=MAX_CHECKPOINT_BYTES,
             missing_ok=missing_ok,
@@ -2658,7 +3095,7 @@ class ProcessRegistry:
                 owner_id, owner_pid, owner_start_token = (
                     self._ensure_checkpoint_owner_identity()
                 )
-                with interprocess_authority_lock(CHECKPOINT_PATH):
+                with _process_authority_lock(CHECKPOINT_PATH):
                     entries, expected = self._read_checkpoint_snapshot_secure(
                         missing_ok=False
                     )
@@ -2717,7 +3154,7 @@ class ProcessRegistry:
                         survivors.append(adopted)
                         adopted_entries.append(adopted)
 
-                    atomic_write_private_json(
+                    _process_authority_atomic_write(
                         CHECKPOINT_PATH,
                         sorted(
                             survivors,
@@ -2792,7 +3229,740 @@ class ProcessRegistry:
 
             self._process_checkpoint_available = True
             self._process_checkpoint_reason = "verified"
+            with self._lock:
+                self._foreign_owner_active = max(
+                    0, len(survivors) - len(adopted_entries)
+                )
             return recovered
+
+    def _managed_recovery_epoch(self) -> tuple[int, str, str]:
+        """Return one fork-safe process and registry-instance identity."""
+        pid = os.getpid()
+        token = self._safe_host_start_token(pid)
+        if not isinstance(token, str) or not token:
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed recovery process identity is unavailable"
+            )
+        current = getattr(self, "_managed_process_recovery_epoch", None)
+        if (
+            not isinstance(current, tuple)
+            or len(current) != 3
+            or current[0] != pid
+            or current[1] != token
+            or not isinstance(current[2], str)
+            or not current[2]
+        ):
+            current = (pid, token, f"registry_{uuid.uuid4().hex}")
+            self._managed_process_recovery_epoch = current
+        return current
+
+    @staticmethod
+    def _validate_managed_checkpoint_entry(entry: Dict[str, Any]) -> None:
+        """Apply strict bounds beyond the legacy compatibility validator."""
+        allowed = {
+            "session_id", "command", "pid", "pid_scope", "host_start_time",
+            "process_start_token", "checkpoint_owner_id",
+            "checkpoint_owner_pid", "checkpoint_owner_start_token", "cwd",
+            "started_at", "task_id", "session_key", "watcher_platform",
+            "watcher_chat_id", "watcher_user_id", "watcher_user_name",
+            "watcher_thread_id", "watcher_message_id", "watcher_interval",
+            "notify_on_complete", "watch_patterns",
+        }
+        if set(entry) - allowed:
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed process checkpoint contains unknown fields"
+            )
+        text_fields = (
+            "session_id",
+            "command",
+            "task_id",
+            "session_key",
+            "cwd",
+            "watcher_platform",
+            "watcher_chat_id",
+            "watcher_user_id",
+            "watcher_user_name",
+            "watcher_thread_id",
+            "watcher_message_id",
+        )
+        for name in text_fields:
+            value = entry.get(name)
+            if value is not None and (
+                not isinstance(value, str) or len(value.encode("utf-8")) > 65_536
+            ):
+                raise ManagedProcessRecoveryAmbiguous(
+                    "managed process checkpoint text field is invalid"
+                )
+        session_id = entry.get("session_id")
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or len(session_id.encode("utf-8")) > 512
+        ):
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed process session identity is invalid"
+            )
+        started_at = entry.get("started_at")
+        if started_at is not None and (
+            isinstance(started_at, bool)
+            or not isinstance(started_at, (int, float))
+            or not math.isfinite(float(started_at))
+        ):
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed process checkpoint timestamp is invalid"
+            )
+        interval = entry.get("watcher_interval", 0)
+        if (
+            isinstance(interval, bool)
+            or not isinstance(interval, int)
+            or interval < 0
+            or interval > 86_400
+        ):
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed process watcher interval is invalid"
+            )
+        pid = entry.get("pid")
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 1
+            or pid > 2**31 - 1
+            or entry.get("pid_scope") not in {"host", "sandbox"}
+        ):
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed process PID authority is invalid"
+            )
+        notify = entry.get("notify_on_complete", False)
+        if not isinstance(notify, bool):
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed process notification flag is invalid"
+            )
+        patterns = entry.get("watch_patterns", [])
+        if (
+            not isinstance(patterns, list)
+            or len(patterns) > 64
+            or any(
+                not isinstance(pattern, str)
+                or len(pattern.encode("utf-8")) > 4096
+                for pattern in patterns
+            )
+        ):
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed process watch patterns are invalid"
+            )
+
+    @staticmethod
+    def _validate_managed_completion_record(record: Dict[str, Any]) -> None:
+        allowed = {
+            "event_id", "type", "session_id", "process_pid",
+            "process_start_token", "session_key", "platform", "chat_id",
+            "user_id", "user_name", "thread_id", "message_id", "command",
+            "exit_code", "completion_reason", "termination_source", "output",
+            "created_at", "delivered", "delivered_at",
+        }
+        if set(record) - allowed:
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed completion record contains unknown fields"
+            )
+        delivered_at = record.get("delivered_at")
+        if delivered_at is not None and (
+            isinstance(delivered_at, bool)
+            or not isinstance(delivered_at, (int, float))
+            or not math.isfinite(float(delivered_at))
+        ):
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed completion delivered timestamp is invalid"
+            )
+        if record.get("delivered") is True and delivered_at is None:
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed delivered completion lacks delivered_at"
+            )
+        if record.get("delivered") is not True and delivered_at is not None:
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed undelivered completion has delivered_at"
+            )
+        created_at = record.get("created_at")
+        if (
+            isinstance(created_at, bool)
+            or not isinstance(created_at, (int, float))
+            or not math.isfinite(float(created_at))
+        ):
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed completion created timestamp is invalid"
+            )
+        exit_code = record.get("exit_code")
+        if exit_code is not None and (
+            isinstance(exit_code, bool) or not isinstance(exit_code, int)
+        ):
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed completion exit code is invalid"
+            )
+        process_pid = record.get("process_pid")
+        if process_pid is not None and (
+            isinstance(process_pid, bool)
+            or not isinstance(process_pid, int)
+            or process_pid <= 1
+        ):
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed completion process PID is invalid"
+            )
+        for name in (
+            "session_id", "process_start_token", "session_key", "platform",
+            "chat_id", "user_id", "user_name", "thread_id", "message_id",
+            "command", "completion_reason", "termination_source", "output",
+        ):
+            value = record.get(name)
+            if value is not None and (
+                not isinstance(value, str)
+                or len(value.encode("utf-8")) > 65_536
+            ):
+                raise ManagedProcessRecoveryAmbiguous(
+                    "managed completion payload field is invalid"
+                )
+
+    @staticmethod
+    def _managed_session_from_entry(entry: Dict[str, Any]) -> ProcessSession:
+        return ProcessSession(
+            id=entry["session_id"],
+            command=entry.get("command", "unknown"),
+            task_id=entry.get("task_id", ""),
+            session_key=entry.get("session_key", ""),
+            pid=entry["pid"],
+            host_start_time=entry.get("host_start_time"),
+            process_start_token=entry.get("process_start_token"),
+            pid_scope="host",
+            cwd=entry.get("cwd"),
+            started_at=entry.get("started_at", time.time()),
+            detached=True,
+            watcher_platform=entry.get("watcher_platform", ""),
+            watcher_chat_id=entry.get("watcher_chat_id", ""),
+            watcher_user_id=entry.get("watcher_user_id", ""),
+            watcher_user_name=entry.get("watcher_user_name", ""),
+            watcher_thread_id=entry.get("watcher_thread_id", ""),
+            watcher_message_id=entry.get("watcher_message_id", ""),
+            watcher_interval=entry.get("watcher_interval", 0),
+            notify_on_complete=entry.get("notify_on_complete", False),
+            watch_patterns=entry.get("watch_patterns", []),
+        )
+
+    @_process_lifecycle_fenced
+    def recover_managed_startup_exact(
+        self,
+        *,
+        crash_hook=None,
+    ) -> ManagedProcessRecoveryReceipt:
+        """Recover process and notification authorities with exact receipts.
+
+        The legacy count-returning startup APIs remain unchanged. This managed
+        path instead binds both authority files, records every checkpoint-row
+        disposition, and independently proves the registry and durable outbox
+        postconditions before returning.
+        """
+        if _IS_WINDOWS:
+            raise ManagedProcessRecoveryAmbiguous(
+                "managed exact recovery requires held POSIX directory authority"
+            )
+        checkpoint_path = _canonical_authority_path(CHECKPOINT_PATH)
+        notifications_path = _canonical_authority_path(NOTIFICATIONS_PATH)
+        process_pid = 0
+        process_token = ""
+        registry_epoch = ""
+        classifications: list[tuple[str, str]] = []
+        adopted_entries: list[Dict[str, Any]] = []
+        recovered_ids: list[str] = []
+        deduped_process_ids: list[str] = []
+        queued_event_ids: list[str] = []
+        deduped_event_ids: list[str] = []
+        terminal_records: list[Dict[str, Any]] = []
+
+        # Match the lock order used by completion finalization:
+        # completion outbox -> checkpoint -> authority-file locks.
+        with self._completion_outbox_lock:
+            with self._checkpoint_io_lock:
+                process_pid, process_token, registry_epoch = (
+                    self._managed_recovery_epoch()
+                )
+                self._process_checkpoint_available = False
+                self._process_checkpoint_reason = "unverified"
+                self._checkpoint_write_blocked = True
+                owner_id, owner_pid, owner_token = (
+                    self._ensure_checkpoint_owner_identity()
+                )
+                with _process_authority_lock(checkpoint_path):
+                    checkpoint_before = _read_private_json_receipt(
+                        checkpoint_path,
+                        max_bytes=MAX_CHECKPOINT_BYTES,
+                        missing_ok=True,
+                    )
+                    if checkpoint_before.identity is None:
+                        entries: List[Dict[str, Any]] = []
+                    else:
+                        try:
+                            entries = self._validate_checkpoint_entries(
+                                checkpoint_before.value
+                            )
+                        except Exception as exc:
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed process checkpoint schema is invalid"
+                            ) from exc
+                    if len(entries) > MAX_MANAGED_RECOVERY_RECORDS:
+                        raise ManagedProcessRecoveryAmbiguous(
+                            "managed process checkpoint record budget exceeded"
+                        )
+                    for entry in entries:
+                        self._validate_managed_checkpoint_entry(entry)
+
+                    # Validate the complete notification authority before any
+                    # checkpoint, registry, or queue mutation. This prevents a
+                    # malformed/unbounded event from being discovered only
+                    # after terminal checkpoint rows have been removed.
+                    with _process_authority_lock(notifications_path):
+                        notification_preflight = _read_private_json_receipt(
+                            notifications_path,
+                            max_bytes=MAX_COMPLETION_OUTBOX_BYTES,
+                            missing_ok=True,
+                        )
+                        if notification_preflight.identity is not None:
+                            raw_preflight = notification_preflight.value
+                            if (
+                                not isinstance(raw_preflight, dict)
+                                or set(raw_preflight) != {"version", "events"}
+                                or raw_preflight.get("version")
+                                != COMPLETION_OUTBOX_VERSION
+                                or not isinstance(
+                                    raw_preflight.get("events"), dict
+                                )
+                                or len(raw_preflight["events"])
+                                > MAX_COMPLETION_OUTBOX_RECORDS
+                            ):
+                                raise ManagedProcessRecoveryAmbiguous(
+                                    "managed completion outbox schema is invalid"
+                                )
+                            try:
+                                preflight_events = {
+                                    event_id: self._validate_completion_record(
+                                        event_id, record
+                                    )
+                                    for event_id, record in raw_preflight[
+                                        "events"
+                                    ].items()
+                                    if isinstance(event_id, str)
+                                }
+                                if len(preflight_events) != len(
+                                    raw_preflight["events"]
+                                ):
+                                    raise ValueError("invalid event id")
+                                for record in preflight_events.values():
+                                    self._validate_managed_completion_record(
+                                        record
+                                    )
+                            except Exception as exc:
+                                raise ManagedProcessRecoveryAmbiguous(
+                                    "managed completion record is invalid"
+                                ) from exc
+
+                    survivors: list[Dict[str, Any]] = []
+                    for entry in entries:
+                        session_id = entry["session_id"]
+                        entry_owner_id = entry.get("checkpoint_owner_id")
+                        entry_owner_pid = entry.get("checkpoint_owner_pid")
+                        entry_owner_token = entry.get(
+                            "checkpoint_owner_start_token"
+                        )
+                        foreign_owner_alive = (
+                            entry_owner_id is not None
+                            and entry_owner_id != owner_id
+                            and self._host_pid_matches_exact_token(
+                                entry_owner_pid,
+                                entry_owner_token,
+                            )
+                        )
+                        if foreign_owner_alive:
+                            survivors.append(entry)
+                            classifications.append(
+                                (session_id, "foreign_owner_active")
+                            )
+                            continue
+                        if entry["pid_scope"] != "host":
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed recovery cannot prove sandbox PID identity"
+                            )
+                        expected_token = entry.get("process_start_token")
+                        if not isinstance(expected_token, str) or not expected_token:
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed host checkpoint lacks exact PID identity"
+                            )
+                        pid = entry["pid"]
+                        if not self._is_host_pid_alive(pid):
+                            classifications.append((session_id, "process_absent"))
+                            if entry.get("notify_on_complete") is True:
+                                terminal_records.append(
+                                    self._build_recovered_terminal_record(
+                                        entry, "process_absent"
+                                    )
+                                )
+                            continue
+                        if self._safe_host_start_token(pid) != expected_token:
+                            classifications.append(
+                                (session_id, "pid_identity_mismatch")
+                            )
+                            if entry.get("notify_on_complete") is True:
+                                terminal_records.append(
+                                    self._build_recovered_terminal_record(
+                                        entry, "pid_identity_mismatch"
+                                    )
+                                )
+                            continue
+                        adopted = dict(entry)
+                        adopted["checkpoint_owner_id"] = owner_id
+                        adopted["checkpoint_owner_pid"] = owner_pid
+                        adopted["checkpoint_owner_start_token"] = owner_token
+                        survivors.append(adopted)
+                        adopted_entries.append(adopted)
+                        classifications.append((session_id, "eligible_recovered"))
+
+                    survivors = sorted(
+                        survivors, key=lambda entry: entry["session_id"]
+                    )
+                    if len(classifications) != len(entries):
+                        raise ManagedProcessRecoveryAmbiguous(
+                            "managed checkpoint classification is incomplete"
+                        )
+                    if terminal_records:
+                        with _process_authority_lock(notifications_path):
+                            existing_events, notification_identity = (
+                                self._read_completion_outbox_snapshot_locked()
+                            )
+                            merged_events = dict(existing_events)
+                            for terminal_record in terminal_records:
+                                self._validate_completion_record(
+                                    terminal_record["event_id"], terminal_record
+                                )
+                                self._validate_managed_completion_record(
+                                    terminal_record
+                                )
+                                event_id = terminal_record["event_id"]
+                                existing_record = merged_events.get(event_id)
+                                if existing_record is None:
+                                    merged_events[event_id] = terminal_record
+                                elif existing_record != terminal_record:
+                                    raise ManagedProcessRecoveryAmbiguous(
+                                        "managed terminal event identity collision"
+                                    )
+                            now = time.time()
+                            for event_id, record in list(merged_events.items()):
+                                if (
+                                    record.get("delivered") is True
+                                    and now
+                                    - float(
+                                        record.get("delivered_at")
+                                        or record["created_at"]
+                                    )
+                                    > COMPLETION_OUTBOX_DELIVERED_TTL_SECONDS
+                                ):
+                                    merged_events.pop(event_id)
+                            if len(merged_events) > MAX_COMPLETION_OUTBOX_RECORDS:
+                                raise ManagedProcessRecoveryAmbiguous(
+                                    "managed completion outbox capacity is exhausted"
+                                )
+                            encoded_outbox = json.dumps(
+                                {
+                                    "version": COMPLETION_OUTBOX_VERSION,
+                                    "events": merged_events,
+                                },
+                                ensure_ascii=False,
+                                allow_nan=False,
+                            ).encode("utf-8")
+                            if len(encoded_outbox) > MAX_COMPLETION_OUTBOX_BYTES:
+                                raise ManagedProcessRecoveryAmbiguous(
+                                    "managed completion outbox byte budget is exhausted"
+                                )
+                            _process_authority_atomic_write(
+                                notifications_path,
+                                {
+                                    "version": COMPLETION_OUTBOX_VERSION,
+                                    "events": merged_events,
+                                },
+                                expected=notification_identity,
+                                max_bytes=MAX_COMPLETION_OUTBOX_BYTES,
+                                sort_keys=True,
+                            )
+                        if crash_hook is not None:
+                            crash_hook("after_terminal_outbox_commit")
+                    if checkpoint_before.identity is not None and (
+                        survivors != checkpoint_before.value
+                    ):
+                        try:
+                            _process_authority_atomic_write(
+                                checkpoint_path,
+                                survivors,
+                                expected=checkpoint_before.identity,
+                                max_bytes=MAX_CHECKPOINT_BYTES,
+                                sort_keys=True,
+                            )
+                        except Exception as exc:
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed checkpoint commit failed"
+                            ) from exc
+                    checkpoint_after = _read_private_json_receipt(
+                        checkpoint_path,
+                        max_bytes=MAX_CHECKPOINT_BYTES,
+                        missing_ok=True,
+                    )
+                    expected_after = (
+                        []
+                        if checkpoint_before.identity is None
+                        else survivors
+                    )
+                    if (
+                        checkpoint_after.identity is None
+                        and checkpoint_before.identity is not None
+                    ) or (
+                        checkpoint_after.identity is not None
+                        and checkpoint_after.value != expected_after
+                    ):
+                        raise ManagedProcessRecoveryAmbiguous(
+                            "managed checkpoint post-snapshot is inconsistent"
+                        )
+
+                if crash_hook is not None:
+                    crash_hook("after_checkpoint_commit")
+
+                for entry in adopted_entries:
+                    session_id = entry["session_id"]
+                    with self._lock:
+                        existing = self._running.get(session_id)
+                        if existing is None:
+                            session = self._managed_session_from_entry(entry)
+                            self._running[session_id] = session
+                            recovered_ids.append(session_id)
+                        elif (
+                            existing.pid == entry["pid"]
+                            and existing.process_start_token
+                            == entry["process_start_token"]
+                        ):
+                            session = existing
+                            deduped_process_ids.append(session_id)
+                        else:
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed process registry identity collides"
+                            )
+                    if session.watcher_interval > 0 and not any(
+                        watcher.get("session_id") == session.id
+                        for watcher in self.pending_watchers
+                    ):
+                        self.pending_watchers.append(
+                            {
+                                "session_id": session.id,
+                                "check_interval": session.watcher_interval,
+                                "session_key": session.session_key,
+                                "platform": session.watcher_platform,
+                                "chat_id": session.watcher_chat_id,
+                                "user_id": session.watcher_user_id,
+                                "user_name": session.watcher_user_name,
+                                "thread_id": session.watcher_thread_id,
+                                "message_id": session.watcher_message_id,
+                                "notify_on_complete": (
+                                    session.notify_on_complete
+                                ),
+                            }
+                        )
+
+                if crash_hook is not None:
+                    crash_hook("after_registry_publish")
+
+                with _process_authority_lock(notifications_path):
+                    notifications = _read_private_json_receipt(
+                        notifications_path,
+                        max_bytes=MAX_COMPLETION_OUTBOX_BYTES,
+                        missing_ok=True,
+                    )
+                    if notifications.identity is None:
+                        events: Dict[str, Dict[str, Any]] = {}
+                    else:
+                        raw = notifications.value
+                        if (
+                            not isinstance(raw, dict)
+                            or raw.get("version") != COMPLETION_OUTBOX_VERSION
+                            or not isinstance(raw.get("events"), dict)
+                        ):
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed completion outbox schema is invalid"
+                            )
+                        if len(raw["events"]) > MAX_COMPLETION_OUTBOX_RECORDS:
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed completion outbox record budget exceeded"
+                            )
+                        try:
+                            events = {
+                                event_id: self._validate_completion_record(
+                                    event_id, record
+                                )
+                                for event_id, record in raw["events"].items()
+                                if isinstance(event_id, str)
+                            }
+                        except Exception as exc:
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed completion record is invalid"
+                            ) from exc
+                        if len(events) != len(raw["events"]):
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed completion event identity is invalid"
+                            )
+                        for record in events.values():
+                            self._validate_managed_completion_record(record)
+                        if any(
+                            len(event_id.encode("utf-8")) > 512
+                            or not math.isfinite(
+                                float(record["created_at"])
+                            )
+                            for event_id, record in events.items()
+                        ):
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed completion event is unbounded or invalid"
+                            )
+
+                    self._completion_outbox = events
+                    self._completion_outbox_loaded = True
+                    self._completion_outbox_available = True
+                    completion_event_ids = tuple(
+                        event_id
+                        for event_id, record in sorted(events.items())
+                        if record.get("delivered") is not True
+                    )
+                    for event_id in completion_event_ids:
+                        if event_id in self._completion_outbox_replayed:
+                            deduped_event_ids.append(event_id)
+                            continue
+                        try:
+                            self.completion_queue.put(
+                                self._public_completion_event(events[event_id])
+                            )
+                        except Exception as exc:
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed completion event could not be queued"
+                            ) from exc
+                        self._completion_outbox_replayed.add(event_id)
+                        queued_event_ids.append(event_id)
+
+                    if crash_hook is not None:
+                        crash_hook("after_notification_queue")
+
+                    notifications_after = _read_private_json_receipt(
+                        notifications_path,
+                        max_bytes=MAX_COMPLETION_OUTBOX_BYTES,
+                        missing_ok=True,
+                    )
+                    if notifications_after != notifications:
+                        raise ManagedProcessRecoveryAmbiguous(
+                            "managed completion outbox changed during recovery"
+                        )
+
+                if not _authority_receipt_is_current(
+                    checkpoint_path, checkpoint_after
+                ) or not _authority_receipt_is_current(
+                    notifications_path, notifications_after
+                ):
+                    raise ManagedProcessRecoveryAmbiguous(
+                        "managed recovery authority changed after post-snapshot"
+                    )
+                with self._lock:
+                    for entry in adopted_entries:
+                        session = self._running.get(entry["session_id"])
+                        if (
+                            session is None
+                            or session.pid != entry["pid"]
+                            or session.process_start_token
+                            != entry["process_start_token"]
+                        ):
+                            raise ManagedProcessRecoveryAmbiguous(
+                                "managed process registry postcondition failed"
+                            )
+                if any(
+                    event_id not in self._completion_outbox_replayed
+                    for event_id in completion_event_ids
+                ):
+                    raise ManagedProcessRecoveryAmbiguous(
+                        "managed completion queue postcondition failed"
+                    )
+                self._checkpoint_write_blocked = False
+                self._process_checkpoint_available = True
+                self._process_checkpoint_reason = "verified"
+                with self._lock:
+                    self._foreign_owner_active = sum(
+                        classification == "foreign_owner_active"
+                        for _session_id, classification in classifications
+                    )
+
+        classifications_tuple = tuple(sorted(classifications))
+        recovered_tuple = tuple(sorted(recovered_ids))
+        deduped_process_tuple = tuple(sorted(deduped_process_ids))
+        queued_tuple = tuple(sorted(queued_event_ids))
+        deduped_event_tuple = tuple(sorted(deduped_event_ids))
+        absent = (
+            checkpoint_before.identity is None
+            and notifications.identity is None
+        )
+        canonical = json.dumps(
+            {
+                "checkpoint_path": str(checkpoint_path),
+                "checkpoint_before": (
+                    checkpoint_before.identity.__dict__
+                    if checkpoint_before.identity is not None
+                    else None
+                ),
+                "checkpoint_before_sha256": checkpoint_before.sha256,
+                "checkpoint_after": (
+                    checkpoint_after.identity.__dict__
+                    if checkpoint_after.identity is not None
+                    else None
+                ),
+                "checkpoint_after_sha256": checkpoint_after.sha256,
+                "notifications_path": str(notifications_path),
+                "notifications": (
+                    notifications_after.identity.__dict__
+                    if notifications_after.identity is not None
+                    else None
+                ),
+                "notifications_sha256": notifications_after.sha256,
+                "process_pid": process_pid,
+                "process_start_token": process_token,
+                "registry_epoch": registry_epoch,
+                "classifications": classifications_tuple,
+                "recovered": recovered_tuple,
+                "deduped_processes": deduped_process_tuple,
+                "completion_events": completion_event_ids,
+                "queued_events": queued_tuple,
+                "deduped_events": deduped_event_tuple,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return ManagedProcessRecoveryReceipt(
+            (
+                ManagedProcessRecoveryOutcome.PROVED_ABSENT
+                if absent
+                else ManagedProcessRecoveryOutcome.PROVED_COMPLETE
+            ),
+            str(checkpoint_path),
+            checkpoint_before.identity,
+            checkpoint_before.sha256,
+            checkpoint_after.identity,
+            checkpoint_after.sha256,
+            str(notifications_path),
+            notifications_after.identity,
+            notifications_after.sha256,
+            process_pid,
+            process_token,
+            registry_epoch,
+            classifications_tuple,
+            recovered_tuple,
+            deduped_process_tuple,
+            completion_event_ids,
+            queued_tuple,
+            deduped_event_tuple,
+            hashlib.sha256(canonical).hexdigest(),
+        )
 
 
 # Module-level singleton

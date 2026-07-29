@@ -37,19 +37,25 @@ logic stays in one place.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import math
 import os
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, replace
+from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.durable_state import (
     FileIdentity,
     atomic_write_private_json,
+    hold_private_authority_directory,
     interprocess_authority_lock,
     read_private_json,
 )
@@ -121,6 +127,1519 @@ _DELIVERY_STATUS_RANK = {
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
 _HEARTBEAT_STALE_SECONDS = _HEARTBEAT_INTERVAL_SECONDS * 3
 
+_MANAGED_OUTBOX_VERSION = 1
+_MAX_MANAGED_TRACKERS = 256
+_MAX_MANAGED_RECORDS = 10_000
+_MAX_MANAGED_OUTBOX_BYTES = 64 * 1024 * 1024
+_MAX_MANAGED_AGGREGATE_BYTES = 128 * 1024 * 1024
+_MAX_MANAGED_AUTHORITY_FDS = 64
+_MANAGED_DELIVERED_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_MANAGED_TOMBSTONE_RETENTION_SECONDS = 30 * 24 * 60 * 60
+_MANAGED_TERMINAL_STATUSES = {
+    "completed",
+    "error",
+    "failed",
+    "interrupted",
+    "lost",
+}
+
+
+class ManagedAsyncDelegationRecoveryOutcome(str, Enum):
+    ABSENT = "ABSENT"
+    COMPLETE = "COMPLETE"
+    PARTIAL = "PARTIAL"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+@dataclass(frozen=True)
+class ManagedAsyncDelegationProfile:
+    profile_id: str
+    tracker_path: Path
+
+
+@dataclass(frozen=True)
+class ManagedAsyncDelegationProfileManifest:
+    generation: str
+    profiles: tuple[ManagedAsyncDelegationProfile, ...]
+    expected_profile_ids: tuple[str, ...]
+    source_digest: str
+
+
+def _managed_crash_hook(
+    hook: Optional[Callable[[str], None]],
+    stage: str,
+) -> None:
+    if hook is None:
+        return
+    try:
+        hook(stage)
+    except Exception as exc:
+        setattr(exc, "_managed_crash_injection", True)
+        raise
+
+
+@dataclass(frozen=True)
+class ManagedAsyncDelegationRecoveryReceipt:
+    outcome: ManagedAsyncDelegationRecoveryOutcome
+    tracker_paths: tuple[str, ...]
+    tracker_hashes_before: tuple[tuple[str, Optional[str]], ...] = ()
+    tracker_hashes_after: tuple[tuple[str, Optional[str]], ...] = ()
+    tracker_identities_before: tuple[tuple[str, Optional[dict]], ...] = ()
+    tracker_identities_after: tuple[tuple[str, Optional[dict]], ...] = ()
+    outbox_path: str = ""
+    outbox_hash_before: Optional[str] = None
+    outbox_hash_after: Optional[str] = None
+    delegation_ids: tuple[str, ...] = ()
+    event_ids: tuple[str, ...] = ()
+    queued_event_ids: tuple[str, ...] = ()
+    deduped_event_ids: tuple[str, ...] = ()
+    status_transitions: tuple[tuple[str, str, str], ...] = ()
+    recovery_epoch: str = ""
+    process_pid: int = 0
+    process_start_token: str = ""
+    runtime_generation: str = ""
+    manifest_generation: str = ""
+    manifest_source_digest: str = ""
+    record_classifications: tuple[tuple[str, str], ...] = ()
+    errors: tuple[str, ...] = ()
+
+
+def _managed_json_hash(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _managed_identity(identity: Optional[FileIdentity]) -> Optional[dict]:
+    return asdict(identity) if identity is not None else None
+
+
+def _managed_paths(
+    tracker_paths: Sequence[Path],
+    outbox_path: Path,
+) -> tuple[tuple[Path, ...], Path]:
+    if isinstance(tracker_paths, (str, bytes, Path)):
+        raise TypeError("managed tracker paths must be an explicit sequence")
+    if len(tracker_paths) > _MAX_MANAGED_TRACKERS:
+        raise ValueError("too many managed async delegation trackers")
+    canonical: list[Path] = []
+    for raw_path in tracker_paths:
+        path = Path(raw_path)
+        if not path.is_absolute() or path.parent.resolve(strict=True) != path.parent:
+            raise ValueError("managed tracker path must be absolute and canonical")
+        canonical.append(path)
+    if len(set(canonical)) != len(canonical):
+        raise ValueError("managed tracker paths must be unique")
+    canonical = sorted(canonical, key=os.fspath)
+    outbox = Path(outbox_path)
+    if (
+        not outbox.is_absolute()
+        or outbox.parent.resolve(strict=True) != outbox.parent
+        or outbox in canonical
+    ):
+        raise ValueError("managed outbox path must be distinct, absolute, and canonical")
+    return tuple(canonical), outbox
+
+
+def _managed_read_tracker(
+    path: Path,
+) -> tuple[Dict[str, Any], Optional[FileIdentity]]:
+    raw, identity = read_private_json(
+        path,
+        max_bytes=_MAX_PERSISTENCE_BYTES,
+        missing_ok=True,
+    )
+    if raw is None:
+        return {"version": _PERSISTENCE_VERSION, "records": {}}, None
+    data = _validate_persisted_data(raw)
+    if len(data["records"]) > _MAX_MANAGED_RECORDS:
+        raise ValueError("managed async delegation tracker has too many records")
+    return data, identity
+
+
+def _managed_read_outbox(
+    path: Path,
+) -> tuple[Dict[str, Any], Optional[FileIdentity]]:
+    raw, identity = read_private_json(
+        path,
+        max_bytes=_MAX_MANAGED_OUTBOX_BYTES,
+        missing_ok=True,
+    )
+    if raw is None:
+        return {"version": _MANAGED_OUTBOX_VERSION, "events": {}}, None
+    if (
+        not isinstance(raw, dict)
+        or raw.get("version") != _MANAGED_OUTBOX_VERSION
+        or not isinstance(raw.get("events"), dict)
+        or len(raw["events"]) > _MAX_MANAGED_RECORDS
+    ):
+        raise ValueError("managed async delegation outbox schema is invalid")
+    events: Dict[str, Dict[str, Any]] = {}
+    for event_id, row in raw["events"].items():
+        if (
+            not isinstance(event_id, str)
+            or not event_id
+            or not isinstance(row, dict)
+            or row.get("event_id") != event_id
+            or row.get("state") not in {"intent", "enqueued", "delivered"}
+            or not isinstance(row.get("event"), dict)
+            or row["event"].get("managed_event_id") != event_id
+            or not isinstance(row.get("tracker_hash"), str)
+            or not row["tracker_hash"]
+            or not isinstance(row.get("tracker_identity"), dict)
+        ):
+            raise ValueError("managed async delegation outbox event is invalid")
+        events[event_id] = dict(row)
+    return {"version": _MANAGED_OUTBOX_VERSION, "events": events}, identity
+
+
+def _managed_queue_event_once(completion_queue: Any, event: Dict[str, Any]) -> bool:
+    event_id = event["managed_event_id"]
+    mutex = getattr(completion_queue, "mutex", None)
+    storage = getattr(completion_queue, "queue", None)
+    not_empty = getattr(completion_queue, "not_empty", None)
+    if mutex is None or storage is None or not_empty is None:
+        raise TypeError("managed completion queue must provide exact membership")
+    with mutex:
+        for existing in storage:
+            if isinstance(existing, dict) and existing.get("managed_event_id") == event_id:
+                if existing != event:
+                    raise ValueError("managed queue event identity collision")
+                return False
+        maxsize = getattr(completion_queue, "maxsize", 0)
+        if isinstance(maxsize, int) and maxsize > 0 and len(storage) >= maxsize:
+            raise RuntimeError("managed completion queue is full")
+        storage.append(dict(event))
+        completion_queue.unfinished_tasks += 1
+        not_empty.notify()
+    return True
+
+
+def _managed_receipt(
+    *,
+    outcome: ManagedAsyncDelegationRecoveryOutcome,
+    trackers: Sequence[Path],
+    outbox: Path,
+    epoch: str,
+    before: Sequence[tuple[Path, Dict[str, Any], Optional[FileIdentity]]] = (),
+    after: Sequence[tuple[Path, Dict[str, Any], Optional[FileIdentity]]] = (),
+    outbox_before: Optional[tuple[Dict[str, Any], Optional[FileIdentity]]] = None,
+    outbox_after: Optional[tuple[Dict[str, Any], Optional[FileIdentity]]] = None,
+    delegation_ids: Sequence[str] = (),
+    event_ids: Sequence[str] = (),
+    queued: Sequence[str] = (),
+    deduped: Sequence[str] = (),
+    transitions: Sequence[tuple[str, str, str]] = (),
+    errors: Sequence[str] = (),
+) -> ManagedAsyncDelegationRecoveryReceipt:
+    return ManagedAsyncDelegationRecoveryReceipt(
+        outcome=outcome,
+        tracker_paths=tuple(os.fspath(path) for path in trackers),
+        tracker_hashes_before=tuple(
+            (os.fspath(path), _managed_json_hash(data)) for path, data, _ in before
+        ),
+        tracker_hashes_after=tuple(
+            (os.fspath(path), _managed_json_hash(data)) for path, data, _ in after
+        ),
+        tracker_identities_before=tuple(
+            (os.fspath(path), _managed_identity(identity))
+            for path, _, identity in before
+        ),
+        tracker_identities_after=tuple(
+            (os.fspath(path), _managed_identity(identity))
+            for path, _, identity in after
+        ),
+        outbox_path=os.fspath(outbox),
+        outbox_hash_before=(
+            _managed_json_hash(outbox_before[0]) if outbox_before else None
+        ),
+        outbox_hash_after=(
+            _managed_json_hash(outbox_after[0]) if outbox_after else None
+        ),
+        delegation_ids=tuple(delegation_ids),
+        event_ids=tuple(event_ids),
+        queued_event_ids=tuple(queued),
+        deduped_event_ids=tuple(deduped),
+        status_transitions=tuple(transitions),
+        recovery_epoch=epoch,
+        errors=tuple(errors),
+    )
+
+
+def _recover_managed_async_delegations_exact_v1(
+    tracker_paths: Sequence[Path],
+    *,
+    outbox_path: Path,
+    completion_queue: Any,
+    recovery_epoch: str,
+    crash_hook: Optional[Callable[[str], None]] = None,
+) -> ManagedAsyncDelegationRecoveryReceipt:
+    """Recover explicitly enumerated profile trackers through a durable outbox."""
+    try:
+        trackers, outbox = _managed_paths(tracker_paths, outbox_path)
+        if not isinstance(recovery_epoch, str) or not recovery_epoch:
+            raise ValueError("managed recovery epoch is required")
+    except Exception as exc:
+        raw_trackers = tuple(Path(path) for path in tracker_paths)
+        return _managed_receipt(
+            outcome=ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS,
+            trackers=raw_trackers,
+            outbox=Path(outbox_path),
+            epoch=str(recovery_epoch or ""),
+            errors=(str(exc),),
+        )
+
+    before: list[tuple[Path, Dict[str, Any], Optional[FileIdentity]]] = []
+    after: list[tuple[Path, Dict[str, Any], Optional[FileIdentity]]] = []
+    outbox_before: Optional[tuple[Dict[str, Any], Optional[FileIdentity]]] = None
+    outbox_after: Optional[tuple[Dict[str, Any], Optional[FileIdentity]]] = None
+    delegation_ids: list[str] = []
+    event_ids: list[str] = []
+    queued: list[str] = []
+    deduped: list[str] = []
+    transitions: list[tuple[str, str, str]] = []
+
+    try:
+        with ExitStack() as stack:
+            for authority in sorted((*trackers, outbox), key=os.fspath):
+                stack.enter_context(interprocess_authority_lock(authority))
+            for tracker in trackers:
+                data, identity = _managed_read_tracker(tracker)
+                before.append((tracker, data, identity))
+            outbox_data, outbox_identity = _managed_read_outbox(outbox)
+            outbox_before = (outbox_data, outbox_identity)
+
+            candidates: list[
+                tuple[Path, Dict[str, Any], Optional[FileIdentity], str, str, dict]
+            ] = []
+            for tracker, data, identity in before:
+                for delegation_id, entry in sorted(data["records"].items()):
+                    status = str(entry.get("status") or "")
+                    delivery = str(entry.get("delivery_status") or "")
+                    event = entry.get("event")
+                    if status == "running":
+                        record = entry.get("record")
+                        if not isinstance(record, dict) or not all(
+                            record.get(name) is not None
+                            for name in (
+                                "runtime_owner_id",
+                                "runtime_owner_pid",
+                                "runtime_owner_start_token",
+                            )
+                        ):
+                            raise ValueError(
+                                f"{tracker}: running delegation {delegation_id} "
+                                "has no exact runtime owner"
+                            )
+                        if _persistence_owner_is_live(record):
+                            continue
+                        raise ValueError(
+                            f"{tracker}: dead running delegation "
+                            f"{delegation_id} requires an explicit loss decision"
+                        )
+                    if delivery == "delivered" or event is None:
+                        continue
+                    event_id = f"async-delegation:{delegation_id}:completion"
+                    managed_event = dict(event)
+                    managed_event["managed_event_id"] = event_id
+                    managed_event["delegation_id"] = delegation_id
+                    candidates.append(
+                        (
+                            tracker,
+                            data,
+                            identity,
+                            delegation_id,
+                            event_id,
+                            managed_event,
+                        )
+                    )
+
+            events = outbox_data["events"]
+            outbox_changed = False
+            for tracker, _data, _identity, delegation_id, event_id, event in candidates:
+                existing = events.get(event_id)
+                candidate = {
+                    "event_id": event_id,
+                    "delegation_id": delegation_id,
+                    "tracker_path": os.fspath(tracker),
+                    "tracker_hash": _managed_json_hash(_data),
+                    "tracker_identity": _managed_identity(_identity),
+                    "event": event,
+                    "state": "intent",
+                    "recovery_epoch": recovery_epoch,
+                }
+                if existing is None:
+                    events[event_id] = candidate
+                    outbox_changed = True
+                elif (
+                    existing.get("delegation_id") != delegation_id
+                    or existing.get("tracker_path") != os.fspath(tracker)
+                    or existing.get("event") != event
+                ):
+                    raise ValueError(f"managed outbox collision for {event_id}")
+                delegation_ids.append(delegation_id)
+                event_ids.append(event_id)
+
+            if outbox_changed:
+                outbox_identity = atomic_write_private_json(
+                    outbox,
+                    outbox_data,
+                    expected=outbox_identity,
+                    max_bytes=_MAX_MANAGED_OUTBOX_BYTES,
+                    sort_keys=True,
+                )
+            if candidates:
+                _managed_crash_hook(crash_hook, "intent_committed")
+
+            for _tracker, _data, _identity, _delegation_id, event_id, event in candidates:
+                row = events[event_id]
+                if row["state"] == "delivered":
+                    deduped.append(event_id)
+                    continue
+                if (
+                    row["state"] == "enqueued"
+                    and row.get("recovery_epoch") == recovery_epoch
+                ):
+                    deduped.append(event_id)
+                    continue
+                if _managed_queue_event_once(completion_queue, event):
+                    queued.append(event_id)
+                else:
+                    deduped.append(event_id)
+                _managed_crash_hook(crash_hook, "event_enqueued")
+                row["state"] = "enqueued"
+                row["recovery_epoch"] = recovery_epoch
+                outbox_changed = True
+
+            if outbox_changed:
+                outbox_identity = atomic_write_private_json(
+                    outbox,
+                    outbox_data,
+                    expected=outbox_identity,
+                    max_bytes=_MAX_MANAGED_OUTBOX_BYTES,
+                    sort_keys=True,
+                )
+            if candidates:
+                _managed_crash_hook(crash_hook, "outbox_enqueued")
+
+            for tracker, data, identity in before:
+                changed = False
+                for delegation_id, entry in data["records"].items():
+                    event_id = f"async-delegation:{delegation_id}:completion"
+                    row = events.get(event_id)
+                    if not row or row["state"] not in {"enqueued", "delivered"}:
+                        continue
+                    old = str(entry.get("delivery_status") or "")
+                    new = "delivered" if row["state"] == "delivered" else "queued"
+                    if _DELIVERY_STATUS_RANK.get(new, -1) > _DELIVERY_STATUS_RANK.get(old, -1):
+                        entry["delivery_status"] = new
+                        if isinstance(entry.get("record"), dict):
+                            entry["record"]["delivery_status"] = new
+                        transitions.append((delegation_id, old, new))
+                        changed = True
+                if changed:
+                    identity = atomic_write_private_json(
+                        tracker,
+                        data,
+                        expected=identity,
+                        max_bytes=_MAX_PERSISTENCE_BYTES,
+                        sort_keys=True,
+                    )
+                reread, final_identity = _managed_read_tracker(tracker)
+                after.append((tracker, reread, final_identity))
+            final_outbox, final_outbox_identity = _managed_read_outbox(outbox)
+            outbox_after = (final_outbox, final_outbox_identity)
+    except Exception as exc:
+        if getattr(exc, "_managed_crash_injection", False):
+            raise
+        return _managed_receipt(
+            outcome=(
+                ManagedAsyncDelegationRecoveryOutcome.PARTIAL
+                if outbox_before is not None
+                else ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+            ),
+            trackers=trackers,
+            outbox=outbox,
+            epoch=recovery_epoch,
+            before=before,
+            after=after,
+            outbox_before=outbox_before,
+            outbox_after=outbox_after,
+            delegation_ids=delegation_ids,
+            event_ids=event_ids,
+            queued=queued,
+            deduped=deduped,
+            transitions=transitions,
+            errors=(str(exc),),
+        )
+
+    outcome = (
+        ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+        if event_ids
+        else ManagedAsyncDelegationRecoveryOutcome.ABSENT
+    )
+    return _managed_receipt(
+        outcome=outcome,
+        trackers=trackers,
+        outbox=outbox,
+        epoch=recovery_epoch,
+        before=before,
+        after=after,
+        outbox_before=outbox_before,
+        outbox_after=outbox_after,
+        delegation_ids=delegation_ids,
+        event_ids=event_ids,
+        queued=queued,
+        deduped=deduped,
+        transitions=transitions,
+    )
+
+
+def _mark_managed_async_delegation_delivered_exact_v1(
+    event: Dict[str, Any],
+    *,
+    tracker_paths: Sequence[Path],
+    outbox_path: Path,
+    crash_hook: Optional[Callable[[str], None]] = None,
+) -> ManagedAsyncDelegationRecoveryReceipt:
+    """Durably ACK one managed event in its outbox and named tracker."""
+    try:
+        trackers, outbox = _managed_paths(tracker_paths, outbox_path)
+        event_id = event.get("managed_event_id") if isinstance(event, dict) else None
+        if not isinstance(event_id, str) or not event_id:
+            raise ValueError("managed delivery event identity is required")
+    except Exception as exc:
+        return _managed_receipt(
+            outcome=ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS,
+            trackers=tuple(Path(path) for path in tracker_paths),
+            outbox=Path(outbox_path),
+            epoch="delivery",
+            errors=(str(exc),),
+        )
+
+    before = []
+    after = []
+    transitions: list[tuple[str, str, str]] = []
+    outbox_before = None
+    outbox_after = None
+    delegation_id = str(event.get("delegation_id") or "")
+    try:
+        with ExitStack() as stack:
+            for authority in sorted((*trackers, outbox), key=os.fspath):
+                stack.enter_context(interprocess_authority_lock(authority))
+            for tracker in trackers:
+                data, identity = _managed_read_tracker(tracker)
+                before.append((tracker, data, identity))
+            outbox_data, outbox_identity = _managed_read_outbox(outbox)
+            outbox_before = (outbox_data, outbox_identity)
+            row = outbox_data["events"].get(event_id)
+            if (
+                not isinstance(row, dict)
+                or row.get("event") != event
+                or row.get("delegation_id") != delegation_id
+            ):
+                raise ValueError("managed delivery does not match durable intent")
+            if row["state"] != "delivered":
+                row["state"] = "delivered"
+                outbox_identity = atomic_write_private_json(
+                    outbox,
+                    outbox_data,
+                    expected=outbox_identity,
+                    max_bytes=_MAX_MANAGED_OUTBOX_BYTES,
+                    sort_keys=True,
+                )
+            _managed_crash_hook(crash_hook, "delivered_committed")
+            found = False
+            for tracker, data, identity in before:
+                entry = data["records"].get(delegation_id)
+                if not isinstance(entry, dict):
+                    after.append((tracker, data, identity))
+                    continue
+                found = True
+                old = str(entry.get("delivery_status") or "")
+                if old != "delivered":
+                    entry["delivery_status"] = "delivered"
+                    if isinstance(entry.get("record"), dict):
+                        entry["record"]["delivery_status"] = "delivered"
+                    transitions.append((delegation_id, old, "delivered"))
+                    identity = atomic_write_private_json(
+                        tracker,
+                        data,
+                        expected=identity,
+                        max_bytes=_MAX_PERSISTENCE_BYTES,
+                        sort_keys=True,
+                    )
+                reread, final_identity = _managed_read_tracker(tracker)
+                after.append((tracker, reread, final_identity))
+            if not found:
+                raise ValueError("managed delivery tracker record is absent")
+            final_outbox, final_outbox_identity = _managed_read_outbox(outbox)
+            outbox_after = (final_outbox, final_outbox_identity)
+    except Exception as exc:
+        if getattr(exc, "_managed_crash_injection", False):
+            raise
+        return _managed_receipt(
+            outcome=(
+                ManagedAsyncDelegationRecoveryOutcome.PARTIAL
+                if outbox_before is not None
+                else ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+            ),
+            trackers=trackers,
+            outbox=outbox,
+            epoch="delivery",
+            before=before,
+            after=after,
+            outbox_before=outbox_before,
+            outbox_after=outbox_after,
+            delegation_ids=(delegation_id,) if delegation_id else (),
+            event_ids=(event_id,),
+            transitions=transitions,
+            errors=(str(exc),),
+        )
+    return _managed_receipt(
+        outcome=ManagedAsyncDelegationRecoveryOutcome.COMPLETE,
+        trackers=trackers,
+        outbox=outbox,
+        epoch="delivery",
+        before=before,
+        after=after,
+        outbox_before=outbox_before,
+        outbox_after=outbox_after,
+        delegation_ids=(delegation_id,),
+        event_ids=(event_id,),
+        transitions=transitions,
+    )
+
+
+def _managed_v2_manifest(
+    manifest: ManagedAsyncDelegationProfileManifest,
+    outbox_path: Path,
+) -> tuple[
+    tuple[ManagedAsyncDelegationProfile, ...],
+    Path,
+]:
+    if not isinstance(manifest, ManagedAsyncDelegationProfileManifest):
+        raise ValueError("authoritative managed profile manifest is required")
+    if (
+        not isinstance(manifest.generation, str)
+        or not manifest.generation
+        or len(manifest.generation.encode("utf-8")) > 256
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for character in manifest.generation
+        )
+        or not manifest.profiles
+        or not isinstance(manifest.source_digest, str)
+        or len(manifest.source_digest) != 64
+        or any(character not in "0123456789abcdef" for character in manifest.source_digest)
+    ):
+        raise ValueError(
+            "managed profile manifest source digest/generation/set is invalid"
+        )
+    if (
+        not manifest.expected_profile_ids
+        or len(manifest.profiles) > _MAX_MANAGED_TRACKERS
+    ):
+        raise ValueError("managed profile manifest is empty or exceeds FD budget")
+    profiles = tuple(
+        sorted(manifest.profiles, key=lambda profile: profile.profile_id)
+    )
+    profile_ids = tuple(profile.profile_id for profile in profiles)
+    if (
+        tuple(sorted(manifest.expected_profile_ids)) != profile_ids
+        or "default" not in profile_ids
+        or len(set(profile_ids)) != len(profile_ids)
+    ):
+        raise ValueError("managed profile manifest is incomplete")
+    paths = []
+    for profile in profiles:
+        if (
+            not isinstance(profile.profile_id, str)
+            or not profile.profile_id
+            or len(profile.profile_id.encode("utf-8")) > 256
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+                for character in profile.profile_id
+            )
+        ):
+            raise ValueError("managed profile identity is invalid")
+        path = Path(profile.tracker_path)
+        if not path.is_absolute() or path.parent.resolve(strict=True) != path.parent:
+            raise ValueError("managed tracker path must be absolute and canonical")
+        paths.append(path)
+    if len(set(paths)) != len(paths):
+        raise ValueError("managed profile tracker paths are not unique")
+    outbox = Path(outbox_path)
+    if (
+        not outbox.is_absolute()
+        or outbox.parent.resolve(strict=True) != outbox.parent
+        or outbox in paths
+    ):
+        raise ValueError("managed outbox path is invalid")
+    authority_paths = (*paths, outbox)
+    required_fds = len(authority_paths) + len(
+        {path.parent for path in authority_paths}
+    )
+    if required_fds > _MAX_MANAGED_AUTHORITY_FDS:
+        raise ValueError("managed profile manifest exceeds FD budget")
+    return profiles, outbox
+
+
+def _managed_v2_runtime() -> tuple[int, str, str, str]:
+    runtime_generation, process_pid, process_token = _runtime_persistence_owner()
+    epoch = (
+        f"{process_pid}:{hashlib.sha256(process_token.encode()).hexdigest()[:24]}"
+        f":{runtime_generation}"
+    )
+    return process_pid, process_token, runtime_generation, epoch
+
+
+def _managed_v2_event_id(
+    profile_id: str,
+    generation: str,
+    delegation_id: str,
+) -> str:
+    binding = hashlib.sha256(
+        f"{profile_id}\0{generation}\0{delegation_id}".encode("utf-8")
+    ).hexdigest()
+    return f"async-delegation:{binding}:completion"
+
+
+def _managed_v2_validate_delegation_id(
+    delegation_id: object,
+    profile_id: str,
+    generation: str,
+) -> str:
+    if not isinstance(delegation_id, str):
+        raise ValueError("managed delegation id is invalid")
+    prefix = f"deleg_{profile_id}_{generation}_"
+    if not delegation_id.startswith(prefix):
+        raise ValueError("managed delegation id does not bind profile generation")
+    try:
+        uuid.UUID(delegation_id[len(prefix):])
+    except (ValueError, TypeError) as exc:
+        raise ValueError("managed delegation id lacks a full UUID") from exc
+    return delegation_id
+
+
+def _managed_v2_read_outbox(
+    held: Any,
+    path: Path,
+) -> tuple[Dict[str, Any], Optional[FileIdentity]]:
+    raw, identity, _payload = held.read_json(
+        path,
+        max_bytes=_MAX_MANAGED_OUTBOX_BYTES,
+        missing_ok=True,
+    )
+    if raw is None:
+        return {"version": 2, "events": {}, "tombstones": {}}, None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"version", "events", "tombstones"}
+        or raw.get("version") != 2
+        or not isinstance(raw.get("events"), dict)
+        or not isinstance(raw.get("tombstones"), dict)
+        or len(raw["events"]) + len(raw["tombstones"]) > _MAX_MANAGED_RECORDS
+    ):
+        raise ValueError("managed async delegation outbox schema is invalid")
+    allowed_row = {
+        "event_id", "delegation_id", "profile_id", "manifest_generation",
+        "manifest_source_digest",
+        "tracker_path", "tracker_hash", "tracker_identity", "event", "state",
+        "created_at", "delivered_at", "last_replay_epoch",
+        "tracker_current_hash", "tracker_current_identity",
+    }
+    events = {}
+    for event_id, raw_row in raw["events"].items():
+        if (
+            not isinstance(event_id, str)
+            or not isinstance(raw_row, dict)
+            or set(raw_row) != allowed_row
+        ):
+            raise ValueError("managed outbox event schema is not closed")
+        row = dict(raw_row)
+        event = row.get("event")
+        metadata = (
+            event.get("managed_delivery") if isinstance(event, dict) else None
+        )
+        if (
+            row.get("event_id") != event_id
+            or row.get("state") not in {"intent", "enqueued", "delivered"}
+            or not isinstance(row.get("event"), dict)
+            or row["event"].get("managed_event_id") != event_id
+            or not isinstance(row.get("tracker_identity"), dict)
+            or not isinstance(row.get("tracker_hash"), str)
+            or not row.get("tracker_hash")
+            or not isinstance(row.get("manifest_source_digest"), str)
+            or len(row.get("manifest_source_digest")) != 64
+            or not isinstance(row.get("tracker_current_hash"), str)
+            or not row.get("tracker_current_hash")
+            or not isinstance(row.get("tracker_current_identity"), dict)
+            or not isinstance(row.get("last_replay_epoch"), str)
+            or not isinstance(row.get("created_at"), (int, float))
+            or isinstance(row.get("created_at"), bool)
+            or not math.isfinite(float(row.get("created_at")))
+            or event.get("type") != "async_delegation"
+            or event.get("delegation_id") != row.get("delegation_id")
+            or event.get("profile_id") != row.get("profile_id")
+            or event.get("profile_generation")
+            != row.get("manifest_generation")
+            or not isinstance(metadata, dict)
+            or set(metadata)
+            != {
+                "protocol",
+                "outbox_path",
+                "event_id",
+                "profile_id",
+                "manifest_generation",
+                "manifest_source_digest",
+                "tracker_path",
+                "tracker_hash",
+                "tracker_identity",
+                "runtime_generation",
+            }
+            or metadata.get("protocol") != 2
+            or metadata.get("outbox_path") != os.fspath(path)
+            or metadata.get("event_id") != event_id
+            or metadata.get("profile_id") != row.get("profile_id")
+            or metadata.get("manifest_generation")
+            != row.get("manifest_generation")
+            or metadata.get("manifest_source_digest")
+            != row.get("manifest_source_digest")
+            or metadata.get("tracker_path") != row.get("tracker_path")
+            or metadata.get("tracker_hash") != row.get("tracker_hash")
+            or metadata.get("tracker_identity")
+            != row.get("tracker_identity")
+            or not isinstance(metadata.get("runtime_generation"), str)
+            or not metadata.get("runtime_generation")
+        ):
+            raise ValueError("managed outbox event is invalid")
+        delivered_at = row.get("delivered_at")
+        if row["state"] == "delivered":
+            if (
+                not isinstance(delivered_at, (int, float))
+                or isinstance(delivered_at, bool)
+                or not math.isfinite(float(delivered_at))
+            ):
+                raise ValueError("managed delivered event timestamp is invalid")
+        elif delivered_at is not None:
+            raise ValueError("managed undelivered event has delivered timestamp")
+        events[event_id] = row
+    tombstones = {}
+    for event_id, tombstone in raw["tombstones"].items():
+        if (
+            not isinstance(event_id, str)
+            or not isinstance(tombstone, dict)
+            or set(tombstone) != {"event_id", "payload_hash", "delivered_at"}
+            or tombstone.get("event_id") != event_id
+            or not isinstance(tombstone.get("payload_hash"), str)
+            or not isinstance(tombstone.get("delivered_at"), (int, float))
+            or isinstance(tombstone.get("delivered_at"), bool)
+            or not math.isfinite(float(tombstone.get("delivered_at")))
+        ):
+            raise ValueError("managed outbox tombstone is invalid")
+        tombstones[event_id] = dict(tombstone)
+    if set(events).intersection(tombstones):
+        raise ValueError("managed outbox event/tombstone identity overlaps")
+    return {"version": 2, "events": events, "tombstones": tombstones}, identity
+
+
+def _managed_v2_tracker(
+    held: Any,
+    profile: ManagedAsyncDelegationProfile,
+    generation: str,
+    *,
+    max_bytes: int = _MAX_PERSISTENCE_BYTES,
+) -> tuple[Dict[str, Any], Optional[FileIdentity]]:
+    raw, identity, _payload = held.read_json(
+        profile.tracker_path,
+        max_bytes=max_bytes,
+        missing_ok=True,
+    )
+    if raw is None:
+        return {"version": 1, "records": {}}, None
+    data = _validate_persisted_data(raw)
+    if len(data["records"]) > _MAX_MANAGED_RECORDS:
+        raise ValueError("managed tracker record budget exceeded")
+    allowed_entry = {
+        "delegation_id", "profile_id", "profile_generation", "status",
+        "delivery_status", "record", "event", "result", "updated_at",
+        "queued_at", "delivered_at",
+    }
+    for delegation_id, entry in data["records"].items():
+        if set(entry) - allowed_entry:
+            raise ValueError("managed tracker entry schema is not closed")
+        _managed_v2_validate_delegation_id(
+            delegation_id, profile.profile_id, generation
+        )
+        if (
+            entry.get("profile_id") != profile.profile_id
+            or entry.get("profile_generation") != generation
+        ):
+            raise ValueError("managed tracker entry profile generation mismatch")
+        record = entry.get("record")
+        if not isinstance(record, dict):
+            raise ValueError("managed tracker record payload is absent")
+        if (
+            record.get("profile_id") != profile.profile_id
+            or record.get("profile_generation") != generation
+            or record.get("delegation_id") != delegation_id
+            or record.get("status") != entry.get("status")
+            or record.get("delivery_status") != entry.get("delivery_status")
+        ):
+            raise ValueError("managed tracker record generation mismatch")
+        status = entry.get("status")
+        delivery = entry.get("delivery_status")
+        if (
+            status not in {"running", *_MANAGED_TERMINAL_STATUSES}
+            or delivery not in _DELIVERY_STATUS_RANK
+        ):
+            raise ValueError("managed tracker status is invalid")
+        event = entry.get("event")
+        if status in _MANAGED_TERMINAL_STATUSES and (
+            not isinstance(event, dict)
+            or event.get("type") != "async_delegation"
+            or event.get("delegation_id") != delegation_id
+            or event.get("profile_id") != profile.profile_id
+            or event.get("profile_generation") != generation
+            or event.get("status") != status
+        ):
+            raise ValueError("managed terminal event binding is invalid")
+        for timestamp_name in ("updated_at", "queued_at", "delivered_at"):
+            timestamp = entry.get(timestamp_name)
+            if timestamp is not None and (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+                or not math.isfinite(float(timestamp))
+            ):
+                raise ValueError("managed tracker timestamp is invalid")
+    return data, identity
+
+
+def _managed_v2_receipt(
+    base: ManagedAsyncDelegationRecoveryReceipt,
+    *,
+    runtime: tuple[int, str, str, str],
+    manifest_generation: str,
+    manifest_source_digest: str,
+    classifications: Sequence[tuple[str, str]],
+) -> ManagedAsyncDelegationRecoveryReceipt:
+    pid, token, runtime_generation, epoch = runtime
+    return replace(
+        base,
+        recovery_epoch=epoch,
+        process_pid=pid,
+        process_start_token=token,
+        runtime_generation=runtime_generation,
+        manifest_generation=manifest_generation,
+        manifest_source_digest=manifest_source_digest,
+        record_classifications=tuple(sorted(classifications)),
+    )
+
+
+def _managed_v2_authorities(paths: Sequence[Path]) -> ExitStack:
+    stack = ExitStack()
+    held_by_parent = {}
+    for path in paths:
+        if path.parent not in held_by_parent:
+            held_by_parent[path.parent] = stack.enter_context(
+                hold_private_authority_directory(path)
+            )
+    stack.held_by_parent = held_by_parent  # type: ignore[attr-defined]
+    for path in sorted(paths, key=os.fspath):
+        stack.enter_context(held_by_parent[path.parent].lock(path))
+    return stack
+
+
+def recover_managed_async_delegations_exact(
+    manifest: ManagedAsyncDelegationProfileManifest,
+    *,
+    outbox_path: Path,
+    completion_queue: Any,
+    crash_hook: Optional[Callable[[str], None]] = None,
+) -> ManagedAsyncDelegationRecoveryReceipt:
+    """Recover an authoritative profile set through one exact durable outbox."""
+    empty_runtime = (0, "", "", "")
+    try:
+        profiles, outbox = _managed_v2_manifest(manifest, outbox_path)
+        runtime = _managed_v2_runtime()
+    except Exception as exc:
+        base = _managed_receipt(
+            outcome=ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS,
+            trackers=(),
+            outbox=Path(outbox_path),
+            epoch="",
+            errors=(str(exc),),
+        )
+        return _managed_v2_receipt(
+            base,
+            runtime=empty_runtime,
+            manifest_generation=getattr(manifest, "generation", ""),
+            manifest_source_digest=getattr(manifest, "source_digest", ""),
+            classifications=(),
+        )
+    tracker_paths = tuple(Path(profile.tracker_path) for profile in profiles)
+    profile_by_id = {profile.profile_id: profile for profile in profiles}
+    before = []
+    after = []
+    outbox_before = None
+    outbox_after = None
+    classifications = []
+    transitions = []
+    delegation_ids = []
+    event_ids = []
+    queued = []
+    deduped = []
+    aggregate_bytes = 0
+    try:
+        with _managed_v2_authorities((*tracker_paths, outbox)) as authorities:
+            held_by_parent = authorities.held_by_parent  # type: ignore[attr-defined]
+            outbox_data, outbox_identity = _managed_v2_read_outbox(
+                held_by_parent[outbox.parent], outbox
+            )
+            outbox_before = (outbox_data, outbox_identity)
+            aggregate_bytes += outbox_identity.size if outbox_identity else 0
+            tracker_snapshots = {}
+            for profile in profiles:
+                tracker = Path(profile.tracker_path)
+                remaining_bytes = (
+                    _MAX_MANAGED_AGGREGATE_BYTES - aggregate_bytes
+                )
+                if remaining_bytes <= 0:
+                    raise ValueError(
+                        "managed aggregate authority budget exceeded"
+                    )
+                data, identity = _managed_v2_tracker(
+                    held_by_parent[tracker.parent],
+                    profile,
+                    manifest.generation,
+                    max_bytes=min(
+                        _MAX_PERSISTENCE_BYTES, remaining_bytes
+                    ),
+                )
+                tracker_snapshots[profile.profile_id] = (data, identity)
+                before.append((tracker, data, identity))
+                aggregate_bytes += identity.size if identity else 0
+            total_records = len(outbox_data["events"]) + len(
+                outbox_data["tombstones"]
+            ) + sum(
+                len(data["records"]) for data, _ in tracker_snapshots.values()
+            )
+            if (
+                aggregate_bytes > _MAX_MANAGED_AGGREGATE_BYTES
+                or total_records > _MAX_MANAGED_RECORDS
+            ):
+                raise ValueError("managed aggregate authority budget exceeded")
+
+            now = time.time()
+            events = outbox_data["events"]
+            tombstones = outbox_data["tombstones"]
+            outbox_changed = False
+            for event_id, row in list(events.items()):
+                if (
+                    row["state"] == "delivered"
+                    and now - float(row["delivered_at"])
+                    > _MANAGED_DELIVERED_RETENTION_SECONDS
+                ):
+                    tombstones[event_id] = {
+                        "event_id": event_id,
+                        "payload_hash": _managed_json_hash(row["event"]),
+                        "delivered_at": row["delivered_at"],
+                    }
+                    events.pop(event_id)
+                    outbox_changed = True
+            for event_id, tombstone in list(tombstones.items()):
+                if (
+                    now - float(tombstone["delivered_at"])
+                    > _MANAGED_TOMBSTONE_RETENTION_SECONDS
+                ):
+                    tombstones.pop(event_id)
+                    outbox_changed = True
+
+            tracker_seen = set()
+            for profile in profiles:
+                tracker = Path(profile.tracker_path)
+                data, identity = tracker_snapshots[profile.profile_id]
+                for delegation_id, entry in sorted(data["records"].items()):
+                    tracker_seen.add(delegation_id)
+                    delegation_ids.append(delegation_id)
+                    status = str(entry.get("status") or "")
+                    delivery = str(entry.get("delivery_status") or "")
+                    if status == "running":
+                        record = entry["record"]
+                        owner = (
+                            record.get("runtime_owner_id"),
+                            record.get("runtime_owner_pid"),
+                            record.get("runtime_owner_start_token"),
+                        )
+                        if not all(owner) or not _persistence_owner_is_live(record):
+                            raise ValueError(
+                                f"running delegation {delegation_id} owner is ambiguous"
+                            )
+                        classifications.append((delegation_id, "in_progress"))
+                        continue
+                    event = entry.get("event")
+                    if delivery == "delivered":
+                        classifications.append((delegation_id, "delivered"))
+                        continue
+                    if not isinstance(event, dict):
+                        raise ValueError(
+                            f"terminal delegation {delegation_id} has no event"
+                        )
+                    event_id = _managed_v2_event_id(
+                        profile.profile_id,
+                        manifest.generation,
+                        delegation_id,
+                    )
+                    event_ids.append(event_id)
+                    durable = events.get(event_id)
+                    durable_runtime_generation = runtime[2]
+                    if isinstance(durable, dict):
+                        durable_metadata = durable.get("event", {}).get(
+                            "managed_delivery"
+                        )
+                        if isinstance(durable_metadata, dict):
+                            durable_runtime_generation = durable_metadata.get(
+                                "runtime_generation", runtime[2]
+                            )
+                    managed_event = dict(event)
+                    delivery_metadata = {
+                        "protocol": 2,
+                        "outbox_path": os.fspath(outbox),
+                        "event_id": event_id,
+                        "profile_id": profile.profile_id,
+                        "manifest_generation": manifest.generation,
+                        "manifest_source_digest": manifest.source_digest,
+                        "tracker_path": os.fspath(tracker),
+                        "tracker_hash": _managed_json_hash(data),
+                        "tracker_identity": _managed_identity(identity),
+                        "runtime_generation": durable_runtime_generation,
+                    }
+                    managed_event["managed_event_id"] = event_id
+                    managed_event["managed_delivery"] = delivery_metadata
+                    candidate = {
+                        "event_id": event_id,
+                        "delegation_id": delegation_id,
+                        "profile_id": profile.profile_id,
+                        "manifest_generation": manifest.generation,
+                        "manifest_source_digest": manifest.source_digest,
+                        "tracker_path": os.fspath(tracker),
+                        "tracker_hash": _managed_json_hash(data),
+                        "tracker_identity": _managed_identity(identity),
+                        "event": managed_event,
+                        "state": "intent",
+                        "created_at": now,
+                        "delivered_at": None,
+                        "last_replay_epoch": "",
+                        "tracker_current_hash": _managed_json_hash(data),
+                        "tracker_current_identity": _managed_identity(identity),
+                    }
+                    tombstone = tombstones.get(event_id)
+                    if tombstone is not None:
+                        if tombstone["payload_hash"] != _managed_json_hash(
+                            managed_event
+                        ):
+                            raise ValueError("managed tombstone collision")
+                        classifications.append((delegation_id, "tombstoned"))
+                        continue
+                    if durable is None:
+                        events[event_id] = candidate
+                        outbox_changed = True
+                        classifications.append((delegation_id, "intent_created"))
+                    else:
+                        immutable = {
+                            key: durable[key]
+                            for key in (
+                                "event_id", "delegation_id", "profile_id",
+                                "manifest_generation", "tracker_path",
+                                "manifest_source_digest",
+                                "tracker_hash", "tracker_identity", "event",
+                            )
+                        }
+                        expected = {
+                            key: candidate[key] for key in immutable
+                        }
+                        if immutable != expected:
+                            raise ValueError("managed event identity collision")
+                        classifications.append((delegation_id, "outbox_bound"))
+
+            final_record_count = len(events) + len(tombstones) + sum(
+                len(data["records"]) for data, _ in tracker_snapshots.values()
+            )
+            if final_record_count > _MAX_MANAGED_RECORDS:
+                raise ValueError("managed aggregate record budget exceeded")
+
+            for event_id, row in sorted(events.items()):
+                if row["manifest_generation"] != manifest.generation:
+                    raise ValueError("outbox row generation is not in manifest")
+                if row["manifest_source_digest"] != manifest.source_digest:
+                    raise ValueError("outbox row source is not in manifest")
+                profile = profile_by_id.get(row["profile_id"])
+                if (
+                    profile is None
+                    or os.fspath(profile.tracker_path) != row["tracker_path"]
+                ):
+                    raise ValueError("outbox row profile is not authoritative")
+                delegation_id = row["delegation_id"]
+                _managed_v2_validate_delegation_id(
+                    delegation_id,
+                    row["profile_id"],
+                    manifest.generation,
+                )
+                if delegation_id not in tracker_seen:
+                    raise ValueError(
+                        "managed outbox event has no ACK-capable tracker row"
+                    )
+
+            if outbox_changed:
+                outbox_identity = held_by_parent[outbox.parent].atomic_write_json(
+                    outbox,
+                    outbox_data,
+                    expected=outbox_identity,
+                    max_bytes=_MAX_MANAGED_OUTBOX_BYTES,
+                    sort_keys=True,
+                )
+            if events:
+                _managed_crash_hook(crash_hook, "intent_committed")
+
+            for event_id, row in sorted(events.items()):
+                if row["state"] == "delivered":
+                    deduped.append(event_id)
+                    continue
+                if row["last_replay_epoch"] == runtime[3]:
+                    deduped.append(event_id)
+                    continue
+                if _managed_queue_event_once(completion_queue, row["event"]):
+                    queued.append(event_id)
+                else:
+                    deduped.append(event_id)
+                _managed_crash_hook(crash_hook, "event_enqueued")
+                row["state"] = "enqueued"
+                row["last_replay_epoch"] = runtime[3]
+                outbox_changed = True
+            if outbox_changed:
+                outbox_identity = held_by_parent[outbox.parent].atomic_write_json(
+                    outbox,
+                    outbox_data,
+                    expected=outbox_identity,
+                    max_bytes=_MAX_MANAGED_OUTBOX_BYTES,
+                    sort_keys=True,
+                )
+            if events:
+                _managed_crash_hook(crash_hook, "outbox_enqueued")
+
+            for profile in profiles:
+                tracker = Path(profile.tracker_path)
+                data, identity = tracker_snapshots[profile.profile_id]
+                changed = False
+                for delegation_id, entry in data["records"].items():
+                    event_id = _managed_v2_event_id(
+                        profile.profile_id,
+                        manifest.generation,
+                        delegation_id,
+                    )
+                    row = events.get(event_id)
+                    new = None
+                    if event_id in tombstones:
+                        new = "delivered"
+                    elif row is not None:
+                        new = (
+                            "delivered"
+                            if row["state"] == "delivered"
+                            else "queued"
+                        )
+                    if (
+                        new is not None
+                        and _DELIVERY_STATUS_RANK.get(new, -1)
+                        > _DELIVERY_STATUS_RANK.get(
+                            str(entry.get("delivery_status") or ""), -1
+                        )
+                    ):
+                        old = str(entry.get("delivery_status") or "")
+                        entry["delivery_status"] = new
+                        entry["record"]["delivery_status"] = new
+                        transitions.append((delegation_id, old, new))
+                        changed = True
+                if changed:
+                    identity = held_by_parent[tracker.parent].atomic_write_json(
+                        tracker,
+                        data,
+                        expected=identity,
+                        max_bytes=_MAX_PERSISTENCE_BYTES,
+                        sort_keys=True,
+                    )
+                    for row in events.values():
+                        if row["tracker_path"] == os.fspath(tracker):
+                            row["tracker_current_hash"] = _managed_json_hash(data)
+                            row["tracker_current_identity"] = _managed_identity(
+                                identity
+                            )
+                    outbox_identity = held_by_parent[
+                        outbox.parent
+                    ].atomic_write_json(
+                        outbox,
+                        outbox_data,
+                        expected=outbox_identity,
+                        max_bytes=_MAX_MANAGED_OUTBOX_BYTES,
+                        sort_keys=True,
+                    )
+                reread, final_identity = _managed_v2_tracker(
+                    held_by_parent[tracker.parent],
+                    profile,
+                    manifest.generation,
+                )
+                after.append((tracker, reread, final_identity))
+            final_outbox, final_outbox_identity = _managed_v2_read_outbox(
+                held_by_parent[outbox.parent], outbox
+            )
+            outbox_after = (final_outbox, final_outbox_identity)
+    except Exception as exc:
+        if getattr(exc, "_managed_crash_injection", False):
+            raise
+        base = _managed_receipt(
+            outcome=ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS,
+            trackers=tracker_paths,
+            outbox=outbox,
+            epoch=runtime[3],
+            before=before,
+            after=after,
+            outbox_before=outbox_before,
+            outbox_after=outbox_after,
+            delegation_ids=delegation_ids,
+            event_ids=event_ids,
+            queued=queued,
+            deduped=deduped,
+            transitions=transitions,
+            errors=(str(exc),),
+        )
+        return _managed_v2_receipt(
+            base,
+            runtime=runtime,
+            manifest_generation=manifest.generation,
+            manifest_source_digest=manifest.source_digest,
+            classifications=classifications,
+        )
+    active = bool(classifications or events or tombstones)
+    base = _managed_receipt(
+        outcome=(
+            ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+            if active
+            else ManagedAsyncDelegationRecoveryOutcome.ABSENT
+        ),
+        trackers=tracker_paths,
+        outbox=outbox,
+        epoch=runtime[3],
+        before=before,
+        after=after,
+        outbox_before=outbox_before,
+        outbox_after=outbox_after,
+        delegation_ids=tuple(sorted(set(delegation_ids))),
+        event_ids=tuple(sorted(set(event_ids))),
+        queued=queued,
+        deduped=deduped,
+        transitions=transitions,
+    )
+    return _managed_v2_receipt(
+        base,
+        runtime=runtime,
+        manifest_generation=manifest.generation,
+        manifest_source_digest=manifest.source_digest,
+        classifications=classifications,
+    )
+
+
+def mark_managed_async_delegation_delivered_exact(
+    event: Dict[str, Any],
+    *,
+    crash_hook: Optional[Callable[[str], None]] = None,
+) -> ManagedAsyncDelegationRecoveryReceipt:
+    """ACK exactly the outbox-bound tracker authority named by a managed event."""
+    metadata = event.get("managed_delivery") if isinstance(event, dict) else None
+    try:
+        if (
+            not isinstance(metadata, dict)
+            or set(metadata) != {
+                "protocol", "outbox_path", "event_id", "profile_id",
+                "manifest_generation", "tracker_path", "tracker_hash",
+                "manifest_source_digest",
+                "tracker_identity", "runtime_generation",
+            }
+            or metadata.get("protocol") != 2
+            or event.get("managed_event_id") != metadata.get("event_id")
+        ):
+            raise ValueError("managed delivery metadata is invalid")
+        outbox = Path(metadata["outbox_path"])
+        tracker = Path(metadata["tracker_path"])
+        profile = ManagedAsyncDelegationProfile(
+            metadata["profile_id"], tracker
+        )
+        generation = metadata["manifest_generation"]
+        source_digest = metadata["manifest_source_digest"]
+        runtime = _managed_v2_runtime()
+        if (
+            not isinstance(profile.profile_id, str)
+            or not profile.profile_id
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+                for character in profile.profile_id
+            )
+            or not isinstance(source_digest, str)
+            or len(source_digest) != 64
+            or any(character not in "0123456789abcdef" for character in source_digest)
+            or not isinstance(generation, str)
+            or not generation
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+                for character in generation
+            )
+            or not tracker.is_absolute()
+            or tracker.parent.resolve(strict=True) != tracker.parent
+            or not outbox.is_absolute()
+            or outbox.parent.resolve(strict=True) != outbox.parent
+            or tracker == outbox
+        ):
+            raise ValueError("managed delivery authority is invalid")
+    except Exception as exc:
+        base = _managed_receipt(
+            outcome=ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS,
+            trackers=(),
+            outbox=Path(metadata.get("outbox_path", "/"))
+            if isinstance(metadata, dict)
+            else Path("/"),
+            epoch="",
+            errors=(str(exc),),
+        )
+        return base
+    before = []
+    after = []
+    outbox_before = None
+    outbox_after = None
+    transitions = []
+    delegation_id = str(event.get("delegation_id") or "")
+    event_id = metadata["event_id"]
+    try:
+        with _managed_v2_authorities((tracker, outbox)) as authorities:
+            held = authorities.held_by_parent  # type: ignore[attr-defined]
+            outbox_data, outbox_identity = _managed_v2_read_outbox(
+                held[outbox.parent], outbox
+            )
+            outbox_before = (outbox_data, outbox_identity)
+            row = outbox_data["events"].get(event_id)
+            if (
+                not isinstance(row, dict)
+                or row["event"] != event
+                or row["delegation_id"] != delegation_id
+                or row["tracker_path"] != os.fspath(tracker)
+                or row["profile_id"] != profile.profile_id
+                or row["manifest_generation"] != generation
+                or row["manifest_source_digest"] != source_digest
+                or row["tracker_hash"] != metadata["tracker_hash"]
+                or row["tracker_identity"] != metadata["tracker_identity"]
+            ):
+                raise ValueError("managed ACK does not match durable binding")
+            data, identity = _managed_v2_tracker(held[tracker.parent], profile, generation)
+            before.append((tracker, data, identity))
+            if (
+                _managed_json_hash(data) != row["tracker_current_hash"]
+                or _managed_identity(identity) != row["tracker_current_identity"]
+            ):
+                raise ValueError("managed ACK tracker authority changed")
+            entry = data["records"].get(delegation_id)
+            if not isinstance(entry, dict):
+                raise ValueError("managed ACK tracker record is absent")
+            if row["state"] != "delivered":
+                row["state"] = "delivered"
+                row["delivered_at"] = time.time()
+                outbox_identity = held[outbox.parent].atomic_write_json(
+                    outbox,
+                    outbox_data,
+                    expected=outbox_identity,
+                    max_bytes=_MAX_MANAGED_OUTBOX_BYTES,
+                    sort_keys=True,
+                )
+            _managed_crash_hook(crash_hook, "delivered_committed")
+            old = str(entry.get("delivery_status") or "")
+            if old != "delivered":
+                entry["delivery_status"] = "delivered"
+                entry["record"]["delivery_status"] = "delivered"
+                transitions.append((delegation_id, old, "delivered"))
+                identity = held[tracker.parent].atomic_write_json(
+                    tracker,
+                    data,
+                    expected=identity,
+                    max_bytes=_MAX_PERSISTENCE_BYTES,
+                    sort_keys=True,
+                )
+                row["tracker_current_hash"] = _managed_json_hash(data)
+                row["tracker_current_identity"] = _managed_identity(identity)
+                outbox_identity = held[outbox.parent].atomic_write_json(
+                    outbox,
+                    outbox_data,
+                    expected=outbox_identity,
+                    max_bytes=_MAX_MANAGED_OUTBOX_BYTES,
+                    sort_keys=True,
+                )
+            reread, final_identity = _managed_v2_tracker(
+                held[tracker.parent], profile, generation
+            )
+            after.append((tracker, reread, final_identity))
+            final_outbox, final_outbox_identity = _managed_v2_read_outbox(
+                held[outbox.parent], outbox
+            )
+            outbox_after = (final_outbox, final_outbox_identity)
+    except Exception as exc:
+        if getattr(exc, "_managed_crash_injection", False):
+            raise
+        base = _managed_receipt(
+            outcome=ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS,
+            trackers=(tracker,),
+            outbox=outbox,
+            epoch=runtime[3],
+            before=before,
+            after=after,
+            outbox_before=outbox_before,
+            outbox_after=outbox_after,
+            delegation_ids=(delegation_id,),
+            event_ids=(event_id,),
+            transitions=transitions,
+            errors=(str(exc),),
+        )
+        return _managed_v2_receipt(
+            base,
+            runtime=runtime,
+            manifest_generation=generation,
+            manifest_source_digest=source_digest,
+            classifications=((delegation_id, "ack_ambiguous"),),
+        )
+    base = _managed_receipt(
+        outcome=ManagedAsyncDelegationRecoveryOutcome.COMPLETE,
+        trackers=(tracker,),
+        outbox=outbox,
+        epoch=runtime[3],
+        before=before,
+        after=after,
+        outbox_before=outbox_before,
+        outbox_after=outbox_after,
+        delegation_ids=(delegation_id,),
+        event_ids=(event_id,),
+        transitions=transitions,
+    )
+    return _managed_v2_receipt(
+        base,
+        runtime=runtime,
+        manifest_generation=generation,
+        manifest_source_digest=source_digest,
+        classifications=((delegation_id, "delivered"),),
+    )
+
 
 def _publish_completion_once(process_registry: Any, delegation_id: str, evt: dict) -> bool:
     """Publish one durable event at most once in this process."""
@@ -167,7 +1686,7 @@ def active_count() -> int:
 
 
 def _new_delegation_id() -> str:
-    return f"deleg_{uuid.uuid4().hex[:8]}"
+    return f"deleg_default_legacy_{uuid.uuid4()}"
 
 
 def _safe_process_start_token(pid: int) -> Optional[str]:
