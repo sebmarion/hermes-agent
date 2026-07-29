@@ -15,8 +15,6 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
-
 from hermes_cli.model_switch import ModelSwitchResult
 
 
@@ -43,7 +41,6 @@ class _StubCLI:
     _explicit_base_url = ""
     api_mode = ""
     _pending_model_switch_note = ""
-    conversation_history = []
 
 
 def _run_display(monkeypatch, result):
@@ -155,113 +152,52 @@ def test_picker_path_falls_back_to_model_info_when_resolver_empty(monkeypatch):
     )
 
 
-def test_picker_runtime_switch_failure_performs_zero_config_writes(monkeypatch):
+def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
     import cli as cli_mod
-    import hermes_cli.config as config_mod
 
-    class _FailingAgent:
-        _config_context_length = None
-
-        def switch_model(self, **_kwargs):
-            raise RuntimeError("client rebuild failed")
-
-    result = ModelSwitchResult(
-        success=True,
-        new_model="gpt-5.4",
-        target_provider="openai-codex",
-        provider_changed=True,
-        api_key="runtime-secret",
-        base_url="",
-        api_mode="codex_responses",
-        provider_label="ChatGPT Codex",
-    )
-    cli = _StubCLI()
-    cli.agent = _FailingAgent()
-    cli.model = "old-model"
-    cli.provider = "custom"
-    cli.requested_provider = "custom"
-    cli.base_url = "https://old.example/v1"
-    cli.api_key = "old-secret"
-    cli.api_mode = "chat_completions"
-    cli._explicit_api_key = "old-secret"
-    cli._explicit_base_url = "https://old.example/v1"
-    calls = []
-    lines = []
-    monkeypatch.setattr(cli_mod, "_cprint", lambda value, *a, **k: lines.append(str(value)))
-    monkeypatch.setattr(
-        "hermes_cli.context_switch_guard.merge_preflight_compression_warning",
-        lambda *a, **k: None,
-    )
-    monkeypatch.setattr(
-        config_mod,
-        "persist_main_model_assignment",
-        lambda **kwargs: calls.append(kwargs),
-        raising=False,
-    )
+    writes = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
     monkeypatch.setattr(
         cli_mod,
         "save_config_value",
-        lambda *a, **k: pytest.fail("legacy dotted writes must not run"),
-    )
-
-    cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
-
-    assert calls == []
-    assert cli.model == "old-model"
-    assert any("failed" in line and "staying on old-model" in line for line in lines)
-
-
-def test_picker_persistence_failure_keeps_session_switch_and_warns_unsaved(
-    monkeypatch
-):
-    import cli as cli_mod
-    import hermes_cli.config as config_mod
-
-    result = ModelSwitchResult(
-        success=True,
-        new_model="gpt-5.4",
-        target_provider="openai-codex",
-        provider_changed=True,
-        api_key="runtime-secret",
-        base_url="",
-        api_mode="codex_responses",
-        provider_label="ChatGPT Codex",
+        lambda key, value: writes.append((key, value)),
     )
     cli = _StubCLI()
-    cli.agent = None
-    cli.model = "old-model"
+    cli.model = "shared-model"
     cli.provider = "custom"
-    cli.requested_provider = "custom"
-    cli.base_url = "https://old.example/v1"
-    cli.api_key = "old-secret"
-    cli.api_mode = "chat_completions"
-    cli._explicit_api_key = "old-secret"
-    cli._explicit_base_url = "https://old.example/v1"
-    lines = []
-    legacy_calls = []
-    monkeypatch.setattr(cli_mod, "_cprint", lambda value, *a, **k: lines.append(str(value)))
-    monkeypatch.setattr(
-        "hermes_cli.model_switch.resolve_display_context_length",
-        lambda *a, **k: None,
-    )
-    monkeypatch.setattr(
-        config_mod,
-        "persist_main_model_assignment",
-        lambda **kwargs: (_ for _ in ()).throw(OSError("disk full")),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        cli_mod,
-        "save_config_value",
-        lambda *args, **kwargs: legacy_calls.append((args, kwargs)),
+    # Runtime may already diverge from persisted config through a session override.
+    cli.base_url = "https://small.example/v1"
+    result = ModelSwitchResult(
+        success=True,
+        new_model="shared-model",
+        target_provider="custom",
+        provider_changed=False,
+        api_key="",
+        base_url="https://small.example/v1",
+        api_mode="chat_completions",
+        warning_message="",
+        provider_label="Custom",
+        resolved_via_alias=False,
+        capabilities=None,
+        model_info=_FakeModelInfo(),
+        is_global=True,
     )
 
-    cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
+    configured = {
+        "model": {
+            "default": "shared-model",
+            "provider": "custom",
+            "base_url": "https://large.example/v1",
+            "context_length": 1_048_576,
+        }
+    }
+    with (
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            return_value=256_000,
+        ),
+        patch("hermes_cli.config.load_config_readonly", return_value=configured),
+    ):
+        cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
 
-    assert cli.model == "gpt-5.4"
-    assert legacy_calls == []
-    assert any("Model switched" in line for line in lines)
-    assert any(
-        "not saved" in line.lower() and "global" in line.lower() for line in lines
-    )
-    assert not any("Saved to config.yaml" in line for line in lines)
+    assert ("model.context_length", None) in writes

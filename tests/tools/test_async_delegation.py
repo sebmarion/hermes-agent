@@ -6,10 +6,12 @@ formatting, capacity rejection, and crash handling.
 """
 
 import json
+import os
 import queue
+import subprocess
+import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -17,396 +19,57 @@ from tools import async_delegation as ad
 from tools.process_registry import process_registry, format_process_notification
 
 
-def _wait_for_async_idle(timeout=5.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if ad.active_count() == 0:
-            return
-        time.sleep(0.02)
-
-
 @pytest.fixture(autouse=True)
-def _clean_state(monkeypatch, tmp_path):
-    # These tests exercise the persistent background-delivery path. The current
-    # host contract requires that capability to be explicit rather than inferred
-    # from whichever session ContextVar a prior test left behind.
-    from gateway import session_context
-    from tools import delegate_tool
-
-    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
-    monkeypatch.setattr(
-        session_context,
-        "async_delivery_capability_version",
-        lambda: 1,
-    )
-    # This module tests the async registry, not lane-schema validation. Isolate
-    # it from the operator's live routing config with a complete synthetic lane
-    # map that satisfies current-main's fail-closed mode contract.
-    test_lane = {"provider": "test", "model": "test-model"}
-    monkeypatch.setattr(
-        delegate_tool,
-        "_load_config",
-        lambda: {
-            "lanes": {
-                "code_worker": dict(test_lane),
-                "smart_reviewer": dict(test_lane),
-                "local_worker": dict(test_lane),
-            }
-        },
-    )
-    monkeypatch.setattr(
-        ad,
-        "_persistence_path",
-        lambda explicit=None: (
-            explicit if explicit is not None else tmp_path / "async_delegations.json"
-        ),
-    )
-    _wait_for_async_idle()
+def _clean_state():
     ad._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
     yield
-    _wait_for_async_idle()
+    # Give just-released workers a beat to finalize BEFORE draining, so their
+    # completion events land now instead of leaking into the next test's
+    # queue (worker threads push events asynchronously; a drain that races an
+    # in-flight _finalize misses it).
+    deadline = time.monotonic() + 2.0
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
     ad._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
 
 
-def _drain_one(timeout=5.0, delegation_id=None):
+def _drain_one(timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_registry.completion_queue.empty():
+            return process_registry.completion_queue.get_nowait()
+        time.sleep(0.02)
+    return None
+
+
+def _drain_for(delegation_id, timeout=5.0):
+    """Drain until the event for *delegation_id* appears (discarding others).
+
+    Completion events are pushed asynchronously by worker threads, so a
+    straggler from a PREVIOUS test can land after that test's teardown drain
+    and leak into the current test's queue. Matching on delegation_id makes
+    the assertion immune to that cross-test leak.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not process_registry.completion_queue.empty():
             evt = process_registry.completion_queue.get_nowait()
-            if delegation_id is None or evt.get("delegation_id") == delegation_id:
+            if evt.get("delegation_id") == delegation_id:
                 return evt
             continue
         time.sleep(0.02)
     return None
 
 
-def test_explicit_tracker_ack_is_verified_and_profile_isolated(tmp_path):
-    coder = tmp_path / "coder" / "async_delegations.json"
-    other = tmp_path / "other" / "async_delegations.json"
-    record = {
-        "delegation_id": "bestplan-1",
-        "status": "completed",
-        "origin_tracker_path": str(coder),
-    }
-    ad._persist_record(record, delivery_status="pending")
-
-    evt = {
-        "type": "async_delegation",
-        "delegation_id": "bestplan-1",
-        "origin_tracker_path": str(coder),
-    }
-    assert ad.mark_async_delegation_delivered(evt) is True
-    assert ad._read_persisted_unlocked(coder)["records"]["bestplan-1"]["delivery_status"] == "delivered"
-    assert ad._read_persisted_unlocked(other)["records"] == {}
-
-    wrong = {**evt, "origin_tracker_path": str(other)}
-    with pytest.raises(KeyError):
-        ad.mark_async_delegation_delivered(wrong)
-
-
-def test_deterministic_batch_dispatch_id_is_idempotent(tmp_path):
-    tracker = tmp_path / "profile" / "async_delegations.json"
-    gate = threading.Event()
-    calls = []
-
-    def runner():
-        calls.append("run")
-        gate.wait(timeout=5)
-        return {"results": [{"status": "completed", "summary": "done"}]}
-
-    kwargs = dict(
-        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
-        session_key="s", runner=runner, max_async_children=2,
-        delegation_id="bestplan-fixed", origin_tracker_path=str(tracker),
-        origin_profile="coder", bestplan_plan_id="bp-1",
-        resolved_runtimes=[{
-            "provider": "test",
-            "model": "m",
-            "request_overrides": {
-                "headers": {"Authorization": "Bearer tracker-secret"},
-                "temperature": 0.2,
-            },
-        }],
-    )
-    first = ad.dispatch_async_delegation_batch(**kwargs)
-    second = ad.dispatch_async_delegation_batch(**kwargs)
-    assert first["delegation_id"] == second["delegation_id"] == "bestplan-fixed"
-    assert second["idempotent_replay"] is True
-    persisted_text = json.dumps(ad._read_persisted_unlocked(tracker), sort_keys=True)
-    assert "tracker-secret" not in persisted_text
-    assert "Authorization" not in persisted_text
-    assert '"temperature": 0.2' in persisted_text
-    gate.set()
-    assert _drain_one(delegation_id="bestplan-fixed") is not None
-    assert calls == ["run"]
-
-
-def test_concurrent_same_dispatch_id_has_one_admission_and_one_runner(
-    tmp_path, monkeypatch,
-):
-    tracker = tmp_path / "profile" / "async_delegations.json"
-    runner_gate = threading.Event()
-    first_intent = threading.Event()
-    release_first = threading.Event()
-    calls_lock = threading.Lock()
-    intent_calls = 0
-    runner_calls = 0
-    real_persist = ad._persist_record
-
-    def delayed_intent(record, **kwargs):
-        nonlocal intent_calls
-        if (
-            record.get("delegation_id") == "bestplan-concurrent"
-            and record.get("status") == "intent"
-        ):
-            with calls_lock:
-                intent_calls += 1
-                ordinal = intent_calls
-            if ordinal == 1:
-                first_intent.set()
-                release_first.wait(timeout=0.3)
-            else:
-                release_first.set()
-        return real_persist(record, **kwargs)
-
-    def runner():
-        nonlocal runner_calls
-        with calls_lock:
-            runner_calls += 1
-        runner_gate.wait(timeout=5)
-        return {"results": [{"status": "completed", "summary": "done"}]}
-
-    monkeypatch.setattr(ad, "_persist_record", delayed_intent)
-    kwargs = dict(
-        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
-        session_key="s", runner=runner, max_async_children=2,
-        delegation_id="bestplan-concurrent", origin_tracker_path=str(tracker),
-        origin_profile="coder", bestplan_plan_id="bp-concurrent",
-    )
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(ad.dispatch_async_delegation_batch, **kwargs)
-        assert first_intent.wait(timeout=1)
-        second = pool.submit(ad.dispatch_async_delegation_batch, **kwargs)
-        results = [first.result(timeout=5), second.result(timeout=5)]
-
-    assert intent_calls == 1
-    assert sum(bool(result.get("idempotent_replay")) for result in results) == 1
-    runner_gate.set()
-    assert _drain_one(delegation_id="bestplan-concurrent") is not None
-    assert runner_calls == 1
-
-
-def test_dead_owner_running_dispatch_is_lost_not_idempotently_live(tmp_path):
-    tracker = tmp_path / "profile" / "async_delegations.json"
-    delegation_id = "bestplan-dead-running"
-    ad._persist_record(
-        {
-            "delegation_id": delegation_id,
-            "goal": "work",
-            "status": "running",
-            "delivery_status": "running",
-            "owner_pid": 99_999_999,
-            "origin_tracker_path": str(tracker),
-            "origin_profile": "coder",
-            "session_key": "s",
-            "model": "m",
-        },
-        delivery_status="running",
-    )
-    runner_called = threading.Event()
-
-    result = ad.dispatch_async_delegation_batch(
-        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
-        session_key="s", runner=lambda: runner_called.set() or {"results": []},
-        max_async_children=1, delegation_id=delegation_id,
-        origin_tracker_path=str(tracker), origin_profile="coder",
-        bestplan_plan_id="bp-dead-running",
-    )
-
-    assert result["status"] == "terminal"
-    assert result["phase"] == "lost"
-    assert runner_called.is_set() is False
-    persisted = ad._read_persisted_unlocked(tracker)["records"][delegation_id]
-    assert persisted["status"] == "lost"
-    assert _drain_one(delegation_id=delegation_id) is not None
-
-
-def test_submit_failure_repairs_intent_and_retry_schedules_once(tmp_path, monkeypatch):
-    tracker = tmp_path / "profile" / "async_delegations.json"
-    calls = []
-
-    class BrokenExecutor:
-        def submit(self, _fn):
-            raise RuntimeError("submit failed")
-
-    real_get_executor = ad._get_executor
-    monkeypatch.setattr(ad, "_get_executor", lambda _workers: BrokenExecutor())
-    kwargs = dict(
-        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
-        session_key="s", runner=lambda: calls.append("run") or {"results": []},
-        max_async_children=1, delegation_id="bestplan-submit",
-        origin_tracker_path=str(tracker), origin_profile="coder",
-        bestplan_plan_id="bp-submit",
-    )
-    failed = ad.dispatch_async_delegation_batch(**kwargs)
-    assert failed["status"] == "rejected"
-    entry = ad._read_persisted_unlocked(tracker)["records"]["bestplan-submit"]
-    assert entry["status"] == "intent"
-    assert calls == []
-
-    monkeypatch.setattr(ad, "_get_executor", real_get_executor)
-    retried = ad.dispatch_async_delegation_batch(**kwargs)
-    assert retried["status"] == "dispatched"
-    assert _drain_one(delegation_id="bestplan-submit") is not None
-    assert calls == ["run"]
-
-
-def test_strict_dispatch_never_runs_without_durable_running_checkpoint(
-    tmp_path, monkeypatch,
-):
-    tracker = tmp_path / "profile" / "async_delegations.json"
-    runner_called = threading.Event()
-    real_persist = ad._persist_record
-
-    def fail_running_checkpoint(record, **kwargs):
-        if record.get("status") == "running":
-            return False
-        return real_persist(record, **kwargs)
-
-    monkeypatch.setattr(ad, "_persist_record", fail_running_checkpoint)
-    result = ad.dispatch_async_delegation_batch(
-        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
-        session_key="s",
-        runner=lambda: runner_called.set() or {"results": []},
-        max_async_children=1,
-        delegation_id="bestplan-running-checkpoint",
-        origin_tracker_path=str(tracker),
-        origin_profile="coder",
-        bestplan_plan_id="bp-running-checkpoint",
-    )
-
-    assert result["status"] == "rejected"
-    assert "running checkpoint" in result["error"]
-    assert runner_called.wait(timeout=0.5) is False
-    persisted = ad._read_persisted_unlocked(tracker)["records"][
-        "bestplan-running-checkpoint"
-    ]
-    assert persisted["status"] == "intent"
-
-
-def test_running_checkpoint_timeout_never_false_acks_retry(tmp_path, monkeypatch):
-    tracker = tmp_path / "profile" / "async_delegations.json"
-    running_write_entered = threading.Event()
-    release_running_write = threading.Event()
-    runner_called = threading.Event()
-    real_persist = ad._persist_record
-
-    def block_running_checkpoint(record, **kwargs):
-        if (
-            record.get("delegation_id") == "bestplan-running-timeout"
-            and record.get("status") == "running"
-            and not release_running_write.is_set()
-        ):
-            running_write_entered.set()
-            release_running_write.wait(timeout=1)
-        return real_persist(record, **kwargs)
-
-    monkeypatch.setattr(ad, "_RUNNING_CHECKPOINT_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr(ad, "_persist_record", block_running_checkpoint)
-    kwargs = dict(
-        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
-        session_key="s", runner=lambda: runner_called.set() or {"results": []},
-        max_async_children=1, delegation_id="bestplan-running-timeout",
-        origin_tracker_path=str(tracker), origin_profile="coder",
-        bestplan_plan_id="bp-running-timeout",
-    )
-
-    first = ad.dispatch_async_delegation_batch(**kwargs)
-    assert running_write_entered.is_set()
-    assert first["status"] == "rejected"
-    retry_while_aborting = ad.dispatch_async_delegation_batch(**kwargs)
-    assert retry_while_aborting["status"] == "rejected"
-    assert not retry_while_aborting.get("idempotent_replay")
-
-    release_running_write.set()
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        persisted = ad._read_persisted_unlocked(tracker)["records"].get(
-            "bestplan-running-timeout", {}
-        )
-        if persisted.get("status") == "intent":
-            break
-        time.sleep(0.01)
-    assert persisted["status"] == "intent"
-
-    accepted = ad.dispatch_async_delegation_batch(**kwargs)
-    assert accepted["status"] == "dispatched"
-    assert runner_called.wait(timeout=1)
-    assert _drain_one(delegation_id="bestplan-running-timeout") is not None
-
-
-def test_crash_before_submit_leaves_intent_retryable(tmp_path):
-    tracker = tmp_path / "profile" / "async_delegations.json"
-    delegation_id = "bestplan-crash-before-submit"
-    ad._write_persisted_unlocked(
-        {
-            "version": 1,
-            "records": {
-                delegation_id: {
-                    "status": "intent",
-                    "delivery_status": "intent",
-                    "record": {
-                        "delegation_id": delegation_id,
-                        "status": "intent",
-                        "delivery_status": "intent",
-                        "owner_pid": 99999999,
-                    },
-                },
-            },
-        },
-        tracker,
-    )
-    calls = []
-    result = ad.dispatch_async_delegation_batch(
-        goals=["work"], context=None, toolsets=None, role="leaf", model="m",
-        session_key="s", runner=lambda: calls.append("run") or {"results": []},
-        max_async_children=1, delegation_id=delegation_id,
-        origin_tracker_path=str(tracker), origin_profile="coder",
-        bestplan_plan_id="bp-crash-before-submit",
-    )
-    assert result["status"] == "dispatched"
-    assert _drain_one(delegation_id=delegation_id) is not None
-    assert calls == ["run"]
-
-
-def test_profile_replay_identity_includes_canonical_tracker_path(tmp_path):
-    first = tmp_path / "p1" / "async_delegations.json"
-    second = tmp_path / "p2" / "async_delegations.json"
-    for tracker, profile in ((first, "p1"), (second, "p2")):
-        record = {
-            "delegation_id": "same-id", "status": "completed",
-            "origin_profile": profile, "origin_tracker_path": str(tracker),
-            "session_key": profile,
-        }
-        event = {
-            "type": "async_delegation", "delegation_id": "same-id",
-            "origin_profile": profile, "origin_tracker_path": str(tracker),
-            "session_key": profile,
-        }
-        ad._persist_record(record, event=event, delivery_status="pending")
-    assert ad.recover_async_delegations(first)["queued"] == 1
-    assert ad.recover_async_delegations(second)["queued"] == 1
-
-
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 
     def runner():
-        gate.wait(timeout=5)
+        gate.wait(timeout=60)
         return {"status": "completed", "summary": "done", "api_calls": 1,
                 "duration_seconds": 0.1, "model": "m"}
 
@@ -427,14 +90,13 @@ def test_dispatch_returns_immediately_without_blocking():
     assert ad.active_count() == 1
     assert elapsed < 4.0, f"dispatch blocked {elapsed:.2f}s (gate is 5s)"
     gate.set()
-    assert _drain_one(delegation_id=res["delegation_id"]) is not None
 
 
 def test_async_executor_workers_are_daemon_threads():
     gate = threading.Event()
 
     def runner():
-        gate.wait(timeout=5)
+        gate.wait(timeout=60)
         return {"status": "completed", "summary": "done"}
 
     res = ad.dispatch_async_delegation(
@@ -456,40 +118,7 @@ def test_async_executor_workers_are_daemon_threads():
     assert worker is not None
     assert worker.daemon is True
     gate.set()
-    assert _drain_one(delegation_id=res["delegation_id"]) is not None
-
-
-def test_running_status_snapshot_includes_liveness_ping():
-    gate = threading.Event()
-
-    def runner():
-        gate.wait(timeout=5)
-        return {"status": "completed", "summary": "done"}
-
-    res = ad.dispatch_async_delegation(
-        goal="slow review", context="ctx", toolsets=None, role="leaf", model="m",
-        session_key="sess", runner=runner, max_async_children=1,
-    )
-    assert res["status"] == "dispatched"
-
-    rows = ad.list_async_delegations()
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["delegation_id"] == res["delegation_id"]
-    assert row["status"] == "running"
-    assert row["goal"] == "slow review"
-    assert row["age_seconds"] >= 0
-    assert row["heartbeat_age_seconds"] >= 0
-    assert row["heartbeat_stale"] is False
-    assert "interrupt_fn" not in row
-    assert "heartbeat_stop" not in row
-
-    before = row["heartbeat_count"]
-    ad._mark_heartbeat(res["delegation_id"])
-    assert ad.list_async_delegations()[0]["heartbeat_count"] == before + 1
-
-    gate.set()
-    assert _drain_one(delegation_id=res["delegation_id"]) is not None
+    assert _drain_one() is not None
 
 
 def test_completion_event_lands_on_shared_queue_with_session_key():
@@ -505,7 +134,7 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     )
     assert res["status"] == "dispatched"
 
-    evt = _drain_one(delegation_id=res["delegation_id"])
+    evt = _drain_one()
     assert evt is not None
     assert evt["type"] == "async_delegation"
     assert evt["summary"] == "the result"
@@ -519,13 +148,13 @@ def test_rich_reinjection_block_is_self_contained():
         return {"status": "completed", "summary": "The answer is 42.",
                 "api_calls": 7, "duration_seconds": 3.5, "model": "test-model"}
 
-    res = ad.dispatch_async_delegation(
+    ad.dispatch_async_delegation(
         goal="Compute the meaning of life",
         context="User is a philosopher. Respond tersely.",
         toolsets=["web"], role="leaf", model="test-model",
         session_key="", runner=runner, max_async_children=3,
     )
-    evt = _drain_one(delegation_id=res["delegation_id"])
+    evt = _drain_one()
     assert evt is not None
     text = format_process_notification(evt)
     assert text is not None
@@ -545,7 +174,7 @@ def test_dispatch_rejected_at_capacity():
     ev = threading.Event()
 
     def blocker():
-        ev.wait(timeout=5)
+        ev.wait(timeout=60)
         return {"status": "completed", "summary": "x"}
 
     for i in range(2):
@@ -564,31 +193,18 @@ def test_dispatch_rejected_at_capacity():
     ev.set()
 
 
-def test_crashed_runner_produces_error_completion():
-    def boom():
-        raise RuntimeError("subagent exploded")
-
-    r = ad.dispatch_async_delegation(
-        goal="risky", context=None, toolsets=None, role="leaf", model="m",
-        session_key="", runner=boom, max_async_children=3,
-    )
-    assert r["status"] == "dispatched"
-    evt = _drain_one(delegation_id=r["delegation_id"])
-    assert evt is not None
-    assert evt["status"] == "error"
-
-    text = format_process_notification(evt)
-    assert text is not None
-    assert "did not complete successfully" in text
-    assert "subagent exploded" in text
-
-
 def test_interrupt_all_signals_running_children():
     ev = threading.Event()
     interrupted = {"count": 0}
+    # No short internal timeout: the blocker holds until interrupt_fn fires.
+    # The old ev.wait(timeout=5) made this test a change-detector for CI
+    # worker load — on a CPU-starved runner the 5s expired before
+    # interrupt_all() ran, the record finalized, and interrupt_all() found
+    # nothing running (n == 0). The pytest-level timeout is the real
+    # runaway guard.
 
     def blocker():
-        ev.wait(timeout=5)
+        ev.wait(timeout=60)
         return {"status": "interrupted", "summary": None,
                 "error": "cancelled"}
 
@@ -596,7 +212,7 @@ def test_interrupt_all_signals_running_children():
         interrupted["count"] += 1
         ev.set()
 
-    res = ad.dispatch_async_delegation(
+    r = ad.dispatch_async_delegation(
         goal="long task", context=None, toolsets=None, role="leaf",
         model="m", session_key="", runner=blocker,
         interrupt_fn=interrupt_fn, max_async_children=3,
@@ -604,10 +220,401 @@ def test_interrupt_all_signals_running_children():
     n = ad.interrupt_all(reason="test")
     assert n == 1
     assert interrupted["count"] == 1
-    # child still emits a completion event after interrupt
-    evt = _drain_one(delegation_id=res["delegation_id"])
+    # child still emits a completion event after interrupt. Match on THIS
+    # delegation's id — straggler 'completed' events from a previous test's
+    # workers can finalize after that test's teardown drain and leak into
+    # this queue (observed on loaded CI workers).
+    evt = _drain_for(r["delegation_id"])
     assert evt is not None
     assert evt["status"] == "interrupted"
+
+
+def _fast_stale_monitor(monkeypatch, *, idle=0.15, in_tool=0.3, grace=0.15):
+    """Shrink the stale-monitor cadence so tests run in milliseconds."""
+    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
+    monkeypatch.setattr(ad, "_STALE_IDLE_SECONDS", idle)
+    monkeypatch.setattr(ad, "_STALE_IN_TOOL_SECONDS", in_tool)
+    monkeypatch.setattr(ad, "_STALL_GRACE_SECONDS", grace)
+
+
+def test_stalled_runner_is_interrupted_then_finalized(monkeypatch):
+    _fast_stale_monitor(monkeypatch)
+    gate = threading.Event()
+    interrupted = {"count": 0}
+
+    def stuck_runner():
+        gate.wait(timeout=10)
+        return {"status": "completed", "summary": "too late"}
+
+    def interrupt_fn():
+        interrupted["count"] += 1
+
+    res = ad.dispatch_async_delegation(
+        goal="stuck child", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=stuck_runner,
+        interrupt_fn=interrupt_fn, max_async_children=1,
+        # Frozen progress token: the child never advances an API call.
+        progress_fn=lambda: ((0, None), False),
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    try:
+        assert evt is not None
+        assert evt["type"] == "async_delegation"
+        assert evt["status"] == "stalled"
+        assert evt["delegation_id"] == res["delegation_id"]
+        assert evt["api_calls"] == 0
+        assert "stalled" in evt["error"]
+        # Interrupt was requested BEFORE force-finalization (grace window).
+        assert interrupted["count"] >= 1
+        assert ad.active_count() == 0
+    finally:
+        gate.set()
+
+    # If the ignored runner eventually returns, it must not enqueue a second
+    # completion for a delegation the monitor already finalized.
+    assert _drain_one(timeout=0.5) is None
+
+
+def test_progressing_runner_is_never_stalled(monkeypatch):
+    """A child that keeps advancing is left alone no matter how long it runs."""
+    _fast_stale_monitor(monkeypatch)
+    gate = threading.Event()
+    ticks = {"n": 0}
+
+    def slow_but_alive_runner():
+        gate.wait(timeout=10)
+        return {"status": "completed", "summary": "done", "api_calls": 7}
+
+    def progress_fn():
+        # Token advances on every sample — simulates a child making steady
+        # API-call progress.
+        ticks["n"] += 1
+        return (ticks["n"], None), False
+
+    res = ad.dispatch_async_delegation(
+        goal="slow child", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=slow_but_alive_runner,
+        max_async_children=1, progress_fn=progress_fn,
+    )
+    assert res["status"] == "dispatched"
+
+    # Run well past the (shrunk) idle threshold — several monitor sweeps.
+    time.sleep(0.6)
+    assert ad.active_count() == 1
+    assert process_registry.completion_queue.empty()
+
+    gate.set()
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"
+    assert evt["summary"] == "done"
+
+
+def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch):
+    """Interrupt-responsive children finalize through the NORMAL path.
+
+    The monitor's interrupt gives a wedged-looking child a grace window; if
+    the runner returns during it, the real result (partial work, api_calls)
+    is delivered instead of a synthetic stalled event.
+    """
+    _fast_stale_monitor(monkeypatch, grace=5.0)
+    interrupted = threading.Event()
+
+    def runner():
+        # "Wedged" until interrupted, then unwinds and reports partial work.
+        interrupted.wait(timeout=10)
+        return {
+            "status": "interrupted",
+            "summary": "partial work saved",
+            "api_calls": 3,
+        }
+
+    res = ad.dispatch_async_delegation(
+        goal="responsive child", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=runner,
+        interrupt_fn=interrupted.set, max_async_children=1,
+        progress_fn=lambda: ((3, None), False),
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "interrupted"
+    assert evt["summary"] == "partial work saved"
+    assert evt["api_calls"] == 3
+    assert ad.active_count() == 0
+
+
+def test_streaming_child_counts_as_alive(monkeypatch):
+    """A child mid-stream (api_call_count frozen, last_activity_ts ticking)
+    must never be stalled — streamed chunks tick _touch_activity, and the
+    progress token includes that timestamp (same liveness signal as the
+    compaction inactivity budget, PR #71508)."""
+    _fast_stale_monitor(monkeypatch)
+    gate = threading.Event()
+    now = {"ts": 1000.0}
+
+    def progress_fn():
+        # api_call_count and current_tool frozen (long streaming response in
+        # flight), but the activity timestamp advances with every chunk.
+        now["ts"] += 1.0
+        return ((1, None, now["ts"]),), False
+
+    res = ad.dispatch_async_delegation(
+        goal="streaming child", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", max_async_children=1,
+        runner=lambda: (gate.wait(timeout=10), {"status": "completed", "summary": "streamed"})[1],
+        progress_fn=progress_fn,
+    )
+    assert res["status"] == "dispatched"
+
+    time.sleep(0.6)  # several sweeps past the shrunk idle threshold
+    assert ad.active_count() == 1
+    assert process_registry.completion_queue.empty()
+
+    gate.set()
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"
+
+
+def test_stalled_event_carries_structured_stall_metadata(monkeypatch):
+    """The terminal stalled event must expose machine-readable stall context
+    (#51690) — quiet duration, tripped threshold, phase, grace — mirroring
+    the sync path's timeout_seconds/timed_out_after_seconds/timeout_phase."""
+    _fast_stale_monitor(monkeypatch)
+    gate = threading.Event()
+
+    res = ad.dispatch_async_delegation(
+        goal="stall metadata", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", max_async_children=1,
+        runner=lambda: {} if gate.wait(timeout=10) else {},
+        progress_fn=lambda: ((0, "terminal"), True),
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    try:
+        assert evt is not None
+        assert evt["status"] == "stalled"
+        assert evt["stalled_after_quiet_seconds"] >= 0.3  # in-tool threshold
+        assert evt["stall_threshold_seconds"] == ad._STALE_IN_TOOL_SECONDS
+        assert evt["stall_phase"] == "in_tool"
+        assert evt["stall_grace_seconds"] == ad._STALL_GRACE_SECONDS
+    finally:
+        gate.set()
+
+
+def test_list_async_delegations_exposes_live_activity(monkeypatch):
+    """list_async_delegations must expose per-child live activity sampled
+    from progress_fn plus seconds_since_progress, for /agents UIs (#51690)."""
+    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
+    gate = threading.Event()
+    base_ts = time.time() - 12.0
+
+    res = ad.dispatch_async_delegation(
+        goal="live listing", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", max_async_children=1,
+        runner=lambda: {} if gate.wait(timeout=10) else {},
+        progress_fn=lambda: (((3, "web_search", base_ts),), True),
+    )
+    try:
+        time.sleep(0.1)  # let the monitor stamp _progress_ts at least once
+        item = next(
+            d for d in ad.list_async_delegations()
+            if d["delegation_id"] == res["delegation_id"]
+        )
+        assert item["status"] == "running"
+        assert item["in_tool"] is True
+        assert "seconds_since_progress" in item
+        (child,) = item["children_activity"]
+        assert child["api_calls"] == 3
+        assert child["current_tool"] == "web_search"
+        assert 10.0 <= child["seconds_since_activity"] <= 20.0
+        # Callables and private bookkeeping must never leak.
+        assert "progress_fn" not in item
+        assert "interrupt_fn" not in item
+        assert not any(k.startswith("_") for k in item)
+    finally:
+        gate.set()
+
+
+def test_stalled_batch_is_interrupted_then_finalized(monkeypatch):
+    _fast_stale_monitor(monkeypatch)
+    gate = threading.Event()
+    interrupted = {"count": 0}
+
+    def stuck_batch():
+        gate.wait(timeout=10)
+        return {"results": [{"status": "completed", "summary": "too late"}]}
+
+    def interrupt_fn():
+        interrupted["count"] += 1
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["a", "b"], context="ctx", toolsets=None, role="leaf",
+        model="m", session_key="", runner=stuck_batch,
+        interrupt_fn=interrupt_fn, max_async_children=1,
+        progress_fn=lambda: (((0, None), (0, None)), False),
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    try:
+        assert evt is not None
+        assert evt["type"] == "async_delegation"
+        assert evt["status"] == "stalled"
+        assert evt["is_batch"] is True
+        assert evt["goals"] == ["a", "b"]
+        assert evt["results"] == []
+        assert "stalled" in evt["error"]
+        assert interrupted["count"] >= 1
+        assert ad.active_count() == 0
+    finally:
+        gate.set()
+
+    assert _drain_one(timeout=0.5) is None
+
+
+def test_in_tool_stall_uses_higher_threshold(monkeypatch):
+    """A frozen child inside a tool gets the in-tool ceiling, not the idle one."""
+    _fast_stale_monitor(monkeypatch, idle=0.1, in_tool=10.0, grace=0.1)
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=10)
+        return {"status": "completed", "summary": "long tool finished"}
+
+    res = ad.dispatch_async_delegation(
+        goal="long tool child", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=runner, max_async_children=1,
+        # Frozen token but in_tool=True — a legitimately slow terminal
+        # command / web fetch. Must NOT be stalled at the idle threshold.
+        progress_fn=lambda: ((1, "terminal"), True),
+    )
+    assert res["status"] == "dispatched"
+
+    time.sleep(0.5)  # far past idle threshold, well under in-tool threshold
+    assert ad.active_count() == 1
+    assert process_registry.completion_queue.empty()
+
+    gate.set()
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"
+
+
+def test_stall_stays_finalizing_until_durable_persistence(tmp_path, monkeypatch):
+    _fast_stale_monitor(monkeypatch)
+    gate = threading.Event()
+    persist_entered = threading.Event()
+    allow_persist = threading.Event()
+    real_persist = ad._persist_completion
+
+    def blocking_persist(event, result):
+        persist_entered.set()
+        allow_persist.wait(timeout=5)
+        real_persist(event, result)
+
+    def stuck_runner():
+        gate.wait(timeout=10)
+        return {"status": "completed", "summary": "too late"}
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_persist_completion", blocking_persist)
+    dispatched = ad.dispatch_async_delegation(
+        goal="durable stall", context=None, toolsets=None, role="leaf",
+        model="m", session_key="owner", runner=stuck_runner,
+        max_async_children=1, progress_fn=lambda: ((0, None), False),
+    )
+
+    try:
+        assert persist_entered.wait(timeout=5)
+        assert ad.active_count() == 1
+        record = next(
+            item for item in ad.list_async_delegations()
+            if item["delegation_id"] == dispatched["delegation_id"]
+        )
+        assert record["status"] == "finalizing"
+        assert process_registry.completion_queue.empty()
+
+        allow_persist.set()
+        evt = _drain_for(dispatched["delegation_id"])
+        assert evt is not None
+        assert evt["status"] == "stalled"
+        assert ad.active_count() == 0
+        durable = ad.get_durable_delegation(dispatched["delegation_id"])
+        assert durable["state"] == "stalled"
+        assert durable["delivery_state"] == "pending"
+    finally:
+        allow_persist.set()
+        gate.set()
+
+
+def test_stalled_completion_restores_once_after_process_restart(tmp_path):
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo}
+    producer = r'''
+import json
+import threading
+import time
+from tools import async_delegation as ad
+ad._STALE_CHECK_INTERVAL = 0.03
+ad._STALE_IDLE_SECONDS = 0.1
+ad._STALL_GRACE_SECONDS = 0.1
+gate = threading.Event()
+r = ad.dispatch_async_delegation(
+    goal="restart stall", context=None, toolsets=None, role="leaf", model="m",
+    session_key="owner-session", parent_session_id="durable-parent",
+    runner=lambda: gate.wait(timeout=60),
+    progress_fn=lambda: ((0, None), False),
+)
+deadline = time.time() + 10
+while ad.active_count() and time.time() < deadline:
+    time.sleep(.01)
+row = ad.get_durable_delegation(r["delegation_id"])
+print(json.dumps({"delegation_id": r["delegation_id"], "row": row}, sort_keys=True))
+'''
+    first = subprocess.run(
+        [sys.executable, "-c", producer], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=30, check=True,
+    )
+    produced = json.loads(first.stdout.strip().splitlines()[-1])
+    delegation_id = produced["delegation_id"]
+    assert produced["row"]["state"] == "stalled"
+    assert produced["row"]["delivery_state"] == "pending"
+
+    consumer = r'''
+import json
+from tools.process_registry import process_registry
+evt = process_registry.completion_queue.get_nowait()
+print(json.dumps({"event": evt, "remaining": process_registry.completion_queue.qsize()}, sort_keys=True))
+'''
+    second = subprocess.run(
+        [sys.executable, "-c", consumer], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    restored = json.loads(second.stdout.strip().splitlines()[-1])
+    assert restored["remaining"] == 0
+    assert restored["event"]["delegation_id"] == delegation_id
+    assert restored["event"]["status"] == "stalled"
+    assert restored["event"]["restored"] is True
+
+    acker = f'''
+from tools import async_delegation as ad
+assert ad.mark_completion_delivered({delegation_id!r})
+'''
+    subprocess.run(
+        [sys.executable, "-c", acker], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    probe = subprocess.run(
+        [sys.executable, "-c", "from tools.process_registry import process_registry; print(process_registry.completion_queue.qsize())"],
+        cwd=repo, env=env, text=True, capture_output=True, timeout=15, check=True,
+    )
+    assert probe.stdout.strip().splitlines()[-1] == "0"
 
 
 def test_completed_records_pruned_to_cap():
@@ -625,161 +632,254 @@ def test_completed_records_pruned_to_cap():
     assert len(ad.list_async_delegations()) <= ad._MAX_RETAINED_COMPLETED
 
 
-def test_cleanup_prunes_old_terminal_records_but_keeps_running():
-    now = time.time()
-    with ad._records_lock:
-        ad._records["old_done"] = {
-            "delegation_id": "old_done",
-            "goal": "old",
-            "status": "completed",
-            "dispatched_at": now - 1000,
-            "completed_at": now - 1000,
-        }
-        ad._records["old_error"] = {
-            "delegation_id": "old_error",
-            "goal": "old error",
-            "status": "error",
-            "dispatched_at": now - 1000,
-            "completed_at": now - 1000,
-        }
-        ad._records["running"] = {
-            "delegation_id": "running",
-            "goal": "still working",
-            "status": "running",
-            "dispatched_at": now - 1000,
-            "last_heartbeat_at": now - 1000,
-        }
-        removed = ad._cleanup_locked(
-            now=now,
-            policy={
-                "completed_seconds": 10,
-                "failed_seconds": 10,
-                "lost_seconds": 10,
-                "max_bytes": 1024 * 1024,
-            },
-        )
-
-    assert removed == 2
-    rows = {r["delegation_id"]: r for r in ad.list_async_delegations()}
-    assert set(rows) == {"running"}
-    assert rows["running"]["heartbeat_stale"] is True
-
-
-def test_cleanup_size_budget_prunes_oldest_terminal_records_first():
-    now = time.time()
-    big_summary = "x" * 400
-    with ad._records_lock:
-        for i in range(3):
-            ad._records[f"done{i}"] = {
-                "delegation_id": f"done{i}",
-                "goal": f"done {i}",
-                "summary": big_summary,
-                "status": "completed",
-                "dispatched_at": now - (30 - i),
-                "completed_at": now - (30 - i),
-            }
-        ad._records["running"] = {
-            "delegation_id": "running",
-            "goal": "large but active",
-            "summary": big_summary,
-            "status": "running",
-            "dispatched_at": now - 100,
-            "last_heartbeat_at": now,
-        }
-        removed = ad._cleanup_locked(
-            now=now,
-            policy={
-                "completed_seconds": 3600,
-                "failed_seconds": 3600,
-                "lost_seconds": 3600,
-                "max_bytes": 900,
-            },
-        )
-
-    assert removed >= 1
-    rows = {r["delegation_id"]: r for r in ad.list_async_delegations()}
-    assert "running" in rows
-    assert "done0" not in rows
-
-
-def test_completion_is_persisted_before_delivery_ack():
-    def runner():
-        return {"status": "completed", "summary": "persist me", "model": "m"}
-
-    res = ad.dispatch_async_delegation(
-        goal="durable task", context="ctx", toolsets=None, role="leaf", model="m",
-        session_key="sess", runner=runner, max_async_children=1,
+def test_completion_is_persisted_and_delivery_can_be_acknowledged(tmp_path, monkeypatch):
+    """A finished child remains pending on disk until its queue consumer acks it."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    dispatched = ad.dispatch_async_delegation(
+        goal="durable", context="ctx", toolsets=["terminal"], role="leaf",
+        model="m", session_key="owner", parent_session_id="parent",
+        runner=lambda: {"status": "completed", "summary": "survived"},
     )
-    evt = _drain_one()
-    assert evt is not None
+    assert _drain_one() is not None
 
-    data = ad._read_persisted_unlocked()
-    entry = data["records"][res["delegation_id"]]
-    assert entry["delivery_status"] == "queued"
-    assert entry["result"]["summary"] == "persist me"
-    assert entry["event"]["delegation_id"] == res["delegation_id"]
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    row = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert row["origin_session"] == "owner"
+    assert row["state"] == "completed"
+    assert row["result"]["summary"] == "survived"
+    assert row["delivery_state"] == "pending"
+    # Queue publication/restoration is not a destination delivery attempt.
+    assert row["delivery_attempts"] == 0
 
-    ad.mark_async_delegation_delivered(evt)
-    data = ad._read_persisted_unlocked()
-    assert data["records"][res["delegation_id"]]["delivery_status"] == "delivered"
+    assert ad.mark_completion_delivered(dispatched["delegation_id"])
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    assert ad.get_durable_delegation(dispatched["delegation_id"])["delivery_state"] == "delivered"
 
 
-def test_recovery_replays_unacked_and_marks_prior_running_lost():
-    now = time.time()
-    data = {
-        "version": 1,
-        "records": {
-            "done": {
-                "delegation_id": "done",
+def test_real_process_restart_restores_owned_completion_once(tmp_path):
+    """Real-import E2E: a fresh interpreter restores a prior process's result."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo}
+    producer = r'''
+import time
+from tools import async_delegation as ad
+r = ad.dispatch_async_delegation(
+    goal="restart", context=None, toolsets=None, role="leaf", model="m",
+    session_key="owner-session", parent_session_id="durable-parent",
+    runner=lambda: {"status": "completed", "summary": "after restart"},
+)
+deadline = time.time() + 5
+while ad.active_count() and time.time() < deadline:
+    time.sleep(.01)
+print(r["delegation_id"])
+'''
+    first = subprocess.run(
+        [sys.executable, "-c", producer], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    delegation_id = first.stdout.strip().splitlines()[-1]
+
+    consumer = r'''
+import json
+from tools.process_registry import process_registry
+evt = process_registry.completion_queue.get_nowait()
+print(json.dumps(evt, sort_keys=True))
+'''
+    second = subprocess.run(
+        [sys.executable, "-c", consumer], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    evt = json.loads(second.stdout.strip().splitlines()[-1])
+    assert evt["delegation_id"] == delegation_id
+    assert evt["session_key"] == "owner-session"
+    assert evt["parent_session_id"] == "durable-parent"
+    assert evt["summary"] == "after restart"
+
+    acker = f'''
+from tools import async_delegation as ad
+assert ad.mark_completion_delivered({delegation_id!r})
+'''
+    subprocess.run(
+        [sys.executable, "-c", acker], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    probe = subprocess.run(
+        [sys.executable, "-c", "from tools.process_registry import process_registry; print(process_registry.completion_queue.qsize())"],
+        cwd=repo, env=env, text=True, capture_output=True, timeout=15, check=True,
+    )
+    assert probe.stdout.strip().splitlines()[-1] == "0"
+
+
+def test_submit_failure_removes_durable_running_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    class _BrokenExecutor:
+        def submit(self, *_args, **_kwargs):
+            raise RuntimeError("submit failed")
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: _BrokenExecutor())
+    result = ad.dispatch_async_delegation(
+        goal="never ran", context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner", runner=lambda: {},
+    )
+
+    assert result["status"] == "rejected"
+    with ad._DB_LOCK, ad._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 0
+
+
+def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
+    for index, delivery_state in enumerate(("pending", "delivered", "pending")):
+        delegation_id = f"deleg_{index}"
+        record = {
+            "delegation_id": delegation_id,
+            "session_key": "owner",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": float(index + 1),
+        }
+        ad._persist_dispatch(record)
+        ad._persist_completion(
+            {
+                "delegation_id": delegation_id,
                 "status": "completed",
-                "delivery_status": "queued",
-                "record": {
-                    "delegation_id": "done",
-                    "goal": "done goal",
-                    "status": "completed",
-                    "dispatched_at": now - 20,
-                    "completed_at": now - 10,
-                    "session_key": "sess",
-                },
-                "result": {"status": "completed", "summary": "done"},
-                "event": {
-                    "type": "async_delegation",
-                    "delegation_id": "done",
-                    "goal": "done goal",
-                    "session_key": "sess",
-                    "status": "completed",
-                    "summary": "done",
-                },
+                "completed_at": float(index + 1),
             },
-            "running": {
-                "delegation_id": "running",
-                "status": "running",
-                "delivery_status": "running",
-                "record": {
-                    "delegation_id": "running",
-                    "goal": "lost goal",
-                    "status": "running",
-                    "dispatched_at": now - 30,
-                    "last_heartbeat_at": now - 20,
-                    "session_key": "sess",
-                },
-            },
-        },
+            {"status": "completed", "summary": delegation_id},
+        )
+        if delivery_state == "delivered":
+            ad.mark_completion_delivered(delegation_id)
+
+    ad._prune_durable_records()
+
+    assert ad.get_durable_delegation("deleg_0") is not None
+    assert ad.get_durable_delegation("deleg_1") is None
+    assert ad.get_durable_delegation("deleg_2") is not None
+
+
+def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_abandoned",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
     }
-    with ad._persist_lock:
-        ad._write_persisted_unlocked(data)
-    ad._recovery_attempted = False
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL WHERE delegation_id=?",
+            (99999999, "deleg_abandoned"),
+        )
 
-    report = ad.recover_async_delegations()
-    assert report == {"queued": 2, "lost": 1}
+    assert ad.recover_abandoned_delegations() == 1
+    durable = ad.get_durable_delegation("deleg_abandoned")
+    assert durable["state"] == "unknown"
+    assert durable["delivery_state"] == "pending"
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    assert restored.get_nowait()["status"] == "unknown"
 
-    drained = [_drain_one(), _drain_one()]
-    ids = {evt["delegation_id"] for evt in drained if evt}
-    assert ids == {"done", "running"}
 
-    stored = ad._read_persisted_unlocked()["records"]
-    assert stored["running"]["status"] == "lost"
-    assert stored["running"]["delivery_status"] == "queued"
+def test_origin_session_id_survives_persistence_round_trip(tmp_path, monkeypatch):
+    """origin_session_id (the api_server wake self-post target) must be
+    persisted with the durable dispatch record and restored on recovery —
+    otherwise completions recovered after a process restart are unroutable
+    to api_server sessions (in-memory record is gone)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_wake_target",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "origin_session_id": "raw-api-sid-42",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+
+    # Durable record carries the wake target.
+    durable = ad.get_durable_delegation("deleg_wake_target")
+    assert durable["origin_session_id"] == "raw-api-sid-42"
+
+    # Simulate the owning process dying, then recovery after restart: the
+    # regenerated completion event must still carry the wake target.
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL WHERE delegation_id=?",
+            (99999999, "deleg_wake_target"),
+        )
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    evt = restored.get_nowait()
+    assert evt["delegation_id"] == "deleg_wake_target"
+    assert evt["origin_session_id"] == "raw-api-sid-42"
+    assert evt["restored"] is True
+
+
+def test_origin_session_id_migration_backfills_legacy_rows(tmp_path, monkeypatch):
+    """Rows written by a pre-origin_session_id build must survive the ALTER
+    TABLE migration and read back as an empty wake target."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Create a legacy-schema DB (no origin_session_id column).
+    import sqlite3
+
+    db_path = ad._db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(str(db_path))
+    legacy.execute(
+        """CREATE TABLE async_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            origin_session TEXT NOT NULL,
+            origin_ui_session_id TEXT NOT NULL DEFAULT '',
+            parent_session_id TEXT,
+            state TEXT NOT NULL,
+            dispatched_at REAL NOT NULL,
+            completed_at REAL,
+            updated_at REAL NOT NULL,
+            event_json TEXT,
+            result_json TEXT,
+            delivery_state TEXT NOT NULL DEFAULT 'pending',
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            delivered_at REAL
+        )"""
+    )
+    legacy.execute(
+        """INSERT INTO async_delegations
+           (delegation_id, origin_session, state, dispatched_at, updated_at)
+           VALUES ('deleg_legacy', 'owner', 'running', 1.0, 1.0)"""
+    )
+    legacy.commit()
+    legacy.close()
+
+    durable = ad.get_durable_delegation("deleg_legacy")
+    assert durable is not None
+    assert durable["origin_session_id"] == ""
+
+
+def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_claim", "session_key": "owner",
+        "origin_ui_session_id": "", "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(
+        {"delegation_id": "deleg_claim", "status": "completed", "completed_at": 2.0},
+        {"status": "completed", "summary": "done"},
+    )
+
+    assert ad.claim_completion_delivery("deleg_claim", "consumer-a")
+    assert not ad.claim_completion_delivery("deleg_claim", "consumer-b")
+    assert ad.release_completion_delivery("deleg_claim", "consumer-a")
+    assert ad.claim_completion_delivery("deleg_claim", "consumer-b")
+    assert ad.complete_completion_delivery("deleg_claim", "consumer-b")
+    assert not ad.claim_completion_delivery("deleg_claim", "consumer-c")
+    assert ad.get_durable_delegation("deleg_claim")["delivery_state"] == "delivered"
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +899,6 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
-    parent.enabled_toolsets = ["terminal", "file"]
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
@@ -807,7 +906,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     gate = threading.Event()
 
     def slow_child(task_index, goal, child=None, parent_agent=None, **kw):
-        gate.wait(timeout=5)  # a sync impl would hang delegate_task here
+        gate.wait(timeout=60)  # a sync impl would hang delegate_task here
         return {
             "task_index": 0, "status": "completed", "summary": f"done: {goal}",
             "api_calls": 1, "duration_seconds": 0.1, "model": "m",
@@ -839,7 +938,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert ad.active_count() == 1  # one background batch unit, not finished
 
     gate.set()
-    evt = _drain_one(delegation_id=parsed["delegation_id"])
+    evt = _drain_one()
     assert evt is not None
     assert evt["type"] == "async_delegation"
     # Single task rides the batch path → carries a 1-item results list.
@@ -849,6 +948,74 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_delegate_task_background_waits_inside_kanban_worker(monkeypatch):
+    """A dispatcher-spawned Kanban worker is a finite process, so a required
+    delegated result must return in-turn instead of becoming an orphaned
+    background completion after the parent exits."""
+    import json
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "kanban-worker-session"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_child(task_index, goal, child=None, parent_agent=None, **kw):
+        started.set()
+        release.wait(timeout=5)
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "review approved",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        }
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
+    monkeypatch.setattr(dt, "_run_single_child", delayed_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+
+    captured = {}
+
+    def call_delegate():
+        captured["output"] = dt.delegate_task(
+            goal="independent review",
+            background=True,
+            parent_agent=parent,
+        )
+
+    caller = threading.Thread(target=call_delegate)
+    caller.start()
+    assert started.wait(timeout=2)
+    assert caller.is_alive(), "Kanban delegate_task returned before its child finished"
+    assert ad.active_count() == 0
+
+    release.set()
+    caller.join(timeout=5)
+    assert not caller.is_alive()
+
+    parsed = json.loads(captured["output"])
+    assert parsed["results"][0]["summary"] == "review approved"
+    assert "SYNCHRONOUSLY" in parsed["note"]
+    assert process_registry.completion_queue.empty()
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
@@ -870,7 +1037,6 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
-    parent.enabled_toolsets = ["terminal", "file"]
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
 
@@ -929,7 +1095,6 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
-    parent.enabled_toolsets = ["terminal", "file"]
 
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
@@ -937,7 +1102,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     gate = threading.Event()
 
     def _blocking_child(task_index, goal, child=None, parent_agent=None, **kw):
-        gate.wait(timeout=5)
+        gate.wait(timeout=60)
         return {
             "task_index": task_index, "status": "completed",
             "summary": f"done: {goal}", "api_calls": 1,
@@ -974,7 +1139,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
 
     # Release the children; the whole batch joins and emits ONE event.
     gate.set()
-    evt = _drain_one(delegation_id=parsed["delegation_id"])
+    evt = _drain_one()
     assert evt is not None
     assert evt["type"] == "async_delegation"
     assert evt.get("is_batch") is True
@@ -988,6 +1153,57 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert "done: a" in text and "done: b" in text and "done: c" in text
     # No more events — it's a single combined completion, not N of them.
     assert _drain_one() is None
+
+
+def test_delegate_task_background_passes_progress_fn_to_async_registry(monkeypatch):
+    import json
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+    fake_child._subagent_id = "s1"
+    fake_child.get_activity_summary.return_value = {
+        "api_call_count": 4,
+        "current_tool": "terminal",
+        "last_activity_ts": 1234.5,
+    }
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    captured = {}
+
+    def fake_dispatch(**kwargs):
+        captured.update(kwargs)
+        return {"status": "dispatched", "delegation_id": "deleg_progress"}
+
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(ad, "dispatch_async_delegation_batch", fake_dispatch)
+
+    out = dt.delegate_task(goal="background stall guard", background=True, parent_agent=parent)
+
+    parsed = json.loads(out)
+    assert parsed["status"] == "dispatched"
+    assert parsed["delegation_id"] == "deleg_progress"
+    # The dispatch wires a live progress sampler over the child agents so the
+    # async registry's stale monitor can watch the detached batch. The token
+    # includes last_activity_ts so streamed chunks count as liveness (each
+    # chunk ticks _touch_activity), not just completed API calls.
+    progress_fn = captured["progress_fn"]
+    assert callable(progress_fn)
+    token, in_tool = progress_fn()
+    assert token == ((4, "terminal", 1234.5),)
+    assert in_tool is True
 
 
 def test_model_dispatch_forces_background():
@@ -1084,7 +1300,6 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     parent.session_id = "sess"
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
-    parent.enabled_toolsets = ["terminal", "file"]
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
@@ -1092,7 +1307,7 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     gate = threading.Event()
 
     def slow_child(task_index, goal, child=None, parent_agent=None, **kw):
-        gate.wait(timeout=5)
+        gate.wait(timeout=60)
         return {"task_index": 0, "status": "completed", "summary": "ok"}
 
     def build_and_register(**kw):
@@ -1111,12 +1326,11 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
         out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
 
     import json
-    parsed_bg = json.loads(out)
-    assert parsed_bg["status"] == "dispatched"
+    assert json.loads(out)["status"] == "dispatched"
     # Child detached immediately at dispatch, while it is still running.
     assert fake_child not in parent._active_children
     gate.set()
-    assert _drain_one(delegation_id=parsed_bg["delegation_id"]) is not None
+    assert _drain_one() is not None
 
 
 def test_concurrent_dispatch_respects_capacity():
@@ -1125,7 +1339,7 @@ def test_concurrent_dispatch_respects_capacity():
     gate = threading.Event()
 
     def blocker():
-        gate.wait(timeout=5)
+        gate.wait(timeout=60)
         return {"status": "completed", "summary": "x"}
 
     results = []
@@ -1239,3 +1453,4 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
+

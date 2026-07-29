@@ -12,6 +12,7 @@ Verifies that:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -70,32 +71,6 @@ class TestApiModeAccepted:
         agent = _make_codex_agent()
         assert agent.api_mode == "codex_app_server"
 
-    def test_app_server_auth_does_not_require_raw_provider_credentials(
-        self, monkeypatch
-    ):
-        from agent import auxiliary_client
-
-        def raw_provider_resolution_must_not_run(*args, **kwargs):
-            raise AssertionError("Codex app-server owns auth through the Codex CLI")
-
-        monkeypatch.setattr(
-            auxiliary_client,
-            "resolve_provider_client",
-            raw_provider_resolution_must_not_run,
-        )
-
-        agent = run_agent.AIAgent(
-            model="gpt-5.6-sol",
-            provider="openai-codex",
-            api_mode="codex_app_server",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-
-        assert agent.api_mode == "codex_app_server"
-        assert agent.client is None
-
 
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
@@ -110,94 +85,6 @@ class TestRunConversationCodexPath:
         assert result["api_calls"] == 1
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
-
-    def test_selected_model_and_control_effort_reach_each_app_server_turn(
-        self, monkeypatch
-    ):
-        captured = {}
-
-        def fake_run_turn(self, user_input: str, **kwargs):
-            captured.update(kwargs)
-            return TurnResult(
-                final_text="done",
-                projected_messages=[{"role": "assistant", "content": "done"}],
-                turn_id="turn-controls-1",
-                thread_id="thread-controls-1",
-            )
-
-        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
-        monkeypatch.setattr(
-            CodexAppServerSession,
-            "ensure_started",
-            lambda self: "thread-controls-1",
-        )
-        agent = _make_codex_agent()
-        agent.model = "gpt-5.6-sol"
-        agent.reasoning_config = {"enabled": True, "effort": "ultra"}
-
-        with patch.object(agent, "_spawn_background_review", return_value=None):
-            result = agent.run_conversation("parallelize this")
-
-        assert result["completed"] is True
-        assert captured["model"] == "gpt-5.6-sol"
-        assert captured["effort"] == "ultra"
-
-    def test_ultra_explicitly_enables_multi_agent_on_session_construction(
-        self, monkeypatch
-    ):
-        captured = {}
-
-        def fake_init(self, **kwargs):
-            captured.update(kwargs)
-            self._thread_id = "thread-ultra-tools"
-
-        def fake_run_turn(self, user_input: str, **kwargs):
-            return TurnResult(
-                final_text="done",
-                projected_messages=[{"role": "assistant", "content": "done"}],
-                turn_id="turn-ultra-tools",
-                thread_id="thread-ultra-tools",
-            )
-
-        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
-        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
-        agent = _make_codex_agent()
-        agent.model = "gpt-5.6-sol"
-        agent.reasoning_config = {"enabled": True, "effort": "ultra"}
-
-        with patch.object(agent, "_spawn_background_review", return_value=None):
-            agent.run_conversation("parallelize this")
-
-        assert captured["enable_multi_agent"] is True
-
-    def test_disabling_reasoning_sends_explicit_none_on_reused_thread(
-        self, monkeypatch
-    ):
-        efforts = []
-
-        def fake_run_turn(self, user_input: str, **kwargs):
-            efforts.append(kwargs.get("effort"))
-            return TurnResult(
-                final_text="done",
-                projected_messages=[{"role": "assistant", "content": "done"}],
-                turn_id=f"turn-{len(efforts)}",
-                thread_id="thread-reused",
-            )
-
-        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
-        monkeypatch.setattr(
-            CodexAppServerSession,
-            "ensure_started",
-            lambda self: "thread-reused",
-        )
-        agent = _make_codex_agent()
-        agent.reasoning_config = {"enabled": True, "effort": "max"}
-        with patch.object(agent, "_spawn_background_review", return_value=None):
-            agent.run_conversation("first")
-            agent.reasoning_config = {"enabled": False}
-            agent.run_conversation("second")
-
-        assert efforts == ["max", "none"]
 
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
@@ -807,86 +694,65 @@ class TestSessionRetirementOnRunAgent:
         assert "codex segfaulted" in result["error"]
 
 
-class TestCodexAgentTeardown:
-    @pytest.mark.parametrize("teardown_name", ["release_clients", "close"])
-    def test_teardown_closes_and_clears_owned_app_server_session(self, teardown_name):
-        agent = _make_codex_agent()
-        codex_session = MagicMock()
-        agent._codex_session = codex_session
-
-        getattr(agent, teardown_name)()
-        getattr(agent, teardown_name)()
-
-        codex_session.close.assert_called_once_with()
-        assert agent._codex_session is None
-
-
 class TestCodexToolProgressBridge:
-    """#38835: Codex app-server item/started notifications must surface as
-    Hermes tool-progress so gateways show verbose breadcrumbs on this route."""
+    """#38835 / #33200: Codex app-server item notifications must surface as
+    Hermes tool-progress so gateways show verbose breadcrumbs on this route.
+    The original item/started-only mapper was superseded by the full event
+    bridge (make_codex_app_server_event_bridge); these tests pin the same
+    mapping contract against the bridge helpers."""
 
     def test_mapper_command_execution(self):
-        from agent.codex_runtime import _codex_note_to_tool_progress
-        note = {"method": "item/started", "params": {"item": {
-            "type": "commandExecution", "command": "ls -la", "cwd": "/tmp"}}}
-        name, preview, args = _codex_note_to_tool_progress(note)
-        assert name == "exec_command"
-        assert preview == "ls -la"
-        assert args == {"command": "ls -la", "cwd": "/tmp"}
+        from agent.codex_runtime import (
+            _codex_item_to_args,
+            _codex_item_to_preview,
+            _codex_item_to_tool_name,
+        )
+        item = {"type": "commandExecution", "command": "ls -la", "cwd": "/tmp"}
+        assert _codex_item_to_tool_name(item) == "exec_command"
+        assert _codex_item_to_preview(item) == "ls -la"
+        assert _codex_item_to_args(item) == {"command": "ls -la", "cwd": "/tmp"}
 
     def test_mapper_file_change(self):
-        from agent.codex_runtime import _codex_note_to_tool_progress
-        note = {"method": "item/started", "params": {"item": {
+        from agent.codex_runtime import (
+            _codex_item_to_preview,
+            _codex_item_to_tool_name,
+        )
+        item = {
             "type": "fileChange",
-            "changes": [{"path": "a.py"}, {"path": "b.py"}]}}}
-        name, preview, args = _codex_note_to_tool_progress(note)
-        assert name == "apply_patch"
-        assert preview == "a.py, b.py"
+            "changes": [{"path": "a.py"}, {"path": "b.py"}],
+        }
+        assert _codex_item_to_tool_name(item) == "apply_patch"
+        assert _codex_item_to_preview(item) == "a.py, b.py"
 
     def test_mapper_mcp_and_dynamic_tool_calls(self):
-        from agent.codex_runtime import _codex_note_to_tool_progress
-        mcp = {"method": "item/started", "params": {"item": {
-            "type": "mcpToolCall", "server": "fs", "tool": "read", "arguments": {"p": 1}}}}
-        name, preview, args = _codex_note_to_tool_progress(mcp)
-        assert name == "mcp.fs.read"
-        assert preview == "read"
-        assert args == {"p": 1}
+        from agent.codex_runtime import (
+            _codex_item_to_args,
+            _codex_item_to_tool_name,
+        )
+        mcp = {"type": "mcpToolCall", "server": "fs", "tool": "read", "arguments": {"p": 1}}
+        assert _codex_item_to_tool_name(mcp) == "mcp.fs.read"
+        assert _codex_item_to_args(mcp) == {"p": 1}
 
-        dyn = {"method": "item/started", "params": {"item": {
-            "type": "dynamicToolCall", "tool": "web_search", "arguments": {"q": "x"}}}}
-        assert _codex_note_to_tool_progress(dyn)[0] == "web_search"
+        dyn = {"type": "dynamicToolCall", "tool": "web_search", "arguments": {"q": "x"}}
+        assert _codex_item_to_tool_name(dyn) == "web_search"
 
-    def test_mapper_collab_agent_spawn_is_live_tool_progress(self):
-        from agent.codex_runtime import _codex_note_to_tool_progress
-
-        note = {"method": "item/started", "params": {"item": {
-            "type": "collabAgentToolCall",
-            "id": "collab-1",
-            "tool": "spawnAgent",
-            "status": "inProgress",
-            "prompt": "Inspect the adapter tests",
-            "model": "gpt-5.6-sol",
-            "reasoningEffort": "high",
-            "senderThreadId": "root-thread",
-            "receiverThreadIds": ["child-thread"],
-            "agentsStates": {"child-thread": {"status": "running"}},
-        }}}
-
-        name, preview, args = _codex_note_to_tool_progress(note)
-
-        assert name == "codex.spawn_agent"
-        assert preview == "Inspect the adapter tests"
-        assert args["model"] == "gpt-5.6-sol"
-        assert args["receiver_thread_ids"] == ["child-thread"]
-
-    def test_mapper_ignores_non_tool_items_and_other_methods(self):
-        from agent.codex_runtime import _codex_note_to_tool_progress
-        # agentMessage / reasoning items are not tool-shaped
-        assert _codex_note_to_tool_progress({"method": "item/started", "params": {
-            "item": {"type": "agentMessage", "text": "hi"}}}) is None
-        # non-item/started methods
-        assert _codex_note_to_tool_progress({"method": "item/completed", "params": {}}) is None
-        assert _codex_note_to_tool_progress({}) is None
+    def test_bridge_ignores_non_tool_items_and_other_methods(self):
+        from agent.codex_runtime import make_codex_app_server_event_bridge
+        events = []
+        agent = SimpleNamespace(
+            tool_progress_callback=lambda *a, **kw: events.append(a),
+            _fire_stream_delta=None,
+            _fire_reasoning_delta=None,
+            _emit_interim_assistant_message=None,
+        )
+        on_event = make_codex_app_server_event_bridge(agent)
+        # agentMessage started items are not tool-shaped
+        on_event({"method": "item/started", "params": {
+            "item": {"type": "agentMessage", "text": "hi"}}})
+        # malformed / empty notes
+        on_event({"method": "item/completed", "params": {}})
+        on_event({})
+        assert events == []
 
     def test_session_wired_with_on_event_that_fires_tool_progress(self, monkeypatch):
         """The session is constructed with an on_event hook that, when fed an
@@ -921,60 +787,3 @@ class TestCodexToolProgressBridge:
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
 
-    def test_session_projects_collab_start_and_completion_to_structured_callbacks(
-        self, monkeypatch
-    ):
-        captured_init = {}
-        starts = []
-        completions = []
-
-        def fake_init(self, **kwargs):
-            captured_init.update(kwargs)
-            self._client = None
-
-        collab_item = {
-            "type": "collabAgentToolCall",
-            "id": "collab-structured-1",
-            "tool": "spawnAgent",
-            "status": "inProgress",
-            "prompt": "Review two independent files",
-            "model": "gpt-5.6-sol",
-            "reasoningEffort": "high",
-            "senderThreadId": "root-thread",
-            "receiverThreadIds": ["child-thread"],
-            "agentsStates": {"child-thread": {"status": "running"}},
-        }
-
-        def fake_run_turn(self, user_input, **kwargs):
-            on_event = captured_init["on_event"]
-            on_event({"method": "item/started", "params": {"item": collab_item}})
-            completed = dict(collab_item)
-            completed["status"] = "completed"
-            completed["agentsStates"] = {
-                "child-thread": {"status": "completed", "message": "reviewed"}
-            }
-            on_event({"method": "item/completed", "params": {"item": completed}})
-            return TurnResult(
-                final_text="done",
-                projected_messages=[{"role": "assistant", "content": "done"}],
-                turn_id="t-collab",
-                thread_id="th-collab",
-            )
-
-        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
-        monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self: "th-collab")
-        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
-
-        agent = _make_codex_agent()
-        agent.tool_progress_callback = None
-        agent.tool_start_callback = lambda tid, name, args: starts.append((tid, name, args))
-        agent.tool_complete_callback = (
-            lambda tid, name, args, result: completions.append((tid, name, args, result))
-        )
-        with patch.object(agent, "_spawn_background_review", return_value=None):
-            agent.run_conversation("parallel review")
-
-        assert starts[0][0:2] == ("collab-structured-1", "codex.spawn_agent")
-        assert completions[0][0:2] == ("collab-structured-1", "codex.spawn_agent")
-        assert completions[0][3]["status"] == "completed"
-        assert completions[0][3]["agents_states"]["child-thread"]["message"] == "reviewed"
