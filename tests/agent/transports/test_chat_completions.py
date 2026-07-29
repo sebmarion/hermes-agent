@@ -38,6 +38,42 @@ class TestChatCompletionsBasic:
         )
         assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "max"}
 
+    def test_glm52_ultra_maps_to_max_on_wire(self, transport):
+        """GLM-5.2's OpenAI-compatible endpoint rejects ``ultra``; the Z.AI
+        profile (plus the transport-wide ultra->max safety net) must emit
+        ``reasoning_effort: max``."""
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("zai")
+        kw = transport.build_kwargs(
+            model="glm-5.2",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "ultra"},
+            provider_profile=profile,
+            provider_name="zai",
+            base_url=profile.base_url,
+        )
+        assert kw["reasoning_effort"] == "max"
+        assert kw["extra_body"]["thinking"] == {"type": "enabled"}
+
+    def test_non_glm52_ultra_does_not_leak_reasoning_effort(self, transport):
+        """Non-GLM-5.2 GLM models have no native reasoning_effort knob; an
+        ``ultra`` preference must not produce a top-level reasoning_effort."""
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("zai")
+        kw = transport.build_kwargs(
+            model="glm-5",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "ultra"},
+            provider_profile=profile,
+            provider_name="zai",
+            base_url=profile.base_url,
+        )
+        assert "reasoning_effort" not in kw
+
     def test_convert_tools_identity(self, transport):
         tools = [{"type": "function", "function": {"name": "test", "parameters": {}}}]
         assert transport.convert_tools(tools) is tools
