@@ -47,6 +47,30 @@ def _make_mock_server(name, session=None, tools=None):
     return server
 
 
+@pytest.fixture(autouse=True)
+def _restore_mcp_registration_provenance():
+    """Keep process-global registration provenance isolated between tests."""
+    import tools.mcp_tool as mcp_tool
+
+    with mcp_tool._lock:
+        saved_tool_servers = dict(mcp_tool._mcp_tool_server_names)
+        saved_tool_origins = dict(mcp_tool._mcp_tool_server_origins)
+        saved_server_origins = dict(mcp_tool._mcp_server_origins)
+        saved_connecting_origins = dict(mcp_tool._mcp_connecting_origins)
+    try:
+        yield
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._mcp_tool_server_names.clear()
+            mcp_tool._mcp_tool_server_names.update(saved_tool_servers)
+            mcp_tool._mcp_tool_server_origins.clear()
+            mcp_tool._mcp_tool_server_origins.update(saved_tool_origins)
+            mcp_tool._mcp_server_origins.clear()
+            mcp_tool._mcp_server_origins.update(saved_server_origins)
+            mcp_tool._mcp_connecting_origins.clear()
+            mcp_tool._mcp_connecting_origins.update(saved_connecting_origins)
+
+
 class TestFilterMCPChildren:
     def test_filters_gateway_children_by_argv_marker(self, monkeypatch):
         """Non-MCP children start with an interpreter/binary, not the marker."""
