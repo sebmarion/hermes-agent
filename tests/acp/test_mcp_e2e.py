@@ -71,7 +71,8 @@ class TestMcpRegistrationE2E:
 
         registered_configs = {}
 
-        def mock_register(config_map):
+        def mock_register(config_map, **kwargs):
+            assert kwargs == {"source": "acp"}
             registered_configs.update(config_map)
             return ["mcp_test_fs_read", "mcp_test_fs_write", "mcp_test_api_search"]
 
@@ -260,7 +261,8 @@ class TestMcpSanitizationE2E:
         ]
 
         registered_configs = {}
-        def mock_register(config_map):
+        def mock_register(config_map, **kwargs):
+            assert kwargs == {"source": "acp"}
             registered_configs.update(config_map)
             return ["mcp_ai_exa_exa_search"]
 
@@ -293,7 +295,8 @@ class TestSessionLifecycleMcpE2E:
         ]
 
         registered = {}
-        def mock_register(config_map):
+        def mock_register(config_map, **kwargs):
+            assert kwargs == {"source": "acp"}
             registered.update(config_map)
             return []
 
@@ -320,7 +323,8 @@ class TestSessionLifecycleMcpE2E:
         ]
 
         registered = {}
-        def mock_register(config_map):
+        def mock_register(config_map, **kwargs):
+            assert kwargs == {"source": "acp"}
             registered.update(config_map)
             return []
 
@@ -347,7 +351,8 @@ class TestSessionLifecycleMcpE2E:
         ]
 
         registered = {}
-        def mock_register(config_map):
+        def mock_register(config_map, **kwargs):
+            assert kwargs == {"source": "acp"}
             registered.update(config_map)
             return []
 

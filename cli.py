@@ -10887,8 +10887,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 enabled_override = None
                 et = self.enabled_toolsets
                 if et and "all" not in et and "*" not in et:
-                    merged = list(et)
-                    for _name in sorted(connected_servers):
+                    # MCP connections are process-global, but this agent's
+                    # surface is not. Do not merge a just-connected server
+                    # into the CLI snapshot unless its current config permits
+                    # the CLI surface.
+                    from hermes_cli.config import load_config
+                    from hermes_cli.tools_config import (
+                        enabled_mcp_server_names,
+                        filter_mcp_toolsets_for_platform,
+                    )
+
+                    policy_platform = getattr(self.agent, "platform", None) or "cli"
+                    latest_config = load_config()
+                    allowed_connected_servers = connected_servers & enabled_mcp_server_names(
+                        latest_config,
+                        platform=policy_platform,
+                    )
+                    merged = filter_mcp_toolsets_for_platform(
+                        list(et), latest_config, platform=policy_platform
+                    )
+                    for _name in sorted(allowed_connected_servers):
                         if _name not in merged:
                             merged.append(_name)
                     enabled_override = merged

@@ -608,11 +608,19 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
-        configured_mcp_servers = [
-            name
-            for name, cfg in (config.get("mcp_servers") or {}).items()
-            if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
-        ]
+        from hermes_cli.tools_config import enabled_mcp_server_names
+
+        # The shared predicate returns a set for efficient membership checks in
+        # the other runtimes. Reapply it in config order here: ACP's existing
+        # session snapshots preserve declaration order, which keeps tool
+        # exposure stable across reconnects.
+        allowed_mcp_servers = enabled_mcp_server_names(config, platform="acp")
+        mcp_config = config.get("mcp_servers") or {}
+        configured_mcp_servers = (
+            [str(name) for name in mcp_config if str(name) in allowed_mcp_servers]
+            if isinstance(mcp_config, dict)
+            else []
+        )
 
         kwargs = {
             "platform": "acp",

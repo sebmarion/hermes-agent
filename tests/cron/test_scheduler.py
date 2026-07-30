@@ -39,11 +39,35 @@ class TestPerJobToolsetMcpMerge:
         result = _merge_mcp_into_per_job_toolsets(["web"], self.CFG)
         assert "disabled_one" not in result
 
+    def test_native_only_list_excludes_mcp_servers_disallowed_for_cron(self):
+        cfg = {
+            "mcp_servers": {
+                "cli-only": {"enabled": True, "allowed_platforms": ["cli"]},
+                "cron-only": {"enabled": True, "allowed_platforms": ["cron"]},
+            }
+        }
+
+        result = _merge_mcp_into_per_job_toolsets(["web"], cfg)
+
+        assert "cron-only" in result
+        assert "cli-only" not in result
+
     def test_explicit_mcp_name_is_treated_as_allowlist(self):
         # User named one server -> add nothing further.
         result = _merge_mcp_into_per_job_toolsets(["web", "finnhub"], self.CFG)
         assert result == ["web", "finnhub"]
         assert "playwright" not in result
+
+    def test_explicit_disallowed_mcp_name_is_removed_from_cron_toolsets(self):
+        cfg = {
+            "mcp_servers": {
+                "cli-only": {"enabled": True, "allowed_platforms": ["cli"]},
+            }
+        }
+
+        result = _merge_mcp_into_per_job_toolsets(["web", "cli-only"], cfg)
+
+        assert result == ["web"]
 
     def test_no_mcp_sentinel_opts_out_and_is_stripped(self):
         result = _merge_mcp_into_per_job_toolsets(["web", "no_mcp"], self.CFG)

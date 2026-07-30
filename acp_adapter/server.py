@@ -799,7 +799,10 @@ class HermesACPAgent(acp.Agent):
             return
 
         try:
-            from tools.mcp_tool import register_mcp_servers
+            from tools.mcp_tool import (
+                get_mcp_server_registration_source,
+                register_mcp_servers,
+            )
 
             config_map: dict[str, dict] = {}
             for server in mcp_servers:
@@ -817,7 +820,20 @@ class HermesACPAgent(acp.Agent):
                     }
                 config_map[name] = config
 
-            await asyncio.to_thread(register_mcp_servers, config_map)
+            await asyncio.to_thread(register_mcp_servers, config_map, source="acp")
+            accepted_server_names = [
+                name
+                for name in config_map
+                if get_mcp_server_registration_source(name) in {None, "acp"}
+            ]
+            conflicting_names = sorted(set(config_map) - set(accepted_server_names))
+            if conflicting_names:
+                logger.warning(
+                    "Session %s: refusing ACP MCP server name(s) already owned "
+                    "by another source: %s",
+                    state.session_id,
+                    ", ".join(conflicting_names),
+                )
         except Exception:
             logger.warning(
                 "Session %s: failed to register ACP MCP servers",
@@ -827,19 +843,35 @@ class HermesACPAgent(acp.Agent):
             return
 
         try:
-            from model_tools import get_tool_definitions
             from agent.memory_manager import inject_memory_provider_tools
+            from model_tools import get_tool_definitions
+            from tools.mcp_tool import filter_mcp_tool_definitions_for_platform
 
+            base_toolsets = list(
+                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            )
+            if conflicting_names:
+                conflicting_toolsets = set(conflicting_names) | {
+                    f"mcp-{name}" for name in conflicting_names
+                }
+                base_toolsets = [
+                    toolset
+                    for toolset in base_toolsets
+                    if toolset not in conflicting_toolsets
+                ]
             enabled_toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
-                mcp_server_names=[server.name for server in mcp_servers],
+                base_toolsets,
+                mcp_server_names=accepted_server_names,
             )
             state.agent.enabled_toolsets = enabled_toolsets
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
-            state.agent.tools = get_tool_definitions(
-                enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
-                quiet_mode=True,
+            state.agent.tools = filter_mcp_tool_definitions_for_platform(
+                get_tool_definitions(
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                    quiet_mode=True,
+                ),
+                getattr(state.agent, "platform", "acp"),
             )
             state.agent.valid_tool_names = {
                 tool["function"]["name"] for tool in state.agent.tools or []

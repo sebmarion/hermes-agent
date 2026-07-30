@@ -132,6 +132,22 @@ class TestCodingSelection:
         for t in ("send_message", "text_to_speech", "image_generate", "computer_use"):
             assert t not in tools
 
+    def test_focus_mcp_servers_follow_the_runtime_surface(self):
+        cfg = {
+            "mcp_servers": {
+                "cli-only": {"enabled": True, "allowed_platforms": ["cli"]},
+                "cron-only": {"enabled": True, "allowed_platforms": ["cron"]},
+            },
+        }
+
+        cli_selection = cc._enabled_mcp_servers(cfg, platform="cli")
+        cron_selection = cc._enabled_mcp_servers(cfg, platform="cron")
+
+        assert "cli-only" in cli_selection
+        assert "cron-only" not in cli_selection
+        assert "cron-only" in cron_selection
+        assert "cli-only" not in cron_selection
+
 
 # ── git/workspace probe ─────────────────────────────────────────────────────
 

@@ -633,6 +633,30 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        execution_platform = kwargs.pop("platform", None)
+        if entry.toolset.startswith("mcp-"):
+            # Schema exposure is intentionally not the authorization boundary:
+            # cached agents and direct registry users can carry an older tool
+            # snapshot. Native MCP ownership is recorded at registration time,
+            # so never infer it from the ambiguous wire name.
+            try:
+                from tools.mcp_tool import mcp_tool_platform_access
+
+                allowed, reason = mcp_tool_platform_access(name, execution_platform)
+            except Exception:
+                logger.exception("MCP platform check failed for tool %s", name)
+                allowed, reason = False, "mcp_platform_check_failed"
+            if not allowed:
+                return json.dumps({
+                    "error": "MCP tool is not available on this platform",
+                    "error_type": reason or "mcp_platform_denied",
+                    "tool": name,
+                }, ensure_ascii=False)
+        if name == "execute_code" and execution_platform is not None:
+            # Nested sandbox RPC calls must retain the same authorization
+            # surface; otherwise a permitted parent call turns into an
+            # unqualified child dispatch.
+            kwargs["execution_platform"] = execution_platform
         try:
             from agent.tool_runtime_context import (
                 bind_prepared_tool_runtime,

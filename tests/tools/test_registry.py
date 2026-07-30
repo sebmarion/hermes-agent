@@ -47,6 +47,118 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("echo", {"msg": "hi"}))
         assert result == {"msg": "hi"}
 
+    def test_dispatch_blocks_platform_restricted_mcp_tool_before_handler(self, monkeypatch):
+        """Direct dispatch cannot bypass a restricted MCP server's snapshot gate."""
+        reg = ToolRegistry()
+        calls = {"count": 0}
+
+        def handler(args, **kwargs):
+            calls["count"] += 1
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="mcp__zeus__open",
+            toolset="mcp-zeus",
+            schema=_make_schema("mcp__zeus__open"),
+            handler=handler,
+        )
+        monkeypatch.setattr(
+            "tools.mcp_tool.mcp_tool_platform_access",
+            lambda tool_name, platform: (False, "mcp_platform_denied"),
+            raising=False,
+        )
+
+        result = json.loads(reg.dispatch("mcp__zeus__open", {}, platform="telegram"))
+
+        assert result["error_type"] == "mcp_platform_denied"
+        assert calls["count"] == 0
+
+    def test_dispatch_allows_matching_platform_mcp_tool(self, monkeypatch):
+        reg = ToolRegistry()
+        calls = {"count": 0}
+
+        def handler(args, **kwargs):
+            calls["count"] += 1
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="mcp__zeus__open",
+            toolset="mcp-zeus",
+            schema=_make_schema("mcp__zeus__open"),
+            handler=handler,
+        )
+        monkeypatch.setattr(
+            "tools.mcp_tool.mcp_tool_platform_access",
+            lambda tool_name, platform: (True, None),
+            raising=False,
+        )
+
+        result = json.loads(reg.dispatch("mcp__zeus__open", {}, platform="cli"))
+
+        assert result == {"ok": True}
+        assert calls["count"] == 1
+
+    def test_dispatch_fails_closed_for_mcp_tool_without_provenance(self):
+        """An mcp-* registry entry must not become callable merely by naming it."""
+        reg = ToolRegistry()
+        calls = {"count": 0}
+        tool_name = "mcp__untracked__open"
+        reg.register(
+            name=tool_name,
+            toolset="mcp-untracked",
+            schema=_make_schema(tool_name),
+            handler=lambda args, **kwargs: calls.__setitem__("count", calls["count"] + 1),
+        )
+
+        result = json.loads(reg.dispatch(tool_name, {}, platform="cli"))
+
+        assert result["error_type"] == "mcp_provenance_missing"
+        assert calls["count"] == 0
+
+    def test_dispatch_blocks_stale_disabled_mcp_config_before_handler(self, monkeypatch):
+        """A config flip to enabled:false revokes a still-registered MCP tool."""
+        import tools.mcp_tool as mcp_tool
+
+        reg = ToolRegistry()
+        calls = {"count": 0}
+        tool_name = "mcp__zeus__open"
+
+        def handler(args, **kwargs):
+            calls["count"] += 1
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name=tool_name,
+            toolset="mcp-zeus",
+            schema=_make_schema(tool_name),
+            handler=handler,
+        )
+        with mcp_tool._lock:
+            old_server = mcp_tool._mcp_tool_server_names.get(tool_name)
+            old_origin = mcp_tool._mcp_tool_server_origins.get(tool_name)
+            mcp_tool._mcp_tool_server_names[tool_name] = "zeus"
+            mcp_tool._mcp_tool_server_origins[tool_name] = "config"
+        monkeypatch.setattr(
+            mcp_tool,
+            "_load_mcp_config",
+            lambda: {"zeus": {"enabled": False, "allowed_platforms": ["cli"]}},
+        )
+        try:
+            result = json.loads(reg.dispatch(tool_name, {}, platform="cli"))
+        finally:
+            with mcp_tool._lock:
+                if old_server is None:
+                    mcp_tool._mcp_tool_server_names.pop(tool_name, None)
+                else:
+                    mcp_tool._mcp_tool_server_names[tool_name] = old_server
+                if old_origin is None:
+                    mcp_tool._mcp_tool_server_origins.pop(tool_name, None)
+                else:
+                    mcp_tool._mcp_tool_server_origins[tool_name] = old_origin
+
+        assert result["error_type"] == "mcp_server_disabled"
+        assert calls["count"] == 0
+
     def test_dispatch_preserves_supported_multimodal_result(self):
         reg = ToolRegistry()
         multimodal = {

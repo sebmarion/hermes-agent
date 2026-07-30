@@ -3437,12 +3437,26 @@ _parallel_safe_servers: set = set()
 # guessing.
 _mcp_tool_server_names: Dict[str, str] = {}
 
+# Exact registration provenance for each MCP tool. A process can connect MCP
+# servers both from config.yaml and from an ACP editor session; the registry is
+# global, so a source label must travel with every registered tool to prevent an
+# ACP-provided server from becoming callable on a different Hermes surface.
+_mcp_tool_server_origins: Dict[str, str] = {}
+
+# Immutable source ownership for a live server and an in-flight connection.
+# The connecting map reserves a name under the same lock as
+# ``_server_connecting``. A competing config/ACP registration cannot overwrite
+# the source while its connection is in flight.
+_mcp_server_origins: Dict[str, str] = {}
+_mcp_connecting_origins: Dict[str, str] = {}
+
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
 # Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
-# _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
+# _parallel_safe_servers, _mcp_tool_server_names, _mcp_tool_server_origins,
+# _mcp_server_origins, _mcp_connecting_origins, and _stdio_pids.
 _lock = threading.Lock()
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
@@ -4649,17 +4663,118 @@ _UTILITY_CAPABILITY_ATTRS = {
 }
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
-    """Remember the exact MCP server that registered *tool_name*."""
-    safe_server_name = sanitize_mcp_name_component(server_name)
+def _track_mcp_tool_server(tool_name: str, server_name: str, source: str) -> None:
+    """Remember the exact configured MCP server that registered *tool_name*."""
     with _lock:
-        _mcp_tool_server_names[tool_name] = safe_server_name
+        # Keep the raw config key. Tool names use a sanitized component, but
+        # policy must resolve the exact config entry (``my-server`` and
+        # ``my_server`` intentionally do not collapse here).
+        raw_server_name = str(server_name)
+        _mcp_tool_server_names[tool_name] = raw_server_name
+        _mcp_tool_server_origins[tool_name] = source
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
     """Forget MCP server provenance for a deregistered tool."""
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+        _mcp_tool_server_origins.pop(tool_name, None)
+
+
+def get_mcp_tool_server_name(tool_name: str) -> Optional[str]:
+    """Return the exact configured server that registered an MCP tool."""
+    with _lock:
+        return _mcp_tool_server_names.get(tool_name)
+
+
+def get_mcp_server_registration_source(server_name: str) -> Optional[str]:
+    """Return the immutable owner of a live or in-flight MCP server name."""
+    with _lock:
+        return _mcp_server_origins.get(server_name) or _mcp_connecting_origins.get(
+            server_name
+        )
+
+
+def mcp_tool_platform_access(
+    tool_name: str, platform: Optional[str]
+) -> tuple[bool, Optional[str]]:
+    """Return whether a registered MCP tool may run on ``platform``.
+
+    This is deliberately evaluated at dispatch time against fresh config, not
+    only while a schema snapshot is assembled. A stale agent snapshot or a
+    direct registry call therefore cannot revive a restricted server.
+    """
+    server_name = get_mcp_tool_server_name(tool_name)
+    if not server_name:
+        return False, "mcp_provenance_missing"
+
+    with _lock:
+        source = _mcp_tool_server_origins.get(tool_name)
+
+    if source == "acp":
+        # ACP-supplied servers are restricted to the ACP runtime surface even
+        # though their registry entries are process-global. Check this before config lookup:
+        # a same-named config server describes a different endpoint and must
+        # never widen the editor-provided server's authority.
+        from hermes_cli.tools_config import mcp_server_allowed_on_platform
+
+        if mcp_server_allowed_on_platform(
+            {"allowed_platforms": ["acp"]}, platform
+        ):
+            return True, None
+        return False, "mcp_platform_denied"
+    if source != "config":
+        return False, "mcp_provenance_missing"
+
+    server_cfg = _load_mcp_config().get(server_name)
+    if not isinstance(server_cfg, dict):
+        return False, "mcp_server_missing"
+
+    from hermes_cli.tools_config import (
+        _parse_enabled_flag,
+        mcp_server_allowed_on_platform,
+    )
+
+    if not _parse_enabled_flag(server_cfg.get("enabled", True), default=True):
+        return False, "mcp_server_disabled"
+    if not mcp_server_allowed_on_platform(server_cfg, platform):
+        return False, "mcp_platform_denied"
+    return True, None
+
+
+def filter_mcp_tool_definitions_for_platform(
+    tool_definitions: List[dict], platform: Optional[str]
+) -> List[dict]:
+    """Return tool schemas whose registered MCP provenance permits ``platform``.
+
+    ``get_tool_definitions()`` intentionally stays platform-neutral because it
+    is used by configuration UI and discovery code. Snapshot builders call this
+    narrow post-filter so explicit ``all`` selections, stale snapshots, and the
+    tool-search bridge cannot advertise an MCP tool that dispatch will reject.
+    """
+    filtered: List[dict] = []
+    dropped = False
+    for tool_def in tool_definitions:
+        try:
+            tool_name = tool_def.get("function", {}).get("name")
+        except AttributeError:
+            filtered.append(tool_def)
+            continue
+        if not isinstance(tool_name, str) or not get_mcp_tool_server_name(tool_name):
+            filtered.append(tool_def)
+            continue
+        try:
+            allowed, _reason = mcp_tool_platform_access(tool_name, platform)
+        except Exception:
+            logger.exception(
+                "MCP platform check failed while filtering schema for %s", tool_name
+            )
+            allowed = False
+        if allowed:
+            filtered.append(tool_def)
+        else:
+            dropped = True
+    return filtered if dropped else tool_definitions
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -4732,7 +4847,13 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
-def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
+def _register_server_tools(
+    name: str,
+    server: MCPServerTask,
+    config: dict,
+    *,
+    source: Optional[str] = None,
+) -> List[str]:
     """Register tools from an already-connected server into the registry.
 
     Handles include/exclude filtering and utility tools. Toolset resolution
@@ -4747,6 +4868,11 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     from tools.registry import registry
 
     registered_names: List[str] = []
+    if source is None:
+        with _lock:
+            registration_source = _mcp_server_origins.get(name, "external")
+    else:
+        registration_source = source
     toolset_name = f"mcp-{name}"
 
     # Selective tool loading: honour include/exclude lists from config.
@@ -4796,7 +4922,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             is_async=False,
             description=schema["description"],
         )
-        _track_mcp_tool_server(tool_name_prefixed, name)
+        _track_mcp_tool_server(tool_name_prefixed, name, registration_source)
         registered_names.append(tool_name_prefixed)
 
     # Register MCP Resources & Prompts utility tools, filtered by config and
@@ -4833,7 +4959,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             is_async=False,
             description=schema["description"],
         )
-        _track_mcp_tool_server(util_name, name)
+        _track_mcp_tool_server(util_name, name, registration_source)
         registered_names.append(util_name)
 
     if registered_names:
@@ -4848,16 +4974,25 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     Returns list of registered tool names.
     """
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
-    server = await asyncio.wait_for(
-        _connect_server(name, config),
-        timeout=connect_timeout,
-    )
+    try:
+        server = await asyncio.wait_for(
+            _connect_server(name, config),
+            timeout=connect_timeout,
+        )
+    except BaseException:
+        with _lock:
+            _server_connecting.discard(name)
+            _mcp_connecting_origins.pop(name, None)
+        raise
     with _lock:
+        registration_source = _mcp_connecting_origins.pop(name, "external")
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
         _servers[name] = server
-
-    registered_names = _register_server_tools(name, server, config)
+        _mcp_server_origins[name] = registration_source
+    registered_names = _register_server_tools(
+        name, server, config, source=registration_source
+    )
     server._registered_tool_names = list(registered_names)
 
     transport_type = "HTTP" if "url" in config else "stdio"
@@ -4873,7 +5008,9 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def register_mcp_servers(
+    servers: Dict[str, dict], *, source: str = "external"
+) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
     Idempotent for already-connected server names. Servers with
@@ -4881,6 +5018,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     Args:
         servers: Mapping of ``{server_name: server_config}``.
+        source: Registration authority. ``"config"`` is config.yaml and
+            ``"acp"`` is an ACP editor session. Unrecognized sources remain
+            registered for compatibility but cannot pass the dispatch gate.
 
     Returns:
         List of all currently registered MCP tool names.
@@ -4896,12 +5036,22 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
+    normalized_source = source if source in {"config", "acp"} else "external"
+    source_conflicts: List[str] = []
     with _lock:
-        new_servers = {
-            k: v
-            for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
-        }
+        new_servers = {}
+        for name, config in servers.items():
+            if not _parse_boolish(config.get("enabled", True), default=True):
+                continue
+            existing_source = (
+                _mcp_server_origins.get(name)
+                or _mcp_connecting_origins.get(name)
+            )
+            if name in _servers or name in _server_connecting:
+                if existing_source and existing_source != normalized_source:
+                    source_conflicts.append(name)
+                continue
+            new_servers[name] = config
         # Cached entries with no live session are parked or mid-reconnect.
         # Their tools are deregistered, so nothing else can reach
         # _signal_reconnect — without this nudge a new session silently
@@ -4914,6 +5064,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         ]
         _server_connecting.update(new_servers)
         for srv_name in new_servers:
+            _mcp_connecting_origins[srv_name] = normalized_source
+        for srv_name in new_servers:
             _server_connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
@@ -4921,6 +5073,14 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 _parallel_safe_servers.add(sanitize_mcp_name_component(srv_name))
             else:
                 _parallel_safe_servers.discard(sanitize_mcp_name_component(srv_name))
+
+    if source_conflicts:
+        logger.warning(
+            "MCP server name(s) already owned by a different registration source; "
+            "refusing %s registration: %s",
+            normalized_source,
+            ", ".join(sorted(source_conflicts)),
+        )
 
     for srv in stale_cached:
         _signal_reconnect(srv)
@@ -4948,6 +5108,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 message = _format_connect_error(result)
                 with _lock:
                     _server_connecting.discard(name)
+                    _mcp_connecting_origins.pop(name, None)
                     _server_connect_errors[name] = message
                 logger.warning(
                     "Failed to connect to MCP server '%s'%s: %s",
@@ -5021,7 +5182,7 @@ def discover_mcp_tools() -> List[str]:
             if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
         ]
 
-    tool_names = register_mcp_servers(servers)
+    tool_names = register_mcp_servers(servers, source="config")
     if not new_server_names:
         return tool_names
 
@@ -5057,7 +5218,10 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return False
     with _lock:
         server_name = _mcp_tool_server_names.get(tool_name)
-        return bool(server_name and server_name in _parallel_safe_servers)
+        return bool(
+            server_name
+            and sanitize_mcp_name_component(server_name) in _parallel_safe_servers
+        )
 
 
 def get_mcp_status() -> List[dict]:
@@ -5305,6 +5469,9 @@ def refresh_agent_mcp_tools(
         )
         or []
     )
+    new_defs = filter_mcp_tool_definitions_for_platform(
+        new_defs, getattr(agent, "platform", None)
+    )
     new_names = {t["function"]["name"] for t in new_defs}
 
     # Re-append the post-build injected families that get_tool_definitions does
@@ -5427,6 +5594,10 @@ def shutdown_mcp_servers():
 
     # Fast path: nothing to shut down.
     if not servers_snapshot:
+        with _lock:
+            _server_connecting.clear()
+            _mcp_server_origins.clear()
+            _mcp_connecting_origins.clear()
         _stop_mcp_loop()
         return
 
@@ -5442,6 +5613,9 @@ def shutdown_mcp_servers():
                 )
         with _lock:
             _servers.clear()
+            _server_connecting.clear()
+            _mcp_server_origins.clear()
+            _mcp_connecting_origins.clear()
 
     with _lock:
         loop = _mcp_loop

@@ -2363,6 +2363,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 original_function_args=_tool_original_args,
                 on_authorized=_on_authorized,
+                **(
+                    {"platform": agent.platform}
+                    if isinstance(getattr(agent, "platform", None), str)
+                    else {}
+                ),
             )
 
     from hermes_cli.middleware import run_tool_execution_middleware

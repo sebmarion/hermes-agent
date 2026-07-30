@@ -98,6 +98,45 @@ def test_refresh_passes_agent_toolset_filters(monkeypatch):
     assert seen["disabled_toolsets"] == ["messaging"]
 
 
+def test_refresh_filters_restricted_mcp_schema_even_for_all_toolsets(monkeypatch):
+    """An explicit all selection cannot re-advertise a disallowed MCP server."""
+    agent = _agent(["read_file"], enabled=["all"])
+    agent.platform = "telegram"
+    tool_name = "mcp__zeus__open"
+
+    with mcp_tool._lock:
+        previous_server = mcp_tool._mcp_tool_server_names.get(tool_name)
+        previous_origin = mcp_tool._mcp_tool_server_origins.get(tool_name)
+        mcp_tool._mcp_tool_server_names[tool_name] = "zeus"
+        mcp_tool._mcp_tool_server_origins[tool_name] = "config"
+    monkeypatch.setattr(
+        mcp_tool,
+        "_load_mcp_config",
+        lambda: {"zeus": {"allowed_platforms": ["cli"]}},
+    )
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("read_file"), _tool(tool_name)],
+    )
+
+    try:
+        mcp_tool.refresh_agent_mcp_tools(agent)
+    finally:
+        with mcp_tool._lock:
+            if previous_server is None:
+                mcp_tool._mcp_tool_server_names.pop(tool_name, None)
+            else:
+                mcp_tool._mcp_tool_server_names[tool_name] = previous_server
+            if previous_origin is None:
+                mcp_tool._mcp_tool_server_origins.pop(tool_name, None)
+            else:
+                mcp_tool._mcp_tool_server_origins[tool_name] = previous_origin
+
+    assert agent.valid_tool_names == {"read_file"}
+
+
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
     """B1 regression: a rebuild must NOT drop post-build-injected tools.
 

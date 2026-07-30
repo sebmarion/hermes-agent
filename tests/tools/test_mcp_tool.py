@@ -1493,6 +1493,29 @@ class TestShutdown:
         _servers.clear()
         shutdown_mcp_servers()  # Should not raise
 
+    def test_no_servers_clears_inflight_source_reservations(self):
+        """A reload cannot inherit a source owner from a cancelled connection."""
+        import tools.mcp_tool as mcp_tool
+
+        with mcp_tool._lock:
+            mcp_tool._servers.clear()
+            mcp_tool._server_connecting.add("inflight")
+            mcp_tool._mcp_server_origins["stale"] = "config"
+            mcp_tool._mcp_connecting_origins["inflight"] = "acp"
+        try:
+            with patch("tools.mcp_tool._stop_mcp_loop"):
+                mcp_tool.shutdown_mcp_servers()
+            with mcp_tool._lock:
+                assert not mcp_tool._server_connecting
+                assert not mcp_tool._mcp_server_origins
+                assert not mcp_tool._mcp_connecting_origins
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.clear()
+                mcp_tool._server_connecting.clear()
+                mcp_tool._mcp_server_origins.clear()
+                mcp_tool._mcp_connecting_origins.clear()
+
     def test_shutdown_clears_servers(self):
         """shutdown_mcp_servers calls shutdown() on each server and clears dict."""
         import tools.mcp_tool as mcp_mod
@@ -4258,6 +4281,126 @@ class TestRegisterMcpServers:
 class TestMcpParallelToolCalls:
     """Tests for the supports_parallel_tool_calls config option."""
 
+    def test_platform_access_uses_raw_configured_server_name(self, monkeypatch):
+        """Policy lookup must not lose a hyphenated config key to tool sanitizing."""
+        import tools.mcp_tool as mcp_tool
+
+        tool_name = "mcp__zeus_browser__open"
+        with mcp_tool._lock:
+            previous = mcp_tool._mcp_tool_server_names.get(tool_name)
+            previous_origin = mcp_tool._mcp_tool_server_origins.get(tool_name)
+            mcp_tool._mcp_tool_server_names[tool_name] = "zeus-browser"
+            mcp_tool._mcp_tool_server_origins[tool_name] = "config"
+        monkeypatch.setattr(
+            mcp_tool,
+            "_load_mcp_config",
+            lambda: {"zeus-browser": {"allowed_platforms": ["cli"]}},
+        )
+        try:
+            assert mcp_tool.get_mcp_tool_server_name(tool_name) == "zeus-browser"
+            assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (True, None)
+            assert mcp_tool.mcp_tool_platform_access(tool_name, "cron") == (
+                False,
+                "mcp_platform_denied",
+            )
+        finally:
+            with mcp_tool._lock:
+                if previous is None:
+                    mcp_tool._mcp_tool_server_names.pop(tool_name, None)
+                else:
+                    mcp_tool._mcp_tool_server_names[tool_name] = previous
+                if previous_origin is None:
+                    mcp_tool._mcp_tool_server_origins.pop(tool_name, None)
+                else:
+                    mcp_tool._mcp_tool_server_origins[tool_name] = previous_origin
+
+    def test_platform_access_preserves_unconfigured_acp_server(self, monkeypatch):
+        """An editor-supplied ACP server is not a missing config.yaml server."""
+        import tools.mcp_tool as mcp_tool
+
+        tool_name = "mcp__editor_server__search"
+        with mcp_tool._lock:
+            previous = mcp_tool._mcp_tool_server_names.get(tool_name)
+            previous_origin = mcp_tool._mcp_tool_server_origins.get(tool_name)
+            mcp_tool._mcp_tool_server_names[tool_name] = "editor-server"
+            mcp_tool._mcp_tool_server_origins[tool_name] = "acp"
+        monkeypatch.setattr(mcp_tool, "_load_mcp_config", lambda: {})
+        try:
+            assert mcp_tool.mcp_tool_platform_access(tool_name, "acp") == (True, None)
+            assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (
+                False,
+                "mcp_platform_denied",
+            )
+        finally:
+            with mcp_tool._lock:
+                if previous is None:
+                    mcp_tool._mcp_tool_server_names.pop(tool_name, None)
+                else:
+                    mcp_tool._mcp_tool_server_names[tool_name] = previous
+                if previous_origin is None:
+                    mcp_tool._mcp_tool_server_origins.pop(tool_name, None)
+                else:
+                    mcp_tool._mcp_tool_server_origins[tool_name] = previous_origin
+
+    def test_platform_access_denies_config_managed_server_removed_from_config(self, monkeypatch):
+        """A stale configured server fails closed when its config entry disappears."""
+        import tools.mcp_tool as mcp_tool
+
+        tool_name = "mcp__zeus__open"
+        with mcp_tool._lock:
+            previous_server = mcp_tool._mcp_tool_server_names.get(tool_name)
+            previous_origin = mcp_tool._mcp_tool_server_origins.get(tool_name)
+            mcp_tool._mcp_tool_server_names[tool_name] = "zeus"
+            mcp_tool._mcp_tool_server_origins[tool_name] = "config"
+        monkeypatch.setattr(mcp_tool, "_load_mcp_config", lambda: {})
+        try:
+            assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (
+                False,
+                "mcp_server_missing",
+            )
+        finally:
+            with mcp_tool._lock:
+                if previous_server is None:
+                    mcp_tool._mcp_tool_server_names.pop(tool_name, None)
+                else:
+                    mcp_tool._mcp_tool_server_names[tool_name] = previous_server
+                if previous_origin is None:
+                    mcp_tool._mcp_tool_server_origins.pop(tool_name, None)
+                else:
+                    mcp_tool._mcp_tool_server_origins[tool_name] = previous_origin
+
+    def test_acp_tool_ignores_same_named_config_server_policy(self, monkeypatch):
+        """A config entry cannot widen a same-named editor-supplied endpoint."""
+        import tools.mcp_tool as mcp_tool
+
+        tool_name = "mcp__zeus__open"
+        with mcp_tool._lock:
+            previous_server = mcp_tool._mcp_tool_server_names.get(tool_name)
+            previous_origin = mcp_tool._mcp_tool_server_origins.get(tool_name)
+            mcp_tool._mcp_tool_server_names[tool_name] = "zeus"
+            mcp_tool._mcp_tool_server_origins[tool_name] = "acp"
+        monkeypatch.setattr(
+            mcp_tool,
+            "_load_mcp_config",
+            lambda: {"zeus": {"allowed_platforms": ["cli"]}},
+        )
+        try:
+            assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (
+                False,
+                "mcp_platform_denied",
+            )
+            assert mcp_tool.mcp_tool_platform_access(tool_name, "acp") == (True, None)
+        finally:
+            with mcp_tool._lock:
+                if previous_server is None:
+                    mcp_tool._mcp_tool_server_names.pop(tool_name, None)
+                else:
+                    mcp_tool._mcp_tool_server_names[tool_name] = previous_server
+                if previous_origin is None:
+                    mcp_tool._mcp_tool_server_origins.pop(tool_name, None)
+                else:
+                    mcp_tool._mcp_tool_server_origins[tool_name] = previous_origin
+
     def test_is_mcp_tool_parallel_safe_non_mcp_tool(self):
         """Non-MCP tool names always return False."""
         from tools.mcp_tool import is_mcp_tool_parallel_safe
@@ -4365,6 +4508,130 @@ class TestMcpParallelToolCalls:
                 _parallel_safe_servers.discard("a")
                 _parallel_safe_servers.discard("a_b")
                 _mcp_tool_server_names.pop("mcp__a_b__tool", None)
+
+    def test_competing_registration_reserves_inflight_source_once(self):
+        """Config and ACP cannot overwrite each other's in-flight ownership."""
+        import tools.mcp_tool as mcp_tool
+
+        barrier = threading.Barrier(2)
+        run_calls = []
+        errors = []
+
+        def synchronized_filter(servers):
+            barrier.wait(timeout=2)
+            return servers
+
+        def register(source):
+            try:
+                mcp_tool.register_mcp_servers(
+                    {"same-name": {"command": "ignored"}}, source=source
+                )
+            except BaseException as exc:  # Thread errors should fail the test.
+                errors.append(exc)
+
+        with (
+            patch("tools.mcp_tool._MCP_AVAILABLE", True),
+            patch(
+                "tools.mcp_tool._filter_suspicious_mcp_servers",
+                side_effect=synchronized_filter,
+            ),
+            patch("tools.mcp_tool._ensure_mcp_loop"),
+            patch(
+                "tools.mcp_tool._run_on_mcp_loop",
+                side_effect=lambda *args, **kwargs: run_calls.append(args),
+            ),
+        ):
+            config_thread = threading.Thread(target=register, args=("config",))
+            acp_thread = threading.Thread(target=register, args=("acp",))
+            config_thread.start()
+            acp_thread.start()
+            config_thread.join(timeout=5)
+            acp_thread.join(timeout=5)
+
+        try:
+            assert not config_thread.is_alive()
+            assert not acp_thread.is_alive()
+            assert not errors
+            assert len(run_calls) == 1
+            assert mcp_tool.get_mcp_server_registration_source("same-name") in {
+                "acp",
+                "config",
+            }
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.pop("same-name", None)
+                mcp_tool._server_connecting.discard("same-name")
+                mcp_tool._mcp_server_origins.pop("same-name", None)
+                mcp_tool._mcp_connecting_origins.pop("same-name", None)
+                mcp_tool._server_connect_errors.pop("same-name", None)
+
+    def test_inflight_acp_registration_stays_acp_when_config_collides(self):
+        """A config collision cannot relabel an ACP endpoint before it connects."""
+        from tools.registry import registry
+        import tools.mcp_tool as mcp_tool
+
+        server = _make_mock_server(
+            "same-name", tools=[_make_mcp_tool("search", "Search")]
+        )
+        registered = []
+
+        with (
+            patch("tools.mcp_tool._MCP_AVAILABLE", True),
+            patch(
+                "tools.mcp_tool._filter_suspicious_mcp_servers",
+                side_effect=lambda servers: servers,
+            ),
+            patch("tools.mcp_tool._ensure_mcp_loop"),
+            patch("tools.mcp_tool._run_on_mcp_loop"),
+        ):
+            mcp_tool.register_mcp_servers(
+                {"same-name": {"command": "ignored"}}, source="acp"
+            )
+            mcp_tool.register_mcp_servers(
+                {"same-name": {"command": "ignored"}}, source="config"
+            )
+
+        async def fake_connect(_name, _config):
+            return server
+
+        try:
+            with (
+                patch("tools.mcp_tool._connect_server", side_effect=fake_connect),
+                patch(
+                    "hermes_cli.config.load_config",
+                    return_value={
+                        "mcp_servers": {
+                            "same-name": {
+                                "command": "ignored",
+                                "allowed_platforms": ["cli"],
+                            }
+                        }
+                    },
+                ),
+            ):
+                registered = asyncio.run(
+                    mcp_tool._discover_and_register_server(
+                        "same-name", {"command": "ignored"}
+                    )
+                )
+                tool_name = "mcp__same_name__search"
+                assert mcp_tool.mcp_tool_platform_access(tool_name, "acp") == (
+                    True,
+                    None,
+                )
+                assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (
+                    False,
+                    "mcp_platform_denied",
+                )
+        finally:
+            for tool_name in registered:
+                registry.deregister(tool_name)
+            with mcp_tool._lock:
+                mcp_tool._servers.pop("same-name", None)
+                mcp_tool._server_connecting.discard("same-name")
+                mcp_tool._mcp_server_origins.pop("same-name", None)
+                mcp_tool._mcp_connecting_origins.pop("same-name", None)
+                mcp_tool._server_connect_errors.pop("same-name", None)
 
     def test_is_mcp_tool_parallel_safe_no_tool_suffix(self):
         """Tool name that is just 'mcp_{server}' without a tool part returns False."""

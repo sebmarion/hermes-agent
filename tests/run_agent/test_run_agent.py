@@ -2865,6 +2865,7 @@ class TestConcurrentToolExecution:
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
+        agent.platform = "cli"
         with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
@@ -2881,6 +2882,7 @@ class TestConcurrentToolExecution:
                 tool_request_middleware_trace=[],
                 original_function_args={"q": "test"},
                 on_authorized=None,
+                platform="cli",
             )
             assert result == "result"
 
@@ -2898,6 +2900,18 @@ class TestConcurrentToolExecution:
 
         assert starts == [("c1", "web_search", {"query": "hello"})]
         assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
+
+    def test_sequential_tool_dispatch_passes_agent_platform(self, agent):
+        agent.platform = "cron"
+        tool_call = _mock_tool_call(
+            name="web_search", arguments='{"query":"hello"}', call_id="c1"
+        )
+        message = _mock_assistant_msg(content="", tool_calls=[tool_call])
+
+        with patch("model_tools.registry.dispatch", return_value='{"success": true}') as dispatch:
+            agent._execute_tool_calls_sequential(message, [], "task-1")
+
+        assert dispatch.call_args.kwargs["platform"] == "cron"
 
     def test_sequential_browser_type_callbacks_redact_api_key(self, agent):
         secret = "sk-proj-ABCD1234567890EFGH"

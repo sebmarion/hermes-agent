@@ -317,6 +317,11 @@ def _tool_search_scoped_names(agent) -> frozenset:
             quiet_mode=True,
             skip_tool_search_assembly=True,
         ) or []
+        from tools.mcp_tool import filter_mcp_tool_definitions_for_platform
+
+        scoped_defs = filter_mcp_tool_definitions_for_platform(
+            scoped_defs, getattr(agent, "platform", None)
+        )
         names = _ts.scoped_deferrable_names(scoped_defs)
     except Exception:
         names = frozenset()
@@ -1799,6 +1804,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_request_middleware_trace=list(middleware_trace),
                     original_function_args=original_function_args,
                     on_authorized=_on_authorized,
+                    **(
+                        {"platform": agent.platform}
+                        if isinstance(getattr(agent, "platform", None), str)
+                        else {}
+                    ),
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1843,6 +1853,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_request_middleware_trace=list(middleware_trace),
                     original_function_args=original_function_args,
                     on_authorized=_on_authorized,
+                    **(
+                        {"platform": agent.platform}
+                        if isinstance(getattr(agent, "platform", None), str)
+                        else {}
+                    ),
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(

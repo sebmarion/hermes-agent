@@ -1594,22 +1594,106 @@ def _parse_enabled_flag(value, default: bool = True) -> bool:
     return default
 
 
-def enabled_mcp_server_names(config: dict) -> Set[str]:
-    """Names of MCP servers globally enabled in config.yaml.
+def _mcp_policy_platform(platform: Optional[str]) -> Optional[str]:
+    """Normalize a runtime tag to the toolset policy surface it uses.
+
+    The standalone TUI and desktop chat backend intentionally resolve their
+    toolsets through the ``cli`` configuration. Their execution tags remain
+    ``tui`` / ``desktop`` for UI behavior and lifecycle metadata, but MCP
+    authorization must use the same surface that assembled the tool snapshot.
+    """
+    if not isinstance(platform, str):
+        return None
+    normalized = platform.strip().lower()
+    if not normalized:
+        return None
+    return {"tui": "cli", "desktop": "cli"}.get(normalized, normalized)
+
+
+def mcp_server_allowed_on_platform(server_cfg: dict, platform: Optional[str]) -> bool:
+    """Whether one MCP server is allowed on a Hermes runtime surface.
+
+    ``allowed_platforms`` names runtime surfaces such as ``cli``, ``cron`` or
+    ``telegram``; it is not an operating-system detector. Omitting the field
+    preserves historical all-surface behaviour. Once present, malformed or
+    empty policy is denied until an operator corrects it.
+    """
+    if not isinstance(server_cfg, dict):
+        return False
+    if "allowed_platforms" not in server_cfg:
+        return True
+
+    allowed_values = server_cfg.get("allowed_platforms")
+    if not isinstance(allowed_values, (list, tuple)) or not allowed_values:
+        return False
+    normalized_allowed: Set[str] = set()
+    for value in allowed_values:
+        if not isinstance(value, str):
+            return False
+        normalized = value.strip().lower()
+        if not normalized:
+            return False
+        normalized_allowed.add(normalized)
+
+    if not isinstance(platform, str):
+        return False
+    normalized_platform = _mcp_policy_platform(platform)
+    return bool(normalized_platform and normalized_platform in normalized_allowed)
+
+
+def configured_mcp_server_names(config: dict) -> Set[str]:
+    """Configured MCP server names, regardless of enablement or platform."""
+    mcp_servers = (config or {}).get("mcp_servers") or {}
+    if not isinstance(mcp_servers, dict):
+        return set()
+    return {
+        str(name)
+        for name, server_cfg in mcp_servers.items()
+        if isinstance(server_cfg, dict)
+    }
+
+
+def enabled_mcp_server_names(config: dict, platform: Optional[str] = None) -> Set[str]:
+    """Names of MCP servers enabled for an optional runtime surface.
 
     Shared by the gateway/CLI platform resolver (``_get_platform_tools``) and
     the cron per-job toolset resolver (``cron.scheduler``) so every path agrees
     on MCP membership. A server is enabled unless its config sets an explicitly
     falsey ``enabled`` (per ``_parse_enabled_flag``: false/0/no/off) — a missing
-    flag or an unrecognized value is treated as enabled.
+    flag or an unrecognized value is treated as enabled. When a server declares
+    ``allowed_platforms``, that allowlist must include ``platform``.
     """
     mcp_servers = (config or {}).get("mcp_servers") or {}
+    if not isinstance(mcp_servers, dict):
+        return set()
     return {
         str(name)
         for name, server_cfg in mcp_servers.items()
         if isinstance(server_cfg, dict)
         and _parse_enabled_flag(server_cfg.get("enabled", True), default=True)
+        and mcp_server_allowed_on_platform(server_cfg, platform)
     }
+
+
+def filter_mcp_toolsets_for_platform(
+    toolsets: List[str], config: dict, *, platform: Optional[str]
+) -> List[str]:
+    """Remove configured MCP aliases that are disabled on ``platform``.
+
+    A saved agent snapshot can retain a raw server name or its ``mcp-`` alias
+    after an operator changes ``enabled`` or ``allowed_platforms``. Preserve
+    all non-MCP/custom entries verbatim, but never let those stale aliases back
+    into an exposure list during a reload.
+    """
+    configured_mcp = configured_mcp_server_names(config)
+    configured_aliases = configured_mcp | {f"mcp-{name}" for name in configured_mcp}
+    enabled_mcp = enabled_mcp_server_names(config, platform=platform)
+    enabled_aliases = enabled_mcp | {f"mcp-{name}" for name in enabled_mcp}
+    return [
+        toolset
+        for toolset in toolsets
+        if toolset not in configured_aliases or toolset in enabled_aliases
+    ]
 
 
 def _exempt_explicit_platform_native(
@@ -1876,14 +1960,26 @@ def _get_platform_tools(
     # If the platform explicitly lists one or more MCP server names, treat that
     # as an allowlist. Otherwise include every globally enabled MCP server.
     # Special sentinel: "no_mcp" in the toolset list disables all MCP servers.
-    enabled_mcp_servers = enabled_mcp_server_names(config)
+    configured_mcp_servers = configured_mcp_server_names(config)
+    configured_mcp_toolsets = configured_mcp_servers | {
+        f"mcp-{name}" for name in configured_mcp_servers
+    }
+    enabled_mcp_servers = enabled_mcp_server_names(config, platform=platform)
+    enabled_mcp_toolsets = enabled_mcp_servers | {
+        f"mcp-{name}" for name in enabled_mcp_servers
+    }
     # Allow "no_mcp" sentinel to opt out of all MCP servers for this platform
     if "no_mcp" in toolset_names:
         explicit_mcp_servers = set()
-        enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers - {"no_mcp"})
+        enabled_toolsets.update(
+            explicit_passthrough - configured_mcp_toolsets - {"no_mcp"}
+        )
     else:
-        explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
-        enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers)
+        explicit_mcp_servers = explicit_passthrough & enabled_mcp_toolsets
+        # A configured MCP alias is not a generic/custom passthrough. This
+        # prevents a platform-specific saved selection from reviving a server
+        # that is denied on that platform.
+        enabled_toolsets.update(explicit_passthrough - configured_mcp_toolsets)
     if include_default_mcp_servers:
         if explicit_mcp_servers or "no_mcp" in toolset_names:
             enabled_toolsets.update(explicit_mcp_servers)

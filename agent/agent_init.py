@@ -1202,6 +1202,22 @@ def init_agent(
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+    try:
+        from tools.mcp_tool import filter_mcp_tool_definitions_for_platform
+
+        agent.tools = filter_mcp_tool_definitions_for_platform(
+            agent.tools, getattr(agent, "platform", None)
+        )
+    except Exception:
+        # A policy-import failure must not leave an MCP schema exposed. Native
+        # tool discovery stays available; only the dynamically registered MCP
+        # family is removed until the integration can be loaded correctly.
+        logger.exception("Could not apply MCP platform filter to agent snapshot")
+        agent.tools = [
+            tool
+            for tool in agent.tools
+            if not str(tool.get("function", {}).get("name") or "").startswith("mcp__")
+        ]
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()

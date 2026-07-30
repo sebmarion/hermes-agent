@@ -31,6 +31,77 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_platform_is_forwarded_to_registry_dispatch(self, monkeypatch):
+        seen = {}
+
+        def fake_dispatch(name, args, **kwargs):
+            seen["name"] = name
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+            return '{"ok":true}'
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+
+        result = handle_function_call(
+            "web_search",
+            {"q": "test"},
+            task_id="platform-test",
+            platform="cli",
+        )
+
+        assert result == '{"ok":true}'
+        assert seen["name"] == "web_search"
+        assert seen["kwargs"]["platform"] == "cli"
+
+    def test_tool_call_bridge_preserves_platform_for_underlying_dispatch(self, monkeypatch):
+        """The deferred-tool bridge must not drop MCP authorization context."""
+        from tools import tool_search
+
+        seen = {}
+        monkeypatch.setattr(
+            "model_tools.get_tool_definitions",
+            lambda **kwargs: [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__zeus__open",
+                        "description": "",
+                        "parameters": {},
+                    },
+                }
+            ],
+        )
+        monkeypatch.setattr(
+            tool_search,
+            "resolve_underlying_call",
+            lambda _args: ("mcp__zeus__open", {"url": "https://example.com"}, None),
+        )
+        monkeypatch.setattr(
+            tool_search,
+            "scoped_deferrable_names",
+            lambda _defs: frozenset({"mcp__zeus__open"}),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda name, args, **kwargs: seen.update(
+                {"name": name, "args": args, "platform": kwargs.get("platform")}
+            )
+            or '{"ok":true}',
+        )
+
+        result = handle_function_call(
+            "tool_call",
+            {"name": "mcp__zeus__open", "arguments": {"url": "https://example.com"}},
+            platform="cli",
+        )
+
+        assert result == '{"ok":true}'
+        assert seen == {
+            "name": "mcp__zeus__open",
+            "args": {"url": "https://example.com"},
+            "platform": "cli",
+        }
+
     def test_exception_returns_json_error(self):
         # Even if something goes wrong, should return valid JSON
         result = handle_function_call("web_search", None)  # None args may cause issues

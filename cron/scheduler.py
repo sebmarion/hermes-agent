@@ -152,15 +152,26 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
         add nothing further (the user named exactly the servers they want)
       * otherwise -> union in every globally-enabled MCP server
     """
-    result = [t for t in per_job if t != "no_mcp"]
+    # A job may retain a raw MCP alias from before an operator tightened its
+    # surface policy. Remove configured aliases that are no longer allowed
+    # before treating the remaining list as an allowlist.
+    from hermes_cli.tools_config import (
+        enabled_mcp_server_names,
+        filter_mcp_toolsets_for_platform,
+    )
+
+    enabled_mcp = enabled_mcp_server_names(cfg, platform="cron")
+    enabled_aliases = enabled_mcp | {f"mcp-{name}" for name in enabled_mcp}
+    result = [
+        toolset
+        for toolset in filter_mcp_toolsets_for_platform(
+            per_job, cfg, platform="cron"
+        )
+        if toolset != "no_mcp"
+    ]
     if "no_mcp" in per_job:
         return result
-    # lazy import: avoid heavy hermes_cli import at cron module load (matches
-    # _resolve_cron_enabled_toolsets' fallback) and share one MCP-membership
-    # computation with the gateway/CLI platform resolver.
-    from hermes_cli.tools_config import enabled_mcp_server_names
-    enabled_mcp = enabled_mcp_server_names(cfg)
-    if set(result) & enabled_mcp:
+    if set(result) & enabled_aliases:
         return result
     for name in sorted(enabled_mcp):
         if name not in result:

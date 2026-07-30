@@ -440,6 +440,43 @@ class TestPersistence:
 
         assert captured["enabled_toolsets"] == ["hermes-acp", "mcp-olympus", "mcp-exa"]
 
+    def test_create_session_excludes_mcp_servers_disallowed_for_acp(self, tmp_path, monkeypatch):
+        """ACP must assemble the same allowed-platform snapshot it dispatches."""
+        captured = {}
+
+        def fake_agent(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                model=kwargs.get("model"),
+                enabled_toolsets=kwargs.get("enabled_toolsets"),
+            )
+
+        config = {
+            "model": {"provider": "openrouter", "default": "test-model"},
+            "mcp_servers": {
+                "acp-ok": {"command": "python", "allowed_platforms": ["acp"]},
+                "cli-only": {"command": "python", "allowed_platforms": ["cli"]},
+                "legacy": {"command": "python"},
+            },
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "chat_completions",
+                "base_url": "https://example.invalid/v1",
+                "api_key": "test-key",
+                "command": None,
+                "args": [],
+            },
+        )
+
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            SessionManager(db=SessionDB(tmp_path / "state.db")).create_session(cwd="/work")
+
+        assert captured["enabled_toolsets"] == ["hermes-acp", "mcp-acp-ok", "mcp-legacy"]
+
     def test_create_session_writes_to_db(self, manager):
         state = manager.create_session(cwd="/project")
         db = manager._get_db()

@@ -24,6 +24,9 @@ from hermes_cli.tools_config import (
     TOOL_CATEGORIES,
     gui_toolset_label,
     _visible_providers,
+    enabled_mcp_server_names,
+    filter_mcp_toolsets_for_platform,
+    mcp_server_allowed_on_platform,
     tools_command,
 )
 
@@ -491,6 +494,81 @@ def test_get_platform_tools_includes_enabled_mcp_servers_by_default():
     assert "exa" in enabled
     assert "web-search-prime" in enabled
     assert "disabled-server" not in enabled
+
+
+def test_enabled_mcp_server_names_filters_allowed_platforms():
+    """A present restriction is a fail-closed runtime-surface allowlist."""
+    config = {
+        "mcp_servers": {
+            "legacy": {"url": "https://example.com/legacy"},
+            "cli-only": {
+                "url": "https://example.com/cli",
+                "allowed_platforms": [" CLI "],
+            },
+            "telegram-only": {
+                "url": "https://example.com/telegram",
+                "allowed_platforms": ["telegram"],
+            },
+            "empty": {"url": "https://example.com/empty", "allowed_platforms": []},
+            "malformed": {
+                "url": "https://example.com/malformed",
+                "allowed_platforms": "cli",
+            },
+            "mixed": {
+                "url": "https://example.com/mixed",
+                "allowed_platforms": ["cli", 42],
+            },
+        }
+    }
+
+    assert enabled_mcp_server_names(config, platform="cli") == {"legacy", "cli-only"}
+    assert enabled_mcp_server_names(config, platform="telegram") == {"legacy", "telegram-only"}
+    assert enabled_mcp_server_names(config, platform=None) == {"legacy"}
+
+
+def test_mcp_platform_policy_uses_cli_surface_for_tui_and_desktop():
+    """Desktop/TUI share the CLI toolset resolver and must share its policy surface."""
+    server_cfg = {"allowed_platforms": ["cli"]}
+
+    assert mcp_server_allowed_on_platform(server_cfg, "cli") is True
+    assert mcp_server_allowed_on_platform(server_cfg, "tui") is True
+    assert mcp_server_allowed_on_platform(server_cfg, "desktop") is True
+    assert mcp_server_allowed_on_platform(server_cfg, "telegram") is False
+
+
+def test_filter_mcp_toolsets_for_platform_prunes_stale_and_denied_aliases():
+    """Reload callers must remove old raw and mcp-* aliases after a policy change."""
+    config = {
+        "mcp_servers": {
+            "zeus": {"enabled": True, "allowed_platforms": ["cli"]},
+            "disabled": {"enabled": False},
+        }
+    }
+
+    assert filter_mcp_toolsets_for_platform(
+        ["web", "zeus", "mcp-zeus", "disabled", "mcp-disabled", "custom"],
+        config,
+        platform="telegram",
+    ) == ["web", "custom"]
+
+
+def test_get_platform_tools_explicit_mcp_name_cannot_bypass_allowed_platforms():
+    """A platform's saved raw/``mcp-`` aliases cannot resurrect a denied server."""
+    config = {
+        "platform_toolsets": {"telegram": ["web", "zeus", "mcp-zeus"]},
+        "mcp_servers": {
+            "zeus": {
+                "url": "https://example.com/zeus",
+                "allowed_platforms": ["cli"],
+            },
+        },
+    }
+
+    enabled = _get_platform_tools(config, "telegram")
+
+    assert "web" in enabled
+    assert "zeus" not in enabled
+    assert "mcp-zeus" not in enabled
 
 
 def test_get_platform_tools_keeps_enabled_mcp_servers_with_explicit_builtin_selection():

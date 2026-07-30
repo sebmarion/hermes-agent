@@ -2687,9 +2687,13 @@ def _load_enabled_toolsets() -> list[str] | None:
 
         mcp_names: set[str] = set()
         mcp_disabled: set[str] = set()
+        mcp_disallowed: set[str] = set()
         try:
             from hermes_cli.config import read_raw_config
-            from hermes_cli.tools_config import _parse_enabled_flag
+            from hermes_cli.tools_config import (
+                _parse_enabled_flag,
+                enabled_mcp_server_names,
+            )
 
             raw_cfg = read_raw_config()
             mcp_servers = (
@@ -2697,23 +2701,29 @@ def _load_enabled_toolsets() -> list[str] | None:
                 if isinstance(raw_cfg.get("mcp_servers"), dict)
                 else {}
             )
+            mcp_names = enabled_mcp_server_names(raw_cfg, platform="cli")
             for name, server_cfg in mcp_servers.items():
                 if not isinstance(server_cfg, dict):
                     continue
-                if _parse_enabled_flag(server_cfg.get("enabled", True), default=True):
-                    mcp_names.add(str(name))
-                else:
+                normalized_name = str(name)
+                if not _parse_enabled_flag(server_cfg.get("enabled", True), default=True):
                     mcp_disabled.add(str(name))
+                elif normalized_name not in mcp_names:
+                    mcp_disallowed.add(normalized_name)
         except Exception:
             mcp_names = set()
             mcp_disabled = set()
+            mcp_disallowed = set()
 
         mcp_valid = [name for name in unresolved if name in mcp_names]
         disabled = [name for name in unresolved if name in mcp_disabled]
+        disallowed = [name for name in unresolved if name in mcp_disallowed]
         unknown = [
             name
             for name in unresolved
-            if name not in mcp_names and name not in mcp_disabled
+            if name not in mcp_names
+            and name not in mcp_disabled
+            and name not in mcp_disallowed
         ]
         valid = built_in + mcp_valid
 
@@ -2728,6 +2738,13 @@ def _load_enabled_toolsets() -> list[str] | None:
                 "[tui] ignoring disabled MCP servers in HERMES_TUI_TOOLSETS "
                 "(set enabled: true in config.yaml to use): "
                 f"{', '.join(disabled)}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if disallowed:
+            print(
+                "[tui] ignoring MCP servers not allowed on the CLI surface: "
+                f"{', '.join(disallowed)}",
                 file=sys.stderr,
                 flush=True,
             )

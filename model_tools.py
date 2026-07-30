@@ -1157,6 +1157,7 @@ def handle_function_call(
     disabled_toolsets: Optional[List[str]] = None,
     original_function_args: Optional[Dict[str, Any]] = None,
     on_authorized: Optional[Callable[[Dict[str, Any]], None]] = None,
+    platform: Optional[str] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1178,6 +1179,8 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        platform: Canonical Hermes runtime surface for dispatch-time MCP
+                  authorization. Restricted MCP servers deny when absent.
 
     Returns:
         Function result as a JSON string.
@@ -1219,6 +1222,11 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
             ) or []
+            from tools.mcp_tool import filter_mcp_tool_definitions_for_platform
+
+            current_defs = filter_mcp_tool_definitions_for_platform(
+                current_defs, platform
+            )
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
@@ -1265,6 +1273,7 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
                 original_function_args=underlying_args,
                 on_authorized=on_authorized,
+                platform=platform,
             )
 
     _tool_original_args = dict(
@@ -1420,27 +1429,31 @@ def handle_function_call(
                     dispatch_block = _prepare_authorized_dispatch(next_args)
                     if dispatch_block is not None:
                         return dispatch_block
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        tool_call_id=tool_call_id,
-                        enabled_tools=sandbox_enabled,
-                    )
+                    dispatch_kwargs = {
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "tool_call_id": tool_call_id,
+                        "enabled_tools": sandbox_enabled,
+                    }
+                    if platform is not None:
+                        dispatch_kwargs["platform"] = platform
+                    return registry.dispatch(function_name, next_args, **dispatch_kwargs)
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     dispatch_block = _prepare_authorized_dispatch(next_args)
                     if dispatch_block is not None:
                         return dispatch_block
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        tool_call_id=tool_call_id,
-                        user_task=user_task,
-                    )
+                    dispatch_kwargs = {
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "tool_call_id": tool_call_id,
+                        "user_task": user_task,
+                    }
+                    if platform is not None:
+                        dispatch_kwargs["platform"] = platform
+                    return registry.dispatch(function_name, next_args, **dispatch_kwargs)
             from hermes_cli.middleware import run_tool_execution_middleware
 
             result = run_tool_execution_middleware(

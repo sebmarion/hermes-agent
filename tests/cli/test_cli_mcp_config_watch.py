@@ -1,6 +1,7 @@
 """Tests for automatic MCP reload when config.yaml mcp_servers section changes."""
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -101,3 +102,66 @@ class TestMCPConfigWatch:
             obj._check_config_mcp_changes()  # should not raise
 
         obj._reload_mcp.assert_not_called()
+
+
+class TestMcpReloadPlatformPolicy:
+    def test_reload_prunes_stale_disallowed_mcp_aliases_before_refresh(self):
+        """A CLI reload removes aliases that the current policy no longer permits."""
+        import cli as cli_mod
+        import tools.mcp_tool as mcp_tool
+
+        obj = object.__new__(cli_mod.HermesCLI)
+        obj._command_running = True
+        obj.agent = SimpleNamespace(platform="cli", tools=[])
+        obj.enabled_toolsets = ["web", "zeus", "mcp-zeus"]
+        obj.conversation_history = []
+        captured = {}
+
+        def capture_refresh(agent, **kwargs):
+            captured["agent"] = agent
+            captured.update(kwargs)
+            return set()
+
+        config = {
+            "mcp_servers": {
+                "zeus": {"enabled": True, "allowed_platforms": ["telegram"]},
+                "allowed": {"enabled": True, "allowed_platforms": ["cli"]},
+            }
+        }
+        with (
+            patch("tools.mcp_tool.shutdown_mcp_servers"),
+            patch("tools.mcp_tool.discover_mcp_tools", return_value=["new-tool"]),
+            patch("tools.mcp_tool.refresh_agent_mcp_tools", side_effect=capture_refresh),
+            patch("hermes_cli.config.load_config", return_value=config),
+            patch.dict(mcp_tool._servers, {"zeus": object(), "allowed": object()}, clear=True),
+        ):
+            obj._reload_mcp()
+
+        assert captured["agent"] is obj.agent
+        assert captured["enabled_override"] == ["web", "allowed"]
+        assert obj.enabled_toolsets == ["web", "allowed"]
+
+    def test_all_toolsets_reload_relies_on_dispatch_snapshot_filter(self):
+        """The explicit all path keeps its selection; refresh applies the MCP schema filter."""
+        import cli as cli_mod
+        import tools.mcp_tool as mcp_tool
+
+        obj = object.__new__(cli_mod.HermesCLI)
+        obj._command_running = True
+        obj.agent = SimpleNamespace(platform="cli", tools=[])
+        obj.enabled_toolsets = ["all"]
+        obj.conversation_history = []
+        captured = {}
+
+        with (
+            patch("tools.mcp_tool.shutdown_mcp_servers"),
+            patch("tools.mcp_tool.discover_mcp_tools", return_value=[]),
+            patch(
+                "tools.mcp_tool.refresh_agent_mcp_tools",
+                side_effect=lambda agent, **kwargs: captured.update(kwargs) or set(),
+            ),
+            patch.dict(mcp_tool._servers, {"zeus": object()}, clear=True),
+        ):
+            obj._reload_mcp()
+
+        assert captured == {"enabled_override": None, "quiet_mode": True}
