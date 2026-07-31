@@ -4299,6 +4299,8 @@ def run_conversation(
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(reason=classified.reason):
+                            cooldown = agent.config.get('agent.fallback_cooldown_seconds', 10)
+                            time.sleep(cooldown)
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
