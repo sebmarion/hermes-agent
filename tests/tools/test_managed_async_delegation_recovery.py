@@ -71,6 +71,77 @@ def _write_tracker(path, profile_id, delegation_id, *, status="completed",
     path.chmod(0o600)
 
 
+def _write_legacy_tracker(
+    path,
+    *,
+    status="completed",
+    delivery="delivered",
+):
+    delegation_id = f"deleg_default_legacy_{uuid.uuid4()}"
+    record = {
+        "delegation_id": delegation_id,
+        "goal": "legacy batch",
+        "goals": ["legacy task"],
+        "context": None,
+        "toolsets": None,
+        "role": "leaf",
+        "model": "local",
+        "session_key": "",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "status": status,
+        "dispatched_at": 1.0,
+        "completed_at": 2.0,
+        "last_heartbeat_at": 2.0,
+        "heartbeat_count": 0,
+        "delivery_status": delivery,
+        "runtime_owner_id": "runtime-legacy",
+        "runtime_owner_pid": 123,
+        "runtime_owner_start_token": "legacy-start-token",
+        "is_batch": True,
+    }
+    result = {
+        "results": [],
+        "total_duration_seconds": 1.0,
+    }
+    entry = {
+        "delegation_id": delegation_id,
+        "status": status,
+        "delivery_status": delivery,
+        "record": record,
+        "event": {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "session_key": "",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "goal": "legacy batch",
+            "goals": ["legacy task"],
+            "context": None,
+            "toolsets": None,
+            "role": "leaf",
+            "model": "local",
+            "status": status,
+            "is_batch": True,
+            "results": [],
+            "error": None,
+            "total_duration_seconds": 1.0,
+            "dispatched_at": 1.0,
+            "completed_at": 2.0,
+        },
+        "result": result,
+        "updated_at": 3.0,
+        "queued_at": 2.0 if delivery == "delivered" else None,
+        "delivered_at": 3.0 if delivery == "delivered" else None,
+    }
+    path.write_text(
+        json.dumps({"version": 1, "records": {delegation_id: entry}}),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    return delegation_id
+
+
 def _worker(manifest, outbox, boundary):
     from tools import async_delegation as worker_ad
     from tools.process_registry import ProcessRegistry
@@ -131,6 +202,86 @@ def test_manifest_is_authoritative_and_runtime_epoch_is_internal(tmp_path):
         event["managed_delivery"]["manifest_source_digest"] == "a" * 64
         for event in events
     )
+
+
+def test_terminal_delivered_legacy_record_is_inert_and_verifiable(tmp_path):
+    manifest = _manifest(tmp_path)
+    tracker = manifest.profiles[0].tracker_path
+    delegation_id = _write_legacy_tracker(tracker)
+    before = tracker.read_bytes()
+    completion_queue = queue.Queue()
+
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest,
+        outbox_path=tmp_path / "outbox.json",
+        completion_queue=completion_queue,
+    )
+
+    assert receipt.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+    assert receipt.record_classifications == (
+        (delegation_id, "legacy_delivered"),
+    )
+    assert tracker.read_bytes() == before
+    assert not (tmp_path / "outbox.json").exists()
+    assert completion_queue.empty()
+
+    verification = ad.verify_managed_async_delegations_exact(
+        receipt,
+        manifest,
+        completion_queue=completion_queue,
+    )
+    assert (
+        verification.outcome
+        is ad.ManagedAsyncDelegationRecoveryOutcome.COMPLETE
+    )
+    assert verification.record_classifications == (
+        (delegation_id, "legacy_delivered"),
+    )
+    assert tracker.read_bytes() == before
+
+
+@pytest.mark.parametrize("payload_name", ["record", "event", "result"])
+def test_legacy_nested_unknown_fields_remain_ambiguous(
+    tmp_path,
+    payload_name,
+):
+    manifest = _manifest(tmp_path)
+    tracker = manifest.profiles[0].tracker_path
+    delegation_id = _write_legacy_tracker(tracker)
+    data = json.loads(tracker.read_text(encoding="utf-8"))
+    data["records"][delegation_id][payload_name]["unexpected"] = True
+    tracker.write_text(json.dumps(data), encoding="utf-8")
+    tracker.chmod(0o600)
+    before = tracker.read_bytes()
+
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest,
+        outbox_path=tmp_path / "outbox.json",
+        completion_queue=queue.Queue(),
+    )
+
+    assert receipt.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    assert "legacy delegation" in receipt.errors[0]
+    assert tracker.read_bytes() == before
+    assert not (tmp_path / "outbox.json").exists()
+
+
+def test_undelivered_legacy_record_remains_ambiguous(tmp_path):
+    manifest = _manifest(tmp_path)
+    tracker = manifest.profiles[0].tracker_path
+    _write_legacy_tracker(tracker, delivery="pending")
+    before = tracker.read_bytes()
+
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest,
+        outbox_path=tmp_path / "outbox.json",
+        completion_queue=queue.Queue(),
+    )
+
+    assert receipt.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    assert "legacy delegation is not terminal and delivered" in receipt.errors[0]
+    assert tracker.read_bytes() == before
+    assert not (tmp_path / "outbox.json").exists()
 
 
 def test_incomplete_or_empty_manifest_is_ambiguous(tmp_path):

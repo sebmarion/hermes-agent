@@ -869,6 +869,325 @@ def _managed_v2_validate_delegation_id(
     return delegation_id
 
 
+_MANAGED_LEGACY_BATCH_RECORD_FIELDS = {
+    "completed_at",
+    "context",
+    "delegation_id",
+    "delivery_status",
+    "dispatched_at",
+    "goal",
+    "goals",
+    "heartbeat_count",
+    "is_batch",
+    "last_heartbeat_at",
+    "model",
+    "origin_ui_session_id",
+    "parent_session_id",
+    "role",
+    "runtime_owner_id",
+    "runtime_owner_pid",
+    "runtime_owner_start_token",
+    "session_key",
+    "status",
+    "toolsets",
+}
+_MANAGED_LEGACY_BATCH_EVENT_FIELDS = {
+    "completed_at",
+    "context",
+    "delegation_id",
+    "dispatched_at",
+    "error",
+    "goal",
+    "goals",
+    "is_batch",
+    "model",
+    "origin_ui_session_id",
+    "parent_session_id",
+    "results",
+    "role",
+    "session_key",
+    "status",
+    "toolsets",
+    "total_duration_seconds",
+    "type",
+}
+_MANAGED_LEGACY_CHILD_RESULT_FIELDS = {
+    "_child_cost_usd",
+    "_child_role",
+    "api_calls",
+    "diagnostic_path",
+    "duration_seconds",
+    "error",
+    "evidence",
+    "exit_reason",
+    "failure_kind",
+    "lane",
+    "mode",
+    "model",
+    "provider",
+    "routed_model",
+    "status",
+    "summary",
+    "summary_full_path",
+    "summary_truncated",
+    "task_index",
+    "tokens",
+    "tool_trace",
+}
+
+
+def _managed_v2_legacy_finite_number(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
+
+
+def _managed_v2_validate_legacy_child_result(value: object) -> None:
+    if (
+        not isinstance(value, dict)
+        or not set(value).issubset(_MANAGED_LEGACY_CHILD_RESULT_FIELDS)
+        or not {"task_index", "status"}.issubset(value)
+    ):
+        raise ValueError("managed legacy child result schema is not closed")
+    for name in (
+        "task_index",
+        "api_calls",
+        "duration_seconds",
+        "_child_cost_usd",
+    ):
+        if name in value and not _managed_v2_legacy_finite_number(value[name]):
+            raise ValueError("managed legacy child result number is invalid")
+    if (
+        isinstance(value["task_index"], bool)
+        or not isinstance(value["task_index"], int)
+        or value["task_index"] < 0
+        or not isinstance(value["status"], str)
+        or not value["status"]
+    ):
+        raise ValueError("managed legacy child result identity is invalid")
+    for name in (
+        "_child_role",
+        "diagnostic_path",
+        "error",
+        "exit_reason",
+        "failure_kind",
+        "lane",
+        "mode",
+        "model",
+        "provider",
+        "routed_model",
+        "summary",
+        "summary_full_path",
+    ):
+        if name in value and value[name] is not None and not isinstance(
+            value[name], str
+        ):
+            raise ValueError("managed legacy child result text is invalid")
+    if "summary_truncated" in value and not isinstance(
+        value["summary_truncated"], bool
+    ):
+        raise ValueError("managed legacy child result truncation is invalid")
+    tokens = value.get("tokens")
+    if tokens is not None and (
+        not isinstance(tokens, dict)
+        or set(tokens) != {"input", "output"}
+        or any(
+            not _managed_v2_legacy_finite_number(tokens[name])
+            for name in ("input", "output")
+        )
+    ):
+        raise ValueError("managed legacy child result tokens are invalid")
+    evidence = value.get("evidence")
+    if evidence is not None and (
+        not isinstance(evidence, dict)
+        or set(evidence)
+        != {"tool_turn_count", "successful_tool_count"}
+        or any(
+            isinstance(evidence[name], bool)
+            or not isinstance(evidence[name], int)
+            or evidence[name] < 0
+            for name in ("tool_turn_count", "successful_tool_count")
+        )
+    ):
+        raise ValueError("managed legacy child result evidence is invalid")
+    tool_trace = value.get("tool_trace")
+    if tool_trace is not None and (
+        not isinstance(tool_trace, list)
+        or any(not isinstance(item, dict) for item in tool_trace)
+    ):
+        raise ValueError("managed legacy child result trace is invalid")
+
+
+def _managed_v2_is_inert_legacy_delivered(
+    delegation_id: str,
+    entry: Dict[str, Any],
+) -> bool:
+    """Recognize only completed legacy rows whose notification is ACKed."""
+    prefix = "deleg_default_legacy_"
+    if not delegation_id.startswith(prefix):
+        return False
+    try:
+        uuid.UUID(delegation_id[len(prefix):])
+    except (ValueError, TypeError) as exc:
+        raise ValueError("managed legacy delegation id lacks a full UUID") from exc
+    if set(entry) != {
+        "delegation_id",
+        "status",
+        "delivery_status",
+        "record",
+        "event",
+        "result",
+        "updated_at",
+        "queued_at",
+        "delivered_at",
+    }:
+        raise ValueError("managed legacy delegation schema is not closed")
+    status = entry.get("status")
+    if (
+        status not in _MANAGED_TERMINAL_STATUSES
+        or entry.get("delivery_status") != "delivered"
+    ):
+        raise ValueError(
+            "managed legacy delegation is not terminal and delivered"
+        )
+    record = entry.get("record")
+    event = entry.get("event")
+    result = entry.get("result")
+    if (
+        not isinstance(record, dict)
+        or set(record) != _MANAGED_LEGACY_BATCH_RECORD_FIELDS
+        or record.get("delegation_id") != delegation_id
+        or record.get("status") != status
+        or record.get("delivery_status") != "delivered"
+        or not isinstance(event, dict)
+        or set(event) != _MANAGED_LEGACY_BATCH_EVENT_FIELDS
+        or event.get("type") != "async_delegation"
+        or event.get("delegation_id") != delegation_id
+        or event.get("status") != status
+        or not isinstance(result, dict)
+        or set(result)
+        not in (
+            {"results", "total_duration_seconds"},
+            {"error", "results", "total_duration_seconds"},
+        )
+    ):
+        raise ValueError("managed legacy delegation binding is invalid")
+    forbidden = {
+        "managed_delivery",
+        "managed_event_id",
+        "profile_generation",
+        "profile_id",
+    }
+    if (
+        forbidden.intersection(record)
+        or forbidden.intersection(event)
+    ):
+        raise ValueError("managed legacy delegation is partially bound")
+    text_or_none = (
+        record["context"],
+        record["model"],
+        record["parent_session_id"],
+    )
+    if (
+        record["is_batch"] is not True
+        or not isinstance(record["goal"], str)
+        or not record["goal"]
+        or not isinstance(record["goals"], list)
+        or not record["goals"]
+        or any(not isinstance(goal, str) or not goal for goal in record["goals"])
+        or any(value is not None and not isinstance(value, str) for value in text_or_none)
+        or not isinstance(record["role"], str)
+        or not record["role"]
+        or not isinstance(record["session_key"], str)
+        or not isinstance(record["origin_ui_session_id"], str)
+        or (
+            record["toolsets"] is not None
+            and (
+                not isinstance(record["toolsets"], list)
+                or any(not isinstance(item, str) for item in record["toolsets"])
+            )
+        )
+        or isinstance(record["heartbeat_count"], bool)
+        or not isinstance(record["heartbeat_count"], int)
+        or record["heartbeat_count"] < 0
+        or not isinstance(record["runtime_owner_id"], str)
+        or not record["runtime_owner_id"]
+        or isinstance(record["runtime_owner_pid"], bool)
+        or not isinstance(record["runtime_owner_pid"], int)
+        or record["runtime_owner_pid"] <= 1
+        or not isinstance(record["runtime_owner_start_token"], str)
+        or not record["runtime_owner_start_token"]
+    ):
+        raise ValueError("managed legacy delegation record is invalid")
+    for name in (
+        "completed_at",
+        "dispatched_at",
+        "last_heartbeat_at",
+    ):
+        if not _managed_v2_legacy_finite_number(record[name]):
+            raise ValueError("managed legacy delegation record time is invalid")
+    if (
+        float(record["dispatched_at"]) > float(record["completed_at"])
+        or float(record["dispatched_at"]) > float(record["last_heartbeat_at"])
+    ):
+        raise ValueError("managed legacy delegation record time order is invalid")
+    bound_event_fields = (
+        "completed_at",
+        "context",
+        "delegation_id",
+        "dispatched_at",
+        "goal",
+        "goals",
+        "is_batch",
+        "model",
+        "origin_ui_session_id",
+        "parent_session_id",
+        "role",
+        "session_key",
+        "status",
+        "toolsets",
+    )
+    if any(event[name] != record[name] for name in bound_event_fields):
+        raise ValueError("managed legacy delegation event binding is invalid")
+    results = result["results"]
+    if not isinstance(results, list):
+        raise ValueError("managed legacy delegation result list is invalid")
+    for child_result in results:
+        _managed_v2_validate_legacy_child_result(child_result)
+    if (
+        not _managed_v2_legacy_finite_number(
+            result["total_duration_seconds"]
+        )
+        or float(result["total_duration_seconds"]) < 0
+        or event["results"] != results
+        or event["total_duration_seconds"] != result["total_duration_seconds"]
+        or event["error"] != result.get("error")
+        or (
+            result.get("error") is not None
+            and not isinstance(result["error"], str)
+        )
+    ):
+        raise ValueError("managed legacy delegation result binding is invalid")
+    timestamps = (
+        entry.get("queued_at"),
+        entry.get("delivered_at"),
+        entry.get("updated_at"),
+    )
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in timestamps
+    ):
+        raise ValueError("managed legacy delegation timestamp is invalid")
+    queued_at, delivered_at, updated_at = map(float, timestamps)
+    if queued_at > delivered_at or delivered_at > updated_at:
+        raise ValueError("managed legacy delegation timestamp order is invalid")
+    return True
+
+
 def _managed_v2_read_outbox(
     held: Any,
     path: Path,
@@ -1016,6 +1335,8 @@ def _managed_v2_tracker(
     for delegation_id, entry in data["records"].items():
         if set(entry) - allowed_entry:
             raise ValueError("managed tracker entry schema is not closed")
+        if _managed_v2_is_inert_legacy_delivered(delegation_id, entry):
+            continue
         _managed_v2_validate_delegation_id(
             delegation_id, profile.profile_id, generation
         )
@@ -1269,6 +1590,13 @@ def recover_managed_async_delegations_exact(
                 for delegation_id, entry in sorted(data["records"].items()):
                     tracker_seen.add(delegation_id)
                     delegation_ids.append(delegation_id)
+                    if _managed_v2_is_inert_legacy_delivered(
+                        delegation_id, entry
+                    ):
+                        classifications.append(
+                            (delegation_id, "legacy_delivered")
+                        )
+                        continue
                     status = str(entry.get("status") or "")
                     delivery = str(entry.get("delivery_status") or "")
                     if status == "running":
@@ -1439,6 +1767,10 @@ def recover_managed_async_delegations_exact(
                 data, identity = tracker_snapshots[profile.profile_id]
                 changed = False
                 for delegation_id, entry in data["records"].items():
+                    if _managed_v2_is_inert_legacy_delivered(
+                        delegation_id, entry
+                    ):
+                        continue
                     event_id = _managed_v2_event_id(
                         profile.profile_id,
                         manifest.generation,
@@ -1658,6 +1990,7 @@ def verify_managed_async_delegations_exact(
                 aggregate_bytes += identity.size if identity else 0
 
             records_by_id: dict[str, Dict[str, Any]] = {}
+            legacy_delivered_ids: set[str] = set()
             for profile in profiles:
                 data, _identity = tracker_data[profile.profile_id]
                 for delegation_id, entry in data["records"].items():
@@ -1667,8 +2000,16 @@ def verify_managed_async_delegations_exact(
                         )
                     records_by_id[delegation_id] = entry
                     delegation_ids.append(delegation_id)
+                    if _managed_v2_is_inert_legacy_delivered(
+                        delegation_id, entry
+                    ):
+                        legacy_delivered_ids.add(delegation_id)
             if tuple(sorted(delegation_ids)) != tuple(sorted(receipt.delegation_ids)):
                 raise ValueError("managed async verification delegation mismatch")
+            classifications.extend(
+                (delegation_id, "legacy_delivered")
+                for delegation_id in sorted(legacy_delivered_ids)
+            )
 
             with completion_queue.mutex:
                 queue_snapshot = tuple(completion_queue.queue)
@@ -1776,6 +2117,7 @@ def verify_managed_async_delegations_exact(
                 matching = [
                     delegation_id
                     for delegation_id in records_by_id
+                    if delegation_id not in legacy_delivered_ids
                     if _managed_v2_event_id(
                         records_by_id[delegation_id]["profile_id"],
                         manifest.generation,
