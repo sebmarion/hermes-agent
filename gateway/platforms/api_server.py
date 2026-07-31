@@ -1573,6 +1573,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "release_checkpoint_steer": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "request_scoped_reasoning_effort": True,
@@ -1613,6 +1614,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "release_checkpoint_steer": {"method": "POST", "path": "/v1/runs/{run_id}/release-checkpoint"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -4814,6 +4816,69 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_release_checkpoint_steer(self, request: "web.Request") -> "web.Response":
+        """Inject one release-owned control into the exact active API run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = str(request.match_info.get("run_id") or "").strip()
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON", code="invalid_json"),
+                status=400,
+            )
+        text = str(body.get("text") or "").strip() if isinstance(body, dict) else ""
+        expected_session = str(body.get("session_id") or "").strip() if isinstance(body, dict) else ""
+        if not run_id or not text or not expected_session:
+            return web.json_response(
+                _openai_error(
+                    "run_id, session_id, and text are required",
+                    code="invalid_release_checkpoint",
+                ),
+                status=400,
+            )
+        status = self._run_statuses.get(run_id)
+        if not isinstance(status, dict):
+            return web.json_response(
+                _openai_error("Run not found", code="run_not_found"),
+                status=404,
+            )
+        if str(status.get("session_id") or "") != expected_session:
+            return web.json_response(
+                _openai_error("Run session owner changed", code="owner_changed"),
+                status=409,
+            )
+        agent = self._active_run_agents.get(run_id)
+        if agent is None:
+            return web.json_response(
+                {"status": "inactive", "run_id": run_id, "session_id": expected_session}
+            )
+        steer = getattr(agent, "steer", None)
+        if not callable(steer):
+            return web.json_response(
+                _openai_error(
+                    "Active run does not support release checkpoint steer",
+                    code="unsupported",
+                ),
+                status=501,
+            )
+        try:
+            accepted = bool(steer(text))
+        except Exception:
+            logger.exception("[api_server] release checkpoint steer failed for run %s", run_id)
+            return web.json_response(
+                _openai_error("Release checkpoint steer was ambiguous", code="ambiguous"),
+                status=503,
+            )
+        return web.json_response({
+            "status": "accepted" if accepted else "inactive",
+            "run_id": run_id,
+            "session_id": expected_session,
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -4988,6 +5053,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
+            self._app.router.add_post("/v1/runs/{run_id}/release-checkpoint", self._handle_release_checkpoint_steer)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
