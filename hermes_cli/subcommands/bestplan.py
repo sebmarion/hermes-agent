@@ -52,7 +52,7 @@ def cmd_bestplan(args) -> int:
 
     from hermes_cli.config import load_config
     from agent.bestplan_orchestrator import (
-        BestPlanUnavailable, DEFAULT_RUNTIME, validate_runtime,
+        BestPlanUnavailable, DEFAULT_RUNTIME, normalize_lanes, validate_runtime,
     )
 
     config = None
@@ -63,17 +63,30 @@ def cmd_bestplan(args) -> int:
 
     # Resolve lanes: config overrides default
     resolved = dict(DEFAULT_RUNTIME)
-    if config:
+    if config is not None:
+        if not isinstance(config, dict):
+            source = "config.yaml"
+            print(f"\n  BestPlan SOTA Lanes — source: {source}")
+            print("  Validation: FAIL — BestPlan config must be a mapping\n")
+            return 1
         resolved.update(config)
 
-    lanes = resolved.get("lanes") or DEFAULT_RUNTIME["lanes"]
+    source = "config.yaml" if config is not None else "DEFAULT (no bestplan config block)"
+    try:
+        lanes = normalize_lanes(resolved.get("lanes"))
+    except BestPlanUnavailable as exc:
+        print(f"\n  BestPlan SOTA Lanes — source: {source}")
+        print(f"  Validation: FAIL — {exc}\n")
+        return 1
     synthesizer = resolved.get("synthesizer", "strongest")
-    source = "config.yaml" if config else "DEFAULT (no bestplan config block)"
 
     print(f"\n  BestPlan SOTA Lanes — source: {source}")
     print(f"  {'Name':<8} {'Provider':<22} {'Model':<20} {'API Mode':<22} {'Reasoning':<12}")
     print(f"  {'─'*8} {'─'*22} {'─'*20} {'─'*22} {'─'*12}")
     for lane in lanes:
+        if not isinstance(lane, dict):
+            print(f"  <invalid lane: {lane!r}>")
+            continue
         print(
             f"  {lane.get('name',''):<8} "
             f"{lane.get('provider',''):<22} "
