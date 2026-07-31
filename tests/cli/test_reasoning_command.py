@@ -49,6 +49,31 @@ class TestParseReasoningConfig(unittest.TestCase):
         self.assertEqual(result["effort"], "high")
 
 
+class TestCLIReasoningResolution(unittest.TestCase):
+    """CLI startup must honor the same per-model override as other surfaces."""
+
+    def test_per_model_override_wins_over_global_effort(self):
+        from cli import _resolve_cli_reasoning_config
+
+        config = {
+            "model": {"default": "gpt-5.6-sol"},
+            "agent": {
+                "reasoning_effort": "xhigh",
+                "reasoning_overrides": {
+                    "escha-qwen36-35b-a3b-w2": "none",
+                },
+            },
+        }
+
+        self.assertEqual(
+            _resolve_cli_reasoning_config(
+                "escha-qwen36-35b-a3b-w2",
+                config=config,
+            ),
+            {"enabled": False},
+        )
+
+
 # ---------------------------------------------------------------------------
 # /reasoning command handler (combined effort + display)
 # ---------------------------------------------------------------------------

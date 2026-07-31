@@ -347,6 +347,17 @@ def _parse_reasoning_config(effort) -> dict | None:
     return result
 
 
+def _resolve_cli_reasoning_config(
+    model: str,
+    *,
+    config: Optional[dict] = None,
+) -> dict | None:
+    """Resolve CLI reasoning through the shared per-model config chokepoint."""
+    from hermes_constants import resolve_reasoning_config
+
+    return resolve_reasoning_config(CLI_CONFIG if config is None else config, model)
+
+
 def _parse_service_tier_config(raw: str) -> str | None:
     """Parse a persisted service-tier preference into a Responses API value."""
     value = str(raw or "").strip().lower()
@@ -3930,10 +3941,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _resolve_prefill_messages_file(CLI_CONFIG)
         )
         
-        # Reasoning config (OpenRouter reasoning effort level)
-        self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
-        )
+        # Reasoning config: per-model override > global agent default.
+        self.reasoning_config = _resolve_cli_reasoning_config(self.model)
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
