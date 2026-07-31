@@ -147,12 +147,14 @@ def _pid_exists(value: Any) -> bool:
         pid = int(value)
         if pid <= 0:
             return False
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, ValueError, TypeError):
+    except (ValueError, TypeError):
         return False
-    except PermissionError:
-        return True
+    try:
+        from gateway.status import _pid_exists as status_pid_exists
+
+        return bool(status_pid_exists(pid))
+    except Exception:
+        return False
 
 
 def _process_start_time(pid: int) -> Optional[int]:
