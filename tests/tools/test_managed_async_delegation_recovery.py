@@ -420,16 +420,89 @@ def test_outbox_payload_collision_fails_closed(tmp_path):
     assert "collision" in receipt.errors[0]
 
 
-def test_manifest_fd_budget_fails_closed(tmp_path, monkeypatch):
-    manifest = _manifest(tmp_path, include_named=True)
-    monkeypatch.setattr(ad, "_MAX_MANAGED_AUTHORITY_FDS", 2)
+def test_manifest_supports_authoritative_inventory_beyond_legacy_fd_cap(tmp_path):
+    profiles = []
+    for index in range(48):
+        profile_id = "default" if index == 0 else f"profile-{index:02d}"
+        profile_dir = tmp_path / profile_id
+        profile_dir.mkdir(mode=0o700)
+        profiles.append(
+            ad.ManagedAsyncDelegationProfile(
+                profile_id,
+                profile_dir / "async_delegations.json",
+            )
+        )
+    manifest = ad.ManagedAsyncDelegationProfileManifest(
+        generation="gen-1",
+        profiles=tuple(profiles),
+        expected_profile_ids=tuple(profile.profile_id for profile in profiles),
+        source_digest="a" * 64,
+    )
 
     receipt = ad.recover_managed_async_delegations_exact(
         manifest,
         outbox_path=tmp_path / "outbox.json",
         completion_queue=queue.Queue(),
     )
+
+    assert receipt.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.ABSENT
+    assert len(receipt.tracker_paths) == 48
+    assert receipt.errors == ()
+
+
+def test_authority_acquisition_failure_releases_earlier_handles(
+    tmp_path,
+    monkeypatch,
+):
+    profiles = []
+    for index in range(3):
+        profile_id = "default" if index == 0 else f"profile-{index:02d}"
+        profile_dir = tmp_path / profile_id
+        profile_dir.mkdir(mode=0o700)
+        profiles.append(
+            ad.ManagedAsyncDelegationProfile(
+                profile_id,
+                profile_dir / "async_delegations.json",
+            )
+        )
+    manifest = ad.ManagedAsyncDelegationProfileManifest(
+        generation="gen-1",
+        profiles=tuple(profiles),
+        expected_profile_ids=tuple(profile.profile_id for profile in profiles),
+        source_digest="a" * 64,
+    )
+    entered = []
+    exited = []
+
+    class FailingAuthority:
+        def __init__(self, path):
+            self.path = path
+
+        def __enter__(self):
+            entered.append(self.path)
+            if len(entered) == 3:
+                raise OSError(24, "Too many open files")
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            exited.append(self.path)
+            return False
+
+    monkeypatch.setattr(
+        ad,
+        "hold_private_authority_directory",
+        FailingAuthority,
+    )
+
+    receipt = ad.recover_managed_async_delegations_exact(
+        manifest,
+        outbox_path=tmp_path / "outbox.json",
+        completion_queue=queue.Queue(),
+    )
+
     assert receipt.outcome is ad.ManagedAsyncDelegationRecoveryOutcome.AMBIGUOUS
+    assert receipt.errors == ("[Errno 24] Too many open files",)
+    assert exited == list(reversed(entered[:2]))
 
 
 def test_manifest_missing_canonical_source_digest_is_ambiguous(tmp_path):

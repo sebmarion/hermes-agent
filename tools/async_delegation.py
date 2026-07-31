@@ -44,12 +44,12 @@ import os
 import threading
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.durable_state import (
@@ -132,7 +132,6 @@ _MAX_MANAGED_TRACKERS = 256
 _MAX_MANAGED_RECORDS = 10_000
 _MAX_MANAGED_OUTBOX_BYTES = 64 * 1024 * 1024
 _MAX_MANAGED_AGGREGATE_BYTES = 128 * 1024 * 1024
-_MAX_MANAGED_AUTHORITY_FDS = 64
 _MANAGED_DELIVERED_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MANAGED_TOMBSTONE_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _MANAGED_TERMINAL_STATUSES = {
@@ -773,7 +772,9 @@ def _managed_v2_manifest(
         not manifest.expected_profile_ids
         or len(manifest.profiles) > _MAX_MANAGED_TRACKERS
     ):
-        raise ValueError("managed profile manifest is empty or exceeds FD budget")
+        raise ValueError(
+            "managed profile manifest is empty or exceeds tracker capacity"
+        )
     profiles = tuple(
         sorted(manifest.profiles, key=lambda profile: profile.profile_id)
     )
@@ -809,12 +810,6 @@ def _managed_v2_manifest(
         or outbox in paths
     ):
         raise ValueError("managed outbox path is invalid")
-    authority_paths = (*paths, outbox)
-    required_fds = len(authority_paths) + len(
-        {path.parent for path in authority_paths}
-    )
-    if required_fds > _MAX_MANAGED_AUTHORITY_FDS:
-        raise ValueError("managed profile manifest exceeds FD budget")
     return profiles, outbox
 
 
@@ -1136,24 +1131,30 @@ def _managed_recovery_receipt_digest(
     return _managed_json_hash(value)
 
 
+@contextmanager
 def _managed_v2_authorities(
     paths: Sequence[Path],
     *,
     create_locks: bool = True,
-) -> ExitStack:
-    stack = ExitStack()
-    held_by_parent = {}
-    for path in paths:
-        if path.parent not in held_by_parent:
-            held_by_parent[path.parent] = stack.enter_context(
-                hold_private_authority_directory(path)
+) -> Iterator[ExitStack]:
+    # The authoritative profile-count bound limits work. Descriptor capacity is
+    # owned by the running process and enforced by acquisition itself; a static
+    # cap can reject valid manifests on a process with ample capacity. Keeping
+    # construction inside the ExitStack also guarantees partial acquisition is
+    # unwound if the OS reports EMFILE or any later authority fails to open.
+    with ExitStack() as stack:
+        held_by_parent = {}
+        for path in paths:
+            if path.parent not in held_by_parent:
+                held_by_parent[path.parent] = stack.enter_context(
+                    hold_private_authority_directory(path)
+                )
+        stack.held_by_parent = held_by_parent  # type: ignore[attr-defined]
+        for path in sorted(paths, key=os.fspath):
+            stack.enter_context(
+                held_by_parent[path.parent].lock(path, create=create_locks)
             )
-    stack.held_by_parent = held_by_parent  # type: ignore[attr-defined]
-    for path in sorted(paths, key=os.fspath):
-        stack.enter_context(
-            held_by_parent[path.parent].lock(path, create=create_locks)
-        )
-    return stack
+        yield stack
 
 
 def recover_managed_async_delegations_exact(
