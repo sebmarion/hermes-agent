@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -20,7 +21,13 @@ from tools.process_registry import process_registry, format_process_notification
 
 
 @pytest.fixture(autouse=True)
-def _clean_state():
+def _clean_state(monkeypatch, tmp_path):
+    tracker = tmp_path / "async_delegations.json"
+
+    def _test_persistence_path(explicit=None):
+        return Path(explicit).expanduser().resolve() if explicit else tracker
+
+    monkeypatch.setattr(ad, "_persistence_path", _test_persistence_path)
     ad._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
@@ -1453,4 +1460,515 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
+
+
+def test_recovery_marks_running_record_lost_when_owner_dead():
+    """Recovery SHOULD mark a running record lost when its owner PID is dead."""
+    import tempfile
+    import pathlib
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tracker = str(pathlib.Path(tmpdir) / "async_delegations.json")
+        now = time.time()
+        record = {
+            "delegation_id": "deleg_test_dead",
+            "goal": "test",
+            "session_key": "",
+            "status": "running",
+            "dispatched_at": now,
+            "completed_at": None,
+            "last_heartbeat_at": now,
+            "heartbeat_count": 0,
+            "delivery_status": "running",
+            "owner_pid": 999999,  # almost certainly dead
+        }
+        data = {"version": 1, "records": {"deleg_test_dead": {
+            "delegation_id": "deleg_test_dead",
+            "record": record,
+            "status": "running",
+            "delivery_status": "running",
+        }}}
+        import json as _json
+        pathlib.Path(tracker).write_text(_json.dumps(data))
+
+        ad._recovery_attempted = False
+        result = ad.recover_async_delegations(tracker)
+
+        assert result["lost"] == 1, "Recovery should mark a dead-owner record as lost"
+
+
+# Review-round regressions: ownership proof, truthful interruption, and durability.
+
+def _review_record(delegation_id, *, status="running", is_batch=False, interrupt_fn=None):
+    now = time.time()
+    record = {
+        "delegation_id": delegation_id,
+        "goal": "review lifecycle probe",
+        "goals": ["a", "b"] if is_batch else None,
+        "session_key": "",
+        "status": status,
+        "delivery_status": status,
+        "dispatched_at": now,
+        "last_heartbeat_at": now,
+        "interrupt_fn": interrupt_fn,
+        "is_batch": is_batch,
+        "owner_pid": os.getpid(),
+    }
+    ad._records[delegation_id] = record
+    return record
+
+
+def test_recovery_rejects_reused_owner_pid(tmp_path, monkeypatch):
+    tracker = tmp_path / "owner-reused.json"
+    now = time.time()
+    record = {
+        "delegation_id": "deleg_owner_reused",
+        "goal": "ownership probe",
+        "session_key": "",
+        "status": "running",
+        "delivery_status": "running",
+        "dispatched_at": now,
+        "last_heartbeat_at": now,
+        "owner_pid": 4242,
+        "owner_started_at": 111,
+    }
+    tracker.write_text(json.dumps({"version": 1, "records": {
+        record["delegation_id"]: {
+            "delegation_id": record["delegation_id"],
+            "record": record,
+            "status": "running",
+            "delivery_status": "running",
+        }
+    }}))
+    monkeypatch.setattr(ad, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(ad, "_process_start_time", lambda pid: 222)
+
+    result = ad.recover_async_delegations(tracker)
+
+    assert result["lost"] == 1
+    stored = json.loads(tracker.read_text())["records"][record["delegation_id"]]
+    assert stored["status"] == "lost"
+
+
+def test_recovery_degrades_missing_owner_identity_to_unknown(tmp_path, monkeypatch):
+    tracker = tmp_path / "owner-unknown.json"
+    now = time.time()
+    record = {
+        "delegation_id": "deleg_owner_unknown",
+        "goal": "ownership probe",
+        "session_key": "",
+        "status": "running",
+        "delivery_status": "running",
+        "dispatched_at": now,
+        "last_heartbeat_at": now,
+    }
+    tracker.write_text(json.dumps({"version": 1, "records": {
+        record["delegation_id"]: {
+            "delegation_id": record["delegation_id"],
+            "record": record,
+            "status": "running",
+            "delivery_status": "running",
+        }
+    }}))
+    monkeypatch.setattr(ad, "_pid_exists", lambda pid: True)
+
+    result = ad.recover_async_delegations(tracker)
+
+    assert result["lost"] == 0
+    stored = json.loads(tracker.read_text())["records"][record["delegation_id"]]
+    assert stored["status"] == "running"
+    assert stored["record"]["owner_liveness"] == "unknown"
+
+
+def test_recovery_marks_dead_interrupting_owner_lost(tmp_path, monkeypatch):
+    tracker = tmp_path / "interrupting-dead.json"
+    now = time.time()
+    record = {
+        "delegation_id": "deleg_interrupting_dead",
+        "goal": "interrupting recovery probe",
+        "session_key": "",
+        "status": "interrupting",
+        "delivery_status": "interrupting",
+        "dispatched_at": now,
+        "last_heartbeat_at": now,
+        "owner_pid": 4242,
+        "owner_started_at": 111,
+    }
+    tracker.write_text(json.dumps({"version": 1, "records": {
+        record["delegation_id"]: {
+            "delegation_id": record["delegation_id"],
+            "record": record,
+            "status": "interrupting",
+            "delivery_status": "interrupting",
+        }
+    }}))
+    monkeypatch.setattr(ad, "_pid_exists", lambda pid: False)
+
+    result = ad.recover_async_delegations(tracker)
+
+    assert result["lost"] == 1
+    stored = json.loads(tracker.read_text())["records"][record["delegation_id"]]
+    assert stored["status"] == "lost"
+
+
+def test_interrupting_record_is_never_pruned_as_terminal(monkeypatch):
+    record = _review_record("deleg_interrupting_retained", status="interrupting")
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 0)
+
+    with ad._records_lock:
+        ad._prune_completed_locked()
+        ad._cleanup_locked(now=time.time() + 365 * 24 * 60 * 60)
+
+    assert ad._records[record["delegation_id"]]["status"] == "interrupting"
+
+
+def test_recovery_preserves_other_live_process_then_loses_it_after_exit(tmp_path):
+    tracker = tmp_path / "two-process-owner.json"
+    ready = tmp_path / "owner-ready"
+    stop = tmp_path / "owner-stop"
+    repo = Path(__file__).resolve().parents[2]
+    script = r'''
+import json, os, sys, time
+from pathlib import Path
+from gateway.status import get_process_start_time
+tracker, ready, stop = map(Path, sys.argv[1:])
+now = time.time()
+record = {
+    "delegation_id": "deleg_other_process",
+    "goal": "two-process probe",
+    "session_key": "",
+    "status": "running",
+    "delivery_status": "running",
+    "dispatched_at": now,
+    "last_heartbeat_at": now,
+    "owner_pid": os.getpid(),
+    "owner_started_at": get_process_start_time(os.getpid()),
+}
+tracker.write_text(json.dumps({"version": 1, "records": {
+    record["delegation_id"]: {
+        "delegation_id": record["delegation_id"],
+        "record": record,
+        "status": "running",
+        "delivery_status": "running",
+    }
+}}))
+ready.write_text("ready")
+while not stop.exists():
+    time.sleep(0.02)
+'''
+    env = os.environ.copy()
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONPATH", None)
+    owner = subprocess.Popen(
+        [sys.executable, "-c", script, str(tracker), str(ready), str(stop)],
+        cwd=repo,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists(), "owner process did not publish its record"
+
+        assert ad.recover_async_delegations(tracker)["lost"] == 0
+        stored = json.loads(tracker.read_text())["records"]["deleg_other_process"]
+        assert stored["status"] == "running"
+
+        stop.write_text("stop")
+        owner.wait(timeout=5)
+        assert ad.recover_async_delegations(tracker)["lost"] == 1
+    finally:
+        if owner.poll() is None:
+            owner.terminate()
+            owner.wait(timeout=5)
+
+
+def test_interrupt_callback_failure_does_not_claim_terminal_state():
+    def broken_interrupt():
+        raise RuntimeError("signal failed")
+
+    record = _review_record("deleg_interrupt_raises", interrupt_fn=broken_interrupt)
+
+    assert ad.interrupt_all(reason="test") == 0
+    assert record["status"] == "running"
+    assert record["interrupt_error"] == "RuntimeError: signal failed"
+    assert _drain_for(record["delegation_id"], timeout=0.2) is None
+
+
+def test_interrupt_without_callback_does_not_claim_terminal_state():
+    record = _review_record("deleg_interrupt_missing")
+
+    assert ad.interrupt_all(reason="test") == 0
+    assert record["status"] == "running"
+    assert record["interrupt_error"] == "interrupt callback unavailable"
+    assert _drain_for(record["delegation_id"], timeout=0.2) is None
+
+
+def test_running_batch_interrupt_waits_for_finalize_and_emits_once():
+    record = _review_record(
+        "deleg_batch_running", is_batch=True, interrupt_fn=lambda: None,
+    )
+
+    assert ad.interrupt_all(reason="test") == 1
+    assert record["status"] == "interrupting"
+    assert ad.active_count() == 1
+    assert _drain_for(record["delegation_id"], timeout=0.2) is None
+
+    ad._finalize_batch(
+        record["delegation_id"],
+        {"results": [{"status": "completed", "summary": "finished"}]},
+        "completed",
+    )
+    event = _drain_for(record["delegation_id"])
+    assert event is not None
+    assert event["status"] == "completed"
+    assert event["is_batch"] is True
+    assert _drain_for(record["delegation_id"], timeout=0.2) is None
+
+
+def test_scheduled_batch_interrupt_uses_batch_event_shape():
+    record = _review_record(
+        "deleg_batch_scheduled",
+        status="scheduled",
+        is_batch=True,
+        interrupt_fn=lambda: None,
+    )
+
+    assert ad.interrupt_all(reason="test") == 1
+    assert record["status"] == "interrupted"
+    event = _drain_for(record["delegation_id"])
+    assert event is not None
+    assert event["status"] == "interrupted"
+    assert event["is_batch"] is True
+    assert event["goals"] == ["a", "b"]
+    assert event["results"] == []
+
+
+def test_single_dispatch_rejects_when_initial_persistence_fails(monkeypatch):
+    ran = threading.Event()
+    monkeypatch.setattr(ad, "_persist_record", lambda *args, **kwargs: False)
+
+    result = ad.dispatch_async_delegation(
+        goal="must not run", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=lambda: ran.set() or {"status": "completed"},
+        max_async_children=1,
+    )
+
+    assert result["status"] == "rejected"
+    assert "persist" in result["error"].lower()
+    assert not ran.wait(timeout=0.2)
+    assert ad.active_count() == 0
+
+
+def test_submit_failure_never_creates_durable_record(monkeypatch):
+    class BrokenExecutor:
+        def submit(self, *_args, **_kwargs):
+            raise RuntimeError("pool closed")
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _n: BrokenExecutor())
+    result = ad.dispatch_async_delegation(
+        goal="never scheduled", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=lambda: {"status": "completed"},
+        max_async_children=1,
+    )
+
+    assert result["status"] == "rejected"
+    tracker = ad._persistence_path()
+    records = json.loads(tracker.read_text()).get("records", {}) if tracker.exists() else {}
+    assert records == {}
+
+
+def test_completion_not_published_without_durable_terminal_state(monkeypatch):
+    record = _review_record("deleg_terminal_persist_failure")
+    monkeypatch.setattr(ad, "_persist_record", lambda *args, **kwargs: False)
+
+    ad._finalize(
+        record["delegation_id"],
+        {"status": "completed", "summary": "done"},
+        "completed",
+    )
+
+    assert _drain_for(record["delegation_id"], timeout=0.2) is None
+    assert record["status"] == "completed"
+    assert record["delivery_status"] == "pending"
+    assert "persist" in record["delivery_error"].lower()
+
+
+def test_standard_batch_rejects_when_scheduled_persistence_fails(monkeypatch):
+    ran = threading.Event()
+    real_persist = ad._persist_record
+
+    def fail_scheduled(record, **kwargs):
+        if kwargs.get("delivery_status") == "scheduled":
+            return False
+        return real_persist(record, **kwargs)
+
+    monkeypatch.setattr(ad, "_persist_record", fail_scheduled)
+    result = ad.dispatch_async_delegation_batch(
+        goals=["a", "b"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=lambda: ran.set() or {"results": []},
+        max_async_children=1,
+    )
+
+    assert result["status"] == "rejected"
+    assert not ran.wait(timeout=0.2)
+
+
+def test_standard_batch_rejects_when_running_persistence_fails(monkeypatch):
+    ran = threading.Event()
+    real_persist = ad._persist_record
+
+    def fail_running(record, **kwargs):
+        if kwargs.get("delivery_status") == "running":
+            return False
+        return real_persist(record, **kwargs)
+
+    monkeypatch.setattr(ad, "_persist_record", fail_running)
+    result = ad.dispatch_async_delegation_batch(
+        goals=["a", "b"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=lambda: ran.set() or {"results": []},
+        max_async_children=1,
+    )
+
+    assert result["status"] == "rejected"
+    assert not ran.wait(timeout=0.2)
+
+
+def test_interrupt_race_during_running_checkpoint_keeps_terminal_event(monkeypatch):
+    """A running->interrupting race must not delete the accepted record."""
+    running_checkpoint_entered = threading.Event()
+    allow_running_checkpoint = threading.Event()
+    child_interrupted = threading.Event()
+    real_persist = ad._persist_record
+
+    def delayed_running_checkpoint(record, **kwargs):
+        if kwargs.get("delivery_status") == "running":
+            running_checkpoint_entered.set()
+            assert allow_running_checkpoint.wait(timeout=5)
+        return real_persist(record, **kwargs)
+
+    monkeypatch.setattr(ad, "_persist_record", delayed_running_checkpoint)
+
+    def runner():
+        assert child_interrupted.wait(timeout=5)
+        return {"status": "interrupted", "summary": "stopped"}
+
+    dispatch_result = {}
+
+    def dispatch():
+        dispatch_result["value"] = ad.dispatch_async_delegation(
+            goal="checkpoint race",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="",
+            runner=runner,
+            interrupt_fn=child_interrupted.set,
+            max_async_children=1,
+        )
+
+    thread = threading.Thread(target=dispatch)
+    thread.start()
+    assert running_checkpoint_entered.wait(timeout=5)
+    assert ad.interrupt_all(reason="race") == 1
+    allow_running_checkpoint.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    result = dispatch_result["value"]
+    assert result["status"] == "dispatched"
+    event = _drain_for(result["delegation_id"])
+    assert event is not None
+    assert event["status"] == "interrupted"
+
+
+def test_stale_scheduled_checkpoint_cannot_overwrite_terminal_state():
+    delegation_id = "deleg_monotonic_checkpoint"
+    scheduled = _review_record(delegation_id, status="scheduled", is_batch=True)
+    terminal = dict(scheduled)
+    terminal.update({
+        "status": "interrupted",
+        "delivery_status": "pending",
+        "completed_at": time.time(),
+    })
+
+    assert ad._persist_record(terminal, delivery_status="pending")
+    assert not ad._persist_record(scheduled, delivery_status="scheduled")
+
+    stored = json.loads(ad._persistence_path().read_text())["records"][delegation_id]
+    assert stored["status"] == "interrupted"
+    assert stored["record"]["status"] == "interrupted"
+
+
+def test_recovery_does_not_publish_when_checkpoint_write_fails(tmp_path, monkeypatch):
+    tracker = tmp_path / "recovery-write-fails.json"
+    now = time.time()
+    record = {
+        "delegation_id": "deleg_recovery_write_fails",
+        "goal": "recovery durability",
+        "session_key": "",
+        "status": "running",
+        "delivery_status": "running",
+        "dispatched_at": now,
+        "last_heartbeat_at": now,
+        "owner_pid": 4242,
+        "owner_started_at": 111,
+    }
+    tracker.write_text(json.dumps({"version": 1, "records": {
+        record["delegation_id"]: {
+            "delegation_id": record["delegation_id"],
+            "record": record,
+            "status": "running",
+            "delivery_status": "running",
+        }
+    }}))
+    monkeypatch.setattr(ad, "_pid_exists", lambda pid: False)
+    monkeypatch.setattr(
+        ad,
+        "_write_persisted_unlocked",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        ad.recover_async_delegations(tracker)
+
+    assert _drain_for(record["delegation_id"], timeout=0.2) is None
+
+
+def test_dead_batch_recovery_preserves_batch_event_shape(tmp_path, monkeypatch):
+    tracker = tmp_path / "dead-batch.json"
+    now = time.time()
+    record = {
+        "delegation_id": "deleg_dead_batch",
+        "goal": "dead batch",
+        "goals": ["a", "b"],
+        "session_key": "",
+        "status": "running",
+        "delivery_status": "running",
+        "dispatched_at": now,
+        "last_heartbeat_at": now,
+        "owner_pid": 4242,
+        "owner_started_at": 111,
+        "is_batch": True,
+    }
+    tracker.write_text(json.dumps({"version": 1, "records": {
+        record["delegation_id"]: {
+            "delegation_id": record["delegation_id"],
+            "record": record,
+            "status": "running",
+            "delivery_status": "running",
+        }
+    }}))
+    monkeypatch.setattr(ad, "_pid_exists", lambda pid: False)
+
+    result = ad.recover_async_delegations(tracker)
+    event = _drain_for(record["delegation_id"])
+
+    assert result["lost"] == 1
+    assert event is not None
+    assert event["status"] == "lost"
+    assert event["is_batch"] is True
+    assert event["goals"] == ["a", "b"]
+    assert event["results"] == []
 
