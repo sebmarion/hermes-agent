@@ -665,7 +665,6 @@ export function useMessageStream({
   )
 
   const handleGatewayEvent = useGatewayEventHandler({
-    activeGatewayProfile,
     appendAssistantDelta,
     appendReasoningDelta,
     activeSessionIdRef,
@@ -675,11 +674,9 @@ export function useMessageStream({
     completeAssistantMessage,
     failAssistantMessage,
     flushQueuedDeltas,
-    finalizeInterimAssistantMessage,
     queryClient,
     refreshHermesConfig,
     sessionInterrupted,
-    sessionStateByRuntimeIdRef,
     updateSessionState,
     upsertToolCall
   })

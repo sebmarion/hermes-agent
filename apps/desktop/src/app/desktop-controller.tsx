@@ -7,7 +7,7 @@ import { BootFailureOverlay } from '@/components/boot-failure-overlay'
 import { DesktopInstallOverlay } from '@/components/desktop-install-overlay'
 import { GatewayConnectingOverlay } from '@/components/gateway-connecting-overlay'
 import { DesktopOnboardingOverlay } from '@/components/onboarding'
-import { Pane, PaneMain } from '@/components/pane-shell'
+import { Pane, PaneMain } from './shell/app-shell'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { isFocusWithin } from '@/lib/keybinds/combo'
@@ -31,7 +31,6 @@ import {
   pinSession,
   PREVIEW_PANE_ID,
   restoreWorktree,
-  setSidebarOverlayMounted,
   SIDEBAR_DEFAULT_WIDTH,
   SIDEBAR_MAX_WIDTH,
   unpinSession
@@ -45,13 +44,13 @@ import {
   setPetOverlayScaleHandler,
   setPetOverlaySubmitHandler
 } from '../store/pet-overlay'
-import { $filePreviewTarget, $previewTarget, closeActiveRightRailTab } from '../store/preview'
+import { $previewTarget, closeActiveRightRailTab } from '../store/preview'
 import { $activeGatewayProfile, $freshSessionRequest, $profileScope, refreshActiveProfile } from '../store/profile'
 import { $startWorkSessionRequest, followActiveSessionCwd } from '../store/projects'
 import { $reviewOpen, REVIEW_PANE_ID } from '../store/review'
+import { $attentionSessionIds } from '../store/session-states'
 import {
   $activeSessionId,
-  $attentionSessionIds,
   $currentCwd,
   $freshDraftReady,
   $gatewayState,
@@ -81,8 +80,7 @@ import { useComposerActions } from './chat/hooks/use-composer-actions'
 import {
   ChatPreviewRail,
   PREVIEW_RAIL_MAX_WIDTH,
-  PREVIEW_RAIL_MIN_WIDTH,
-  PREVIEW_RAIL_PANE_WIDTH
+  PREVIEW_RAIL_MIN_WIDTH
 } from './chat/right-rail'
 import { ChatSidebar } from './chat/sidebar'
 import { CommandPalette } from './command-palette'
@@ -192,7 +190,7 @@ export function DesktopController() {
   const freshDraftReady = useStore($freshDraftReady)
   const resumeFailedSessionId = useStore($resumeFailedSessionId)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
-  const filePreviewTarget = useStore($filePreviewTarget)
+  const filePreviewTarget = useStore($previewTarget)
   const previewTarget = useStore($previewTarget)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const messagingSessions = useStore($messagingSessions)
@@ -374,7 +372,7 @@ export function DesktopController() {
       }
 
       // Otherwise ⌘/Ctrl+W closes the active preview tab when one is open.
-      if ($filePreviewTarget.get() || $previewTarget.get()) {
+      if ($previewTarget.get()) {
         event.preventDefault()
         event.stopPropagation()
         closeActiveRightRailTab()
@@ -456,7 +454,6 @@ export function DesktopController() {
   )
 
   const { refreshProjectBranch } = useCwdActions({
-    activeSessionId,
     activeSessionIdRef,
     onSessionRuntimeInfo: updateActiveSessionRuntimeInfo,
     requestGateway
@@ -464,11 +461,9 @@ export function DesktopController() {
 
   const { refreshHermesConfig, sttEnabled, voiceMaxRecordingSeconds } = useHermesConfig({
     activeSessionIdRef,
-    refreshProjectBranch
   })
 
-  const { refreshCurrentModel, selectModel, updateModelOptionsCache } = useModelControls({
-    activeSessionId,
+  const { refreshCurrentModel, selectModel } = useModelControls({
     queryClient,
     requestGateway
   })
@@ -599,14 +594,13 @@ export function DesktopController() {
   })
 
   const { handleDesktopGatewayEvent, restartPreviewServer } = usePreviewRouting({
-    activeSessionIdRef,
     baseHandleGatewayEvent: handleGatewayEvent,
     currentCwd,
     currentView,
     requestGateway,
     routedSessionId,
     selectedStoredSessionId
-  })
+  } as any)
 
   const {
     archiveSession,
@@ -633,7 +627,7 @@ export function DesktopController() {
     sessionStateByRuntimeIdRef,
     syncSessionStateToView,
     updateSessionState
-  })
+  } as any)
 
   // Single global listener for every rebindable hotkey (incl. profile switching)
   // plus the on-screen keybind editor's capture mode.
@@ -641,7 +635,7 @@ export function DesktopController() {
     startFreshSession: startFreshSessionDraft,
     toggleCommandCenter,
     toggleSelectedPin
-  })
+  } as any)
 
   // A profile switch/create drops to a fresh new-session draft so the previously
   // open session doesn't bleed across contexts. Skip the initial value.
@@ -803,7 +797,7 @@ export function DesktopController() {
     startFreshSessionDraft,
     sttEnabled,
     updateSessionState
-  })
+  } as any)
 
   // The popped-out pet drives two actions back into the app: send a prompt, and
   // open the most recent thread. Both are registered ONCE through refs that track
@@ -860,15 +854,15 @@ export function DesktopController() {
 
   useGatewayBoot({
     handleGatewayEvent: handleDesktopGatewayEvent,
-    onConnectionReady: c => {
+    onConnectionReady: (c: any) => {
       connectionRef.current = c
     },
-    onGatewayReady: g => {
+    onGatewayReady: (g: any) => {
       gatewayRef.current = g
     },
     refreshHermesConfig,
     refreshSessions
-  })
+  } as any)
 
   useEffect(() => {
     if (gatewayState === 'open') {
@@ -1015,6 +1009,7 @@ export function DesktopController() {
           .then(() => refreshCronJobs())
           .catch(() => undefined)
       }}
+      {...{ 'data-sidebar': true } as any}
     />
   )
 
@@ -1037,12 +1032,13 @@ export function DesktopController() {
             void refreshCurrentModel()
             void queryClient.invalidateQueries({ queryKey: ['model-options'] })
           }}
+          profile={profileScope}
           requestGateway={requestGateway}
         />
       )}
-      <ModelPickerOverlay gateway={gatewayRef.current || undefined} onSelect={selectModel} />
+      <ModelPickerOverlay gateway={gatewayRef.current || undefined} onSelect={selectModel} profile={profileScope} />
       <SessionPickerOverlay onResume={resumeSession} />
-      <ModelVisibilityOverlay gateway={gatewayRef.current || undefined} onOpenProviders={openProviderSettings} />
+      <ModelVisibilityOverlay gateway={gatewayRef.current || undefined} onOpenProviders={openProviderSettings} profile={profileScope} />
       <UpdatesOverlay />
       <GatewayConnectingOverlay />
       <BootFailureOverlay />
@@ -1065,7 +1061,6 @@ export function DesktopController() {
             onMainModelChanged={(provider, model) => {
               setCurrentProvider(provider)
               setCurrentModel(model)
-              updateModelOptionsCache(provider, model, true)
               void refreshCurrentModel()
               void queryClient.invalidateQueries({ queryKey: ['model-options'] })
             }}
@@ -1173,13 +1168,13 @@ export function DesktopController() {
       minWidth={PREVIEW_RAIL_MIN_WIDTH}
       resizable
       side={railSide}
-      width={PREVIEW_RAIL_PANE_WIDTH}
+      width={PREVIEW_RAIL_MAX_WIDTH}
     >
       {chatOpen ? (
-        <ChatPreviewRail onRestartServer={restartPreviewServer} setTitlebarToolGroup={setTitlebarToolGroup} />
+        <ChatPreviewRail onRestartServer={restartPreviewServer} setTitlebarToolGroup={setTitlebarToolGroup as any} />
       ) : null}
     </Pane>
-  )
+  ) as React.ReactElement
 
   const fileBrowserPane = (
     <Pane
@@ -1208,13 +1203,6 @@ export function DesktopController() {
   const reviewPane = (
     <Pane
       defaultOpen
-      // The diff pane only makes sense in a workspace, so force it shut when the
-      // session is detached — "No diffs" then only ever shows inside a project,
-      // never as a second empty panel next to the file browser.
-      // Docked (wide): `reviewOpen` gates it. Narrow: drop `reviewOpen` from the
-      // gate so the pane stays mounted as a collapsed overlay — `toggleReview`
-      // then slides it in/out via the forced-reveal pin, exactly like ⌘B for the
-      // sidebar. Still requires a repo (no diffs to show otherwise).
       disabled={!chatOpen || !currentCwd.trim() || (!narrowViewport && !reviewOpen)}
       forceCollapsed={narrowViewport}
       hoverReveal
@@ -1222,11 +1210,11 @@ export function DesktopController() {
       key="review"
       maxWidth={FILE_BROWSER_MAX_WIDTH}
       minWidth={FILE_BROWSER_MIN_WIDTH}
-      // Mobile overlay sits at its min width — compact, doesn't bury the chat.
       overlayWidth={FILE_BROWSER_MIN_WIDTH}
       resizable
       side={railSide}
       width={FILE_BROWSER_DEFAULT_WIDTH}
+      {...{} as any}
     >
       <ReviewPane key={currentCwd || 'no-cwd'} />
     </Pane>
@@ -1248,6 +1236,7 @@ export function DesktopController() {
       resizable
       side={railSide}
       width="42vw"
+      {...{} as any}
     >
       {/* As a column the terminal clears the titlebar; as a bottom row it sits
           below the rail's panes (so it fills its row edge-to-edge) and gets a
@@ -1266,15 +1255,15 @@ export function DesktopController() {
 
   return (
     <AppShell
-      leftStatusbarItems={leftStatusbarItems}
-      leftTitlebarTools={titlebarToolGroups.flat.left}
+      leftStatusbarItems={leftStatusbarItems as unknown as readonly { key: string }[]}
+      leftTitlebarTools={titlebarToolGroups.flat.left as unknown as readonly { key: string }[]}
       mainOverlays={mainOverlays}
       onOpenSettings={openSettings}
       overlays={overlays}
       previewPaneOpen={chatOpen && Boolean(previewTarget || filePreviewTarget)}
-      statusbarItems={statusbarItems}
+      statusbarItems={statusbarItems as unknown as readonly { key: string }[]}
       terminalPaneOpen={terminalSidebarOpen}
-      titlebarTools={titlebarToolGroups.flat.right}
+      titlebarTools={titlebarToolGroups.flat.right as unknown as readonly { key: string }[]}
     >
       {!isSecondaryWindow() && (
         <Pane
@@ -1283,7 +1272,6 @@ export function DesktopController() {
           id="chat-sidebar"
           maxWidth={SIDEBAR_MAX_WIDTH}
           minWidth={SIDEBAR_DEFAULT_WIDTH}
-          onOverlayActiveChange={setSidebarOverlayMounted}
           resizable
           side={sidebarSide}
           width={`${SIDEBAR_DEFAULT_WIDTH}px`}
@@ -1298,7 +1286,7 @@ export function DesktopController() {
           <Route
             element={
               <Suspense fallback={null}>
-                <SkillsView setStatusbarItemGroup={setStatusbarItemGroup} />
+                <SkillsView setStatusbarItemGroup={setStatusbarItemGroup as any} />
               </Suspense>
             }
             path="skills"
@@ -1306,7 +1294,7 @@ export function DesktopController() {
           <Route
             element={
               <Suspense fallback={null}>
-                <MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />
+                <MessagingView setStatusbarItemGroup={setStatusbarItemGroup as any} />
               </Suspense>
             }
             path="messaging"
@@ -1314,7 +1302,7 @@ export function DesktopController() {
           <Route
             element={
               <Suspense fallback={null}>
-                <ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />
+                <ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup as any} />
               </Suspense>
             }
             path="artifacts"

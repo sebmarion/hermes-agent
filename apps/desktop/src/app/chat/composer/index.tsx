@@ -48,7 +48,7 @@ import {
   composerPlainText,
   deleteChipBeforeCaret,
   deleteSelectionInEditor,
-  insertPlainTextAtCaret,
+  insertComposerContentsAtCaret,
   normalizeComposerEditorDom,
   RICH_INPUT_SLOT
 } from './rich-editor'
@@ -209,8 +209,8 @@ export function ChatBar({
     activeQueueSessionKeyRef,
     attachments,
     busy,
-    canSteer,
     clearDraft,
+    compacting: false,
     disabled,
     draftRef,
     drainNextQueued,
@@ -361,7 +361,7 @@ export function ChatBar({
     }
 
     event.preventDefault()
-    insertPlainTextAtCaret(event.currentTarget, pastedText)
+    insertComposerContentsAtCaret(event.currentTarget, pastedText)
     scheduleFlushEditorToDraft(event.currentTarget)
   }
 
@@ -647,7 +647,7 @@ export function ChatBar({
     useComposerBranch({ clearDraft, cwd, draftRef })
 
   // Global Esc-to-cancel when the chat (not the composer input) has focus.
-  useComposerEscCancel({ awaitingInput, busy, onCancel })
+  useComposerEscCancel({ awaitingInput, busy, onCancel, target: 'main' })
 
   const {
     conversation,
@@ -667,7 +667,8 @@ export function ChatBar({
     maxRecordingSeconds,
     onSubmit,
     onTranscribeAudio,
-    sessionId
+    sessionId,
+    target: 'main'
   })
 
   const contextMenu = (
@@ -879,7 +880,9 @@ export function ChatBar({
                     }
                   }}
                   onEdit={beginQueuedEdit}
+                  onResume={() => {}}
                   onSendNow={id => void sendQueuedNow(id)}
+                  parked={false}
                 />
               ) : null
             }

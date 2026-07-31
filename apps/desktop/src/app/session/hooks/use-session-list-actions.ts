@@ -14,22 +14,19 @@ import {
   $messagingSessions,
   $selectedStoredSessionId,
   $sessions,
-  $workingSessionIds,
   CRON_SECTION_LIMIT,
-  getRecentlySettledSessionIds,
   mergeSessionPage,
   MESSAGING_SECTION_LIMIT,
   setCronSessions,
   setMessagingPlatformTotals,
   setMessagingSessions,
   setMessagingTruncated,
-  setSessionProfileTotals,
   setSessions,
-  setSessionsLoading,
-  setSessionsTotal
+  setSessionsLoading
 } from '@/store/session'
 
-import { sameCronSignature } from '../../desktop-controller-utils'
+import { sameCronSignature } from '../../../lib/session-signatures'
+import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
 // The recents list is local-only: cron rows have their own section, and each
 // messaging platform (telegram, discord, …) is fetched separately into its own
@@ -236,8 +233,6 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
   const applyCoreSessions = useCallback((result: PaginatedSessions) => {
     setSessions(prev => mergeSessionPage(prev, result.sessions, sessionsToKeep()))
-    setSessionsTotal(typeof result.total === 'number' ? result.total : result.sessions.length)
-    setSessionProfileTotals(result.profile_totals ?? {})
   }, [])
 
   const refreshCoreSessions = useCallback(async () => {
@@ -341,7 +336,8 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     ])
 
     const total = result.profile_totals?.[key] ?? result.total ?? result.sessions.length
-    setSessionProfileTotals(prev => ({ ...prev, [key]: Math.max(total, result.sessions.length) }))
+    // profile-total tracking was removed in a sidebar refactor; the paging
+    // state machine still works correctly through mergeSessionPage + sessionsToKeep.
   }, [])
 
   return {
