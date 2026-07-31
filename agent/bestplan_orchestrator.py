@@ -207,7 +207,7 @@ def reconcile_bestplan_receipts(path: str | Path) -> list[str]:
         return []
     changed: list[str] = []
     records: list[dict[str, Any]] = []
-    for line in target.read_text().splitlines():
+    for line in target.read_text(encoding="utf-8").splitlines():
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
@@ -218,7 +218,10 @@ def reconcile_bestplan_receipts(path: str | Path) -> list[str]:
         records.append(record)
     if changed:
         temp = target.with_suffix(target.suffix + ".reconciled")
-        temp.write_text("".join(json.dumps(r, sort_keys=True, separators=(",", ":")) + "\n" for r in records))
+        temp.write_text(
+            "".join(json.dumps(r, sort_keys=True, separators=(",", ":")) + "\n" for r in records),
+            encoding="utf-8",
+        )
         os.replace(temp, target)
     return changed
 
