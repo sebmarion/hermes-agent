@@ -1489,7 +1489,7 @@ def test_recovery_marks_running_record_lost_when_owner_dead():
             "delivery_status": "running",
         }}}
         import json as _json
-        pathlib.Path(tracker).write_text(_json.dumps(data))
+        pathlib.Path(tracker).write_text(_json.dumps(data), encoding="utf-8")
 
         ad._recovery_attempted = False
         result = ad.recover_async_delegations(tracker)
@@ -1674,7 +1674,7 @@ while not stop.exists():
         stored = json.loads(tracker.read_text())["records"]["deleg_other_process"]
         assert stored["status"] == "running"
 
-        stop.write_text("stop")
+        stop.write_text("stop", encoding="utf-8")
         owner.wait(timeout=5)
         assert ad.recover_async_delegations(tracker)["lost"] == 1
     finally:
