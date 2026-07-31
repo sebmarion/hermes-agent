@@ -59,7 +59,8 @@ function renderSubmitHook({
       queuedPrompts: [],
       sessionId: 'runtime-session',
       setComposerText: vi.fn(),
-      stashAt: vi.fn()
+      stashAt: vi.fn(),
+      submitting: false
     })
   )
 

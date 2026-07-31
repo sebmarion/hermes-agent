@@ -129,17 +129,9 @@ export function useComposerVoice({
     consumePendingResponse,
     enabled: voiceConversationActive,
     onFatalError: () => setVoiceConversationActive(false),
-    // A spoken stop command ("stop", "never mind", "goodbye", …) ends the
-    // hands-free conversation. Flipping the flag is the authoritative off
-    // switch — the enabled=false prop + effect below drive conversation.end()
-    // teardown (mic close, wake re-arm).
-    onStopWord: () => setVoiceConversationActive(false),
     onSubmit: submitVoiceTurn,
     onTranscribeAudio,
     pendingResponse: pendingTurnResponse,
-    // Before the conversation opens the mic, wait for any in-flight wake.pause
-    // to finish releasing the capture device (see wakePauseBarrierRef).
-    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
   })
 
   // The `composer.voice` hotkey (Ctrl+B) toggles the conversation. Starting

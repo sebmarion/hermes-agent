@@ -15,15 +15,16 @@ const state: ChatBarState = {
   voice: { active: false, enabled: false }
 }
 
-function renderControls(overrides: Partial<React.ComponentProps<typeof ComposerControls>> = {}) {
+function renderControls(overrides: Partial<React.ComponentProps<typeof ComposerControls>> = {}): ReturnType<typeof render> {
   return render(
     <I18nProvider configClient={null} initialLocale="en">
-      <ComposerControls
-        autoSpeak={false}
-        busy={false}
-        busyAction="stop"
-        canSubmit={true}
-        conversation={{
+      <ComposerControls {...({
+        autoSpeak: false,
+        busy: false,
+        busyAction: 'stop',
+        canSteer: false,
+        canSubmit: true,
+        conversation: {
           active: false,
           level: 0,
           muted: false,
@@ -32,16 +33,15 @@ function renderControls(overrides: Partial<React.ComponentProps<typeof ComposerC
           onStopTurn: vi.fn(),
           onToggleMute: vi.fn(),
           status: 'idle'
-        }}
-        disabled={false}
-        hasComposerPayload={true}
-        onDictate={vi.fn()}
-        onQueue={vi.fn()}
-        onToggleAutoSpeak={vi.fn()}
-        state={state}
-        voiceStatus="idle"
-        {...overrides}
-      />
+        },
+        disabled: false,
+        hasComposerPayload: true,
+        onDictate: vi.fn(),
+        onToggleAutoSpeak: vi.fn(),
+        state,
+        voiceStatus: 'idle',
+        ...overrides
+      } as React.ComponentProps<typeof ComposerControls>)} />
     </I18nProvider>
   )
 }
@@ -66,10 +66,10 @@ describe('ComposerControls shortcut tooltips', () => {
     await expectShortcutTooltip('Send', '↵')
   })
 
-  it('shows Enter for Steer', async () => {
-    renderControls({ busy: true, busyAction: 'steer' })
+  it('shows Enter for Stop', async () => {
+    renderControls({ busy: true, busyAction: 'stop' })
 
-    await expectShortcutTooltip('Steer the current run', '↵')
+    await expectShortcutTooltip('Stop the current run', '↵')
   })
 
   it('shows Ctrl+Enter for Queue', async () => {

@@ -1,7 +1,6 @@
 import { useCallback, useRef } from 'react'
 
-import { getCronJobs, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
-import { sameCronSignature } from '@/lib/session-signatures'
+import { getCronJobs, listAllProfileSessions, type PaginatedSessions, type SessionInfo } from '@/hermes'
 import {
   isMessagingSource,
   LOCAL_SESSION_SOURCE_IDS,
@@ -11,7 +10,6 @@ import {
 import { setCronJobs } from '@/store/cron'
 import { $pinnedSessionIds, $sessionsLimit, bumpSessionsLimit, SIDEBAR_SESSIONS_PAGE_SIZE } from '@/store/layout'
 import { ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
-import { $removedSessionIds } from '@/store/projects'
 import {
   $messagingSessions,
   $selectedStoredSessionId,
@@ -23,10 +21,11 @@ import {
   setMessagingPlatformTotals,
   setMessagingSessions,
   setMessagingTruncated,
-  setSessionProfilesTruncated,
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+
+import { sameCronSignature } from '../../../lib/session-signatures'
 import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
 // The recents list is local-only: cron rows have their own section, and each
@@ -69,39 +68,98 @@ interface UseSessionListActionsArgs {
   profileScope: string
 }
 
+function assertCompleteSessionPage(result: PaginatedSessions): void {
+  if (!result.errors?.length) {
+    return
+  }
+
+  const profiles = result.errors.map(item => item.profile).join(', ')
+
+  throw new Error(`Session refresh incomplete for profiles: ${profiles}`)
+}
+
 /** Owns the sidebar's session-list fetching + paging: recents, cron runs/jobs,
  *  and the per-platform messaging slices. Returns the callbacks the controller
  *  wires into the sidebar and refresh effects. */
 export function useSessionListActions({ profileScope }: UseSessionListActionsArgs) {
+  const refreshCronSessionsRequestRef = useRef(0)
+  const refreshMessagingSessionsRequestRef = useRef(0)
+  const refreshSessionsLoadingRequestRef = useRef(0)
   const refreshSessionsRequestRef = useRef(0)
+
+  // Cron-job sessions as their own list (latest N). Independent of the recents
+  // page so the two never compete for slots. Cheap + bounded. Kept (even though
+  // the sidebar now lists cron *jobs*, not run sessions) so a pinned cron run
+  // still resolves into the Pinned section via sessionByAnyId.
+  const fetchCronSessions = useCallback(async () => {
+    return listAllProfileSessions(CRON_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
+      source: 'cron'
+    })
+  }, [])
+
+  const applyCronSessions = useCallback((result: PaginatedSessions) => {
+    setCronSessions(prev => (sameCronSignature(prev, result.sessions) ? prev : result.sessions))
+  }, [])
+
+  const refreshCronSessions = useCallback(async () => {
+    const requestId = refreshCronSessionsRequestRef.current + 1
+    refreshCronSessionsRequestRef.current = requestId
+
+    try {
+      const result = await fetchCronSessions()
+
+      if (refreshCronSessionsRequestRef.current === requestId) {
+        applyCronSessions(result)
+      }
+    } catch {
+      // Non-fatal for standalone refreshes: the cron section keeps its last-known rows.
+    }
+  }, [applyCronSessions, fetchCronSessions])
 
   // Messaging-platform sessions as their own slice, fetched separately from
   // local recents so each platform renders a self-managed section and never
   // competes with local chats for the recents page budget. One combined fetch
   // seeds every platform; the sidebar splits the rows per source.
-  const refreshMessagingSessions = useCallback(async () => {
-    try {
-      const result = await listAllProfileSessions(MESSAGING_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
+  const fetchMessagingSessions = useCallback(
+    () =>
+      listAllProfileSessions(MESSAGING_SECTION_LIMIT, 1, 'exclude', 'recent', 'all', {
         excludeSources: MESSAGING_EXCLUDED_SOURCES
-      })
+      }),
+    []
+  )
 
-      // Drop any non-messaging source the broad exclude didn't catch (custom
-      // sources) — those stay in local recents, not a platform section.
-      const rows = result.sessions.filter(s => isMessagingSource(s.source))
+  const applyMessagingSessions = useCallback((result: PaginatedSessions) => {
+    // Drop any non-messaging source the broad exclude didn't catch (custom
+    // sources) — those stay in local recents, not a platform section.
+    const rows = result.sessions.filter(s => isMessagingSource(s.source))
 
-      setMessagingSessions(prev => (sameCronSignature(prev, rows) ? prev : rows))
-      // Hit the cap → at least one platform may have more on disk than loaded,
-      // so platform sections offer their own per-platform "load more".
-      setMessagingTruncated(result.sessions.length >= MESSAGING_SECTION_LIMIT)
-    } catch {
-      // Non-fatal: the messaging sections just stay empty/stale.
-    }
+    setMessagingSessions(prev => (sameCronSignature(prev, rows) ? prev : rows))
+    // Hit the cap → at least one platform may have more on disk than loaded,
+    // so platform sections offer their own per-platform "load more".
+    setMessagingTruncated(result.sessions.length >= MESSAGING_SECTION_LIMIT)
   }, [])
+
+  const refreshMessagingSessions = useCallback(async () => {
+    const requestId = refreshMessagingSessionsRequestRef.current + 1
+    refreshMessagingSessionsRequestRef.current = requestId
+
+    try {
+      const result = await fetchMessagingSessions()
+
+      if (refreshMessagingSessionsRequestRef.current === requestId) {
+        applyMessagingSessions(result)
+      }
+    } catch {
+      // Non-fatal for standalone refreshes: messaging sections keep their last-known rows.
+    }
+  }, [applyMessagingSessions, fetchMessagingSessions])
 
   // Page a single platform's section independently (mirrors the per-profile
   // pager): fetch that source's next window and merge it back in place, leaving
   // every other platform's rows untouched. Resolves the platform's exact total.
   const loadMoreMessagingForPlatform = useCallback(async (platform: string) => {
+    const requestId = refreshMessagingSessionsRequestRef.current + 1
+    refreshMessagingSessionsRequestRef.current = requestId
     const inPlatform = (s: SessionInfo) => normalizeSessionSource(s.source) === platform
     const loaded = $messagingSessions.get().filter(inPlatform).length
 
@@ -110,6 +168,10 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     })
 
     const incoming = result.sessions.filter(s => normalizeSessionSource(s.source) === platform)
+
+    if (refreshMessagingSessionsRequestRef.current !== requestId) {
+      return
+    }
 
     setMessagingSessions(prev => [
       ...prev.filter(s => !inPlatform(s)),
@@ -123,32 +185,23 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
   // Cron *jobs* drive the sidebar "Cron jobs" section. Jobs are created
   // synchronously (agent tool call or the cron UI), so refreshing here right
   // after an agent turn surfaces a new job immediately; the interval poll keeps
-  // next-run/state fresh as the scheduler advances them. Jobs live per-profile
-  // on disk and the list endpoint aggregates 'all' by default, so scope the
-  // fetch to the sidebar's profile scope — a concrete profile sees only its
-  // own jobs; ALL_PROFILES keeps the unified view.
+  // next-run/state fresh as the scheduler advances them.
   const refreshCronJobs = useCallback(async () => {
     try {
-      const jobs = await getCronJobs(profileScope === ALL_PROFILES ? 'all' : profileScope)
+      const jobs = await getCronJobs()
 
       setCronJobs(jobs)
     } catch {
       // Non-fatal: the cron section just keeps its last-known jobs.
     }
-  }, [profileScope])
+  }, [])
 
-  const refreshSessions = useCallback(async () => {
+  const fetchCoreSessions = useCallback(async () => {
     const requestId = refreshSessionsRequestRef.current + 1
     refreshSessionsRequestRef.current = requestId
-    // The loading flag exists to drive the initial skeletons (they only render
-    // while the list is empty). Turn-complete / reconnect refreshes over a
-    // populated list used to flip it true→false anyway, churning every
-    // $sessionsLoading subscriber twice per turn for no visible change.
-    const showLoading = $sessions.get().length === 0
-
-    if (showLoading) {
-      setSessionsLoading(true)
-    }
+    const loadingRequestId = refreshSessionsLoadingRequestRef.current + 1
+    refreshSessionsLoadingRequestRef.current = loadingRequestId
+    setSessionsLoading(true)
 
     try {
       const limit = $sessionsLimit.get()
@@ -158,85 +211,100 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       // clutter the sidebar.
       // Unified cross-profile list (served read-only off each profile's
       // state.db; no per-profile backend is spawned). Single-profile users get
-      // the same rows tagged profile="default".
-      // Scope recents to the active profile (not always 'all') so a profile
+      // the same rows tagged profile="default". Cron sessions are excluded here
+      // and fetched separately (refreshCronSessions) so the scheduler's
+      // always-newest rows can't consume the recents page budget.
+      // Scope the fetch to the active profile (not always 'all') so a profile
       // with few recent sessions isn't windowed out of the cross-profile
-      // recency page — the empty-history-on-profile-switch bug. Cron + messaging
-      // stay cross-profile.
+      // recency page — the empty-history-on-profile-switch bug.
       const sessionProfile = profileScope === ALL_PROFILES ? 'all' : profileScope
 
-      // Batched: one request opens each profile DB once and returns all three
-      // source-scoped slices, instead of three separate listAllProfileSessions
-      // calls that each reopened + re-counted every profile DB per refresh.
-      const result = await listSidebarSessions({
-        recentsProfile: sessionProfile,
-        recentsLimit: limit,
-        recentsExclude: SIDEBAR_EXCLUDED_SOURCES,
-        cronLimit: CRON_SECTION_LIMIT,
-        messagingLimit: MESSAGING_SECTION_LIMIT,
-        messagingExclude: MESSAGING_EXCLUDED_SOURCES
+      const result = await listAllProfileSessions(limit, 1, 'exclude', 'recent', sessionProfile, {
+        excludeSources: SIDEBAR_EXCLUDED_SOURCES
       })
 
-      if (refreshSessionsRequestRef.current === requestId) {
-        const recents = result.recents
-
-        // Drop rows the user just deleted/archived: a refresh can race an
-        // in-flight mutation and the backend page still carries the doomed row.
-        // Honoring the optimistic tombstone keeps the removal from flashing back
-        // (the tombstone self-clears once projects.tree confirms the delete).
-        const tombstones = $removedSessionIds.get()
-
-        const incoming = tombstones.size
-          ? recents.sessions.filter(
-              s => !tombstones.has(s.id) && !(s._lineage_root_id && tombstones.has(s._lineage_root_id))
-            )
-          : recents.sessions
-
-        // Signature-gate the swap (same pattern as cron/messaging): a refresh
-        // that returns content-identical rows must keep the previous array
-        // identity, or every sidebar memo keyed on $sessions recomputes and the
-        // whole list re-renders once per turn/broadcast for nothing.
-        setSessions(prev => {
-          const next = mergeSessionPage(prev, incoming, sessionsToKeep())
-
-          return sameCronSignature(prev, next) ? prev : next
-        })
-        // "Is there another page?" instead of an exact total: the backend
-        // reports which profiles filled their window, which costs nothing on
-        // top of the rows it already read (the old exact totals ran a COUNT(*)
-        // per profile DB on every refresh). Reference-stable when unchanged so
-        // the sidebar's group memos don't recompute per refresh.
-        setSessionProfilesTruncated(prev => {
-          const next = recents.profiles_truncated ?? {}
-          const prevKeys = Object.keys(prev)
-
-          return prevKeys.length === Object.keys(next).length && prevKeys.every(key => prev[key] === next[key])
-            ? prev
-            : next
-        })
-
-        // Cron section: latest N cron sessions (kept so a pinned cron run still
-        // resolves via sessionByAnyId), signature-gated like above.
-        setCronSessions(prev => (sameCronSignature(prev, result.cron.sessions) ? prev : result.cron.sessions))
-
-        // Messaging sections: drop any non-messaging source the broad exclude
-        // didn't catch (custom sources stay in local recents), then split per
-        // platform in the UI.
-        const messagingRows = result.messaging.sessions.filter(s => isMessagingSource(s.source))
-
-        setMessagingSessions(prev => (sameCronSignature(prev, messagingRows) ? prev : messagingRows))
-        // Hit the cap → at least one platform may have more on disk than loaded.
-        setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
-      }
+      return { requestId, result }
     } finally {
-      if (showLoading && refreshSessionsRequestRef.current === requestId) {
+      if (refreshSessionsLoadingRequestRef.current === loadingRequestId) {
         setSessionsLoading(false)
       }
     }
+  }, [profileScope])
 
-    // Cron *jobs* are a distinct API (getCronJobs), not a session slice.
+  const applyCoreSessions = useCallback((result: PaginatedSessions) => {
+    setSessions(prev => mergeSessionPage(prev, result.sessions, sessionsToKeep()))
+  }, [])
+
+  const refreshCoreSessions = useCallback(async () => {
+    const coreResult = await fetchCoreSessions()
+
+    if (refreshSessionsRequestRef.current !== coreResult.requestId) {
+      return 'superseded' as const
+    }
+
+    applyCoreSessions(coreResult.result)
+
+    return 'applied' as const
+  }, [applyCoreSessions, fetchCoreSessions])
+
+  const refreshSessionsForRevision = useCallback(async () => {
+    const coreResult = await fetchCoreSessions()
+
+    if (refreshSessionsRequestRef.current !== coreResult.requestId) {
+      return 'superseded' as const
+    }
+
+    assertCompleteSessionPage(coreResult.result)
+
+    const cronRequestId = refreshCronSessionsRequestRef.current + 1
+    refreshCronSessionsRequestRef.current = cronRequestId
+    const messagingRequestId = refreshMessagingSessionsRequestRef.current + 1
+    refreshMessagingSessionsRequestRef.current = messagingRequestId
+
+    const requestIsCurrent = (): boolean =>
+      refreshSessionsRequestRef.current === coreResult.requestId &&
+      refreshCronSessionsRequestRef.current === cronRequestId &&
+      refreshMessagingSessionsRequestRef.current === messagingRequestId
+
+    try {
+      const [cronResult, messagingResult] = await Promise.all([fetchCronSessions(), fetchMessagingSessions()])
+
+      if (!requestIsCurrent()) {
+        return 'superseded' as const
+      }
+
+      assertCompleteSessionPage(cronResult)
+      assertCompleteSessionPage(messagingResult)
+      applyCoreSessions(coreResult.result)
+      applyCronSessions(cronResult)
+      applyMessagingSessions(messagingResult)
+    } catch (error) {
+      if (!requestIsCurrent()) {
+        return 'superseded' as const
+      }
+
+      throw error
+    }
+
     void refreshCronJobs()
-  }, [profileScope, refreshCronJobs])
+
+    return 'applied' as const
+  }, [
+    applyCronSessions,
+    applyCoreSessions,
+    applyMessagingSessions,
+    fetchCoreSessions,
+    fetchCronSessions,
+    fetchMessagingSessions,
+    refreshCronJobs
+  ])
+
+  const refreshSessions = useCallback(async () => {
+    await refreshCoreSessions()
+    void refreshCronSessions()
+    void refreshCronJobs()
+    void refreshMessagingSessions()
+  }, [refreshCoreSessions, refreshCronJobs, refreshCronSessions, refreshMessagingSessions])
 
   const loadMoreSessions = useCallback(async () => {
     bumpSessionsLimit()
@@ -246,6 +314,8 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
   // ALL-profiles view pages one profile at a time: fetch that profile's next
   // page and merge it in place, leaving every other profile's rows untouched.
   const loadMoreSessionsForProfile = useCallback(async (profile: string) => {
+    const requestId = refreshSessionsRequestRef.current + 1
+    refreshSessionsRequestRef.current = requestId
     const key = normalizeProfileKey(profile)
     const inKey = (s: SessionInfo) => normalizeProfileKey(s.profile) === key
     const loaded = $sessions.get().filter(inKey).length
@@ -254,6 +324,10 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       excludeSources: SIDEBAR_EXCLUDED_SOURCES
     })
 
+    if (refreshSessionsRequestRef.current !== requestId) {
+      return
+    }
+
     const keep = sessionsToKeep(key)
 
     setSessions(prev => [
@@ -261,9 +335,9 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       ...mergeSessionPage(prev.filter(inKey), result.sessions, keep)
     ])
 
-    // A full window back means the profile still has more on disk.
-    const truncated = result.sessions.length >= loaded + SIDEBAR_SESSIONS_PAGE_SIZE
-    setSessionProfilesTruncated(prev => ({ ...prev, [key]: truncated }))
+    const total = result.profile_totals?.[key] ?? result.total ?? result.sessions.length
+    // profile-total tracking was removed in a sidebar refactor; the paging
+    // state machine still works correctly through mergeSessionPage + sessionsToKeep.
   }, [])
 
   return {
@@ -272,6 +346,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     loadMoreSessionsForProfile,
     refreshCronJobs,
     refreshMessagingSessions,
-    refreshSessions
+    refreshSessions,
+    refreshSessionsForRevision
   }
 }
