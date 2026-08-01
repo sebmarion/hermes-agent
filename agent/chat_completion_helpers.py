@@ -148,24 +148,25 @@ def build_provider_request_admission_receipt(agent, api_kwargs: Any) -> Dict[str
     context_length = raw_context_length if type(raw_context_length) is int else None
     threshold_tokens = raw_threshold_tokens if type(raw_threshold_tokens) is int else None
 
-    explicit_output_tokens = 0
-    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
-        raw_output_tokens = payload.get(key)
-        if type(raw_output_tokens) is int and raw_output_tokens > 0:
-            explicit_output_tokens = raw_output_tokens
-            break
+    output_cap_keys = ("max_output_tokens", "max_completion_tokens", "max_tokens")
+    present_output_caps = [payload[key] for key in output_cap_keys if key in payload]
+    invalid_output_cap = any(
+        type(raw_output_tokens) is not int or raw_output_tokens <= 0
+        for raw_output_tokens in present_output_caps
+    )
+    explicit_output_tokens = (
+        max(present_output_caps)
+        if present_output_caps and not invalid_output_cap
+        else 0
+    )
 
     window_input_ceiling = (
         context_length - explicit_output_tokens
         if context_length is not None
         else None
     )
-    effective_input_ceiling = threshold_tokens
-    if (
-        explicit_output_tokens > 0
-        and threshold_tokens is not None
-        and window_input_ceiling is not None
-    ):
+    effective_input_ceiling = None
+    if threshold_tokens is not None and window_input_ceiling is not None:
         effective_input_ceiling = min(threshold_tokens, window_input_ceiling)
 
     receipt: Dict[str, Any] = {
@@ -188,6 +189,8 @@ def build_provider_request_admission_receipt(agent, api_kwargs: Any) -> Dict[str
         decision, reason = "reject", "invalid_compressor_context_length"
     elif threshold_tokens is None or threshold_tokens <= 0:
         decision, reason = "reject", "invalid_compressor_threshold_tokens"
+    elif invalid_output_cap:
+        decision, reason = "reject", "invalid_explicit_output_tokens"
     elif not resolved_model:
         decision, reason = "reject", "unresolved_agent_model"
     elif not resolved_provider:

@@ -135,8 +135,27 @@ def test_effective_ceiling_is_smaller_of_threshold_and_reserved_window(
     assert receipt["decision"] == "admit"
 
 
+def test_absent_output_cap_still_uses_context_window_as_a_ceiling():
+    api_kwargs = {"input": "x" * 4_000}
+    estimated = estimate_request_context_tokens(api_kwargs)
+    required_tokens = estimated + max(1_024, math.ceil(estimated * 0.05))
+
+    receipt = build_provider_request_admission_receipt(
+        _agent(
+            context_length=required_tokens - 1,
+            threshold_tokens=required_tokens + 1_000,
+        ),
+        api_kwargs,
+    )
+
+    assert receipt["explicit_output_tokens"] == 0
+    assert receipt["window_input_ceiling"] == required_tokens - 1
+    assert receipt["effective_input_ceiling"] == required_tokens - 1
+    assert receipt["decision"] == "reject"
+
+
 @pytest.mark.parametrize("raw_output", [0, -1, False, "2048", 2_048.0])
-def test_non_positive_or_non_integer_output_limits_are_ignored(raw_output):
+def test_present_non_positive_or_non_integer_output_limits_fail_closed(raw_output):
     receipt = build_provider_request_admission_receipt(
         _agent(context_length=6_000, threshold_tokens=5_000),
         {"input": "x" * 400, "max_output_tokens": raw_output},
@@ -144,7 +163,38 @@ def test_non_positive_or_non_integer_output_limits_are_ignored(raw_output):
 
     assert receipt["explicit_output_tokens"] == 0
     assert receipt["effective_input_ceiling"] == 5_000
-    assert receipt["decision"] == "admit"
+    assert receipt["decision"] == "reject"
+    assert receipt["reason"] == "invalid_explicit_output_tokens"
+
+
+def test_multiple_valid_output_caps_reserve_the_largest_value():
+    receipt = build_provider_request_admission_receipt(
+        _agent(context_length=10_000, threshold_tokens=9_000),
+        {
+            "input": "x" * 400,
+            "max_tokens": 4_000,
+            "max_completion_tokens": 2_000,
+            "max_output_tokens": 1_000,
+        },
+    )
+
+    assert receipt["explicit_output_tokens"] == 4_000
+    assert receipt["window_input_ceiling"] == 6_000
+    assert receipt["effective_input_ceiling"] == 6_000
+
+
+def test_valid_output_cap_cannot_mask_another_invalid_present_cap():
+    receipt = build_provider_request_admission_receipt(
+        _agent(context_length=10_000, threshold_tokens=9_000),
+        {
+            "input": "x" * 400,
+            "max_output_tokens": 1_000,
+            "max_tokens": 0,
+        },
+    )
+
+    assert receipt["decision"] == "reject"
+    assert receipt["reason"] == "invalid_explicit_output_tokens"
 
 
 @pytest.mark.parametrize(
