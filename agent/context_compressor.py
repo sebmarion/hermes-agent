@@ -201,6 +201,7 @@ _SUMMARY_TOKENS_CEILING = 10_000
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 _TOOL_RESULT_SUMMARY_MAX_CHARS = 200
+_TOOL_CALL_ARGS_MAX_CHARS = 500
 
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
@@ -433,7 +434,11 @@ def _strip_image_parts_from_parts(parts: Any) -> Any:
     return out if had_image else None
 
 
-def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
+def _truncate_tool_call_args_json(
+    args: str,
+    head_chars: int = 200,
+    max_chars: int = _TOOL_CALL_ARGS_MAX_CHARS,
+) -> str:
     """Shrink long string values inside a tool-call arguments JSON blob while
     preserving JSON validity.
 
@@ -452,31 +457,100 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     turn. See issue #11762 for the observed loop.
 
     This helper parses the arguments, shrinks long string leaves inside the
-    parsed structure, and re-serialises. Non-string values (paths, ints,
-    booleans) are preserved intact. If the arguments are not valid JSON
-    to begin with — some model backends use non-JSON tool arguments — the
-    original string is returned unchanged rather than replaced with
-    something neither we nor the backend can parse.
+    parsed structure, and re-serialises. Non-string values are preserved when
+    that structural pass fits within ``max_chars``. If a large value has no
+    shrinkable string leaves (for example, a huge numeric array), it becomes a
+    small JSON receipt containing only safe shape metadata. Invalid JSON is
+    returned unchanged rather than replaced with something neither we nor the
+    backend can parse. Every changed return value is strictly shorter than the
+    input.
     """
     try:
         parsed = json.loads(args)
     except (ValueError, TypeError):
         return args
 
-    def _shrink(obj: Any) -> Any:
+    shrinkable_string_found = False
+
+    def _shrink(obj: Any, retained_chars: int) -> Any:
+        nonlocal shrinkable_string_found
         if isinstance(obj, str):
             if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
+                shrinkable_string_found = True
+                return obj[:retained_chars] + "...[truncated]"
             return obj
         if isinstance(obj, dict):
-            return {k: _shrink(v) for k, v in obj.items()}
+            return {k: _shrink(v, retained_chars) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [_shrink(v) for v in obj]
+            return [_shrink(v, retained_chars) for v in obj]
         return obj
 
-    shrunken = _shrink(parsed)
-    # ensure_ascii=False preserves CJK/emoji instead of bloating with \uXXXX
-    return json.dumps(shrunken, ensure_ascii=False)
+    # Compact separators avoid growing already-minified arguments. The
+    # structural form is useful only when it actually fits the bounded replay
+    # slot; otherwise a many-item non-string container would remain enormous.
+    def _serialize_with_retained_chars(retained_chars: int) -> str:
+        return json.dumps(
+            _shrink(parsed, retained_chars),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    candidate = _serialize_with_retained_chars(head_chars)
+    if len(candidate) <= max_chars and len(candidate) < len(args):
+        return candidate
+
+    # Preserve the original JSON shape when possible. Find the largest common
+    # prefix for leaves that were already over ``head_chars`` such that the
+    # complete serialized structure fits the replay bound. Short strings are
+    # never expanded into truncation markers during this search.
+    if shrinkable_string_found:
+        low = 0
+        high = max(0, head_chars - 1)
+        bounded_candidate = None
+        while low <= high:
+            retained_chars = (low + high) // 2
+            trial = _serialize_with_retained_chars(retained_chars)
+            if len(trial) <= max_chars:
+                bounded_candidate = trial
+                low = retained_chars + 1
+            else:
+                high = retained_chars - 1
+        if (
+            bounded_candidate is not None
+            and len(bounded_candidate) < len(args)
+        ):
+            return bounded_candidate
+
+    if isinstance(parsed, dict):
+        receipt = {
+            "_hermes_truncated": True,
+            "original_chars": len(args),
+            "value_type": "object",
+            "key_count": len(parsed),
+            "keys": [str(key)[:40] for key in list(parsed)[:8]],
+        }
+    elif isinstance(parsed, list):
+        receipt = {
+            "_hermes_truncated": True,
+            "original_chars": len(args),
+            "value_type": "list",
+            "item_count": len(parsed),
+        }
+    else:
+        receipt = {
+            "_hermes_truncated": True,
+            "original_chars": len(args),
+            "value_type": type(parsed).__name__,
+        }
+    fallback = json.dumps(receipt, ensure_ascii=False, separators=(",", ":"))
+    while len(fallback) > max_chars and receipt.get("keys"):
+        receipt["keys"].pop()
+        fallback = json.dumps(
+            receipt,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return fallback if len(fallback) < len(args) else args
 
 
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
@@ -609,7 +683,9 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
     """
     try:
         args = json.loads(tool_args) if tool_args else {}
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError):
+        args = {}
+    if not isinstance(args, dict):
         args = {}
 
     content = tool_content or ""
@@ -1384,7 +1460,6 @@ class ContextCompressor(ContextEngine):
                 msg = result[i]
                 msg_tokens = _estimate_msg_budget_tokens(msg)
                 if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
-                    boundary = i
                     break
                 accumulated += msg_tokens
                 boundary = i
@@ -1493,9 +1568,9 @@ class ContextCompressor(ContextEngine):
             for tc in msg["tool_calls"]:
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
-                    if len(args) > 500:
+                    if len(args) > _TOOL_CALL_ARGS_MAX_CHARS:
                         new_args = _truncate_tool_call_args_json(args)
-                        if new_args != args:
+                        if new_args != args and len(new_args) < len(args):
                             tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
                             modified = True
                             pruned += 1

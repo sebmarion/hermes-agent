@@ -4306,7 +4306,11 @@ class SessionDB:
             return cursor.fetchone() is not None
 
     def archive_and_compact(
-        self, session_id: str, compacted_messages: List[Dict[str, Any]]
+        self,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+        *,
+        expected_active_message_ids: Optional[Tuple[int, ...]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -4330,9 +4334,34 @@ class SessionDB:
         This is the durability-preserving alternative to :meth:`replace_messages`
         for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
         matching what the live load returns. Returns the new active count.
+
+        When ``expected_active_message_ids`` is provided, the replacement is a
+        compare-and-swap: the active row IDs are checked inside the same
+        ``BEGIN IMMEDIATE`` transaction before any row is archived. A mismatch
+        raises and leaves every active row untouched. Legacy callers that omit
+        the expectation retain the existing unconditional behavior.
         """
 
+        expected_ids = (
+            tuple(expected_active_message_ids)
+            if expected_active_message_ids is not None
+            else None
+        )
+
         def _do(conn):
+            if expected_ids is not None:
+                current_ids = tuple(
+                    row["id"] if isinstance(row, sqlite3.Row) else row[0]
+                    for row in conn.execute(
+                        "SELECT id FROM messages "
+                        "WHERE session_id = ? AND active = 1 ORDER BY id",
+                        (session_id,),
+                    ).fetchall()
+                )
+                if current_ids != expected_ids:
+                    raise RuntimeError(
+                        "active session projection changed before compaction"
+                    )
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it

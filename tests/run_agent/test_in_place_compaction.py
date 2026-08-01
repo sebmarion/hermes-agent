@@ -5,8 +5,8 @@ message list and rebuilds the system prompt but keeps the SAME ``session_id``:
 no ``end_session``, no ``parent_session_id`` child row, no ``name #N`` title
 renumber, no flush-cursor reset. This eliminates the session-rotation bug
 cluster (#33618 /goal loss, #14238 lost response, #33907 orphans, #45117 search
-gaps, #42228 null cwd). When the flag is False (default), rotation behaves
-exactly as before.
+gaps, #42228 null cwd). When the flag is explicitly False, rotation behaves
+exactly as before as the opt-out fallback.
 """
 
 import os
@@ -309,6 +309,7 @@ class TestDispatchProjectionPersistence:
                 {"role": "user", "content": "bounded summary"},
                 {"role": "assistant", "content": "recent reply"},
             ]
+            expected_active_ids = tuple(row["id"] for row in db.get_messages(sid))
 
             with patch.object(
                 db, "archive_and_compact", wraps=db.archive_and_compact
@@ -317,7 +318,11 @@ class TestDispatchProjectionPersistence:
                     agent, previous, compacted
                 )
 
-            archive.assert_called_once_with(sid, compacted)
+            archive.assert_called_once_with(
+                sid,
+                compacted,
+                expected_active_message_ids=expected_active_ids,
+            )
             assert persisted is True
             assert adopted is compacted
             rows = db.get_messages(sid, include_inactive=True)
@@ -392,6 +397,87 @@ class TestDispatchProjectionPersistence:
             assert [row["content"] for row in rows] == [f"msg {i}" for i in range(4)]
             assert all(row["active"] == 1 and row["compacted"] == 0 for row in rows)
             assert db.get_session(sid)["message_count"] == 4
+
+    def test_concurrent_append_after_snapshot_fails_cas_without_archiving(self):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=db_path)
+            writer = SessionDB(db_path=db_path)
+            sid = "dispatch_projection_stale"
+            _seed(db, sid, "projection", n=4)
+            previous = [
+                {"role": "user", "content": "msg 0"},
+                {"role": "assistant", "content": "msg 1"},
+                {"role": "user", "content": "msg 2"},
+                {"role": "assistant", "content": "msg 3"},
+            ]
+            compacted = [{"role": "user", "content": "must not be adopted"}]
+            flushed_ids = {17, 23}
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=4,
+                _flushed_db_message_ids=flushed_ids,
+            )
+            original_archive = db.archive_and_compact
+
+            def archive_after_concurrent_append(*args, **kwargs):
+                writer.append_message(
+                    session_id=sid,
+                    role="user",
+                    content="concurrent append",
+                )
+                return original_archive(*args, **kwargs)
+
+            try:
+                with (
+                    patch.object(
+                        db,
+                        "try_acquire_compression_lock",
+                        wraps=db.try_acquire_compression_lock,
+                    ) as acquire,
+                    patch.object(
+                        db,
+                        "release_compression_lock",
+                        wraps=db.release_compression_lock,
+                    ) as release,
+                    patch.object(
+                        db,
+                        "archive_and_compact",
+                        side_effect=archive_after_concurrent_append,
+                    ),
+                ):
+                    adopted, persisted = persist_in_place_projection(
+                        agent, previous, compacted
+                    )
+
+                assert adopted is previous
+                assert persisted is False
+                assert agent._last_compaction_in_place is False
+                assert agent._last_flushed_db_idx == 4
+                assert agent._flushed_db_message_ids is flushed_ids
+                assert [row["content"] for row in db.get_messages(sid)] == [
+                    "msg 0",
+                    "msg 1",
+                    "msg 2",
+                    "msg 3",
+                    "concurrent append",
+                ]
+                rows = db.get_messages(sid, include_inactive=True)
+                assert all(
+                    row["active"] == 1 and row["compacted"] == 0
+                    for row in rows
+                )
+                assert db.get_session(sid)["message_count"] == 5
+                acquire.assert_called_once()
+                release.assert_called_once()
+            finally:
+                writer.close()
+                db.close()
 
     def test_without_durable_session_adopts_memory_projection_but_reports_not_persisted(self):
         from agent.conversation_compression import persist_in_place_projection
