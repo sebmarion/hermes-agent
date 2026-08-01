@@ -333,6 +333,38 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
+# GitNexus is a structural narrowing tool, not a bulk source dump. Keep its
+# common discovery calls bounded at the MCP boundary so an accidental broad
+# request cannot consume the whole model context before the generic tool-result
+# persistence layer gets a chance to spill it.
+_GITNEXUS_SERVER_NAME = "gitnexus"
+_GITNEXUS_LIST_REPOS_CACHE_TTL_SECONDS = 60.0
+_GITNEXUS_LIST_REPOS_CACHE_MAX_ENTRIES = 32
+_GITNEXUS_TOOL_GUIDANCE = {
+    "trace": (
+        "Prefer this when both source and target symbols are known; it returns "
+        "the compact directed path."
+    ),
+    "query": (
+        "Use for bounded discovery when the concept or symbol is not known yet; "
+        "do not use it as a substitute for trace when both endpoints are known."
+    ),
+    "context": (
+        "Use after resolving one unambiguous symbol; include_content is off by "
+        "default, so read only the identified source ranges separately."
+    ),
+    "impact": (
+        "Use before modifying shared code; the default is shallow summary-only "
+        "risk analysis."
+    ),
+    "list_repos": (
+        "Use only for initial repository resolution; Hermes caches identical "
+        "successful results briefly."
+    ),
+    "detect_changes": (
+        "Use before committing to identify execution flows affected by the diff."
+    ),
+}
 # While parked (reconnect budget exhausted, tools deregistered) the run task
 # wakes on this cadence and attempts one revival probe. Without it a parked
 # server is unrevivable: its tools are out of the registry, so no tool call
@@ -412,6 +444,74 @@ _CREDENTIAL_PATTERN = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+def _is_gitnexus_server(server_name: str) -> bool:
+    """Return whether *server_name* identifies the GitNexus MCP server."""
+    return str(server_name or "").strip().lower() == _GITNEXUS_SERVER_NAME
+
+
+def _bounded_int(value: Any, *, default: int, maximum: int) -> int:
+    """Coerce a GitNexus numeric argument to a safe bounded integer."""
+    try:
+        # bool is an int subclass but is not a useful graph traversal limit.
+        if isinstance(value, bool):
+            raise ValueError
+        return max(1, min(int(value), maximum))
+    except (OverflowError, TypeError, ValueError):
+        return default
+
+
+def _prepare_gitnexus_arguments(
+    server_name: str,
+    tool_name: str,
+    args: dict,
+) -> dict:
+    """Apply bounded defaults to high-volume GitNexus calls.
+
+    Defaults are inserted only when the model omitted the field. Explicit
+    values are retained when they are within the GitNexus schema's supported
+    range and capped only at that server-defined maximum. This keeps valid
+    targeted/deep requests intact while making broad calls cheap by default.
+    """
+    if not _is_gitnexus_server(server_name):
+        return args
+
+    prepared = dict(args or {})
+    if tool_name == "query":
+        prepared.setdefault("limit", 3)
+        prepared["limit"] = _bounded_int(
+            prepared["limit"], default=3, maximum=100
+        )
+        prepared.setdefault("max_symbols", 8)
+        prepared["max_symbols"] = _bounded_int(
+            prepared["max_symbols"], default=8, maximum=200
+        )
+        prepared.setdefault("include_content", False)
+    elif tool_name == "context":
+        prepared.setdefault("include_content", False)
+    elif tool_name == "impact":
+        prepared.setdefault("summaryOnly", True)
+        prepared.setdefault("maxDepth", 2)
+        prepared["maxDepth"] = _bounded_int(
+            prepared["maxDepth"], default=2, maximum=32
+        )
+        prepared.setdefault("limit", 20)
+        prepared["limit"] = _bounded_int(
+            prepared["limit"], default=20, maximum=10_000
+        )
+    elif tool_name == "trace":
+        prepared.setdefault("maxDepth", 8)
+        prepared["maxDepth"] = _bounded_int(
+            prepared["maxDepth"], default=8, maximum=30
+        )
+    elif tool_name == "list_repos":
+        prepared.setdefault("limit", 5)
+        prepared["limit"] = _bounded_int(
+            prepared["limit"], default=5, maximum=200
+        )
+    return prepared
+
 
 # Pre-compiled pattern for ${VAR_NAME} style env-var interpolation.
 # Supports any non-} characters in the variable name (hyphens, dots, etc.)
@@ -4104,6 +4204,11 @@ _parallel_safe_servers: set = set()
 # on parsing or re-sanitizing the generated name.
 _mcp_tool_server_names: Dict[str, str] = {}
 
+# Short-lived cache for GitNexus repository discovery. Repository identity is
+# stable during a normal coding turn, while the TTL keeps manual re-indexing
+# and multi-project sessions from serving stale data indefinitely.
+_gitnexus_list_repos_cache: Dict[tuple[str, str], tuple[float, str]] = {}
+
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
@@ -4111,6 +4216,62 @@ _mcp_thread: Optional[threading.Thread] = None
 # Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
 # _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
 _lock = threading.Lock()
+
+
+def _gitnexus_list_repos_cache_key(server_name: str, args: dict) -> tuple[str, str]:
+    """Return a deterministic cache key for one GitNexus list_repos call."""
+    try:
+        encoded = json.dumps(args, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        encoded = repr(args)
+    return server_name, encoded
+
+
+def _get_cached_gitnexus_list_repos(
+    server_name: str,
+    args: dict,
+) -> Optional[str]:
+    """Return a fresh cached repository listing, if one exists."""
+    key = _gitnexus_list_repos_cache_key(server_name, args)
+    now = time.monotonic()
+    with _lock:
+        cached = _gitnexus_list_repos_cache.get(key)
+        if cached is None:
+            return None
+        created_at, result = cached
+        if now - created_at >= _GITNEXUS_LIST_REPOS_CACHE_TTL_SECONDS:
+            _gitnexus_list_repos_cache.pop(key, None)
+            return None
+        return result
+
+
+def _cache_gitnexus_list_repos(
+    server_name: str,
+    args: dict,
+    result: str,
+) -> None:
+    """Cache one successful GitNexus repository listing for a short TTL."""
+    key = _gitnexus_list_repos_cache_key(server_name, args)
+    with _lock:
+        _gitnexus_list_repos_cache[key] = (time.monotonic(), result)
+        while len(_gitnexus_list_repos_cache) > _GITNEXUS_LIST_REPOS_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                _gitnexus_list_repos_cache,
+                key=lambda cache_key: _gitnexus_list_repos_cache[cache_key][0],
+            )
+            _gitnexus_list_repos_cache.pop(oldest_key, None)
+
+
+def _clear_gitnexus_list_repos_cache(server_name: Optional[str] = None) -> None:
+    """Invalidate cached repository discovery after lifecycle changes."""
+    with _lock:
+        if server_name is None:
+            _gitnexus_list_repos_cache.clear()
+            return
+        for key in list(_gitnexus_list_repos_cache):
+            if key[0] == server_name:
+                _gitnexus_list_repos_cache.pop(key, None)
+
 
 # ---------------------------------------------------------------------------
 # Cross-process MCP discovery guard
@@ -4748,6 +4909,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     "error": f"MCP server '{server_name}' is not connected"
                 }, ensure_ascii=False)
 
+        prepared_args = _prepare_gitnexus_arguments(server_name, tool_name, args)
+        if tool_name == "list_repos" and _is_gitnexus_server(server_name):
+            cached_result = _get_cached_gitnexus_list_repos(server_name, prepared_args)
+            if cached_result is not None:
+                logger.debug(
+                    "MCP GitNexus list_repos cache hit for server '%s'",
+                    server_name,
+                )
+                return cached_result
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
@@ -4757,7 +4928,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    result = await server.session.call_tool(tool_name, arguments=prepared_args)
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -4860,6 +5031,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     _bump_server_error(server_name)
                 else:
                     _reset_server_error(server_name)  # success — reset
+                    if tool_name == "list_repos" and _is_gitnexus_server(server_name):
+                        _cache_gitnexus_list_repos(server_name, prepared_args, result)
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)  # non-JSON = success
             return result
@@ -5365,9 +5538,14 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
         A dict suitable for ``registry.register(schema=...)``.
     """
     prefixed_name = mcp_prefixed_tool_name(server_name, mcp_tool.name)
+    description = mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}"
+    if _is_gitnexus_server(server_name):
+        guidance = _GITNEXUS_TOOL_GUIDANCE.get(mcp_tool.name)
+        if guidance:
+            description = f"{description.rstrip()} {guidance}"
     return {
         "name": prefixed_name,
-        "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
+        "description": description,
         "parameters": _normalize_mcp_input_schema(getattr(mcp_tool, "inputSchema", None)),
     }
 
@@ -5821,6 +5999,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _connect_server(name, config),
         timeout=connect_timeout,
     )
+    _clear_gitnexus_list_repos_cache(name)
     with _lock:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
@@ -6452,6 +6631,7 @@ def shutdown_mcp_servers():
     the anyio cancel-scope cleanup happens in the same Task that opened it.
     All servers are shut down in parallel via ``asyncio.gather``.
     """
+    _clear_gitnexus_list_repos_cache()
     with _lock:
         servers_snapshot = list(_servers.values())
 

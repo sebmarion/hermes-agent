@@ -316,6 +316,14 @@ class TestSchemaConversion:
         assert schema["parameters"]["type"] == "object"
         assert schema["parameters"]["properties"] == {}
 
+    def test_gitnexus_schema_explains_task_aware_routing(self):
+        from tools.mcp_tool import _convert_mcp_schema
+
+        mcp_tool = _make_mcp_tool(name="trace", description="Trace a path")
+        schema = _convert_mcp_schema("gitnexus", mcp_tool)
+
+        assert "Prefer this when both source and target symbols are known" in schema["description"]
+
     def test_object_schema_without_properties_gets_normalized(self):
         from tools.mcp_tool import _convert_mcp_schema
 
@@ -787,6 +795,137 @@ class TestToolHandler:
         if coro_side_effect:
             return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=coro_side_effect)
         return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run)
+
+    def test_gitnexus_arguments_default_to_bounded_discovery(self):
+        from tools.mcp_tool import _prepare_gitnexus_arguments
+
+        assert _prepare_gitnexus_arguments("gitnexus", "query", {}) == {
+            "limit": 3,
+            "max_symbols": 8,
+            "include_content": False,
+        }
+        assert _prepare_gitnexus_arguments("gitnexus", "context", {}) == {
+            "include_content": False,
+        }
+        assert _prepare_gitnexus_arguments("gitnexus", "impact", {}) == {
+            "summaryOnly": True,
+            "maxDepth": 2,
+            "limit": 20,
+        }
+        assert _prepare_gitnexus_arguments("gitnexus", "trace", {}) == {
+            "maxDepth": 8,
+        }
+        assert _prepare_gitnexus_arguments("gitnexus", "list_repos", {}) == {
+            "limit": 5,
+        }
+
+    def test_gitnexus_arguments_cap_pathological_values_without_mutating_input(self):
+        from tools.mcp_tool import _prepare_gitnexus_arguments
+
+        args = {
+            "limit": 10_000,
+            "max_symbols": 10_000,
+            "include_content": True,
+        }
+        prepared = _prepare_gitnexus_arguments("gitnexus", "query", args)
+
+        assert prepared == {
+            "limit": 100,
+            "max_symbols": 200,
+            "include_content": True,
+        }
+        assert _prepare_gitnexus_arguments(
+            "gitnexus", "query", {"limit": float("inf")}
+        ) == {
+            "limit": 3,
+            "max_symbols": 8,
+            "include_content": False,
+        }
+        assert args == {
+            "limit": 10_000,
+            "max_symbols": 10_000,
+            "include_content": True,
+        }
+        assert _prepare_gitnexus_arguments("other-server", "query", args) is args
+
+    def test_gitnexus_arguments_preserve_valid_explicit_depth_and_limits(self):
+        from tools.mcp_tool import _prepare_gitnexus_arguments
+
+        assert _prepare_gitnexus_arguments("gitnexus", "query", {
+            "limit": 50,
+            "max_symbols": 150,
+        }) == {
+            "limit": 50,
+            "max_symbols": 150,
+            "include_content": False,
+        }
+        assert _prepare_gitnexus_arguments("gitnexus", "impact", {
+            "maxDepth": 12,
+            "limit": 500,
+            "summaryOnly": False,
+        }) == {
+            "maxDepth": 12,
+            "limit": 500,
+            "summaryOnly": False,
+        }
+        assert _prepare_gitnexus_arguments("gitnexus", "trace", {
+            "maxDepth": 25,
+        }) == {"maxDepth": 25}
+
+    def test_gitnexus_list_repos_uses_short_lived_cache(self):
+        import tools.mcp_tool as mcp_tool
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result('{"repos": []}', is_error=False)
+        )
+        server = _make_mock_server("gitnexus", session=mock_session)
+        sentinel = object()
+        with mcp_tool._lock:
+            saved_cache = dict(mcp_tool._gitnexus_list_repos_cache)
+            saved_server = mcp_tool._servers.get("gitnexus", sentinel)
+            mcp_tool._gitnexus_list_repos_cache.clear()
+            mcp_tool._servers["gitnexus"] = server
+
+        try:
+            handler = mcp_tool._make_tool_handler("gitnexus", "list_repos", 120)
+            with self._patch_mcp_loop():
+                first = handler({})
+                second = handler({})
+
+            assert first == second == '{"result": "{\\"repos\\": []}"}'
+            mock_session.call_tool.assert_called_once_with(
+                "list_repos", arguments={"limit": 5}
+            )
+        finally:
+            with mcp_tool._lock:
+                if saved_server is sentinel:
+                    mcp_tool._servers.pop("gitnexus", None)
+                else:
+                    mcp_tool._servers["gitnexus"] = saved_server
+                mcp_tool._gitnexus_list_repos_cache.clear()
+                mcp_tool._gitnexus_list_repos_cache.update(saved_cache)
+
+    def test_gitnexus_list_repos_cache_is_invalidated_for_server(self):
+        import tools.mcp_tool as mcp_tool
+
+        key = ("gitnexus", '{"limit":5}')
+        with mcp_tool._lock:
+            saved_cache = dict(mcp_tool._gitnexus_list_repos_cache)
+            mcp_tool._gitnexus_list_repos_cache.clear()
+            mcp_tool._gitnexus_list_repos_cache[key] = (time.monotonic(), "stale")
+            mcp_tool._gitnexus_list_repos_cache[("other", "{}")] = (
+                time.monotonic(), "other"
+            )
+        try:
+            mcp_tool._clear_gitnexus_list_repos_cache("gitnexus")
+            with mcp_tool._lock:
+                assert key not in mcp_tool._gitnexus_list_repos_cache
+                assert ("other", "{}") in mcp_tool._gitnexus_list_repos_cache
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._gitnexus_list_repos_cache.clear()
+                mcp_tool._gitnexus_list_repos_cache.update(saved_cache)
 
     def test_successful_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers

@@ -41,6 +41,8 @@ PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 STORAGE_DIR = "/tmp/hermes-results"
 HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
+_GITNEXUS_TOOL_PREFIX = "mcp__gitnexus__"
+GITNEXUS_RESULT_SIZE_CHARS = 20_000
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
 
@@ -59,6 +61,22 @@ def _resolve_storage_dir(env) -> str:
                     temp_dir = temp_dir.rstrip("/") or "/"
                     return f"{temp_dir}/hermes-results"
     return STORAGE_DIR
+
+
+def _resolve_result_threshold(
+    tool_name: str,
+    config: BudgetConfig,
+    explicit_threshold: int | float | None,
+) -> int | float:
+    """Resolve a result budget, applying the GitNexus safety ceiling."""
+    threshold = (
+        explicit_threshold
+        if explicit_threshold is not None
+        else config.resolve_threshold(tool_name)
+    )
+    if str(tool_name or "").lower().startswith(_GITNEXUS_TOOL_PREFIX):
+        return min(threshold, GITNEXUS_RESULT_SIZE_CHARS)
+    return threshold
 
 
 def _safe_result_filename(tool_use_id: str) -> str:
@@ -166,7 +184,11 @@ def maybe_persist_tool_result(
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
-    effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
+    effective_threshold = _resolve_result_threshold(
+        tool_name,
+        config,
+        threshold,
+    )
 
     if effective_threshold == float("inf"):
         return content
