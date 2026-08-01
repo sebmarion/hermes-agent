@@ -598,6 +598,64 @@ def test_dispatch_falls_back_for_large_non_string_json_and_is_idempotent():
     assert second is first
 
 
+def test_dispatch_falls_back_when_valid_json_decodes_to_nonfinite_values():
+    compressor = _compressor(protect_last_n=2, tail_token_budget=1)
+    huge_number = "1e" + ("9" * 600)
+    arguments = [
+        huge_number,
+        f"[{huge_number}]",
+        f'{{"value":{huge_number}}}',
+    ]
+    call_ids = [
+        "call-nonfinite-scalar",
+        "call-nonfinite-list",
+        "call-nonfinite-object",
+    ]
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "batch", "arguments": argument},
+                }
+                for call_id, argument in zip(call_ids, arguments)
+            ],
+        },
+        *[
+            {"role": "tool", "tool_call_id": call_id, "content": "ok"}
+            for call_id in call_ids
+        ],
+        {"role": "user", "content": "latest"},
+        {"role": "assistant", "content": "reply"},
+    ]
+
+    first, first_count = compressor.prune_tool_results_for_dispatch(messages)
+    second, second_count = compressor.prune_tool_results_for_dispatch(first)
+
+    assert first_count == 3
+    receipts = [
+        tool_call["function"]["arguments"]
+        for tool_call in first[0]["tool_calls"]
+    ]
+
+    def reject_nonfinite(token):
+        raise ValueError(f"non-standard JSON constant: {token}")
+
+    for original, receipt in zip(arguments, receipts):
+        assert len(receipt) < len(original)
+        assert len(receipt) <= 500
+        parsed = json.loads(receipt, parse_constant=reject_nonfinite)
+        assert parsed["_hermes_truncated"] is True
+        assert parsed["original_chars"] == len(original)
+    assert [call["id"] for call in first[0]["tool_calls"]] == call_ids
+    assert [first[i]["tool_call_id"] for i in (1, 2, 3)] == call_ids
+    assert second_count == 0
+    assert second is first
+
+
 def test_tool_result_summary_accepts_valid_non_object_arguments():
     from agent.context_compressor import _summarize_tool_result
 

@@ -889,15 +889,26 @@ def _truncate_tool_call_args_json(
     # Compact separators avoid growing already-minified arguments. The
     # structural form is useful only when it actually fits the bounded replay
     # slot; otherwise a many-item non-string container would remain enormous.
-    def _serialize_with_retained_chars(retained_chars: int) -> str:
-        return json.dumps(
-            _shrink(parsed, retained_chars),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+    def _serialize_with_retained_chars(retained_chars: int) -> Optional[str]:
+        try:
+            return json.dumps(
+                _shrink(parsed, retained_chars),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except ValueError:
+            # Python accepts overflowing JSON numbers as infinities, but
+            # downstream providers require strict JSON and reject the
+            # ``Infinity`` token that json.dumps emits by default.
+            return None
 
     candidate = _serialize_with_retained_chars(head_chars)
-    if len(candidate) <= max_chars and len(candidate) < len(args):
+    if (
+        candidate is not None
+        and len(candidate) <= max_chars
+        and len(candidate) < len(args)
+    ):
         return candidate
 
     # Preserve the original JSON shape when possible. Find the largest common
@@ -911,7 +922,7 @@ def _truncate_tool_call_args_json(
         while low <= high:
             retained_chars = (low + high) // 2
             trial = _serialize_with_retained_chars(retained_chars)
-            if len(trial) <= max_chars:
+            if trial is not None and len(trial) <= max_chars:
                 bounded_candidate = trial
                 low = retained_chars + 1
             else:
@@ -943,13 +954,19 @@ def _truncate_tool_call_args_json(
             "original_chars": len(args),
             "value_type": type(parsed).__name__,
         }
-    fallback = json.dumps(receipt, ensure_ascii=False, separators=(",", ":"))
+    fallback = json.dumps(
+        receipt,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     while len(fallback) > max_chars and receipt.get("keys"):
         receipt["keys"].pop()
         fallback = json.dumps(
             receipt,
             ensure_ascii=False,
             separators=(",", ":"),
+            allow_nan=False,
         )
     return fallback if len(fallback) < len(args) else args
 
