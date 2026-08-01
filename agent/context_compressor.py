@@ -351,6 +351,7 @@ _SUMMARY_INPUT_MAX_CHARS = 160_000
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+_TOOL_RESULT_SUMMARY_MAX_CHARS = 200
 
 # Ghost-skill defense (#32106): when compaction reduces an old ``skill_view``
 # result to a 1-line metadata summary, the model still believes the skill is
@@ -2609,6 +2610,7 @@ class ContextCompressor(ContextEngine):
         # When the same file is read multiple times, keep only the most recent
         # full copy and replace older duplicates with a back-reference.
         content_hashes: dict = {}  # hash -> (index, tool_call_id)
+        newest_duplicate_indices: set[int] = set()
         for i in range(len(result) - 1, -1, -1):
             msg = result[i]
             if msg.get("role") != "tool":
@@ -2621,10 +2623,11 @@ class ContextCompressor(ContextEngine):
                 # Multimodal dict envelopes ({_multimodal: True, content: [...]}) and
                 # other non-string tool-result shapes can't be hashed/deduped by text.
                 continue
-            if len(content) < 200:
+            if len(content) <= _TOOL_RESULT_SUMMARY_MAX_CHARS:
                 continue
             h = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:12]
             if h in content_hashes:
+                newest_duplicate_indices.add(content_hashes[h][0])
                 # This is an older duplicate. The full-list scan deliberately
                 # sees protected messages so it can identify the true newest
                 # copy, but the protected tail is immutable: only replace a
@@ -2670,6 +2673,10 @@ class ContextCompressor(ContextEngine):
                 return False
             if content.startswith("[Duplicate tool output"):
                 return False
+            # Keep the newest member of a duplicate set as the authoritative
+            # full copy even when it sits outside the protected tail.
+            if idx in newest_duplicate_indices:
+                return False
             # Already replaced by a prior prune/pressure pass (1-line summary).
             if content.startswith("[") and " chars)" in content and len(content) < 400:
                 return False
@@ -2692,12 +2699,18 @@ class ContextCompressor(ContextEngine):
                 if isinstance(_skill, str) and _skill.lower() in protected_skills:
                     return False
             summary = _summarize_tool_result(tool_name, tool_args, content)
+            if len(summary) > _TOOL_RESULT_SUMMARY_MAX_CHARS:
+                summary = (
+                    summary[:_TOOL_RESULT_SUMMARY_MAX_CHARS - 3].rstrip()
+                    + "..."
+                )
             result[idx] = {**msg, "content": summary}
             pruned += 1
             return True
 
         def _truncate_tool_call_args_at(idx: int) -> bool:
             """Shrink large tool_call argument payloads at ``idx``."""
+            nonlocal pruned
             msg = result[idx]
             if msg.get("role") != "assistant" or not msg.get("tool_calls"):
                 return False
@@ -2711,6 +2724,7 @@ class ContextCompressor(ContextEngine):
                         if new_args != args:
                             tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
                             modified = True
+                            pruned += 1
                 new_tcs.append(tc)
             if modified:
                 result[idx] = {**msg, "tool_calls": new_tcs}
