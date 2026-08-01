@@ -12,6 +12,7 @@ exactly as before.
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -256,6 +257,155 @@ class TestInPlaceConfigDefault:
 
         assert DEFAULT_CONFIG["compression"].get("in_place") is True
 
+    @pytest.mark.parametrize(
+        ("compression_config", "expected"),
+        [({}, True), ({"in_place": False}, False)],
+    )
+    def test_agent_missing_config_defaults_on_but_explicit_false_opts_out(
+        self, compression_config, expected
+    ):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), patch(
+            "hermes_cli.config.load_config",
+            return_value={"compression": compression_config},
+        ):
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert agent.compression_in_place is expected
+
+
+class TestDispatchProjectionPersistence:
+    def test_changed_projection_is_atomically_archived_and_rebaselined(self):
+        from agent.conversation_compression import (
+            conversation_history_after_compression,
+            persist_in_place_projection,
+        )
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=db_path)
+            sid = "dispatch_projection_success"
+            _seed(db, sid, "projection", n=4)
+            agent = _make_agent(db, sid, in_place=True)
+            agent._last_compaction_in_place = False
+            agent._last_flushed_db_idx = 4
+            agent._flushed_db_message_ids = {1234}
+            previous = [
+                {"role": "user", "content": "msg 0"},
+                {"role": "assistant", "content": "msg 1"},
+                {"role": "user", "content": "msg 2"},
+                {"role": "assistant", "content": "msg 3"},
+            ]
+            compacted = [
+                {"role": "user", "content": "bounded summary"},
+                {"role": "assistant", "content": "recent reply"},
+            ]
+
+            with patch.object(
+                db, "archive_and_compact", wraps=db.archive_and_compact
+            ) as archive:
+                adopted, persisted = persist_in_place_projection(
+                    agent, previous, compacted
+                )
+
+            archive.assert_called_once_with(sid, compacted)
+            assert persisted is True
+            assert adopted is compacted
+            rows = db.get_messages(sid, include_inactive=True)
+            assert all(row["active"] == 0 and row["compacted"] == 1 for row in rows[:4])
+            assert all(row["active"] == 1 for row in rows[4:])
+            assert agent._last_compaction_in_place is True
+            assert agent._last_flushed_db_idx == 0
+            assert agent._flushed_db_message_ids == set()
+
+            # The re-baseline treats the inserted projection as history, so a
+            # normal append-only flush writes only the new tail message.
+            history = conversation_history_after_compression(agent, adopted)
+            assert history is not adopted
+            appended = adopted + [{"role": "user", "content": "new turn"}]
+            agent._flush_messages_to_session_db(appended, history)
+            assert [row["content"] for row in db.get_messages(sid)] == [
+                "bounded summary",
+                "recent reply",
+                "new turn",
+            ]
+
+            db.close()
+            restarted = SessionDB(db_path=db_path)
+            try:
+                assert [
+                    message["content"]
+                    for message in restarted.get_messages_as_conversation(sid)
+                ] == ["bounded summary", "recent reply", "new turn"]
+            finally:
+                restarted.close()
+
+    def test_db_failure_returns_exact_original_and_rolls_back_all_state(self):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_failure"
+            _seed(db, sid, "projection", n=4)
+            original = [
+                {"role": "user", "content": "msg 0"},
+                {"role": "assistant", "content": "msg 1"},
+                {"role": "user", "content": "msg 2"},
+                {"role": "assistant", "content": "msg 3"},
+            ]
+            compacted = [{"role": "user", "content": "must not be adopted"}]
+            flushed_ids = {17, 23}
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=4,
+                _flushed_db_message_ids=flushed_ids,
+            )
+
+            # Fail after archive_and_compact has issued its active=0 UPDATE.
+            # SessionDB's transaction must roll that UPDATE back as well as
+            # preventing any partial projection INSERT.
+            with patch.object(
+                db, "_insert_message_rows", side_effect=RuntimeError("insert failed")
+            ):
+                adopted, persisted = persist_in_place_projection(
+                    agent, original, compacted
+                )
+
+            assert persisted is False
+            assert adopted is original
+            assert agent._last_compaction_in_place is False
+            assert agent._last_flushed_db_idx == 4
+            assert agent._flushed_db_message_ids is flushed_ids
+            rows = db.get_messages(sid, include_inactive=True)
+            assert [row["content"] for row in rows] == [f"msg {i}" for i in range(4)]
+            assert all(row["active"] == 1 and row["compacted"] == 0 for row in rows)
+            assert db.get_session(sid)["message_count"] == 4
+
+    def test_without_durable_session_adopts_memory_projection_but_reports_not_persisted(self):
+        from agent.conversation_compression import persist_in_place_projection
+
+        agent = SimpleNamespace(_session_db=None, session_id=None)
+        original = [{"role": "user", "content": "old"}]
+        compacted = [{"role": "user", "content": "bounded"}]
+
+        adopted, persisted = persist_in_place_projection(agent, original, compacted)
+
+        assert adopted is compacted
+        assert persisted is False
+        assert not hasattr(agent, "_last_compaction_in_place")
+
 
 class TestCompactedTurnsStaySearchable:
     """Teknium's review hinges on the pre-compaction transcript staying
@@ -317,4 +467,3 @@ class TestCompactedTurnsStaySearchable:
                 "ZEBRAWORD", role_filter=["user", "assistant"], include_inactive=True
             )
             assert len(recovered) == 1
-

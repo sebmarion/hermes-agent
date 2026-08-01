@@ -391,6 +391,46 @@ def conversation_history_after_compression(agent: Any, messages: list) -> Option
     return None
 
 
+def persist_in_place_projection(
+    agent: Any,
+    previous_messages: list,
+    compacted_messages: list,
+) -> tuple[list, bool]:
+    """Atomically adopt a changed dispatch projection under the same session.
+
+    Returns ``(messages, persisted)``. A durable session adopts the compacted
+    projection only after ``archive_and_compact()`` succeeds; a write failure
+    returns the exact original list and leaves all persistence cursors and
+    compaction flags untouched. Agents without a durable DB/session may still
+    use the in-memory projection, reported explicitly as ``persisted=False``.
+    """
+    if compacted_messages is previous_messages or compacted_messages == previous_messages:
+        return previous_messages, False
+
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    durable_session = (
+        session_db is not None
+        and bool(session_id)
+        and not bool(getattr(agent, "_persist_disabled", False))
+    )
+    if not durable_session:
+        return compacted_messages, False
+
+    try:
+        session_db.archive_and_compact(session_id, compacted_messages)
+    except Exception:
+        return previous_messages, False
+
+    # Match the successful in-place compression baseline: the projection is
+    # already durable, and conversation_history_after_compression() will expose
+    # a shallow identity baseline so append-only flushing writes only new rows.
+    agent._flushed_db_message_ids = set()
+    agent._last_flushed_db_idx = 0
+    agent._last_compaction_in_place = True
+    return compacted_messages, True
+
+
 def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) -> None:
     """Preserve a real user turn when a compressor returns assistant/tool-only context.
 
