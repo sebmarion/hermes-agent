@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
+from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
 
 logger = logging.getLogger(__name__)
@@ -5042,6 +5043,18 @@ def providers_dict_to_custom_providers(providers_dict: Any) -> List[Dict[str, An
     return custom_providers
 
 
+def is_provider_enabled(entry: dict) -> bool:
+    """Check if a provider entry is enabled.
+
+    Providers with ``enabled: false`` in config.yaml are skipped during
+    resolution so they remain available for re-enabling without editing the
+    config.
+    """
+    if not isinstance(entry, dict):
+        return True
+    return bool(entry.get("enabled", True))
+
+
 def get_compatible_custom_providers(
     config: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
@@ -5240,9 +5253,9 @@ def get_custom_provider_context_length(
 ) -> Optional[int]:
     """Look up a per-model ``context_length`` override from ``custom_providers``.
 
-    Matches any entry whose ``base_url`` equals ``base_url`` (trailing-slash
-    insensitive) and returns ``custom_providers[i].models.<model>.context_length``
-    if present and valid.  Returns ``None`` when no override applies.
+    Matches any entry whose normalized route identity equals ``base_url`` and
+    returns ``custom_providers[i].models.<model>.context_length`` if present and
+    valid.  Returns ``None`` when no override applies.
 
     This is the single source of truth for custom-provider context overrides,
     used by:
@@ -5269,14 +5282,14 @@ def get_custom_provider_context_length(
     if not isinstance(custom_providers, list):
         return None
 
-    target_url = (base_url or "").rstrip("/")
+    target_url = normalize_route_base_url(base_url)
     if not target_url:
         return None
 
     for entry in custom_providers:
         if not isinstance(entry, dict):
             continue
-        entry_url = (entry.get("base_url") or "").rstrip("/")
+        entry_url = normalize_route_base_url(entry.get("base_url"))
         if not entry_url or entry_url != target_url:
             continue
         models = entry.get("models")

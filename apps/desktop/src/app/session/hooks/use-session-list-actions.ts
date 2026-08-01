@@ -24,9 +24,9 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
 import { sameCronSignature } from '../../../lib/session-signatures'
-import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
 // The recents list is local-only: cron rows have their own section, and each
 // messaging platform (telegram, discord, …) is fetched separately into its own

@@ -27,6 +27,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from hermes_cli.config import cfg_get
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
@@ -3305,7 +3306,7 @@ def _run_conversation(
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(reason=classified.reason):
-                            cooldown = agent.config.get('agent.fallback_cooldown_seconds', 10)
+                            cooldown = cfg_get(agent._config, 'agent', 'fallback_cooldown_seconds', default=10)
                             time.sleep(cooldown)
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)

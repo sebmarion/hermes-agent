@@ -7,7 +7,6 @@ import { BootFailureOverlay } from '@/components/boot-failure-overlay'
 import { DesktopInstallOverlay } from '@/components/desktop-install-overlay'
 import { GatewayConnectingOverlay } from '@/components/gateway-connecting-overlay'
 import { DesktopOnboardingOverlay } from '@/components/onboarding'
-import { Pane, PaneMain } from './shell/app-shell'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { isFocusWithin } from '@/lib/keybinds/combo'
@@ -48,7 +47,6 @@ import { $previewTarget, closeActiveRightRailTab } from '../store/preview'
 import { $activeGatewayProfile, $freshSessionRequest, $profileScope, refreshActiveProfile } from '../store/profile'
 import { $startWorkSessionRequest, followActiveSessionCwd } from '../store/projects'
 import { $reviewOpen, REVIEW_PANE_ID } from '../store/review'
-import { $attentionSessionIds } from '../store/session-states'
 import {
   $activeSessionId,
   $currentCwd,
@@ -69,6 +67,7 @@ import {
   setMessages,
   setRememberedSessionId
 } from '../store/session'
+import { $attentionSessionIds } from '../store/session-states'
 import { onSessionsChanged } from '../store/session-sync'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '../store/todos'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '../store/updates'
@@ -115,6 +114,7 @@ import { useSessionListActions } from './session/hooks/use-session-list-actions'
 import { useSessionRevisionPoll } from './session/hooks/use-session-revision-poll'
 import { useSessionStateCache } from './session/hooks/use-session-state-cache'
 import { startWorkspaceSession } from './session/workspace-session-target'
+import { Pane, PaneMain } from './shell/app-shell'
 import { AppShell } from './shell/app-shell'
 import { useOverlayRouting } from './shell/hooks/use-overlay-routing'
 import { useStatusSnapshot } from './shell/hooks/use-status-snapshot'
@@ -279,6 +279,7 @@ export function DesktopController() {
   // haven't navigated yet). A dead/deleted id self-clears via the exhausted latch
   // below, so we never boot-loop into an error screen.
   const restoredLastSessionRef = useRef(false)
+  // eslint-disable-next-line no-restricted-syntax -- mount latch, not a reactive-value mirror
   useEffect(() => {
     if (restoredLastSessionRef.current) {
       return
@@ -642,6 +643,7 @@ export function DesktopController() {
   const freshSessionRequest = useStore($freshSessionRequest)
   const lastFreshRef = useRef(freshSessionRequest)
 
+  // eslint-disable-next-line no-restricted-syntax -- previous request token prevents duplicate handling
   useEffect(() => {
     if (freshSessionRequest === lastFreshRef.current) {
       return
@@ -660,6 +662,7 @@ export function DesktopController() {
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const lastGatewayProfileRef = useRef(activeGatewayProfile)
 
+  // eslint-disable-next-line no-restricted-syntax -- previous profile token detects a live profile swap
   useEffect(() => {
     if (activeGatewayProfile === lastGatewayProfileRef.current) {
       return
@@ -757,6 +760,7 @@ export function DesktopController() {
   const startWorkSessionRequest = useStore($startWorkSessionRequest)
   const lastStartWorkTokenRef = useRef(startWorkSessionRequest?.token ?? 0)
 
+  // eslint-disable-next-line no-restricted-syntax -- previous request token prevents duplicate handling
   useEffect(() => {
     if (!startWorkSessionRequest || startWorkSessionRequest.token === lastStartWorkTokenRef.current) {
       return
