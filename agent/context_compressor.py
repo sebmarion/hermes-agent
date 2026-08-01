@@ -2625,9 +2625,13 @@ class ContextCompressor(ContextEngine):
                 continue
             h = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:12]
             if h in content_hashes:
-                # This is an older duplicate — replace with back-reference
-                result[i] = {**msg, "content": "[Duplicate tool output — same content as a more recent call]"}
-                pruned += 1
+                # This is an older duplicate. The full-list scan deliberately
+                # sees protected messages so it can identify the true newest
+                # copy, but the protected tail is immutable: only replace a
+                # duplicate when this message is before the prune boundary.
+                if i < prune_boundary:
+                    result[i] = {**msg, "content": "[Duplicate tool output — same content as a more recent call]"}
+                    pruned += 1
             else:
                 content_hashes[h] = (i, msg.get("tool_call_id", "?"))
 
@@ -2872,6 +2876,24 @@ class ContextCompressor(ContextEngine):
             if (before - after) < self.proactive_prune_min_reclaim_tokens:
                 return messages, 0
         return pruned_msgs, pruned_count
+
+    def prune_tool_results_for_dispatch(
+        self, messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Build a bounded tool-history projection without calling an LLM.
+
+        Uses the compressor's existing 200-character pruning floor and its
+        configured message-count/token-budget tail protections. The input list
+        is returned unchanged when the projection needs no mutations.
+        """
+        pruned_messages, pruned_count = self._prune_old_tool_results(
+            messages,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=self.tail_token_budget,
+        )
+        if pruned_count == 0:
+            return messages, 0
+        return pruned_messages, pruned_count
 
     # ------------------------------------------------------------------
     # Summarization
