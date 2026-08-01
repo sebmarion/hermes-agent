@@ -51,21 +51,12 @@ export function useVoiceConversation({
   const statusRef = useRef<ConversationStatus>('idle')
   const wasEnabledRef = useRef(enabled)
 
-  useEffect(() => {
-    enabledRef.current = enabled
-  }, [enabled])
-
-  useEffect(() => {
-    mutedRef.current = muted
-  }, [muted])
-
-  useEffect(() => {
-    busyRef.current = busy
-  }, [busy])
-
-  useEffect(() => {
-    statusRef.current = status
-  }, [status])
+  // Keep callback reads current during render; syncing these reactive inputs in
+  // an effect would leave the refs one render behind.
+  enabledRef.current = enabled
+  mutedRef.current = muted
+  busyRef.current = busy
+  statusRef.current = status
 
   const clearTurnTimeout = () => {
     if (turnTimeoutRef.current) {
@@ -339,6 +330,7 @@ export function useVoiceConversation({
 
   // Drive the loop: after a voice-submitted turn, speak stable chunks as the
   // assistant stream grows. Otherwise start listening when idle between turns.
+  // eslint-disable-next-line no-restricted-syntax -- voice state-machine refs are mutated here, not mirrored reactive values
   useEffect(() => {
     if (!enabled || muted) {
       return
@@ -396,6 +388,7 @@ export function useVoiceConversation({
     }
   }, [busy, consumePendingResponse, enabled, muted, pendingResponse, speak, startListening, status])
 
+  // eslint-disable-next-line no-restricted-syntax -- previous enabled state is a transition latch
   useEffect(() => {
     if (enabled && !wasEnabledRef.current) {
       void start()

@@ -323,12 +323,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // prompt, and vice versa.
         clearAllPrompts(sessionId)
         clearClarifyRequest(undefined, sessionId)
+
         // Turn ended without a final `todo` update — drop a still-unfinished
         // list so "Tasks N/M" doesn't stay pinned above the composer with the
         // last item stuck pending/in_progress. Finished lists keep their linger.
         if (!autoContinuing) {
           clearActiveSessionTodos(sessionId)
         }
+
         setSessionCompacting(sessionId, false)
 
         flushQueuedDeltas(sessionId)

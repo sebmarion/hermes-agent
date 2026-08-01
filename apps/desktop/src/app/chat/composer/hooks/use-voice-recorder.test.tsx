@@ -9,6 +9,7 @@ const notifyError = vi.hoisted(() => vi.fn())
 
 const mic = vi.hoisted(() => {
   type RecorderError = (error: Error) => void
+
   const state: {
     cancel: ReturnType<typeof vi.fn>
     onError: RecorderError | null
@@ -146,6 +147,7 @@ describe('useVoiceRecorder', () => {
   it('uses voiceStatus as a fallback stop signal when recorder state desynchronizes', async () => {
     const focusInput = vi.fn()
     let api: RecorderApi | null = null
+
     const { rerender } = render(
       <Harness
         focusInput={focusInput}

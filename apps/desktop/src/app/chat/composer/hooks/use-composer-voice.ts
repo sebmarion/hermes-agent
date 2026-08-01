@@ -113,6 +113,7 @@ export function useComposerVoice({
     triggerHaptic('submit')
     resetBrowseState(sessionId)
     clearDraft()
+
     return onSubmit(text)
   }
 

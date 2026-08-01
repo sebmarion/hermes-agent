@@ -1,5 +1,5 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // renders ClarifyToolPending instead of falling back to ToolFallback.
 vi.mock('@assistant-ui/react', async () => {
   const actual = await vi.importActual('@assistant-ui/react')
+
   return {
     ...actual,
     useAuiState: vi.fn((selector?: (s: unknown) => unknown) =>
@@ -16,10 +17,10 @@ vi.mock('@assistant-ui/react', async () => {
 })
 
 import { I18nProvider } from '@/i18n'
+import { $clarifyRequest, $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import { $activeSessionId } from '@/store/session'
-import { $clarifyRequest, $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
 
 import { ClarifyTool, readClarifyResult } from './clarify-tool'
 

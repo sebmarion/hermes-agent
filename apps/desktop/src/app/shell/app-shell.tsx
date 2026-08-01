@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, type ReactNode } from 'react'
+import { createContext, type ReactNode, useContext, useState } from 'react'
 
 /** ... */
 const GroupContext = createContext<GroupContextShape>({ kind: 'grid' })
@@ -63,6 +63,7 @@ interface GroupHandle<T> {
 
 export function useGroupRegistry<T>(): GroupHandle<T> {
   const [group] = useState<T[]>([])
+
   return {
     flat: { left: group, right: group },
     set: () => {},

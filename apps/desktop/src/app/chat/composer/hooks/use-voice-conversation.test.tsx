@@ -11,6 +11,7 @@ const stopVoicePlayback = vi.hoisted(() => vi.fn())
 
 const mic = vi.hoisted(() => {
   type StartOptions = { onSilence?: () => void }
+
   const state: {
     cancel: ReturnType<typeof vi.fn>
     onSilence: (() => void) | null
@@ -118,6 +119,7 @@ describe('useVoiceConversation', () => {
   it('does not speak a stale assistant response when voice submit is rejected', async () => {
     const onSubmit = vi.fn(async () => false)
     let api: ConversationApi | null = null
+
     const { rerender } = render(
       <Harness
         enabled={false}

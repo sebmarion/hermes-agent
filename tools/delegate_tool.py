@@ -4447,7 +4447,7 @@ def _dispatch_bestplan_tasks_async_impl(
                     )
                 except subprocess.TimeoutExpired:
                     try:
-                        os.killpg(process.pid, 9)
+                        os.killpg(process.pid, 9)  # windows-footgun: ok — start_new_session above is POSIX-only
                     except OSError:
                         process.kill()
                     stdout, stderr = process.communicate()

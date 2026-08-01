@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import psutil
 import re
 import sqlite3
 import stat
@@ -615,9 +616,8 @@ class BestplanStore:
                         owner_pid = int(record.get("owner_pid"))
                         if owner_pid <= 0:
                             raise ValueError("invalid owner pid")
-                        os.kill(owner_pid, 0)
-                        owner_live = True
-                    except (ProcessLookupError, TypeError, ValueError):
+                        owner_live = psutil.pid_exists(owner_pid)
+                    except (TypeError, ValueError):
                         owner_live = False
                     except PermissionError:
                         owner_live = True
@@ -940,10 +940,7 @@ class BestplanStore:
                     continue
                 try:
                     pid = int(owner.split(":", 1)[1])
-                    os.kill(pid, 0)
-                    live = True
-                except ProcessLookupError:
-                    live = False
+                    live = psutil.pid_exists(pid)
                 except (PermissionError, ValueError):
                     live = True
                 if live:
