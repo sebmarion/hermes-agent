@@ -1027,6 +1027,13 @@ def _str_arg(args: dict, key: str, default: str = "") -> str:
     return str(val) if val is not None else default
 
 
+def _bound_tool_result_receipt(receipt: str) -> str:
+    """Keep generated receipts at or below the tool-result pruning floor."""
+    if len(receipt) <= _TOOL_RESULT_SUMMARY_MAX_CHARS:
+        return receipt
+    return receipt[:_TOOL_RESULT_SUMMARY_MAX_CHARS - 3].rstrip() + "..."
+
+
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
     """Create an informative 1-line summary of a tool call + result.
 
@@ -2664,7 +2671,8 @@ class ContextCompressor(ContextEngine):
                 return False
             if isinstance(content, dict) and content.get("_multimodal"):
                 summary = content.get("text_summary") or "[screenshot removed to save context]"
-                result[idx] = {**msg, "content": f"[screenshot removed] {summary[:200]}"}
+                receipt = _bound_tool_result_receipt(f"[screenshot removed] {summary}")
+                result[idx] = {**msg, "content": receipt}
                 pruned += 1
                 return True
             if not isinstance(content, str):
@@ -2698,12 +2706,9 @@ class ContextCompressor(ContextEngine):
                 _skill = _args.get("name", "") if isinstance(_args, dict) else ""
                 if isinstance(_skill, str) and _skill.lower() in protected_skills:
                     return False
-            summary = _summarize_tool_result(tool_name, tool_args, content)
-            if len(summary) > _TOOL_RESULT_SUMMARY_MAX_CHARS:
-                summary = (
-                    summary[:_TOOL_RESULT_SUMMARY_MAX_CHARS - 3].rstrip()
-                    + "..."
-                )
+            summary = _bound_tool_result_receipt(
+                _summarize_tool_result(tool_name, tool_args, content)
+            )
             result[idx] = {**msg, "content": summary}
             pruned += 1
             return True
