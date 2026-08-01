@@ -259,6 +259,45 @@ def test_dispatch_preserves_multimodal_pruning_and_is_idempotent():
     assert second is first
 
 
+def test_dispatch_bounds_multimodal_envelope_receipt_across_two_passes():
+    compressor = _compressor(protect_last_n=2, tail_token_budget=1)
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call-old-envelope",
+                "type": "function",
+                "function": {"name": "computer_use", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-old-envelope",
+            "content": {
+                "_multimodal": True,
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,OLD"},
+                }],
+                "text_summary": "s" * 200,
+            },
+        },
+        {"role": "user", "content": "latest"},
+        {"role": "assistant", "content": "reply"},
+    ]
+
+    first, first_count = compressor.prune_tool_results_for_dispatch(messages)
+    second, second_count = compressor.prune_tool_results_for_dispatch(first)
+
+    assert first_count == 1
+    assert first[1]["content"].startswith("[screenshot removed] ")
+    assert len(first[1]["content"]) == 200
+    assert first[1]["content"].endswith("...")
+    assert second_count == 0
+    assert second is first
+
+
 def test_dispatch_noop_returns_input_list_and_keeps_200_char_floor():
     compressor = _compressor(protect_last_n=2, tail_token_budget=1)
     messages = [

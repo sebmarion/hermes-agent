@@ -587,6 +587,13 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
     return result if changed else messages
 
 
+def _bound_tool_result_receipt(receipt: str) -> str:
+    """Keep generated receipts at or below the tool-result pruning floor."""
+    if len(receipt) <= _TOOL_RESULT_SUMMARY_MAX_CHARS:
+        return receipt
+    return receipt[:_TOOL_RESULT_SUMMARY_MAX_CHARS - 3].rstrip() + "..."
+
+
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
     """Create an informative 1-line summary of a tool call + result.
 
@@ -1444,7 +1451,8 @@ class ContextCompressor(ContextEngine):
                 continue
             if isinstance(content, dict) and content.get("_multimodal"):
                 summary = content.get("text_summary") or "[screenshot removed to save context]"
-                result[i] = {**msg, "content": f"[screenshot removed] {summary[:200]}"}
+                receipt = _bound_tool_result_receipt(f"[screenshot removed] {summary}")
+                result[i] = {**msg, "content": receipt}
                 pruned += 1
                 continue
             if not isinstance(content, str):
@@ -1462,12 +1470,9 @@ class ContextCompressor(ContextEngine):
             if len(content) > _TOOL_RESULT_SUMMARY_MAX_CHARS:
                 call_id = msg.get("tool_call_id", "")
                 tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
-                summary = _summarize_tool_result(tool_name, tool_args, content)
-                if len(summary) > _TOOL_RESULT_SUMMARY_MAX_CHARS:
-                    summary = (
-                        summary[:_TOOL_RESULT_SUMMARY_MAX_CHARS - 3].rstrip()
-                        + "..."
-                    )
+                summary = _bound_tool_result_receipt(
+                    _summarize_tool_result(tool_name, tool_args, content)
+                )
                 result[i] = {**msg, "content": summary}
                 pruned += 1
 
