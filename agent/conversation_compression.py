@@ -28,7 +28,6 @@ these paths see no behavioural change.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import tempfile
@@ -392,59 +391,6 @@ def conversation_history_after_compression(agent: Any, messages: list) -> Option
     return None
 
 
-def _durable_projection_message(message: Any) -> Optional[dict]:
-    """Return the provider-replay fields persisted for stale-snapshot checks."""
-    if not isinstance(message, dict):
-        return None
-
-    view = {
-        "role": message.get("role", "unknown"),
-        "content": message.get("content"),
-    }
-    for key in (
-        "tool_call_id",
-        "tool_name",
-        "effect_disposition",
-        "finish_reason",
-        "reasoning",
-    ):
-        value = message.get(key)
-        if value:
-            view[key] = value
-
-    tool_calls = message.get("tool_calls")
-    if tool_calls:
-        view["tool_calls"] = tool_calls
-
-    reasoning_content = message.get("reasoning_content")
-    if reasoning_content is not None:
-        view["reasoning_content"] = reasoning_content
-
-    for key in (
-        "reasoning_details",
-        "codex_reasoning_items",
-        "codex_message_items",
-    ):
-        value = message.get(key)
-        if not value:
-            continue
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        view[key] = value
-
-    platform_message_id = (
-        message.get("platform_message_id") or message.get("message_id")
-    )
-    if platform_message_id:
-        view["message_id"] = platform_message_id
-    if message.get("observed"):
-        view["observed"] = True
-    return view
-
-
 def persist_in_place_projection(
     agent: Any,
     previous_messages: list,
@@ -498,10 +444,19 @@ def persist_in_place_projection(
         if len(active_rows) > len(previous_messages):
             return previous_messages, False
         durable_projection = [
-            _durable_projection_message(row) for row in active_rows
+            session_db._canonical_persisted_replay_message(
+                row,
+                include_timestamp=False,
+                normalize_for_persistence=True,
+            )
+            for row in active_rows
         ]
         previous_prefix = [
-            _durable_projection_message(message)
+            session_db._canonical_persisted_replay_message(
+                message,
+                include_timestamp=False,
+                normalize_for_persistence=True,
+            )
             for message in previous_messages[:len(active_rows)]
         ]
         if durable_projection != previous_prefix:

@@ -354,6 +354,86 @@ class TestDispatchProjectionPersistence:
             finally:
                 restarted.close()
 
+    def test_restored_whitespace_normalization_still_matches_durable_prefix(self):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_restored_whitespace"
+            db.create_session(sid, "cli", model="test/model")
+            agent = _make_agent(db, sid, in_place=True)
+            live_messages = [
+                {"role": "user", "content": "  ordinary resumed prompt  \n"},
+                {"role": "assistant", "content": "\nordinary response\n"},
+            ]
+            agent._flush_messages_to_session_db(live_messages)
+            assert [row["content"] for row in db.get_messages(sid)] == [
+                "  ordinary resumed prompt  \n",
+                "\nordinary response\n",
+            ]
+            previous = db.get_messages_as_conversation(sid)
+            assert [message["content"] for message in previous] == [
+                "ordinary resumed prompt",
+                "ordinary response",
+            ]
+            compacted = [{"role": "user", "content": "bounded summary"}]
+
+            adopted, persisted = persist_in_place_projection(
+                agent,
+                previous,
+                compacted,
+            )
+
+            assert adopted is compacted
+            assert persisted is True
+            assert [
+                message["content"]
+                for message in db.get_messages_as_conversation(sid)
+            ] == ["bounded summary"]
+
+    def test_live_multimodal_normalization_still_matches_durable_prefix(self):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_live_multimodal"
+            db.create_session(sid, "cli", model="test/model")
+            agent = _make_agent(db, sid, in_place=True)
+            previous = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "inspect this"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,abc"},
+                        },
+                    ],
+                },
+                {"role": "assistant", "content": "ordinary response"},
+            ]
+            agent._flush_messages_to_session_db(previous)
+            assert [row["content"] for row in db.get_messages(sid)] == [
+                "inspect this\n[screenshot]",
+                "ordinary response",
+            ]
+            compacted = [{"role": "user", "content": "bounded visual summary"}]
+
+            adopted, persisted = persist_in_place_projection(
+                agent,
+                previous,
+                compacted,
+            )
+
+            assert adopted is compacted
+            assert persisted is True
+            assert [
+                message["content"]
+                for message in db.get_messages_as_conversation(sid)
+            ] == ["bounded visual summary"]
+
     def test_db_failure_returns_exact_original_and_rolls_back_all_state(self):
         from agent.conversation_compression import persist_in_place_projection
         from hermes_state import SessionDB

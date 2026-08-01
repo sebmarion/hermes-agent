@@ -656,6 +656,71 @@ def test_dispatch_falls_back_when_valid_json_decodes_to_nonfinite_values():
     assert second is first
 
 
+def test_dispatch_falls_back_for_huge_json_integers_but_not_malformed_json():
+    compressor = _compressor(protect_last_n=2, tail_token_budget=1)
+    huge_integer = "9" * 5_000
+    arguments = [
+        huge_integer,
+        f"[{huge_integer}]",
+        f'{{"value":{huge_integer}}}',
+        huge_integer + "x",
+    ]
+    call_ids = [
+        "call-huge-integer-scalar",
+        "call-huge-integer-list",
+        "call-huge-integer-object",
+        "call-malformed-integer",
+    ]
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "batch", "arguments": argument},
+                }
+                for call_id, argument in zip(call_ids, arguments)
+            ],
+        },
+        *[
+            {"role": "tool", "tool_call_id": call_id, "content": "ok"}
+            for call_id in call_ids
+        ],
+        {"role": "user", "content": "latest"},
+        {"role": "assistant", "content": "reply"},
+    ]
+
+    first, first_count = compressor.prune_tool_results_for_dispatch(messages)
+    second, second_count = compressor.prune_tool_results_for_dispatch(first)
+
+    assert first_count == 3
+    receipts = [
+        tool_call["function"]["arguments"]
+        for tool_call in first[0]["tool_calls"]
+    ]
+
+    def reject_nonfinite(token):
+        raise ValueError(f"non-standard JSON constant: {token}")
+
+    for original, receipt in zip(arguments[:3], receipts[:3]):
+        assert len(receipt) < len(original)
+        assert len(receipt) <= 500
+        parsed = json.loads(
+            receipt,
+            parse_int=str,
+            parse_constant=reject_nonfinite,
+        )
+        assert parsed["_hermes_truncated"] is True
+        assert parsed["original_chars"] == str(len(original))
+    assert receipts[3] == arguments[3]
+    assert [call["id"] for call in first[0]["tool_calls"]] == call_ids
+    assert [first[i]["tool_call_id"] for i in (1, 2, 3, 4)] == call_ids
+    assert second_count == 0
+    assert second is first
+
+
 def test_tool_result_summary_accepts_valid_non_object_arguments():
     from agent.context_compressor import _summarize_tool_result
 
