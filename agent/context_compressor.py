@@ -200,6 +200,7 @@ _SUMMARY_TOKENS_CEILING = 10_000
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+_TOOL_RESULT_SUMMARY_MAX_CHARS = 200
 
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
@@ -1397,6 +1398,7 @@ class ContextCompressor(ContextEngine):
         # When the same file is read multiple times, keep only the most recent
         # full copy and replace older duplicates with a back-reference.
         content_hashes: dict = {}  # hash -> (index, tool_call_id)
+        newest_duplicate_indices: set[int] = set()
         for i in range(len(result) - 1, -1, -1):
             msg = result[i]
             if msg.get("role") != "tool":
@@ -1409,10 +1411,11 @@ class ContextCompressor(ContextEngine):
                 # Multimodal dict envelopes ({_multimodal: True, content: [...]}) and
                 # other non-string tool-result shapes can't be hashed/deduped by text.
                 continue
-            if len(content) < 200:
+            if len(content) <= _TOOL_RESULT_SUMMARY_MAX_CHARS:
                 continue
             h = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:12]
             if h in content_hashes:
+                newest_duplicate_indices.add(content_hashes[h][0])
                 # This is an older duplicate. The full-list scan deliberately
                 # sees protected messages so it can identify the true newest
                 # copy, but the protected tail is immutable: only replace a
@@ -1451,11 +1454,20 @@ class ContextCompressor(ContextEngine):
             # Skip already-deduplicated or previously-summarized results
             if content.startswith("[Duplicate tool output"):
                 continue
+            # The newest member of a duplicate set remains the authoritative
+            # full copy even when it is outside the protected tail.
+            if i in newest_duplicate_indices:
+                continue
             # Only prune if the content is substantial (>200 chars)
-            if len(content) > 200:
+            if len(content) > _TOOL_RESULT_SUMMARY_MAX_CHARS:
                 call_id = msg.get("tool_call_id", "")
                 tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
                 summary = _summarize_tool_result(tool_name, tool_args, content)
+                if len(summary) > _TOOL_RESULT_SUMMARY_MAX_CHARS:
+                    summary = (
+                        summary[:_TOOL_RESULT_SUMMARY_MAX_CHARS - 3].rstrip()
+                        + "..."
+                    )
                 result[i] = {**msg, "content": summary}
                 pruned += 1
 
@@ -1481,10 +1493,10 @@ class ContextCompressor(ContextEngine):
                         if new_args != args:
                             tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
                             modified = True
+                            pruned += 1
                 new_tcs.append(tc)
             if modified:
                 result[i] = {**msg, "tool_calls": new_tcs}
-                pruned += 1
 
         return result, pruned
 
