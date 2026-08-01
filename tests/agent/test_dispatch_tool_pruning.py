@@ -478,3 +478,129 @@ def test_dispatch_prunes_raw_output_that_starts_with_tool_name_prefix():
     assert count == 1
     assert pruned[1]["content"] == "[read_file] read raw.txt from line 1 (534 chars)"
     assert messages[1]["content"] == raw_output
+
+
+def test_dispatch_prunes_first_over_budget_message_after_tail_floor():
+    compressor = _compressor(protect_last_n=20, tail_token_budget=1_000)
+    large_result = "x" * 10_000
+    recent_tail = [
+        {
+            "role": "user" if i % 2 == 0 else "assistant",
+            "content": f"recent {i}",
+        }
+        for i in range(20)
+    ]
+    messages = [
+        {"role": "user", "content": "start"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call-over-budget",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "big.txt"}),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-over-budget",
+            "content": large_result,
+        },
+        *recent_tail,
+    ]
+
+    pruned, count = compressor.prune_tool_results_for_dispatch(messages)
+
+    assert count == 1
+    assert pruned[2]["content"] == (
+        "[read_file] read big.txt from line 1 (10,000 chars)"
+    )
+    assert pruned[3:] == recent_tail
+    assert messages[2]["content"] == large_result
+
+
+def test_dispatch_falls_back_for_large_non_string_json_and_is_idempotent():
+    compressor = _compressor(protect_last_n=2, tail_token_budget=1)
+    arguments = [
+        json.dumps(list(range(10_000)), separators=(",", ":")),
+        json.dumps(
+            {
+                "enabled": True,
+                "matrix": [list(range(2_000)) for _ in range(6)],
+                "options": {"retries": list(range(1_000))},
+            },
+            separators=(",", ":"),
+        ),
+    ]
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-numeric-array",
+                    "type": "function",
+                    "function": {"name": "batch", "arguments": arguments[0]},
+                },
+                {
+                    "id": "call-nested-containers",
+                    "type": "function",
+                    "function": {"name": "batch", "arguments": arguments[1]},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-numeric-array", "content": "ok"},
+        {
+            "role": "tool",
+            "tool_call_id": "call-nested-containers",
+            "content": "ok",
+        },
+        {"role": "user", "content": "latest"},
+        {"role": "assistant", "content": "reply"},
+    ]
+
+    first, first_count = compressor.prune_tool_results_for_dispatch(messages)
+    second, second_count = compressor.prune_tool_results_for_dispatch(first)
+
+    assert first_count == 2
+    receipts = [
+        tool_call["function"]["arguments"]
+        for tool_call in first[0]["tool_calls"]
+    ]
+    for original, receipt in zip(arguments, receipts):
+        assert len(receipt) < len(original)
+        assert len(receipt) <= 500
+        parsed = json.loads(receipt)
+        assert parsed["_hermes_truncated"] is True
+        assert parsed["original_chars"] == len(original)
+    assert json.loads(receipts[0]) == {
+        "_hermes_truncated": True,
+        "original_chars": len(arguments[0]),
+        "value_type": "list",
+        "item_count": 10_000,
+    }
+    nested_receipt = json.loads(receipts[1])
+    assert nested_receipt["value_type"] == "object"
+    assert nested_receipt["key_count"] == 3
+    assert nested_receipt["keys"] == ["enabled", "matrix", "options"]
+    assert [call["id"] for call in first[0]["tool_calls"]] == [
+        "call-numeric-array",
+        "call-nested-containers",
+    ]
+    assert [first[i]["tool_call_id"] for i in (1, 2)] == [
+        "call-numeric-array",
+        "call-nested-containers",
+    ]
+    assert second_count == 0
+    assert second is first
+
+
+def test_tool_result_summary_accepts_valid_non_object_arguments():
+    from agent.context_compressor import _summarize_tool_result
+
+    for arguments in ("[]", "null", "42", json.dumps("scalar")):
+        receipt = _summarize_tool_result("read_file", arguments, "x" * 300)
+        assert receipt == "[read_file] read ? from line 1 (300 chars)"

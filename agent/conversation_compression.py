@@ -1013,6 +1013,59 @@ def conversation_history_after_compression(
     return None
 
 
+def _durable_projection_message(message: Any) -> Optional[dict]:
+    """Return the provider-replay fields persisted for stale-snapshot checks."""
+    if not isinstance(message, dict):
+        return None
+
+    view = {
+        "role": message.get("role", "unknown"),
+        "content": message.get("content"),
+    }
+    for key in (
+        "tool_call_id",
+        "tool_name",
+        "effect_disposition",
+        "finish_reason",
+        "reasoning",
+    ):
+        value = message.get(key)
+        if value:
+            view[key] = value
+
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        view["tool_calls"] = tool_calls
+
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content is not None:
+        view["reasoning_content"] = reasoning_content
+
+    for key in (
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+    ):
+        value = message.get(key)
+        if not value:
+            continue
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        view[key] = value
+
+    platform_message_id = (
+        message.get("platform_message_id") or message.get("message_id")
+    )
+    if platform_message_id:
+        view["message_id"] = platform_message_id
+    if message.get("observed"):
+        view["observed"] = True
+    return view
+
+
 def persist_in_place_projection(
     agent: Any,
     previous_messages: list,
@@ -1021,10 +1074,14 @@ def persist_in_place_projection(
     """Atomically adopt a changed dispatch projection under the same session.
 
     Returns ``(messages, persisted)``. A durable session adopts the compacted
-    projection only after ``archive_and_compact()`` succeeds; a write failure
-    returns the exact original list and leaves all persistence cursors and
-    compaction flags untouched. Agents without a durable DB/session may still
-    use the in-memory projection, reported explicitly as ``persisted=False``.
+    projection only after ``archive_and_compact()`` succeeds. Durable writes
+    hold the existing per-session compression lock, verify that the current
+    active DB rows still match the durable prefix of ``previous_messages``, and
+    pass their exact IDs into the archive transaction as a compare-and-swap.
+    Any lock, stale-snapshot, or write failure returns the exact original list
+    and leaves all persistence cursors and compaction flags untouched. Agents
+    without a durable DB/session may still use the in-memory projection,
+    reported explicitly as ``persisted=False``.
     """
     if compacted_messages is previous_messages or compacted_messages == previous_messages:
         return previous_messages, False
@@ -1040,9 +1097,49 @@ def persist_in_place_projection(
         return compacted_messages, False
 
     try:
-        session_db.archive_and_compact(session_id, compacted_messages)
+        lock_ttl = float(
+            getattr(agent, "_compression_lock_ttl_seconds", 300.0) or 300.0
+        )
+    except (TypeError, ValueError):
+        lock_ttl = 300.0
+    lock_holder = _compression_lock_holder(agent)
+    try:
+        lock_acquired = session_db.try_acquire_compression_lock(
+            session_id,
+            lock_holder,
+            ttl_seconds=lock_ttl,
+        )
     except Exception:
         return previous_messages, False
+    if not lock_acquired:
+        return previous_messages, False
+
+    try:
+        active_rows = session_db.get_messages(session_id)
+        if len(active_rows) > len(previous_messages):
+            return previous_messages, False
+        durable_projection = [
+            _durable_projection_message(row) for row in active_rows
+        ]
+        previous_prefix = [
+            _durable_projection_message(message)
+            for message in previous_messages[:len(active_rows)]
+        ]
+        if durable_projection != previous_prefix:
+            return previous_messages, False
+        expected_active_ids = tuple(row["id"] for row in active_rows)
+        session_db.archive_and_compact(
+            session_id,
+            compacted_messages,
+            expected_active_message_ids=expected_active_ids,
+        )
+    except Exception:
+        return previous_messages, False
+    finally:
+        try:
+            session_db.release_compression_lock(session_id, lock_holder)
+        except Exception:
+            pass
 
     # Match the successful in-place compression baseline: the projection is
     # already durable, and conversation_history_after_compression() will expose
