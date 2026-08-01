@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -114,6 +115,98 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
         return sum(_chars(value) for value in api_payload.values()) // 4
 
     return _chars(api_payload) // 4
+
+
+def build_provider_request_admission_receipt(agent, api_kwargs: Any) -> Dict[str, Any]:
+    """Build a content-free admission decision for a provider-ready request."""
+    payload = api_kwargs if isinstance(api_kwargs, dict) else {}
+    estimated_input_tokens = estimate_request_context_tokens(api_kwargs)
+    margin_tokens = max(1_024, math.ceil(estimated_input_tokens * 0.05))
+
+    category_estimated_tokens = {
+        category: (
+            estimate_request_context_tokens(payload[category])
+            if category in payload
+            else 0
+        )
+        for category in ("messages", "input", "instructions", "tools")
+    }
+    category_estimated_tokens["total"] = estimated_input_tokens
+
+    compressor = getattr(agent, "context_compressor", None)
+
+    def _identity(value: Any) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    resolved_model = _identity(getattr(agent, "model", ""))
+    resolved_provider = _identity(getattr(agent, "provider", ""))
+    compressor_model = _identity(getattr(compressor, "model", ""))
+    compressor_provider = _identity(getattr(compressor, "provider", ""))
+
+    raw_context_length = getattr(compressor, "context_length", None)
+    raw_threshold_tokens = getattr(compressor, "threshold_tokens", None)
+    context_length = raw_context_length if type(raw_context_length) is int else None
+    threshold_tokens = raw_threshold_tokens if type(raw_threshold_tokens) is int else None
+
+    explicit_output_tokens = 0
+    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+        raw_output_tokens = payload.get(key)
+        if type(raw_output_tokens) is int and raw_output_tokens > 0:
+            explicit_output_tokens = raw_output_tokens
+            break
+
+    window_input_ceiling = (
+        context_length - explicit_output_tokens
+        if context_length is not None
+        else None
+    )
+    effective_input_ceiling = threshold_tokens
+    if (
+        explicit_output_tokens > 0
+        and threshold_tokens is not None
+        and window_input_ceiling is not None
+    ):
+        effective_input_ceiling = min(threshold_tokens, window_input_ceiling)
+
+    receipt: Dict[str, Any] = {
+        "resolved_model": resolved_model,
+        "resolved_provider": resolved_provider,
+        "compressor_model": compressor_model,
+        "compressor_provider": compressor_provider,
+        "context_length": context_length,
+        "threshold_tokens": threshold_tokens,
+        "estimated_input_tokens": estimated_input_tokens,
+        "margin_tokens": margin_tokens,
+        "estimated_input_with_margin_tokens": estimated_input_tokens + margin_tokens,
+        "explicit_output_tokens": explicit_output_tokens,
+        "window_input_ceiling": window_input_ceiling,
+        "effective_input_ceiling": effective_input_ceiling,
+        "category_estimated_tokens": category_estimated_tokens,
+    }
+
+    if context_length is None or context_length <= 0:
+        decision, reason = "reject", "invalid_compressor_context_length"
+    elif threshold_tokens is None or threshold_tokens <= 0:
+        decision, reason = "reject", "invalid_compressor_threshold_tokens"
+    elif not resolved_model:
+        decision, reason = "reject", "unresolved_agent_model"
+    elif not resolved_provider:
+        decision, reason = "reject", "unresolved_agent_provider"
+    elif compressor_model.casefold() != resolved_model.casefold():
+        decision, reason = "reject", "compressor_model_mismatch"
+    elif compressor_provider.casefold() != resolved_provider.casefold():
+        decision, reason = "reject", "compressor_provider_mismatch"
+    elif explicit_output_tokens > 0 and window_input_ceiling <= 0:
+        decision, reason = "reject", "non_positive_window_input_ceiling"
+    elif estimated_input_tokens + margin_tokens <= effective_input_ceiling:
+        decision, reason = "admit", "within_effective_input_ceiling"
+    else:
+        decision = "reject"
+        reason = "estimated_input_plus_margin_exceeds_ceiling"
+
+    receipt["decision"] = decision
+    receipt["reason"] = reason
+    return receipt
 
 
 def _is_openai_codex_backend(agent) -> bool:
