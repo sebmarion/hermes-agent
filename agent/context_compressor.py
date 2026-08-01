@@ -866,10 +866,20 @@ def _truncate_tool_call_args_json(
     backend can parse. Every changed return value is strictly shorter than the
     input.
     """
+    force_receipt = False
     try:
         parsed = json.loads(args)
     except (ValueError, TypeError):
-        return args
+        # Python 3.11 rejects otherwise-valid integers longer than the process
+        # digit limit before json.loads can return their surrounding shape.
+        # Re-parse with a non-numeric hook to validate the complete JSON text
+        # without constructing native ints, then use only bounded shape
+        # metadata. Malformed JSON still fails this second parse unchanged.
+        try:
+            parsed = json.loads(args, parse_int=str)
+        except (ValueError, TypeError):
+            return args
+        force_receipt = True
 
     shrinkable_string_found = False
 
@@ -903,7 +913,11 @@ def _truncate_tool_call_args_json(
             # ``Infinity`` token that json.dumps emits by default.
             return None
 
-    candidate = _serialize_with_retained_chars(head_chars)
+    candidate = (
+        None
+        if force_receipt
+        else _serialize_with_retained_chars(head_chars)
+    )
     if (
         candidate is not None
         and len(candidate) <= max_chars
@@ -915,7 +929,7 @@ def _truncate_tool_call_args_json(
     # prefix for leaves that were already over ``head_chars`` such that the
     # complete serialized structure fits the replay bound. Short strings are
     # never expanded into truncation markers during this search.
-    if shrinkable_string_found:
+    if shrinkable_string_found and not force_receipt:
         low = 0
         high = max(0, head_chars - 1)
         bounded_candidate = None
@@ -952,7 +966,7 @@ def _truncate_tool_call_args_json(
         receipt = {
             "_hermes_truncated": True,
             "original_chars": len(args),
-            "value_type": type(parsed).__name__,
+            "value_type": "integer" if force_receipt else type(parsed).__name__,
         }
     fallback = json.dumps(
         receipt,

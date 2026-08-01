@@ -4071,6 +4071,112 @@ class SessionDB:
                 return content
         return content
 
+    @classmethod
+    def _normalize_content_for_persistence(cls, content: Any) -> Any:
+        """Apply the normal DB content projection without replay sanitizing."""
+        from agent.tool_dispatch_helpers import (
+            _is_multimodal_tool_result,
+            _multimodal_text_summary,
+        )
+
+        if _is_multimodal_tool_result(content):
+            return _multimodal_text_summary(content)
+        if not isinstance(content, list):
+            return content
+
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(str(part.get("text", "")))
+            elif (
+                isinstance(part, dict)
+                and part.get("type") in {"image", "image_url", "input_image"}
+            ):
+                text_parts.append("[screenshot]")
+        return "\n".join(text_parts) if text_parts else None
+
+    @classmethod
+    def _canonical_persisted_replay_message(
+        cls,
+        message: Any,
+        *,
+        include_timestamp: bool = True,
+        normalize_for_persistence: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Project a stored or live message through persistence and replay.
+
+        Restored conversations and durable-prefix comparisons share this
+        replay projection. When ``normalize_for_persistence`` is true, it first
+        applies the same content projection used by normal session flushes.
+        The result is idempotent for rows already returned by
+        :meth:`get_messages`.
+        """
+        try:
+            source = dict(message)
+        except (TypeError, ValueError):
+            return None
+
+        role = source.get("role", "unknown")
+        content = cls._decode_content(source.get("content"))
+        if normalize_for_persistence:
+            content = cls._normalize_content_for_persistence(content)
+        if role in {"user", "assistant"} and isinstance(content, str):
+            content = sanitize_context(content).strip()
+
+        result = {"role": role, "content": content}
+        if include_timestamp and source.get("timestamp"):
+            result["timestamp"] = source["timestamp"]
+        for key in ("tool_call_id", "tool_name", "effect_disposition"):
+            if source.get(key):
+                result[key] = source[key]
+
+        tool_calls = source.get("tool_calls")
+        if tool_calls:
+            if isinstance(tool_calls, str):
+                try:
+                    tool_calls = json.loads(tool_calls)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in conversation replay, "
+                        "falling back to []"
+                    )
+                    tool_calls = []
+            result["tool_calls"] = tool_calls
+
+        platform_message_id = (
+            source.get("platform_message_id") or source.get("message_id")
+        )
+        if platform_message_id:
+            result["message_id"] = platform_message_id
+        if source.get("observed"):
+            result["observed"] = True
+
+        if role == "assistant":
+            for key in ("finish_reason", "reasoning"):
+                if source.get(key):
+                    result[key] = source[key]
+            if source.get("reasoning_content") is not None:
+                result["reasoning_content"] = source["reasoning_content"]
+            for key in (
+                "reasoning_details",
+                "codex_reasoning_items",
+                "codex_message_items",
+            ):
+                value = source.get(key)
+                if not value:
+                    continue
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            "Failed to deserialize %s, falling back to None",
+                            key,
+                        )
+                        value = None
+                result[key] = value
+        return result
+
     def append_message(
         self,
         session_id: str,
@@ -4829,61 +4935,9 @@ class SessionDB:
 
         messages = []
         for row in rows:
-            content = self._decode_content(row["content"])
-            if row["role"] in {"user", "assistant"} and isinstance(content, str):
-                content = sanitize_context(content).strip()
-            msg = {"role": row["role"], "content": content}
-            if row["timestamp"]:
-                msg["timestamp"] = row["timestamp"]
-            if row["tool_call_id"]:
-                msg["tool_call_id"] = row["tool_call_id"]
-            if row["tool_name"]:
-                msg["tool_name"] = row["tool_name"]
-            if row["effect_disposition"]:
-                msg["effect_disposition"] = row["effect_disposition"]
-            if row["tool_calls"]:
-                try:
-                    msg["tool_calls"] = json.loads(row["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
-                    msg["tool_calls"] = []
-            # Surface the platform-side message id (e.g. yuanbao msg_id,
-            # telegram update_id) so platform-specific flows like recall
-            # can match by external identifier instead of having to fall
-            # back to content-match heuristics.  Exposed as ``message_id``
-            # for backward compatibility with the JSONL transcript shape.
-            if row["platform_message_id"]:
-                msg["message_id"] = row["platform_message_id"]
-            if row["observed"]:
-                msg["observed"] = True
-            # Restore reasoning fields on assistant messages so providers
-            # that replay reasoning (OpenRouter, OpenAI, Nous) receive
-            # coherent multi-turn reasoning context.
-            if row["role"] == "assistant":
-                if row["finish_reason"]:
-                    msg["finish_reason"] = row["finish_reason"]
-                if row["reasoning"]:
-                    msg["reasoning"] = row["reasoning"]
-                if row["reasoning_content"] is not None:
-                    msg["reasoning_content"] = row["reasoning_content"]
-                if row["reasoning_details"]:
-                    try:
-                        msg["reasoning_details"] = json.loads(row["reasoning_details"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize reasoning_details, falling back to None")
-                        msg["reasoning_details"] = None
-                if row["codex_reasoning_items"]:
-                    try:
-                        msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize codex_reasoning_items, falling back to None")
-                        msg["codex_reasoning_items"] = None
-                if row["codex_message_items"]:
-                    try:
-                        msg["codex_message_items"] = json.loads(row["codex_message_items"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize codex_message_items, falling back to None")
-                        msg["codex_message_items"] = None
+            msg = self._canonical_persisted_replay_message(row)
+            if msg is None:
+                continue
             if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)
