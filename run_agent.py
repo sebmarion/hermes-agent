@@ -766,38 +766,66 @@ class AIAgent:
             except Exception as exc:
                 logger.debug("context engine bind_session_state during reset: %s", exc)
 
-    def _ensure_lmstudio_runtime_loaded(self, config_context_length: Optional[int] = None) -> None:
-        """
-        Preload the LM Studio model with at least Hermes' minimum context.
-        """
+    @staticmethod
+    def _effective_lmstudio_context_length(
+        config_context_length: Optional[int],
+        runtime_context_length: Any,
+    ) -> Optional[int]:
+        """Return a safe context budget from explicit intent and verified runtime."""
+        explicit = (
+            config_context_length
+            if isinstance(config_context_length, int)
+            and not isinstance(config_context_length, bool)
+            and config_context_length > 0
+            else None
+        )
+        runtime_value = getattr(runtime_context_length, "context_length", runtime_context_length)
+        runtime = (
+            runtime_value
+            if isinstance(runtime_value, int)
+            and not isinstance(runtime_value, bool)
+            and runtime_value > 0
+            else None
+        )
+        if bool(getattr(runtime_context_length, "rejected", False)) or (
+            bool(getattr(runtime_context_length, "load_attempted", False))
+            and runtime is None
+        ):
+            return None
+        if runtime is not None and explicit is not None:
+            return min(runtime, explicit)
+        return runtime if runtime is not None else explicit
+
+    @staticmethod
+    def _lmstudio_load_was_unverified(load_result: Any) -> bool:
+        """Return true when a management load was rejected or unverifiable."""
+        return bool(getattr(load_result, "rejected", False)) or (
+            bool(getattr(load_result, "load_attempted", False))
+            and getattr(load_result, "context_length", None) is None
+        )
+
+    def _ensure_lmstudio_runtime_loaded(
+        self,
+        config_context_length: Optional[int] = None,
+    ) -> Any:
+        """Preload LM Studio unless configured to rely on JIT loading."""
         if (self.provider or "").strip().lower() != "lmstudio":
-            return
-        try:
-            from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
-            from hermes_cli.models import ensure_lmstudio_model_loaded
-            if config_context_length is None:
-                config_context_length = getattr(self, "_config_context_length", None)
-            target_ctx = max(config_context_length or 0, MINIMUM_CONTEXT_LENGTH)
-            loaded_ctx = ensure_lmstudio_model_loaded(
-                self.model, self.base_url, getattr(self, "api_key", ""), target_ctx,
-            )
-            if loaded_ctx:
-                # Push into the live compressor so the status bar reflects the
-                # real loaded ctx the moment the load resolves, instead of
-                # holding the previous model's value (or "ctx --") through the
-                # next render tick.
-                cc = getattr(self, "context_compressor", None)
-                if cc is not None:
-                    cc.update_model(
-                        model=self.model,
-                        context_length=loaded_ctx,
-                        base_url=self.base_url,
-                        api_key=getattr(self, "api_key", ""),
-                        provider=self.provider,
-                        api_mode=self.api_mode,
-                    )
-        except Exception as err:
-            logger.debug("LM Studio preload skipped: %s", err)
+            return None
+        if (getattr(self, "lmstudio_load_mode", "explicit") or "explicit").strip().lower() == "jit":
+            logger.debug("LM Studio explicit preload skipped: lmstudio_load_mode=jit")
+            return None
+
+        from hermes_cli.models import ensure_lmstudio_model_loaded
+
+        if config_context_length is None:
+            config_context_length = getattr(self, "_config_context_length", None)
+        return ensure_lmstudio_model_loaded(
+            self.model,
+            self.base_url,
+            getattr(self, "api_key", ""),
+            config_context_length,
+            return_load_result=True,
+        )
 
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
@@ -939,6 +967,16 @@ class AIAgent:
                 self.notice_clear_callback(key)
             except Exception:
                 logger.debug("notice_clear_callback error in _emit_notice_clear", exc_info=True)
+
+    def _emit_wait_notice(self, text: str) -> None:
+        """Surface a live wait-state explanation without breaking the wait loop."""
+        self._touch_activity(text)
+        thinking_callback = getattr(self, "thinking_callback", None)
+        if thinking_callback:
+            try:
+                thinking_callback(text)
+            except Exception:
+                logger.debug("thinking_callback error in _emit_wait_notice", exc_info=True)
 
     # ── Buffered retry/fallback status ────────────────────────────────────
     # Retry and fallback chains were flooding the CLI/gateway with status
@@ -3486,11 +3524,12 @@ class AIAgent:
 
         self._close_codex_app_server_session()
 
-        # Close the OpenAI/httpx client to release sockets immediately.
+        # Retire the OpenAI/httpx client to release sockets without releasing
+        # FDs from a thread that may not own an in-flight request (#70773).
         try:
             client = getattr(self, "client", None)
             if client is not None:
-                self._close_openai_client(client, reason="cache_evict", shared=True)
+                self._retire_shared_openai_client(client, reason="cache_evict")
                 self.client = None
         except Exception:
             pass
@@ -4057,6 +4096,38 @@ class AIAgent:
                 exc,
             )
 
+    def _retire_shared_openai_client(self, client: Any, *, reason: str) -> None:
+        """Retire a replaced shared client without cross-thread FD release.
+
+        Shared clients may still be borrowed by a worker or streaming request
+        when a refresh, recovery, or cache eviction replaces them. Calling
+        ``client.close()`` here can release a TLS socket FD from the wrong
+        thread while another thread's SSL layer still caches that integer;
+        the kernel may then recycle it for an unrelated file descriptor.
+
+        Shutdown is safe from any thread and unblocks pending I/O. The
+        client's actual FD release is left to its owner-thread unwind / GC.
+        Full ``close()`` remains appropriate for a real session teardown.
+        """
+        if client is None:
+            return
+        try:
+            shutdown_count = self._force_close_tcp_sockets(client)
+            logger.info(
+                "Shared OpenAI client retired (%s, tcp_shutdown=%d, "
+                "fd_release=deferred_to_gc) %s",
+                reason,
+                shutdown_count,
+                self._client_log_context(),
+            )
+        except Exception as exc:
+            logger.debug(
+                "Shared OpenAI client retire failed (%s) %s error=%s",
+                reason,
+                self._client_log_context(),
+                exc,
+            )
+
     def _replace_primary_openai_client(self, *, reason: str) -> bool:
         with self._openai_client_lock():
             old_client = getattr(self, "client", None)
@@ -4071,7 +4142,9 @@ class AIAgent:
                 )
                 return False
             self.client = new_client
-        self._close_openai_client(old_client, reason=f"replace:{reason}", shared=True)
+        # The caller may not own an in-flight request on the old shared pool;
+        # shut sockets down, but defer FD release until borrowers unwind.
+        self._retire_shared_openai_client(old_client, reason=f"replace:{reason}")
         return True
 
     def _ensure_primary_openai_client(self, *, reason: str) -> Any:
@@ -4188,13 +4261,21 @@ class AIAgent:
             return
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
-            logger.info(
-                "OpenAI client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) %s",
-                reason,
-                shutdown_count,
-                self._client_log_context(),
-            )
+            if shutdown_count == 0:
+                logger.warning(
+                    "OpenAI client aborted (%s, shared=False, tcp_force_closed=0, "
+                    "no sockets found, deferred_close=stranger_thread) %s",
+                    reason,
+                    self._client_log_context(),
+                )
+            else:
+                logger.info(
+                    "OpenAI client aborted (%s, shared=False, tcp_force_closed=%d, "
+                    "deferred_close=stranger_thread) %s",
+                    reason,
+                    shutdown_count,
+                    self._client_log_context(),
+                )
         except Exception as exc:
             logger.debug(
                 "OpenAI client abort failed (%s, shared=False) %s error=%s",
@@ -4292,7 +4373,7 @@ class AIAgent:
         *,
         force: bool = True,
     ) -> bool:
-        if self.api_mode != "chat_completions" or self.provider != "nous":
+        if self.api_mode not in {"chat_completions", "anthropic_messages"} or self.provider != "nous":
             return False
 
         try:
@@ -4319,6 +4400,16 @@ class AIAgent:
         self._client_kwargs["base_url"] = self.base_url
         # Nous requests should not inherit OpenRouter-only attribution headers.
         self._client_kwargs.pop("default_headers", None)
+
+        if self.api_mode == "anthropic_messages":
+            self._anthropic_api_key = self.api_key
+            self._anthropic_base_url = self.base_url
+            try:
+                self._rebuild_anthropic_client()
+            except Exception as exc:
+                logger.warning("Failed to rebuild Nous Anthropic client after credential refresh: %s", exc)
+                return False
+            return True
 
         if not self._replace_primary_openai_client(reason="nous_credential_refresh"):
             return False
@@ -4698,13 +4789,63 @@ class AIAgent:
         streamed = self._normalize_interim_visible_text(
             self._strip_think_blocks(getattr(self, "_current_streamed_assistant_text", "") or "")
         )
-        return bool(streamed) and streamed == visible_content
+        return bool(streamed) and (
+            streamed == visible_content or visible_content.startswith(streamed)
+        )
 
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer."""
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
             return
+
+        # Structured Responses commentary is kept separately from the final
+        # answer. Emit each visible commentary item once, including when it is
+        # delivered live by the low-level stream and then seen again during
+        # response normalization/replay.
+        message_items = assistant_msg.get("codex_message_items")
+        commentary_texts = []
+        if isinstance(message_items, list):
+            for item in message_items:
+                if not isinstance(item, dict):
+                    continue
+                phase = str(item.get("phase") or "").strip().lower()
+                if phase not in {"commentary", "analysis"}:
+                    continue
+                parts = item.get("content")
+                if not isinstance(parts, list):
+                    continue
+                text_parts = []
+                for part in parts:
+                    if isinstance(part, dict):
+                        text = part.get("text")
+                    else:
+                        text = getattr(part, "text", None)
+                    if isinstance(text, str) and text:
+                        text_parts.append(text)
+                text = "".join(text_parts).strip()
+                if text and text not in commentary_texts:
+                    commentary_texts.append(text)
+
+        if commentary_texts:
+            if getattr(self, "show_commentary", True) is False:
+                return
+            emitted = getattr(self, "_codex_emitted_commentary_texts", None)
+            if not isinstance(emitted, set):
+                emitted = set()
+                self._codex_emitted_commentary_texts = emitted
+            from agent.redact import redact_sensitive_text
+            for text in commentary_texts:
+                visible = self._strip_think_blocks(redact_sensitive_text(text)).strip()
+                if not visible or visible in emitted:
+                    continue
+                emitted.add(visible)
+                try:
+                    cb(visible, already_streamed=False)
+                except Exception:
+                    logger.debug("interim_assistant_callback error", exc_info=True)
+            return
+
         content = assistant_msg.get("content")
         visible = self._strip_think_blocks(content or "").strip()
         if not visible or visible == "(empty)":

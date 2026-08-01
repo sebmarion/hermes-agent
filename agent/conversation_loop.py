@@ -27,6 +27,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from hermes_cli.config import cfg_get
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
@@ -3305,7 +3306,7 @@ def _run_conversation(
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(reason=classified.reason):
-                            cooldown = agent.config.get('agent.fallback_cooldown_seconds', 10)
+                            cooldown = cfg_get(agent._config, 'agent', 'fallback_cooldown_seconds', default=10)
                             time.sleep(cooldown)
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
@@ -4488,22 +4489,65 @@ def _run_conversation(
                     # while visible content/reasoning are unchanged), compare
                     # those opaque payloads too so we don't silently drop the
                     # newer continuation state.
-                    last_codex_items = last_msg.get("codex_reasoning_items") if isinstance(last_msg, dict) else None
-                    interim_codex_items = interim_msg.get("codex_reasoning_items")
-                    last_codex_message_items = last_msg.get("codex_message_items") if isinstance(last_msg, dict) else None
-                    interim_codex_message_items = interim_msg.get("codex_message_items")
+                    def _interim_visible_signature(message):
+                        if not isinstance(message, dict):
+                            return None
+                        content = message.get("content") or ""
+                        commentary = []
+                        for item in message.get("codex_message_items") or []:
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("phase") or "").strip().lower() not in {"commentary", "analysis"}:
+                                continue
+                            parts = item.get("content") or []
+                            text = "".join(
+                                str(part.get("text") or "")
+                                for part in parts
+                                if isinstance(part, dict) and part.get("type") == "output_text"
+                            ).strip()
+                            if text:
+                                commentary.append(text)
+                        # Hidden reasoning summaries are provider state, not
+                        # visible progress; do not let them defeat dedup.
+                        return (content, tuple(commentary)) if commentary else (content,)
+
                     duplicate_interim = (
                         isinstance(last_msg, dict)
                         and last_msg.get("role") == "assistant"
                         and last_msg.get("finish_reason") == "incomplete"
-                        and (last_msg.get("content") or "") == (interim_msg.get("content") or "")
-                        and (last_msg.get("reasoning") or "") == (interim_msg.get("reasoning") or "")
-                        and last_codex_items == interim_codex_items
-                        and last_codex_message_items == interim_codex_message_items
+                        and _interim_visible_signature(last_msg) == _interim_visible_signature(interim_msg)
                     )
-                    if not duplicate_interim:
+                    if duplicate_interim:
+                        # Visible progress is the deduplication key. Replace
+                        # the prior message in place so the newest encrypted
+                        # reasoning/message item remains replayable.
+                        messages[-1] = interim_msg
+                    else:
                         messages.append(interim_msg)
                         agent._emit_interim_assistant_message(interim_msg)
+
+                if (
+                    not interim_has_content
+                    and not interim_has_codex_message_items
+                    and not any(
+                        isinstance(item, dict) and item.get("encrypted_content")
+                        for item in (interim_msg.get("codex_reasoning_items") or [])
+                    )
+                    and not any(
+                        isinstance(msg, dict)
+                        and msg.get("role") == "user"
+                        and "only internal reasoning" in str(msg.get("content") or "")
+                        for msg in messages
+                    )
+                ):
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "The previous response contained only internal reasoning "
+                            "and no replayable visible content. Continue now with "
+                            "the required tool calls or a visible answer."
+                        ),
+                    })
 
                 if agent._codex_incomplete_retries < 3:
                     if not agent.quiet_mode:
@@ -5652,6 +5696,7 @@ def run_conversation(
     # Do not let a setup failure close the previous turn using stale identity.
     agent._current_turn_id = None
     agent._current_task_id = None
+    agent._codex_emitted_commentary_texts = set()
     result = None
     try:
         result = _run_conversation(

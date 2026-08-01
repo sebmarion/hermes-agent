@@ -1018,6 +1018,8 @@ def _preflight_codex_api_kwargs(
     ):
         val = api_kwargs.get(passthrough_key)
         if val is not None:
+            if passthrough_key == "prompt_cache_key" and isinstance(val, str) and len(val) > 64:
+                val = "pck_" + hashlib.sha256(val.encode("utf-8", errors="replace")).hexdigest()[:24]
             normalized[passthrough_key] = val
 
     extra_headers = api_kwargs.get("extra_headers")
@@ -1045,7 +1047,13 @@ def _preflight_codex_api_kwargs(
         # type checks, so it survives Responses.stream() kwarg-signature
         # changes that would otherwise raise TypeError before the wire.
         if extra_body:
-            normalized["extra_body"] = dict(extra_body)
+            normalized_extra_body = dict(extra_body)
+            cache_key = normalized_extra_body.get("prompt_cache_key")
+            if isinstance(cache_key, str) and len(cache_key) > 64:
+                normalized_extra_body["prompt_cache_key"] = (
+                    "pck_" + hashlib.sha256(cache_key.encode("utf-8", errors="replace")).hexdigest()[:24]
+                )
+            normalized["extra_body"] = normalized_extra_body
 
     if allow_stream:
         stream = api_kwargs.get("stream")
