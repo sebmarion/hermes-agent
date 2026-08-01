@@ -181,6 +181,19 @@ class TestProjectFacts:
         assert "scripts/run_tests.sh" in block
         assert "pytest" in block.split("Verify:")[1]
 
+    def test_scripts_test_sh_is_a_verify_command(self, tmp_path):
+        _git_init(tmp_path)
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        (scripts / "test.sh").write_text("#!/bin/sh\n")
+        (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+        f = cc.detect_project_facts(tmp_path)
+        assert "scripts/test.sh" in f.verify_commands
+        # The wrapper script is the project's canonical verify command, so
+        # running it must classify as verification evidence (which is what
+        # flips the supervision loop out of its unverified nag).
+        assert any(c.startswith("scripts/test.sh") for c in f.verify_commands)
+
     def test_makefile_verify_targets_only(self, tmp_path):
         _git_init(tmp_path)
         (tmp_path / "Makefile").write_text("test:\n\tgo test ./...\n\ndeploy:\n\t./deploy.sh\n")

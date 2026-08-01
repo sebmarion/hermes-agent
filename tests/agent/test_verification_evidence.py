@@ -154,6 +154,31 @@ def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
     assert echoed is None
 
 
+def test_dot_slash_prefix_matches_canonical_verify_script(tmp_path, monkeypatch):
+    """./scripts/test.sh must match the detected canonical scripts/test.sh.
+
+    Without this, running the project's documented verify wrapper records no
+    evidence, leaving verification_status() permanently unverified and the
+    supervision loop nagging on every turn.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+
+    evidence = classify_verification_command(
+        "./scripts/run_tests.sh tests/test_widget.py -q",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="1 passed",
+    )
+
+    assert evidence is not None
+    assert evidence.canonical_command == "scripts/run_tests.sh"
+    assert evidence.kind == "test"
+    assert evidence.scope == "targeted"
+    assert evidence.status == "passed"
+
+
 def test_uv_run_pytest_matches_detected_pytest(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     _python_project(tmp_path)

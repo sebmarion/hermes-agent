@@ -232,12 +232,17 @@ def _tokens_prefix_match(candidate: list[str], actual: list[str]) -> bool:
     token itself contains a ``:`` (i.e. is a namespaced script name), so
     bare commands like ``pytest`` or ``scripts/run_tests.sh`` are not
     over-matched.
+
+    Actual tokens are cleaned the same way the canonical needle is, so a
+    ``./``-prefixed invocation (``./scripts/test.sh``) matches the detected
+    canonical (``scripts/test.sh``).
     """
     if not candidate or len(actual) < len(candidate):
         return False
-    if actual[: len(candidate) - 1] != candidate[:-1]:
+    cleaned = [_clean_token(t) for t in actual]
+    if cleaned[: len(candidate) - 1] != candidate[:-1]:
         return False
-    actual_last = actual[len(candidate) - 1]
+    actual_last = cleaned[len(candidate) - 1]
     canonical_last = candidate[-1]
     if actual_last == canonical_last:
         return True

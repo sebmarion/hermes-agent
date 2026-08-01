@@ -794,8 +794,14 @@ def detect_project_facts(root: Path) -> ProjectFacts:
     )
 
     verify: list[str] = []
-    if (root / "scripts" / "run_tests.sh").is_file():
-        verify.append("scripts/run_tests.sh")
+    # Common local verify wrapper scripts. Projects routinely wrap the real
+    # suite in scripts/{run_tests,test,check,verify,lint}.sh and AGENTS.md
+    # tells the agent to use the wrapper, so each existing one is a canonical
+    # verify command — otherwise running it records no verification evidence
+    # and the supervision loop re-nags forever.
+    for _script in ("run_tests.sh", "test.sh", "check.sh", "verify.sh", "lint.sh"):
+        if (root / "scripts" / _script).is_file():
+            verify.append(f"scripts/{_script}")
     if (root / "package.json").is_file():
         try:
             scripts = json.loads(_read_small(root / "package.json") or "{}").get("scripts") or {}
