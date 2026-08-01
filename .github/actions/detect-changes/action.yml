@@ -13,7 +13,7 @@ inputs:
 
 outputs:
   python:
-    description: Run Python tests / ruff / ty / windows-footguns.
+    description: Run Python tests / ruff / ty.
     value: ${{ steps.classify.outputs.python }}
   frontend:
     description: Run the TypeScript testing matrix + desktop build.
