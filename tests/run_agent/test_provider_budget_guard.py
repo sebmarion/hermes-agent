@@ -155,7 +155,11 @@ def test_local_budget_rejection_blocks_both_transports(agent, monkeypatch, strea
         and str(message.get("content") or "").startswith("irreducible ")
         for message in result["messages"]
     )
-    assert result["messages"][-1]["content"] == result["final_response"]
+    assert not any(
+        message.get("role") == "assistant"
+        and message.get("content") == result["final_response"]
+        for message in result["messages"]
+    )
     assert agent._last_provider_admission_receipt == rejected
 
 

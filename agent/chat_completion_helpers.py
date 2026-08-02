@@ -139,19 +139,96 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
     return _chars(api_payload) // 4
 
 
+_PROVIDER_REQUEST_METADATA_KEYS = frozenset(
+    {
+        "model",
+        "modelId",
+        "stream",
+        "stream_options",
+        "extra_headers",
+        "headers",
+        "timeout",
+        "api_key",
+        "base_url",
+        "client",
+        "http_client",
+        "request_id",
+        "user",
+        "metadata",
+    }
+)
+
+
+def _provider_payload_token_estimate(value: Any) -> int:
+    """Return a conservative, tokenizer-independent token estimate.
+
+    Provider tokenizers differ, and the admission guard runs before transport
+    selection. Compact JSON accounts for role/content wrappers, multimodal
+    parts, tool schemas, and provider-specific nesting. ASCII text normally
+    tokenizes at roughly four bytes per token; non-ASCII bytes get a tighter
+    two-bytes-per-token bound so CJK/emoji content cannot slip through the
+    legacy character/4 estimate while ordinary compacted prompts are not
+    rejected four times too early.
+    """
+    if value is None or value == "" or value == [] or value == {}:
+        return 0
+    try:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception:
+        serialized = str(value)
+    encoded = serialized.encode("utf-8")
+    ascii_bytes = sum(byte < 128 for byte in encoded)
+    non_ascii_bytes = len(encoded) - ascii_bytes
+    return math.ceil(ascii_bytes / 4 + non_ascii_bytes / 2)
+
+
+def estimate_provider_request_context_tokens(api_payload: Any) -> int:
+    """Conservatively estimate all context-bearing fields in a final request.
+
+    The legacy ``estimate_request_context_tokens`` remains intentionally cheap
+    for stale-timeout heuristics. Admission must account for every provider
+    request body shape, including top-level ``system`` and native Bedrock
+    ``toolConfig``/``inferenceConfig`` fields, so it uses this bounded JSON
+    serialization instead.
+    """
+    if not isinstance(api_payload, dict):
+        return _provider_payload_token_estimate(api_payload)
+    context_payload = {
+        key: value
+        for key, value in api_payload.items()
+        if key not in _PROVIDER_REQUEST_METADATA_KEYS
+    }
+    return _provider_payload_token_estimate(context_payload)
+
+
 def build_provider_request_admission_receipt(agent, api_kwargs: Any) -> Dict[str, Any]:
     """Build a content-free admission decision for a provider-ready request."""
     payload = api_kwargs if isinstance(api_kwargs, dict) else {}
-    estimated_input_tokens = estimate_request_context_tokens(api_kwargs)
+    estimated_input_tokens = estimate_provider_request_context_tokens(api_kwargs)
     margin_tokens = max(1_024, math.ceil(estimated_input_tokens * 0.05))
 
+    category_keys = (
+        "messages",
+        "input",
+        "instructions",
+        "system",
+        "tools",
+        "toolConfig",
+        "inferenceConfig",
+        "extra_body",
+    )
     category_estimated_tokens = {
         category: (
-            estimate_request_context_tokens(payload[category])
+            _provider_payload_token_estimate(payload[category])
             if category in payload
             else 0
         )
-        for category in ("messages", "input", "instructions", "tools")
+        for category in category_keys
     }
     category_estimated_tokens["total"] = estimated_input_tokens
 
@@ -170,8 +247,21 @@ def build_provider_request_admission_receipt(agent, api_kwargs: Any) -> Dict[str
     context_length = raw_context_length if type(raw_context_length) is int else None
     threshold_tokens = raw_threshold_tokens if type(raw_threshold_tokens) is int else None
 
-    output_cap_keys = ("max_output_tokens", "max_completion_tokens", "max_tokens")
+    output_cap_keys = (
+        "max_output_tokens",
+        "max_completion_tokens",
+        "max_tokens",
+        "maxTokens",
+    )
     present_output_caps = [payload[key] for key in output_cap_keys if key in payload]
+    for config_key in ("inferenceConfig", "inference_config"):
+        config = payload.get(config_key)
+        if isinstance(config, dict):
+            present_output_caps.extend(
+                config[key]
+                for key in output_cap_keys
+                if key in config
+            )
     invalid_output_cap = any(
         type(raw_output_tokens) is not int or raw_output_tokens <= 0
         for raw_output_tokens in present_output_caps

@@ -10,7 +10,7 @@ import pytest
 
 from agent.chat_completion_helpers import (
     build_provider_request_admission_receipt,
-    estimate_request_context_tokens,
+    estimate_provider_request_context_tokens,
 )
 
 
@@ -41,7 +41,7 @@ def test_chat_completions_uses_minimum_margin_without_payload_content():
         "messages": [{"role": "user", "content": "PRIVATE_MESSAGE_" * 100}],
         "tools": [{"type": "function", "name": "PRIVATE_TOOL"}],
     }
-    estimated = estimate_request_context_tokens(api_kwargs)
+    estimated = estimate_provider_request_context_tokens(api_kwargs)
     threshold = estimated + 1_024
 
     receipt = build_provider_request_admission_receipt(
@@ -70,7 +70,7 @@ def test_responses_uses_five_percent_margin_and_rejects_over_ceiling():
         "instructions": "PRIVATE_INSTRUCTIONS_" * 100,
         "tools": [{"name": "PRIVATE_RESPONSES_TOOL", "description": "x" * 500}],
     }
-    estimated = estimate_request_context_tokens(api_kwargs)
+    estimated = estimate_provider_request_context_tokens(api_kwargs)
     margin = math.ceil(estimated * 0.05)
     assert margin > 1_024
 
@@ -137,7 +137,7 @@ def test_effective_ceiling_is_smaller_of_threshold_and_reserved_window(
 
 def test_absent_output_cap_still_uses_context_window_as_a_ceiling():
     api_kwargs = {"input": "x" * 4_000}
-    estimated = estimate_request_context_tokens(api_kwargs)
+    estimated = estimate_provider_request_context_tokens(api_kwargs)
     required_tokens = estimated + max(1_024, math.ceil(estimated * 0.05))
 
     receipt = build_provider_request_admission_receipt(
@@ -270,3 +270,52 @@ def test_identity_comparison_trims_and_ignores_case():
     assert receipt["resolved_model"] == "GPT-5"
     assert receipt["resolved_provider"] == "OpenAI"
     assert receipt["decision"] == "admit"
+
+
+def test_admission_does_not_underestimate_multibyte_provider_payloads():
+    """Unicode content must not pass because the legacy char/4 estimate is low."""
+    receipt = build_provider_request_admission_receipt(
+        _agent(context_length=6_000, threshold_tokens=3_000),
+        {
+            "messages": [{"role": "user", "content": "龍" * 5_500}],
+            "max_tokens": 500,
+        },
+    )
+
+    assert receipt["decision"] == "reject"
+    assert receipt["reason"] == "estimated_input_plus_margin_exceeds_ceiling"
+
+
+def test_admission_counts_anthropic_system_prompt():
+    """Anthropic's top-level system field is part of the provider context."""
+    receipt = build_provider_request_admission_receipt(
+        _agent(context_length=64_000, threshold_tokens=60_000),
+        {
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": "system context " * 20_000,
+            "max_tokens": 1_024,
+        },
+    )
+
+    assert receipt["decision"] == "reject"
+    assert receipt["category_estimated_tokens"]["system"] > 0
+
+
+def test_admission_counts_bedrock_native_system_tools_and_output_config():
+    """Bedrock Converse nests context and output fields under native keys."""
+    receipt = build_provider_request_admission_receipt(
+        _agent(context_length=64_000, threshold_tokens=60_000),
+        {
+            "modelId": "us.anthropic.claude-sonnet",
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+            "system": [{"text": "system context " * 20_000}],
+            "toolConfig": {"tools": [{"toolSpec": {"description": "tool " * 10_000}}]},
+            "inferenceConfig": {"maxTokens": 1_024},
+        },
+    )
+
+    assert receipt["decision"] == "reject"
+    assert receipt["category_estimated_tokens"]["system"] > 0
+    assert receipt["category_estimated_tokens"]["toolConfig"] > 0
+    assert receipt["explicit_output_tokens"] == 1_024

@@ -258,7 +258,11 @@ def finalize_turn(
         # single chokepoint every recovery ``break`` flows through, so the
         # invariant "delivered final_response ⇒ assistant row in transcript"
         # holds regardless of which path produced it. (#43849 / #44100)
-        if final_response and not interrupted:
+        if (
+            final_response
+            and not interrupted
+            and str(_turn_exit_reason) != "compression_exhausted"
+        ):
             try:
                 _tail_role = messages[-1].get("role") if messages else None
             except Exception:
