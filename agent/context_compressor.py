@@ -222,6 +222,7 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 # become another unbounded transcript copy after the LLM summarizer failed.
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
 _FALLBACK_TURN_MAX_CHARS = 700
+_FALLBACK_PREVIOUS_SUMMARY_MAX_CHARS = 4_000
 _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
@@ -1866,16 +1867,33 @@ class ContextCompressor(ContextEngine):
             if user_asks
             else "Unknown from deterministic fallback."
         )
+        previous_checkpoint = "None available."
         previous_summary_note = ""
         if self._previous_summary:
+            previous_checkpoint = redact_sensitive_text(
+                self._strip_summary_prefix(self._previous_summary).strip()
+            ) or "None available."
+            if len(previous_checkpoint) > _FALLBACK_PREVIOUS_SUMMARY_MAX_CHARS:
+                marker = "\n...[previous checkpoint truncated]...\n"
+                available = _FALLBACK_PREVIOUS_SUMMARY_MAX_CHARS - len(marker)
+                head = max(1, available * 3 // 4)
+                tail = max(1, available - head)
+                previous_checkpoint = (
+                    previous_checkpoint[:head].rstrip()
+                    + marker
+                    + previous_checkpoint[-tail:].lstrip()
+                )
             previous_summary_note = (
-                "\n\nPrevious compaction summary was present and should still be treated as "
-                "background continuity context, but the latest LLM summary update failed."
+                " The last verified checkpoint is preserved above because the "
+                "latest LLM summary update failed."
             )
 
         reason_text = f" Summary failure reason: {reason}." if reason else ""
         body = f"""{HISTORICAL_TASK_HEADING}
 {active_task}
+
+## Previous Verified Checkpoint
+{previous_checkpoint}
 
 ## Goal
 Recovered from a deterministic fallback because the LLM context summarizer was unavailable. Continue from the protected recent messages after this summary and use current file/system state for exact details.{previous_summary_note}
@@ -3243,6 +3261,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 turns_to_summarize,
                 reason=self._last_summary_error,
             )
+            self._previous_summary = self._strip_summary_prefix(summary)
 
         _merge_summary_into_tail = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
