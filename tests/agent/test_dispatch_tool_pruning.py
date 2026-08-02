@@ -31,7 +31,9 @@ def _call_ids(messages):
 
 
 def test_dispatch_prunes_only_old_tool_results_and_preserves_protected_duplicates():
-    compressor = _compressor(protect_last_n=6, tail_token_budget=1)
+    # Keep the protected tail below main's pressure-demotion ceiling so this
+    # test isolates ordinary historical pruning and duplicate handling.
+    compressor = _compressor(protect_last_n=6, tail_token_budget=360)
     duplicate_output = "same protected output\n" + ("d" * 400)
     unique_output = "unique old output\n" + ("u" * 400)
     messages = [
@@ -206,7 +208,9 @@ def test_dispatch_truncates_old_tool_arguments_as_json_and_counts_each_mutation(
 
 
 def test_dispatch_preserves_multimodal_pruning_and_is_idempotent():
-    compressor = _compressor(protect_last_n=4, tail_token_budget=1)
+    # A multimodal image is estimated at roughly 1,500 tokens. Give the recent
+    # four-message tail room to stay protected while the older image is pruned.
+    compressor = _compressor(protect_last_n=4, tail_token_budget=1_700)
     old_image = [
         {"type": "text", "text": "old screenshot text"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,OLD"}},

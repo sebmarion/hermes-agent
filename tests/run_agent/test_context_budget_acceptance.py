@@ -120,13 +120,21 @@ def test_four_tool_heavy_in_place_compactions_survive_durable_restarts(tmp_path)
     db.append_message(session_id=session_id, role="user", content=_CHECKPOINT)
     archived_ids: set[int] = set()
     summary_calls = 0
+    fallback_reached_next_summary = False
     agent = None
 
     def _summary_provider(**_kwargs):
-        nonlocal summary_calls
+        nonlocal summary_calls, fallback_reached_next_summary
         summary_calls += 1
         if summary_calls == 3:
             raise RuntimeError("injected summary provider failure")
+        if summary_calls == 4:
+            fallback_reached_next_summary = (
+                _FAILURE_WINDOW_MARKER in str(_kwargs.get("messages") or [])
+            )
+            return _chat_response(
+                _CHECKPOINT + "\n" + _FAILURE_WINDOW_MARKER
+            )
         return _chat_response(_CHECKPOINT)
 
     try:
@@ -136,12 +144,24 @@ def test_four_tool_heavy_in_place_compactions_survive_durable_restarts(tmp_path)
         ):
             for pass_number in range(1, 5):
                 _append_tool_heavy_tail(db, session_id, pass_number)
+                # Model four consecutive user turns. Current main protects the
+                # latest actionable user message verbatim, so a fresh turn after
+                # each tool-heavy batch leaves the completed batch compressible.
+                db.append_message(
+                    session_id=session_id,
+                    role="user",
+                    content=f"continue bounded rollout pass {pass_number}",
+                )
                 messages = db.get_messages_as_conversation(session_id)
                 active_before = {
                     row["id"] for row in db.get_messages(session_id)
                 }
                 assert active_before.isdisjoint(archived_ids)
-                assert all(str(messages).count(marker) == 1 for marker in _MARKERS)
+                input_marker_counts = [
+                    str(messages).count(marker) for marker in _MARKERS
+                ]
+                assert len(set(input_marker_counts)) == 1
+                assert 1 <= input_marker_counts[0] <= 2
 
                 if pass_number < 4:
                     agent = _make_agent(session_db=db, session_id=session_id)
@@ -187,12 +207,25 @@ def test_four_tool_heavy_in_place_compactions_survive_durable_restarts(tmp_path)
                     messages,
                     system_message="bounded system prompt",
                     approx_tokens=oversized["estimated_input_tokens"],
+                    # The injected pass-3 summary failure activates main's
+                    # intentional cooldown. A manual retry is the supported way
+                    # to prove the fallback feeds the next iterative summary.
+                    force=pass_number == 4,
                 )
 
                 assert agent.session_id == session_id
                 assert agent._last_compaction_in_place is True
                 assert system_prompt == "bounded system prompt"
-                assert all(str(compacted).count(marker) == 1 for marker in _MARKERS)
+                marker_counts = [
+                    str(compacted).count(marker) for marker in _MARKERS
+                ]
+                assert len(set(marker_counts)) == 1
+                # First compaction may contain the task in both the grounded
+                # snapshot and the model summary; iterative passes converge to
+                # one bounded copy instead of accumulating duplicates.
+                assert marker_counts[0] <= 2
+                if pass_number >= 2:
+                    assert marker_counts[0] == 1
                 bounded = build_provider_request_admission_receipt(
                     agent,
                     {
@@ -234,7 +267,13 @@ def test_four_tool_heavy_in_place_compactions_survive_durable_restarts(tmp_path)
                 db.close()
                 db = SessionDB(db_path=db_path)
                 reloaded = db.get_messages_as_conversation(session_id)
-                assert all(str(reloaded).count(marker) == 1 for marker in _MARKERS)
+                reloaded_marker_counts = [
+                    str(reloaded).count(marker) for marker in _MARKERS
+                ]
+                assert len(set(reloaded_marker_counts)) == 1
+                assert 1 <= reloaded_marker_counts[0] <= 2
+                if pass_number >= 2:
+                    assert reloaded_marker_counts[0] == 1
                 if pass_number >= 3:
                     assert (
                         _compaction_summary_text(reloaded).count(
@@ -246,7 +285,8 @@ def test_four_tool_heavy_in_place_compactions_survive_durable_restarts(tmp_path)
                     row["id"] for row in db.get_messages(session_id)
                 }.isdisjoint(archived_ids)
 
-        assert summary_calls == 3
+        assert summary_calls == 4
+        assert fallback_reached_next_summary is True
         assert db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
         assert db.get_session(session_id)["message_count"] == len(reloaded)
     finally:
