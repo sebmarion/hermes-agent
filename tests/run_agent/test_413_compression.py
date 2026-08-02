@@ -86,6 +86,8 @@ def agent():
         a = AIAgent(
             api_key="test-key-1234567890",
             base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            model="test/model",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -101,6 +103,20 @@ def agent():
         a.compression_enabled = True
         a.save_trajectories = False
         return a
+
+
+@pytest.fixture()
+def admitted_provider_request(monkeypatch):
+    """Isolate proactive-compression tests from the final admission guard."""
+    monkeypatch.setattr(
+        "agent.conversation_loop.build_provider_request_admission_receipt",
+        lambda *_args, **_kwargs: {
+            "decision": "admit",
+            "reason": "within_effective_input_ceiling",
+            "estimated_input_tokens": 100,
+            "category_estimated_tokens": {"total": 100},
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -227,14 +243,8 @@ class TestHTTP413Compression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
 
-    def test_413_strips_vision_payloads_when_compression_cannot_reduce_messages(self, agent):
-        """If compression leaves image payloads behind, strip them and retry.
-
-        Browser vision tool results can contain base64 image parts. A 413 can
-        persist even after summarisation when the remaining recent tool result
-        still carries binary data; Hermes should evict the image payload and
-        keep the text/placeholder context instead of failing immediately.
-        """
+    def test_413_no_progress_fails_closed_without_ephemeral_image_retry(self, agent):
+        """A no-op compaction must not retry from an unpersisted API-only copy."""
         err_413 = _make_413_error()
         ok_resp = _mock_response(content="Recovered after image eviction", finish_reason="stop")
         request_payloads = []
@@ -281,21 +291,16 @@ class TestHTTP413Compression:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            # Simulate the bad production case: compression ran, but the
-            # recent vision tool message survived so message count did not drop.
+            # Compression made no canonical progress. The old recovery path
+            # stripped only the provider-facing copy and retried without
+            # durably adopting/rebaselining that projection.
             mock_compress.side_effect = lambda msgs, *_a, **_k: (msgs, "compressed prompt")
             result = agent.run_conversation("continue", conversation_history=prefill)
 
         mock_compress.assert_called_once()
-        assert result["completed"] is True
-        assert result["final_response"] == "Recovered after image eviction"
-        assert len(request_payloads) == 2
-        first_tool = next(m for m in request_payloads[0]["messages"] if m.get("role") == "tool")
-        retried_tool = next(m for m in request_payloads[1]["messages"] if m.get("role") == "tool")
-        assert "Screenshot of the dashboard" in str(first_tool["content"])
-        assert "data:image" not in str(retried_tool["content"])
-        assert "Screenshot of the dashboard" in str(retried_tool["content"])
-        assert not getattr(agent, "_no_list_tool_content_models", set())
+        assert result["completed"] is False
+        assert result["compression_exhausted"] is True
+        assert len(request_payloads) == 1
 
     def test_413_clears_conversation_history_on_persist(self, agent):
         """After 413-triggered compression, _persist_session must receive None history.
@@ -589,7 +594,9 @@ class TestPreflightCompression:
         assert "Compacting context" in events[0][1]
         assert events[1] == ("compress", "started")
 
-    def test_preflight_compresses_oversized_history(self, agent):
+    def test_preflight_compresses_oversized_history(
+        self, agent, admitted_provider_request
+    ):
         """When loaded history exceeds the model's context threshold, compress before API call."""
         agent.compression_enabled = True
         # Set a small context so the history is "oversized", but large enough
@@ -783,7 +790,9 @@ class TestPreflightCompression:
 
         mock_compress.assert_not_called()
 
-    def test_preflight_respects_anti_thrash(self, agent):
+    def test_preflight_respects_anti_thrash(
+        self, agent, admitted_provider_request
+    ):
         """Preflight must call ``should_compress()`` so anti-thrash applies.
 
         Regression for #29335 — preflight used to bypass ``should_compress()``

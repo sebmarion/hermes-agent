@@ -53,6 +53,17 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
 
+class ProviderRequestBudgetError(RuntimeError):
+    """Typed local rejection raised before a provider transport is called."""
+
+    def __init__(self, receipt: Dict[str, Any]):
+        self.receipt = dict(receipt)
+        super().__init__(
+            "provider request rejected locally: "
+            + str(self.receipt.get("reason") or "unknown_reason")
+        )
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 

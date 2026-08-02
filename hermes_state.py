@@ -4417,13 +4417,17 @@ class SessionDB:
         compacted_messages: List[Dict[str, Any]],
         *,
         expected_active_message_ids: Optional[Tuple[int, ...]] = None,
+        system_prompt: Optional[str] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
         Soft-archives every currently-active message (``active = 0``) and
         inserts *compacted_messages* as fresh active rows — atomically, in one
-        write transaction. The conversation keeps ONE session id for life
-        (#38763) WITHOUT destroying history:
+        write transaction. When ``system_prompt`` is provided, the rebuilt
+        prompt is committed in that same transaction so the durable projection
+        can never expose new messages with the old prompt (or vice versa). The
+        conversation keeps ONE session id for life (#38763) WITHOUT destroying
+        history:
 
         - The live-context load (:meth:`get_messages_as_conversation`,
           :meth:`get_messages`) filters ``active = 1`` by default, so the model
@@ -4484,12 +4488,27 @@ class SessionDB:
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
-                "last_activity_at = (SELECT MAX(timestamp) FROM messages "
-                "WHERE session_id = ? AND active = 1) WHERE id = ?",
-                (inserted, tool_calls_total, session_id, session_id),
-            )
+            if system_prompt is None:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                    "last_activity_at = (SELECT MAX(timestamp) FROM messages "
+                    "WHERE session_id = ? AND active = 1) WHERE id = ?",
+                    (inserted, tool_calls_total, session_id, session_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                    "system_prompt = ?, "
+                    "last_activity_at = (SELECT MAX(timestamp) FROM messages "
+                    "WHERE session_id = ? AND active = 1) WHERE id = ?",
+                    (
+                        inserted,
+                        tool_calls_total,
+                        system_prompt,
+                        session_id,
+                        session_id,
+                    ),
+                )
             self._bump_session_projection_for_id(conn, session_id)
             return inserted
 

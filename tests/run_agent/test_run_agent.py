@@ -47,6 +47,18 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
+def _sync_test_compressor_identity(agent) -> None:
+    """Mirror the runtime rebind helper after a test mutates provider/model."""
+    agent.context_compressor.update_model(
+        model=agent.model,
+        context_length=agent.context_compressor.context_length,
+        base_url=agent.base_url,
+        api_key=agent.api_key,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+
+
 def test_is_destructive_command_treats_cp_as_mutating():
     assert run_agent._is_destructive_command("cp .env.local .env") is True
 
@@ -108,6 +120,8 @@ def agent():
         a = AIAgent(
             api_key="test-key-1234567890",
             base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            model="test/model",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -4376,6 +4390,7 @@ class TestRunConversation:
             agent._fallback_activated = True
             agent.model = "anthropic/claude-sonnet-4"
             agent.provider = "openrouter"
+            _sync_test_compressor_identity(agent)
             return True
 
         with (
@@ -4412,6 +4427,7 @@ class TestRunConversation:
             agent._fallback_activated = True
             agent.model = "anthropic/claude-sonnet-4"
             agent.provider = "openrouter"
+            _sync_test_compressor_identity(agent)
             return True
 
         with (
@@ -4598,6 +4614,7 @@ class TestRunConversation:
         self._setup_agent(agent)
         agent.provider = "nous"
         agent.api_mode = "chat_completions"
+        _sync_test_compressor_identity(agent)
 
         calls = {"api": 0, "refresh": 0}
 
@@ -4711,6 +4728,7 @@ class TestRunConversation:
         agent.context_compressor.threshold_tokens = int(
             agent.context_compressor.context_length * agent.context_compressor.threshold_percent
         )
+        _sync_test_compressor_identity(agent)
 
         err_400 = Exception(
             "HTTP 400: invalid params, context window exceeds limit (2013)"
@@ -4757,6 +4775,7 @@ class TestRunConversation:
         agent.context_compressor.threshold_tokens = int(
             agent.context_compressor.context_length * agent.context_compressor.threshold_percent
         )
+        _sync_test_compressor_identity(agent)
 
         err_400 = Exception(
             "HTTP 400: invalid params, context window exceeds limit (2013)"
@@ -4845,6 +4864,7 @@ class TestRunConversation:
         agent.base_url = "http://localhost:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "glm-5.1:cloud"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -4890,6 +4910,7 @@ class TestRunConversation:
         agent.base_url = "http://localhost:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "glm-5.1:cloud"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -4923,6 +4944,7 @@ class TestRunConversation:
         agent.base_url = "https://api.openai.com/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "gpt-4o-mini"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -4959,6 +4981,7 @@ class TestRunConversation:
         agent.base_url = "http://127.0.0.1:60000/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "glm-5-fp8"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -4990,6 +5013,7 @@ class TestRunConversation:
         agent.base_url = "http://localhost:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "glm-5.1:cloud"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -5031,6 +5055,7 @@ class TestRunConversation:
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "ollama"
         agent.model = "glm-5.1:cloud"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -5074,6 +5099,7 @@ class TestRunConversation:
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "zai"
         agent.model = "glm-5-turbo"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -7244,6 +7270,7 @@ class TestReasoningReplayForStrictProviders:
         agent.base_url = "https://api.kimi.com/coding/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "kimi-coding"
+        _sync_test_compressor_identity(agent)
 
         prior_assistant = {
             "role": "assistant",
@@ -7287,6 +7314,7 @@ class TestReasoningReplayForStrictProviders:
         agent.base_url = "https://api.kimi.com/coding/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "kimi-coding"
+        _sync_test_compressor_identity(agent)
         prior_assistant = {
             "role": "assistant",
             "content": "",
@@ -7327,6 +7355,7 @@ class TestReasoningReplayForStrictProviders:
         agent.base_url = "https://api.mistral.ai/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "mistral"
+        _sync_test_compressor_identity(agent)
         prior_assistant = {
             "role": "assistant",
             "content": "",

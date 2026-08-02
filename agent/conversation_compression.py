@@ -598,9 +598,11 @@ def compress_context(
     # eliminating the session-rotation bug cluster. In-place is the default;
     # an explicit compression.in_place=false opts into legacy rotation.
     in_place = bool(getattr(agent, "compression_in_place", False))
+    _original_cached_system_prompt = getattr(agent, "_cached_system_prompt", None)
     # Set True once the in-place DB write actually completes (the DB block can
     # raise and skip it). Surfaced to the gateway via agent._last_compaction_in_place.
     compacted_in_place = False
+    agent._last_compaction_in_place = False
     logger.info(
         "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
         agent.session_id or "none", _pre_msg_count,
@@ -633,6 +635,12 @@ def compress_context(
     # we just sit out this round and let the winner finish.
     _lock_db = getattr(agent, "_session_db", None)
     _lock_sid = agent.session_id or ""
+    _durable_in_place = bool(
+        in_place
+        and _lock_db is not None
+        and _lock_sid
+        and not bool(getattr(agent, "_persist_disabled", False))
+    )
     _lock_holder: Optional[str] = None
     # Probe whether the lock subsystem is actually available on this
     # SessionDB instance.  A process running mismatched module versions
@@ -728,6 +736,52 @@ def compress_context(
             agent._memory_manager.on_pre_compress(messages)
         except Exception:
             pass
+
+    # ContextCompressor builds a candidate summary before the durable in-place
+    # boundary. Snapshot its per-session candidate bookkeeping so a failed DB
+    # commit cannot make the next pass iterate from an unpersisted summary or
+    # drift compression counters/anti-thrash state.
+    _compressor_candidate_fields = (
+        "_previous_summary",
+        "compression_count",
+        "_last_compression_savings_pct",
+        "_ineffective_compression_count",
+        "_last_compression_made_progress",
+        "_verify_compaction_cleared_threshold",
+        "_last_summary_error",
+        "_last_summary_dropped_count",
+        "_last_summary_fallback_used",
+        "_last_compress_aborted",
+        "_last_summary_auth_failure",
+        "_last_summary_network_failure",
+        "_last_aux_model_failure_error",
+        "_last_aux_model_failure_model",
+        "_summary_model_fallen_back",
+        "_summary_failure_cooldown_until",
+        "last_prompt_tokens",
+        "last_completion_tokens",
+        "last_real_prompt_tokens",
+        "last_compression_rough_tokens",
+        "last_rough_tokens_when_real_prompt_fit",
+        "awaiting_real_usage_after_compression",
+    )
+    _missing_candidate_state = object()
+    _compressor_candidate_state = {
+        field: getattr(
+            agent.context_compressor, field, _missing_candidate_state
+        )
+        for field in _compressor_candidate_fields
+    } if _durable_in_place else {}
+
+    def _restore_compressor_candidate_state() -> None:
+        for field, value in _compressor_candidate_state.items():
+            if value is _missing_candidate_state:
+                try:
+                    delattr(agent.context_compressor, field)
+                except AttributeError:
+                    pass
+            else:
+                setattr(agent.context_compressor, field, value)
 
     try:
         compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
@@ -844,7 +898,11 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
-                    agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    agent._session_db.archive_and_compact(
+                        agent.session_id,
+                        compressed,
+                        system_prompt=new_system_prompt,
+                    )
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
                     # are passed as conversation_history next turn and skipped by
@@ -961,7 +1019,10 @@ def compress_context(
                 # in-place keeps and rotation has already reassigned to the new id):
                 # refresh the stored system prompt and reset the flush cursor so the
                 # next turn re-bases its append diff.
-                agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
+                if not in_place:
+                    agent._session_db.update_system_prompt(
+                        agent.session_id, new_system_prompt
+                    )
                 agent._last_flushed_db_idx = 0
             except Exception as e:
                 # If the rotation rolled back to the parent (orphan-avoidance
@@ -976,6 +1037,20 @@ def compress_context(
                     )
                 else:
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+                if _durable_in_place:
+                    # The summary is only a candidate until the same-session
+                    # messages + rebuilt prompt commit succeeds. Keep the exact
+                    # original canonical projection on any durable failure.
+                    agent._cached_system_prompt = _original_cached_system_prompt
+                    agent._last_compaction_in_place = False
+                    _restore_compressor_candidate_state()
+                    _existing_sp = _original_cached_system_prompt
+                    if not _existing_sp:
+                        _existing_sp = system_message or agent._build_system_prompt(
+                            system_message
+                        )
+                        agent._cached_system_prompt = _existing_sp
+                    return messages, _existing_sp
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`

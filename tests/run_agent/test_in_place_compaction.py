@@ -125,6 +125,36 @@ class TestInPlaceCompaction:
             # Live transcript actually shrank.
             assert len(compressed) == 2
 
+    def test_archive_and_compact_rolls_back_prompt_and_rows_together(self):
+        """The rebuilt prompt and active projection are one durable commit."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "atomic_prompt_projection"
+            _seed(db, sid, "atomic", n=4)
+            db.update_system_prompt(sid, "original prompt")
+            compacted = [{"role": "user", "content": "bounded summary"}]
+
+            with (
+                patch.object(
+                    db,
+                    "_bump_session_projection_for_id",
+                    side_effect=RuntimeError("projection bump failed"),
+                ),
+                pytest.raises(RuntimeError, match="projection bump failed"),
+            ):
+                db.archive_and_compact(
+                    sid,
+                    compacted,
+                    system_prompt="rebuilt prompt",
+                )
+
+            assert [row["content"] for row in db.get_messages(sid)] == [
+                f"msg {index}" for index in range(4)
+            ]
+            assert db.get_session(sid)["system_prompt"] == "original prompt"
+
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
         from hermes_state import SessionDB

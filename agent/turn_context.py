@@ -110,6 +110,8 @@ class TurnContext:
     current_turn_user_idx: int
     # Whether the post-turn memory review should fire.
     should_review_memory: bool = False
+    # Full compaction passes already consumed by the turn-start preflight.
+    compression_attempts: int = 0
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
@@ -374,6 +376,7 @@ def build_turn_context(
         )
 
     # ── Preflight context compression ──
+    compression_attempts = 0
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix
     # issue #27405 (a few very large messages slipping past the count gate).
@@ -457,6 +460,7 @@ def build_turn_context(
                 "This may take a moment."
             )
             for _pass in range(3):
+                compression_attempts += 1
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens
                 messages, active_system_prompt = agent._compress_context(
@@ -586,6 +590,7 @@ def build_turn_context(
         turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx,
         should_review_memory=should_review_memory,
+        compression_attempts=compression_attempts,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
     )
