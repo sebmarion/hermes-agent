@@ -333,6 +333,72 @@ class TestHTTP413Compression:
         assert "Screenshot of the dashboard" in str(canonical_tool["content"])
         assert not getattr(agent, "_no_list_tool_content_models", set())
 
+    def test_413_vision_projection_persistence_failure_does_not_retry(self, agent):
+        """A failed canonical adoption keeps the original payload and fails closed."""
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            raise _make_413_error()
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+        prefill = [
+            {"role": "user", "content": "please inspect this page"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_vision",
+                        "type": "function",
+                        "function": {"name": "browser_vision", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_vision",
+                "name": "browser_vision",
+                "content": [
+                    {"type": "text", "text": "Screenshot of the dashboard"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64," + ("a" * 2000)
+                        },
+                    },
+                ],
+            },
+        ]
+
+        from agent import conversation_loop
+
+        with (
+            patch.object(
+                agent,
+                "_compress_context",
+                side_effect=lambda msgs, *_a, **_k: (msgs, "compressed prompt"),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                conversation_loop,
+                "persist_in_place_projection",
+                side_effect=lambda _agent, original, _projection: (original, False),
+            ) as persist_projection,
+        ):
+            result = agent.run_conversation("continue", conversation_history=prefill)
+
+        persist_projection.assert_called_once()
+        assert result["completed"] is False
+        assert result["compression_exhausted"] is True
+        assert len(request_payloads) == 1
+        canonical_tool = next(
+            message for message in result["messages"] if message.get("role") == "tool"
+        )
+        assert "data:image" in str(canonical_tool["content"])
+
     def test_413_clears_conversation_history_on_persist(self, agent):
         """After 413-triggered compression, _persist_session must receive None history.
 

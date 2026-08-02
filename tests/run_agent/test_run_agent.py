@@ -6510,10 +6510,8 @@ class TestRunConversation:
         assert agent.context_compressor.context_length == 200_000
         mock_compress.assert_called_once()
 
-    def test_output_cap_retry_request_pressure_lower_bound(self, agent):
-        """When the provider reports a large available_tokens but local request
-        pressure leaves less room, the retry cap is the smaller of the two.
-        """
+    def test_output_cap_retry_is_readmitted_against_final_request(self, agent):
+        """The lowered output-cap retry passes the same final admission gate."""
         self._setup_agent(agent)
         agent.api_mode = "chat_completions"
         agent.provider = "openrouter"
@@ -6521,15 +6519,12 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
-
-        # A large API-only system prompt so the local estimate is the binding
-        # constraint, not the provider's available_tokens.
-        agent._cached_system_prompt = "S" * 796_000
 
         error_msg = (
             "max_tokens: 65536 > context_window: 200000 "
-            "- input_tokens: 190000 = available_tokens: 50000"
+            "- input_tokens: 150000 = available_tokens: 50000"
         )
         exc = Exception(error_msg)
         exc.status_code = 400
@@ -6548,19 +6543,15 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        first_call = agent.client.chat.completions.create.call_args_list[0].kwargs
         second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
         assert result["completed"] is True
-
-        # Verify the local estimate is actually the lower bound.
-        from agent.model_metadata import estimate_request_tokens_rough
-        estimated_request = estimate_request_tokens_rough(
-            first_call["messages"], tools=agent.tools or None,
+        assert second_call["max_tokens"] == 49_936
+        receipt = agent._last_provider_admission_receipt
+        assert receipt["decision"] == "admit"
+        assert (
+            receipt["estimated_input_with_margin_tokens"]
+            <= receipt["effective_input_ceiling"]
         )
-        local_available = 200_000 - estimated_request
-        expected_cap = max(1, min(50_000, local_available) - 64)
-        assert local_available < 50_000
-        assert second_call["max_tokens"] == expected_cap
         assert agent.context_compressor.context_length == 200_000
         mock_compress.assert_not_called()
 
@@ -6615,6 +6606,7 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = False
         agent.context_compressor.context_length = 200_000
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
         error_msg = (
@@ -6662,6 +6654,7 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = False
         agent.context_compressor.context_length = 131_072
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
         # vLLM-format error (from tests/test_output_cap_parsing.py)

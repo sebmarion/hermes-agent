@@ -3378,6 +3378,18 @@ def _run_conversation(
                 # compress history and retry, not abort immediately.
                 status_code = getattr(api_error, "status_code", None)
 
+                # Output-cap recovery only lowers the requested response size;
+                # it does not compact input history. Keep it available even
+                # when automatic compaction is disabled, then re-admit the
+                # rebuilt provider-ready request before transport.
+                _available_output_tokens = (
+                    parse_available_output_tokens_from_error(error_msg)
+                )
+                _is_output_cap_recovery = (
+                    is_output_cap_error(error_msg)
+                    or _available_output_tokens is not None
+                )
+
                 # ── Respect disabled auto-compaction on overflow ──────
                 # Ported from anomalyco/opencode#30749.  When the user has
                 # turned auto-compaction off (``compression.enabled: false``),
@@ -3402,6 +3414,7 @@ def _run_conversation(
                 if (
                     classified.reason in _overflow_reasons
                     and not getattr(agent, "compression_enabled", True)
+                    and not _is_output_cap_recovery
                 ):
                     agent._flush_status_buffer()
                     agent._vprint(
@@ -3776,7 +3789,7 @@ def _run_conversation(
                             )
                             agent._buffer_status(
                                 "📐 Compression could not reduce the request further — "
-                                "removed retained vision payloads, persisted the "
+                                "removed retained vision payloads, adopted the "
                                 "bounded projection, and will remeasure before retrying..."
                             )
                             _retry.restart_with_compressed_messages = True
@@ -3829,7 +3842,7 @@ def _run_conversation(
                     #
                     # Note: max_tokens = output token cap (one response).
                     #       context_length = total window (input + output combined).
-                    available_out = parse_available_output_tokens_from_error(error_msg)
+                    available_out = _available_output_tokens
                     if available_out is not None:
                         # Error is purely about the output cap being too large.
                         # Cap output to the available space and retry without
