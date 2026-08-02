@@ -1013,6 +1013,47 @@ def conversation_history_after_compression(
     return None
 
 
+def _capture_active_projection_ids(
+    session_db: Any,
+    session_id: str,
+    previous_messages: list,
+) -> tuple[int, ...]:
+    """Validate a durable snapshot and return its exact active-row identity.
+
+    The active rows may be a prefix of ``previous_messages`` because the live
+    list can include a current turn that has not been flushed yet.  Canonical
+    replay normalization is required here: restored DB rows intentionally omit
+    transport-only fields and normalize persisted content.
+
+    The returned IDs are a compare-and-swap token for
+    ``archive_and_compact()``.  A caller must pass them unchanged into the
+    archive transaction so any append or competing compaction after this read
+    fails closed instead of archiving content outside this snapshot.
+    """
+    active_rows = session_db.get_messages(session_id)
+    if len(active_rows) > len(previous_messages):
+        raise RuntimeError("active session projection extends past snapshot")
+    durable_projection = [
+        session_db._canonical_persisted_replay_message(
+            row,
+            include_timestamp=False,
+            normalize_for_persistence=True,
+        )
+        for row in active_rows
+    ]
+    previous_prefix = [
+        session_db._canonical_persisted_replay_message(
+            message,
+            include_timestamp=False,
+            normalize_for_persistence=True,
+        )
+        for message in previous_messages[:len(active_rows)]
+    ]
+    if durable_projection != previous_prefix:
+        raise RuntimeError("active session projection does not match snapshot")
+    return tuple(row["id"] for row in active_rows)
+
+
 def persist_in_place_projection(
     agent: Any,
     previous_messages: list,
@@ -1062,28 +1103,11 @@ def persist_in_place_projection(
         return previous_messages, False
 
     try:
-        active_rows = session_db.get_messages(session_id)
-        if len(active_rows) > len(previous_messages):
-            return previous_messages, False
-        durable_projection = [
-            session_db._canonical_persisted_replay_message(
-                row,
-                include_timestamp=False,
-                normalize_for_persistence=True,
-            )
-            for row in active_rows
-        ]
-        previous_prefix = [
-            session_db._canonical_persisted_replay_message(
-                message,
-                include_timestamp=False,
-                normalize_for_persistence=True,
-            )
-            for message in previous_messages[:len(active_rows)]
-        ]
-        if durable_projection != previous_prefix:
-            return previous_messages, False
-        expected_active_ids = tuple(row["id"] for row in active_rows)
+        expected_active_ids = _capture_active_projection_ids(
+            session_db,
+            session_id,
+            previous_messages,
+        )
         session_db.archive_and_compact(
             session_id,
             compacted_messages,
@@ -1844,6 +1868,32 @@ def compress_context(
                     # instead of under-counting the newly visible rows.
                     approx_tokens = 0
 
+        _expected_active_message_ids: Optional[tuple[int, ...]] = None
+        if _durable_in_place:
+            try:
+                _expected_active_message_ids = _capture_active_projection_ids(
+                    _lock_db,
+                    _lock_sid,
+                    messages,
+                )
+            except Exception as _snapshot_err:
+                logger.warning(
+                    "in-place compression skipped: durable projection does not "
+                    "match the input snapshot for session=%s (%s)",
+                    _lock_sid,
+                    _snapshot_err,
+                )
+                agent._cached_system_prompt = _original_cached_system_prompt
+                agent._last_compaction_in_place = False
+                _existing_sp = _original_cached_system_prompt
+                if not _existing_sp:
+                    _existing_sp = system_message or agent._build_system_prompt(
+                        system_message
+                    )
+                    agent._cached_system_prompt = _existing_sp
+                _release_lock()
+                return messages, _existing_sp
+
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
         # wants surfaced inside the compression summary; capture and forward it
@@ -2235,6 +2285,7 @@ def compress_context(
                     agent._session_db.archive_and_compact(
                         agent.session_id,
                         compressed,
+                        expected_active_message_ids=_expected_active_message_ids,
                         system_prompt=new_system_prompt,
                     )
                     split_status = "in_place_committed"
