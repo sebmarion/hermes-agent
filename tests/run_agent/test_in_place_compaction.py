@@ -13,7 +13,7 @@ import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -59,7 +59,126 @@ def _seed(db, sid, title, n=8):
         )
 
 
+def _seed_messages(n=8):
+    return [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"msg {index}",
+        }
+        for index in range(n)
+    ]
+
+
 class TestInPlaceCompaction:
+    def test_concurrent_append_after_snapshot_fails_cas_without_adoption(self):
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=db_path)
+            writer = SessionDB(db_path=db_path)
+            sid = "automatic_compaction_stale_append"
+            _seed(db, sid, "race")
+            db.update_system_prompt(sid, "original prompt")
+            agent = _make_agent(db, sid, in_place=True)
+            agent._cached_system_prompt = "original prompt"
+            agent.event_callback = MagicMock()
+            agent.context_compressor._previous_summary = "durable summary"
+            agent.context_compressor.compression_count = 4
+            original_messages = _seed_messages()
+
+            def candidate_compression(*_args, **_kwargs):
+                agent.context_compressor._previous_summary = "unpersisted candidate"
+                agent.context_compressor.compression_count = 5
+                return [{"role": "user", "content": "candidate summary"}]
+
+            agent.context_compressor.compress = MagicMock(
+                side_effect=candidate_compression
+            )
+            agent._build_system_prompt = MagicMock(return_value="rebuilt prompt")
+            archive = db.archive_and_compact
+
+            def append_then_archive(*args, **kwargs):
+                writer.append_message(
+                    session_id=sid,
+                    role="user",
+                    content="concurrent append",
+                )
+                return archive(*args, **kwargs)
+
+            try:
+                with patch.object(
+                    db,
+                    "archive_and_compact",
+                    side_effect=append_then_archive,
+                ):
+                    returned, returned_prompt = compress_context(
+                        agent,
+                        original_messages,
+                        approx_tokens=100_000,
+                        system_message="sys",
+                    )
+
+                assert returned is original_messages
+                assert returned_prompt == "original prompt"
+                assert agent._cached_system_prompt == "original prompt"
+                assert agent._last_compaction_in_place is False
+                assert agent.context_compressor._previous_summary == "durable summary"
+                assert agent.context_compressor.compression_count == 4
+                agent.event_callback.assert_not_called()
+                assert [row["content"] for row in db.get_messages(sid)] == [
+                    *(f"msg {index}" for index in range(8)),
+                    "concurrent append",
+                ]
+                assert all(
+                    row["active"] == 1 and row["compacted"] == 0
+                    for row in db.get_messages(sid, include_inactive=True)
+                )
+            finally:
+                writer.close()
+                db.close()
+
+    def test_initial_durable_prefix_mismatch_fails_before_summary(self):
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "automatic_compaction_prefix_mismatch"
+            _seed(db, sid, "mismatch")
+            db.update_system_prompt(sid, "original prompt")
+            agent = _make_agent(db, sid, in_place=True)
+            agent._cached_system_prompt = "original prompt"
+            agent.event_callback = MagicMock()
+            compressor = MagicMock(
+                return_value=[{"role": "user", "content": "candidate summary"}]
+            )
+            agent.context_compressor.compress = compressor
+            mismatched_messages = _seed_messages()
+            mismatched_messages[0] = {
+                "role": "user",
+                "content": "different in-memory prefix",
+            }
+
+            returned, returned_prompt = compress_context(
+                agent,
+                mismatched_messages,
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+
+            assert returned is mismatched_messages
+            assert returned_prompt == "original prompt"
+            assert agent._cached_system_prompt == "original prompt"
+            assert agent._last_compaction_in_place is False
+            compressor.assert_not_called()
+            agent.event_callback.assert_not_called()
+            assert [row["content"] for row in db.get_messages(sid)] == [
+                f"msg {index}" for index in range(8)
+            ]
+            assert db.get_compression_lock_holder(sid) is None
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB
@@ -72,7 +191,7 @@ class TestInPlaceCompaction:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _seed_messages()
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -165,7 +284,7 @@ class TestInPlaceCompaction:
             sid = "20260619_120500_cccccc"
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _seed_messages()
             compressed, _ = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -189,7 +308,7 @@ class TestInPlaceCompaction:
                 "n", calls["n"] + 1
             )
             compress_context(
-                agent, [{"role": "user", "content": "x"}] * 8,
+                agent, _seed_messages(),
                 approx_tokens=100_000, system_message="sys",
             )
             assert calls["n"] == 0
@@ -264,7 +383,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
             compress_context(
-                a_ip, [{"role": "user", "content": "x"}] * 8,
+                a_ip, _seed_messages(),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_ip._last_compaction_in_place is True
