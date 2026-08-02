@@ -81,13 +81,14 @@ def finalize_turn(
         iteration_limit_fallback = True
         preserved_verification_fallback = True
     elif final_response is None and budget_fallback_eligible:
-        # Budget exhausted — ask the model for a summary via one extra
-        # API call with tools stripped.  _handle_max_iterations injects a
-        # user message and makes a single toolless request.
+        # Budget exhausted — finalize deterministically. A model-generated
+        # summary here would be an extra provider call outside the main loop's
+        # final admission boundary, and could transport the very oversized
+        # transcript that exhausted the turn.
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         agent._emit_status(
             f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-            "— asking model to summarise"
+            "— finalizing with a recovery handoff"
         )
         if not agent.quiet_mode:
             agent._safe_print(
@@ -109,12 +110,16 @@ def finalize_turn(
             final_response = None
 
         if final_response is None:
-            final_response = agent._handle_max_iterations(messages, api_call_count)
+            final_response = (
+                f"Iteration limit reached ({api_call_count}/{agent.max_iterations}) "
+                "before the task completed. The session and tool results were "
+                "preserved. Start a new turn to continue from this state, review "
+                "the latest tool results, and verify the remaining work before "
+                "claiming completion."
+            )
 
-        # The model-summary path appends its assistant message inside
-        # _handle_max_iterations. The deterministic verification-gap path does
-        # not call the model, so close the in-memory turn here before trajectory
-        # saving/persistence so every sink sees the same final response.
+        # Close the in-memory turn before trajectory saving/persistence so every
+        # sink sees the same deterministic recovery response.
         if final_response:
             try:
                 _tail_role = messages[-1].get("role") if messages else None
@@ -478,7 +483,7 @@ def finalize_turn(
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
-        "partial": False,  # True only when stopped due to invalid tool calls
+        "partial": iteration_limit_fallback,
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),

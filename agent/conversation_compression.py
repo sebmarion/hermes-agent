@@ -1499,9 +1499,11 @@ def compress_context(
     # NOT fall back to rotation mode — that re-enables the pre-lease drift
     # path and can wedge busy sessions that never set the flag.
     in_place = bool(getattr(agent, "compression_in_place", True))
+    _original_cached_system_prompt = getattr(agent, "_cached_system_prompt", None)
     # Set True once the in-place DB write actually completes (the DB block can
     # raise and skip it). Surfaced to the gateway via agent._last_compaction_in_place.
     compacted_in_place = False
+    agent._last_compaction_in_place = False
     logger.info(
         "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
         agent.session_id or "none", _pre_msg_count,
@@ -1559,6 +1561,12 @@ def compress_context(
     # we just sit out this round and let the winner finish.
     _lock_db = getattr(agent, "_session_db", None)
     _lock_sid = agent.session_id or ""
+    _durable_in_place = bool(
+        in_place
+        and _lock_db is not None
+        and _lock_sid
+        and not bool(getattr(agent, "_persist_disabled", False))
+    )
     _lock_holder: Optional[str] = None
     # Probe whether the lock subsystem is actually available on this
     # SessionDB instance. A process running mismatched module versions can have
@@ -1874,6 +1882,56 @@ def compress_context(
                     engine_name,
                 )
 
+        # ContextCompressor builds candidate state before the durable in-place
+        # boundary. Restore it if the atomic projection+prompt commit fails.
+        _compressor_candidate_fields = (
+            "_previous_summary",
+            "compression_count",
+            "_last_compression_savings_pct",
+            "_ineffective_compression_count",
+            "_last_compression_made_progress",
+            "_verify_compaction_cleared_threshold",
+            "_last_summary_error",
+            "_last_summary_dropped_count",
+            "_last_summary_fallback_used",
+            "_last_compress_aborted",
+            "_last_summary_auth_failure",
+            "_last_summary_network_failure",
+            "_last_aux_model_failure_error",
+            "_last_aux_model_failure_model",
+            "_summary_model_fallen_back",
+            "_summary_failure_cooldown_until",
+            "last_prompt_tokens",
+            "last_completion_tokens",
+            "last_real_prompt_tokens",
+            "last_compression_rough_tokens",
+            "last_rough_tokens_when_real_prompt_fit",
+            "awaiting_real_usage_after_compression",
+        )
+        _missing_candidate_state = object()
+        _compressor_candidate_state = (
+            {
+                field: getattr(
+                    agent.context_compressor,
+                    field,
+                    _missing_candidate_state,
+                )
+                for field in _compressor_candidate_fields
+            }
+            if _durable_in_place
+            else {}
+        )
+
+        def _restore_compressor_candidate_state() -> None:
+            for field, value in _compressor_candidate_state.items():
+                if value is _missing_candidate_state:
+                    try:
+                        delattr(agent.context_compressor, field)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(agent.context_compressor, field, value)
+
         messages_before_compression = copy.deepcopy(messages)
         _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
         # Publish forward progress to the commit fence while the summary LLM
@@ -2174,7 +2232,11 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
-                    agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    agent._session_db.archive_and_compact(
+                        agent.session_id,
+                        compressed,
+                        system_prompt=new_system_prompt,
+                    )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -2283,12 +2345,9 @@ def compress_context(
                         except (ValueError, Exception) as e:
                             logger.debug("Could not propagate title on compression: %s", e)
 
-                # In-place mode still updates/replaces the current row here.
-                # Rotation already published prompt + compacted handoff atomically.
+                # In-place already published prompt + compacted handoff atomically.
+                # Rotation published the handoff with its child row.
                 if in_place:
-                    agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
-                    )
                     agent._last_flushed_db_idx = 0
                 else:
                     agent._last_flushed_db_idx = len(compressed)
@@ -2328,6 +2387,20 @@ def compress_context(
                     )
                 else:
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+                if _durable_in_place:
+                    # The summary is only a candidate until the same-session
+                    # messages + rebuilt prompt commit succeeds. Keep the exact
+                    # original canonical projection on any durable failure.
+                    agent._cached_system_prompt = _original_cached_system_prompt
+                    agent._last_compaction_in_place = False
+                    _restore_compressor_candidate_state()
+                    _existing_sp = _original_cached_system_prompt
+                    if not _existing_sp:
+                        _existing_sp = system_message or agent._build_system_prompt(
+                            system_message
+                        )
+                        agent._cached_system_prompt = _existing_sp
+                    return messages, _existing_sp
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`
