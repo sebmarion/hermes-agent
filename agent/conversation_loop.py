@@ -3747,6 +3747,40 @@ def _run_conversation(
                             current_system_prompt=active_system_prompt,
                         )
                     )
+                    if compaction_failure == "compaction_made_no_progress":
+                        image_stripped_projection = [
+                            dict(message) if isinstance(message, dict) else message
+                            for message in previous_messages
+                        ]
+                        if agent._try_strip_image_parts_from_tool_messages(
+                            image_stripped_projection,
+                            remember_model=False,
+                        ):
+                            adopted_messages, projection_persisted = (
+                                persist_in_place_projection(
+                                    agent,
+                                    previous_messages,
+                                    image_stripped_projection,
+                                )
+                            )
+                            if adopted_messages is previous_messages:
+                                return _compression_exhausted_result(
+                                    "Request payload vision cleanup could not be "
+                                    "persisted safely after HTTP 413."
+                                )
+                            messages = adopted_messages
+                            conversation_history = (
+                                conversation_history_after_compression(agent, messages)
+                                if projection_persisted
+                                else None
+                            )
+                            agent._buffer_status(
+                                "📐 Compression could not reduce the request further — "
+                                "removed retained vision payloads, persisted the "
+                                "bounded projection, and will remeasure before retrying..."
+                            )
+                            _retry.restart_with_compressed_messages = True
+                            break
                     if compaction_failure:
                         messages = previous_messages
                         return _compression_exhausted_result(

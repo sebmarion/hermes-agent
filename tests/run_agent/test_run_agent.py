@@ -6431,6 +6431,7 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
         error_msg = (
@@ -6460,11 +6461,10 @@ class TestRunConversation:
         assert agent.context_compressor.context_length == 200_000
         mock_compress.assert_not_called()
 
-    def test_output_cap_retry_with_large_api_only_content(self, agent):
-        """When a large system prompt makes api_messages huge while persisted
-        messages stay tiny, the retry cap must still respect provider
-        available_tokens — not blow up to the full context window.
-        """
+    def test_final_admission_blocks_large_api_only_content_before_output_cap_retry(
+        self, agent
+    ):
+        """Final admission blocks a huge provider-ready payload before transport."""
         self._setup_agent(agent)
         agent.api_mode = "chat_completions"
         agent.provider = "openrouter"
@@ -6472,6 +6472,7 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
         # Huge API-only system prompt; persisted messages are tiny.
@@ -6498,13 +6499,16 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
-        assert result["completed"] is True
-        # The current branch (messages-only estimate) would send max_tokens
-        # near 199927 — this test fails on it.
-        assert second_call["max_tokens"] <= 936
+        assert agent.client.chat.completions.create.call_count == 0
+        assert result["completed"] is False
+        assert result["compression_exhausted"] is True
+        assert agent._last_provider_admission_receipt["decision"] == "reject"
+        assert (
+            agent._last_provider_admission_receipt["reason"]
+            == "estimated_input_plus_margin_exceeds_ceiling"
+        )
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
 
     def test_output_cap_retry_request_pressure_lower_bound(self, agent):
         """When the provider reports a large available_tokens but local request
@@ -6569,6 +6573,7 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
         error_msg = (

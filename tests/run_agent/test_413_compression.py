@@ -244,8 +244,8 @@ class TestHTTP413Compression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
 
-    def test_413_no_progress_fails_closed_without_ephemeral_image_retry(self, agent):
-        """A no-op compaction must not retry from an unpersisted API-only copy."""
+    def test_413_persists_stripped_vision_projection_before_retry(self, agent):
+        """A no-op compaction may retry only from the adopted canonical projection."""
         err_413 = _make_413_error()
         ok_resp = _mock_response(content="Recovered after image eviction", finish_reason="stop")
         request_payloads = []
@@ -286,22 +286,52 @@ class TestHTTP413Compression:
             },
         ]
 
+        from agent import conversation_loop
+
         with (
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                conversation_loop,
+                "persist_in_place_projection",
+                wraps=conversation_loop.persist_in_place_projection,
+            ) as persist_projection,
         ):
-            # Compression made no canonical progress. The old recovery path
-            # stripped only the provider-facing copy and retried without
-            # durably adopting/rebaselining that projection.
+            # Compression made no canonical progress, so the recovery must
+            # strip a changed canonical projection and adopt it before retry.
             mock_compress.side_effect = lambda msgs, *_a, **_k: (msgs, "compressed prompt")
             result = agent.run_conversation("continue", conversation_history=prefill)
 
         mock_compress.assert_called_once()
-        assert result["completed"] is False
-        assert result["compression_exhausted"] is True
-        assert len(request_payloads) == 1
+        persist_projection.assert_called_once()
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after image eviction"
+        assert len(request_payloads) == 2
+        retried_tool = next(
+            message
+            for message in request_payloads[1]["messages"]
+            if message.get("role") == "tool"
+        )
+        canonical_tool = next(
+            message for message in result["messages"] if message.get("role") == "tool"
+        )
+        previous_projection = persist_projection.call_args.args[1]
+        stripped_projection = persist_projection.call_args.args[2]
+        previous_tool = next(
+            message for message in previous_projection if message.get("role") == "tool"
+        )
+        stripped_tool = next(
+            message for message in stripped_projection if message.get("role") == "tool"
+        )
+        assert "data:image" in str(previous_tool["content"])
+        assert "data:image" not in str(stripped_tool["content"])
+        assert "data:image" not in str(retried_tool["content"])
+        assert "Screenshot of the dashboard" in str(retried_tool["content"])
+        assert "data:image" not in str(canonical_tool["content"])
+        assert "Screenshot of the dashboard" in str(canonical_tool["content"])
+        assert not getattr(agent, "_no_list_tool_content_models", set())
 
     def test_413_clears_conversation_history_on_persist(self, agent):
         """After 413-triggered compression, _persist_session must receive None history.
