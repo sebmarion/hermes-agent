@@ -1948,7 +1948,7 @@ export const en: Translations = {
     startVoice: 'Start voice conversation',
     queueMessage: 'Queue message',
     steer: 'Steer the current run',
-    stop: 'Stop',
+    stop: 'Stop the current run',
     send: 'Send',
     sending: 'Sending…',
     speaking: 'Speaking',
