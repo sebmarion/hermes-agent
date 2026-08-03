@@ -130,7 +130,6 @@ def _set_reasoning_effort(config: Dict[str, Any], effort: str) -> None:
         agent_cfg = {}
         config["agent"] = agent_cfg
     agent_cfg["reasoning_effort"] = effort
-    agent_cfg.pop("reasoning_mode", None)
 
 
 
@@ -3112,7 +3111,7 @@ def _blank_slate_minimal_toolsets(config: dict):
     config.setdefault("platform_toolsets", {})["cli"] = sorted(keep)
 
     try:
-        from toolsets import TOOLSETS, resolve_toolset
+        from toolsets import TOOLSETS
         from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _get_plugin_toolset_keys
 
         all_keys = set()
@@ -3133,19 +3132,7 @@ def _blank_slate_minimal_toolsets(config: dict):
                 # minimal Blank Slate surface (#57315).
             all_keys.add(k)
 
-        kept_tools = {
-            tool
-            for toolset in keep
-            for tool in resolve_toolset(toolset)
-        }
-        # ``disabled_toolsets`` is enforced at tool granularity. Do not disable
-        # a bundle that shares a tool with the kept surface, or that bundle
-        # would subtract the kept tool despite not being selected itself.
-        disabled = sorted(
-            key
-            for key in all_keys - keep
-            if set(resolve_toolset(key)).isdisjoint(kept_tools)
-        )
+        disabled = sorted(all_keys - keep)
         if disabled:
             config.setdefault("agent", {})["disabled_toolsets"] = disabled
     except Exception as exc:

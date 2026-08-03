@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+from pathlib import Path
 import logging
 import os
 import random
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from agent.display import (
@@ -30,18 +32,13 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
-from agent.tool_guardrails import (
-    FAILURE_STREAK_GUARDRAIL_CODES,
-    ToolCallObservation,
-    ToolGuardrailDecision,
-    append_toolguard_guidance,
-    observation_proves_verified_file_progress,
-)
+from agent.tool_guardrails import ToolGuardrailDecision
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
+    _plan_tool_batch_segments,
     make_tool_result_message,
 )
 from tools.terminal_tool import (
@@ -55,6 +52,28 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_file_checkpoint(
+    agent,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+) -> None:
+    """Checkpoint the same workspace path that the file tool will mutate."""
+    file_path = function_args.get("path", "")
+    if not file_path:
+        return
+
+    # File tools resolve relative paths against the task's live/session cwd,
+    # which can differ from the Hermes process cwd (notably in Docker).  Resolve
+    # through that same path pipeline before asking the checkpoint manager to
+    # discover the project root.
+    from tools.file_tools import _resolve_path_for_task
+
+    resolved_path = _resolve_path_for_task(file_path, effective_task_id or "default")
+    work_dir = agent._checkpoint_mgr.get_working_dir_for_path(str(resolved_path))
+    agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -117,71 +136,13 @@ def _resolve_concurrent_tool_timeout() -> float | None:
     return value
 
 
-def _clear_stale_failure_halts_after_verified_progress(agent) -> None:
-    """Drop only agent-level halts invalidated by a material patch."""
-    recorded = getattr(agent, "_tool_guardrail_halt_decisions", None)
-    survivors = [
-        decision
-        for decision in (recorded if isinstance(recorded, list) else [])
-        if decision.code not in FAILURE_STREAK_GUARDRAIL_CODES
-    ]
-    agent._tool_guardrail_halt_decisions = survivors
-    current = getattr(agent, "_tool_guardrail_halt_decision", None)
-    if (
-        current is not None
-        and current.code in FAILURE_STREAK_GUARDRAIL_CODES
-    ):
-        agent._tool_guardrail_halt_decision = next(
-            (decision for decision in survivors if decision.should_halt),
-            None,
-        )
-
-
-def _finalize_guardrail_observations(
-    agent,
-    observations: list[ToolCallObservation],
-) -> list[ToolGuardrailDecision]:
-    """Finalize one assistant tool batch and retain its first terminal decision."""
-    verified_progress = any(
-        observation_proves_verified_file_progress(observation)
-        for observation in observations
-    )
-    decisions = agent._tool_guardrails.after_batch(observations)
-    if verified_progress:
-        _clear_stale_failure_halts_after_verified_progress(agent)
-    for decision in decisions:
-        if decision.should_halt:
-            agent._set_tool_guardrail_halt(decision)
-    recovery_halt = agent._tool_guardrails.finish_recovery_epoch(
-        observations,
-        decisions,
-    )
-    if recovery_halt is not None:
-        agent._record_tool_guardrail_recovery_halt(recovery_halt)
-    elif agent._tool_guardrails.recovery_state == "recovered":
-        metadata = getattr(agent, "_tool_guardrail_recovery_metadata", None)
-        if isinstance(metadata, dict):
-            metadata["state"] = "recovered"
-    return decisions
-
-
-def _snapshot_concurrent_results(results: list) -> list:
-    """Freeze the outcomes that both guardrails and the model will observe.
-
-    Timed-out daemon workers may still finish after the executor returns from
-    its deadline wait. A single snapshot prevents a late write from changing
-    the transcript after guardrail accounting has recorded a timeout.
-    """
-    return list(results)
-
-
 def _flush_session_db_after_tool_progress(
     agent,
     messages: list,
     *,
     stage: str,
-) -> None:
-    """Best-effort incremental SessionDB flush for tool-call progress.
+) -> bool:
+    """Flush tool-call progress before projecting it to any UI surface.
 
     Tool execution can perform side effects that terminate or restart the
     current Hermes process before the normal turn-end persistence path runs.
@@ -189,9 +150,14 @@ def _flush_session_db_after_tool_progress(
     transcript survives destructive-but-valid tool calls.
     """
     try:
-        agent._flush_messages_to_session_db(messages)
+        persisted = agent._flush_messages_to_session_db(messages) is not False
+        if not persisted:
+            agent._incremental_persistence_failed = True
+        return persisted
     except Exception as exc:
+        agent._incremental_persistence_failed = True
         logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
+        return False
 
 
 def _ra():
@@ -327,54 +293,283 @@ def _tool_search_scoped_names(agent) -> frozenset:
     return names
 
 
-def _apply_tool_request_middleware_for_agent(
+@dataclass
+class _ManagedToolResult:
+    result: Any
+    args: dict[str, Any]
+    middleware_trace: list[dict[str, Any]]
+    blocked: bool
+
+
+class _ConcurrentToolAuthorizationGate:
+    """Serialize policy prompts and exclude their queue from batch deadlines."""
+
+    def __init__(self) -> None:
+        self._serialization_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._pending = 0
+        self._window_started: float | None = None
+        self._excluded_seconds = 0.0
+
+    def run(self, callback):
+        now = time.monotonic()
+        with self._state_lock:
+            if self._pending == 0:
+                self._window_started = now
+            self._pending += 1
+        try:
+            with self._serialization_lock:
+                return callback()
+        finally:
+            now = time.monotonic()
+            with self._state_lock:
+                self._pending -= 1
+                if self._pending == 0:
+                    if self._window_started is not None:
+                        self._excluded_seconds += max(
+                            0.0, now - self._window_started
+                        )
+                    self._window_started = None
+
+    def excluded_seconds(self) -> float:
+        """Return completed plus currently active authorization wait time."""
+        now = time.monotonic()
+        with self._state_lock:
+            excluded = self._excluded_seconds
+            if self._window_started is not None:
+                excluded += max(0.0, now - self._window_started)
+            return excluded
+
+
+def _managed_values(
+    outcome: _ManagedToolResult,
+) -> tuple[Any, dict[str, Any], list[dict[str, Any]], bool]:
+    return (
+        outcome.result,
+        outcome.args,
+        outcome.middleware_trace,
+        outcome.blocked,
+    )
+
+
+def _run_agent_tool_execution_middleware(
     agent,
     *,
     function_name: str,
     function_args: dict,
     effective_task_id: str,
     tool_call_id: str,
-) -> tuple[dict, dict, list[dict[str, Any]]]:
-    try:
-        from hermes_cli.middleware import apply_tool_request_middleware
+    execute,
+    scope_block: str | None = None,
+    display_index: int | None = None,
+    middleware_trace: list[dict[str, Any]] | None = None,
+    begin_execution=None,
+    authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+) -> _ManagedToolResult:
+    """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    from agent import relay_tools
+    from hermes_cli.middleware import (
+        apply_tool_request_middleware,
+        run_tool_execution_middleware,
+    )
 
-        result = apply_tool_request_middleware(
+    trace = middleware_trace if middleware_trace is not None else []
+    state = {
+        "args": function_args,
+        "middleware_trace": trace,
+        "blocked": False,
+        "dispatched": False,
+    }
+    dispatch_lock = threading.Lock()
+
+    def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
+        with dispatch_lock:
+            if state["dispatched"]:
+                raise RuntimeError(
+                    "Hermes tool execution callback invoked more than once"
+                )
+            state["dispatched"] = True
+            state["blocked"] = False
+            state["args"] = final_args
+
+        def _begin() -> None:
+            _begin_tool_execution(
+                agent,
+                function_name=function_name,
+                function_args=final_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                display_index=display_index,
+            )
+
+        def _advance_start_order(callback=None) -> None:
+            if begin_execution is None:
+                if callback is not None:
+                    callback()
+                return
+            begin_execution(callback)
+
+        block_message = scope_block
+        block_error_type = "tool_scope_block"
+        if block_message is None:
+            block_error_type = "plugin_block"
+
+            def _resolve_pre_tool_block():
+                try:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+
+                    return resolve_pre_tool_block(
+                        function_name,
+                        final_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=tool_call_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "")
+                        or "",
+                        middleware_trace=list(state["middleware_trace"]),
+                    )
+                except Exception:
+                    return None
+
+            block_message = (
+                _resolve_pre_tool_block()
+                if authorization_gate is None
+                else authorization_gate.run(_resolve_pre_tool_block)
+            )
+
+        guardrail_decision = None
+        if block_message is None:
+            guardrail_decision = agent._tool_guardrails.before_call(
+                function_name, final_args
+            )
+            if guardrail_decision.allows_execution:
+                guardrail_decision = None
+
+        if block_message is not None or guardrail_decision is not None:
+            _advance_start_order()
+            state["blocked"] = True
+            if block_message is not None:
+                result = json.dumps({"error": block_message}, ensure_ascii=False)
+                error_type = block_error_type
+                error_message = block_message
+            else:
+                result = agent._guardrail_block_result(guardrail_decision)
+                error_type = "guardrail_block"
+                error_message = (
+                    getattr(guardrail_decision, "message", None)
+                    or "Tool blocked by guardrail policy"
+                )
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=final_args,
+                result=result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                status="blocked",
+                error_type=error_type,
+                error_message=error_message,
+                middleware_trace=list(state["middleware_trace"]),
+            )
+            return result
+
+        if function_name == "memory":
+            agent._turns_since_memory = 0
+        elif function_name == "skill_manage":
+            agent._iters_since_skill = 0
+
+        _advance_start_order(_begin)
+        return execute(final_args)
+
+    def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
+        request_result = apply_tool_request_middleware(
             function_name,
-            function_args,
+            relay_args,
+            skip_relay=True,
             task_id=effective_task_id or "",
             session_id=getattr(agent, "session_id", "") or "",
             tool_call_id=tool_call_id or "",
             turn_id=getattr(agent, "_current_turn_id", "") or "",
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
-        payload = result.payload if isinstance(result.payload, dict) else function_args
-        original_payload = (
-            result.original_payload
-            if isinstance(result.original_payload, dict)
-            else function_args
+        request_args = (
+            request_result.payload
+            if isinstance(request_result.payload, dict)
+            else relay_args
         )
-        return payload, original_payload, list(result.trace)
-    except Exception as exc:
-        logger.debug("tool_request middleware error: %s", exc)
-        return function_args, function_args, []
+        trace.clear()
+        trace.extend(request_result.trace)
+        return run_tool_execution_middleware(
+            function_name,
+            request_args,
+            lambda next_args: _authorized_dispatch(
+                next_args if isinstance(next_args, dict) else request_args
+            ),
+            original_args=function_args,
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        )
+
+    result, _relay_args = relay_tools.execute(
+        function_name,
+        function_args,
+        _hermes_pipeline,
+        session_id=str(getattr(agent, "session_id", "") or ""),
+        metadata={
+            "task_id": effective_task_id or "",
+            "turn_id": getattr(agent, "_current_turn_id", "") or "",
+            "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+            "tool_call_id": tool_call_id or "",
+        },
+    )
+    return _ManagedToolResult(
+        result=result,
+        args=state["args"],
+        middleware_trace=state["middleware_trace"],
+        blocked=bool(state["blocked"]),
+    )
 
 
-def _mark_authorized_tool_start(
+def _begin_tool_execution(
     agent,
     *,
     function_name: str,
-    function_args: dict,
+    function_args: dict[str, Any],
+    effective_task_id: str,
     tool_call_id: str,
+    display_index: int | None,
 ) -> None:
-    """Run start-only side effects after the exact dispatch is authorized."""
-    if function_name == "memory":
-        agent._turns_since_memory = 0
-    elif function_name == "skill_manage":
-        agent._iters_since_skill = 0
+    """Run user-visible and checkpoint preflight on final tool arguments."""
+    if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
+        display_args = (
+            _redact_tool_args_for_display(function_name, function_args) or function_args
+        )
+        args_str = json.dumps(display_args, ensure_ascii=False)
+        prefix = f"Tool {display_index}" if display_index is not None else "Tool"
+        if agent.verbose_logging:
+            print(f"  📞 {prefix}: {function_name}({list(display_args.keys())})")
+            print(
+                agent._wrap_verbose(
+                    "Args: ", json.dumps(display_args, indent=2, ensure_ascii=False)
+                )
+            )
+        else:
+            args_preview = (
+                args_str[: agent.log_prefix_chars] + "..."
+                if len(args_str) > agent.log_prefix_chars
+                else args_str
+            )
+            print(
+                f"  📞 {prefix}: {function_name}({list(function_args.keys())}) - "
+                f"{args_preview}"
+            )
 
     agent._current_tool = function_name
     agent._touch_activity(f"executing tool: {function_name}")
-
     try:
         from tools.environments.base import set_activity_callback
 
@@ -390,13 +585,10 @@ def _mark_authorized_tool_start(
             )
             preview = _build_tool_preview(function_name, display_args)
             agent.tool_progress_callback(
-                "tool.started",
-                function_name,
-                preview,
-                display_args,
+                "tool.started", function_name, preview, display_args
             )
-        except Exception as cb_err:
-            logging.debug(f"Tool progress callback error: {cb_err}")
+        except Exception as callback_error:
+            logging.debug("Tool progress callback error: %s", callback_error)
 
     if agent.tool_start_callback:
         try:
@@ -405,83 +597,45 @@ def _mark_authorized_tool_start(
                 or function_args
             )
             agent.tool_start_callback(
-                tool_call_id,
-                function_name,
-                display_args,
+                tool_call_id, function_name, display_args
             )
-        except Exception as cb_err:
-            logging.debug(f"Tool start callback error: {cb_err}")
+        except Exception as callback_error:
+            logging.debug("Tool start callback error: %s", callback_error)
 
     if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
         try:
-            file_path = function_args.get("path", "")
-            if file_path:
-                work_dir = agent._checkpoint_mgr.get_working_dir_for_path(file_path)
-                agent._checkpoint_mgr.ensure_checkpoint(
-                    work_dir,
-                    f"before {function_name}",
-                )
+            _ensure_file_checkpoint(
+                agent,
+                function_name,
+                function_args,
+                effective_task_id,
+            )
         except Exception:
             pass
 
     if function_name == "terminal" and agent._checkpoint_mgr.enabled:
         try:
-            cmd = function_args.get("command", "")
-            if _is_destructive_command(cmd):
+            command = function_args.get("command", "")
+            if _is_destructive_command(command):
                 cwd = function_args.get("workdir") or os.getenv(
-                    "TERMINAL_CWD",
-                    os.getcwd(),
+                    "TERMINAL_CWD", os.getcwd()
                 )
                 agent._checkpoint_mgr.ensure_checkpoint(
-                    cwd,
-                    f"before terminal: {cmd[:60]}",
+                    cwd, f"before terminal: {command[:60]}"
                 )
         except Exception:
             pass
 
 
-def _run_agent_tool_execution_middleware(
-    agent,
-    *,
-    function_name: str,
-    function_args: dict,
-    effective_task_id: str,
-    tool_call_id: str,
-    original_args: dict,
-    on_authorized,
-    middleware_trace: Optional[list[dict[str, Any]]],
-    execute,
-) -> tuple[Any, dict]:
-    observed_args = function_args
-
-    def _execute(next_args: dict) -> Any:
-        nonlocal observed_args
-        observed_args = next_args if isinstance(next_args, dict) else function_args
-        on_authorized(observed_args)
-        return execute(observed_args)
-
-    from hermes_cli.middleware import run_tool_execution_middleware
-
-    result = run_tool_execution_middleware(
-        function_name,
-        function_args,
-        _execute,
-        original_args=original_args,
-        task_id=effective_task_id or "",
-        session_id=getattr(agent, "session_id", "") or "",
-        tool_call_id=tool_call_id or "",
-        turn_id=getattr(agent, "_current_turn_id", "") or "",
-        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-        middleware_trace=list(middleware_trace or []),
-    )
-    return result, observed_args
-
-
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
     messages so the API sees them in the expected sequence.
+
+    ``finalize=False`` skips the end-of-batch aggregate budget enforcement
+    and /steer injection — used when this call is one segment of a larger
+    mixed batch and the segmented dispatcher owns the turn-end work.
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
@@ -508,10 +662,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         return
 
     # ── Parse args + pre-execution bookkeeping ───────────────────────
-    # Keep both audit-original args and request-middleware output. Execution
-    # middleware may rewrite the effective args again inside the worker.
+    # (tool call, resolved name, parsed args, middleware trace, parse error,
+    # tool-search scope block)
     parsed_calls = []
-    guardrail_signatures = []
     for tool_call in tool_calls:
         function_name = tool_call.function.name
 
@@ -525,20 +678,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     tool_call,
                     function_name,
                     function_args,
-                    function_args,
                     [],
                     malformed_args_result,
-                    False,
+                    None,
                 )
             )
-            guardrail_signatures.append(None)
             continue
-
-        # Reset nudge counters only for a structurally valid invocation.
-        if function_name == "memory":
-            agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
 
         # ── Tool Search unwrap ────────────────────────────────────────
         # When the model invokes the tool_call bridge, peel it open so
@@ -563,159 +708,67 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
-                        function_name = _underlying
-                        function_args = _underlying_args
+                        # Probe-validate before unwrapping (ironclaw#5149):
+                        # missing required args return the parameter schema
+                        # instead of dispatching into an opaque failure.
+                        _probe_err = _ts.validate_deferred_call_args(_underlying, _underlying_args)
+                        if _probe_err is not None:
+                            _ts_scope_block = _probe_err
+                        else:
+                            function_name = _underlying
+                            function_args = _underlying_args
                     else:
-                        _ts_scope_block = json.dumps({
-                            "error": (
-                                f"'{_underlying}' is not available in this session. "
-                                "Use tool_search to find tools you can call."
-                            ),
-                        }, ensure_ascii=False)
+                        _ts_scope_block = (
+                            f"'{_underlying}' is not available in this session. "
+                            "Use tool_search to find tools you can call."
+                        )
         except Exception:
             pass
 
-        (
-            function_args,
-            original_function_args,
-            middleware_trace,
-        ) = _apply_tool_request_middleware_for_agent(
-            agent,
-            function_name=function_name,
-            function_args=function_args,
-            effective_task_id=effective_task_id,
-            tool_call_id=getattr(tool_call, "id", "") or "",
-        )
-
-        # ── Block evaluation (BEFORE checkpoint preflight) ───────────
-        # We must know whether the tool will execute before touching
-        # checkpoint state (dedup slot, real snapshots).
-        block_result = None
-        blocked_by_guardrail = False
-        guardrail_signature = None
-        if _ts_scope_block is not None:
-            # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
-            block_result = _ts_scope_block
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                result=block_result,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                status="blocked",
-                error_type="tool_scope_block",
-                error_message=_ts_scope_block,
-                middleware_trace=list(middleware_trace),
-            )
-        else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                block_message = None
-
-            if block_message is not None:
-                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
-                _emit_terminal_post_tool_call(
-                    agent,
-                    function_name=function_name,
-                    function_args=function_args,
-                    result=block_result,
-                    effective_task_id=effective_task_id,
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    status="blocked",
-                    error_type="plugin_block",
-                    error_message=block_message,
-                    middleware_trace=list(middleware_trace),
-                )
-            else:
-                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-                guardrail_signature = guardrail_decision.signature
-                if not guardrail_decision.allows_execution:
-                    block_result = agent._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
-                    _emit_terminal_post_tool_call(
-                        agent,
-                        function_name=function_name,
-                        function_args=function_args,
-                        result=block_result,
-                        effective_task_id=effective_task_id,
-                        tool_call_id=getattr(tool_call, "id", "") or "",
-                        status="blocked",
-                        error_type="guardrail_block",
-                        error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
-                        middleware_trace=list(middleware_trace),
-                    )
-
         parsed_calls.append(
-            (
-                tool_call,
-                function_name,
-                original_function_args,
-                function_args,
-                middleware_trace,
-                block_result,
-                blocked_by_guardrail,
-            )
+            (tool_call, function_name, function_args, [], None, _ts_scope_block)
         )
-        guardrail_signatures.append(guardrail_signature)
 
     # ── Logging / callbacks ──────────────────────────────────────────
-    tool_names_str = ", ".join(name for _, name, _, _, _, _, _ in parsed_calls)
+    tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-        for i, (
-            tc,
-            name,
-            original_args,
-            args,
-            middleware_trace,
-            block_result,
-            blocked_by_guardrail,
-        ) in enumerate(parsed_calls, 1):
-            display_args = _redact_tool_args_for_display(name, args) or args
-            args_str = json.dumps(display_args, ensure_ascii=False)
-            if agent.verbose_logging:
-                print(f"  📞 Tool {i}: {name}({list(display_args.keys())})")
-                print(agent._wrap_verbose("Args: ", json.dumps(display_args, indent=2, ensure_ascii=False)))
-            else:
-                args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
-                print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
-    authorized_indices: set[int] = set()
-    authorized_indices_lock = threading.Lock()
-    for i, (
-        tc,
-        name,
-        original_args,
-        args,
-        middleware_trace,
-        block_result,
-        blocked_by_guardrail,
-    ) in enumerate(parsed_calls):
+    for i, (tc, name, args, middleware_trace, block_result, _scope_block) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
+
+    start_condition = threading.Condition()
+    next_start_order = 0
+    authorization_gate = _ConcurrentToolAuthorizationGate()
+
+    def _begin_in_order(order: int, callback=None) -> None:
+        nonlocal next_start_order
+        with start_condition:
+            start_condition.wait_for(lambda: order == next_start_order)
+            try:
+                if callback is not None:
+                    callback()
+            finally:
+                next_start_order += 1
+                start_condition.notify_all()
+
+    # Touch activity before launching workers so the gateway knows
+    # we're executing tools (not stuck).
+    agent._current_tool = tool_names_str
+    agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
     def _run_tool(
         index,
         tool_call,
         function_name,
-        original_function_args,
         function_args,
         middleware_trace,
+        scope_block,
+        start_order,
     ):
         """Worker function executed in a thread."""
         # Register this worker tid so the agent can fan out an interrupt
@@ -733,46 +786,63 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _ra()._set_interrupt(True, _worker_tid)
             except Exception:
                 pass
+        # Set the activity callback on THIS worker thread so
+        # _wait_for_process (terminal commands) can fire heartbeats.
+        # The callback is thread-local; the main thread's callback
+        # is invisible to worker threads.
+        try:
+            from tools.environments.base import set_activity_callback
+            set_activity_callback(agent._touch_activity)
+        except Exception:
+            pass
         # Approval/sudo callbacks (thread-local) and the agent turn's
         # ContextVars are propagated by propagate_context_to_thread() at the
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
-        observed_args = function_args
-        start_marked = False
+        blocked = False
+        start_advanced = False
 
-        def _on_authorized(next_args: dict) -> None:
-            nonlocal observed_args, start_marked
-            observed_args = next_args
-            if start_marked:
+        def _advance_start(callback=None) -> None:
+            nonlocal start_advanced
+            if start_advanced:
                 return
-            start_marked = True
-            with authorized_indices_lock:
-                authorized_indices.add(index)
-            _mark_authorized_tool_start(
-                agent,
-                function_name=function_name,
-                function_args=next_args,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-            )
+            try:
+                _begin_in_order(start_order, callback)
+            finally:
+                start_advanced = True
 
         try:
             try:
-                from hermes_cli.middleware import bind_tool_dispatch_delegation
-
-                with bind_tool_dispatch_delegation(
-                    original_function_args,
-                    _on_authorized,
-                ):
-                    result = agent._invoke_tool(
+                def _execute(next_args: dict[str, Any]) -> Any:
+                    return agent._invoke_tool(
                         function_name,
-                        function_args,
+                        next_args,
                         effective_task_id,
                         tool_call.id,
                         messages=messages,
                         pre_tool_block_checked=True,
                         skip_tool_request_middleware=True,
+                        skip_tool_execution_middleware=True,
                         tool_request_middleware_trace=list(middleware_trace),
                     )
+
+                managed = _run_agent_tool_execution_middleware(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    execute=_execute,
+                    scope_block=scope_block,
+                    display_index=index + 1,
+                    middleware_trace=middleware_trace,
+                    begin_execution=_advance_start,
+                    authorization_gate=authorization_gate,
+                )
+                result = managed.result
+                function_args = managed.args
+                middleware_trace = managed.middleware_trace
+                blocked = managed.blocked
             except KeyboardInterrupt:
                 try:
                     agent.interrupt("keyboard interrupt")
@@ -791,7 +861,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
                 results[index] = (
                     function_name,
-                    observed_args,
+                    function_args,
                     result,
                     duration,
                     True,
@@ -804,28 +874,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
-            from hermes_cli.middleware import get_required_policy_block_record
-
-            required_policy_blocked = (
-                get_required_policy_block_record(
-                    str(getattr(tool_call, "id", "") or "")
-                )
-                is not None
-            )
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (
                 function_name,
-                observed_args,
+                function_args,
                 result,
                 duration,
                 is_error,
-                required_policy_blocked,
+                blocked,
                 middleware_trace,
             )
         finally:
+            _advance_start()
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
             # starts with a clean slate.  This MUST be in a finally block
@@ -848,17 +911,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     try:
         runnable_calls = [
-            (i, tc, name, original_args, args, middleware_trace)
-            for i, (
-                tc,
-                name,
-                original_args,
-                args,
-                middleware_trace,
-                block_result,
-                blocked_by_guardrail,
-            ) in enumerate(parsed_calls)
-            if block_result is None
+            (i, tc, name, args, scope_block)
+            for i, (tc, name, args, _trace, parse_error, scope_block) in enumerate(
+                parsed_calls
+            )
+            if parse_error is None
         ]
         futures = []
         future_to_index = {}
@@ -876,14 +933,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             executor = DaemonThreadPoolExecutor(max_workers=max_workers)
             abandon_executor = False
             try:
-                for submit_index, (
-                    i,
-                    tc,
-                    name,
-                    original_args,
-                    args,
-                    middleware_trace,
-                ) in enumerate(runnable_calls):
+                for submit_index, (i, tc, name, args, scope_block) in enumerate(
+                    runnable_calls
+                ):
                     # Propagate the agent turn's ContextVars (e.g.
                     # _approval_session_key) AND thread-local approval/sudo
                     # callbacks into the worker thread; clears callbacks on exit.
@@ -893,9 +945,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             i,
                             tc,
                             name,
-                            original_args,
                             args,
-                            middleware_trace,
+                            parsed_calls[i][3],
+                            scope_block,
+                            submit_index,
                         )
                     except RuntimeError as submit_error:
                         if not _is_interpreter_shutdown_submit_error(submit_error):
@@ -910,11 +963,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             skipped_i,
                             _tc,
                             skipped_name,
-                            _original_args,
                             skipped_args,
-                            middleware_trace,
+                            _scope_block,
                         ) in skipped_calls:
                             if results[skipped_i] is None:
+                                middleware_trace = parsed_calls[skipped_i][3]
                                 result = (
                                     f"Error executing tool '{skipped_name}': "
                                     "Python interpreter is shutting down; tool was not started"
@@ -925,7 +978,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                     result,
                                     0.0,
                                     True,
-                                    True,
+                                    False,
                                     middleware_trace,
                                 )
                         break
@@ -942,7 +995,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 while True:
                     wait_timeout = 5.0
                     if deadline is not None:
-                        remaining = deadline - time.monotonic()
+                        effective_deadline = (
+                            deadline + authorization_gate.excluded_seconds()
+                        )
+                        remaining = effective_deadline - time.monotonic()
                         if remaining <= 0:
                             done, not_done = set(), {
                                 f for f in futures if not f.done()
@@ -959,7 +1015,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     if not not_done:
                         break
 
-                    if deadline is not None and time.monotonic() >= deadline:
+                    if (
+                        deadline is not None
+                        and time.monotonic()
+                        >= deadline + authorization_gate.excluded_seconds()
+                    ):
                         abandon_executor = True
                         timed_out_indices = {
                             future_to_index[f]
@@ -1038,124 +1098,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             total_dur = sum(r[3] for r in results if r is not None)
             spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
-    # Finalize guardrail state once for the complete assistant batch, in the
-    # model's original call order rather than worker completion order. Freeze
-    # the result vector first: abandoned workers can still write to `results`,
-    # but guardrails and the model must observe the same immutable outcomes.
-    observed_results = _snapshot_concurrent_results(results)
-    guardrail_slots: list[tuple[int, ToolCallObservation]] = []
-    with authorized_indices_lock:
-        authorized_snapshot = set(authorized_indices)
-    for result_index, result_tuple in enumerate(observed_results):
-        if result_tuple is None:
-            if result_index not in timed_out_indices:
-                continue
-            (
-                _tc,
-                observed_name,
-                _original_args,
-                observed_args,
-                _middleware_trace,
-                _block_result,
-                _blocked_by_guardrail,
-            ) = parsed_calls[result_index]
-            suffix = (
-                f"{timeout_s:.1f}s"
-                if timeout_s is not None
-                else "the configured timeout"
-            )
-            guardrail_slots.append((
-                result_index,
-                ToolCallObservation(
-                    tool_name=observed_name,
-                    args=observed_args,
-                    result=(
-                        f"Error executing tool '{observed_name}': "
-                        f"timed out after {suffix}"
-                    ),
-                    failed=True,
-                    executed=result_index in authorized_snapshot,
-                    guardrail_signature=guardrail_signatures[result_index],
-                ),
-            ))
-            continue
-        (
-            observed_name,
-            observed_args,
-            observed_result,
-            _duration,
-            observed_failed,
-            observed_blocked,
-            _middleware_trace,
-        ) = result_tuple
-        guardrail_slots.append((
-            result_index,
-            ToolCallObservation(
-                tool_name=observed_name,
-                args=observed_args,
-                result=(
-                    observed_result
-                    if isinstance(observed_result, str)
-                    else _multimodal_text_summary(observed_result)
-                ),
-                failed=observed_failed,
-                executed=not observed_blocked,
-                guardrail_signature=guardrail_signatures[result_index],
-            ),
-        ))
-    guardrail_decisions = _finalize_guardrail_observations(
-        agent,
-        [observation for _index, observation in guardrail_slots],
-    )
-    guardrail_decisions_by_index = {
-        result_index: decision
-        for (result_index, _observation), decision in zip(
-            guardrail_slots,
-            guardrail_decisions,
-        )
-    }
-    for (result_index, _observation), decision in zip(
-        guardrail_slots,
-        guardrail_decisions,
-    ):
-        result_tuple = observed_results[result_index]
-        if (
-            result_tuple is not None
-            and decision.action in {"warn", "halt"}
-            and isinstance(result_tuple[2], str)
-        ):
-            updated = list(result_tuple)
-            updated[2] = append_toolguard_guidance(updated[2], decision)
-            observed_results[result_index] = tuple(updated)
-
     # ── Post-execution: display per-tool results ─────────────────────
-    for i, (
-        tc,
-        name,
-        original_args,
-        args,
-        middleware_trace,
-        block_result,
-        blocked_by_guardrail,
-    ) in enumerate(parsed_calls):
-        r = observed_results[i]
+    for i, (tc, name, args, middleware_trace, _parse_error, _scope_block) in enumerate(
+        parsed_calls
+    ):
+        r = results[i]
         blocked = False
-        # A worker may finish after the deadline snapshot. Only results that
-        # landed before `observed_results` was frozen are visible; later writes
-        # stay detached so transcript and guardrail accounting cannot diverge.
+        is_error = True
+        progress_function_name = name
+        # A worker can finish and write results[i] in the window between the
+        # deadline snapshot (timed_out_indices, taken from not_done) and this
+        # loop. Prefer that real result over a fabricated timeout message — the
+        # tool genuinely succeeded, just slightly late.
         effect_disposition = None
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
-            timeout_decision = guardrail_decisions_by_index.get(i)
-            if (
-                timeout_decision is not None
-                and timeout_decision.action in {"warn", "halt"}
-            ):
-                function_result = append_toolguard_guidance(
-                    function_result,
-                    timeout_decision,
-                )
             effect_disposition = "unknown"
             _emit_terminal_post_tool_call(
                 agent,
@@ -1203,11 +1161,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = 0.0
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
-            # The worker reports the execution-middleware output. Keep all
-            # downstream observers on those exact authorized args.
+            name = function_name
             args = function_args
+            progress_function_name = function_name
             if blocked:
                 effect_disposition = "none"
+
+            if not blocked:
+                function_result = agent._append_guardrail_observation(
+                    function_name,
+                    function_args,
+                    function_result,
+                    failed=is_error,
+                )
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
@@ -1225,43 +1191,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-            if not blocked and agent.tool_progress_callback:
-                try:
-                    agent.tool_progress_callback(
-                        "tool.completed", function_name, None, None,
-                        duration=tool_duration, is_error=is_error,
-                        result=function_result,
-                    )
-                except Exception as cb_err:
-                    logging.debug(f"Tool progress callback error: {cb_err}")
-
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
 
-        # Print cute message per tool
-        if agent._should_emit_quiet_tool_messages():
-            cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
-            agent._safe_print(f"  {cute_msg}")
-        elif not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
-            _preview_str = _multimodal_text_summary(function_result)
-            if agent.verbose_logging:
-                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
-                print(agent._wrap_verbose("Result: ", _preview_str))
-            else:
-                response_preview = _preview_str[:agent.log_prefix_chars] + "..." if len(_preview_str) > agent.log_prefix_chars else _preview_str
-                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
-
         agent._current_tool = None
-        agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+        _status_suffix = " (error)" if is_error else ""
+        agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
-        if not blocked and agent.tool_complete_callback:
-            try:
-                display_args = _redact_tool_args_for_display(name, args) or args
-                agent.tool_complete_callback(tc.id, name, display_args, function_result)
-            except Exception as cb_err:
-                logging.debug(f"Tool complete callback error: {cb_err}")
-
+        display_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -1270,11 +1208,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
-        subdir_hints = (
-            ""
-            if blocked
-            else agent._subdirectory_hints.check_tool_call(name, args)
-        )
+        subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
                 # Append the hint to the text summary part so the model
@@ -1299,13 +1233,51 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             effect_disposition=effect_disposition,
         )
         messages.append(tool_message)
-        if r is not None:
-            from hermes_cli.middleware import mark_required_policy_block_appended
-
-            mark_required_policy_block_appended(
-                str(getattr(tc, "id", "") or "")
-            )
         risk_metadata = tool_message.get("_tool_output_risk")
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"tool result {name}",
+        ):
+            return
+
+        # Every completion surface is downstream of the canonical append. If
+        # the UI bridge or process dies while projecting one of these events,
+        # resume can reconstruct the tool result that was already visible.
+        if not blocked and agent.tool_progress_callback:
+            try:
+                agent.tool_progress_callback(
+                    "tool.completed", progress_function_name, None, None,
+                    duration=tool_duration, is_error=is_error,
+                    result=display_function_result,
+                )
+            except Exception as cb_err:
+                logging.debug(f"Tool progress callback error: {cb_err}")
+
+        # Print cute message per tool
+        if agent._should_emit_quiet_tool_messages():
+            cute_msg = _get_cute_tool_message_impl(
+                name, args, tool_duration, result=display_function_result,
+            )
+            agent._safe_print(f"  {cute_msg}")
+        elif not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
+            _preview_str = _multimodal_text_summary(display_function_result)
+            if agent.verbose_logging:
+                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
+                print(agent._wrap_verbose("Result: ", _preview_str))
+            else:
+                response_preview = _preview_str[:agent.log_prefix_chars] + "..." if len(_preview_str) > agent.log_prefix_chars else _preview_str
+                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
+
+        if not blocked and agent.tool_complete_callback:
+            try:
+                display_args = _redact_tool_args_for_display(name, args) or args
+                agent.tool_complete_callback(
+                    tc.id, name, display_args, display_function_result,
+                )
+            except Exception as cb_err:
+                logging.debug(f"Tool complete callback error: {cb_err}")
+
         if (
             risk_metadata is not None
             and risk_metadata.get("risk") != "low"
@@ -1322,11 +1294,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool output risk callback error: %s", cb_err)
-        _flush_session_db_after_tool_progress(
-            agent,
-            messages,
-            stage=f"tool result {name}",
-        )
 
         # ── Per-tool /steer drain ───────────────────────────────────
         # Same as the sequential path: drain between each collected
@@ -1335,7 +1302,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools = len(parsed_calls)
-    if num_tools > 0:
+    if finalize and num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
         enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
 
@@ -1343,18 +1310,23 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Append any pending user steer text to the last tool result so the
     # agent sees it on its next iteration. Runs AFTER budget enforcement
     # so the steer marker is never truncated. See steer() for details.
-    if num_tools > 0:
+    if finalize and num_tools > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
-    """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
+def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+    """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
+
+    ``finalize=False`` skips the end-of-batch aggregate budget enforcement
+    and /steer injection — used when this call is one segment of a larger
+    mixed batch and the segmented dispatcher owns the turn-end work.
+    """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
-    guardrail_observations: list[ToolCallObservation] = []
-    guardrail_message_indices: list[int] = []
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
+        if getattr(agent, "_incremental_persistence_failed", False):
+            return
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
@@ -1370,11 +1342,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skipped_tc.id,
                     effect_disposition="none",
                 ))
-                _flush_session_db_after_tool_progress(
+                if not _flush_session_db_after_tool_progress(
                     agent,
                     messages,
                     stage=f"cancelled tool result {skipped_name}",
-                )
+                ):
+                    return
             break
 
         function_name = tool_call.function.name
@@ -1390,11 +1363,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_call.id,
                 )
             )
-            _flush_session_db_after_tool_progress(
+            if not _flush_session_db_after_tool_progress(
                 agent,
                 messages,
                 stage=f"invalid tool arguments {function_name}",
-            )
+            ):
+                return
             agent._apply_pending_steer_to_tool_results(messages, 1)
             continue
 
@@ -1408,8 +1382,25 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
-                        function_name = _underlying
-                        function_args = _underlying_args
+                        # Probe-validate before unwrapping (ironclaw#5149):
+                        # missing required args return the parameter schema
+                        # instead of dispatching into an opaque failure.
+                        _probe_err = _ts.validate_deferred_call_args(_underlying, _underlying_args)
+                        if _probe_err is not None:
+                            # This path wraps _block_msg in {"error": ...} —
+                            # flatten the probe payload to one plain string.
+                            try:
+                                _probe = json.loads(_probe_err)
+                                _ts_scope_block = (
+                                    f"{_probe.get('error', '')} Parameters schema: "
+                                    f"{json.dumps(_probe.get('parameters', {}), ensure_ascii=False)}. "
+                                    f"{_probe.get('hint', '')}"
+                                ).strip()
+                            except Exception:
+                                _ts_scope_block = _probe_err
+                        else:
+                            function_name = _underlying
+                            function_args = _underlying_args
                     else:
                         _ts_scope_block = (
                             f"'{_underlying}' is not available in this session. "
@@ -1418,111 +1409,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        (
-            function_args,
-            original_function_args,
-            middleware_trace,
-        ) = _apply_tool_request_middleware_for_agent(
-            agent,
-            function_name=function_name,
-            function_args=function_args,
-            effective_task_id=effective_task_id,
-            tool_call_id=getattr(tool_call, "id", "") or "",
-        )
-
-        # Check plugin hooks for a block directive before executing.
-        _block_msg: Optional[str] = None
-        _block_error_type = "plugin_block"
-        if _ts_scope_block is not None:
-            _block_msg = _ts_scope_block
-            _block_error_type = "tool_scope_block"
-        else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                _block_msg = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                pass
-
-        _guardrail_block_decision: ToolGuardrailDecision | None = None
-        guardrail_signature = None
-        if _block_msg is None:
-            guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-            guardrail_signature = guardrail_decision.signature
-            if not guardrail_decision.allows_execution:
-                _guardrail_block_decision = guardrail_decision
-
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
-
-        if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
-            display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
-            args_str = json.dumps(display_args, ensure_ascii=False)
-            if agent.verbose_logging:
-                print(f"  📞 Tool {i}: {function_name}({list(display_args.keys())})")
-                print(agent._wrap_verbose("Args: ", json.dumps(display_args, indent=2, ensure_ascii=False)))
-            else:
-                args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
-                print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
-
-        _start_marked = False
-
-        def _on_authorized(next_args: dict) -> None:
-            nonlocal function_args, _start_marked
-            function_args = next_args
-            if _start_marked:
-                return
-            _start_marked = True
-            _mark_authorized_tool_start(
-                agent,
-                function_name=function_name,
-                function_args=next_args,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-            )
+        middleware_trace: list[dict[str, Any]] = []
+        _execution_blocked = False
 
         tool_start_time = time.time()
 
-        if _block_msg is not None:
-            # Tool blocked by plugin policy — return error without executing.
-            function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
-            tool_duration = 0.0
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                result=function_result,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                status="blocked",
-                error_type=_block_error_type,
-                error_message=_block_msg,
-                middleware_trace=list(middleware_trace),
-            )
-        elif _guardrail_block_decision is not None:
-            # Tool blocked by tool-loop guardrail — synthesize exactly one
-            # tool result for the original tool_call_id without executing.
-            function_result = agent._guardrail_block_result(_guardrail_block_decision)
-            tool_duration = 0.0
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                result=function_result,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                status="blocked",
-                error_type="guardrail_block",
-                error_message=getattr(_guardrail_block_decision, "message", None) or "Tool blocked by guardrail policy",
-                middleware_trace=list(middleware_trace),
-            )
-        elif function_name == "todo":
+        if function_name == "todo":
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool
                 return _todo_tool(
@@ -1530,17 +1422,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     merge=next_args.get("merge", False),
                     store=agent._todo_store,
                 )
-            function_result, function_args = _run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
-                original_args=original_function_args,
-                on_authorized=_on_authorized,
-                middleware_trace=middleware_trace,
                 execute=_execute,
-            )
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
@@ -1562,17 +1453,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     db=session_db,
                     current_session_id=agent.session_id,
                 )
-            function_result, function_args = _run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
-                original_args=original_function_args,
-                on_authorized=_on_authorized,
-                middleware_trace=middleware_trace,
                 execute=_execute,
-            )
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
@@ -1602,17 +1492,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         ),
                     )
                 return result
-            function_result, function_args = _run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
-                original_args=original_function_args,
-                on_authorized=_on_authorized,
-                middleware_trace=middleware_trace,
                 execute=_execute,
-            )
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
@@ -1622,19 +1511,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 return _clarify_tool(
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
+                    multi_select=next_args.get("multi_select", False),
                     callback=agent.clarify_callback,
                 )
-            function_result, function_args = _run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
-                original_args=original_function_args,
-                on_authorized=_on_authorized,
-                middleware_trace=middleware_trace,
                 execute=_execute,
-            )
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
@@ -1646,17 +1535,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     count=next_args.get("count"),
                     callback=getattr(agent, "read_terminal_callback", None),
                 )
-            function_result, function_args = _run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
-                original_args=original_function_args,
-                on_authorized=_on_authorized,
-                middleware_trace=middleware_trace,
                 execute=_execute,
-            )
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
@@ -1681,17 +1569,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 def _execute(next_args: dict) -> Any:
                     return agent._dispatch_delegate_task(next_args)
-                function_result, function_args = _run_agent_tool_execution_middleware(
+                function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                     agent,
                     function_name=function_name,
                     function_args=function_args,
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
-                    original_args=original_function_args,
-                    on_authorized=_on_authorized,
-                    middleware_trace=middleware_trace,
                     execute=_execute,
-                )
+                    scope_block=_ts_scope_block,
+                    display_index=i,
+                ))
                 _delegate_result = function_result
             finally:
                 agent._delegate_spinner = None
@@ -1715,17 +1602,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 def _execute(next_args: dict) -> Any:
                     return agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages)
-                function_result, function_args = _run_agent_tool_execution_middleware(
+                function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                     agent,
                     function_name=function_name,
                     function_args=function_args,
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
-                    original_args=original_function_args,
-                    on_authorized=_on_authorized,
-                    middleware_trace=middleware_trace,
                     execute=_execute,
-                )
+                    scope_block=_ts_scope_block,
+                    display_index=i,
+                ))
                 _ce_result = function_result
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
@@ -1752,17 +1638,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 def _execute(next_args: dict) -> Any:
                     return agent._memory_manager.handle_tool_call(function_name, next_args)
-                function_result, function_args = _run_agent_tool_execution_middleware(
+                function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                     agent,
                     function_name=function_name,
                     function_args=function_args,
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
-                    original_args=original_function_args,
-                    on_authorized=_on_authorized,
-                    middleware_trace=middleware_trace,
                     execute=_execute,
-                )
+                    scope_block=_ts_scope_block,
+                    display_index=i,
+                ))
                 _mem_result = function_result
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
@@ -1785,20 +1670,46 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner.start()
             _spinner_result = None
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
-                    original_function_args=original_function_args,
-                    on_authorized=_on_authorized,
+                def _execute(next_args: dict) -> Any:
+                    return _ra().handle_function_call(
+                        function_name,
+                        next_args,
+                        effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "")
+                        or "",
+                        enabled_tools=(
+                            list(agent.valid_tool_names)
+                            if agent.valid_tool_names
+                            else None
+                        ),
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        skip_tool_execution_middleware=True,
+                        tool_request_middleware_trace=list(middleware_trace),
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    )
+
+                (
+                    function_result,
+                    function_args,
+                    middleware_trace,
+                    _execution_blocked,
+                ) = _managed_values(
+                    _run_agent_tool_execution_middleware(
+                        agent,
+                        function_name=function_name,
+                        function_args=function_args,
+                        effective_task_id=effective_task_id,
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        execute=_execute,
+                        scope_block=_ts_scope_block,
+                        display_index=i,
+                        middleware_trace=middleware_trace,
+                    )
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1829,20 +1740,46 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent._vprint(f"  {cute_msg}")
         else:
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
-                    original_function_args=original_function_args,
-                    on_authorized=_on_authorized,
+                def _execute(next_args: dict) -> Any:
+                    return _ra().handle_function_call(
+                        function_name,
+                        next_args,
+                        effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "")
+                        or "",
+                        enabled_tools=(
+                            list(agent.valid_tool_names)
+                            if agent.valid_tool_names
+                            else None
+                        ),
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        skip_tool_execution_middleware=True,
+                        tool_request_middleware_trace=list(middleware_trace),
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    )
+
+                (
+                    function_result,
+                    function_args,
+                    middleware_trace,
+                    _execution_blocked,
+                ) = _managed_values(
+                    _run_agent_tool_execution_middleware(
+                        agent,
+                        function_name=function_name,
+                        function_args=function_args,
+                        effective_task_id=effective_task_id,
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        execute=_execute,
+                        scope_block=_ts_scope_block,
+                        display_index=i,
+                        middleware_trace=middleware_trace,
+                    )
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
@@ -1863,15 +1800,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
-
-        from hermes_cli.middleware import get_required_policy_block_record
-        from hermes_cli.tool_policy import PolicyDecisionCode
-
-        _required_policy_record = get_required_policy_block_record(
-            str(getattr(tool_call, "id", "") or "")
-        )
-        if _required_policy_record is not None:
-            _execution_blocked = True
 
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
@@ -1908,19 +1836,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 duration_ms=int(tool_duration * 1000),
                 middleware_trace=list(middleware_trace),
             )
-        guardrail_observations.append(ToolCallObservation(
-            tool_name=function_name,
-            args=function_args,
-            result=(
-                function_result
-                if isinstance(function_result, str)
-                else _multimodal_text_summary(function_result)
-            ),
-            failed=_is_error_result,
-            executed=not _execution_blocked,
-            guardrail_signature=guardrail_signature,
-        ))
-        if isinstance(function_result, str):
+        if not _execution_blocked:
+            function_result = agent._append_guardrail_observation(
+                function_name,
+                function_args,
+                function_result,
+                failed=_is_error_result,
+            )
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
@@ -1941,31 +1863,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-        if not _execution_blocked and agent.tool_progress_callback:
-            try:
-                agent.tool_progress_callback(
-                    "tool.completed", function_name, None, None,
-                    duration=tool_duration, is_error=_is_error_result,
-                    result=function_result,
-                )
-            except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
-
         agent._current_tool = None
-        agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
+        _status_suffix = " (error)" if _is_error_result else ""
+        agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
         if agent.verbose_logging:
             logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
             _log_result = _multimodal_text_summary(function_result)
             logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
 
-        if not _execution_blocked and agent.tool_complete_callback:
-            try:
-                display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
-                agent.tool_complete_callback(tool_call.id, function_name, display_args, function_result)
-            except Exception as cb_err:
-                logging.debug(f"Tool complete callback error: {cb_err}")
-
+        display_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,
@@ -1975,14 +1882,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
         # Discover subdirectory context files from tool arguments
-        subdir_hints = (
-            ""
-            if _execution_blocked
-            else agent._subdirectory_hints.check_tool_call(
-                function_name,
-                function_args,
-            )
-        )
+        subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
                 _append_subdir_hint_to_multimodal(function_result, subdir_hints)
@@ -1992,20 +1892,43 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(
-            function_name,
-            _tool_content,
-            tool_call.id,
-            effect_disposition="none" if _execution_blocked else None,
-        )
+        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
         messages.append(tool_message)
-        guardrail_message_indices.append(len(messages) - 1)
-        from hermes_cli.middleware import mark_required_policy_block_appended
-
-        mark_required_policy_block_appended(
-            str(getattr(tool_call, "id", "") or "")
-        )
         risk_metadata = tool_message.get("_tool_output_risk")
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"tool result {function_name}",
+        ):
+            return
+
+        # UI completion/progress events are projections of the canonical tool
+        # row, never a competing in-memory authority.
+        if not _execution_blocked and agent.tool_progress_callback:
+            try:
+                agent.tool_progress_callback(
+                    "tool.completed", function_name, None, None,
+                    duration=tool_duration, is_error=_is_error_result,
+                    result=display_function_result,
+                )
+            except Exception as cb_err:
+                logging.debug(f"Tool progress callback error: {cb_err}")
+
+        if not _execution_blocked and agent.tool_complete_callback:
+            try:
+                display_args = (
+                    _redact_tool_args_for_display(function_name, function_args)
+                    or function_args
+                )
+                agent.tool_complete_callback(
+                    tool_call.id,
+                    function_name,
+                    display_args,
+                    display_function_result,
+                )
+            except Exception as cb_err:
+                logging.debug(f"Tool complete callback error: {cb_err}")
+
         if (
             risk_metadata is not None
             and risk_metadata.get("risk") != "low"
@@ -2022,38 +1945,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool output risk callback error: %s", cb_err)
-        _flush_session_db_after_tool_progress(
-            agent,
-            messages,
-            stage=f"tool result {function_name}",
-        )
 
         # ── Per-tool /steer drain ───────────────────────────────────
         # Drain pending steer BETWEEN individual tool calls so the
         # injection lands as soon as a tool finishes — not after the
         # entire batch.  The model sees it on the next API iteration.
         agent._apply_pending_steer_to_tool_results(messages, 1)
-
-        if (
-            _required_policy_record is not None
-            and _required_policy_record.block.policy_code != PolicyDecisionCode.BLOCKED
-        ):
-            for skipped_tc in assistant_message.tool_calls[i:]:
-                skipped_name = skipped_tc.function.name
-                messages.append(make_tool_result_message(
-                    skipped_name,
-                    (
-                        f"[Tool execution skipped — {skipped_name} was not started "
-                        "because required policy enforcement halted this turn]"
-                    ),
-                    skipped_tc.id,
-                ))
-                _flush_session_db_after_tool_progress(
-                    agent,
-                    messages,
-                    stage=f"required-policy skipped tool result {skipped_name}",
-                )
-            break
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:
@@ -2075,58 +1972,93 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skipped_tc.id,
                     effect_disposition="none",
                 ))
-                _flush_session_db_after_tool_progress(
+                if not _flush_session_db_after_tool_progress(
                     agent,
                     messages,
                     stage=f"skipped tool result {skipped_name}",
-                )
+                ):
+                    return
             break
 
         if agent.tool_delay > 0 and i < len(assistant_message.tool_calls):
             time.sleep(agent.tool_delay)
 
-    # Finalize the observation epoch only after every sequential call requested
-    # by this assistant message has either run or produced a synthetic result.
-    guardrail_decisions = _finalize_guardrail_observations(
-        agent,
-        guardrail_observations,
-    )
-    guardrail_guidance_added = False
-    for message_index, decision in zip(
-        guardrail_message_indices,
-        guardrail_decisions,
-    ):
-        if decision.action not in {"warn", "halt"}:
-            continue
-        content = messages[message_index].get("content")
-        if isinstance(content, str):
-            messages[message_index]["content"] = append_toolguard_guidance(
-                content,
-                decision,
-            )
-            guardrail_guidance_added = True
-    if guardrail_guidance_added:
-        _flush_session_db_after_tool_progress(
-            agent,
-            messages,
-            stage="assistant tool-batch guardrail finalization",
-        )
-
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools_seq = len(assistant_message.tool_calls)
-    if num_tools_seq > 0:
+    if finalize and num_tools_seq > 0:
         enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
 
     # ── /steer injection ──────────────────────────────────────────────
     # See _execute_tool_calls_parallel for the rationale. Same hook,
     # applied to sequential execution as well.
-    if num_tools_seq > 0:
+    if finalize and num_tools_seq > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
 
 
+def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
+    """Execute a mixed tool-call batch as ordered parallel/sequential segments.
+
+    ``segments`` is the ``(kind, calls)`` plan from
+    ``_plan_tool_batch_segments``: maximal contiguous runs of parallel-safe
+    calls execute on the concurrent path, barrier calls on the sequential
+    path, strictly in the model's original call order. Because segments are
+    contiguous, every tool result is still appended one-per-call in emission
+    order and no call ever starts before an earlier barrier finishes —
+    identical ordering and side-effect boundaries to fully-sequential
+    execution, with I/O parallelism recovered inside the safe runs.
+
+    Turn-end work (aggregate budget enforcement + /steer injection) is done
+    once here for the WHOLE batch; the per-segment executor calls run with
+    ``finalize=False`` so a multi-segment turn cannot multiply the budget or
+    truncate a steer marker.
+
+    Interrupt semantics: each segment executor already checks
+    ``agent._interrupt_requested`` up front and appends a cancelled/skipped
+    result per call, so an interrupt during segment *k* drains segments
+    *k+1..n* without executing them while preserving one result per
+    tool_call_id.
+    """
+    from types import SimpleNamespace
+
+    if segments is None:
+        _active_env = get_active_env(effective_task_id)
+        _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
+        segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
+
+    for kind, calls in segments:
+        if getattr(agent, "_incremental_persistence_failed", False):
+            return
+        segment_message = SimpleNamespace(tool_calls=list(calls))
+        if kind == "parallel":
+            execute_tool_calls_concurrent(
+                agent, segment_message, messages, effective_task_id, api_call_count,
+                finalize=False,
+            )
+        else:
+            execute_tool_calls_sequential(
+                agent, segment_message, messages, effective_task_id, api_call_count,
+                finalize=False,
+            )
+
+        if getattr(agent, "_incremental_persistence_failed", False):
+            return
+
+    # ── Whole-turn finalize (budget + /steer) ─────────────────────────
+    total_tools = len(assistant_message.tool_calls)
+    if total_tools > 0:
+        _tool_budget = _budget_for_agent(agent)
+        enforce_turn_budget(
+            messages[-total_tools:],
+            env=get_active_env(effective_task_id),
+            config=_tool_budget,
+        )
+        agent._apply_pending_steer_to_tool_results(messages, total_tools)
+
+
 __all__ = [
     "execute_tool_calls_concurrent",
     "execute_tool_calls_sequential",
+    "execute_tool_calls_segmented",
 ]
