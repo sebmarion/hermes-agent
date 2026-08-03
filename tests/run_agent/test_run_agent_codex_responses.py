@@ -57,6 +57,20 @@ def _build_agent(monkeypatch):
     return agent
 
 
+def _use_custom_codex_endpoint(agent):
+    """Keep the compressor identity aligned with a test-only provider switch."""
+    agent.provider = "custom"
+    agent.base_url = "https://api.example.com/v1"
+    agent.context_compressor.update_model(
+        model=agent.model,
+        context_length=agent.context_compressor.context_length,
+        base_url=agent.base_url,
+        api_key=agent.api_key,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+
+
 def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
     _patch_agent_bootstrap(monkeypatch)
 
@@ -3505,8 +3519,7 @@ def test_preflight_codex_input_deduplicates_reasoning_ids(monkeypatch):
 
 def test_run_conversation_codex_disables_reasoning_replay_after_invalid_encrypted_content(monkeypatch):
     agent = _build_agent(monkeypatch)
-    agent.provider = "custom"
-    agent.base_url = "https://api.example.com/v1"
+    _use_custom_codex_endpoint(agent)
 
     request_payloads = []
 
@@ -3565,8 +3578,7 @@ def test_run_conversation_codex_disables_reasoning_replay_after_invalid_encrypte
 
 def test_run_conversation_codex_invalid_encrypted_content_without_replay_state_does_not_disable_replay(monkeypatch):
     agent = _build_agent(monkeypatch)
-    agent.provider = "custom"
-    agent.base_url = "https://api.example.com/v1"
+    _use_custom_codex_endpoint(agent)
     monkeypatch.setattr(run_agent, "jittered_backoff", lambda *args, **kwargs: 0)
 
     request_payloads = []

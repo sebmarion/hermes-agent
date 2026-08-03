@@ -49,6 +49,18 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
+def _sync_test_compressor_identity(agent) -> None:
+    """Mirror the runtime rebind helper after a test mutates provider/model."""
+    agent.context_compressor.update_model(
+        model=agent.model,
+        context_length=agent.context_compressor.context_length,
+        base_url=agent.base_url,
+        api_key=agent.api_key,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+
+
 def test_is_destructive_command_treats_cp_as_mutating():
     assert run_agent._is_destructive_command("cp .env.local .env") is True
 
@@ -110,6 +122,8 @@ def agent():
         a = AIAgent(
             api_key="test-key-1234567890",
             base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            model="test/model",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -5040,6 +5054,7 @@ class TestRunConversation:
             agent._fallback_activated = True
             agent.model = "anthropic/claude-sonnet-4"
             agent.provider = "openrouter"
+            _sync_test_compressor_identity(agent)
             return True
 
         with (
@@ -5076,6 +5091,7 @@ class TestRunConversation:
             agent._fallback_activated = True
             agent.model = "anthropic/claude-sonnet-4"
             agent.provider = "openrouter"
+            _sync_test_compressor_identity(agent)
             return True
 
         with (
@@ -5400,6 +5416,7 @@ class TestRunConversation:
         self._setup_agent(agent)
         agent.provider = "nous"
         agent.api_mode = "chat_completions"
+        _sync_test_compressor_identity(agent)
 
         calls = {"api": 0, "refresh": 0}
 
@@ -5649,6 +5666,7 @@ class TestRunConversation:
         agent.context_compressor.threshold_tokens = int(
             agent.context_compressor.context_length * agent.context_compressor.threshold_percent
         )
+        _sync_test_compressor_identity(agent)
 
         err_400 = Exception(
             "HTTP 400: invalid params, context window exceeds limit (2013)"
@@ -5695,6 +5713,7 @@ class TestRunConversation:
         agent.context_compressor.threshold_tokens = int(
             agent.context_compressor.context_length * agent.context_compressor.threshold_percent
         )
+        _sync_test_compressor_identity(agent)
 
         err_400 = Exception(
             "HTTP 400: invalid params, context window exceeds limit (2013)"
@@ -5783,6 +5802,7 @@ class TestRunConversation:
         agent.base_url = "http://localhost:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "glm-5.1:cloud"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -5828,6 +5848,7 @@ class TestRunConversation:
         agent.base_url = "http://localhost:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "glm-5.1:cloud"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -5861,6 +5882,7 @@ class TestRunConversation:
         agent.base_url = "https://api.openai.com/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "gpt-4o-mini"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -5897,6 +5919,7 @@ class TestRunConversation:
         agent.base_url = "http://127.0.0.1:60000/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "glm-5-fp8"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -5928,6 +5951,7 @@ class TestRunConversation:
         agent.base_url = "http://localhost:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "glm-5.1:cloud"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -5969,6 +5993,7 @@ class TestRunConversation:
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "ollama"
         agent.model = "glm-5.1:cloud"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -6012,6 +6037,7 @@ class TestRunConversation:
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "zai"
         agent.model = "glm-5-turbo"
+        _sync_test_compressor_identity(agent)
 
         tool_turn = _mock_response(
             content="",
@@ -6405,6 +6431,7 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
         error_msg = (
@@ -6434,11 +6461,10 @@ class TestRunConversation:
         assert agent.context_compressor.context_length == 200_000
         mock_compress.assert_not_called()
 
-    def test_output_cap_retry_with_large_api_only_content(self, agent):
-        """When a large system prompt makes api_messages huge while persisted
-        messages stay tiny, the retry cap must still respect provider
-        available_tokens — not blow up to the full context window.
-        """
+    def test_final_admission_blocks_large_api_only_content_before_output_cap_retry(
+        self, agent
+    ):
+        """Final admission blocks a huge provider-ready payload before transport."""
         self._setup_agent(agent)
         agent.api_mode = "chat_completions"
         agent.provider = "openrouter"
@@ -6446,6 +6472,7 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
         # Huge API-only system prompt; persisted messages are tiny.
@@ -6472,18 +6499,19 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
-        assert result["completed"] is True
-        # The current branch (messages-only estimate) would send max_tokens
-        # near 199927 — this test fails on it.
-        assert second_call["max_tokens"] <= 936
+        assert agent.client.chat.completions.create.call_count == 0
+        assert result["completed"] is False
+        assert result["compression_exhausted"] is True
+        assert agent._last_provider_admission_receipt["decision"] == "reject"
+        assert (
+            agent._last_provider_admission_receipt["reason"]
+            == "estimated_input_plus_margin_exceeds_ceiling"
+        )
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
 
-    def test_output_cap_retry_request_pressure_lower_bound(self, agent):
-        """When the provider reports a large available_tokens but local request
-        pressure leaves less room, the retry cap is the smaller of the two.
-        """
+    def test_output_cap_retry_is_readmitted_against_final_request(self, agent):
+        """The lowered output-cap retry passes the same final admission gate."""
         self._setup_agent(agent)
         agent.api_mode = "chat_completions"
         agent.provider = "openrouter"
@@ -6491,15 +6519,12 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
-
-        # A large API-only system prompt so the local estimate is the binding
-        # constraint, not the provider's available_tokens.
-        agent._cached_system_prompt = "S" * 796_000
 
         error_msg = (
             "max_tokens: 65536 > context_window: 200000 "
-            "- input_tokens: 190000 = available_tokens: 50000"
+            "- input_tokens: 150000 = available_tokens: 50000"
         )
         exc = Exception(error_msg)
         exc.status_code = 400
@@ -6518,19 +6543,15 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        first_call = agent.client.chat.completions.create.call_args_list[0].kwargs
         second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
         assert result["completed"] is True
-
-        # Verify the local estimate is actually the lower bound.
-        from agent.model_metadata import estimate_request_tokens_rough
-        estimated_request = estimate_request_tokens_rough(
-            first_call["messages"], tools=agent.tools or None,
+        assert second_call["max_tokens"] == 49_936
+        receipt = agent._last_provider_admission_receipt
+        assert receipt["decision"] == "admit"
+        assert (
+            receipt["estimated_input_with_margin_tokens"]
+            <= receipt["effective_input_ceiling"]
         )
-        local_available = 200_000 - estimated_request
-        expected_cap = max(1, min(50_000, local_available) - 64)
-        assert local_available < 50_000
-        assert second_call["max_tokens"] == expected_cap
         assert agent.context_compressor.context_length == 200_000
         mock_compress.assert_not_called()
 
@@ -6543,6 +6564,7 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
         error_msg = (
@@ -6584,6 +6606,7 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = False
         agent.context_compressor.context_length = 200_000
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
         error_msg = (
@@ -6631,6 +6654,7 @@ class TestRunConversation:
         agent.max_tokens = 65_536
         agent.compression_enabled = False
         agent.context_compressor.context_length = 131_072
+        _sync_test_compressor_identity(agent)
         agent.context_compressor.should_compress = MagicMock(return_value=False)
 
         # vLLM-format error (from tests/test_output_cap_parsing.py)
@@ -8734,6 +8758,7 @@ class TestReasoningReplayForStrictProviders:
         agent.base_url = "https://api.kimi.com/coding/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "kimi-coding"
+        _sync_test_compressor_identity(agent)
 
         prior_assistant = {
             "role": "assistant",
@@ -8777,6 +8802,7 @@ class TestReasoningReplayForStrictProviders:
         agent.base_url = "https://api.kimi.com/coding/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "kimi-coding"
+        _sync_test_compressor_identity(agent)
         prior_assistant = {
             "role": "assistant",
             "content": "",
@@ -8817,6 +8843,7 @@ class TestReasoningReplayForStrictProviders:
         agent.base_url = "https://api.mistral.ai/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "mistral"
+        _sync_test_compressor_identity(agent)
         prior_assistant = {
             "role": "assistant",
             "content": "",

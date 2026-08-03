@@ -5,14 +5,15 @@ message list and rebuilds the system prompt but keeps the SAME ``session_id``:
 no ``end_session``, no ``parent_session_id`` child row, no ``name #N`` title
 renumber, no flush-cursor reset. This eliminates the session-rotation bug
 cluster (#33618 /goal loss, #14238 lost response, #33907 orphans, #45117 search
-gaps, #42228 null cwd). When the flag is False (default), rotation behaves
-exactly as before.
+gaps, #42228 null cwd). When the flag is explicitly False, rotation behaves
+exactly as before as the opt-out fallback.
 """
 
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -58,7 +59,129 @@ def _seed(db, sid, title, n=8):
         )
 
 
+def _seed_messages(n=8):
+    return [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"msg {index}",
+        }
+        for index in range(n)
+    ]
+
+
 class TestInPlaceCompaction:
+    def test_concurrent_append_after_snapshot_fails_cas_without_adoption(self):
+        from agent.conversation_compression import compress_context
+        from hermes_state import CompressionSessionBusyError, SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=db_path)
+            writer = SessionDB(db_path=db_path)
+            sid = "automatic_compaction_stale_append"
+            _seed(db, sid, "race")
+            db.update_system_prompt(sid, "original prompt")
+            agent = _make_agent(db, sid, in_place=True)
+            agent._cached_system_prompt = "original prompt"
+            agent.event_callback = MagicMock()
+            agent.context_compressor._previous_summary = "durable summary"
+            agent.context_compressor.compression_count = 4
+            original_messages = _seed_messages()
+
+            def candidate_compression(*_args, **_kwargs):
+                agent.context_compressor._previous_summary = "unpersisted candidate"
+                agent.context_compressor.compression_count = 5
+                return [{"role": "user", "content": "candidate summary"}]
+
+            agent.context_compressor.compress = MagicMock(
+                side_effect=candidate_compression
+            )
+            agent._build_system_prompt = MagicMock(return_value="rebuilt prompt")
+            archive = db.archive_and_compact
+
+            def append_then_archive(*args, **kwargs):
+                # The live compression lease rejects concurrent durable
+                # writers before the CAS boundary, so the snapshot remains
+                # unchanged.
+                with pytest.raises(CompressionSessionBusyError) as blocked:
+                    writer.append_message(
+                        session_id=sid,
+                        role="user",
+                        content="concurrent append",
+                    )
+                raise blocked.value
+
+            try:
+                with patch.object(
+                    db,
+                    "archive_and_compact",
+                    side_effect=append_then_archive,
+                ):
+                    returned, returned_prompt = compress_context(
+                        agent,
+                        original_messages,
+                        approx_tokens=100_000,
+                        system_message="sys",
+                    )
+
+                assert returned is original_messages
+                assert returned_prompt == "original prompt"
+                assert agent._cached_system_prompt == "original prompt"
+                assert agent._last_compaction_in_place is False
+                assert agent.context_compressor._previous_summary == "durable summary"
+                assert agent.context_compressor.compression_count == 4
+                agent.event_callback.assert_not_called()
+                assert [row["content"] for row in db.get_messages(sid)] == [
+                    *(f"msg {index}" for index in range(8)),
+                ]
+                assert all(
+                    row["active"] == 1 and row["compacted"] == 0
+                    for row in db.get_messages(sid, include_inactive=True)
+                )
+            finally:
+                writer.close()
+                db.close()
+
+    def test_initial_durable_prefix_mismatch_fails_before_summary(self):
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "automatic_compaction_prefix_mismatch"
+            _seed(db, sid, "mismatch")
+            db.update_system_prompt(sid, "original prompt")
+            agent = _make_agent(db, sid, in_place=True)
+            agent._cached_system_prompt = "original prompt"
+            agent.event_callback = MagicMock()
+            compressor = MagicMock(
+                return_value=[{"role": "user", "content": "candidate summary"}]
+            )
+            agent.context_compressor.compress = compressor
+            mismatched_messages = _seed_messages()
+            mismatched_messages[0] = {
+                "role": "user",
+                "content": "different in-memory prefix",
+            }
+
+            returned, returned_prompt = compress_context(
+                agent,
+                mismatched_messages,
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+
+            assert returned is mismatched_messages
+            assert returned_prompt == "original prompt"
+            assert agent._cached_system_prompt == "original prompt"
+            assert agent._last_compaction_in_place is False
+            compressor.assert_not_called()
+            agent.event_callback.assert_not_called()
+            assert [row["content"] for row in db.get_messages(sid)] == [
+                f"msg {index}" for index in range(8)
+            ]
+            assert db.get_compression_lock_holder(sid) is None
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB
@@ -71,7 +194,7 @@ class TestInPlaceCompaction:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _seed_messages()
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -124,6 +247,36 @@ class TestInPlaceCompaction:
             # Live transcript actually shrank.
             assert len(compressed) == 2
 
+    def test_archive_and_compact_rolls_back_prompt_and_rows_together(self):
+        """The rebuilt prompt and active projection are one durable commit."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "atomic_prompt_projection"
+            _seed(db, sid, "atomic", n=4)
+            db.update_system_prompt(sid, "original prompt")
+            compacted = [{"role": "user", "content": "bounded summary"}]
+
+            with (
+                patch.object(
+                    db,
+                    "_bump_session_projection_for_id",
+                    side_effect=RuntimeError("projection bump failed"),
+                ),
+                pytest.raises(RuntimeError, match="projection bump failed"),
+            ):
+                db.archive_and_compact(
+                    sid,
+                    compacted,
+                    system_prompt="rebuilt prompt",
+                )
+
+            assert [row["content"] for row in db.get_messages(sid)] == [
+                f"msg {index}" for index in range(4)
+            ]
+            assert db.get_session(sid)["system_prompt"] == "original prompt"
+
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
         from hermes_state import SessionDB
@@ -134,7 +287,7 @@ class TestInPlaceCompaction:
             sid = "20260619_120500_cccccc"
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _seed_messages()
             compressed, _ = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -158,7 +311,7 @@ class TestInPlaceCompaction:
                 "n", calls["n"] + 1
             )
             compress_context(
-                agent, [{"role": "user", "content": "x"}] * 8,
+                agent, _seed_messages(),
                 approx_tokens=100_000, system_message="sys",
             )
             assert calls["n"] == 0
@@ -239,7 +392,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
             compress_context(
-                a_ip, [{"role": "user", "content": "x"}] * 8,
+                a_ip, _seed_messages(),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_ip._last_compaction_in_place is True
@@ -261,6 +414,323 @@ class TestInPlaceConfigDefault:
         from hermes_cli.config import DEFAULT_CONFIG
 
         assert DEFAULT_CONFIG["compression"].get("in_place") is True
+
+    @pytest.mark.parametrize(
+        ("compression_config", "expected"),
+        [({}, True), ({"in_place": False}, False)],
+    )
+    def test_agent_missing_config_defaults_on_but_explicit_false_opts_out(
+        self, compression_config, expected
+    ):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), patch(
+            "hermes_cli.config.load_config",
+            return_value={"compression": compression_config},
+        ):
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert agent.compression_in_place is expected
+
+
+class TestDispatchProjectionPersistence:
+    def test_changed_projection_is_atomically_archived_and_rebaselined(self):
+        from agent.conversation_compression import (
+            conversation_history_after_compression,
+            persist_in_place_projection,
+        )
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=db_path)
+            sid = "dispatch_projection_success"
+            _seed(db, sid, "projection", n=4)
+            agent = _make_agent(db, sid, in_place=True)
+            agent._last_compaction_in_place = False
+            agent._last_flushed_db_idx = 4
+            agent._flushed_db_message_ids = {1234}
+            previous = [
+                {"role": "user", "content": "msg 0"},
+                {"role": "assistant", "content": "msg 1"},
+                {"role": "user", "content": "msg 2"},
+                {"role": "assistant", "content": "msg 3"},
+            ]
+            compacted = [
+                {"role": "user", "content": "bounded summary"},
+                {"role": "assistant", "content": "recent reply"},
+            ]
+            expected_active_ids = tuple(row["id"] for row in db.get_messages(sid))
+
+            with patch.object(
+                db, "archive_and_compact", wraps=db.archive_and_compact
+            ) as archive:
+                adopted, persisted = persist_in_place_projection(
+                    agent, previous, compacted
+                )
+
+            archive.assert_called_once_with(
+                sid,
+                compacted,
+                expected_active_message_ids=expected_active_ids,
+            )
+            assert persisted is True
+            assert adopted is compacted
+            rows = db.get_messages(sid, include_inactive=True)
+            assert all(row["active"] == 0 and row["compacted"] == 1 for row in rows[:4])
+            assert all(row["active"] == 1 for row in rows[4:])
+            assert agent._last_compaction_in_place is True
+            assert agent._last_flushed_db_idx == 0
+            assert agent._flushed_db_message_ids == set()
+
+            # The re-baseline treats the inserted projection as history, so a
+            # normal append-only flush writes only the new tail message.
+            history = conversation_history_after_compression(agent, adopted)
+            assert history is not adopted
+            appended = adopted + [{"role": "user", "content": "new turn"}]
+            agent._flush_messages_to_session_db(appended, history)
+            assert [row["content"] for row in db.get_messages(sid)] == [
+                "bounded summary",
+                "recent reply",
+                "new turn",
+            ]
+
+            db.close()
+            restarted = SessionDB(db_path=db_path)
+            try:
+                assert [
+                    message["content"]
+                    for message in restarted.get_messages_as_conversation(sid)
+                ] == ["bounded summary", "recent reply", "new turn"]
+            finally:
+                restarted.close()
+
+    def test_restored_whitespace_normalization_still_matches_durable_prefix(self):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_restored_whitespace"
+            db.create_session(sid, "cli", model="test/model")
+            agent = _make_agent(db, sid, in_place=True)
+            live_messages = [
+                {"role": "user", "content": "  ordinary resumed prompt  \n"},
+                {"role": "assistant", "content": "\nordinary response\n"},
+            ]
+            agent._flush_messages_to_session_db(live_messages)
+            assert [row["content"] for row in db.get_messages(sid)] == [
+                "  ordinary resumed prompt  \n",
+                "\nordinary response\n",
+            ]
+            previous = db.get_messages_as_conversation(sid)
+            assert [message["content"] for message in previous] == [
+                "ordinary resumed prompt",
+                "ordinary response",
+            ]
+            compacted = [{"role": "user", "content": "bounded summary"}]
+
+            adopted, persisted = persist_in_place_projection(
+                agent,
+                previous,
+                compacted,
+            )
+
+            assert adopted is compacted
+            assert persisted is True
+            assert [
+                message["content"]
+                for message in db.get_messages_as_conversation(sid)
+            ] == ["bounded summary"]
+
+    def test_live_multimodal_normalization_still_matches_durable_prefix(self):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_live_multimodal"
+            db.create_session(sid, "cli", model="test/model")
+            agent = _make_agent(db, sid, in_place=True)
+            previous = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "inspect this"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,abc"},
+                        },
+                    ],
+                },
+                {"role": "assistant", "content": "ordinary response"},
+            ]
+            agent._flush_messages_to_session_db(previous)
+            assert [row["content"] for row in db.get_messages(sid)] == [
+                "inspect this\n[screenshot]",
+                "ordinary response",
+            ]
+            compacted = [{"role": "user", "content": "bounded visual summary"}]
+
+            adopted, persisted = persist_in_place_projection(
+                agent,
+                previous,
+                compacted,
+            )
+
+            assert adopted is compacted
+            assert persisted is True
+            assert [
+                message["content"]
+                for message in db.get_messages_as_conversation(sid)
+            ] == ["bounded visual summary"]
+
+    def test_db_failure_returns_exact_original_and_rolls_back_all_state(self):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_failure"
+            _seed(db, sid, "projection", n=4)
+            original = [
+                {"role": "user", "content": "msg 0"},
+                {"role": "assistant", "content": "msg 1"},
+                {"role": "user", "content": "msg 2"},
+                {"role": "assistant", "content": "msg 3"},
+            ]
+            compacted = [{"role": "user", "content": "must not be adopted"}]
+            flushed_ids = {17, 23}
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=4,
+                _flushed_db_message_ids=flushed_ids,
+            )
+
+            # Fail after archive_and_compact has issued its active=0 UPDATE.
+            # SessionDB's transaction must roll that UPDATE back as well as
+            # preventing any partial projection INSERT.
+            with patch.object(
+                db, "_insert_message_rows", side_effect=RuntimeError("insert failed")
+            ):
+                adopted, persisted = persist_in_place_projection(
+                    agent, original, compacted
+                )
+
+            assert persisted is False
+            assert adopted is original
+            assert agent._last_compaction_in_place is False
+            assert agent._last_flushed_db_idx == 4
+            assert agent._flushed_db_message_ids is flushed_ids
+            rows = db.get_messages(sid, include_inactive=True)
+            assert [row["content"] for row in rows] == [f"msg {i}" for i in range(4)]
+            assert all(row["active"] == 1 and row["compacted"] == 0 for row in rows)
+            assert db.get_session(sid)["message_count"] == 4
+
+    def test_concurrent_append_after_snapshot_fails_cas_without_archiving(self):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=db_path)
+            writer = SessionDB(db_path=db_path)
+            sid = "dispatch_projection_stale"
+            _seed(db, sid, "projection", n=4)
+            previous = [
+                {"role": "user", "content": "msg 0"},
+                {"role": "assistant", "content": "msg 1"},
+                {"role": "user", "content": "msg 2"},
+                {"role": "assistant", "content": "msg 3"},
+            ]
+            compacted = [{"role": "user", "content": "must not be adopted"}]
+            flushed_ids = {17, 23}
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=4,
+                _flushed_db_message_ids=flushed_ids,
+            )
+            original_archive = db.archive_and_compact
+
+            def archive_after_concurrent_append(*args, **kwargs):
+                from hermes_state import CompressionSessionBusyError
+
+                with pytest.raises(CompressionSessionBusyError) as blocked:
+                    writer.append_message(
+                        session_id=sid,
+                        role="user",
+                        content="concurrent append",
+                    )
+                raise blocked.value
+
+            try:
+                with (
+                    patch.object(
+                        db,
+                        "try_acquire_compression_lock",
+                        wraps=db.try_acquire_compression_lock,
+                    ) as acquire,
+                    patch.object(
+                        db,
+                        "release_compression_lock",
+                        wraps=db.release_compression_lock,
+                    ) as release,
+                    patch.object(
+                        db,
+                        "archive_and_compact",
+                        side_effect=archive_after_concurrent_append,
+                    ),
+                ):
+                    adopted, persisted = persist_in_place_projection(
+                        agent, previous, compacted
+                    )
+
+                assert adopted is previous
+                assert persisted is False
+                assert agent._last_compaction_in_place is False
+                assert agent._last_flushed_db_idx == 4
+                assert agent._flushed_db_message_ids is flushed_ids
+                assert [row["content"] for row in db.get_messages(sid)] == [
+                    "msg 0",
+                    "msg 1",
+                    "msg 2",
+                    "msg 3",
+                ]
+                rows = db.get_messages(sid, include_inactive=True)
+                assert all(
+                    row["active"] == 1 and row["compacted"] == 0
+                    for row in rows
+                )
+                assert db.get_session(sid)["message_count"] == 4
+                acquire.assert_called_once()
+                release.assert_called_once()
+            finally:
+                writer.close()
+                db.close()
+
+    def test_without_durable_session_adopts_memory_projection_but_reports_not_persisted(self):
+        from agent.conversation_compression import persist_in_place_projection
+
+        agent = SimpleNamespace(_session_db=None, session_id=None)
+        original = [{"role": "user", "content": "old"}]
+        compacted = [{"role": "user", "content": "bounded"}]
+
+        adopted, persisted = persist_in_place_projection(agent, original, compacted)
+
+        assert adopted is compacted
+        assert persisted is False
+        assert not hasattr(agent, "_last_compaction_in_place")
 
 
 class TestCompactedTurnsStaySearchable:

@@ -2653,6 +2653,34 @@ class SessionDB:
             "database is locked after max retries"
         )
 
+    @classmethod
+    def _bump_session_projection_for_id(
+        cls, conn: sqlite3.Connection, session_id: str
+    ) -> None:
+        """Invalidate the optional sidebar projection when it is present.
+
+        This storage layout may not create the legacy
+        ``session_projection_meta`` table. Keep the compaction call as a
+        compatibility seam, but treat an absent projection schema as a valid
+        no-op; deployments that still have the additive projection retain its
+        generation-bump behavior.
+        """
+        try:
+            row = conn.execute(
+                "SELECT source FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None or str(row[0] or "").strip().lower() == "subagent":
+                return
+            conn.execute(
+                "UPDATE session_projection_meta SET generation = generation + 1 "
+                "WHERE id = 1"
+            )
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "no such table" in message or "no such column" in message:
+                return
+            raise
+
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
         """True for the error class a corrupt FTS index raises on writes.
@@ -7028,6 +7056,112 @@ class SessionDB:
             return None
         return meta
 
+    @classmethod
+    def _normalize_content_for_persistence(cls, content: Any) -> Any:
+        """Apply the normal DB content projection without replay sanitizing."""
+        from agent.tool_dispatch_helpers import (
+            _is_multimodal_tool_result,
+            _multimodal_text_summary,
+        )
+
+        if _is_multimodal_tool_result(content):
+            return _multimodal_text_summary(content)
+        if not isinstance(content, list):
+            return content
+
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(str(part.get("text", "")))
+            elif (
+                isinstance(part, dict)
+                and part.get("type") in {"image", "image_url", "input_image"}
+            ):
+                text_parts.append("[screenshot]")
+        return "\n".join(text_parts) if text_parts else None
+
+    @classmethod
+    def _canonical_persisted_replay_message(
+        cls,
+        message: Any,
+        *,
+        include_timestamp: bool = True,
+        normalize_for_persistence: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Project a stored or live message through persistence and replay.
+
+        Restored conversations and durable-prefix comparisons share this
+        replay projection. When ``normalize_for_persistence`` is true, it first
+        applies the same content projection used by normal session flushes.
+        The result is idempotent for rows already returned by
+        :meth:`get_messages`.
+        """
+        try:
+            source = dict(message)
+        except (TypeError, ValueError):
+            return None
+
+        role = source.get("role", "unknown")
+        content = cls._decode_content(source.get("content"))
+        if normalize_for_persistence:
+            content = cls._normalize_content_for_persistence(content)
+        if role in {"user", "assistant"} and isinstance(content, str):
+            content = sanitize_context(content).strip()
+
+        result = {"role": role, "content": content}
+        if include_timestamp and source.get("timestamp"):
+            result["timestamp"] = source["timestamp"]
+        for key in ("tool_call_id", "tool_name", "effect_disposition"):
+            if source.get(key):
+                result[key] = source[key]
+
+        tool_calls = source.get("tool_calls")
+        if tool_calls:
+            if isinstance(tool_calls, str):
+                try:
+                    tool_calls = json.loads(tool_calls)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in conversation replay, "
+                        "falling back to []"
+                    )
+                    tool_calls = []
+            result["tool_calls"] = tool_calls
+
+        platform_message_id = (
+            source.get("platform_message_id") or source.get("message_id")
+        )
+        if platform_message_id:
+            result["message_id"] = platform_message_id
+        if source.get("observed"):
+            result["observed"] = True
+
+        if role == "assistant":
+            for key in ("finish_reason", "reasoning"):
+                if source.get(key):
+                    result[key] = source[key]
+            if source.get("reasoning_content") is not None:
+                result["reasoning_content"] = source["reasoning_content"]
+            for key in (
+                "reasoning_details",
+                "codex_reasoning_items",
+                "codex_message_items",
+            ):
+                value = source.get(key)
+                if not value:
+                    continue
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            "Failed to deserialize %s, falling back to None",
+                            key,
+                        )
+                        value = None
+                result[key] = value
+        return result
+
     def append_message(
         self,
         session_id: str,
@@ -7391,14 +7525,22 @@ class SessionDB:
             return cursor.fetchone() is not None
 
     def archive_and_compact(
-        self, session_id: str, compacted_messages: List[Dict[str, Any]]
+        self,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+        *,
+        expected_active_message_ids: Optional[Tuple[int, ...]] = None,
+        system_prompt: Optional[str] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
         Soft-archives every currently-active message (``active = 0``) and
         inserts *compacted_messages* as fresh active rows — atomically, in one
-        write transaction. The conversation keeps ONE session id for life
-        (#38763) WITHOUT destroying history:
+        write transaction. When ``system_prompt`` is provided, the rebuilt
+        prompt is committed in that same transaction so the durable projection
+        can never expose new messages with the old prompt (or vice versa). The
+        conversation keeps ONE session id for life (#38763) WITHOUT destroying
+        history:
 
         - The live-context load (:meth:`get_messages_as_conversation`,
           :meth:`get_messages`) filters ``active = 1`` by default, so the model
@@ -7415,9 +7557,34 @@ class SessionDB:
         This is the durability-preserving alternative to :meth:`replace_messages`
         for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
         matching what the live load returns. Returns the new active count.
+
+        When ``expected_active_message_ids`` is provided, the replacement is a
+        compare-and-swap: the active row IDs are checked inside the same
+        ``BEGIN IMMEDIATE`` transaction before any row is archived. A mismatch
+        raises and leaves every active row untouched. Legacy callers that omit
+        the expectation retain the existing unconditional behavior.
         """
 
+        expected_ids = (
+            tuple(expected_active_message_ids)
+            if expected_active_message_ids is not None
+            else None
+        )
+
         def _do(conn):
+            if expected_ids is not None:
+                current_ids = tuple(
+                    row["id"] if isinstance(row, sqlite3.Row) else row[0]
+                    for row in conn.execute(
+                        "SELECT id FROM messages "
+                        "WHERE session_id = ? AND active = 1 ORDER BY id",
+                        (session_id,),
+                    ).fetchall()
+                )
+                if current_ids != expected_ids:
+                    raise RuntimeError(
+                        "active session projection changed before compaction"
+                    )
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -7434,10 +7601,24 @@ class SessionDB:
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (inserted, tool_calls_total, session_id),
-            )
+            if system_prompt is None:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                    "WHERE id = ?",
+                    (inserted, tool_calls_total, session_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                    "system_prompt = ? WHERE id = ?",
+                    (
+                        inserted,
+                        tool_calls_total,
+                        system_prompt,
+                        session_id,
+                    ),
+                )
+            self._bump_session_projection_for_id(conn, session_id)
             return inserted
 
         return self._execute_write(_do)

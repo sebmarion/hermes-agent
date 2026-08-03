@@ -1111,6 +1111,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
+        required_policy_record = None
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
@@ -1164,6 +1165,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             name = function_name
             args = function_args
             progress_function_name = function_name
+            try:
+                from hermes_cli.middleware import get_required_policy_block_record
+
+                required_policy_record = get_required_policy_block_record(
+                    str(getattr(tc, "id", "") or "")
+                )
+            except Exception:
+                pass
+            if required_policy_record is not None:
+                blocked = True
+                effect_disposition = "none"
             if blocked:
                 effect_disposition = "none"
 
@@ -1233,6 +1245,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             effect_disposition=effect_disposition,
         )
         messages.append(tool_message)
+        if required_policy_record is not None and i not in timed_out_indices:
+            try:
+                from hermes_cli.middleware import mark_required_policy_block_appended
+
+                mark_required_policy_block_appended(
+                    str(getattr(tc, "id", "") or "")
+                )
+            except Exception:
+                pass
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
             agent,
@@ -1801,6 +1822,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
+        required_policy_record = None
+        try:
+            from hermes_cli.middleware import get_required_policy_block_record
+
+            required_policy_record = get_required_policy_block_record(
+                str(getattr(tool_call, "id", "") or "")
+            )
+        except Exception:
+            pass
+        if required_policy_record is not None:
+            _execution_blocked = True
+
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -1894,6 +1927,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
         messages.append(tool_message)
+        if required_policy_record is not None:
+            try:
+                from hermes_cli.middleware import mark_required_policy_block_appended
+
+                mark_required_policy_block_appended(
+                    str(getattr(tool_call, "id", "") or "")
+                )
+            except Exception:
+                pass
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
             agent,
@@ -1951,6 +1993,35 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # injection lands as soon as a tool finishes — not after the
         # entire batch.  The model sees it on the next API iteration.
         agent._apply_pending_steer_to_tool_results(messages, 1)
+
+        # Non-recoverable required-policy infrastructure failures terminate
+        # this assistant batch.  Close every tool-call id that the model
+        # emitted but that we deliberately did not start, so the transcript
+        # remains structurally valid for the next request/resume.
+        if required_policy_record is not None:
+            from hermes_cli.tool_policy import PolicyDecisionCode
+
+            if required_policy_record.block.policy_code == PolicyDecisionCode.BLOCKED:
+                required_policy_record = None
+        if required_policy_record is not None:
+            for skipped_tc in assistant_message.tool_calls[i:]:
+                skipped_name = skipped_tc.function.name
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    (
+                        f"[Tool execution skipped — {skipped_name} was not started "
+                        "because required policy enforcement halted this turn]"
+                    ),
+                    skipped_tc.id,
+                    effect_disposition="none",
+                ))
+                if not _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"required-policy skipped tool result {skipped_name}",
+                ):
+                    return
+            break
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:

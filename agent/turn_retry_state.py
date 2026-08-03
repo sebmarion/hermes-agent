@@ -67,6 +67,10 @@ class TurnRetryState:
 
     # ── Restart signals (read by the outer loop after the attempt) ───────
     restart_with_compressed_messages: bool = False
+    # True only when the compression restart happened before provider
+    # transport (for example, a local admission rejection). Provider-originated
+    # overflow retries keep their consumed call/budget accounting.
+    refund_compressed_restart: bool = False
     restart_with_length_continuation: bool = False
     # Set when a content-filter stream stall (e.g. MiniMax "new_sensitive")
     # has been escalated to the fallback chain: the partial-stream content

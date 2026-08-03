@@ -351,6 +351,8 @@ _SUMMARY_INPUT_MAX_CHARS = 160_000
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+_TOOL_RESULT_SUMMARY_MAX_CHARS = 200
+_TOOL_CALL_ARGS_MAX_CHARS = 500
 
 # Ghost-skill defense (#32106): when compaction reduces an old ``skill_view``
 # result to a 1-line metadata summary, the model still believes the skill is
@@ -833,7 +835,11 @@ def _strip_image_parts_from_parts(parts: Any) -> Any:
     return out if had_image else None
 
 
-def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
+def _truncate_tool_call_args_json(
+    args: str,
+    head_chars: int = 200,
+    max_chars: int = _TOOL_CALL_ARGS_MAX_CHARS,
+) -> str:
     """Shrink long string values inside a tool-call arguments JSON blob while
     preserving JSON validity.
 
@@ -852,31 +858,131 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     turn. See issue #11762 for the observed loop.
 
     This helper parses the arguments, shrinks long string leaves inside the
-    parsed structure, and re-serialises. Non-string values (paths, ints,
-    booleans) are preserved intact. If the arguments are not valid JSON
-    to begin with — some model backends use non-JSON tool arguments — the
-    original string is returned unchanged rather than replaced with
-    something neither we nor the backend can parse.
+    parsed structure, and re-serialises. Non-string values are preserved when
+    that structural pass fits within ``max_chars``. If a large value has no
+    shrinkable string leaves (for example, a huge numeric array), it becomes a
+    small JSON receipt containing only safe shape metadata. Invalid JSON is
+    returned unchanged rather than replaced with something neither we nor the
+    backend can parse. Every changed return value is strictly shorter than the
+    input.
     """
+    force_receipt = False
     try:
         parsed = json.loads(args)
     except (ValueError, TypeError):
-        return args
+        # Python 3.11 rejects otherwise-valid integers longer than the process
+        # digit limit before json.loads can return their surrounding shape.
+        # Re-parse with a non-numeric hook to validate the complete JSON text
+        # without constructing native ints, then use only bounded shape
+        # metadata. Malformed JSON still fails this second parse unchanged.
+        try:
+            parsed = json.loads(args, parse_int=str)
+        except (ValueError, TypeError):
+            return args
+        force_receipt = True
 
-    def _shrink(obj: Any) -> Any:
+    shrinkable_string_found = False
+
+    def _shrink(obj: Any, retained_chars: int) -> Any:
+        nonlocal shrinkable_string_found
         if isinstance(obj, str):
             if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
+                shrinkable_string_found = True
+                return obj[:retained_chars] + "...[truncated]"
             return obj
         if isinstance(obj, dict):
-            return {k: _shrink(v) for k, v in obj.items()}
+            return {k: _shrink(v, retained_chars) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [_shrink(v) for v in obj]
+            return [_shrink(v, retained_chars) for v in obj]
         return obj
 
-    shrunken = _shrink(parsed)
-    # ensure_ascii=False preserves CJK/emoji instead of bloating with \uXXXX
-    return json.dumps(shrunken, ensure_ascii=False)
+    # Compact separators avoid growing already-minified arguments. The
+    # structural form is useful only when it actually fits the bounded replay
+    # slot; otherwise a many-item non-string container would remain enormous.
+    def _serialize_with_retained_chars(retained_chars: int) -> Optional[str]:
+        try:
+            return json.dumps(
+                _shrink(parsed, retained_chars),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except ValueError:
+            # Python accepts overflowing JSON numbers as infinities, but
+            # downstream providers require strict JSON and reject the
+            # ``Infinity`` token that json.dumps emits by default.
+            return None
+
+    candidate = (
+        None
+        if force_receipt
+        else _serialize_with_retained_chars(head_chars)
+    )
+    if (
+        candidate is not None
+        and len(candidate) <= max_chars
+        and len(candidate) < len(args)
+    ):
+        return candidate
+
+    # Preserve the original JSON shape when possible. Find the largest common
+    # prefix for leaves that were already over ``head_chars`` such that the
+    # complete serialized structure fits the replay bound. Short strings are
+    # never expanded into truncation markers during this search.
+    if shrinkable_string_found and not force_receipt:
+        low = 0
+        high = max(0, head_chars - 1)
+        bounded_candidate = None
+        while low <= high:
+            retained_chars = (low + high) // 2
+            trial = _serialize_with_retained_chars(retained_chars)
+            if trial is not None and len(trial) <= max_chars:
+                bounded_candidate = trial
+                low = retained_chars + 1
+            else:
+                high = retained_chars - 1
+        if (
+            bounded_candidate is not None
+            and len(bounded_candidate) < len(args)
+        ):
+            return bounded_candidate
+
+    if isinstance(parsed, dict):
+        receipt = {
+            "_hermes_truncated": True,
+            "original_chars": len(args),
+            "value_type": "object",
+            "key_count": len(parsed),
+            "keys": [str(key)[:40] for key in list(parsed)[:8]],
+        }
+    elif isinstance(parsed, list):
+        receipt = {
+            "_hermes_truncated": True,
+            "original_chars": len(args),
+            "value_type": "list",
+            "item_count": len(parsed),
+        }
+    else:
+        receipt = {
+            "_hermes_truncated": True,
+            "original_chars": len(args),
+            "value_type": "integer" if force_receipt else type(parsed).__name__,
+        }
+    fallback = json.dumps(
+        receipt,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    while len(fallback) > max_chars and receipt.get("keys"):
+        receipt["keys"].pop()
+        fallback = json.dumps(
+            receipt,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    return fallback if len(fallback) < len(args) else args
 
 
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
@@ -1026,6 +1132,13 @@ def _str_arg(args: dict, key: str, default: str = "") -> str:
     return str(val) if val is not None else default
 
 
+def _bound_tool_result_receipt(receipt: str) -> str:
+    """Keep generated receipts at or below the tool-result pruning floor."""
+    if len(receipt) <= _TOOL_RESULT_SUMMARY_MAX_CHARS:
+        return receipt
+    return receipt[:_TOOL_RESULT_SUMMARY_MAX_CHARS - 3].rstrip() + "..."
+
+
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
     """Create an informative 1-line summary of a tool call + result.
 
@@ -1058,7 +1171,9 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
     """Build the summary line (unguarded; see ``_summarize_tool_result``)."""
     try:
         args = json.loads(tool_args) if tool_args else {}
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError):
+        args = {}
+    if not isinstance(args, dict):
         args = {}
     if not isinstance(args, dict):
         args = {}
@@ -2585,7 +2700,6 @@ class ContextCompressor(ContextEngine):
                 msg = result[i]
                 msg_tokens = _estimate_msg_budget_tokens(msg)
                 if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
-                    boundary = i
                     break
                 accumulated += msg_tokens
                 boundary = i
@@ -2606,6 +2720,7 @@ class ContextCompressor(ContextEngine):
         # When the same file is read multiple times, keep only the most recent
         # full copy and replace older duplicates with a back-reference.
         content_hashes: dict = {}  # hash -> (index, tool_call_id)
+        newest_duplicate_indices: set[int] = set()
         for i in range(len(result) - 1, -1, -1):
             msg = result[i]
             if msg.get("role") != "tool":
@@ -2618,13 +2733,18 @@ class ContextCompressor(ContextEngine):
                 # Multimodal dict envelopes ({_multimodal: True, content: [...]}) and
                 # other non-string tool-result shapes can't be hashed/deduped by text.
                 continue
-            if len(content) < 200:
+            if len(content) <= _TOOL_RESULT_SUMMARY_MAX_CHARS:
                 continue
             h = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:12]
             if h in content_hashes:
-                # This is an older duplicate — replace with back-reference
-                result[i] = {**msg, "content": "[Duplicate tool output — same content as a more recent call]"}
-                pruned += 1
+                newest_duplicate_indices.add(content_hashes[h][0])
+                # This is an older duplicate. The full-list scan deliberately
+                # sees protected messages so it can identify the true newest
+                # copy, but the protected tail is immutable: only replace a
+                # duplicate when this message is before the prune boundary.
+                if i < prune_boundary:
+                    result[i] = {**msg, "content": "[Duplicate tool output — same content as a more recent call]"}
+                    pruned += 1
             else:
                 content_hashes[h] = (i, msg.get("tool_call_id", "?"))
 
@@ -2654,7 +2774,8 @@ class ContextCompressor(ContextEngine):
                 return False
             if isinstance(content, dict) and content.get("_multimodal"):
                 summary = content.get("text_summary") or "[screenshot removed to save context]"
-                result[idx] = {**msg, "content": f"[screenshot removed] {summary[:200]}"}
+                receipt = _bound_tool_result_receipt(f"[screenshot removed] {summary}")
+                result[idx] = {**msg, "content": receipt}
                 pruned += 1
                 return True
             if not isinstance(content, str):
@@ -2662,6 +2783,10 @@ class ContextCompressor(ContextEngine):
             if not content or content == _PRUNED_TOOL_PLACEHOLDER:
                 return False
             if content.startswith("[Duplicate tool output"):
+                return False
+            # Keep the newest member of a duplicate set as the authoritative
+            # full copy even when it sits outside the protected tail.
+            if idx in newest_duplicate_indices:
                 return False
             # Already replaced by a prior prune/pressure pass (1-line summary).
             if content.startswith("[") and " chars)" in content and len(content) < 400:
@@ -2684,13 +2809,16 @@ class ContextCompressor(ContextEngine):
                 _skill = _args.get("name", "") if isinstance(_args, dict) else ""
                 if isinstance(_skill, str) and _skill.lower() in protected_skills:
                     return False
-            summary = _summarize_tool_result(tool_name, tool_args, content)
+            summary = _bound_tool_result_receipt(
+                _summarize_tool_result(tool_name, tool_args, content)
+            )
             result[idx] = {**msg, "content": summary}
             pruned += 1
             return True
 
         def _truncate_tool_call_args_at(idx: int) -> bool:
             """Shrink large tool_call argument payloads at ``idx``."""
+            nonlocal pruned
             msg = result[idx]
             if msg.get("role") != "assistant" or not msg.get("tool_calls"):
                 return False
@@ -2699,11 +2827,12 @@ class ContextCompressor(ContextEngine):
             for tc in msg["tool_calls"]:
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
-                    if len(args) > 500:
+                    if len(args) > _TOOL_CALL_ARGS_MAX_CHARS:
                         new_args = _truncate_tool_call_args_json(args)
-                        if new_args != args:
+                        if new_args != args and len(new_args) < len(args):
                             tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
                             modified = True
+                            pruned += 1
                 new_tcs.append(tc)
             if modified:
                 result[idx] = {**msg, "tool_calls": new_tcs}
@@ -2869,6 +2998,24 @@ class ContextCompressor(ContextEngine):
             if (before - after) < self.proactive_prune_min_reclaim_tokens:
                 return messages, 0
         return pruned_msgs, pruned_count
+
+    def prune_tool_results_for_dispatch(
+        self, messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Build a bounded tool-history projection without calling an LLM.
+
+        Uses the compressor's existing 200-character pruning floor and its
+        configured message-count/token-budget tail protections. The input list
+        is returned unchanged when the projection needs no mutations.
+        """
+        pruned_messages, pruned_count = self._prune_old_tool_results(
+            messages,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=self.tail_token_budget,
+        )
+        if pruned_count == 0:
+            return messages, 0
+        return pruned_messages, pruned_count
 
     # ------------------------------------------------------------------
     # Summarization
@@ -5399,6 +5546,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 turns_to_summarize,
                 reason=self._last_summary_error,
             )
+            self._previous_summary = self._strip_summary_prefix(summary)
 
         tail_messages: List[Dict[str, Any]] = []
         # Start at tail_start (not compress_end): the restart-decay scan may

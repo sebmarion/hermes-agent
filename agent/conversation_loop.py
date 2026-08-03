@@ -29,7 +29,14 @@ from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import cfg_get
 from agent.codex_responses_adapter import _summarize_user_message_for_log
-from agent.conversation_compression import conversation_history_after_compression
+from agent.chat_completion_helpers import (
+    ProviderRequestBudgetError,
+    build_provider_request_admission_receipt,
+)
+from agent.conversation_compression import (
+    conversation_history_after_compression,
+    persist_in_place_projection,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
@@ -554,6 +561,91 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _apply_context_engine_selection(
+    agent: Any,
+    api_messages: List[Dict[str, Any]],
+    conversation_messages: List[Dict[str, Any]],
+    incoming_message: Optional[Dict[str, Any]],
+    *,
+    logger: Any,
+) -> List[Dict[str, Any]]:
+    """Apply an optional request-only context selection hook."""
+    engine = getattr(agent, "context_compressor", None)
+    if engine is None or not hasattr(engine, "select_context"):
+        return api_messages
+    try:
+        from agent.context_engine import ContextEngine as _CE
+        if getattr(engine.select_context, "__func__", None) is _CE.select_context:
+            return api_messages
+    except Exception:
+        pass
+    session_label = getattr(agent, "session_id", None) or "-"
+    try:
+        selected = engine.select_context(
+            [dict(m) if isinstance(m, dict) else m for m in api_messages],
+            conversation_messages=(
+                [dict(m) if isinstance(m, dict) else m for m in conversation_messages]
+                if conversation_messages is not None else None
+            ),
+            incoming_message=(
+                dict(incoming_message) if isinstance(incoming_message, dict)
+                else incoming_message
+            ),
+            budget_tokens=getattr(engine, "context_length", 0) or 0,
+        )
+    except Exception:
+        logger.warning(
+            "Context engine select_context hook failed; using unmodified request "
+            "messages (session=%s)",
+            session_label,
+            exc_info=True,
+        )
+        return api_messages
+    if isinstance(selected, list) and selected and all(
+        isinstance(message, dict) for message in selected
+    ):
+        return selected
+    logger.warning(
+        "Context engine select_context returned an invalid value; ignoring "
+        "(session=%s)",
+        session_label,
+    )
+    return api_messages
+
+
+def _notify_context_engine_turn_complete(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    usage: Optional[Dict[str, Any]] = None,
+    logger: Any,
+    **meta: Any,
+) -> None:
+    """Notify an active context engine after a finalized turn, fail-open."""
+    engine = getattr(agent, "context_compressor", None)
+    hook = getattr(engine, "on_turn_complete", None)
+    if engine is None or not callable(hook):
+        return
+    try:
+        from agent.context_engine import ContextEngine as _CE
+        if getattr(hook, "__func__", None) is _CE.on_turn_complete:
+            return
+    except Exception:
+        pass
+    try:
+        hook(
+            [dict(message) if isinstance(message, dict) else message for message in messages],
+            usage=usage,
+            **meta,
+        )
+    except Exception:
+        logger.warning(
+            "Context engine on_turn_complete hook failed (session=%s)",
+            getattr(agent, "session_id", None) or "-",
+            exc_info=True,
+        )
+
+
 def _run_conversation(
     agent,
     user_message: str,
@@ -691,13 +783,105 @@ def _run_conversation(
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
-    compression_attempts = 0
+    compression_attempts = _ctx.compression_attempts
+    provider_context_retry = {"used": False, "before_tokens": None}
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
     # user-facing result available; it must not be confused with error or
     # recovery text produced by unrelated exit paths.
     _pending_verification_response = None
+
+    def _refund_untransported_attempt() -> None:
+        """Undo loop admission when no provider transport was attempted."""
+        nonlocal api_call_count
+        api_call_count = max(0, api_call_count - 1)
+        agent._api_call_count = api_call_count
+        try:
+            agent.iteration_budget.refund()
+        except Exception:
+            pass
+
+    def _compression_exhausted_result(message: str) -> Dict[str, Any]:
+        """Return one truthful same-session terminal context failure."""
+        from agent.turn_finalizer import finalize_turn
+
+        agent._flush_status_buffer()
+        result = finalize_turn(
+            agent,
+            final_response=message,
+            api_call_count=api_call_count,
+            interrupted=False,
+            failed=True,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=False,
+            _turn_exit_reason="compression_exhausted",
+            preserve_final_response=True,
+        )
+        result.update(
+            completed=False,
+            error=message,
+            partial=True,
+            failed=True,
+            compression_exhausted=True,
+        )
+        return result
+
+    def _claim_provider_context_retry() -> bool:
+        """Reserve the sole compact-and-retry allowed for this logical turn."""
+        if provider_context_retry["used"]:
+            return False
+        receipt = getattr(agent, "_last_provider_admission_receipt", {})
+        provider_context_retry["used"] = True
+        provider_context_retry["before_tokens"] = int(
+            receipt.get("estimated_input_tokens") or 0
+        )
+        return True
+
+    def _compact_canonical_for_budget(
+        previous_messages: List[Dict[str, Any]],
+        *,
+        approx_input_tokens: int,
+        current_system_prompt: str,
+    ) -> tuple[List[Dict[str, Any]], str, Optional[str]]:
+        """Compact once, adopting only a real durable in-place projection."""
+        if not bool(getattr(agent, "compression_in_place", False)):
+            return previous_messages, current_system_prompt, "in_place_compaction_disabled"
+
+        agent._last_compaction_in_place = False
+        try:
+            compacted_messages, compacted_prompt = agent._compress_context(
+                previous_messages,
+                system_message,
+                approx_tokens=approx_input_tokens,
+                task_id=effective_task_id,
+            )
+        except Exception:
+            return previous_messages, current_system_prompt, "compaction_failed"
+
+        if not isinstance(compacted_messages, list):
+            return previous_messages, current_system_prompt, "invalid_compaction_projection"
+        if bool(getattr(agent.context_compressor, "_last_compress_aborted", False)):
+            return previous_messages, current_system_prompt, "compaction_aborted"
+        if compacted_messages == previous_messages:
+            return previous_messages, current_system_prompt, "compaction_made_no_progress"
+
+        durable_session = (
+            getattr(agent, "_session_db", None) is not None
+            and bool(getattr(agent, "session_id", None))
+            and not bool(getattr(agent, "_persist_disabled", False))
+        )
+        if durable_session and not bool(
+            getattr(agent, "_last_compaction_in_place", False)
+        ):
+            return previous_messages, current_system_prompt, "compaction_not_persisted"
+
+        return compacted_messages, compacted_prompt, None
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -869,6 +1053,36 @@ def _run_conversation(
                 agent.session_id or "-",
             )
 
+        # Bound old tool history on the canonical transcript before creating
+        # the provider-facing copy. A changed projection is adopted only after
+        # the same-session persistence helper succeeds; then restart request
+        # construction so every derived field is rebuilt from that projection.
+        _dispatch_pruner = getattr(
+            agent.context_compressor, "prune_tool_results_for_dispatch", None
+        )
+        if callable(_dispatch_pruner):
+            dispatch_projection, pruned_tool_items = _dispatch_pruner(messages)
+        else:
+            dispatch_projection, pruned_tool_items = messages, 0
+        if pruned_tool_items:
+            previous_messages = messages
+            adopted_messages, projection_persisted = persist_in_place_projection(
+                agent, previous_messages, dispatch_projection
+            )
+            if adopted_messages is previous_messages:
+                _refund_untransported_attempt()
+                return _compression_exhausted_result(
+                    "Context budget pruning could not be persisted safely."
+                )
+            messages = adopted_messages
+            conversation_history = (
+                conversation_history_after_compression(agent, messages)
+                if projection_persisted
+                else None
+            )
+            _refund_untransported_attempt()
+            continue
+
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
@@ -964,6 +1178,22 @@ def _run_conversation(
             sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
+
+        # Context selection is request-only: it may route/retrieve a bounded
+        # view for this provider call, but never mutates the canonical
+        # transcript that is persisted and replayed next turn.
+        _sel_incoming = (
+            messages[current_turn_user_idx]
+            if 0 <= current_turn_user_idx < len(messages)
+            else None
+        )
+        api_messages = _apply_context_engine_selection(
+            agent,
+            api_messages,
+            messages,
+            _sel_incoming,
+            logger=request_logger,
+        )
 
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
@@ -1208,7 +1438,6 @@ def _run_conversation(
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
-                            compression_attempts = 0
                             _retry.primary_recovery_attempted = False
                             continue
                         # No fallback available — surface buffered context
@@ -1252,14 +1481,6 @@ def _run_conversation(
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
                     )
-                # Copilot x-initiator: the first API call of a user turn is
-                # marked "user" so Copilot bills a premium request; tool-loop
-                # follow-ups keep the default "agent" header (#3040).
-                if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
-                    _xh = dict(api_kwargs.get("extra_headers") or {})
-                    _xh["x-initiator"] = "user"
-                    api_kwargs["extra_headers"] = _xh
-                    agent._is_user_initiated_turn = False
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -1404,6 +1625,96 @@ def _run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
+                    # Mark only the first request that survives final admission
+                    # as user-initiated. A local budget rejection rebuilds the
+                    # request without consuming this one-shot Copilot signal.
+                    _copilot_user_initiated = bool(
+                        getattr(agent, "_is_user_initiated_turn", False)
+                        and agent._is_copilot_url()
+                    )
+                    if _copilot_user_initiated:
+                        next_api_kwargs = dict(next_api_kwargs)
+                        _xh = dict(next_api_kwargs.get("extra_headers") or {})
+                        _xh["x-initiator"] = "user"
+                        next_api_kwargs["extra_headers"] = _xh
+                    _admission_receipt = build_provider_request_admission_receipt(
+                        agent, next_api_kwargs
+                    )
+                    _provider_retry_before = provider_context_retry["before_tokens"]
+                    if _provider_retry_before is not None:
+                        _provider_retry_after = int(
+                            _admission_receipt.get("estimated_input_tokens") or 0
+                        )
+                        _provider_retry_reject_reason = None
+                        _base_admission_reason = str(
+                            _admission_receipt.get("reason") or ""
+                        )
+                        if (
+                            _admission_receipt.get("decision") != "admit"
+                            and _base_admission_reason
+                            != "estimated_input_plus_margin_exceeds_ceiling"
+                        ):
+                            _provider_retry_reject_reason = _base_admission_reason
+                        elif (
+                            _provider_retry_before <= 0
+                            or _provider_retry_after <= 0
+                            or _provider_retry_after * 100
+                            > _provider_retry_before * 95
+                        ):
+                            _provider_retry_reject_reason = (
+                                "provider_context_retry_shrink_below_five_percent"
+                            )
+                        elif _admission_receipt.get("decision") != "admit":
+                            _provider_retry_reject_reason = (
+                                "provider_context_retry_still_over_budget"
+                            )
+                        if _provider_retry_reject_reason:
+                            _admission_receipt = dict(_admission_receipt)
+                            _admission_receipt["decision"] = "reject"
+                            _admission_receipt["reason"] = (
+                                _provider_retry_reject_reason
+                            )
+                            _admission_receipt["provider_retry_before_tokens"] = (
+                                _provider_retry_before
+                            )
+                            _admission_receipt["provider_retry_after_tokens"] = (
+                                _provider_retry_after
+                            )
+                        else:
+                            provider_context_retry["before_tokens"] = None
+                    agent._last_provider_admission_receipt = _admission_receipt
+                    _admission_log = {
+                        key: _admission_receipt.get(key)
+                        for key in (
+                            "resolved_model",
+                            "resolved_provider",
+                            "compressor_model",
+                            "compressor_provider",
+                            "context_length",
+                            "threshold_tokens",
+                            "estimated_input_tokens",
+                            "margin_tokens",
+                            "estimated_input_with_margin_tokens",
+                            "explicit_output_tokens",
+                            "window_input_ceiling",
+                            "effective_input_ceiling",
+                            "provider_retry_before_tokens",
+                            "provider_retry_after_tokens",
+                            "decision",
+                            "reason",
+                        )
+                    }
+                    _admission_log["category_estimated_tokens"] = dict(
+                        _admission_receipt.get("category_estimated_tokens") or {}
+                    )
+                    request_logger.info(
+                        "provider_request_admission",
+                        extra={"provider_request_admission": _admission_log},
+                    )
+                    if _admission_receipt.get("decision") != "admit":
+                        raise ProviderRequestBudgetError(_admission_receipt)
+                    if _copilot_user_initiated:
+                        agent._is_user_initiated_turn = False
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -1564,7 +1875,6 @@ def _run_conversation(
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
-                        compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
 
@@ -1637,7 +1947,6 @@ def _run_conversation(
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
-                            compression_attempts = 0
                             _retry.primary_recovery_attempted = False
                             continue
                         # Terminal — flush buffered retry trace so user sees what happened.
@@ -1793,7 +2102,6 @@ def _run_conversation(
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
-                        compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
 
@@ -1969,7 +2277,6 @@ def _run_conversation(
                                 length_continue_retries = 0
                                 truncated_response_parts = []
                                 retry_count = 0
-                                compression_attempts = 0
                                 _retry.primary_recovery_attempted = False
                                 _retry.restart_with_rebuilt_messages = True
                                 break
@@ -2376,6 +2683,53 @@ def _run_conversation(
                         pass
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
+
+            except ProviderRequestBudgetError as budget_error:
+                if thinking_spinner:
+                    thinking_spinner.stop("")
+                    thinking_spinner = None
+                if agent.thinking_callback:
+                    agent.thinking_callback("")
+
+                receipt = budget_error.receipt
+                reason = str(receipt.get("reason") or "local_budget_rejection")
+                if (
+                    reason != "estimated_input_plus_margin_exceeds_ceiling"
+                    or not agent.compression_enabled
+                    or not bool(getattr(agent, "compression_in_place", False))
+                    or compression_attempts >= max_compression_attempts
+                ):
+                    _refund_untransported_attempt()
+                    return _compression_exhausted_result(
+                        f"Context budget rejected locally: {reason}."
+                    )
+
+                previous_messages = messages
+                compression_attempts += 1
+                compressed_messages, compressed_prompt, compaction_failure = (
+                    _compact_canonical_for_budget(
+                        previous_messages,
+                        approx_input_tokens=int(
+                            receipt.get("estimated_input_tokens") or 0
+                        ),
+                        current_system_prompt=active_system_prompt,
+                    )
+                )
+                if compaction_failure:
+                    messages = previous_messages
+                    _refund_untransported_attempt()
+                    return _compression_exhausted_result(
+                        "Context budget rejected locally: "
+                        f"{compaction_failure}."
+                    )
+                messages = compressed_messages
+                active_system_prompt = compressed_prompt
+                conversation_history = conversation_history_after_compression(
+                    agent, messages
+                )
+                _retry.restart_with_compressed_messages = True
+                _retry.refund_compressed_restart = True
+                break
 
             except InterruptedError:
                 if thinking_spinner:
@@ -3125,6 +3479,18 @@ def _run_conversation(
                 # compress history and retry, not abort immediately.
                 status_code = getattr(api_error, "status_code", None)
 
+                # Output-cap recovery only lowers the requested response size;
+                # it does not compact input history. Keep it available even
+                # when automatic compaction is disabled, then re-admit the
+                # rebuilt provider-ready request before transport.
+                _available_output_tokens = (
+                    parse_available_output_tokens_from_error(error_msg)
+                )
+                _is_output_cap_recovery = (
+                    is_output_cap_error(error_msg)
+                    or _available_output_tokens is not None
+                )
+
                 # ── Respect disabled auto-compaction on overflow ──────
                 # Ported from anomalyco/opencode#30749.  When the user has
                 # turned auto-compaction off (``compression.enabled: false``),
@@ -3149,6 +3515,7 @@ def _run_conversation(
                 if (
                     classified.reason in _overflow_reasons
                     and not getattr(agent, "compression_enabled", True)
+                    and not _is_output_cap_recovery
                 ):
                     agent._flush_status_buffer()
                     agent._vprint(
@@ -3190,6 +3557,16 @@ def _run_conversation(
                 # credentials won't help.  Reduce context to 200k (the
                 # standard tier) and compress.
                 if classified.reason == FailoverReason.long_context_tier:
+                    if compression_attempts >= max_compression_attempts:
+                        return _compression_exhausted_result(
+                            "Long-context tier rejection arrived after the shared "
+                            "compression limit was exhausted."
+                        )
+                    if not _claim_provider_context_retry():
+                        return _compression_exhausted_result(
+                            "Long-context tier rejection persisted after the single "
+                            "compact-and-retry."
+                        )
                     _reduced_ctx = 200000
                     compressor = agent.context_compressor
                     old_ctx = compressor.context_length
@@ -3218,26 +3595,35 @@ def _run_conversation(
                         )
 
                     compression_attempts += 1
-                    if compression_attempts <= max_compression_attempts:
-                        original_len = len(messages)
-                        messages, active_system_prompt = agent._compress_context(
-                            messages, system_message,
-                            approx_tokens=approx_tokens,
-                            task_id=effective_task_id,
+                    previous_messages = messages
+                    original_len = len(messages)
+                    original_tokens = estimate_messages_tokens_rough(messages)
+                    messages, active_system_prompt, compaction_failure = (
+                        _compact_canonical_for_budget(
+                            previous_messages,
+                            approx_input_tokens=approx_tokens,
+                            current_system_prompt=active_system_prompt,
                         )
-                        conversation_history = conversation_history_after_compression(
-                            agent, messages
+                    )
+                    if compaction_failure:
+                        messages = previous_messages
+                        return _compression_exhausted_result(
+                            "Long-context tier compaction failed: "
+                            f"{compaction_failure}."
                         )
-                        if len(messages) < original_len or old_ctx > _reduced_ctx:
-                            agent._buffer_status(
-                                f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
-                                f"(was {old_ctx:,}), retrying..."
-                            )
-                            time.sleep(2)
-                            _retry.restart_with_compressed_messages = True
-                            break
-                    # Fall through to normal error handling if compression
-                    # is exhausted or didn't help.
+                    conversation_history = conversation_history_after_compression(
+                        agent, messages
+                    )
+                    new_tokens = estimate_messages_tokens_rough(messages)
+                    agent._buffer_status(
+                        f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
+                        f"(was {old_ctx:,}); compacted {original_len} → "
+                        f"{len(messages)} messages, ~{original_tokens:,} → "
+                        f"~{new_tokens:,} tokens; remeasuring before retry..."
+                    )
+                    time.sleep(2)
+                    _retry.restart_with_compressed_messages = True
+                    break
 
                 # Eager fallback for rate-limit errors (429 or quota exhaustion)
                 # and transport errors (connection failure / timeout / provider
@@ -3311,7 +3697,6 @@ def _run_conversation(
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
-                            compression_attempts = 0
                             _retry.primary_recovery_attempted = False
                             continue
 
@@ -3344,7 +3729,6 @@ def _run_conversation(
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
-                        compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
 
@@ -3454,33 +3838,69 @@ def _run_conversation(
                     )
 
                 if is_payload_too_large:
+                    if compression_attempts >= max_compression_attempts:
+                        return _compression_exhausted_result(
+                            "Request payload too large after the shared compression "
+                            "limit was exhausted."
+                        )
+                    if not _claim_provider_context_retry():
+                        return _compression_exhausted_result(
+                            "Request payload too large after the single "
+                            "compact-and-retry."
+                        )
                     compression_attempts += 1
-                    if compression_attempts > max_compression_attempts:
-                        # Terminal — surface the buffered retry trace.
-                        agent._flush_status_buffer()
-                        agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                        logger.error(f"{agent.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
-                        agent._persist_session(messages, conversation_history)
-                        _final_response = f"Request payload too large: max compression attempts ({max_compression_attempts}) reached."
-                        return {
-                            "final_response": _final_response,
-                            "messages": messages,
-                            "completed": False,
-                            "api_calls": api_call_count,
-                            "error": _final_response,
-                            "partial": True,
-                            "failed": True,
-                            "compression_exhausted": True,
-                        }
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
-                    original_len = len(messages)
-                    original_tokens = estimate_messages_tokens_rough(messages)
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=approx_tokens,
-                        task_id=effective_task_id,
+                    previous_messages = messages
+                    original_len = len(previous_messages)
+                    original_tokens = estimate_messages_tokens_rough(previous_messages)
+                    messages, active_system_prompt, compaction_failure = (
+                        _compact_canonical_for_budget(
+                            previous_messages,
+                            approx_input_tokens=approx_tokens,
+                            current_system_prompt=active_system_prompt,
+                        )
                     )
+                    if compaction_failure == "compaction_made_no_progress":
+                        image_stripped_projection = [
+                            dict(message) if isinstance(message, dict) else message
+                            for message in previous_messages
+                        ]
+                        if agent._try_strip_image_parts_from_tool_messages(
+                            image_stripped_projection,
+                            remember_model=False,
+                        ):
+                            adopted_messages, projection_persisted = (
+                                persist_in_place_projection(
+                                    agent,
+                                    previous_messages,
+                                    image_stripped_projection,
+                                )
+                            )
+                            if adopted_messages is previous_messages:
+                                return _compression_exhausted_result(
+                                    "Request payload vision cleanup could not be "
+                                    "persisted safely after HTTP 413."
+                                )
+                            messages = adopted_messages
+                            conversation_history = (
+                                conversation_history_after_compression(agent, messages)
+                                if projection_persisted
+                                else None
+                            )
+                            agent._buffer_status(
+                                "📐 Compression could not reduce the request further — "
+                                "removed retained vision payloads, adopted the "
+                                "bounded projection, and will remeasure before retrying..."
+                            )
+                            _retry.restart_with_compressed_messages = True
+                            break
+                    if compaction_failure:
+                        messages = previous_messages
+                        return _compression_exhausted_result(
+                            "Request payload compaction failed after HTTP 413: "
+                            f"{compaction_failure}."
+                        )
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )
@@ -3492,43 +3912,14 @@ def _run_conversation(
                     new_tokens = estimate_messages_tokens_rough(messages)
                     approx_tokens = new_tokens  # update for downstream logging
 
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
-                        if len(messages) < original_len:
-                            agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
-                        else:
-                            agent._buffer_status(f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying...")
-                        time.sleep(2)  # Brief pause between compression retries
-                        _retry.restart_with_compressed_messages = True
-                        break
-                    else:
-                        if agent._try_strip_image_parts_from_tool_messages(
-                            api_messages,
-                            remember_model=False,
-                        ):
-                            agent._buffer_status(
-                                "📐 Compression could not reduce the request further — "
-                                "removed retained vision payloads and retrying..."
-                            )
-                            continue
-
-                        # Terminal — surface buffered context so the user
-                        # sees what compression attempts were made.
-                        agent._flush_status_buffer()
-                        agent._vprint(f"{agent.log_prefix}❌ Payload too large and cannot compress further.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                        logger.error(f"{agent.log_prefix}413 payload too large. Cannot compress further.")
-                        agent._persist_session(messages, conversation_history)
-                        _final_response = "Request payload too large (413). Cannot compress further."
-                        return {
-                            "final_response": _final_response,
-                            "messages": messages,
-                            "completed": False,
-                            "api_calls": api_call_count,
-                            "error": _final_response,
-                            "partial": True,
-                            "failed": True,
-                            "compression_exhausted": True,
-                        }
+                    agent._buffer_status(
+                        f"🗜️ Compacted {original_len} → {len(messages)} messages, "
+                        f"~{original_tokens:,} → ~{new_tokens:,} tokens; "
+                        "remeasuring before retry..."
+                    )
+                    time.sleep(2)  # Brief pause between compression retries
+                    _retry.restart_with_compressed_messages = True
+                    break
 
                 # Check for context-length errors BEFORE generic 4xx handler.
                 # The classifier detects context overflow from: explicit error
@@ -3552,7 +3943,7 @@ def _run_conversation(
                     #
                     # Note: max_tokens = output token cap (one response).
                     #       context_length = total window (input + output combined).
-                    available_out = parse_available_output_tokens_from_error(error_msg)
+                    available_out = _available_output_tokens
                     if available_out is not None:
                         # Error is purely about the output cap being too large.
                         # Cap output to the available space and retry without
@@ -3566,24 +3957,11 @@ def _run_conversation(
                         )
                         # Still count against compression_attempts so we don't
                         # loop forever if the error keeps recurring.
+                        if compression_attempts >= max_compression_attempts:
+                            return _compression_exhausted_result(
+                                "Output-cap recovery reached the shared retry limit."
+                            )
                         compression_attempts += 1
-                        if compression_attempts > max_compression_attempts:
-                            agent._flush_status_buffer()
-                            agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
-                            agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                            logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
-                            agent._persist_session(messages, conversation_history)
-                            _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
-                            return {
-                                "final_response": _final_response,
-                                "messages": messages,
-                                "completed": False,
-                                "api_calls": api_call_count,
-                                "error": _final_response,
-                                "partial": True,
-                                "failed": True,
-                                "compression_exhausted": True,
-                            }
                         _retry.restart_with_compressed_messages = True
                         break
 
@@ -3627,6 +4005,12 @@ def _run_conversation(
                             "partial": True,
                             "failed": True,
                         }
+
+                    if compression_attempts >= max_compression_attempts:
+                        return _compression_exhausted_result(
+                            "Context length exceeded after the shared compression "
+                            "limit was exhausted."
+                        )
 
                     # Error is about the INPUT being too large.  Only reduce
                     # context_length when the provider explicitly reports the
@@ -3678,32 +4062,30 @@ def _run_conversation(
                             f"keeping context_length at {old_ctx:,} tokens and compressing."
                         )
 
+                    if not _claim_provider_context_retry():
+                        return _compression_exhausted_result(
+                            "Context length exceeded after the single "
+                            "compact-and-retry."
+                        )
                     compression_attempts += 1
-                    if compression_attempts > max_compression_attempts:
-                        agent._flush_status_buffer()
-                        agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
-                        logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
-                        agent._persist_session(messages, conversation_history)
-                        _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
-                        return {
-                            "final_response": _final_response,
-                            "messages": messages,
-                            "completed": False,
-                            "api_calls": api_call_count,
-                            "error": _final_response,
-                            "partial": True,
-                            "failed": True,
-                            "compression_exhausted": True,
-                        }
                     agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
-                    original_len = len(messages)
-                    original_tokens = estimate_messages_tokens_rough(messages)
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=approx_tokens,
-                        task_id=effective_task_id,
+                    previous_messages = messages
+                    original_len = len(previous_messages)
+                    original_tokens = estimate_messages_tokens_rough(previous_messages)
+                    messages, active_system_prompt, compaction_failure = (
+                        _compact_canonical_for_budget(
+                            previous_messages,
+                            approx_input_tokens=approx_tokens,
+                            current_system_prompt=active_system_prompt,
+                        )
                     )
+                    if compaction_failure:
+                        messages = previous_messages
+                        return _compression_exhausted_result(
+                            "Context-length compaction failed: "
+                            f"{compaction_failure}."
+                        )
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )
@@ -3715,32 +4097,14 @@ def _run_conversation(
                     new_tokens = estimate_messages_tokens_rough(messages)
                     approx_tokens = new_tokens  # update for downstream logging
 
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
-                        if len(messages) < original_len:
-                            agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
-                        elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
-                            agent._buffer_status(f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying...")
-                        time.sleep(2)  # Brief pause between compression retries
-                        _retry.restart_with_compressed_messages = True
-                        break
-                    else:
-                        # Can't compress further and already at minimum tier
-                        agent._flush_status_buffer()
-                        agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
-                        logger.error(f"{agent.log_prefix}Context length exceeded: {new_tokens:,} tokens. Cannot compress further.")
-                        agent._persist_session(messages, conversation_history)
-                        _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
-                        return {
-                            "final_response": _final_response,
-                            "messages": messages,
-                            "completed": False,
-                            "api_calls": api_call_count,
-                            "error": _final_response,
-                            "partial": True,
-                            "failed": True,
-                            "compression_exhausted": True,
-                        }
+                    agent._buffer_status(
+                        f"🗜️ Compacted {original_len} → {len(messages)} messages, "
+                        f"~{original_tokens:,} → ~{new_tokens:,} tokens; "
+                        "remeasuring before retry..."
+                    )
+                    time.sleep(2)  # Brief pause between compression retries
+                    _retry.restart_with_compressed_messages = True
+                    break
 
                 # Check for non-retryable client errors.  The classifier
                 # already accounts for 413, 429, 529 (transient), context
@@ -3831,7 +4195,6 @@ def _run_conversation(
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
-                        compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
                     if api_kwargs is not None:
@@ -4029,7 +4392,6 @@ def _run_conversation(
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
-                        compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
                     # Terminal — flush buffered retry/fallback trace.
@@ -4286,13 +4648,16 @@ def _run_conversation(
             break
 
         if _retry.restart_with_compressed_messages:
-            api_call_count -= 1
-            agent.iteration_budget.refund()
+            if _retry.refund_compressed_restart:
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                agent.iteration_budget.refund()
             # Count compression restarts toward the retry limit to prevent
             # infinite loops when compression reduces messages but not enough
             # to fit the context window.
             retry_count += 1
             _retry.restart_with_compressed_messages = False
+            _retry.refund_compressed_restart = False
             continue
 
         if _retry.restart_with_rebuilt_messages:
@@ -5067,7 +5432,12 @@ def _run_conversation(
                         messages, tools=agent.tools or None
                     )
 
-                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+                if (
+                    agent.compression_enabled
+                    and compression_attempts < max_compression_attempts
+                    and _compressor.should_compress(_real_tokens)
+                ):
+                    compression_attempts += 1
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
