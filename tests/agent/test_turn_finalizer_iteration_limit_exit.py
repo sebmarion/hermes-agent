@@ -149,7 +149,7 @@ def test_pending_pre_verify_response_is_preserved_on_budget_exhaustion(monkeypat
     assert agent._handle_max_iterations_called is False
 
 
-def test_empty_pending_verification_response_uses_summary_fallback(monkeypatch):
+def test_empty_pending_verification_response_uses_deterministic_recovery(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _LimitAgent()
 
@@ -160,9 +160,11 @@ def test_empty_pending_verification_response_uses_summary_fallback(monkeypatch):
         pending_verification_response="",
     )
 
-    assert result["final_response"] == "summary from extra call"
+    assert "Iteration limit reached (60/60)" in result["final_response"]
+    assert "Start a new turn" in result["final_response"]
     assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
-    assert agent._handle_max_iterations_called is True
+    assert result["partial"] is True
+    assert agent._handle_max_iterations_called is False
 
 
 def test_shared_budget_exhaustion_is_not_reported_completed(monkeypatch):
@@ -177,20 +179,21 @@ def test_shared_budget_exhaustion_is_not_reported_completed(monkeypatch):
         api_call_count=12,
     )
 
-    assert result["final_response"] == "summary from extra call"
+    assert "Iteration limit reached (12/60)" in result["final_response"]
+    assert "Start a new turn" in result["final_response"]
     assert result["turn_exit_reason"] == "max_iterations_reached(12/60)"
     assert result["completed"] is False
-    assert agent._handle_max_iterations_called is True
+    assert result["partial"] is True
+    assert agent._handle_max_iterations_called is False
 
 
-def test_short_generated_summary_keeps_abnormal_turn_explainer(monkeypatch):
+def test_iteration_limit_recovery_never_uses_model_summary(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _LimitAgent(completion_explainer=True)
-    agent._handle_max_iterations = lambda *_args: "The"
-
     result = _finalize(agent, final_response=None, exit_reason="unknown")
 
-    assert result["final_response"] == "The\n\niteration-limit explanation"
+    assert "Iteration limit reached (60/60)" in result["final_response"]
+    assert agent._handle_max_iterations_called is False
 
 
 def test_short_preserved_verification_response_is_not_rewritten(monkeypatch):

@@ -38,3 +38,21 @@ def file_mutation_result_landed(tool_name: str, result: Any) -> bool:
     if tool_name == "patch":
         return data.get("success") is True
     return False
+
+
+def file_mutation_result_proves_change(tool_name: str, result: Any) -> bool:
+    """Return True only when a patch result proves content changed."""
+    if tool_name != "patch" or not isinstance(result, str):
+        return False
+    try:
+        data = json.loads(result.strip())
+    except Exception:
+        return False
+    if (
+        not isinstance(data, dict)
+        or data.get("error")
+        or data.get("success") is not True
+    ):
+        return False
+    diff = data.get("diff")
+    return isinstance(diff, str) and bool(diff.strip())

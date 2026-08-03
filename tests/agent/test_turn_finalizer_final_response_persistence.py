@@ -282,6 +282,34 @@ def test_final_response_does_not_clobber_tool_call_tail_with_text(monkeypatch):
     assert agent.persisted_messages[-1]["content"] == "partial text"
 
 
+def test_compression_exhausted_rejection_is_not_persisted_as_assistant_message(monkeypatch):
+    """A local budget failure belongs in the gateway error surface, not context."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    messages = [{"role": "user", "content": "oversized request"}]
+    rejection = "Context budget rejected locally: compaction_made_no_progress."
+
+    result = finalize_turn(
+        agent,
+        final_response=rejection,
+        api_call_count=1,
+        interrupted=False,
+        failed=True,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="oversized request",
+        original_user_message="oversized request",
+        _should_review_memory=False,
+        _turn_exit_reason="compression_exhausted",
+        preserve_final_response=True,
+    )
+
+    assert agent.persisted_messages == [{"role": "user", "content": "oversized request"}]
+    assert result["messages"] == agent.persisted_messages
+
+
 def test_fill_pops_db_persisted_marker_for_durable_rewrite(monkeypatch):
     """The incremental tool-call persist stamps ``_db_persisted`` on the row.
 

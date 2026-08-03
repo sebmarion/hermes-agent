@@ -64,6 +64,17 @@ def _context_thread_target(callback):
     return lambda: context.run(callback)
 
 
+class ProviderRequestBudgetError(RuntimeError):
+    """Typed local rejection raised before a provider transport is called."""
+
+    def __init__(self, receipt: Dict[str, Any]):
+        self.receipt = dict(receipt)
+        super().__init__(
+            "provider request rejected locally: "
+            + str(self.receipt.get("reason") or "unknown_reason")
+        )
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -126,6 +137,205 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
         return sum(_chars(value) for value in api_payload.values()) // 4
 
     return _chars(api_payload) // 4
+
+
+_PROVIDER_REQUEST_METADATA_KEYS = frozenset(
+    {
+        "model",
+        "modelId",
+        "stream",
+        "stream_options",
+        "extra_headers",
+        "headers",
+        "timeout",
+        "api_key",
+        "base_url",
+        "client",
+        "http_client",
+        "request_id",
+        "user",
+        "metadata",
+    }
+)
+
+
+def _provider_payload_token_estimate(value: Any) -> int:
+    """Return a conservative, tokenizer-independent token estimate.
+
+    Provider tokenizers differ, and the admission guard runs before transport
+    selection. Compact JSON accounts for role/content wrappers, multimodal
+    parts, tool schemas, and provider-specific nesting. ASCII text normally
+    tokenizes at roughly four bytes per token; non-ASCII bytes get a tighter
+    two-bytes-per-token bound so CJK/emoji content cannot slip through the
+    legacy character/4 estimate while ordinary compacted prompts are not
+    rejected four times too early.
+    """
+    if value is None or value == "" or value == [] or value == {}:
+        return 0
+    try:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception:
+        serialized = str(value)
+    encoded = serialized.encode("utf-8")
+    ascii_bytes = sum(byte < 128 for byte in encoded)
+    non_ascii_bytes = len(encoded) - ascii_bytes
+    return math.ceil(ascii_bytes / 4 + non_ascii_bytes / 2)
+
+
+def estimate_provider_request_context_tokens(api_payload: Any) -> int:
+    """Conservatively estimate all context-bearing fields in a final request.
+
+    The legacy ``estimate_request_context_tokens`` remains intentionally cheap
+    for stale-timeout heuristics. Admission must account for every provider
+    request body shape, including top-level ``system`` and native Bedrock
+    ``toolConfig``/``inferenceConfig`` fields, so it uses this bounded JSON
+    serialization instead.
+    """
+    if not isinstance(api_payload, dict):
+        return _provider_payload_token_estimate(api_payload)
+    context_payload = {
+        key: value
+        for key, value in api_payload.items()
+        if key not in _PROVIDER_REQUEST_METADATA_KEYS
+    }
+    return _provider_payload_token_estimate(context_payload)
+
+
+def build_provider_request_admission_receipt(agent, api_kwargs: Any) -> Dict[str, Any]:
+    """Build a content-free admission decision for a provider-ready request."""
+    payload = api_kwargs if isinstance(api_kwargs, dict) else {}
+    estimated_input_tokens = estimate_provider_request_context_tokens(api_kwargs)
+    margin_tokens = max(1_024, math.ceil(estimated_input_tokens * 0.05))
+
+    category_keys = (
+        "messages",
+        "input",
+        "instructions",
+        "system",
+        "tools",
+        "toolConfig",
+        "inferenceConfig",
+        "extra_body",
+    )
+    category_estimated_tokens = {
+        category: (
+            _provider_payload_token_estimate(payload[category])
+            if category in payload
+            else 0
+        )
+        for category in category_keys
+    }
+    category_estimated_tokens["total"] = estimated_input_tokens
+
+    compressor = getattr(agent, "context_compressor", None)
+
+    def _identity(value: Any) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    resolved_model = _identity(getattr(agent, "model", ""))
+    resolved_provider = _identity(getattr(agent, "provider", ""))
+    compressor_model = _identity(getattr(compressor, "model", ""))
+    compressor_provider = _identity(getattr(compressor, "provider", ""))
+
+    raw_context_length = getattr(compressor, "context_length", None)
+    raw_threshold_tokens = getattr(compressor, "threshold_tokens", None)
+    context_length = raw_context_length if type(raw_context_length) is int else None
+    threshold_tokens = raw_threshold_tokens if type(raw_threshold_tokens) is int else None
+
+    output_cap_keys = (
+        "max_output_tokens",
+        "max_completion_tokens",
+        "max_tokens",
+        "maxTokens",
+    )
+    present_output_caps = [payload[key] for key in output_cap_keys if key in payload]
+    for config_key in ("inferenceConfig", "inference_config"):
+        config = payload.get(config_key)
+        if isinstance(config, dict):
+            present_output_caps.extend(
+                config[key]
+                for key in output_cap_keys
+                if key in config
+            )
+    invalid_output_cap = any(
+        type(raw_output_tokens) is not int or raw_output_tokens <= 0
+        for raw_output_tokens in present_output_caps
+    )
+    explicit_output_tokens = (
+        max(present_output_caps)
+        if present_output_caps and not invalid_output_cap
+        else 0
+    )
+
+    window_input_ceiling = (
+        context_length - explicit_output_tokens
+        if context_length is not None
+        else None
+    )
+    effective_input_ceiling = None
+    if threshold_tokens is not None and window_input_ceiling is not None:
+        effective_input_ceiling = min(threshold_tokens, window_input_ceiling)
+
+    receipt: Dict[str, Any] = {
+        "resolved_model": resolved_model,
+        "resolved_provider": resolved_provider,
+        "compressor_model": compressor_model,
+        "compressor_provider": compressor_provider,
+        "context_length": context_length,
+        "threshold_tokens": threshold_tokens,
+        "estimated_input_tokens": estimated_input_tokens,
+        "margin_tokens": margin_tokens,
+        "estimated_input_with_margin_tokens": estimated_input_tokens + margin_tokens,
+        "explicit_output_tokens": explicit_output_tokens,
+        "window_input_ceiling": window_input_ceiling,
+        "effective_input_ceiling": effective_input_ceiling,
+        "category_estimated_tokens": category_estimated_tokens,
+    }
+
+    # Explicitly disabled compression is a legacy opt-out used by lightweight
+    # callers (and by agents that supply their own bounded context). In that
+    # mode there may be no resolved model/provider identity to compare against
+    # the compressor; retain the size checks but do not reject solely on those
+    # absent identity fields. Normal managed agents keep the fail-closed
+    # identity checks below.
+    identity_optional = getattr(agent, "compression_enabled", True) is False
+
+    if context_length is None or context_length <= 0:
+        decision, reason = "reject", "invalid_compressor_context_length"
+    elif threshold_tokens is None or threshold_tokens <= 0:
+        decision, reason = "reject", "invalid_compressor_threshold_tokens"
+    elif invalid_output_cap:
+        decision, reason = "reject", "invalid_explicit_output_tokens"
+    elif not resolved_model and not identity_optional:
+        decision, reason = "reject", "unresolved_agent_model"
+    elif not resolved_provider and not identity_optional:
+        decision, reason = "reject", "unresolved_agent_provider"
+    elif (
+        not identity_optional
+        and compressor_model.casefold() != resolved_model.casefold()
+    ):
+        decision, reason = "reject", "compressor_model_mismatch"
+    elif (
+        not identity_optional
+        and compressor_provider.casefold() != resolved_provider.casefold()
+    ):
+        decision, reason = "reject", "compressor_provider_mismatch"
+    elif explicit_output_tokens > 0 and window_input_ceiling <= 0:
+        decision, reason = "reject", "non_positive_window_input_ceiling"
+    elif estimated_input_tokens + margin_tokens <= effective_input_ceiling:
+        decision, reason = "admit", "within_effective_input_ceiling"
+    else:
+        decision = "reject"
+        reason = "estimated_input_plus_margin_exceeds_ceiling"
+
+    receipt["decision"] = decision
+    receipt["reason"] = reason
+    return receipt
 
 
 def _is_openai_codex_backend(agent) -> bool:

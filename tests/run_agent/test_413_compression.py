@@ -87,6 +87,8 @@ def agent():
         a = AIAgent(
             api_key="test-key-1234567890",
             base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            model="test/model",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -102,6 +104,20 @@ def agent():
         a.compression_enabled = True
         a.save_trajectories = False
         return a
+
+
+@pytest.fixture()
+def admitted_provider_request(monkeypatch):
+    """Isolate proactive-compression tests from the final admission guard."""
+    monkeypatch.setattr(
+        "agent.conversation_loop.build_provider_request_admission_receipt",
+        lambda *_args, **_kwargs: {
+            "decision": "admit",
+            "reason": "within_effective_input_ceiling",
+            "estimated_input_tokens": 100,
+            "category_estimated_tokens": {"total": 100},
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -228,14 +244,8 @@ class TestHTTP413Compression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
 
-    def test_413_strips_vision_payloads_when_compression_cannot_reduce_messages(self, agent):
-        """If compression leaves image payloads behind, strip them and retry.
-
-        Browser vision tool results can contain base64 image parts. A 413 can
-        persist even after summarisation when the remaining recent tool result
-        still carries binary data; Hermes should evict the image payload and
-        keep the text/placeholder context instead of failing immediately.
-        """
+    def test_413_persists_stripped_vision_projection_before_retry(self, agent):
+        """A no-op compaction may retry only from the adopted canonical projection."""
         err_413 = _make_413_error()
         ok_resp = _mock_response(content="Recovered after image eviction", finish_reason="stop")
         request_payloads = []
@@ -276,27 +286,118 @@ class TestHTTP413Compression:
             },
         ]
 
+        from agent import conversation_loop
+
         with (
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                conversation_loop,
+                "persist_in_place_projection",
+                wraps=conversation_loop.persist_in_place_projection,
+            ) as persist_projection,
         ):
-            # Simulate the bad production case: compression ran, but the
-            # recent vision tool message survived so message count did not drop.
+            # Compression made no canonical progress, so the recovery must
+            # strip a changed canonical projection and adopt it before retry.
             mock_compress.side_effect = lambda msgs, *_a, **_k: (msgs, "compressed prompt")
             result = agent.run_conversation("continue", conversation_history=prefill)
 
         mock_compress.assert_called_once()
+        persist_projection.assert_called_once()
         assert result["completed"] is True
         assert result["final_response"] == "Recovered after image eviction"
         assert len(request_payloads) == 2
-        first_tool = next(m for m in request_payloads[0]["messages"] if m.get("role") == "tool")
-        retried_tool = next(m for m in request_payloads[1]["messages"] if m.get("role") == "tool")
-        assert "Screenshot of the dashboard" in str(first_tool["content"])
+        retried_tool = next(
+            message
+            for message in request_payloads[1]["messages"]
+            if message.get("role") == "tool"
+        )
+        canonical_tool = next(
+            message for message in result["messages"] if message.get("role") == "tool"
+        )
+        previous_projection = persist_projection.call_args.args[1]
+        stripped_projection = persist_projection.call_args.args[2]
+        previous_tool = next(
+            message for message in previous_projection if message.get("role") == "tool"
+        )
+        stripped_tool = next(
+            message for message in stripped_projection if message.get("role") == "tool"
+        )
+        assert "data:image" in str(previous_tool["content"])
+        assert "data:image" not in str(stripped_tool["content"])
         assert "data:image" not in str(retried_tool["content"])
         assert "Screenshot of the dashboard" in str(retried_tool["content"])
+        assert "data:image" not in str(canonical_tool["content"])
+        assert "Screenshot of the dashboard" in str(canonical_tool["content"])
         assert not getattr(agent, "_no_list_tool_content_models", set())
+
+    def test_413_vision_projection_persistence_failure_does_not_retry(self, agent):
+        """A failed canonical adoption keeps the original payload and fails closed."""
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            raise _make_413_error()
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+        prefill = [
+            {"role": "user", "content": "please inspect this page"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_vision",
+                        "type": "function",
+                        "function": {"name": "browser_vision", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_vision",
+                "name": "browser_vision",
+                "content": [
+                    {"type": "text", "text": "Screenshot of the dashboard"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64," + ("a" * 2000)
+                        },
+                    },
+                ],
+            },
+        ]
+
+        from agent import conversation_loop
+
+        with (
+            patch.object(
+                agent,
+                "_compress_context",
+                side_effect=lambda msgs, *_a, **_k: (msgs, "compressed prompt"),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                conversation_loop,
+                "persist_in_place_projection",
+                side_effect=lambda _agent, original, _projection: (original, False),
+            ) as persist_projection,
+        ):
+            result = agent.run_conversation("continue", conversation_history=prefill)
+
+        persist_projection.assert_called_once()
+        assert result["completed"] is False
+        assert result["compression_exhausted"] is True
+        assert len(request_payloads) == 1
+        canonical_tool = next(
+            message for message in result["messages"] if message.get("role") == "tool"
+        )
+        assert "data:image" in str(canonical_tool["content"])
 
     def test_413_clears_conversation_history_on_persist(self, agent):
         """After 413-triggered compression, _persist_session must receive None history.
@@ -956,7 +1057,9 @@ class TestPreflightCompression:
             for ev, msg in status_messages
         )
 
-    def test_preflight_compresses_oversized_history(self, agent):
+    def test_preflight_compresses_oversized_history(
+        self, agent, admitted_provider_request
+    ):
         """When loaded history exceeds the model's context threshold, compress before API call."""
         agent.compression_enabled = True
         # Set a small context so the history is "oversized", but large enough
@@ -1244,7 +1347,9 @@ class TestPreflightCompression:
 
         mock_compress.assert_not_called()
 
-    def test_preflight_respects_anti_thrash(self, agent):
+    def test_preflight_respects_anti_thrash(
+        self, agent, admitted_provider_request
+    ):
         """Preflight must call ``should_compress()`` so anti-thrash applies.
 
         Regression for #29335 — preflight used to bypass ``should_compress()``
