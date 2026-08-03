@@ -315,7 +315,6 @@ class TestInPlaceCompaction:
                 approx_tokens=100_000, system_message="sys",
             )
             assert calls["n"] == 0
-
     def test_rotation_still_preflushes(self):
         """Rotation MUST pre-flush so current-turn messages survive in the
         preserved old (parent) session before it is ended (#47202)."""

@@ -73,8 +73,17 @@ _records_lock = threading.Lock()
 _records: Dict[str, Dict[str, Any]] = {}
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
-_ACTIVE_STATUSES = frozenset({"scheduled", "running", "interrupting"})
-_STATUS_PHASE = {"intent": 0, "scheduled": 1, "running": 2, "interrupting": 3}
+_ACTIVE_STATUSES = frozenset({
+    "scheduled", "running", "stalling", "interrupting", "finalizing",
+})
+_STATUS_PHASE = {
+    "intent": 0,
+    "scheduled": 1,
+    "running": 2,
+    "stalling": 3,
+    "interrupting": 4,
+    "finalizing": 5,
+}
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
 # Age/size retention defaults for terminal async delegation records. Active
@@ -107,6 +116,18 @@ _PERSISTENCE_VERSION = 1
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
 _HEARTBEAT_STALE_SECONDS = _HEARTBEAT_INTERVAL_SECONDS * 3
 
+# Progress-based stale-delegation detection. A frozen progress token is
+# interrupted first, then force-finalized after a grace window if the runner
+# never returns. Legitimate long-running children that keep changing their
+# token are not wall-clock timed out.
+_STALE_CHECK_INTERVAL = 30.0
+_STALE_IDLE_SECONDS = 450.0
+_STALE_IN_TOOL_SECONDS = 1200.0
+_STALL_GRACE_SECONDS = 120.0
+_monitor_lock = threading.Lock()
+_monitor_thread: Optional[threading.Thread] = None
+_monitor_stop = threading.Event()
+
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
     """Lazily create (or grow) the shared daemon executor.
@@ -128,7 +149,14 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 
 
 def active_count() -> int:
-    """Number of delegations still running or finishing durable delivery."""
+    """Number of async delegation UNITS still active or finishing delivery.
+
+    A unit is one dispatch: a single subagent OR a whole fan-out batch. A batch
+    counts as ONE here because it occupies one async-pool slot (the capacity
+    semantics ``dispatch_async_delegation_batch`` relies on). For the count of
+    actual concurrent child subagents (batch expanded), use
+    ``active_task_count()``.
+    """
     with _records_lock:
         return sum(
             1
@@ -138,8 +166,100 @@ def active_count() -> int:
         )
 
 
+def active_for_session(origin_ui_session_id: str) -> int:
+    """Number of live async delegations owned by one UI session."""
+    if not origin_ui_session_id:
+        return 0
+    with _records_lock:
+        return sum(
+            1
+            for r in _records.values()
+            if r.get("status") in {"running", "stalling", "finalizing"}
+            and str(r.get("origin_ui_session_id") or "")
+            == origin_ui_session_id
+        )
+
+
+def active_task_count() -> int:
+    """Number of async delegation TASKS (child subagents) currently running.
+
+    Unlike ``active_count()`` (units/slots), this expands a batch to its child
+    count: a running batch of N tasks contributes N, a single subagent
+    contributes 1. This is the truthful "how many subagents are actually
+    working right now" figure for observability, where a 3-task batch shown as
+    "1" undercounts real concurrent work. Falls back to counting a batch as 1
+    if its goal list is missing.
+    """
+    with _records_lock:
+        total = 0
+        for r in _records.values():
+            if r.get("status") not in {"running", "finalizing"}:
+                continue
+            if r.get("is_batch"):
+                goals = r.get("goals")
+                total += len(goals) if isinstance(goals, (list, tuple)) and goals else 1
+            else:
+                total += 1
+        return total
+
+
+def _matches_session_selectors(
+    record: Dict[str, Any],
+    *,
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+) -> bool:
+    return (
+        (origin_ui_session_id and str(record.get("origin_ui_session_id") or "") == origin_ui_session_id)
+        or (session_key and str(record.get("session_key") or "") == session_key)
+        or (parent_session_id and str(record.get("parent_session_id") or "") == parent_session_id)
+    )
+
+
+def has_live_for_session(
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+) -> bool:
+    """Whether a session still owns any live async delegation.
+
+    Live = running / stalling / finalizing — the same states the reapers'
+    keepalive treats as active work.
+    """
+    if not session_key and not origin_ui_session_id and not parent_session_id:
+        return False
+    with _records_lock:
+        return any(
+            r.get("status") in {"running", "stalling", "finalizing"}
+            and _matches_session_selectors(
+                r,
+                session_key=session_key,
+                origin_ui_session_id=origin_ui_session_id,
+                parent_session_id=parent_session_id,
+            )
+            for r in _records.values()
+        )
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
+
+
+def _current_origin_session_id() -> str:
+    """Return the raw API-server session id of the originating request.
+
+    Child-agent construction can overwrite the ordinary session context. The
+    request-scoped chat-id binding remains stable and is the safe wake target.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return ""
+        return get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+    except Exception:
+        return ""
 
 
 def _pid_exists(value: Any) -> bool:
@@ -258,7 +378,7 @@ def _persistable_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return {
         k: v
         for k, v in record.items()
-        if k not in {"interrupt_fn", "heartbeat_stop"}
+        if k not in {"interrupt_fn", "heartbeat_stop", "progress_fn"}
     }
 
 
@@ -537,6 +657,150 @@ def mark_async_delegation_delivered(evt: Dict[str, Any]) -> bool:
     return True
 
 
+def mark_completion_delivered(delegation_id: str | Dict[str, Any]) -> bool:
+    """Backward-compatible ACK by durable delegation id."""
+    if isinstance(delegation_id, dict):
+        return mark_async_delegation_delivered(delegation_id)
+    resolved_id = str(delegation_id or "")
+    if not resolved_id:
+        return False
+    with _records_lock:
+        record = _records.get(resolved_id)
+        if isinstance(record, dict):
+            record["delivery_status"] = "delivered"
+            record["delivered_at"] = time.time()
+            tracker_path = str(record.get("origin_tracker_path") or "") or None
+        else:
+            tracker_path = None
+    return _mark_persisted_delivery(
+        resolved_id,
+        "delivered",
+        tracker_path=tracker_path,
+    )
+
+
+def _tracker_path_for_delegation(delegation_id: str) -> str | None:
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if isinstance(record, dict):
+            path = record.get("origin_tracker_path")
+            return str(path) if path else None
+    return None
+
+
+def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Atomically claim one durable completion for gateway delivery."""
+    if not delegation_id or not claim_id:
+        return False
+    tracker_path = _tracker_path_for_delegation(delegation_id)
+    try:
+        with _persist_lock:
+            data = _read_persisted_unlocked(tracker_path)
+            entry = (data.get("records") or {}).get(delegation_id)
+            if not isinstance(entry, dict):
+                return False
+            existing = str(entry.get("delivery_claim") or "")
+            if existing and existing != claim_id:
+                return False
+            entry["delivery_claim"] = claim_id
+            entry["delivery_claimed_at"] = time.time()
+            _write_persisted_unlocked(data, tracker_path)
+            verify = _read_persisted_unlocked(tracker_path)
+            return (
+                (verify.get("records") or {})
+                .get(delegation_id, {})
+                .get("delivery_claim")
+                == claim_id
+            )
+    except Exception:
+        logger.warning("Failed to claim async completion %s", delegation_id, exc_info=True)
+        return False
+
+
+def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Release a delivery claim when injection did not complete."""
+    return _update_completion_claim(delegation_id, claim_id, delivered=False)
+
+
+def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Acknowledge a successfully injected completion and clear its claim."""
+    if not _update_completion_claim(delegation_id, claim_id, delivered=True):
+        return False
+    return True
+
+
+def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
+    """Claim a durable delegation event; ordinary process events need no token."""
+    if evt.get("type") != "async_delegation":
+        return ""
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not delegation_id:
+        return ""
+    claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
+    return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+
+
+def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+    """Complete a durable delegation event after injecting it into a turn."""
+    if claim_id and evt.get("type") == "async_delegation":
+        complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+
+
+def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+    """Release a durable delegation event claim for a later consumer."""
+    if claim_id and evt.get("type") == "async_delegation":
+        release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+
+
+def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Terminally drop a completion whose target session is gone."""
+    if not delegation_id or not claim_id:
+        return False
+    tracker_path = _tracker_path_for_delegation(delegation_id)
+    try:
+        with _persist_lock:
+            data = _read_persisted_unlocked(tracker_path)
+            entry = (data.get("records") or {}).get(delegation_id)
+            if not isinstance(entry, dict) or str(entry.get("delivery_claim") or "") != claim_id:
+                return False
+            entry["delivery_status"] = "dropped"
+            entry["delivery_claim"] = ""
+            entry["updated_at"] = time.time()
+            _write_persisted_unlocked(data, tracker_path)
+        return True
+    except Exception:
+        logger.warning("Failed to drop async completion %s", delegation_id, exc_info=True)
+        return False
+
+
+def _update_completion_claim(
+    delegation_id: str, claim_id: str, *, delivered: bool
+) -> bool:
+    if not delegation_id or not claim_id:
+        return False
+    tracker_path = _tracker_path_for_delegation(delegation_id)
+    try:
+        with _persist_lock:
+            data = _read_persisted_unlocked(tracker_path)
+            entry = (data.get("records") or {}).get(delegation_id)
+            if not isinstance(entry, dict) or str(entry.get("delivery_claim") or "") != claim_id:
+                return False
+            entry["delivery_claim"] = ""
+            entry["updated_at"] = time.time()
+            if delivered:
+                entry["delivery_status"] = "delivered"
+                entry["delivered_at"] = time.time()
+            _write_persisted_unlocked(data, tracker_path)
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None:
+                live["delivery_status"] = "delivered" if delivered else "queued"
+        return True
+    except Exception:
+        logger.warning("Failed to update async completion %s", delegation_id, exc_info=True)
+        return False
+
+
 def _remove_persisted_record(
     delegation_id: str,
     *,
@@ -604,6 +868,9 @@ def _event_for_lost_record(record: Dict[str, Any]) -> Dict[str, Any]:
 
 def recover_async_delegations(
     tracker_path: str | Path | None = None,
+    *,
+    target_queue=None,
+    mark_restored: bool = False,
 ) -> Dict[str, Any]:
     """Replay undelivered completions and mark previous-process runners lost."""
     global _recovery_attempted
@@ -614,10 +881,13 @@ def recover_async_delegations(
     notifications: List[
         tuple[tuple[str, str], str, Dict[str, Any], Dict[str, Any]]
     ] = []
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:
-        return {"queued": 0, "lost": 0, "error": str(exc)}
+    if target_queue is None:
+        try:
+            from tools.process_registry import process_registry
+
+            target_queue = process_registry.completion_queue
+        except Exception as exc:
+            return {"queued": 0, "lost": 0, "error": str(exc)}
     with _persist_lock:
         data = _read_persisted_unlocked(tracker_path)
         records = data.setdefault("records", {})
@@ -692,7 +962,10 @@ def recover_async_delegations(
         _cleanup_persisted_data_locked(data, now=now)
         _write_persisted_unlocked(data, tracker_path)
         for replay_identity, rid, event, record in notifications:
-            process_registry.completion_queue.put(event)
+            queued_event = dict(event)
+            if mark_restored:
+                queued_event["restored"] = True
+            target_queue.put(queued_event)
             _replayed_persisted_ids.add(replay_identity)
             queued += 1
             restored = dict(record)
@@ -704,6 +977,12 @@ def recover_async_delegations(
                 _records.setdefault(rid, restored)
     _recovery_attempted = True
     return {"queued": queued, "lost": lost}
+
+
+def restore_undelivered_completions(target_queue) -> int:
+    """Restore durable completion events onto the registry's supplied queue."""
+    result = recover_async_delegations(target_queue=target_queue, mark_restored=True)
+    return int(result.get("queued", 0))
 
 
 def _recover_once() -> None:
@@ -827,12 +1106,166 @@ def _start_heartbeat_thread(delegation_id: str) -> threading.Event:
     return stop
 
 
+def _ensure_stale_monitor() -> None:
+    """Start the shared progress-based stale-delegation monitor."""
+    global _monitor_thread
+    with _monitor_lock:
+        if _monitor_thread is not None and _monitor_thread.is_alive():
+            return
+        _monitor_stop.clear()
+        _monitor_thread = threading.Thread(
+            target=_stale_monitor_loop,
+            name="async-delegate-stale-monitor",
+            daemon=True,
+        )
+        _monitor_thread.start()
+
+
+def _stale_monitor_loop() -> None:
+    """Interrupt frozen progress, then finalize children that never unwind."""
+    while not _monitor_stop.wait(_STALE_CHECK_INTERVAL):
+        now = time.time()
+        stalled: List[tuple[str, bool, float, bool]] = []
+        expired: List[str] = []
+        any_monitorable = False
+        with _records_lock:
+            for record in _records.values():
+                status = record.get("status")
+                if status == "stalling":
+                    any_monitorable = True
+                    interrupted_at = record.get("_interrupted_at") or now
+                    if now - interrupted_at >= _STALL_GRACE_SECONDS:
+                        expired.append(str(record.get("delegation_id") or ""))
+                    continue
+                if status != "running":
+                    continue
+                progress_fn = record.get("progress_fn")
+                if progress_fn is None:
+                    continue
+                any_monitorable = True
+                try:
+                    token, in_tool = progress_fn()
+                except Exception:
+                    token, in_tool = record.get("_progress_token"), False
+                if token != record.get("_progress_token"):
+                    record["_progress_token"] = token
+                    record["_progress_ts"] = now
+                    continue
+                quiet_for = now - (record.get("_progress_ts") or now)
+                limit = _STALE_IN_TOOL_SECONDS if in_tool else _STALE_IDLE_SECONDS
+                if quiet_for >= limit:
+                    record["status"] = "stalling"
+                    record["delivery_status"] = "stalling"
+                    record["_interrupted_at"] = now
+                    record["_stall_quiet_seconds"] = round(quiet_for, 2)
+                    record["_stall_threshold_seconds"] = limit
+                    record["_stall_in_tool"] = bool(in_tool)
+                    stalled.append(
+                        (
+                            str(record.get("delegation_id") or ""),
+                            bool(record.get("is_batch")),
+                            quiet_for,
+                            bool(in_tool),
+                        )
+                    )
+        for delegation_id, _is_batch, quiet_for, in_tool in stalled:
+            logger.warning(
+                "Async delegation %s made no progress for %.0fs (in_tool=%s) "
+                "— interrupting; grace window %.0fs",
+                delegation_id,
+                quiet_for,
+                in_tool,
+                _STALL_GRACE_SECONDS,
+            )
+            with _records_lock:
+                record = _records.get(delegation_id)
+                fn = record.get("interrupt_fn") if record else None
+            if callable(fn):
+                try:
+                    fn()
+                except Exception as exc:
+                    logger.debug(
+                        "Async delegation %s stall interrupt failed: %s",
+                        delegation_id,
+                        exc,
+                    )
+        for delegation_id in expired:
+            _finalize_stalled(delegation_id)
+        if not any_monitorable:
+            return
+
+
+def _finalize_stalled(delegation_id: str) -> None:
+    """Force-finalize a stalled child whose runner never returned."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None or record.get("status") != "stalling":
+            return
+        completed_at = time.time()
+        duration = round(
+            completed_at - (record.get("dispatched_at") or completed_at), 2
+        )
+        quiet_seconds = record.get("_stall_quiet_seconds")
+        threshold_seconds = record.get("_stall_threshold_seconds")
+        stall_in_tool = record.get("_stall_in_tool")
+    error = (
+        f"Async delegation {delegation_id} stalled: the detached subagent "
+        "stopped making progress (no new API calls, tool activity, or "
+        "streamed tokens), did not respond to interruption, and never "
+        "produced a completion event. Re-dispatch the task if it is still needed."
+    )
+    _finalize(
+        delegation_id,
+        {
+            "status": "stalled",
+            "summary": None,
+            "error": error,
+            "api_calls": 0,
+            "duration_seconds": duration,
+            "exit_reason": "stalled",
+            "stalled_after_quiet_seconds": quiet_seconds,
+            "stall_threshold_seconds": threshold_seconds,
+            "stall_phase": (
+                "in_tool" if stall_in_tool
+                else "idle" if stall_in_tool is not None
+                else None
+            ),
+            "stall_grace_seconds": _STALL_GRACE_SECONDS,
+        },
+        "stalled",
+    )
+
+
+def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
+    """Best-effort projection of a progress token for status UIs."""
+    try:
+        parts = list(token)
+    except TypeError:
+        return None
+    out: List[Optional[Dict[str, Any]]] = []
+    for part in parts:
+        if isinstance(part, (list, tuple)) and len(part) >= 2:
+            entry: Dict[str, Any] = {
+                "api_calls": part[0],
+                "current_tool": part[1],
+            }
+            if len(part) >= 3 and isinstance(part[2], (int, float)):
+                entry["seconds_since_activity"] = round(
+                    max(0.0, now - float(part[2])), 1
+                )
+            out.append(entry)
+        else:
+            out.append(None)
+    return out
+
+
 def _serialise_record(record: Dict[str, Any], now: float) -> Dict[str, Any]:
     """Return a JSON-safe status snapshot with derived liveness fields."""
     out = {
         k: v
         for k, v in record.items()
-        if k not in {"interrupt_fn", "heartbeat_stop"}
+        if k not in {"interrupt_fn", "heartbeat_stop", "progress_fn"}
+        and not k.startswith("_")
     }
     dispatched_at = float(record.get("dispatched_at") or now)
     completed_at = record.get("completed_at")
@@ -844,6 +1277,30 @@ def _serialise_record(record: Dict[str, Any], now: float) -> Dict[str, Any]:
         heartbeat_age = max(0.0, now - last_heartbeat_at)
         out["heartbeat_age_seconds"] = round(heartbeat_age, 2)
         out["heartbeat_stale"] = heartbeat_age > _HEARTBEAT_STALE_SECONDS
+    if record.get("status") in {"running", "stalling"}:
+        progress_ts = record.get("_progress_ts")
+        if progress_ts:
+            out["seconds_since_progress"] = round(
+                max(0.0, now - float(progress_ts)), 1
+            )
+        progress_fn = record.get("progress_fn")
+        if callable(progress_fn):
+            try:
+                token, in_tool = progress_fn()
+                activity = _children_activity_from_token(token, now)
+                if activity is not None:
+                    out["children_activity"] = activity
+                out["in_tool"] = bool(in_tool)
+            except Exception:
+                pass
+    if record.get("status") in {"stalling", "stalled"}:
+        for source, target in (
+            ("_stall_quiet_seconds", "stalled_after_quiet_seconds"),
+            ("_stall_threshold_seconds", "stall_threshold_seconds"),
+            ("_stall_in_tool", "stall_in_tool"),
+        ):
+            if record.get(source) is not None:
+                out[target] = record.get(source)
     return out
 
 
@@ -858,8 +1315,10 @@ def dispatch_async_delegation(
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
+    origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    progress_fn: Optional[Callable[[], tuple]] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -908,6 +1367,7 @@ def dispatch_async_delegation(
         "model": model,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
+        "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
         "status": "scheduled",
         "dispatched_at": dispatched_at,
@@ -916,6 +1376,10 @@ def dispatch_async_delegation(
         "heartbeat_count": 0,
         "delivery_status": "scheduled",
         "interrupt_fn": interrupt_fn,
+        "progress_fn": progress_fn,
+        "_progress_token": None,
+        "_progress_ts": dispatched_at,
+        "_interrupted_at": None,
         "owner_pid": os.getpid(),
         "owner_started_at": _process_start_time(os.getpid()),
     }
@@ -1055,6 +1519,8 @@ def dispatch_async_delegation(
         else:
             heartbeat_stop.set()
     execute_gate.set()
+    if progress_fn is not None:
+        _ensure_stale_monitor()
 
     logger.info(
         "Dispatched async delegation %s (session_key=%s): %s",
@@ -1109,6 +1575,7 @@ def _push_completion_event(
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
+        "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
@@ -1126,6 +1593,14 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    for key in (
+        "stalled_after_quiet_seconds",
+        "stall_threshold_seconds",
+        "stall_phase",
+        "stall_grace_seconds",
+    ):
+        if key in result:
+            evt[key] = result[key]
     _persist_and_queue_terminal(record, result, evt)
 
 
@@ -1189,8 +1664,10 @@ def dispatch_async_delegation_batch(
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
+    origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    progress_fn: Optional[Callable[[], tuple]] = None,
     delegation_id: Optional[str] = None,
     origin_profile: str = "",
     origin_tracker_path: str = "",
@@ -1213,8 +1690,10 @@ def dispatch_async_delegation_batch(
             parent_session_id=parent_session_id,
             runner=runner,
             origin_ui_session_id=origin_ui_session_id,
+            origin_session_id=origin_session_id,
             interrupt_fn=interrupt_fn,
             max_async_children=max_async_children,
+            progress_fn=progress_fn,
             delegation_id=resolved_id,
             origin_profile=origin_profile,
             origin_tracker_path=origin_tracker_path,
@@ -1234,8 +1713,10 @@ def _dispatch_async_delegation_batch_admitted(
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
+    origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    progress_fn: Optional[Callable[[], tuple]] = None,
     delegation_id: Optional[str] = None,
     origin_profile: str = "",
     origin_tracker_path: str = "",
@@ -1332,6 +1813,11 @@ def _dispatch_async_delegation_batch_admitted(
         "model": model,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
+        "origin_session_id": origin_session_id,
+        "progress_fn": progress_fn,
+        "_progress_token": None,
+        "_progress_ts": dispatched_at,
+        "_interrupted_at": None,
         "origin_profile": origin_profile,
         "origin_tracker_path": origin_tracker_path,
         "parent_session_id": parent_session_id,
@@ -1574,6 +2060,8 @@ def _dispatch_async_delegation_batch_admitted(
         else:
             heartbeat_stop.set()
     execute_gate.set()
+    if progress_fn is not None:
+        _ensure_stale_monitor()
 
     logger.info(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
@@ -1611,6 +2099,7 @@ def _finalize_batch(
         "delegation_id": delegation_id,
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
+        "origin_session_id": event_record.get("origin_session_id", ""),
         "origin_profile": event_record.get("origin_profile", ""),
         "origin_tracker_path": event_record.get("origin_tracker_path", ""),
         "parent_session_id": event_record.get("parent_session_id"),
@@ -1632,6 +2121,14 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    for key in (
+        "stalled_after_quiet_seconds",
+        "stall_threshold_seconds",
+        "stall_phase",
+        "stall_grace_seconds",
+    ):
+        if key in combined:
+            evt[key] = combined[key]
     plan_id = str(event_record.get("bestplan_plan_id") or "")
     tracker_path = str(event_record.get("origin_tracker_path") or "")
     if plan_id and tracker_path:
@@ -1661,7 +2158,8 @@ def list_async_delegations() -> List[Dict[str, Any]]:
     _maybe_cleanup()
     now = time.time()
     with _records_lock:
-        return [_serialise_record(r, now) for r in _records.values()]
+        records = list(_records.values())
+    return [_serialise_record(r, now) for r in records]
 
 
 def _interrupt_records(
@@ -1673,7 +2171,7 @@ def _interrupt_records(
         delegation_id = str(target.get("delegation_id") or "")
         with _records_lock:
             live = _records.get(delegation_id)
-            if live is None or live.get("status") not in {"scheduled", "running"}:
+            if live is None or live.get("status") not in {"scheduled", "running", "stalling"}:
                 continue
             phase = str(live.get("status"))
             if phase == "scheduled":
@@ -1714,7 +2212,7 @@ def _interrupt_records(
             error = "interrupt callback unavailable"
             with _records_lock:
                 live = _records.get(delegation_id)
-                if live is not None and live.get("status") == "running":
+                if live is not None and live.get("status") in {"running", "stalling"}:
                     live["interrupt_error"] = error
                     live["interrupt_requested_at"] = time.time()
                     failed_snapshot = dict(live)
@@ -1732,7 +2230,7 @@ def _interrupt_records(
             error = f"{type(exc).__name__}: {exc}"
             with _records_lock:
                 live = _records.get(delegation_id)
-                if live is not None and live.get("status") == "running":
+                if live is not None and live.get("status") in {"running", "stalling"}:
                     live["interrupt_error"] = error
                     live["interrupt_requested_at"] = time.time()
                     failed_snapshot = dict(live)
@@ -1748,7 +2246,7 @@ def _interrupt_records(
 
         with _records_lock:
             live = _records.get(delegation_id)
-            if live is None or live.get("status") != "running":
+            if live is None or live.get("status") not in {"running", "stalling"}:
                 continue
             live["status"] = "interrupting"
             live["delivery_status"] = "interrupting"
@@ -1776,7 +2274,7 @@ def interrupt_all(reason: str = "shutdown") -> int:
     with _records_lock:
         targets = [
             r for r in _records.values()
-            if r.get("status") in {"scheduled", "running"}
+            if r.get("status") in {"scheduled", "running", "stalling"}
         ]
     count = _interrupt_records(targets, reason=reason, source="interrupt_all")
     if count:
@@ -1796,11 +2294,12 @@ def interrupt_for_session(
     with _records_lock:
         targets = [
             r for r in _records.values()
-            if r.get("status") in {"scheduled", "running"}
-            and (
-                (origin_ui_session_id and str(r.get("origin_ui_session_id") or "") == origin_ui_session_id)
-                or (session_key and str(r.get("session_key") or "") == session_key)
-                or (parent_session_id and str(r.get("parent_session_id") or "") == parent_session_id)
+            if r.get("status") in {"scheduled", "running", "stalling"}
+            and _matches_session_selectors(
+                r,
+                session_key=session_key,
+                origin_ui_session_id=origin_ui_session_id,
+                parent_session_id=parent_session_id,
             )
         ]
     count = _interrupt_records(
@@ -1816,7 +2315,10 @@ def interrupt_for_session(
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor."""
-    global _executor, _executor_max_workers, _last_cleanup_at, _recovery_attempted
+    global _executor, _executor_max_workers, _last_cleanup_at, _recovery_attempted, _monitor_thread
+    _monitor_stop.set()
+    with _monitor_lock:
+        _monitor_thread = None
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)

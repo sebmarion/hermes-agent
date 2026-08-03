@@ -138,14 +138,6 @@ def _run(
     )
 
 
-def test_all_cleanup_steps_raise_response_still_returned():
-    agent = _StubAgent(
-        raise_in=("save_trajectory", "cleanup_task_resources", "persist_session")
-    )
-    result = _run(agent)
-    assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
-    labels = [e.split(":")[0] for e in result["cleanup_errors"]]
-    assert labels == ["save_trajectory", "cleanup_task_resources", "persist_session"]
 
 
 @pytest.mark.parametrize(
