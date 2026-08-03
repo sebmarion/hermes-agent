@@ -11145,25 +11145,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = event.source
 
-        # Synthetic goal continuations are capabilities tied to one exact
-        # persisted revision. Revalidate at execution time, not merely when
-        # queued, so a later pause/clear/edit cannot leak one stale turn.
-        _meta = getattr(event, "metadata", None) or {}
-        if _meta.get("goal_continuation"):
-            try:
-                from hermes_cli.goals import load_goal
-                _goal_state = load_goal(str(_meta.get("goal_session_id") or ""))
-                _goal_revision = int(_meta.get("goal_revision"))
-            except Exception:
-                _goal_state = None
-                _goal_revision = -1
-            if (
-                _goal_state is None
-                or _goal_state.status != "active"
-                or _goal_state.revision != _goal_revision
-            ):
-                return None
-
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
         # context with copy_context(). If a *concurrent* message had already
@@ -15786,12 +15767,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
-                    internal=True,
-                    metadata={
-                        "goal_continuation": True,
-                        "goal_session_id": mgr.session_id,
-                        "goal_revision": decision.get("goal_revision"),
-                    },
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -22980,30 +22955,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                from agent.bestplan_state import run_planning_only_bestplan_turn
-
-                def _run_gateway_model_turn():
-                    try:
-                        from agent.autonomy_shadow import submit_shadow_observation
-
-                        submit_shadow_observation(
-                            message,
-                            session_id=str(session_entry.session_id or ""),
-                            source=f"gateway:{source.platform}",
-                            workspace=os.getcwd(),
-                            parent_agent=agent,
-                        )
-                    except Exception as _shadow_exc:
-                        logger.debug("autonomy ingress failed open: %s", _shadow_exc)
-                    return agent.run_conversation(_api_run_message, **_conversation_kwargs)
-
-                result = run_planning_only_bestplan_turn(
-                    invocation_message=message,
-                    conversation_history=agent_history,
-                    host_name=f"messaging gateway ({source.platform})",
-                    host_agent=agent,
-                    run_model_turn=_run_gateway_model_turn,
-                )
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -24064,25 +24016,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_type = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
-                    if self._is_goal_continuation_event(pending_event):
-                        _goal_meta = getattr(pending_event, "metadata", None) or {}
-                        try:
-                            from hermes_cli.goals import load_goal
-                            _queued_goal = load_goal(str(_goal_meta.get("goal_session_id") or session_id))
-                            _queued_revision = int(_goal_meta.get("goal_revision"))
-                        except Exception:
-                            _queued_goal = None
-                            _queued_revision = -1
-                        if (
-                            _queued_goal is None
-                            or _queued_goal.status != "active"
-                            or _queued_goal.revision != _queued_revision
-                        ):
-                            logger.info(
-                                "Discarding stale goal continuation for session %s — revision changed",
-                                session_key or "?",
-                            )
-                            return result
+                    if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
+                        logger.info(
+                            "Discarding stale goal continuation for session %s — goal is no longer active",
+                            session_key or "?",
+                        )
+                        return result
                     # Resolve the follow-up's session key BEFORE preparing the
                     # inbound text: _prepare_inbound_message_text buffers native
                     # image paths under the key it is given, and the recursive

@@ -2092,12 +2092,6 @@ def _resolve_command_cwd(
     record yet (first command) runs in ``default_cwd`` (config/override cwd),
     which is also what seeds a fresh environment.
     """
-    from agent.tool_runtime_context import get_prepared_tool_runtime
-
-    prepared = get_prepared_tool_runtime()
-    if prepared is not None and prepared.effective_cwd:
-        return prepared.effective_cwd
-
     if workdir:
         return workdir
     return get_session_cwd(session_key) or default_cwd
