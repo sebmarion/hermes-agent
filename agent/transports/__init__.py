@@ -6,6 +6,8 @@ Usage:
     result = transport.normalize_response(raw_response)
 """
 
+import importlib
+
 from agent.transports.types import (
     NormalizedResponse,
     ToolCall,
@@ -16,6 +18,13 @@ from agent.transports.types import (
 
 _REGISTRY: dict = {}
 _discovered: bool = False
+_IMPORT_ERRORS: dict[str, ImportError] = {}
+_BUILTIN_TRANSPORT_MODULES = {
+    "anthropic_messages": "agent.transports.anthropic",
+    "codex_responses": "agent.transports.codex",
+    "chat_completions": "agent.transports.chat_completions",
+    "bedrock_converse": "agent.transports.bedrock",
+}
 
 
 def register_transport(api_mode: str, transport_cls: type) -> None:
@@ -26,9 +35,9 @@ def register_transport(api_mode: str, transport_cls: type) -> None:
 def get_transport(api_mode: str):
     """Get a transport instance for the given api_mode.
 
-    Returns None if no transport is registered for this api_mode.
-    This allows gradual migration — call sites can check for None
-    and fall back to the legacy code path.
+    Returns None if api_mode is unknown. Import failures for a built-in
+    transport are re-raised so callers see the real load failure instead of
+    treating a broken built-in as an unregistered extension.
     """
     global _discovered
     if not _discovered:
@@ -42,6 +51,9 @@ def get_transport(api_mode: str):
         _discover_transports()
         cls = _REGISTRY.get(api_mode)
     if cls is None:
+        import_error = _IMPORT_ERRORS.get(api_mode)
+        if import_error is not None:
+            raise import_error
         return None
     return cls()
 
@@ -50,19 +62,10 @@ def _discover_transports() -> None:
     """Import all transport modules to trigger auto-registration."""
     global _discovered
     _discovered = True
-    try:
-        import agent.transports.anthropic  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import agent.transports.codex  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import agent.transports.chat_completions  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import agent.transports.bedrock  # noqa: F401
-    except ImportError:
-        pass
+    for api_mode, module_name in _BUILTIN_TRANSPORT_MODULES.items():
+        try:
+            importlib.import_module(module_name)
+        except ImportError as exc:
+            _IMPORT_ERRORS[api_mode] = exc
+        else:
+            _IMPORT_ERRORS.pop(api_mode, None)

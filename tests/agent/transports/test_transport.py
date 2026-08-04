@@ -1,8 +1,11 @@
 """Tests for the transport ABC, registry, and AnthropicTransport."""
 
-import pytest
+import sys
 from types import SimpleNamespace
 
+import pytest
+
+import agent.transports as transports
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse
 from agent.transports import get_transport, register_transport, _REGISTRY
@@ -52,6 +55,40 @@ class TestTransportRegistry:
 
     def test_get_unregistered_returns_none(self):
         assert get_transport("nonexistent_mode") is None
+
+    def test_builtin_transport_propagates_transitive_import_error(self):
+        from agent import codex_responses_adapter as adapter
+
+        api_mode = "codex_responses"
+        module_name = "agent.transports.codex"
+        validator = adapter.validate_raw_responses_reasoning_effort
+        original_module = sys.modules.pop(module_name, None)
+        original_cls = _REGISTRY.pop(api_mode, None)
+        original_discovered = transports._discovered
+        original_import_error = transports._IMPORT_ERRORS.pop(api_mode, None)
+        del adapter.validate_raw_responses_reasoning_effort
+        transports._discovered = False
+
+        try:
+            with pytest.raises(
+                ImportError,
+                match="validate_raw_responses_reasoning_effort",
+            ):
+                get_transport(api_mode)
+        finally:
+            adapter.validate_raw_responses_reasoning_effort = validator
+            sys.modules.pop(module_name, None)
+            if original_module is not None:
+                sys.modules[module_name] = original_module
+            if original_cls is not None:
+                _REGISTRY[api_mode] = original_cls
+            else:
+                _REGISTRY.pop(api_mode, None)
+            if original_import_error is not None:
+                transports._IMPORT_ERRORS[api_mode] = original_import_error
+            else:
+                transports._IMPORT_ERRORS.pop(api_mode, None)
+            transports._discovered = original_discovered
 
 
 
