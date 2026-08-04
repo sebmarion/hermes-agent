@@ -422,7 +422,7 @@ class TestInPlaceConfigDefault:
         self, compression_config, expected
     ):
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), patch(
-            "hermes_cli.config.load_config",
+            "hermes_cli.config.load_config_readonly",
             return_value={"compression": compression_config},
         ):
             from run_agent import AIAgent
@@ -573,7 +573,7 @@ class TestDispatchProjectionPersistence:
             ]
             agent._flush_messages_to_session_db(previous)
             assert [row["content"] for row in db.get_messages(sid)] == [
-                "inspect this\n[screenshot]",
+                previous[0]["content"],
                 "ordinary response",
             ]
             compacted = [{"role": "user", "content": "bounded visual summary"}]
@@ -591,7 +591,220 @@ class TestDispatchProjectionPersistence:
                 for message in db.get_messages_as_conversation(sid)
             ] == ["bounded visual summary"]
 
-    def test_db_failure_returns_exact_original_and_rolls_back_all_state(self):
+    def test_repaired_user_merge_and_unflushed_tail_commit_with_pruning(self):
+        from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_repaired_merge"
+            db.create_session(sid, "webui", model="test/model")
+            durable = [
+                {"role": "user", "content": "first request"},
+                {"role": "user", "content": "second request"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_old",
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_old",
+                    "tool_name": "terminal",
+                    "content": "large old result",
+                },
+            ]
+            db.append_messages_batch(sid, durable)
+            previous = db.get_messages_as_conversation(sid)
+            previous.append(
+                {"role": "assistant", "content": "unflushed current answer"}
+            )
+            durable_snapshot = [dict(message) for message in previous]
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _persist_disabled=False,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=len(durable),
+                _flushed_db_message_ids={1, 2, 3, 4},
+            )
+
+            assert repair_message_sequence_with_cursor(agent, previous) == 1
+            projected = [dict(message) for message in previous]
+            tool_index = next(
+                index
+                for index, message in enumerate(projected)
+                if message.get("tool_call_id") == "call_old"
+            )
+            projected[tool_index] = {
+                **projected[tool_index],
+                "content": "[bounded old result]",
+            }
+
+            adopted, persisted = persist_in_place_projection(
+                agent,
+                previous,
+                projected,
+                durable_snapshot_messages=durable_snapshot,
+            )
+
+            assert persisted is True
+            assert adopted is projected
+            active = db.get_messages_as_conversation(sid)
+            assert [message["role"] for message in active] == [
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+            ]
+            assert active[0]["content"] == "first request\n\nsecond request"
+            assert active[2]["content"] == "[bounded old result]"
+            assert active[3]["content"] == "unflushed current answer"
+            all_rows = db.get_messages(sid, include_inactive=True)
+            assert sum(not row["active"] for row in all_rows) == len(durable)
+
+    def test_repaired_projection_commits_even_when_pruning_is_a_noop(self):
+        from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_repair_only"
+            db.create_session(sid, "webui", model="test/model")
+            durable = [
+                {"role": "user", "content": "first request"},
+                {"role": "user", "content": "second request"},
+                {"role": "assistant", "content": "old answer"},
+            ]
+            db.append_messages_batch(sid, durable)
+            previous = db.get_messages_as_conversation(sid)
+            durable_snapshot = [dict(message) for message in previous]
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _persist_disabled=False,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=len(durable),
+                _flushed_db_message_ids=set(),
+            )
+
+            assert repair_message_sequence_with_cursor(agent, previous) == 1
+            repair_only_projection = list(previous)
+            assert repair_only_projection is not previous
+            assert repair_only_projection == previous
+
+            adopted, persisted = persist_in_place_projection(
+                agent,
+                previous,
+                repair_only_projection,
+                durable_snapshot_messages=durable_snapshot,
+            )
+
+            assert persisted is True
+            assert adopted is repair_only_projection
+            assert [
+                message["content"]
+                for message in db.get_messages_as_conversation(sid)
+            ] == [
+                "first request\n\nsecond request",
+                "old answer",
+            ]
+
+    def test_repaired_orphan_drop_commits_with_pruning(self):
+        from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_repaired_orphan"
+            db.create_session(sid, "webui", model="test/model")
+            durable = [
+                {"role": "user", "content": "request"},
+                {"role": "assistant", "content": "answer"},
+                {
+                    "role": "tool",
+                    "tool_call_id": "orphan",
+                    "tool_name": "terminal",
+                    "content": "orphan result",
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_old",
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_old",
+                    "tool_name": "terminal",
+                    "content": "large old result",
+                },
+            ]
+            db.append_messages_batch(sid, durable)
+            previous = db.get_messages_as_conversation(sid)
+            durable_snapshot = [dict(message) for message in previous]
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _persist_disabled=False,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=len(durable),
+                _flushed_db_message_ids=set(),
+            )
+
+            assert repair_message_sequence_with_cursor(agent, previous) == 1
+            projected = [dict(message) for message in previous]
+            tool_index = next(
+                index
+                for index, message in enumerate(projected)
+                if message.get("tool_call_id") == "call_old"
+            )
+            projected[tool_index] = {
+                **projected[tool_index],
+                "content": "[bounded old result]",
+            }
+
+            adopted, persisted = persist_in_place_projection(
+                agent,
+                previous,
+                projected,
+                durable_snapshot_messages=durable_snapshot,
+            )
+
+            assert persisted is True
+            assert adopted is projected
+            active = db.get_messages_as_conversation(sid)
+            assert not any(
+                message.get("tool_call_id") == "orphan" for message in active
+            )
+            assert any(
+                message.get("content") == "[bounded old result]"
+                for message in active
+            )
+
+    def test_db_failure_returns_exact_original_and_rolls_back_all_state(
+        self, caplog
+    ):
         from agent.conversation_compression import persist_in_place_projection
         from hermes_state import SessionDB
 
@@ -634,6 +847,202 @@ class TestDispatchProjectionPersistence:
             assert [row["content"] for row in rows] == [f"msg {i}" for i in range(4)]
             assert all(row["active"] == 1 and row["compacted"] == 0 for row in rows)
             assert db.get_session(sid)["message_count"] == 4
+            assert "stage=archive_write" in caplog.text
+            assert "error_type=RuntimeError" in caplog.text
+            assert "insert failed" not in caplog.text
+            assert "must not be adopted" not in caplog.text
+
+    def test_repaired_snapshot_rejects_concurrent_append_without_archiving(
+        self, caplog
+    ):
+        from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=db_path)
+            writer = SessionDB(db_path=db_path)
+            sid = "dispatch_projection_repaired_stale"
+            db.create_session(sid, "webui", model="test/model")
+            durable = [
+                {"role": "user", "content": "first request"},
+                {"role": "user", "content": "second request"},
+            ]
+            db.append_messages_batch(sid, durable)
+            previous = db.get_messages_as_conversation(sid)
+            durable_snapshot = [dict(message) for message in previous]
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _persist_disabled=False,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=len(durable),
+                _flushed_db_message_ids={1, 2},
+            )
+            assert repair_message_sequence_with_cursor(agent, previous) == 1
+            projected = [dict(message) for message in previous]
+            projected[0] = {**projected[0], "content": "bounded merged request"}
+            writer.append_message(
+                session_id=sid,
+                role="assistant",
+                content="concurrent durable append",
+            )
+
+            try:
+                adopted, persisted = persist_in_place_projection(
+                    agent,
+                    previous,
+                    projected,
+                    durable_snapshot_messages=durable_snapshot,
+                )
+
+                assert persisted is False
+                assert adopted is previous
+                assert [row["content"] for row in db.get_messages(sid)] == [
+                    "first request",
+                    "second request",
+                    "concurrent durable append",
+                ]
+                assert all(
+                    row["active"] == 1 and row["compacted"] == 0
+                    for row in db.get_messages(sid, include_inactive=True)
+                )
+                assert "stage=snapshot_validate" in caplog.text
+                assert "failure=active_projection_extends_snapshot" in caplog.text
+                assert "concurrent durable append" not in caplog.text
+                assert db.try_acquire_compression_lock(
+                    sid, "post-rejection-probe", ttl_seconds=60
+                )
+                db.release_compression_lock(sid, "post-rejection-probe")
+            finally:
+                writer.close()
+                db.close()
+
+    def test_lock_contention_is_logged_without_projection_content(self, caplog):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_lock_contention"
+            _seed(db, sid, "projection", n=2)
+            assert db.try_acquire_compression_lock(
+                sid, "external-holder", ttl_seconds=60
+            )
+            previous = _seed_messages(n=2)
+            projected = [{"role": "user", "content": "secret projected body"}]
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=2,
+                _flushed_db_message_ids=set(),
+            )
+
+            try:
+                adopted, persisted = persist_in_place_projection(
+                    agent, previous, projected
+                )
+
+                assert persisted is False
+                assert adopted is previous
+                assert "stage=lock_contended" in caplog.text
+                assert "secret projected body" not in caplog.text
+                assert "external-holder" not in caplog.text
+            finally:
+                db.release_compression_lock(sid, "external-holder")
+                db.close()
+
+    def test_lock_acquire_exception_is_logged_and_cleanup_is_attempted(
+        self, caplog
+    ):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_lock_acquire_error"
+            _seed(db, sid, "projection", n=2)
+            previous = _seed_messages(n=2)
+            projected = [{"role": "user", "content": "secret projected body"}]
+            flushed_ids = {7, 9}
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=2,
+                _flushed_db_message_ids=flushed_ids,
+            )
+
+            with (
+                patch.object(
+                    db,
+                    "try_acquire_compression_lock",
+                    side_effect=RuntimeError("secret acquire detail"),
+                ),
+                patch.object(
+                    db,
+                    "release_compression_lock",
+                    wraps=db.release_compression_lock,
+                ) as release,
+            ):
+                adopted, persisted = persist_in_place_projection(
+                    agent, previous, projected
+                )
+
+            assert persisted is False
+            assert adopted is previous
+            assert agent._last_compaction_in_place is False
+            assert agent._last_flushed_db_idx == 2
+            assert agent._flushed_db_message_ids is flushed_ids
+            release.assert_called_once()
+            assert "stage=lock_acquire" in caplog.text
+            assert "error_type=RuntimeError" in caplog.text
+            assert "secret acquire detail" not in caplog.text
+            assert "secret projected body" not in caplog.text
+            db.close()
+
+    def test_lock_release_exception_is_logged_without_failing_committed_write(
+        self, caplog
+    ):
+        from agent.conversation_compression import persist_in_place_projection
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_lock_release_error"
+            _seed(db, sid, "projection", n=2)
+            previous = _seed_messages(n=2)
+            projected = [{"role": "user", "content": "bounded projection"}]
+            agent = SimpleNamespace(
+                _session_db=db,
+                session_id=sid,
+                _last_compaction_in_place=False,
+                _last_flushed_db_idx=2,
+                _flushed_db_message_ids=set(),
+            )
+
+            with patch.object(
+                db,
+                "release_compression_lock",
+                side_effect=RuntimeError("secret release detail"),
+            ):
+                adopted, persisted = persist_in_place_projection(
+                    agent, previous, projected
+                )
+
+            assert persisted is True
+            assert adopted is projected
+            assert [
+                message["content"]
+                for message in db.get_messages_as_conversation(sid)
+            ] == ["bounded projection"]
+            assert "stage=lock_release" in caplog.text
+            assert "error_type=RuntimeError" in caplog.text
+            assert "secret release detail" not in caplog.text
+            assert "bounded projection" not in caplog.text
+            db.close()
 
     def test_concurrent_append_after_snapshot_fails_cas_without_archiving(self):
         from agent.conversation_compression import persist_in_place_projection

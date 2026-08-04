@@ -339,6 +339,221 @@ def test_old_tool_history_is_persisted_then_rebuilt_before_dispatch(
     compress.assert_not_called()
 
 
+def test_repaired_history_uses_pre_repair_snapshot_for_dispatch_persistence(
+    agent, monkeypatch
+):
+    """Repair and pruning must commit as one projection against DB history.
+
+    The durable compare-and-swap snapshot is the history as it existed before
+    sequence repair.  Passing the already-merged history as that snapshot makes
+    a legitimate durable prefix look stale and terminates the user turn before
+    dispatch.
+    """
+    old_tool_result = "old tool output " + "x" * 10_000
+    bounded_tool_result = "[tool result pruned after sequence repair]"
+    history = [
+        {"role": "user", "content": "first persisted request"},
+        {"role": "user", "content": "second persisted request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_old",
+            "content": old_tool_result,
+        },
+        {"role": "assistant", "content": "old answer"},
+    ]
+    prune_calls = 0
+
+    def _prune(messages):
+        nonlocal prune_calls
+        prune_calls += 1
+        if prune_calls > 1:
+            return messages, 0
+        projected = [dict(message) for message in messages]
+        tool_index = next(
+            index
+            for index, message in enumerate(projected)
+            if message.get("tool_call_id") == "call_old"
+        )
+        projected[tool_index] = {
+            **projected[tool_index],
+            "content": bounded_tool_result,
+        }
+        return projected, 1
+
+    monkeypatch.setattr(
+        agent.context_compressor,
+        "prune_tool_results_for_dispatch",
+        _prune,
+    )
+    persisted = []
+
+    def _persist_projection(
+        _agent,
+        previous,
+        projected,
+        *,
+        durable_snapshot_messages=None,
+    ):
+        persisted.append(
+            (
+                [dict(message) for message in previous],
+                [dict(message) for message in projected],
+                [dict(message) for message in durable_snapshot_messages],
+                projected is not previous,
+            )
+        )
+        return projected, True
+
+    monkeypatch.setattr(
+        conversation_loop,
+        "persist_in_place_projection",
+        _persist_projection,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_provider_request_admission_receipt",
+        lambda *_args, **_kwargs: _receipt(
+            "admit", "within_effective_input_ceiling"
+        ),
+        raising=False,
+    )
+    dispatched = []
+    agent._disable_streaming = True
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda request: dispatched.append(request) or _chat_response("continued"),
+    )
+    monkeypatch.setattr(agent, "_compress_context", MagicMock())
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "current request",
+            conversation_history=history,
+        )
+
+    assert result["completed"] is True
+    assert len(persisted) == 1
+    repaired, projected, durable_snapshot, _used_distinct_projection = persisted[0]
+    assert [message["content"] for message in durable_snapshot[:2]] == [
+        "first persisted request",
+        "second persisted request",
+    ]
+    assert repaired[0]["content"] == (
+        "first persisted request\n\nsecond persisted request"
+    )
+    assert any(
+        message.get("content") == bounded_tool_result for message in projected
+    )
+    assert len(dispatched) == 1
+
+
+def test_repair_only_projection_is_persisted_before_provider_dispatch(
+    agent, monkeypatch
+):
+    history = [
+        {"role": "user", "content": "first persisted request"},
+        {"role": "user", "content": "second persisted request"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    monkeypatch.setattr(
+        agent.context_compressor,
+        "prune_tool_results_for_dispatch",
+        lambda messages: (messages, 0),
+    )
+    persisted = []
+
+    def _persist_projection(
+        _agent,
+        previous,
+        projected,
+        *,
+        durable_snapshot_messages=None,
+    ):
+        persisted.append(
+            (
+                [dict(message) for message in previous],
+                [dict(message) for message in projected],
+                [dict(message) for message in durable_snapshot_messages],
+                projected is not previous,
+            )
+        )
+        return projected, True
+
+    monkeypatch.setattr(
+        conversation_loop,
+        "persist_in_place_projection",
+        _persist_projection,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_provider_request_admission_receipt",
+        lambda *_args, **_kwargs: _receipt(
+            "admit", "within_effective_input_ceiling"
+        ),
+        raising=False,
+    )
+    dispatched = []
+
+    def _transport(request):
+        assert len(persisted) == 1, "repair must commit before provider transport"
+        persisted_projection = persisted[0][1]
+        expected_user_idx = next(
+            index
+            for index, message in enumerate(persisted_projection)
+            if message.get("role") == "user"
+            and message.get("content") == "current request"
+        )
+        assert agent._persist_user_message_idx == expected_user_idx
+        dispatched.append(request)
+        return _chat_response("continued")
+
+    agent._disable_streaming = True
+    monkeypatch.setattr(agent, "_interruptible_api_call", _transport)
+    monkeypatch.setattr(agent, "_compress_context", MagicMock())
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "current request",
+            conversation_history=history,
+        )
+
+    assert result["completed"] is True
+    assert len(persisted) == 1
+    repaired, projected, durable_snapshot, used_distinct_projection = persisted[0]
+    assert used_distinct_projection is True
+    assert projected == repaired
+    assert [message["content"] for message in durable_snapshot[:2]] == [
+        "first persisted request",
+        "second persisted request",
+    ]
+    assert repaired[0]["content"] == (
+        "first persisted request\n\nsecond persisted request"
+    )
+    assert len(dispatched) == 1
+
+
 def test_local_budget_compaction_rebuilds_then_dispatches(agent, monkeypatch):
     receipts = [
         _receipt("reject", "estimated_input_plus_margin_exceeds_ceiling"),

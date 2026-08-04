@@ -1339,7 +1339,17 @@ def _run_conversation(
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+        # Repair replaces top-level fields/lists but never mutates nested
+        # payloads. A one-level snapshot therefore preserves the DB-aligned
+        # CAS input without duplicating bulky tool results or multimodal data.
+        repair_snapshot_candidate = [
+            dict(message) if isinstance(message, dict) else message
+            for message in messages
+        ]
         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
+        repair_durable_snapshot = (
+            repair_snapshot_candidate if repaired_seq > 0 else None
+        )
         if repaired_seq > 0:
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",
@@ -1358,17 +1368,56 @@ def _run_conversation(
             dispatch_projection, pruned_tool_items = _dispatch_pruner(messages)
         else:
             dispatch_projection, pruned_tool_items = messages, 0
-        if pruned_tool_items:
+        # A repair must be made durable before provider/tool work can append
+        # beyond its old snapshot. If pruning also changed the history, publish
+        # both mutations in the same archive transaction. For repair-only work,
+        # use a distinct top-level list so success cannot be mistaken for the
+        # helper's exact-original failure sentinel.
+        if repaired_seq > 0 or pruned_tool_items:
             previous_messages = messages
-            adopted_messages, projection_persisted = persist_in_place_projection(
-                agent, previous_messages, dispatch_projection
-            )
+            projection_to_persist = dispatch_projection
+            if projection_to_persist is previous_messages:
+                projection_to_persist = list(previous_messages)
+            if repair_durable_snapshot is None:
+                adopted_messages, projection_persisted = (
+                    persist_in_place_projection(
+                        agent,
+                        previous_messages,
+                        projection_to_persist,
+                    )
+                )
+            else:
+                adopted_messages, projection_persisted = (
+                    persist_in_place_projection(
+                        agent,
+                        previous_messages,
+                        projection_to_persist,
+                        durable_snapshot_messages=repair_durable_snapshot,
+                    )
+                )
             if adopted_messages is previous_messages:
                 _refund_untransported_attempt()
+                if repaired_seq > 0 and not pruned_tool_items:
+                    persistence_failure = (
+                        "Conversation history repair could not be persisted safely."
+                    )
+                elif repaired_seq > 0:
+                    persistence_failure = (
+                        "Conversation history repair and context budget pruning "
+                        "could not be persisted safely."
+                    )
+                else:
+                    persistence_failure = (
+                        "Context budget pruning could not be persisted safely."
+                    )
                 return _compression_exhausted_result(
-                    "Context budget pruning could not be persisted safely."
+                    persistence_failure
                 )
             messages = adopted_messages
+            current_turn_user_idx = reanchor_current_turn_user_idx(
+                messages, user_message
+            )
+            agent._persist_user_message_idx = current_turn_user_idx
             conversation_history = (
                 conversation_history_after_compression(agent, messages)
                 if projection_persisted

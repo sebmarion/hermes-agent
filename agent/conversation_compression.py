@@ -1881,6 +1881,14 @@ def conversation_history_after_compression(
     return None
 
 
+class _ActiveProjectionSnapshotError(RuntimeError):
+    """Payload-free durable snapshot rejection with a stable reason code."""
+
+    def __init__(self, failure: str, message: str) -> None:
+        super().__init__(message)
+        self.failure = failure
+
+
 def _capture_active_projection_ids(
     session_db: Any,
     session_id: str,
@@ -1900,7 +1908,10 @@ def _capture_active_projection_ids(
     """
     active_rows = session_db.get_messages(session_id)
     if len(active_rows) > len(previous_messages):
-        raise RuntimeError("active session projection extends past snapshot")
+        raise _ActiveProjectionSnapshotError(
+            "active_projection_extends_snapshot",
+            "active session projection extends past snapshot",
+        )
     durable_projection = [
         session_db._canonical_persisted_replay_message(
             row,
@@ -1918,14 +1929,54 @@ def _capture_active_projection_ids(
         for message in previous_messages[:len(active_rows)]
     ]
     if durable_projection != previous_prefix:
-        raise RuntimeError("active session projection does not match snapshot")
+        raise _ActiveProjectionSnapshotError(
+            "active_projection_mismatch",
+            "active session projection does not match snapshot",
+        )
     return tuple(row["id"] for row in active_rows)
+
+
+def _log_projection_persistence_failure(
+    *,
+    session_id: str,
+    stage: str,
+    previous_messages: list,
+    snapshot_messages: list,
+    compacted_messages: list,
+    exc: BaseException | None = None,
+    failure: str | None = None,
+) -> None:
+    """Log only structural diagnostics for a rejected projection commit.
+
+    Message bodies, tool arguments, lock-holder identifiers, and exception
+    strings are intentionally excluded.  Exception strings can contain bound
+    SQL values or adapter-provided text; stage + class + stable failure code and
+    row counts are sufficient to distinguish lock, snapshot, and write faults.
+    """
+    if failure is None and exc is not None:
+        failure = getattr(exc, "failure", None)
+        if not failure:
+            failure = getattr(exc, "sqlite_errorname", None)
+    logger.warning(
+        "dispatch projection persistence stage failed: "
+        "session=%s stage=%s error_type=%s failure=%s "
+        "previous_count=%s snapshot_count=%s projected_count=%s",
+        session_id,
+        stage,
+        type(exc).__name__ if exc is not None else "none",
+        failure or "exception",
+        len(previous_messages),
+        len(snapshot_messages),
+        len(compacted_messages),
+    )
 
 
 def persist_in_place_projection(
     agent: Any,
     previous_messages: list,
     compacted_messages: list,
+    *,
+    durable_snapshot_messages: list | None = None,
 ) -> tuple[list, bool]:
     """Atomically adopt a changed dispatch projection under the same session.
 
@@ -1934,12 +1985,23 @@ def persist_in_place_projection(
     hold the existing per-session compression lock, verify that the current
     active DB rows still match the durable prefix of ``previous_messages``, and
     pass their exact IDs into the archive transaction as a compare-and-swap.
+    ``durable_snapshot_messages`` may provide an earlier, DB-aligned projection
+    when ``previous_messages`` was canonically repaired in memory.  The earlier
+    projection is used only to validate and capture row IDs; the single archive
+    transaction still publishes ``compacted_messages`` and re-checks those IDs.
     Any lock, stale-snapshot, or write failure returns the exact original list
     and leaves all persistence cursors and compaction flags untouched. Agents
     without a durable DB/session may still use the in-memory projection,
     reported explicitly as ``persisted=False``.
     """
-    if compacted_messages is previous_messages or compacted_messages == previous_messages:
+    # Supplying an earlier durable snapshot is an explicit request to rewrite
+    # an in-memory-repaired projection, even when the repaired target is only a
+    # distinct shallow list equal to ``previous_messages``.
+    durable_rewrite_required = durable_snapshot_messages is not None
+    if (
+        compacted_messages is previous_messages
+        or compacted_messages == previous_messages
+    ) and not durable_rewrite_required:
         return previous_messages, False
 
     session_db = getattr(agent, "_session_db", None)
@@ -1952,6 +2014,12 @@ def persist_in_place_projection(
     if not durable_session:
         return compacted_messages, False
 
+    snapshot_messages = (
+        durable_snapshot_messages
+        if durable_snapshot_messages is not None
+        else previous_messages
+    )
+
     try:
         lock_ttl = float(
             getattr(agent, "_compression_lock_ttl_seconds", 300.0) or 300.0
@@ -1959,35 +2027,98 @@ def persist_in_place_projection(
     except (TypeError, ValueError):
         lock_ttl = 300.0
     lock_holder = _compression_lock_holder(agent)
+
+    def _release_projection_lock() -> None:
+        try:
+            session_db.release_compression_lock(session_id, lock_holder)
+        except Exception as exc:
+            _log_projection_persistence_failure(
+                session_id=session_id,
+                stage="lock_release",
+                previous_messages=previous_messages,
+                snapshot_messages=snapshot_messages,
+                compacted_messages=compacted_messages,
+                exc=exc,
+            )
+
     try:
         lock_acquired = session_db.try_acquire_compression_lock(
             session_id,
             lock_holder,
             ttl_seconds=lock_ttl,
         )
-    except Exception:
+    except Exception as exc:
+        _log_projection_persistence_failure(
+            session_id=session_id,
+            stage="lock_acquire",
+            previous_messages=previous_messages,
+            snapshot_messages=snapshot_messages,
+            compacted_messages=compacted_messages,
+            exc=exc,
+        )
+        # A wrapper may raise after the acquire transaction committed. The
+        # holder-qualified release is harmless when no row was acquired and
+        # prevents a successful-but-unreported acquire from leaking its lease.
+        _release_projection_lock()
         return previous_messages, False
     if not lock_acquired:
+        active_holder = False
+        get_holder = getattr(session_db, "get_compression_lock_holder", None)
+        if callable(get_holder):
+            try:
+                active_holder = bool(get_holder(session_id))
+            except Exception:
+                active_holder = False
+        _log_projection_persistence_failure(
+            session_id=session_id,
+            stage="lock_contended" if active_holder else "lock_acquire",
+            previous_messages=previous_messages,
+            snapshot_messages=snapshot_messages,
+            compacted_messages=compacted_messages,
+            failure=(
+                "active_lock_holder_present"
+                if active_holder
+                else "lock_not_acquired"
+            ),
+        )
         return previous_messages, False
 
     try:
-        expected_active_ids = _capture_active_projection_ids(
-            session_db,
-            session_id,
-            previous_messages,
-        )
-        session_db.archive_and_compact(
-            session_id,
-            compacted_messages,
-            expected_active_message_ids=expected_active_ids,
-        )
-    except Exception:
-        return previous_messages, False
-    finally:
         try:
-            session_db.release_compression_lock(session_id, lock_holder)
-        except Exception:
-            pass
+            expected_active_ids = _capture_active_projection_ids(
+                session_db,
+                session_id,
+                snapshot_messages,
+            )
+        except Exception as exc:
+            _log_projection_persistence_failure(
+                session_id=session_id,
+                stage="snapshot_validate",
+                previous_messages=previous_messages,
+                snapshot_messages=snapshot_messages,
+                compacted_messages=compacted_messages,
+                exc=exc,
+            )
+            return previous_messages, False
+
+        try:
+            session_db.archive_and_compact(
+                session_id,
+                compacted_messages,
+                expected_active_message_ids=expected_active_ids,
+            )
+        except Exception as exc:
+            _log_projection_persistence_failure(
+                session_id=session_id,
+                stage="archive_write",
+                previous_messages=previous_messages,
+                snapshot_messages=snapshot_messages,
+                compacted_messages=compacted_messages,
+                exc=exc,
+            )
+            return previous_messages, False
+    finally:
+        _release_projection_lock()
 
     # Match the successful in-place compression baseline: the projection is
     # already durable, and conversation_history_after_compression() will expose
