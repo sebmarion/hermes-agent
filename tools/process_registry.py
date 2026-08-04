@@ -7,6 +7,7 @@ Tracks processes spawned via terminal(background=true), providing:
   - Blocking wait with interrupt support
   - Process killing
   - Crash recovery via JSON checkpoint file
+  - Durable completion-notification outbox for restart recovery
   - Session-scoped tracking for gateway reset protection
 
 Background processes execute THROUGH the environment interface -- nothing
@@ -118,6 +119,7 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    completion_event_id: str = ""                # Stable durable completion identity
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -162,6 +164,15 @@ class ProcessRegistry:
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+
+        # Completion notifications are an outbox, not just an in-memory queue.
+        # A process can exit after the host writes its checkpoint but before a
+        # consumer receives the queue item; retaining the exact event makes the
+        # next host able to replay it without inventing a second completion.
+        self._pending_completion_events: Dict[str, Dict[str, Any]] = {}
+        self._completion_recovery_enqueued: set[str] = set()
+        self._checkpoint_state_loaded = False
+        self._checkpoint_state_error = False
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -1189,15 +1200,20 @@ class ProcessRegistry:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
         session._completion_event.set()
-        self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
+        event = None
         if was_running and session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
+            event_id = session.completion_event_id or (
+                f"completion:{session.id}:{session.started_at:.9f}"
+            )
+            session.completion_event_id = event_id
+            event = {
+                "event_id": event_id,
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
@@ -1210,7 +1226,211 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
-            })
+            }
+            with self._lock:
+                self._pending_completion_events[event_id] = dict(event)
+
+        # Persist the terminal state and its completion obligation before
+        # touching the process-local queue.  If queue delivery or the host
+        # crashes here, startup recovery can replay the durable event.
+        self._write_checkpoint()
+        if event is not None:
+            try:
+                self.completion_queue.put(event)
+            except Exception:
+                logger.warning(
+                    "Could not enqueue durable process completion %s; "
+                    "startup recovery will retry",
+                    event.get("event_id"),
+                    exc_info=True,
+                )
+            else:
+                with self._lock:
+                    self._completion_recovery_enqueued.add(event["event_id"])
+
+    def _load_checkpoint_state(self) -> tuple[list[dict], list[dict]]:
+        """Load the running-process and completion-outbox checkpoint once."""
+        if self._checkpoint_state_loaded:
+            with self._lock:
+                return list(self._running_checkpoint_entries), [
+                    dict(value) for value in self._pending_completion_events.values()
+                ]
+
+        self._checkpoint_state_loaded = True
+        self._running_checkpoint_entries: list[dict] = []
+        if not CHECKPOINT_PATH.exists():
+            return [], []
+
+        try:
+            payload = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                running = payload
+                pending = []
+            elif isinstance(payload, dict):
+                running = payload.get("running", [])
+                pending = payload.get("pending_completions", [])
+                if not isinstance(running, list) or not isinstance(pending, list):
+                    raise ValueError("checkpoint sections must be lists")
+            else:
+                raise ValueError("checkpoint must be a list or object")
+            if any(not isinstance(entry, dict) for entry in running):
+                raise ValueError("running checkpoint entries must be objects")
+            if any(
+                not isinstance(entry, dict)
+                or not str(entry.get("event_id") or "").strip()
+                or entry.get("type", "completion") != "completion"
+                for entry in pending
+            ):
+                raise ValueError("pending completion entries are invalid")
+        except Exception:
+            self._checkpoint_state_error = True
+            logger.warning("Process checkpoint is malformed; refusing recovery")
+            return [], []
+
+        self._running_checkpoint_entries = [dict(entry) for entry in running]
+        with self._lock:
+            self._pending_completion_events = {
+                str(entry["event_id"]): dict(entry) for entry in pending
+            }
+        return list(self._running_checkpoint_entries), [
+            dict(value) for value in self._pending_completion_events.values()
+        ]
+
+    def completion_activity_snapshot(self) -> dict:
+        """Return the verified process/checkpoint activity contract for hosts."""
+        self._load_checkpoint_state()
+        with self._lock:
+            running = sum(1 for session in self._running.values() if not session.exited)
+            pending = len(self._pending_completion_events)
+            unavailable = self._checkpoint_state_error
+        return {
+            "running_processes": running,
+            "foreign_owner_active_processes": 0,
+            "finalizing_processes": 0,
+            "durable_undelivered_completions": pending,
+            "process_completion_activity_available": not unavailable,
+            "process_checkpoint_available": not unavailable,
+            "process_checkpoint_reason": "unavailable" if unavailable else "verified",
+        }
+
+    def recover_completion_notifications(self) -> int:
+        """Replay each durable completion obligation into this process once."""
+        _running, pending = self._load_checkpoint_state()
+        if self._checkpoint_state_error:
+            return 0
+        replayed = 0
+        for event in pending:
+            event_id = str(event.get("event_id") or "").strip()
+            if not event_id:
+                continue
+            with self._lock:
+                if event_id in self._completion_recovery_enqueued:
+                    continue
+            try:
+                self.completion_queue.put(dict(event))
+            except Exception:
+                logger.warning(
+                    "Could not replay durable process completion %s",
+                    event_id,
+                    exc_info=True,
+                )
+                continue
+            with self._lock:
+                self._completion_recovery_enqueued.add(event_id)
+            replayed += 1
+        return replayed
+
+    def finish_notification_delivery(self, event: dict, committed: bool) -> bool:
+        """Atomically ACK a committed completion or requeue an uncommitted one.
+
+        WebUI claims a completion before starting its replacement turn.  The
+        claim must remain in the Agent outbox until that turn's transcript is
+        durably written; a failed turn therefore calls this method with
+        ``committed=False`` and gets the exact event back on the queue.  The
+        method is intentionally idempotent for already-settled events.
+        """
+        if not isinstance(event, dict):
+            return False
+        event_type = str(event.get("type") or "completion")
+        if event_type == "async_delegation":
+            if not committed:
+                try:
+                    self.completion_queue.put(dict(event))
+                except Exception:
+                    logger.warning(
+                        "Could not requeue uncommitted async delegation completion",
+                        exc_info=True,
+                    )
+                return False
+            try:
+                from tools.async_delegation import mark_async_delegation_delivered
+
+                return bool(mark_async_delegation_delivered(event))
+            except Exception:
+                logger.warning(
+                    "Could not acknowledge async delegation completion",
+                    exc_info=True,
+                )
+                return False
+        if event_type != "completion":
+            return False
+
+        event_id = str(event.get("event_id") or "").strip()
+        session_id = str(event.get("session_id") or "").strip()
+        if not event_id:
+            return False
+        if not committed:
+            try:
+                self.completion_queue.put(dict(event))
+            except Exception:
+                logger.warning(
+                    "Could not requeue uncommitted process completion %s",
+                    event_id,
+                    exc_info=True,
+                )
+            return False
+
+        with self._lock:
+            pending_event = self._pending_completion_events.pop(event_id, None)
+            already_consumed = bool(session_id and session_id in self._completion_consumed)
+            if session_id:
+                self._completion_consumed.add(session_id)
+            self._completion_recovery_enqueued.discard(event_id)
+
+        # The outbox row is the durable source of truth. If the write fails,
+        # restore it and publish the exact event for an in-process retry; a
+        # future restart will also replay the restored row.
+        if self._write_checkpoint():
+            return True
+        with self._lock:
+            if pending_event is not None:
+                self._pending_completion_events[event_id] = pending_event
+            if session_id and not already_consumed:
+                self._completion_consumed.discard(session_id)
+        try:
+            self.completion_queue.put(dict(event))
+        except Exception:
+            logger.warning(
+                "Could not preserve process completion %s after checkpoint failure",
+                event_id,
+                exc_info=True,
+            )
+        return False
+
+    def ack_completion_notification(self, event_or_id: object) -> bool:
+        """Backward-compatible ACK for one durable completion event."""
+        if isinstance(event_or_id, dict):
+            event = event_or_id
+        else:
+            event = {
+                "type": "completion",
+                "event_id": str(event_or_id or "").strip(),
+            }
+        event_id = str(event.get("event_id") or "").strip()
+        with self._lock:
+            if not event_id or event_id not in self._pending_completion_events:
+                return False
+        return self.finish_notification_delivery(event, True)
 
     # ----- Query Methods -----
 
@@ -2053,9 +2273,12 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file atomically."""
+    def _write_checkpoint(self) -> bool:
+        """Write running process metadata and completion outbox atomically."""
         try:
+            self._load_checkpoint_state()
+            if self._checkpoint_state_error:
+                return False
             with self._lock:
                 entries = []
                 for s in self._running.values():
@@ -2083,14 +2306,28 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "completion_event_id": s.completion_event_id,
                             "watch_patterns": s.watch_patterns,
                         })
-            
+                pending = [
+                    dict(event)
+                    for event in self._pending_completion_events.values()
+                ]
+
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+            payload = entries
+            if pending:
+                payload = {
+                    "version": 2,
+                    "running": entries,
+                    "pending_completions": pending,
+                }
+            atomic_json_write(CHECKPOINT_PATH, payload)
+            return True
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+            return False
 
     def recover_from_checkpoint(self) -> int:
         """
@@ -2098,12 +2335,8 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
-            return 0
-
-        try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
-        except Exception:
+        entries, _pending = self._load_checkpoint_state()
+        if self._checkpoint_state_error:
             return 0
 
         recovered = 0
@@ -2161,6 +2394,7 @@ class ProcessRegistry:
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                completion_event_id=entry.get("completion_event_id", ""),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:

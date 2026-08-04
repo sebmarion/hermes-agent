@@ -871,6 +871,101 @@ class TestSpawnRewriteCompoundBackground:
 # =========================================================================
 
 class TestCheckpoint:
+    def test_completion_notification_survives_restart_and_ack_is_idempotent(
+        self, registry, tmp_path
+    ):
+        checkpoint = tmp_path / "procs.json"
+        session = ProcessSession(
+            id="proc_completion_restart",
+            command="echo done",
+            task_id="t1",
+            session_key="webui-session",
+            started_at=123.0,
+            exited=True,
+            exit_code=0,
+            notify_on_complete=True,
+            output_buffer="done\n",
+        )
+        registry._running[session.id] = session
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            registry._move_to_finished(session)
+            payload = json.loads(checkpoint.read_text())
+
+            assert payload["pending_completions"][0]["session_id"] == session.id
+            assert payload["pending_completions"][0]["event_id"]
+
+            restarted = ProcessRegistry()
+            recovered = restarted.recover_from_checkpoint()
+            assert recovered == 0
+            assert restarted.recover_completion_notifications() == 1
+            assert restarted.recover_completion_notifications() == 0
+            event = restarted.completion_queue.get_nowait()
+            assert event["event_id"] == payload["pending_completions"][0]["event_id"]
+            assert restarted.completion_activity_snapshot() == {
+                "running_processes": 0,
+                "foreign_owner_active_processes": 0,
+                "finalizing_processes": 0,
+                "durable_undelivered_completions": 1,
+                "process_completion_activity_available": True,
+                "process_checkpoint_available": True,
+                "process_checkpoint_reason": "verified",
+            }
+
+            assert restarted.finish_notification_delivery(event, False) is False
+            assert restarted.completion_queue.get_nowait()["event_id"] == event["event_id"]
+            assert restarted.completion_activity_snapshot()[
+                "durable_undelivered_completions"
+            ] == 1
+            assert restarted.finish_notification_delivery(event, True) is True
+            assert restarted.ack_completion_notification(event) is False
+            assert restarted.completion_activity_snapshot()[
+                "durable_undelivered_completions"
+            ] == 0
+
+    def test_completion_queue_failure_leaves_durable_event_for_recovery(
+        self, registry, tmp_path
+    ):
+        checkpoint = tmp_path / "procs.json"
+
+        class BrokenQueue:
+            def put(self, _event):
+                raise OSError("queue unavailable")
+
+        session = ProcessSession(
+            id="proc_completion_queue_failure",
+            command="echo done",
+            task_id="t1",
+            session_key="webui-session",
+            started_at=456.0,
+            exited=True,
+            exit_code=0,
+            notify_on_complete=True,
+        )
+        registry._running[session.id] = session
+        registry.completion_queue = BrokenQueue()
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            registry._move_to_finished(session)
+            payload = json.loads(checkpoint.read_text())
+            assert len(payload["pending_completions"]) == 1
+
+            restarted = ProcessRegistry()
+            assert restarted.recover_from_checkpoint() == 0
+            assert restarted.recover_completion_notifications() == 1
+
+    def test_malformed_checkpoint_reports_unavailable_activity(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text("not json")
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 0
+            snapshot = registry.completion_activity_snapshot()
+
+        assert snapshot["process_completion_activity_available"] is False
+        assert snapshot["process_checkpoint_available"] is False
+        assert snapshot["process_checkpoint_reason"] == "unavailable"
+
     def test_recover_dead_pid(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
@@ -1533,4 +1628,3 @@ class TestReaderLoopOrphanedPipe:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-
