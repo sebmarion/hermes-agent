@@ -1434,6 +1434,13 @@ If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
 
+### GitNexus index routing
+
+This project is indexed by GitNexus as **hermes-agent**. When calling GitNexus
+MCP tools from outside this repo, pass `repo: "hermes-agent"` to route queries
+to this index. Use the GitNexus tools to understand code, assess impact, and
+navigate safely.
+
 ## General Engineering Principles
 
 - Do not preserve backward compatibility.

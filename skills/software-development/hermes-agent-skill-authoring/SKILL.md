@@ -1,7 +1,7 @@
 ---
 name: hermes-agent-skill-authoring
-description: "Author in-repo SKILL.md files: frontmatter and structure."
-version: 1.1.0
+description: "Use when authoring or editing in-repo Hermes Agent SKILL.md files; covers frontmatter, validation, structure, and no-op prose checks."
+version: 1.1.1
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -81,6 +81,20 @@ Use these quality checks when writing or editing any skill:
 6. **Use strong leading words.** Prefer compact concepts the model already knows — e.g. "tight loop," "tracer bullet," "root cause," "regression test" — over long repeated explanations. A good leading word saves tokens and anchors behavior.
 7. **Prune duplication and no-ops.** Keep each meaning in one source of truth. Sentence by sentence, ask whether the sentence changes agent behavior versus the default. If not, delete it rather than polishing it.
 8. **Watch for premature completion.** If agents tend to rush a step, first sharpen that step's completion criterion. Split the sequence only when later steps distract from doing the current step well.
+
+After drafting, run the bundled conservative linter. The script path below is relative to the canonical `hermes-agent` repository root; from another directory, use its absolute path.
+
+```bash
+# In-repo skill, from the hermes-agent root
+python3 skills/software-development/hermes-agent-skill-authoring/scripts/noop_skill_lint.py \
+  skills/<category>/<name>/SKILL.md
+
+# User-local skill, still from the hermes-agent root
+python3 skills/software-development/hermes-agent-skill-authoring/scripts/noop_skill_lint.py \
+  "$HOME/.hermes/skills/<category>/<name>/SKILL.md"
+```
+
+The argument may be a `SKILL.md` file or its containing directory. Exit `1` means obvious standalone generic instructions were found; exit `2` means the supplied path did not resolve to a skill file. Exit `0` means no known phrase matched—it does not prove the skill changes behavior.
 
 Common quality failures:
 
@@ -202,6 +216,6 @@ Pick the closest existing category. Don't invent new top-level categories casual
 - [ ] Each ordered step has a checkable completion criterion
 - [ ] Description is trigger-focused and avoids duplicated body content
 - [ ] Bulky or branch-specific reference is progressively disclosed in linked files
-- [ ] No-op prose and duplicated rules removed
+- [ ] `noop_skill_lint.py` exits 0, and manual review confirms remaining prose changes behavior
 - [ ] `related_skills` references resolve in-repo (or are explicitly OK to be user-local)
 - [ ] `git add skills/<category>/<name>/ && git commit` completed on the intended branch
