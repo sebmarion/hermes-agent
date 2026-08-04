@@ -165,6 +165,36 @@ def test_iteration_limit_recovery_never_uses_model_summary(monkeypatch):
     assert agent._handle_max_iterations_called is False
 
 
+def test_short_preserved_verification_response_is_not_rewritten(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(completion_explainer=True)
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        pending_verification_response="The",
+    )
+
+    assert result["final_response"] == "The"
+
+
+def test_text_response_exit_not_rewritten_at_iteration_limit(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(budget_remaining=5)
+    exit_reason = "text_response(finish_reason=stop)"
+
+    result = _finalize(
+        agent,
+        final_response="normal answer",
+        exit_reason=exit_reason,
+        api_call_count=59,
+    )
+
+    assert result["turn_exit_reason"] == exit_reason
+    assert agent._handle_max_iterations_called is False
+
+
 
 
 
@@ -276,4 +306,3 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert agent.persisted_messages is not None
     persisted_roles = [m["role"] for m in agent.persisted_messages]
     assert persisted_roles == ["user", "assistant"]
-

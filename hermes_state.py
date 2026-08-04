@@ -6901,18 +6901,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # the archived rows are still on disk but not part of the live count.
             if system_prompt is None:
                 conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ? "
-                    "WHERE id = ?",
-                    (inserted, tool_calls_total, session_id),
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                    "last_activity_at = (SELECT MAX(timestamp) FROM messages "
+                    "WHERE session_id = ? AND active = 1) WHERE id = ?",
+                    (inserted, tool_calls_total, session_id, session_id),
                 )
             else:
                 conn.execute(
                     "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
-                    "system_prompt = ? WHERE id = ?",
+                    "system_prompt = ?, "
+                    "last_activity_at = (SELECT MAX(timestamp) FROM messages "
+                    "WHERE session_id = ? AND active = 1) WHERE id = ?",
                     (
                         inserted,
                         tool_calls_total,
                         system_prompt,
+                        session_id,
                         session_id,
                     ),
                 )

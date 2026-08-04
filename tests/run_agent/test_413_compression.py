@@ -191,6 +191,57 @@ class TestHTTP413Compression:
         assert result["final_response"] == "Success after compression"
 
 
+    def test_413_not_treated_as_generic_4xx(self, agent):
+        """413 must attempt compression instead of aborting as generic 4xx."""
+        err_413 = _make_413_error()
+        ok_resp = _mock_response(content="Recovered", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [err_413, ok_resp]
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "hello"}],
+                "compressed",
+            )
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        # If 413 were treated as generic 4xx, result would have "failed": True
+        assert result.get("failed") is not True
+        assert result["completed"] is True
+
+    def test_413_error_message_detection(self, agent):
+        """413 detected via error message string (no status_code attr)."""
+        err = _make_413_error(use_status_code=False, message="error code: 413")
+        ok_resp = _mock_response(content="OK", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [err, ok_resp]
+
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "hello"}],
+                "compressed",
+            )
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_compress.assert_called_once()
+        assert result["completed"] is True
 
     def test_413_persists_stripped_vision_projection_before_retry(self, agent):
         """A no-op compaction may retry only from the adopted canonical projection."""
@@ -724,6 +775,45 @@ class TestPreflightCompression:
             "Pre-API compression" in msg for _ev, msg in status_messages
         )
 
+    def test_pre_api_compression_status_emitted_by_default(self, agent):
+        """Control: the default (non-quiet) engine keeps the pre-API line."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 130_000
+
+        history = [
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": "earlier answer"},
+        ]
+        ok_resp = _mock_response(content="After pre-API", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+        status_messages = []
+        agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=144_669),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=144_669,
+            ),
+            patch.object(
+                agent,
+                "_compress_context",
+                side_effect=lambda msgs, *a, **k: (msgs, agent._cached_system_prompt),
+            ) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=history)
+
+        assert result["completed"] is True
+        assert mock_compress.call_count >= 1
+        assert any(
+            ev == "lifecycle" and "Pre-API compression" in msg
+            for ev, msg in status_messages
+        )
 
     def test_preflight_compresses_oversized_history(
         self, agent, admitted_provider_request
@@ -979,6 +1069,39 @@ class TestPreflightCompression:
         self, agent, admitted_provider_request
     ):
         """Preflight must call ``should_compress()`` so anti-thrash applies.
+
+        Regression for #29335 — preflight used to bypass ``should_compress()``
+        and re-trigger every turn even when the prior two passes each saved
+        <10% (the canonical infinite-compression-loop signal).
+        """
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 2_000
+        agent.context_compressor.threshold_tokens = 200
+
+        big_history = []
+        for i in range(20):
+            big_history.append({"role": "user", "content": f"Message {i} padded"})
+            big_history.append({"role": "assistant", "content": f"Response {i} padded"})
+
+        ok_resp = _mock_response(content="No preflight", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "should_compress",
+                return_value=False,
+            ) as mock_should,
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=big_history)
+
+        mock_should.assert_called()
+        mock_compress.assert_not_called()
+        assert result["completed"] is True
 
 
 
