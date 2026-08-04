@@ -28,13 +28,13 @@ def _default_lanes_by_name() -> dict:
     return {lane["name"]: lane for lane in DEFAULT_RUNTIME["lanes"]}
 
 
-def test_default_runtime_has_two_validated_lanes():
-    """DEFAULT_RUNTIME provides exactly two lanes named 'glm' and 'sol',
-    each with all required keys."""
+def test_default_runtime_has_one_validated_lane():
+    """DEFAULT_RUNTIME uses the remaining supported Codex lane."""
     lanes = DEFAULT_RUNTIME["lanes"]
-    assert len(lanes) == 2
+    assert len(lanes) == 1
     names = {lane["name"] for lane in lanes}
-    assert names == {"glm", "sol"}
+    assert names == {"sol"}
+    assert all("neuralwatt" not in lane["provider"].lower() for lane in lanes)
     for lane in lanes:
         for key in _REQUIRED_LANE_KEYS:
             assert lane.get(key), f"lane '{lane.get('name')}' missing key '{key}'"
@@ -43,15 +43,15 @@ def test_default_runtime_has_two_validated_lanes():
 def test_validate_runtime_accepts_default_config():
     """validate_runtime() with no config must succeed (uses DEFAULT_RUNTIME)."""
     cfg = validate_runtime()
-    assert len(cfg["lanes"]) == 2
-    assert {lane["name"] for lane in cfg["lanes"]} == {"glm", "sol"}
+    assert len(cfg["lanes"]) == 1
+    assert {lane["name"] for lane in cfg["lanes"]} == {"sol"}
 
 
 def test_validate_runtime_accepts_config_lanes_with_arbitrary_models():
     """When config supplies lanes with different model strings, validate_runtime
     must accept them as long as the structure invariant holds."""
     custom_lanes = [
-        {"name": "glm", "provider": "custom:neuralwatt", "model": "glm-5.3-fast",
+        {"name": "glm", "provider": "provider-a", "model": "glm-5.3-fast",
          "api_mode": "chat_completions", "reasoning_effort": "high"},
         {"name": "sol", "provider": "openai-codex", "model": "gpt-6-sol",
          "api_mode": "codex_app_server", "reasoning_effort": "ultra"},
@@ -176,7 +176,7 @@ def test_sol_ultra_requires_codex_app_server():
     validate_runtime must raise BestPlanUnavailable — the ultra→codex_app_server
     safety contract (see codex_responses_adapter.py:50-55)."""
     bad_lanes = [
-        {"name": "glm", "provider": "custom:neuralwatt", "model": "glm-5.2",
+        {"name": "glm", "provider": "provider-a", "model": "glm-5.2",
          "api_mode": "chat_completions", "reasoning_effort": "high"},
         {"name": "sol", "provider": "openai-codex", "model": "gpt-5.6-sol",
          "api_mode": "codex_responses", "reasoning_effort": "ultra"},

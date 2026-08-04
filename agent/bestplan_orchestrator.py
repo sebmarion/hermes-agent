@@ -30,13 +30,6 @@ RECEIPT_VERSION = 1
 # the strongest available lane for synthesis.
 _DEFAULT_LANES = (
     {
-        "name": "glm",
-        "provider": "custom:neuralwatt",
-        "model": "glm-5.2",
-        "api_mode": "chat_completions",
-        "reasoning_effort": "high",
-    },
-    {
         "name": "sol",
         "provider": "openai-codex",
         "model": "gpt-5.6-sol",
