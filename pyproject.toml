@@ -379,6 +379,7 @@ py-modules = [
   "hermes_state_portability",
   "hermes_state_schema",
   "hermes_state_search",
+  "session_catalog",
   "hermes_time",
   "hermes_logging",
   "utils",

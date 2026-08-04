@@ -8,6 +8,7 @@ formatting, capacity rejection, and crash handling.
 import json
 import os
 import queue
+import stat
 import subprocess
 import sys
 import threading
@@ -51,6 +52,20 @@ def _drain_one(timeout=5.0):
             return process_registry.completion_queue.get_nowait()
         time.sleep(0.02)
     return None
+
+
+def test_persisted_tracker_is_replaced_with_private_permissions(tmp_path):
+    tracker = tmp_path / "authority.json"
+    temporary = tracker.with_suffix(tracker.suffix + ".tmp")
+    temporary.write_text("stale", encoding="utf-8")
+    temporary.chmod(0o644)
+
+    ad._write_persisted_unlocked(
+        {"version": 1, "records": {}},
+        tracker,
+    )
+
+    assert stat.S_IMODE(tracker.stat().st_mode) == 0o600
 
 
 def _drain_for(delegation_id, timeout=5.0):
@@ -1278,4 +1293,3 @@ def test_dead_batch_recovery_preserves_batch_event_shape(tmp_path, monkeypatch):
     assert event["is_batch"] is True
     assert event["goals"] == ["a", "b"]
     assert event["results"] == []
-

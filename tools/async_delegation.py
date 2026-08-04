@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 import uuid
@@ -366,12 +367,28 @@ def _read_persisted_unlocked(path: str | Path | None = None) -> Dict[str, Any]:
 def _write_persisted_unlocked(data: Dict[str, Any], path: str | Path | None = None) -> None:
     path = Path(_persistence_path() if path is None else _persistence_path(path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2),
-        encoding="utf-8",
+    payload = json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
     )
-    os.replace(tmp, path)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _persistable_record(record: Dict[str, Any]) -> Dict[str, Any]:

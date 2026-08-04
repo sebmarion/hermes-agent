@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -70,3 +71,29 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
 
     assert result.returncode == 0, result.stderr
     assert list(tmp_path.glob(artifact_glob))
+
+
+def test_built_wheel_imports_hermes_state_in_isolation(tmp_path):
+    """The managed-runtime replacement must import from the built wheel alone."""
+    result = _build_artifact("wheel", tmp_path, nix_build=True)
+    assert result.returncode == 0, result.stderr
+
+    wheel = next(tmp_path.glob("hermes_agent-*.whl"))
+    unpacked = tmp_path / "unpacked-wheel"
+    with zipfile.ZipFile(wheel) as archive:
+        archive.extractall(unpacked)
+
+    imported = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            f"import sys; sys.path.insert(0, {str(unpacked)!r}); import hermes_state",
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert imported.returncode == 0, imported.stderr
