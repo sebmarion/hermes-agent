@@ -3320,6 +3320,21 @@ class ContextCompressor(ContextEngine):
             if role == "assistant":
                 if len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+                # Include reasoning from thinking models (DeepSeek thinking,
+                # Kimi thinking, MiniMax, Claude extended thinking) so the
+                # summarizer can preserve the "why" behind decisions — not
+                # just the visible action.  Without this, compression on long
+                # sessions destroys the intermediate reasoning chain that
+                # self-correction and "Key Decisions" in the summary depend on.
+                # Bounded by the same _CONTENT_MAX truncation as visible
+                # content; redacted the same way for secrets.  Only populated
+                # for thinking models — non-thinking models have empty fields.
+                reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+                if reasoning:
+                    reasoning = redact_sensitive_text(reasoning)
+                    if len(reasoning) > self._CONTENT_MAX:
+                        reasoning = reasoning[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + reasoning[-self._CONTENT_TAIL:]
+                    content += f"\n[REASONING]: {reasoning}"
                 tool_calls = msg.get("tool_calls", [])
                 if tool_calls:
                     tc_parts = []

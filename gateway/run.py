@@ -15269,6 +15269,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "subgoal":
             return await self._handle_subgoal_command(event)
 
+        if canonical == "bestplan":
+            return await self._handle_bestplan_command(event)
+
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
@@ -18515,6 +18518,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_cli.blueprint_cmd import BlueprintCommandResult
 
             return BlueprintCommandResult(f"Cron blueprint command failed: {e}")
+
+    # ────────────────────────────────────────────────────────────────
+    # /bestplan — adversarial planning / plan review
+    # ────────────────────────────────────────────────────────────────
+    async def _handle_bestplan_command(self, event: MessageEvent) -> str:
+        """Handle /bestplan in the gateway.
+
+        If args provided: run $bestplan with those args (planning iterations).
+        If no args: auto-review the previous plan in the conversation.
+        """
+        args = (event.get_command_args() or "").strip()
+
+        if not args:
+            # No args - auto-review previous plan in conversation
+            # We'll rewrite the event text to trigger a plan review
+            event.text = "/bestplan 3 adversarial review of the previous plan in this conversation"
+            # Fall through to agent processing
+            return ""
+
+        # Has args - rewrite to $bestplan format for the skill
+        event.text = f"$bestplan {args}"
+        return ""
 
     # ────────────────────────────────────────────────────────────────
     # /goal — persistent cross-turn goals (Ralph-style loop)

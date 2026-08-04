@@ -9209,6 +9209,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_fast_command(cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
+        elif canonical == "bestplan":
+            self._handle_bestplan_command(cmd_original)
         elif canonical == "usage":
             self._show_usage()
         elif canonical == "credits":
@@ -12551,6 +12553,64 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "deny": "deny",
             "timeout": "timeout",
         }.get(verdict, "deny")
+
+    def _handle_bestplan_command(self, cmd_original: str) -> None:
+        """Handle /bestplan — run adversarial planning iterations or auto-review previous plan."""
+        # Extract args after /bestplan
+        parts = cmd_original.split(None, 1)
+        args = parts[1].strip() if len(parts) > 1 else ""
+
+        if not args:
+            # No args: auto-review the previous plan in conversation history
+            self._auto_review_previous_plan()
+        else:
+            # Has args: run $bestplan with those args
+            # The $bestplan skill is invoked via the skill system, so we construct
+            # the user instruction and load the skill
+            from agent.skill_commands import build_skill_invocation_message
+
+            msg = build_skill_invocation_message(
+                "/bestplan",
+                args,
+                task_id=self.session_id
+            )
+            if msg:
+                if hasattr(self, '_pending_input'):
+                    self._pending_input.put(msg)
+                print(f"\n⚡ Loading skill: bestplan")
+            else:
+                _cprint("  Failed to load bestplan skill")
+
+    def _auto_review_previous_plan(self) -> None:
+        """Auto-review the most recent plan in conversation history."""
+        # Find the last assistant message that looks like a BestPlan output
+        if not self.conversation_history:
+            _cprint("  No conversation history to review.")
+            return
+
+        # Search backwards for a plan-like message
+        plan_marker = "BestPlan" in str(self.conversation_history) or "## Iteration Proof" in str(self.conversation_history)
+
+        # Simple heuristic: look for recent assistant messages with plan content
+        review_prompt = (
+            "ADVERSARIAL REVIEW of the previous plan in this conversation. "
+            "Run a full adversarial pass: identify the strongest concrete failure mode, "
+            "tighten the plan against it, and attach objective verification. "
+            "This is a /bestplan auto-review triggered without explicit arguments."
+        )
+
+        from agent.skill_commands import build_skill_invocation_message
+        msg = build_skill_invocation_message(
+            "/bestplan",
+            review_prompt,
+            task_id=self.session_id
+        )
+        if msg:
+            if hasattr(self, '_pending_input'):
+                self._pending_input.put(msg)
+            print(f"\n⚡ Auto-reviewing previous plan with bestplan skill")
+        else:
+            _cprint("  Failed to load bestplan skill for auto-review")
 
     def _handle_approval_selection(self) -> None:
         """Process the currently selected dangerous-command approval choice."""
