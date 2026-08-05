@@ -21,6 +21,7 @@ from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
     DelegateEvent,
+    _DelegatedRequestContext,
     _get_max_concurrent_children,
     _load_config,
     delegate_task,
@@ -918,6 +919,9 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child._credential_pool = MagicMock()
         child._credential_pool.acquire_lease.return_value = "cred-b"
         child._credential_pool.current.return_value = leased_entry
+        child._delegate_request_context = _DelegatedRequestContext(
+            "Investigate rate limits", None, None
+        )
         child.run_conversation.return_value = {
             "final_response": "done",
             "completed": True,
@@ -945,6 +949,9 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child._credential_pool = MagicMock()
         child._credential_pool.acquire_lease.return_value = "cred-a"
         child._credential_pool.current.return_value = MagicMock(id="cred-a")
+        child._delegate_request_context = _DelegatedRequestContext(
+            "Trigger failure", None, None
+        )
         child.run_conversation.side_effect = RuntimeError("boom")
 
         result = _run_single_child(
@@ -986,6 +993,9 @@ class TestDelegateHeartbeat(unittest.TestCase):
             "max_iterations": 50,
             "last_activity_desc": "executing tool: terminal",
         }
+        child._delegate_request_context = _DelegatedRequestContext(
+            "Test heartbeat", None, None
+        )
 
         # Block the child only until the first heartbeat lands (bounded), so
         # the test is event-driven rather than sleep-timed.
@@ -1026,6 +1036,9 @@ class TestDelegateHeartbeat(unittest.TestCase):
             "max_iterations": 50,
             "last_activity_desc": "done",
         }
+        child._delegate_request_context = _DelegatedRequestContext(
+            "Test cleanup", None, None
+        )
         child.run_conversation.return_value = {
             "final_response": "done", "completed": True, "api_calls": 1,
         }
@@ -1078,6 +1091,9 @@ class TestDelegateHeartbeat(unittest.TestCase):
             "max_iterations": 50,
             "last_activity_desc": "executing tool: terminal",
         }
+        child._delegate_request_context = _DelegatedRequestContext(
+            "Test long-running tool", None, None
+        )
 
         def slow_run(**kwargs):
             # Return as soon as the heartbeat has proven it kept firing past

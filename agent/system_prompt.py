@@ -48,7 +48,10 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
 )
-from agent.runtime_cwd import resolve_context_cwd
+from agent.runtime_cwd import (
+    resolve_context_cwd,
+    session_cwd_uses_non_host_namespace,
+)
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 
@@ -171,6 +174,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
+    _prompt_cwd = resolve_context_cwd()
+    _non_host_workspace = session_cwd_uses_non_host_namespace()
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
@@ -313,9 +318,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         try:
             from agent.coding_context import coding_compact_skill_categories
 
-            _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
-            )
+            if not _non_host_workspace:
+                _compact_cats = coding_compact_skill_categories(
+                    platform=agent.platform,
+                    cwd=_prompt_cwd,
+                )
         except Exception:
             _compact_cats = frozenset()
         skills_prompt = _r.build_skills_system_prompt(
@@ -360,8 +367,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
             coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = coding_system_prompt_parts(
                 platform=agent.platform,
-                cwd=resolve_context_cwd(),
+                cwd=_prompt_cwd,
                 model=agent.model,
+                allow_host_workspace_probe=not _non_host_workspace,
             )
             stable_parts.extend(coding_prefix_parts)
         except Exception:
@@ -477,7 +485,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if system_message is not None:
         context_parts.append(system_message)
 
-    if not agent.skip_context_files:
+    if not agent.skip_context_files and not _non_host_workspace:
         # Prefer the configured TERMINAL_CWD (gateway mode). When unset (local
         # CLI), None lets build_context_files_prompt fall back to the launch
         # dir — the user's real cwd there, but the install dir for the gateway
@@ -489,7 +497,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # gateway daemons) self-spawns into the install tree, where the
         # fallback would inject this repo's contributor AGENTS.md (#64590).
         context_files_prompt = _r.build_context_files_prompt(
-            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+            cwd=_prompt_cwd, skip_soul=_soul_loaded,
             context_length=_ctx_len,
             allow_install_tree_fallback=agent.platform in ("cli", "tui"))
         if context_files_prompt:

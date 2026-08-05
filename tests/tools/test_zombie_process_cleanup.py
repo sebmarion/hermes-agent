@@ -371,7 +371,7 @@ class TestDelegationCleanup:
             set_hermes_home_override,
         )
         from hermes_cli.observability import relay_runtime
-        from tools.delegate_tool import _run_single_child
+        from tools.delegate_tool import _DelegatedRequestContext, _run_single_child
 
         parent = MagicMock()
         parent._active_children = []
@@ -380,6 +380,9 @@ class TestDelegationCleanup:
         child = MagicMock()
         child.session_id = "child-session"
         child._delegate_saved_tool_names = ["tool1"]
+        child._delegate_request_context = _DelegatedRequestContext(
+            "test goal", None, None
+        )
         observed = {}
 
         def run_conversation(**_kwargs):
@@ -416,7 +419,7 @@ class TestDelegationCleanup:
         from unittest.mock import MagicMock
 
         from hermes_cli.observability import relay_runtime
-        from tools.delegate_tool import _run_single_child
+        from tools.delegate_tool import _DelegatedRequestContext, _run_single_child
 
         parent = MagicMock()
         parent._active_children = []
@@ -424,6 +427,9 @@ class TestDelegationCleanup:
         child = MagicMock()
         child.session_id = "active-child-session"
         child._delegate_saved_tool_names = ["tool1"]
+        child._delegate_request_context = _DelegatedRequestContext(
+            "test active turn cleanup", None, None
+        )
         child.run_conversation.side_effect = RuntimeError("test abort")
         parent._active_children.append(child)
         relay_host = MagicMock()
@@ -454,7 +460,7 @@ class TestDelegationCleanup:
             reset_hermes_home_override,
             set_hermes_home_override,
         )
-        from tools.delegate_tool import _run_single_child
+        from tools.delegate_tool import _DelegatedRequestContext, _run_single_child
 
         relay_runtime._reset_for_tests()
         profile_home = tmp_path / "profile-timeout"
@@ -468,6 +474,9 @@ class TestDelegationCleanup:
         child = MagicMock()
         child.session_id = "timed-out-child"
         child._delegate_saved_tool_names = ["tool1"]
+        child._delegate_request_context = _DelegatedRequestContext(
+            "test timed-out turn cleanup", None, None
+        )
         child.get_activity_summary.return_value = {"api_call_count": 1}
         parent._active_children.append(child)
         relay_host = MagicMock()

@@ -282,7 +282,16 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
         def close(self):
             return None
 
-    result = delegate_tool._run_single_child(0, "try to complete parent", Child(), Parent())
+    child = Child()
+    child._delegate_request_context = delegate_tool._DelegatedRequestContext(
+        "try to complete parent", None, None
+    )
+    result = delegate_tool._run_single_child(
+        0,
+        "try to complete parent",
+        child,
+        Parent(),
+    )
 
     conn = kb.connect()
     try:

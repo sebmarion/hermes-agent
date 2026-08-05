@@ -298,6 +298,26 @@ class TestRuntimeMode:
         mode = cc.resolve_runtime_mode(platform="cli", cwd=tmp_path, config={"agent": {"coding_context": "on"}})
         assert not any("Operator instructions" in b for b in mode.system_blocks())
 
+    def test_forced_remote_posture_omits_all_host_workspace_probes(
+        self, monkeypatch
+    ):
+        def fail_probe(*_args, **_kwargs):
+            raise AssertionError("host workspace probe must not run")
+
+        monkeypatch.setattr(cc, "_detect_profile_name", fail_probe)
+        monkeypatch.setattr(cc, "build_coding_workspace_block", fail_probe)
+
+        prefix, workspace, trailing = cc.coding_system_prompt_parts(
+            platform="subagent",
+            cwd="/workspace/task42",
+            config={"agent": {"coding_context": "on"}},
+            allow_host_workspace_probe=False,
+        )
+
+        assert any("coding agent" in block for block in prefix)
+        assert workspace == []
+        assert trailing == []
+
 
 
 # ── edit-format steering (per-model harness tuning) ──────────────────────────

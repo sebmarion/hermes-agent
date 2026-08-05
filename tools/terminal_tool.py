@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import platform
+import posixpath
 import re
 import shlex
 import stat
@@ -47,7 +48,7 @@ import atexit
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, NamedTuple
 
 from utils import env_var_enabled
 
@@ -1306,7 +1307,11 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     return "default"
 
 
-def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
+def resolve_task_overrides(
+    task_id: Optional[str],
+    *,
+    include_container_fallback: bool = True,
+) -> Dict[str, Any]:
     """Return the env overrides for *task_id*, raw key first then collapsed.
 
     ``register_task_env_overrides`` writes under the *raw* task/session id, but
@@ -1317,13 +1322,21 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     read the raw id FIRST and only fall back to the collapsed container id, or
     the originating session's override is silently dropped. This is the single
     source of that lookup so the terminal and file layers can't drift apart.
+
+    Callers comparing multiple raw session identities can set
+    ``include_container_fallback=False`` to inspect each exact record first,
+    then perform one deliberate collapsed/default lookup after all exact
+    candidates have been considered. This prevents an early session miss from
+    returning the shared ``"default"`` override ahead of a later session's
+    exact override.
     """
     raw = task_id or "default"
-    return (
-        _task_env_overrides.get(raw)
-        or _task_env_overrides.get(_resolve_container_task_id(raw))
-        or {}
-    )
+    exact = _task_env_overrides.get(raw)
+    if exact:
+        return exact
+    if not include_container_fallback:
+        return exact or {}
+    return _task_env_overrides.get(_resolve_container_task_id(raw)) or {}
 
 
 # Configuration from environment variables
@@ -1367,6 +1380,13 @@ _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
 
+class TaskWorkspaceResolution(NamedTuple):
+    """A cwd normalized in one task's terminal filesystem namespace."""
+
+    path: str
+    non_host_namespace: bool
+
+
 def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
     """Return True when *cwd* is a tilde path that the remote SSH shell must
     expand itself, so the Hermes host/container must NOT ``expanduser`` it.
@@ -1402,6 +1422,94 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     if not os.path.isabs(cwd):
         return True
     return False
+
+
+def _task_terminal_backend(task_id: Optional[str]) -> str:
+    """Return the terminal backend that owns *task_id*'s cwd namespace."""
+    exact_overrides = resolve_task_overrides(
+        task_id,
+        include_container_fallback=False,
+    )
+    override_backend = exact_overrides.get("env_type")
+    if isinstance(override_backend, str) and override_backend.strip():
+        return override_backend.strip().lower()
+
+    raw = task_id or "default"
+    container_key = _resolve_container_task_id(raw)
+    with _env_lock:
+        env = _active_environments.get(raw) or _active_environments.get(container_key)
+    if env is not None:
+        class_name = env.__class__.__name__.lower()
+        for backend in (
+            "vercel_sandbox",
+            "singularity",
+            "daytona",
+            "docker",
+            "modal",
+            "ssh",
+            "local",
+        ):
+            if backend.replace("_", "") in class_name.replace("_", ""):
+                return backend
+
+    config = _get_env_config()
+    return str(config.get("env_type") or "local").strip().lower()
+
+
+def resolve_task_workspace(
+    task_id: Optional[str],
+    candidate: Any,
+) -> Optional[TaskWorkspaceResolution]:
+    """Validate a cwd and retain the owning task's filesystem namespace.
+
+    Local paths must be absolute directories that exist on this host and are
+    canonicalized through ``realpath``. Container and remote paths belong to a
+    different filesystem: validate their syntax against the terminal backend
+    contract without dereferencing them on the host. The returned namespace bit
+    lets bounded runtime consumers preserve a valid remote path without later
+    re-inferring the backend or silently substituting a host cwd. Ambiguous
+    empty, sentinel, and relative values are rejected in every namespace.
+    """
+    if not isinstance(candidate, (str, os.PathLike)):
+        return None
+    try:
+        raw = os.fspath(candidate)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
+        return None
+    if raw.strip().lower() in {".", "./", "auto", "cwd"}:
+        return None
+
+    backend = _task_terminal_backend(task_id)
+    if backend == "ssh" and _is_ssh_remote_tilde_cwd(backend, raw):
+        return TaskWorkspaceResolution(posixpath.normpath(raw), True)
+    if backend in _CONTAINER_BACKENDS or backend == "ssh":
+        if not posixpath.isabs(raw):
+            return None
+        if backend in _CONTAINER_BACKENDS and _is_unusable_container_cwd(raw):
+            return None
+        return TaskWorkspaceResolution(posixpath.normpath(raw), True)
+
+    try:
+        expanded = os.path.expanduser(raw)
+        if not os.path.isabs(expanded):
+            return None
+        canonical = os.path.realpath(expanded)
+    except (OSError, TypeError, ValueError):
+        return None
+    if os.path.isdir(canonical):
+        return TaskWorkspaceResolution(canonical, False)
+    return None
+
+
+def resolve_task_workspace_cwd(
+    task_id: Optional[str],
+    candidate: Any,
+) -> Optional[str]:
+    """Return only the normalized cwd from :func:`resolve_task_workspace`."""
+    resolved = resolve_task_workspace(task_id, candidate)
+    return resolved.path if resolved is not None else None
 
 
 # One-shot guard for the config-fallback bridge below.  Purely an

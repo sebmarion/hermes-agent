@@ -188,6 +188,9 @@ class TestRunSingleChildTimeoutDump:
         parent = MagicMock()
         parent._touch_activity = MagicMock()
         parent._current_task_id = None
+        child._delegate_request_context = delegate_tool._DelegatedRequestContext(
+            "test goal", None, None
+        )
         return delegate_tool._run_single_child(
             task_index=0,
             goal="test goal",
@@ -227,6 +230,9 @@ class TestRunSingleChildTimeoutDump:
             raise RuntimeError("child crashed")
 
         child.run_conversation = _boom
+        child._delegate_request_context = delegate_tool._DelegatedRequestContext(
+            "test goal", None, None
+        )
         parent = MagicMock()
         parent._touch_activity = MagicMock()
         parent._current_task_id = None

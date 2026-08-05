@@ -29,7 +29,7 @@ import time
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
@@ -781,6 +781,22 @@ _LEGACY_EVENT_MAP: Dict[str, DelegateEvent] = {
 }
 
 
+class _DelegatedRequestContext(NamedTuple):
+    """Immutable request-local inputs shared by child prompt and runtime."""
+
+    goal: str
+    context: Optional[str]
+    workspace_path: Optional[str]
+    workspace_non_host_namespace: bool = False
+
+
+class _DelegatedWorkspace(NamedTuple):
+    """A validated workspace path plus its terminal filesystem namespace."""
+
+    path: Optional[str]
+    non_host_namespace: bool
+
+
 def check_delegate_requirements() -> bool:
     """Delegation has no external requirements -- always available."""
     return True
@@ -864,31 +880,216 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
-def _resolve_workspace_hint(parent_agent) -> Optional[str]:
-    """Best-effort local workspace hint for child prompts.
+_MISSING_WORKSPACE_VALUE = object()
 
-    We only inject a path when we have a concrete absolute directory. This avoids
-    teaching subagents a fake container path while still helping them avoid
-    guessing `/workspace/...` for local repo tasks.
+
+def _explicit_attribute(owner: Any, name: str) -> Any:
+    """Read an actually-present attribute without triggering mock fallbacks."""
+    if owner is None:
+        return _MISSING_WORKSPACE_VALUE
+    try:
+        namespace = vars(owner)
+    except TypeError:
+        namespace = {}
+    if name in namespace:
+        return namespace[name]
+    try:
+        declares_attribute = any(
+            name in vars(base) for base in type(owner).__mro__
+        )
+    except (AttributeError, TypeError):
+        declares_attribute = False
+    if not declares_attribute:
+        return _MISSING_WORKSPACE_VALUE
+    try:
+        return getattr(owner, name)
+    except AttributeError:
+        return _MISSING_WORKSPACE_VALUE
+
+
+def _resolve_delegated_workspace(parent_agent) -> _DelegatedWorkspace:
+    """Resolve the parent's validated workspace for prompt and child runtime.
+
+    Delegated children use a raw per-task cwd record for file and terminal
+    resolution.  A parent's current turn id is not necessarily that record's
+    key (gateway sessions record their stable session key), so consult the
+    task/session records and the current runtime context before process-global
+    fallbacks.  The same resolved path is used in the child prompt and seeded
+    into the child's own cwd record by ``_run_single_child``.
     """
-    candidates = [
-        os.getenv("TERMINAL_CWD"),
-        getattr(
-            getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
-        ),
-        getattr(parent_agent, "terminal_cwd", None),
-        getattr(parent_agent, "cwd", None),
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
+    session_keys: list[str] = []
+    request_session_key: Optional[str] = None
+
+    def _add_key(value: Any) -> None:
+        if isinstance(value, str) and value.strip() and value not in session_keys:
+            session_keys.append(value)
+
+    _add_key(getattr(parent_agent, "_current_task_id", None))
+    try:
+        from gateway.session_context import get_session_env
+
+        request_session_key = get_session_env("HERMES_SESSION_KEY", "")
+        _add_key(request_session_key)
+    except (ImportError, LookupError, RuntimeError) as exc:
+        logger.debug(
+            "Could not read request-local workspace session key: %s",
+            exc,
+        )
+    _add_key(getattr(parent_agent, "session_id", None))
+
+    try:
+        from tools.terminal_tool import (
+            get_session_cwd,
+            resolve_task_overrides,
+            resolve_task_workspace,
+        )
+    except ImportError as exc:
+        logger.debug("Could not import delegated workspace resolvers: %s", exc)
+        raise RuntimeError("Delegated workspace resolver is unavailable") from exc
+
+    def _read_source(source: str, reader) -> Any:
         try:
-            text = os.path.abspath(os.path.expanduser(str(candidate)))
-        except Exception:
-            continue
-        if os.path.isabs(text) and os.path.isdir(text):
-            return text
-    return None
+            return reader()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.debug("Could not read %s: %s", source, exc)
+            raise RuntimeError(f"Could not resolve delegated workspace {source}") from exc
+
+    def _validate_source(
+        candidate: Any,
+        source: str,
+        task_key: str,
+    ) -> Optional[_DelegatedWorkspace]:
+        if candidate is None or candidate is _MISSING_WORKSPACE_VALUE:
+            return None
+        try:
+            resolved = resolve_task_workspace(task_key, candidate)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.debug("Could not validate %s: %s", source, exc)
+            raise RuntimeError(
+                f"Could not validate delegated workspace {source}"
+            ) from exc
+        if resolved is None:
+            logger.warning(
+                "Rejected invalid delegated workspace from %s: %r",
+                source,
+                candidate,
+            )
+            raise RuntimeError(
+                f"Delegated workspace {source} is invalid: {candidate!r}"
+            )
+        return _DelegatedWorkspace(
+            path=resolved.path,
+            non_host_namespace=resolved.non_host_namespace,
+        )
+
+    # Each raw task/session identity is authoritative ahead of the shared
+    # container/default fallback. Keep the fallback disabled while inspecting
+    # exact keys so an early miss cannot mask a later session's correct cwd.
+    for key in session_keys:
+        candidate = _read_source(
+            f"session cwd record {key!r}",
+            lambda key=key: get_session_cwd(key),
+        )
+        resolved = _validate_source(candidate, f"session cwd record {key!r}", key)
+        if resolved is not None:
+            return resolved
+
+        overrides = _read_source(
+            f"task cwd override {key!r}",
+            lambda key=key: resolve_task_overrides(
+                key,
+                include_container_fallback=False,
+            ),
+        )
+        if not isinstance(overrides, dict):
+            raise RuntimeError(
+                f"Delegated workspace task cwd override {key!r} is invalid"
+            )
+        candidate = overrides.get("cwd") if "cwd" in overrides else None
+        resolved = _validate_source(candidate, f"task cwd override {key!r}", key)
+        if resolved is not None:
+            return resolved
+
+    # Gateway/ACP turns pin their logical cwd in this ContextVar. It is copied
+    # into batch and detached-background workers, while TERMINAL_CWD remains a
+    # process-global fallback that can belong to a different session.
+    try:
+        from agent.runtime_cwd import get_session_cwd_override
+
+        context_candidate = get_session_cwd_override()
+    except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+        logger.debug("Could not read request-local runtime cwd: %s", exc)
+        context_candidate = None
+    if context_candidate is not None:
+        context_key = (
+            request_session_key
+            if isinstance(request_session_key, str) and request_session_key.strip()
+            else (session_keys[0] if session_keys else "default")
+        )
+        resolved = _validate_source(
+            context_candidate,
+            "request-local runtime cwd",
+            context_key,
+        )
+        if resolved is not None:
+            return resolved
+
+    parent_key = session_keys[0] if session_keys else "default"
+    hints = _explicit_attribute(parent_agent, "_subdirectory_hints")
+    if hints is not _MISSING_WORKSPACE_VALUE and hints is not None:
+        candidate = _explicit_attribute(hints, "working_dir")
+        resolved = _validate_source(candidate, "parent working_dir", parent_key)
+        if resolved is not None:
+            return resolved
+
+    for attribute in ("terminal_cwd", "cwd"):
+        candidate = _explicit_attribute(parent_agent, attribute)
+        resolved = _validate_source(
+            candidate,
+            f"parent {attribute}",
+            parent_key,
+        )
+        if resolved is not None:
+            return resolved
+
+    # Consult the shared default exactly once, after all request-local and
+    # explicitly parent-owned sources. It is a broad fallback, not an exact
+    # record for the first session key that happened to miss.
+    if "default" not in session_keys:
+        default_overrides = _read_source(
+            "default task cwd override",
+            lambda: resolve_task_overrides(
+                "default",
+                include_container_fallback=False,
+            ),
+        )
+        if not isinstance(default_overrides, dict):
+            raise RuntimeError("Delegated workspace default task cwd override is invalid")
+        default_candidate = (
+            default_overrides.get("cwd") if "cwd" in default_overrides else None
+        )
+        resolved = _validate_source(
+            default_candidate,
+            "default task cwd override",
+            "default",
+        )
+        if resolved is not None:
+            return resolved
+
+    if "TERMINAL_CWD" in os.environ:
+        resolved = _validate_source(
+            os.environ["TERMINAL_CWD"],
+            "TERMINAL_CWD",
+            "default",
+        )
+        if resolved is not None:
+            return resolved
+    return _DelegatedWorkspace(None, False)
+
+
+def _resolve_workspace_hint(parent_agent) -> Optional[str]:
+    """Compatibility path-only view of the delegated workspace contract."""
+    return _resolve_delegated_workspace(parent_agent).path
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
@@ -1315,11 +1516,17 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    delegated_workspace = _resolve_delegated_workspace(parent_agent)
+    request_context = _DelegatedRequestContext(
+        goal=goal,
+        context=context,
+        workspace_path=delegated_workspace.path,
+        workspace_non_host_namespace=delegated_workspace.non_host_namespace,
+    )
     child_prompt = _build_child_system_prompt(
-        goal,
-        context,
-        workspace_path=workspace_hint,
+        request_context.goal,
+        request_context.context,
+        workspace_path=request_context.workspace_path,
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
@@ -1553,6 +1760,10 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    # This frozen tuple is the only authority for the child request after
+    # construction. In particular, _run_single_child must not re-read mutable
+    # parent/session cwd state after the prompt has advertised this workspace.
+    child._delegate_request_context = request_context
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1974,6 +2185,25 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    request_context = getattr(child, "_delegate_request_context", None)
+    if not isinstance(request_context, _DelegatedRequestContext):
+        error = "Delegated child is missing its immutable delegation request snapshot"
+        logger.error("[subagent-%s] %s", task_index, error)
+        try:
+            if child is not None and hasattr(child, "close"):
+                child.close()
+        except Exception:
+            logger.debug("Failed to close snapshot-less child agent")
+        return {
+            "task_index": task_index,
+            "status": "error",
+            "summary": None,
+            "error": error,
+            "api_calls": 0,
+            "duration_seconds": round(time.monotonic() - child_start, 2),
+            "_child_role": getattr(child, "_delegate_role", None),
+        }
+    goal = request_context.goal
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2125,18 +2355,26 @@ def _run_single_child(
 
         child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
-        # Seed the child's session-cwd record from the parent's (cwd rearch):
-        # children share the parent's container, and today they inherit the
-        # parent's live env.cwd implicitly. Seeding at spawn preserves that
-        # starting directory while keeping the child's subsequent `cd`s
-        # isolated in its own record (a child's cd no longer bleeds back into
-        # the parent once readers flip to the record store).
-        try:
-            from tools.terminal_tool import get_session_cwd, record_session_cwd
+        # Seed from the immutable construction-time value that was rendered
+        # into the provider prompt. Never re-resolve mutable parent/session
+        # state here: detached work may begin after that state has advanced.
+        workspace_path = request_context.workspace_path
+        if workspace_path is not None:
+            try:
+                from tools import terminal_tool
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
-        except Exception as e:
-            logger.debug("Child cwd seed failed: %s", e)
+                terminal_tool.record_session_cwd(child_task_id, workspace_path)
+                recorded_workspace = terminal_tool.get_session_cwd(child_task_id)
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Could not seed delegated child workspace "
+                    f"{workspace_path!r}: {exc}"
+                ) from exc
+            if recorded_workspace != workspace_path:
+                raise RuntimeError(
+                    "Could not seed delegated child workspace exactly: "
+                    f"expected {workspace_path!r}, recorded {recorded_workspace!r}"
+                )
         wall_start = time.time()
         parent_reads_snapshot = (
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
@@ -2177,8 +2415,19 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from agent.runtime_cwd import bind_session_cwd
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with (
+                delegated_child_context(
+                    str(getattr(child, "session_id", "") or "")
+                ),
+                bind_session_cwd(
+                    workspace_path,
+                    non_host_namespace=(
+                        request_context.workspace_non_host_namespace
+                    ),
+                ),
+            ):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,

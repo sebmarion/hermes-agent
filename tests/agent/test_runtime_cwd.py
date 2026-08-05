@@ -7,9 +7,11 @@ import pytest
 
 import agent.runtime_cwd as rt
 from agent.runtime_cwd import (
+    bind_session_cwd,
     clear_session_cwd,
     resolve_agent_cwd,
     resolve_context_cwd,
+    session_cwd_uses_non_host_namespace,
     set_session_cwd,
 )
 
@@ -79,3 +81,18 @@ class TestSessionCwdOverride:
         finally:
             rt._SESSION_CWD.reset(token)
 
+    def test_bounded_non_host_workspace_is_preserved_without_host_deref(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+        with bind_session_cwd(
+            "/workspace/task42",
+            non_host_namespace=True,
+        ):
+            assert session_cwd_uses_non_host_namespace() is True
+            assert resolve_agent_cwd() == Path("/workspace/task42")
+            assert resolve_context_cwd() == Path("/workspace/task42")
+
+        assert session_cwd_uses_non_host_namespace() is False
+        assert resolve_agent_cwd() == tmp_path

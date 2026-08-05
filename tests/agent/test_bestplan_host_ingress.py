@@ -543,7 +543,7 @@ def test_reconcile_dead_scheduled_waiting_reopens_retryable_intent(tmp_path):
 
 def test_strict_child_tools_resolve_inside_isolated_worktree(tmp_path):
     from agent.runtime_cwd import resolve_agent_cwd
-    from tools.delegate_tool import _run_single_child
+    from tools.delegate_tool import _DelegatedRequestContext, _run_single_child
 
     observed = []
     child = MagicMock()
@@ -552,6 +552,9 @@ def test_strict_child_tools_resolve_inside_isolated_worktree(tmp_path):
     # Current-main execution/review children must prove successful tool use.
     # This test isolates task-local cwd propagation, so use the reasoning lane.
     child._delegate_mode = "reason"
+    child._delegate_request_context = _DelegatedRequestContext(
+        "Implement safely", None, str(tmp_path)
+    )
     child.get_activity_summary.return_value = {
         "current_tool": None,
         "api_call_count": 0,

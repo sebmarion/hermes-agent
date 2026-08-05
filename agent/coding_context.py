@@ -520,7 +520,11 @@ class RuntimeMode:
             return None
         return [self.profile.toolset, *_enabled_mcp_servers(config)]
 
-    def system_prompt_parts(self) -> tuple[list[str], list[str], list[str]]:
+    def system_prompt_parts(
+        self,
+        *,
+        include_workspace_snapshot: bool = True,
+    ) -> tuple[list[str], list[str], list[str]]:
         """Return prefix, workspace, and trailing posture blocks separately.
 
         The operating brief carries a model-family edit-format nudge appended
@@ -543,9 +547,10 @@ class RuntimeMode:
             if edit_line:
                 brief = f"{brief}\n{edit_line}"
             prefix.append(brief)
-        workspace = build_coding_workspace_block(self.cwd)
-        if workspace:
-            workspace_parts.append(workspace)
+        if include_workspace_snapshot:
+            workspace = build_coding_workspace_block(self.cwd)
+            if workspace:
+                workspace_parts.append(workspace)
         # Operator instructions ride their own block so the brief (block 0) stays
         # byte-stable and cache-keyed independently of user config.
         if self.instructions:
@@ -590,6 +595,7 @@ def resolve_runtime_mode(
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
+    allow_host_workspace_probe: bool = True,
 ) -> RuntimeMode:
     """Resolve the operating posture once. Cheap — a handful of ``stat`` calls.
 
@@ -602,9 +608,16 @@ def resolve_runtime_mode(
     """
     resolved_cwd = _resolve_cwd(cwd)
     mode = _coding_mode(config)
-    name = _detect_profile_name(
-        mode, (platform or "").strip().lower(), str(resolved_cwd)
-    )
+    if allow_host_workspace_probe:
+        name = _detect_profile_name(
+            mode, (platform or "").strip().lower(), str(resolved_cwd)
+        )
+    else:
+        # A container/SSH cwd belongs to a different filesystem namespace.
+        # Preserve an explicitly forced coding posture, but never stat/git-probe
+        # that path on the host. Auto/focus cannot prove a remote project from
+        # here and therefore fail closed to the general profile.
+        name = CODING_PROFILE.name if mode == "on" else GENERAL_PROFILE.name
     return RuntimeMode(
         profile=get_profile(name),
         surface=platform or "",
@@ -666,11 +679,18 @@ def coding_system_prompt_parts(
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
+    allow_host_workspace_probe: bool = True,
 ) -> tuple[list[str], list[str], list[str]]:
     """Return coding prefix, workspace snapshot, and trailing guidance."""
     return resolve_runtime_mode(
-        platform=platform, cwd=cwd, config=config, model=model
-    ).system_prompt_parts()
+        platform=platform,
+        cwd=cwd,
+        config=config,
+        model=model,
+        allow_host_workspace_probe=allow_host_workspace_probe,
+    ).system_prompt_parts(
+        include_workspace_snapshot=allow_host_workspace_probe,
+    )
 
 
 def coding_compact_skill_categories(

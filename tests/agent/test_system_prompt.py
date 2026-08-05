@@ -115,6 +115,31 @@ class TestCodingContextBlock:
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
 
+    def test_non_host_binding_keeps_guidance_without_host_workspace_probes(self):
+        from agent.runtime_cwd import bind_session_cwd
+
+        agent = _make_agent(valid_tool_names=["read_file"], platform="subagent")
+        with (
+            bind_session_cwd(
+                "/workspace/task42",
+                non_host_namespace=True,
+            ),
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt") as context_probe,
+            patch("agent.coding_context._coding_mode", return_value="on"),
+            patch(
+                "agent.coding_context.build_coding_workspace_block",
+                side_effect=AssertionError("host workspace probe must not run"),
+            ),
+        ):
+            parts = build_system_prompt_parts(agent)
+
+        assert "coding agent" in parts["stable"]
+        assert "Workspace (snapshot" not in parts["context"]
+        context_probe.assert_not_called()
+
 
 def test_build_system_prompt_records_stable_prefix():
     agent = _make_agent()
