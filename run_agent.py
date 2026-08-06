@@ -1847,7 +1847,11 @@ class AIAgent:
                 # blocks with the text-only persistence override before the
                 # model call is built. The paired timestamp override still
                 # applies — it is metadata, not content.
-                if override is not None and not isinstance(msg.get("content"), list):
+                if (
+                    override is not None
+                    and not isinstance(msg.get("content"), list)
+                    and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                ):
                     msg["content"] = override
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
@@ -2065,14 +2069,46 @@ class AIAgent:
                     _row_api_content = None
                 _row_timestamp = msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
-                # (never to the live dict). Match the original guard: text-only
-                # content is replaced; multimodal (list) content is left intact
-                # so image/audio blocks aren't clobbered by the text override.
-                if _ov_idx == _msg_idx and msg.get("role") == "user":
-                    if _ov_content is not None and not isinstance(content, list):
-                        content = _ov_content
+                # (never to the live dict). Keep the exact live/API bytes in the
+                # sidecar when the clean transcript override differs. A
+                # compression-merged user row owns the summary in its content;
+                # replacing it with the raw user text would erase durable
+                # history, so leave marked merged rows untouched.
+                pending_cli_message = getattr(self, "_pending_cli_user_message", None)
+                is_current_turn_user = (
+                    _ov_idx == _msg_idx or msg is pending_cli_message
+                )
+                if (
+                    is_current_turn_user
+                    and msg.get("role") == "user"
+                    and _ov_content is not None
+                    and (not isinstance(content, list) or isinstance(_ov_content, list))
+                    and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                ):
+                    if (
+                        _row_api_content is None
+                        and isinstance(content, str)
+                        and content != _ov_content
+                    ):
+                        _row_api_content = content
+                    content = _ov_content
                     if _ov_timestamp is not None:
                         _row_timestamp = _ov_timestamp
+                elif is_current_turn_user and _ov_timestamp is not None:
+                    _row_timestamp = _ov_timestamp
+                if _row_api_content == content:
+                    _row_api_content = None
+                # get_messages_as_conversation sanitizes user/assistant text on
+                # reload. Capture any bytes that sanitizer would rewrite so a
+                # resumed turn replays the provider-facing value exactly.
+                if (
+                    _row_api_content is None
+                    and role in ("user", "assistant")
+                    and isinstance(content, str)
+                    and content
+                    and sanitize_context(content).strip() != content.strip()
+                ):
+                    _row_api_content = content
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
                     tool_calls_data = [

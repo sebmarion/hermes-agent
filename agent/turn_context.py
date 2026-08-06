@@ -517,19 +517,39 @@ def build_turn_context(
     expected_persist_content = (
         persist_user_message if persist_user_message is not None else user_message
     )
+    clean_user_message = expected_persist_content
     if (
         isinstance(pending_cli_message, dict)
         and pending_cli_message.get("content") == expected_persist_content
     ):
         user_msg = pending_cli_message
-        # The CLI-staged value is the clean transcript text. Restore the
-        # API-facing variant (for example, a voice-mode prefix) while retaining
-        # the same dict and any close-path durable marker.
-        user_msg["content"] = user_message
     else:
         user_msg = {"role": "user", "content": user_message}
         if isinstance(pending_cli_message, dict):
             agent._pending_cli_user_message = None
+
+    # Keep the durable/live transcript projection clean when a caller supplies
+    # a separate API-facing string (workspace, gateway, voice, or model-note
+    # context). The exact provider bytes ride in the existing sidecar contract;
+    # every API build substitutes that sidecar before transport. Multimodal
+    # content and transports whose wire bytes are composed later retain their
+    # existing list/live representation.
+    if isinstance(clean_user_message, str) and isinstance(user_message, str):
+        user_msg["content"] = clean_user_message
+    else:
+        # Multimodal turns cannot use the string-only api_content sidecar.
+        # Preserve their provider-ready content blocks exactly, including when
+        # a caller also supplies a clean text persistence override.
+        user_msg["content"] = user_message
+    user_msg.pop("api_content", None)
+    if (
+        not moa_active
+        and getattr(agent, "api_mode", None) != "codex_app_server"
+        and isinstance(clean_user_message, str)
+        and isinstance(user_message, str)
+        and user_message != clean_user_message
+    ):
+        user_msg["api_content"] = user_message
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
@@ -728,7 +748,7 @@ def build_turn_context(
                     # just-appended user message is stale — re-anchor it the
                     # same way the preflight path does below.
                     current_turn_user_idx = reanchor_current_turn_user_idx(
-                        messages, user_message
+                        messages, original_user_message
                     )
                     agent._persist_user_message_idx = current_turn_user_idx
 
@@ -1051,7 +1071,7 @@ def build_turn_context(
         # position. Exact-content match first so a todo-snapshot user message
         # appended after the tail can't steal the anchor.
         current_turn_user_idx = reanchor_current_turn_user_idx(
-            messages, user_message
+            messages, original_user_message
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
@@ -1196,8 +1216,11 @@ def build_turn_context(
         and messages[current_turn_user_idx].get("role") == "user"
     ):
         _turn_user_msg = messages[current_turn_user_idx]
+        _wire_base = _turn_user_msg.get("api_content")
+        if not isinstance(_wire_base, str):
+            _wire_base = _turn_user_msg.get("content", "")
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _wire_base, ext_prefetch_cache, plugin_user_context
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content

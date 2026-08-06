@@ -246,6 +246,44 @@ def _stub_runtime_main():
 
 
 class TestPrologueStamping:
+    def test_multimodal_wire_content_survives_clean_text_override(self):
+        """A clean transcript override must not replace provider image blocks."""
+        agent = _FakeAgent()
+        wire_message = [
+            {"type": "text", "text": "what is this?"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,aGVsbG8="},
+            },
+        ]
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(
+                agent,
+                user_message=wire_message,
+                persist_user_message="what is this?",
+                summarize_user_message_for_log=lambda _message: "what is this?",
+            )
+
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"] == wire_message
+        assert "api_content" not in msg
+
+    def test_stamps_workspace_wire_bytes_on_clean_current_user(self):
+        """API-only workspace context stays in the sidecar, not the transcript."""
+        agent = _FakeAgent()
+        wire_message = "[Workspace::v1: project-root]\n\nhello"
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(
+                agent,
+                user_message=wire_message,
+                persist_user_message="hello",
+            )
+
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"] == "hello"
+        assert msg["api_content"] == wire_message
+        assert agent.api_content_at_persist == wire_message
+
     def test_stamps_api_content_from_plugin_context(self):
         agent = _FakeAgent()
         with patch(

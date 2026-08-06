@@ -46,6 +46,20 @@ def _no_compression_sleep(monkeypatch):
     monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
     monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
 
+    def _admit(_agent, api_kwargs):
+        estimated = max(1, len(api_kwargs.get("messages") or [])) * 100
+        return {
+            "decision": "admit",
+            "reason": "within_effective_input_ceiling",
+            "estimated_input_tokens": estimated,
+            "category_estimated_tokens": {"total": estimated},
+        }
+
+    monkeypatch.setattr(
+        "agent.conversation_loop.build_provider_request_admission_receipt",
+        _admit,
+    )
+
 
 def _make_tool_defs(*names: str) -> list:
     return [
@@ -98,6 +112,8 @@ def agent():
         a = AIAgent(
             api_key="test-key-1234567890",
             base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            model="test/model",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,

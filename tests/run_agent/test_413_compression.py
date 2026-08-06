@@ -1294,6 +1294,89 @@ class TestToolResultPreflightCompression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
 
+    def test_tool_result_reopens_turn_start_marginal_preflight_block(
+        self, agent, admitted_provider_request
+    ):
+        """A provider/tool cycle materially changes a previously blocked request."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 130_000
+
+        history = []
+        for i in range(20):
+            history.extend(
+                [
+                    {"role": "user", "content": f"question {i}"},
+                    {"role": "assistant", "content": f"answer {i}"},
+                ]
+            )
+
+        tc = SimpleNamespace(
+            id="tc1",
+            type="function",
+            function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'),
+        )
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="",
+                finish_reason="stop",
+                tool_calls=[tc],
+                usage={
+                    "prompt_tokens": 1_000,
+                    "completion_tokens": 20,
+                    "total_tokens": 1_020,
+                },
+            ),
+            _mock_response(content="Done after refreshed compression"),
+        ]
+
+        def _compress(messages, *_args, **_kwargs):
+            return messages[2:], agent._cached_system_prompt
+
+        def _loop_estimate(messages, *_args, **_kwargs):
+            return (
+                150_000
+                if any(
+                    isinstance(message, dict) and message.get("role") == "tool"
+                    for message in messages
+                )
+                else 1_000
+            )
+
+        with (
+            patch(
+                "agent.turn_context.estimate_request_tokens_rough",
+                side_effect=[150_000, 148_000],
+            ),
+            patch(
+                "agent.conversation_loop.estimate_request_tokens_rough",
+                side_effect=_loop_estimate,
+            ),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=1_000,
+            ),
+            patch.object(
+                agent.context_compressor,
+                "should_compress",
+                side_effect=lambda tokens: tokens >= 130_000,
+            ),
+            patch("run_agent.handle_function_call", return_value="x" * 100_000),
+            patch.object(agent, "_compress_context", side_effect=_compress) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "current question",
+                conversation_history=history,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Done after refreshed compression"
+        assert agent.client.chat.completions.create.call_count == 2
+        assert mock_compress.call_count == 2
+
     def test_mid_turn_retry_compares_fully_assembled_requests(self, agent):
         """API-only context must not make marginal compression look effective."""
         agent.compression_enabled = True
@@ -1323,10 +1406,22 @@ class TestToolResultPreflightCompression:
             [1_000, 150_000, 148_000, 148_000, 148_000]
         )
 
+        def _estimate_request(messages, *_args, **_kwargs):
+            # The provider-ready request is the system-prefixed projection.
+            # Keep raw/canonical message estimates small so this exercises the
+            # in-loop pre-API pressure gate, not the post-tool fallback gate.
+            if messages and messages[0].get("role") == "system":
+                return next(assembled_estimates)
+            return 1_000
+
         with (
             patch(
                 "agent.conversation_loop.estimate_messages_tokens_rough",
-                side_effect=lambda *_a, **_k: next(assembled_estimates),
+                return_value=1_000,
+            ),
+            patch(
+                "agent.conversation_loop.estimate_request_tokens_rough",
+                side_effect=_estimate_request,
             ),
             patch("run_agent.handle_function_call", return_value="x" * 100_000),
             patch.object(

@@ -307,7 +307,8 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
     )
 
     assert ctx.messages[-1] is staged
-    assert ctx.messages[-1]["content"] == "[MODEL NOTE]\n\nclean prompt"
+    assert ctx.messages[-1]["content"] == "clean prompt"
+    assert ctx.messages[-1]["api_content"] == "[MODEL NOTE]\n\nclean prompt"
     assert ctx.messages[-1]["_db_persisted"] is True
     assert agent._pending_cli_user_message is None
 
@@ -363,7 +364,6 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 

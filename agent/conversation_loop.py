@@ -32,9 +32,12 @@ from agent.chat_completion_helpers import (
     build_provider_request_admission_receipt,
 )
 from agent.conversation_compression import (
+    PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    compression_skipped_due_to_lock,
     conversation_history_after_compression,
     persist_in_place_projection,
 )
+from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
@@ -43,9 +46,9 @@ from agent.turn_context import (
     build_turn_context,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
+    substitute_api_content,
 )
 from agent.turn_retry_state import TurnRetryState
-from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -1065,6 +1068,31 @@ def _run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = _ctx.compression_attempts
+    max_compression_attempts = max(
+        1, int(getattr(agent, "max_compression_attempts", 3) or 3)
+    )
+    _last_preflight_pressure: Optional[int] = None
+    _preflight_compression_blocked = _ctx.preflight_compression_blocked
+
+    def _preflight_projection_marker() -> tuple:
+        """Identify the canonical tail that an anti-thrash block applies to."""
+        if not messages:
+            return (0, None, None, None)
+        tail = messages[-1]
+        if not isinstance(tail, dict):
+            return (len(messages), id(tail), type(tail).__name__, None)
+        content = tail.get("content")
+        if isinstance(content, str):
+            content_marker = (len(content), content[:32], content[-32:])
+        elif isinstance(content, list):
+            content_marker = ("list", len(content))
+        else:
+            content_marker = (type(content).__name__, None)
+        return (len(messages), id(tail), tail.get("role"), content_marker)
+
+    _preflight_blocked_projection = (
+        _preflight_projection_marker() if _preflight_compression_blocked else None
+    )
     provider_context_retry = {"used": False, "before_tokens": None}
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
@@ -1110,6 +1138,52 @@ def _run_conversation(
             partial=True,
             failed=True,
             compression_exhausted=True,
+        )
+        return result
+
+    def _compression_deferred_result(message: Optional[str] = None) -> Dict[str, Any]:
+        """Return a soft result when another path owns compression."""
+        from agent.turn_finalizer import finalize_turn
+
+        holder = getattr(agent, "_compression_skipped_due_to_lock", None)
+        logger.info(
+            "turn deferred: compression lock held by another path "
+            "(session=%s holder=%s)",
+            agent.session_id or "none",
+            holder if isinstance(holder, str) else "unconfirmed",
+        )
+        final = message or (
+            "Context compression is already running for this session. "
+            "Please retry in a moment — your next message will be processed "
+            "once the concurrent compression finishes."
+        )
+        agent._flush_status_buffer()
+        # Finalize with no assistant response so this transient operational
+        # message is not appended to the canonical transcript. The caller
+        # still receives it below, while the clean user turn is persisted.
+        result = finalize_turn(
+            agent,
+            final_response=None,
+            api_call_count=api_call_count,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=False,
+            _turn_exit_reason="compression_deferred",
+            preserve_final_response=True,
+        )
+        result.update(
+            final_response=final,
+            completed=False,
+            error=final,
+            partial=True,
+            failed=False,
+            compression_deferred=True,
         )
         return result
 
@@ -1415,7 +1489,7 @@ def _run_conversation(
                 )
             messages = adopted_messages
             current_turn_user_idx = reanchor_current_turn_user_idx(
-                messages, user_message
+                messages, original_user_message
             )
             agent._persist_user_message_idx = current_turn_user_idx
             conversation_history = (
@@ -1430,12 +1504,11 @@ def _run_conversation(
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
 
-            # api_content is the persistence sidecar carrying the exact bytes
-            # sent to the API for this message when they differ from the clean
-            # stored content (see compose_user_api_content in turn_context).
-            # It is bookkeeping, never a provider field — pop it from EVERY
-            # outgoing copy.
-            _api_content = api_msg.pop("api_content", None)
+            # api_content is bookkeeping, never a provider field. Substitute
+            # it before transport so historical user/assistant rows replay the
+            # exact bytes previously sent, including API-only workspace or
+            # memory/plugin context.
+            _api_content = substitute_api_content(api_msg)
 
             # Display-only timeline metadata. Never a provider field — strip
             # from every outgoing copy so strict OpenAI-compatible backends
@@ -1449,23 +1522,21 @@ def _run_conversation(
             # Bookkeeping, never a provider field — only the chat-completions
             # transport strips underscore keys, so drop it centrally here.
             api_msg.pop("_row_id", None)
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated, so nothing leaks into session persistence.
-            if idx == current_turn_user_idx and msg.get("role") == "user":
-                _injections = []
-                if _ext_prefetch_cache:
-                    _fenced = build_memory_context_block(_ext_prefetch_cache)
-                    if _fenced:
-                        _injections.append(_fenced)
-                if _plugin_user_context:
-                    _injections.append(_plugin_user_context)
-                if _injections:
-                    _base = api_msg.get("content", "")
-                    if isinstance(_base, str):
-                        api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+            # Callers that bypass prologue stamping can still compose the
+            # current turn here. A stamped sidecar already contains the exact
+            # final wire bytes and must win over recomposition.
+            if (
+                idx == current_turn_user_idx
+                and msg.get("role") == "user"
+                and not isinstance(_api_content, str)
+            ):
+                _composed = compose_user_api_content(
+                    api_msg.get("content", ""),
+                    _ext_prefetch_cache,
+                    _plugin_user_context,
+                )
+                if _composed is not None:
+                    api_msg["content"] = _composed
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
@@ -1718,6 +1789,46 @@ def _run_conversation(
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
+        _preflight_threshold = int(
+            getattr(_compressor, "threshold_tokens", 0) or 0
+        )
+        _current_preflight_projection = _preflight_projection_marker()
+        if (
+            _preflight_compression_blocked
+            and _preflight_blocked_projection is not None
+            and _current_preflight_projection != _preflight_blocked_projection
+        ):
+            # The blocker only describes the request it measured. A completed
+            # provider/tool cycle appends a materially new canonical tail, so
+            # its large tool result gets one bounded proactive pass instead of
+            # inheriting an anti-thrash decision from the pre-tool request.
+            _preflight_compression_blocked = False
+            _preflight_blocked_projection = None
+        # A previous mid-turn pass deliberately restarted request assembly.
+        # Compare the two fully assembled requests: canonical ``messages`` omit
+        # API-only context, prefills, MoA output, and ephemeral system text.
+        _previous_preflight_pressure = _last_preflight_pressure
+        _last_preflight_pressure = None
+        if (
+            _previous_preflight_pressure is not None
+            and request_pressure_tokens >= _preflight_threshold
+            and not _compression_warrants_another_preflight_pass(
+                _previous_preflight_pressure,
+                request_pressure_tokens,
+                _preflight_threshold,
+            )
+        ):
+            # Stop proactive retries without consuming the remaining recovery
+            # budget. A provider 413/overflow is stronger evidence and may
+            # still claim its bounded compact-and-retry below.
+            _preflight_compression_blocked = True
+            _preflight_blocked_projection = _current_preflight_projection
+            logger.warning(
+                "Pre-API compression made insufficient progress: ~%s -> "
+                "~%s request tokens; skipping additional preflight passes",
+                f"{_previous_preflight_pressure:,}",
+                f"{request_pressure_tokens:,}",
+            )
         _defer_preflight = getattr(
             _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
         )
@@ -1727,7 +1838,8 @@ def _run_conversation(
         if (
             agent.compression_enabled
             and len(messages) > 1
-            and compression_attempts < 3
+            and compression_attempts < max_compression_attempts
+            and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
@@ -1735,47 +1847,70 @@ def _run_conversation(
             compression_attempts += 1
             logger.info(
                 "Pre-API compression: ~%s request tokens >= %s threshold "
-                "(context=%s, attempt=%s/3)",
+                "(context=%s, attempt=%s/%s)",
                 f"{request_pressure_tokens:,}",
                 f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
                 f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
                 if getattr(_compressor, "context_length", 0) else "unknown",
                 compression_attempts,
+                max_compression_attempts,
             )
-            agent._emit_status(
-                f"📦 Pre-API compression: ~{request_pressure_tokens:,} tokens "
-                f"near the context/output limit. Compacting before the next model call."
+            _pre_api_status = automatic_compaction_status_message(
+                _compressor,
+                phase="pre_api",
+                default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
+                    tokens=request_pressure_tokens
+                ),
+                approx_tokens=request_pressure_tokens,
+                threshold_tokens=_preflight_threshold,
+                context_length=int(
+                    getattr(_compressor, "context_length", 0) or 0
+                ),
+                model=agent.model,
+                attempt=compression_attempts,
+                max_attempts=max_compression_attempts,
             )
+            if _pre_api_status:
+                agent._emit_status(_pre_api_status)
+            _last_preflight_pressure = request_pressure_tokens
+            _pre_api_input = messages
             messages, active_system_prompt = agent._compress_context(
                 messages,
                 system_message,
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
             )
-            # Reset retry/empty-response state so the compacted request
-            # gets a fresh chance instead of inheriting stale recovery
-            # counters from the pre-compaction history.
-            agent._empty_content_retries = 0
-            agent._thinking_prefill_retries = 0
-            agent._last_content_with_tools = None
-            agent._last_content_tools_all_housekeeping = False
-            agent._mute_post_response = False
-            # Re-baseline the flush cursor for the compaction mode that just
-            # ran. Legacy session-rotation returns None (the child session has
-            # not seen the compacted transcript, so the next flush writes it
-            # whole); in-place compaction returns list(messages) because the
-            # compacted rows are already persisted under the same session id —
-            # leaving None there would re-append them, doubling the active
-            # context and retriggering compression. Mirrors the post-response
-            # and preflight compaction sites; see
-            # conversation_history_after_compression().
-            conversation_history = conversation_history_after_compression(
-                agent, messages
-            )
-            api_call_count -= 1
-            agent._api_call_count = api_call_count
-            agent.iteration_budget.refund()
-            continue
+            if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
+                # Lock contention is temporary, not evidence that the request
+                # cannot be compacted. Preserve the provider-proven recovery
+                # attempt and continue with the already assembled request.
+                compression_attempts = max(0, compression_attempts - 1)
+                _last_preflight_pressure = None
+            else:
+                # Reset retry/empty-response state so the compacted request
+                # gets a fresh chance instead of inheriting stale recovery
+                # counters from the pre-compaction history.
+                agent._empty_content_retries = 0
+                agent._thinking_prefill_retries = 0
+                agent._last_content_with_tools = None
+                agent._last_content_tools_all_housekeeping = False
+                agent._mute_post_response = False
+                # Re-baseline the flush cursor for the compaction mode that just
+                # ran. Legacy session-rotation returns None (the child session has
+                # not seen the compacted transcript, so the next flush writes it
+                # whole); in-place compaction returns list(messages) because the
+                # compacted rows are already persisted under the same session id —
+                # leaving None there would re-append them, doubling the active
+                # context and retriggering compression. Mirrors the post-response
+                # and preflight compaction sites; see
+                # conversation_history_after_compression().
+                conversation_history = conversation_history_after_compression(
+                    agent, messages
+                )
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                agent.iteration_budget.refund()
+                continue
         
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
@@ -1809,8 +1944,6 @@ def _run_conversation(
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
-        max_compression_attempts = 3
-
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
@@ -3141,6 +3274,14 @@ def _run_conversation(
                         current_system_prompt=active_system_prompt,
                     )
                 )
+                if (
+                    compressed_messages is previous_messages
+                    and compression_skipped_due_to_lock(agent)
+                ):
+                    compression_attempts = max(0, compression_attempts - 1)
+                    messages = previous_messages
+                    _refund_untransported_attempt()
+                    return _compression_deferred_result()
                 if compaction_failure:
                     messages = previous_messages
                     _refund_untransported_attempt()
@@ -4037,6 +4178,12 @@ def _run_conversation(
                             current_system_prompt=active_system_prompt,
                     )
                     )
+                    if (
+                        messages is previous_messages
+                        and compression_skipped_due_to_lock(agent)
+                    ):
+                        compression_attempts = max(0, compression_attempts - 1)
+                        return _compression_deferred_result()
                     if compaction_failure:
                         messages = previous_messages
                         return _compression_exhausted_result(
@@ -4295,6 +4442,12 @@ def _run_conversation(
                             current_system_prompt=active_system_prompt,
                         )
                     )
+                    if (
+                        messages is previous_messages
+                        and compression_skipped_due_to_lock(agent)
+                    ):
+                        compression_attempts = max(0, compression_attempts - 1)
+                        return _compression_deferred_result()
                     if compression_attempts > max_compression_attempts:
                         return _compression_exhausted_result(
                             "Request payload compaction reached the shared retry limit."
@@ -4547,6 +4700,12 @@ def _run_conversation(
                             current_system_prompt=active_system_prompt,
                         )
                     )
+                    if (
+                        messages is previous_messages
+                        and compression_skipped_due_to_lock(agent)
+                    ):
+                        compression_attempts = max(0, compression_attempts - 1)
+                        return _compression_deferred_result()
                     if compaction_failure:
                         messages = previous_messages
                         return _compression_exhausted_result(
@@ -5941,9 +6100,15 @@ def _run_conversation(
                         approx_tokens=_real_tokens,
                         task_id=effective_task_id,
                     )
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages
-                    )
+                    if (
+                        messages is _post_tool_input
+                        and compression_skipped_due_to_lock(agent)
+                    ):
+                        compression_attempts = max(0, compression_attempts - 1)
+                    else:
+                        conversation_history = conversation_history_after_compression(
+                            agent, messages
+                        )
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
