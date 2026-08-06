@@ -2123,6 +2123,7 @@ class AIAgent:
                     "tool_name": msg.get("tool_name"),
                     "tool_calls": tool_calls_data,
                     "tool_call_id": msg.get("tool_call_id"),
+                    "effect_disposition": msg.get("effect_disposition"),
                     "finish_reason": msg.get("finish_reason"),
                     # Reasoning/codex fields are role-gated (assistant-only)
                     # inside _insert_message_rows — pass through untouched.

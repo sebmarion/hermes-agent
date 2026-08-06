@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import subprocess
@@ -11463,7 +11464,27 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
 
     parent = {
         "session_key": "parent-key",
-        "history": [{"role": "user", "content": "hi"}],
+        "history": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-guarded",
+                        "type": "function",
+                        "function": {"name": "search_files", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "Search blocked by the lifecycle guard",
+                "tool_name": "search_files",
+                "tool_call_id": "call-guarded",
+                "effect_disposition": "none",
+            },
+        ],
         "history_lock": __import__("threading").Lock(),
         "running": False,
         "cols": 80,
@@ -11490,6 +11511,17 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_session_cwd", lambda s: str(tmp_path))
     monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
     monkeypatch.setattr(server, "_attach_worker", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+
+    def _fake_init_session(sid, key, agent, history, **kwargs):
+        server._sessions[sid] = {
+            "agent": agent,
+            "session_key": key,
+            "history": history,
+            "profile_home": kwargs.get("profile_home"),
+        }
+
+    monkeypatch.setattr(server, "_init_session", _fake_init_session)
     try:
         resp = server.handle_request(
             {
@@ -11505,7 +11537,11 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         # profile, not left NULL for aggregators to mis-tag as "default".
         assert seen.get("profile_name") == "mlperf"
         assert seen.get("title") == (seen["created"], "forked")
-        assert len(seen["msgs"]) == 1
+        assert len(seen["msgs"]) == 3
+        copied_tool = next(msg for msg in seen["msgs"] if msg["role"] == "tool")
+        assert copied_tool["tool_name"] == "search_files"
+        assert copied_tool["tool_call_id"] == "call-guarded"
+        assert copied_tool["effect_disposition"] == "none"
         assert seen.get("launch") is None
         assert seen.get("launch_create") is None
         child_sid = resp["result"]["session_id"]
@@ -11517,6 +11553,50 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
     finally:
         for k in list(server._sessions):
             server._sessions.pop(k, None)
+
+
+def test_first_turn_branch_seed_preserves_tool_effect_disposition(monkeypatch):
+    """A draft branch's first-turn seed must match its in-memory transcript."""
+    captured = {}
+
+    class FakeDB:
+        def append_messages_batch(self, session_id, messages, **kwargs):
+            captured["session_id"] = session_id
+            captured["messages"] = messages
+            return len(messages)
+
+    @contextlib.contextmanager
+    def fake_session_db(_session):
+        yield FakeDB()
+
+    monkeypatch.setattr(server, "_session_db", fake_session_db)
+    session = _session(
+        session_key="branch-key",
+        parent_session_id="parent-key",
+        history=[
+            {
+                "role": "tool",
+                "content": "Search blocked by the lifecycle guard",
+                "tool_name": "search_files",
+                "tool_call_id": "call-guarded",
+                "effect_disposition": "none",
+            }
+        ],
+    )
+
+    server._persist_branch_seed(session)
+
+    assert captured["session_id"] == "branch-key"
+    assert captured["messages"] == [
+        {
+            "role": "tool",
+            "content": "Search blocked by the lifecycle guard",
+            "tool_name": "search_files",
+            "tool_call_id": "call-guarded",
+            "effect_disposition": "none",
+        }
+    ]
+    assert session["_branch_seed_persisted"] is True
 
 
 def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_path):

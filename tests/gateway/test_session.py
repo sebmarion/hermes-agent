@@ -432,6 +432,45 @@ class TestSessionStoreRewriteTranscript:
         assert reloaded[0]["content"] == "hello"
         assert reloaded[1]["content"] == "hi"
 
+    def test_append_preserves_tool_effect_disposition(self, store):
+        session_id = "guarded_tool_session"
+        store._db.create_session(session_id=session_id, source="gateway")
+
+        store.append_to_transcript(
+            session_id,
+            {"role": "user", "content": "Inspect the repository"},
+        )
+        store.append_to_transcript(
+            session_id,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-guarded",
+                        "type": "function",
+                        "function": {"name": "search_files", "arguments": "{}"},
+                    }
+                ],
+            },
+        )
+        store.append_to_transcript(
+            session_id,
+            {
+                "role": "tool",
+                "content": "Search blocked by the lifecycle guard",
+                "tool_name": "search_files",
+                "tool_call_id": "call-guarded",
+                "effect_disposition": "none",
+            },
+        )
+
+        reloaded = store.load_transcript(session_id)
+        tool_message = next(msg for msg in reloaded if msg.get("role") == "tool")
+        assert tool_message["tool_name"] == "search_files"
+        assert tool_message["tool_call_id"] == "call-guarded"
+        assert tool_message["effect_disposition"] == "none"
+
 
 class TestLoadTranscriptDBOnly:
     """After spec 002, load_transcript reads only from state.db."""
@@ -1528,5 +1567,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 

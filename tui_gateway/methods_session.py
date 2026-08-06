@@ -2655,13 +2655,7 @@ def _(rid, params: dict) -> dict:
             db.append_messages_batch(
                 new_key,
                 [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        # Preserve the parent's original message timestamps —
-                        # branch copies are history, not new activity (9d73006ad).
-                        "timestamp": msg.get("timestamp"),
-                    }
+                    copy_message_for_persistence(msg)
                     for msg in history
                 ],
                 chunk_rows=500,

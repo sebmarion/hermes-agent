@@ -511,6 +511,62 @@ class TestDispatchProjectionPersistence:
             finally:
                 restarted.close()
 
+    def test_flushed_tool_effect_disposition_matches_durable_projection(self):
+        from agent.conversation_compression import persist_in_place_projection
+        from agent.tool_dispatch_helpers import make_tool_result_message
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "dispatch_projection_tool_effect"
+            db.create_session(sid, "webui", model="test/model")
+            agent = _make_agent(db, sid, in_place=True)
+            previous = [
+                {"role": "user", "content": "inspect guarded state"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_guarded",
+                            "type": "function",
+                            "function": {
+                                "name": "search_files",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                make_tool_result_message(
+                    "search_files",
+                    '{"error": "guarded path"}',
+                    "call_guarded",
+                    effect_disposition="none",
+                ),
+            ]
+            agent._flush_messages_to_session_db(previous)
+            projected = [dict(message) for message in previous]
+            projected[-1] = {
+                **projected[-1],
+                "content": "[bounded guarded result]",
+            }
+
+            adopted, persisted = persist_in_place_projection(
+                agent,
+                previous,
+                projected,
+            )
+
+            assert persisted is True
+            assert adopted is projected
+            durable_tool = db.get_messages_as_conversation(sid)[-1]
+            assert durable_tool["role"] == "tool"
+            assert durable_tool["content"] == "[bounded guarded result]"
+            assert durable_tool["tool_call_id"] == "call_guarded"
+            assert durable_tool["tool_name"] == "search_files"
+            assert durable_tool["effect_disposition"] == "none"
+            db.close()
+
     def test_restored_whitespace_normalization_still_matches_durable_prefix(self):
         from agent.conversation_compression import persist_in_place_projection
         from hermes_state import SessionDB

@@ -85,6 +85,46 @@ class TestBranchCommandCLI:
         messages = session_db.get_messages_as_conversation(cli_instance.session_id)
         assert len(messages) == 4  # All 4 messages copied
 
+    def test_branch_preserves_tool_effect_disposition(self, cli_instance, session_db):
+        """A branch must keep guarded tool rows identical to live history."""
+        from cli import HermesCLI
+
+        cli_instance.conversation_history = [
+            {
+                "role": "user",
+                "content": "Inspect the repository",
+                "api_content": "Inspect the repository\n\nRuntime context",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-guarded",
+                        "type": "function",
+                        "function": {"name": "search_files", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "Search blocked by the lifecycle guard",
+                "tool_name": "search_files",
+                "tool_call_id": "call-guarded",
+                "effect_disposition": "none",
+            },
+        ]
+
+        HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        messages = session_db.get_messages_as_conversation(cli_instance.session_id)
+        user_message = next(msg for msg in messages if msg.get("role") == "user")
+        tool_message = next(msg for msg in messages if msg.get("role") == "tool")
+        assert user_message["api_content"] == "Inspect the repository\n\nRuntime context"
+        assert tool_message["tool_name"] == "search_files"
+        assert tool_message["tool_call_id"] == "call-guarded"
+        assert tool_message["effect_disposition"] == "none"
+
 
 
     def test_branch_with_custom_name(self, cli_instance, session_db):

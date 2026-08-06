@@ -30,6 +30,7 @@ from hermes_constants import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
+from agent.message_persistence import copy_message_for_persistence
 from agent.replay_cleanup import sanitize_replay_history
 from agent.secret_scope import (
     build_profile_secret_scope,
@@ -2463,14 +2464,7 @@ def _persist_branch_seed(session: dict) -> None:
             db.append_messages_batch(
                 key,
                 [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        # Preserve the parent's original message timestamps —
-                        # append_message would otherwise stamp time.time() and the
-                        # branch's copied history would all appear authored "now".
-                        "timestamp": msg.get("timestamp"),
-                    }
+                    copy_message_for_persistence(msg)
                     for msg in seed
                 ],
                 chunk_rows=500,
