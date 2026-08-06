@@ -999,7 +999,17 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         required = params.get("required")
         if not isinstance(required, list) or not required:
             return None
-        missing = [r for r in required if isinstance(r, str) and r not in args]
+        # ``web_search`` historically accepted the compact ``q`` spelling in
+        # model-generated bridge calls.  Keep that compatibility at the
+        # probe boundary; the downstream dispatcher still receives the exact
+        # original/effective mapping for policy and audit purposes.
+        missing = [
+            r
+            for r in required
+            if isinstance(r, str)
+            and r not in args
+            and not (r == "query" and "q" in args)
+        ]
         if not missing:
             return None
         return tool_error(

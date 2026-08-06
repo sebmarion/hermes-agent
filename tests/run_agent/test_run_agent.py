@@ -2070,6 +2070,15 @@ class TestConcurrentToolExecution:
         assert progress[0][2].startswith("sk-pro")
         assert secret not in repr(starts + completes + progress)
 
+    def test_concurrent_tool_callbacks_preserve_order(self, agent):
+        tc1 = _mock_tool_call(name="web_search", arguments='{"query":"one"}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"query":"two"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        starts = []
+        completes = []
+        agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
+        agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
 
         with patch(
             "model_tools.registry.dispatch",
@@ -2231,17 +2240,6 @@ class TestConcurrentToolExecution:
 
         assert json.loads(result) == {"error": "Blocked"}
         assert agent._turns_since_memory == 5
-
-
-
-
-
-
-        assert len(calls) == 1
-        action, target, content, metadata = calls[0]
-        assert (action, target, content) == ("remove", "memory", "")
-        assert metadata["old_text"] == old_text
-        assert metadata["tool_call_id"] == "mem-1"
 
     def test_invoke_tool_memory_failed_remove_skips_provider_notification(self, agent, monkeypatch):
         monkeypatch.setattr(

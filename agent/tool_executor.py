@@ -620,13 +620,31 @@ def _run_agent_tool_execution_middleware(
         )
         trace.clear()
         trace.extend(request_result.trace)
+        def _dispatch_after_execution_middleware(next_args: dict[str, Any]) -> Any:
+            # The relay-facing executor and Hermes dispatcher are separate
+            # execution middleware boundaries. Preserve both callbacks before
+            # the one-use policy authorization so policy sees the exact
+            # terminal payload (and never authorizes an earlier rewrite).
+            return run_tool_execution_middleware(
+                function_name,
+                next_args,
+                lambda final_args: _authorized_dispatch(
+                    final_args if isinstance(final_args, dict) else next_args
+                ),
+                original_args=function_args,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            )
+
         return run_tool_execution_middleware(
             function_name,
             request_args,
-            lambda next_args: _authorized_dispatch(
-                next_args if isinstance(next_args, dict) else request_args
-            ),
+            _dispatch_after_execution_middleware,
             original_args=function_args,
+            final_dispatch=False,
             task_id=effective_task_id or "",
             session_id=getattr(agent, "session_id", "") or "",
             tool_call_id=tool_call_id or "",
@@ -1050,6 +1068,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 middleware_trace = managed.middleware_trace
                 blocked = managed.blocked
                 dispatched = managed.dispatched
+                try:
+                    from hermes_cli.middleware import is_required_policy_block_result
+
+                    if is_required_policy_block_result(result):
+                        # The execution middleware already emitted the
+                        # terminal required-policy hook; keep the worker from
+                        # synthesizing a second post_tool_call below.
+                        blocked = True
+                except Exception:
+                    pass
             except _BatchAbandoned:
                 # The batch was abandoned while we were parked at the start-order
                 # gate. The main thread already synthesized this tool's result
@@ -1413,6 +1441,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             args = function_args
             progress_function_name = function_name
             try:
+                from hermes_cli.middleware import is_required_policy_block_result
+
+                if is_required_policy_block_result(function_result):
+                    # Direct executor calls (without the public batch wrapper)
+                    # do not have a collector to identify the host-created
+                    # block.  The structured envelope is still authoritative:
+                    # it must not be projected as an ordinary completion or
+                    # receive a second post_tool_call hook.
+                    blocked = True
+                    effect_disposition = "none"
+            except Exception:
+                pass
+            try:
                 from hermes_cli.middleware import get_required_policy_block_record
 
                 required_policy_record = get_required_policy_block_record(
@@ -1480,7 +1521,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
-        subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
+        subdir_hints = (
+            agent._subdirectory_hints.check_tool_call(name, args)
+            if not blocked
+            else ""
+        )
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
                 # Append the hint to the text summary part so the model
@@ -2173,6 +2218,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             )
         except Exception:
             pass
+        try:
+            from hermes_cli.middleware import is_required_policy_block_result
+
+            if is_required_policy_block_result(function_result):
+                # The outer execution middleware already emitted the terminal
+                # policy hook.  Keep this result blocked so the executor does
+                # not emit a duplicate hook or UI completion event.
+                _execution_blocked = True
+        except Exception:
+            pass
         if required_policy_record is not None:
             _execution_blocked = True
 
@@ -2260,7 +2315,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
         # Discover subdirectory context files from tool arguments
-        subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
+        subdir_hints = (
+            agent._subdirectory_hints.check_tool_call(function_name, function_args)
+            if not _execution_blocked
+            else ""
+        )
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
                 _append_subdir_hint_to_multimodal(function_result, subdir_hints)

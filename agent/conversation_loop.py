@@ -103,6 +103,51 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
+    """Append a provider-safe checkpoint and correction to the live turn.
+
+    The checkpoint is model-facing scaffolding, not transcript prose.  Keep it
+    in the provider-only ``api_content`` sidecar so a resumed conversation
+    retains the interrupted context without painting implementation details in
+    the user's chat history.  Streamed reasoning is deliberately excluded:
+    chain-of-thought is display-only and must never be replayed.
+    """
+    visible = agent._strip_think_blocks(
+        getattr(agent, "_current_streamed_assistant_text", "") or ""
+    ).strip()
+
+    checkpoint_parts = ["[This response was interrupted by a user correction.]"]
+    if visible:
+        checkpoint_parts.extend(
+            ["Visible response before the interruption:", visible]
+        )
+    checkpoint = "\n\n".join(checkpoint_parts)
+
+    # If an assistant item is already committed, append one user row and carry
+    # the model-facing checkpoint in its sidecar. Otherwise add a hidden
+    # assistant checkpoint followed by the user's correction.
+    if messages and messages[-1].get("role") == "assistant":
+        correction = (
+            "[Context from the interrupted assistant response]\n"
+            f"{checkpoint}\n\n"
+            f"{text}"
+        )
+        messages.append({"role": "user", "content": text, "api_content": correction})
+    else:
+        entry: Dict[str, Any] = {
+            "role": "assistant",
+            "content": visible or checkpoint,
+            "api_content": checkpoint,
+        }
+        if not visible:
+            entry["display_kind"] = "hidden"
+        messages.append(entry)
+        messages.append({"role": "user", "content": text})
+
+    agent._current_streamed_assistant_text = ""
+    agent._stream_needs_break = True
+
+
 def _emit_turn_end_hook(
     agent,
     *,
@@ -931,6 +976,62 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _synchronize_context_engine_identity(agent: Any) -> None:
+    """Repair a stale compressor route before final request admission.
+
+    Model/provider switches normally call ``update_model``. A cached agent can
+    nevertheless arrive at a turn with a stale engine identity (for example
+    after a caller mutates runtime routing or a plugin restores only half of a
+    snapshot). Repair the shared identity at this turn boundary so the final
+    admission guard evaluates the same route that will actually be used. If the
+    engine refuses the update, leave the mismatch intact and let admission fail
+    closed.
+    """
+    engine = getattr(agent, "context_compressor", None)
+    if engine is None:
+        return
+    model = str(getattr(agent, "model", "") or "")
+    provider = str(getattr(agent, "provider", "") or "")
+    if (
+        str(getattr(engine, "model", "") or "") == model
+        and str(getattr(engine, "provider", "") or "") == provider
+    ):
+        return
+    updater = getattr(engine, "update_model", None)
+    if not callable(updater):
+        return
+    try:
+        updater(
+            model=agent.model,
+            context_length=getattr(engine, "context_length", None),
+            base_url=getattr(agent, "base_url", ""),
+            api_key=getattr(agent, "api_key", ""),
+            provider=agent.provider,
+            api_mode=getattr(agent, "api_mode", ""),
+        )
+    except Exception:
+        logger.warning(
+            "Context engine identity repair failed (model=%s provider=%s)",
+            model,
+            provider,
+            exc_info=True,
+        )
+        return
+    # Some test doubles/plugins intentionally make update_model a no-op. The
+    # identity fields are still authoritative runtime metadata; synchronizing
+    # them here preserves the fail-closed admission check without guessing a
+    # new context budget.
+    try:
+        if str(getattr(engine, "model", "") or "") != model:
+            engine.model = agent.model
+        if str(getattr(engine, "provider", "") or "") != provider:
+            engine.provider = agent.provider
+        if hasattr(engine, "api_mode"):
+            engine.api_mode = getattr(agent, "api_mode", "")
+    except Exception:
+        logger.debug("Context engine identity fields could not be rebound", exc_info=True)
+
+
 def _run_conversation(
     agent,
     user_message: str,
@@ -966,6 +1067,8 @@ def _run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    _synchronize_context_engine_identity(agent)
+
     if bestplan_config is None and isinstance(user_message, str):
         from agent.bestplan_orchestrator import TURN_MARKER
         if user_message.startswith(TURN_MARKER):
@@ -1280,6 +1383,16 @@ def _run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        _redirect_text = agent._drain_pending_redirect()
+        if _redirect_text:
+            _apply_active_turn_redirect(agent, messages, _redirect_text)
+            if isinstance(original_user_message, str):
+                original_user_message = (
+                    f"{original_user_message}\n\n"
+                    f"User correction during the turn: {_redirect_text}"
+                )
+            agent._persist_session(messages, conversation_history)
+
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 
@@ -2083,7 +2196,7 @@ def _run_conversation(
                     _llm_middleware_trace = []
 
                 try:
-                    from hermes_cli.plugins import (
+                    from hermes_cli.lifecycle import (
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
@@ -2124,6 +2237,7 @@ def _run_conversation(
                             base_url=agent.base_url,
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
+                            retry_count=retry_count,
                             request_messages=list(request_messages)
                             if isinstance(request_messages, list)
                             else [],
@@ -2298,26 +2412,82 @@ def _run_conversation(
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    from agent import relay_llm
+
+                    return relay_llm.execute(
+                        next_api_kwargs,
+                        agent._interruptible_api_call,
+                        session_id=str(agent.session_id or ""),
+                        name=str(agent.provider or "provider"),
+                        model_name=str(agent.model or ""),
+                        metadata={
+                            "api_mode": agent.api_mode,
+                            "api_request_id": api_request_id,
+                            "call_role": (
+                                "delegated"
+                                if getattr(agent, "is_subagent", False)
+                                else "fallback"
+                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                                else "primary"
+                            ),
+                            "retry_count": retry_count,
+                        },
+                        defer_logical_completion=True,
+                    )
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
-                response = run_llm_execution_middleware(
-                    api_kwargs,
-                    _perform_api_call,
-                    original_request=_original_api_kwargs,
-                    task_id=effective_task_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    session_id=agent.session_id or "",
-                    platform=agent.platform or "",
-                    model=agent.model,
-                    provider=agent.provider,
-                    base_url=agent.base_url,
-                    api_mode=agent.api_mode,
-                    api_call_count=api_call_count,
-                    middleware_trace=list(_llm_middleware_trace),
-                )
+                _model_request_active = getattr(agent, "_model_request_active", None)
+                _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
+                if _redirect_lock is not None:
+                    with _redirect_lock:
+                        if _model_request_active is not None:
+                            _model_request_active.set()
+                elif _model_request_active is not None:
+                    _model_request_active.set()
+                _redirect_crossed_response = False
+                try:
+                    response = run_llm_execution_middleware(
+                        api_kwargs,
+                        _perform_api_call,
+                        original_request=_original_api_kwargs,
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id or "",
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                        middleware_trace=list(_llm_middleware_trace),
+                    )
+                finally:
+                    if _redirect_lock is not None:
+                        with _redirect_lock:
+                            if _model_request_active is not None:
+                                _model_request_active.clear()
+                            _redirect_crossed_response = bool(
+                                getattr(agent, "_pending_redirect", None)
+                            )
+                    else:
+                        if _model_request_active is not None:
+                            _model_request_active.clear()
+                        _redirect_crossed_response = agent._has_pending_redirect()
+                if _redirect_crossed_response:
+                    # A correction can race the provider returning. Discard the
+                    # stale response and rebuild from the queued correction.
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                        thinking_spinner = None
+                    if agent.thinking_callback:
+                        agent.thinking_callback("")
+                    if agent.clear_interrupt(preserve_redirect=True):
+                        _retry.restart_with_redirected_messages = True
+                    else:
+                        interrupted = True
+                    break
                 
                 api_duration = time.time() - api_start_time
                 
@@ -2579,12 +2749,16 @@ def _run_conversation(
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
                     status = getattr(response, "status", None)
+                    if isinstance(status, str):
+                        status = status.strip().lower()
                     incomplete_details = getattr(response, "incomplete_details", None)
                     incomplete_reason = None
                     if isinstance(incomplete_details, dict):
                         incomplete_reason = incomplete_details.get("reason")
                     else:
                         incomplete_reason = getattr(incomplete_details, "reason", None)
+                    if incomplete_reason is not None:
+                        incomplete_reason = str(incomplete_reason).strip().lower()
                     if status == "incomplete" and incomplete_reason in {"max_output_tokens", "length"}:
                         # Responses API max-output exhaustion is a normal
                         # Codex incomplete turn.  Let the Codex-specific
@@ -2594,6 +2768,8 @@ def _run_conversation(
                         # emits "Response truncated due to output length
                         # limit" and stops gateway turns.
                         finish_reason = "incomplete"
+                    elif status == "incomplete" and incomplete_reason == "content_filter":
+                        finish_reason = "content_filter"
                     else:
                         finish_reason = "stop"
                 elif agent.api_mode == "anthropic_messages":
@@ -3260,6 +3436,15 @@ def _run_conversation(
                         clear_nous_rate_limit()
                     except Exception:
                         pass
+                try:
+                    from agent import relay_llm
+
+                    relay_llm.complete_logical_call(
+                        api_request_id,
+                        outcome="success",
+                    )
+                except Exception:
+                    pass
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
@@ -3324,6 +3509,14 @@ def _run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+                if agent._has_pending_redirect():
+                    # redirect() intentionally cancelled only this provider
+                    # request. Keep the correction queued and replay the same
+                    # logical iteration after the outer loop applies it.
+                    if agent.clear_interrupt(preserve_redirect=True):
+                        _retry.restart_with_redirected_messages = True
+                        interrupted = False
+                        break
                 api_elapsed = time.time() - api_start_time
                 agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
                 interrupted = True
@@ -4611,41 +4804,51 @@ def _run_conversation(
                                 "failed": True,
                                 "compression_exhausted": True,
                             }
-                        # Also compress the message history so the output-cap
-                        # retry does not just spin on max_tokens alone.  The
-                        # compressor drops the middle window, freeing enough
-                        # tokens for the total to fit inside context_length.
-                        # (#55546)
-                        try:
-                            original_len = len(messages)
-                            original_tokens = estimate_messages_tokens_rough(messages)
-                            _overflow_input = messages
-                            messages, active_system_prompt = agent._compress_context(
-                                messages, system_message,
-                                approx_tokens=request_input_estimate,
-                                task_id=effective_task_id,
-                            )
-                            if messages is _overflow_input and compression_skipped_due_to_lock(agent):
-                                compression_attempts -= 1
-                                agent._persist_session(messages, conversation_history)
-                                return _compression_deferred_result(
-                                    agent, messages, api_call_count
+                        # A very small remaining output budget means the input
+                        # is effectively consuming the whole window. Compact
+                        # only that near-full, provider-identified output-cap
+                        # case. A generous budget (or vLLM's input-overflow
+                        # wording) needs only the lowered max_tokens retry; a
+                        # one-token floor cannot benefit from compaction.
+                        _should_compact_output_cap = (
+                            is_output_cap_error(error_msg)
+                            and available_out > 1
+                            and available_out <= 4096
+                        )
+                        if _should_compact_output_cap:
+                            try:
+                                original_len = len(messages)
+                                original_tokens = estimate_messages_tokens_rough(messages)
+                                _overflow_input = messages
+                                messages, active_system_prompt = agent._compress_context(
+                                    messages, system_message,
+                                    approx_tokens=estimate_request_tokens_rough(
+                                        api_messages,
+                                        tools=agent.tools or None,
+                                    ),
+                                    task_id=effective_task_id,
                                 )
-                            conversation_history = conversation_history_after_compression(
-                                agent, messages, conversation_history
-                            )
-                            new_tokens = estimate_messages_tokens_rough(messages)
-                            if len(messages) < original_len:
-                                agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
-                            elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
-                                agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
-                        except Exception:
-                            # Compression must never turn an output-cap error
-                            # fatal — fall through and retry on max_tokens alone.
-                            logger.warning(
-                                "%sOutput-cap compression hit an error; retrying on max_tokens only.",
-                                agent.log_prefix,
-                            )
+                                if messages is _overflow_input and compression_skipped_due_to_lock(agent):
+                                    compression_attempts -= 1
+                                    agent._persist_session(messages, conversation_history)
+                                    return _compression_deferred_result(
+                                        agent, messages, api_call_count
+                                    )
+                                conversation_history = conversation_history_after_compression(
+                                    agent, messages, conversation_history
+                                )
+                                new_tokens = estimate_messages_tokens_rough(messages)
+                                if len(messages) < original_len:
+                                    agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
+                                elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
+                                    agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                            except Exception:
+                                # Compression must never turn an output-cap
+                                # error fatal; retry on max_tokens alone.
+                                logger.warning(
+                                    "%sOutput-cap compression hit an error; retrying on max_tokens only.",
+                                    agent.log_prefix,
+                                )
                         _retry.restart_with_compressed_messages = True
                         break
 
@@ -5371,6 +5574,16 @@ def _run_conversation(
                             f"{int(sleep_end - time.time())}s remaining"
                         )
         
+        if _retry.restart_with_redirected_messages:
+            # The cancelled request produced no valid assistant item. Reuse
+            # the same logical iteration after the outer loop applies the
+            # correction and rebuilds the request tail.
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            agent.iteration_budget.refund()
+            _retry.restart_with_redirected_messages = False
+            continue
+
         # If the API call was interrupted, skip response processing
         if interrupted:
             _turn_exit_reason = "interrupted_during_api_call"
@@ -5457,7 +5670,7 @@ def _run_conversation(
                     assistant_message.content = str(raw)
 
             try:
-                from hermes_cli.plugins import (
+                from hermes_cli.lifecycle import (
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
@@ -5479,6 +5692,7 @@ def _run_conversation(
                         base_url=agent.base_url,
                         api_mode=agent.api_mode,
                         api_call_count=api_call_count,
+                        retry_count=retry_count,
                         api_duration=api_duration,
                         started_at=api_start_time,
                         ended_at=_api_ended_at,
@@ -6632,7 +6846,22 @@ def _run_conversation(
                                ". No fallback providers configured.")
                         )
 
-                    final_response = "(empty)"
+                    if reasoning_text:
+                        reasoning_preview = (
+                            reasoning_text[:500] + "..."
+                            if len(reasoning_text) > 500
+                            else reasoning_text
+                        )
+                        final_response = (
+                            "⚠️ The model produced only internal reasoning and "
+                            "no final answer, despite retries"
+                            + (" and fallback" if agent._fallback_chain else "")
+                            + ". Its last reasoning, which may contain the "
+                            "answer:\n\n"
+                            + reasoning_preview
+                        )
+                    else:
+                        final_response = "(empty)"
                     break
                 
                 # Reset retry counter/signature on successful content

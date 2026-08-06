@@ -1159,7 +1159,10 @@ def _emit_post_tool_call_hook(
     listener will actually consume it).
     """
     try:
-        from hermes_cli.plugins import has_hook, invoke_hook
+        # Route through the lifecycle facade so built-in observers and plugin
+        # hooks share one post-tool event (and so recovery paths cannot bypass
+        # first-party telemetry by calling the plugin manager directly).
+        from hermes_cli.lifecycle import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
             return
         if status is None:
@@ -1423,47 +1426,6 @@ def handle_function_call(
                 )
                 return result
 
-        # ACP/Zed edit approval runs before any file mutation.  The requester
-        # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
-        # are unaffected when it is unset.
-        try:
-            from acp_adapter.edit_approval import maybe_require_edit_approval
-
-            edit_block_message = maybe_require_edit_approval(function_name, function_args)
-            if edit_block_message is not None:
-                _emit_post_tool_call_hook(
-                    function_name=function_name,
-                    function_args=function_args,
-                    result=edit_block_message,
-                    task_id=task_id,
-                    session_id=session_id,
-                    tool_call_id=tool_call_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    status="blocked",
-                    error_type="edit_approval_denied",
-                    middleware_trace=list(_tool_middleware_trace),
-                )
-                return edit_block_message
-        except Exception as _edit_approval_err:
-            logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
-            if function_name in {"write_file", "patch"}:
-                result = tool_error("Edit approval denied: approval guard failed")
-                _emit_post_tool_call_hook(
-                    function_name=function_name,
-                    function_args=function_args,
-                    result=result,
-                    task_id=task_id,
-                    session_id=session_id,
-                    tool_call_id=tool_call_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    status="blocked",
-                    error_type="edit_approval_error",
-                    middleware_trace=list(_tool_middleware_trace),
-                )
-                return result
-
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:
@@ -1598,6 +1560,24 @@ def handle_function_call(
             return result
         function_args = _tool_effective_args
 
+        _observer_status = None
+        _observer_error_type = None
+        _observer_error_message = None
+        try:
+            _parsed_result = json.loads(result) if isinstance(result, str) else None
+            _edit_error = (
+                _parsed_result.get("error")
+                if isinstance(_parsed_result, dict)
+                else None
+            )
+            if isinstance(_edit_error, str) and _edit_error.startswith(
+                "Edit approval denied"
+            ):
+                _observer_status = "blocked"
+                _observer_error_type = "edit_approval_denied"
+                _observer_error_message = _edit_error
+        except Exception:
+            pass
         _emit_post_tool_call_hook(
             function_name=function_name,
             function_args=function_args,
@@ -1608,6 +1588,9 @@ def handle_function_call(
             turn_id=turn_id,
             api_request_id=api_request_id,
             duration_ms=duration_ms,
+            status=_observer_status,
+            error_type=_observer_error_type,
+            error_message=_observer_error_message,
             middleware_trace=list(_tool_middleware_trace),
         )
 

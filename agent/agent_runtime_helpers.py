@@ -3006,6 +3006,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                original_function_args=function_args,
+                on_authorized=None,
             )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
@@ -3031,6 +3033,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         tool_call_id=tool_call_id or "",
         turn_id=getattr(agent, "_current_turn_id", "") or "",
         api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        final_dispatch=agent_runtime_owns_post_tool_hook(agent, function_name),
     )
 
 

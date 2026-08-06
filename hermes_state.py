@@ -9059,6 +9059,73 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def update_meta(self, key: str, transform: Callable[[Optional[str]], Optional[str]]) -> Optional[str]:
+        """Atomically transform one metadata value and return its new value.
+
+        ``state_meta`` is used as a small cross-process coordination store, so
+        a read followed by a separate ``set_meta`` would lose concurrent
+        updates.  Execute the read, callback, and write in one transaction.
+        Returning ``None`` from ``transform`` removes the key.
+        """
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+            current = row["value"] if row is not None else None
+            value = transform(current)
+            if value is None:
+                conn.execute("DELETE FROM state_meta WHERE key = ?", (key,))
+                return None
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
+            return str(value)
+
+        return self._execute_write(_do)
+
+    def move_meta_if_absent(
+        self,
+        source_key: str,
+        target_key: str,
+        source_transform: Callable[[Optional[str]], Optional[str]],
+    ) -> bool:
+        """Move a metadata value to an empty target without overwriting it.
+
+        The source is transformed in place (the callback receives its current
+        value), while the original value is copied to ``target_key``.  The
+        existence check, copy, and source update are one transaction, so only
+        one concurrent caller can claim a target.
+        """
+        def _do(conn):
+            target = conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?", (target_key,)
+            ).fetchone()
+            if target is not None:
+                return False
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (source_key,)
+            ).fetchone()
+            if row is None:
+                return False
+            source_value = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (target_key, source_value),
+            )
+            transformed = source_transform(source_value)
+            if transformed is None:
+                conn.execute("DELETE FROM state_meta WHERE key = ?", (source_key,))
+            else:
+                conn.execute(
+                    "UPDATE state_meta SET value = ? WHERE key = ?",
+                    (str(transformed), source_key),
+                )
+            return True
+
+        return bool(self._execute_write(_do))
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban``.
 

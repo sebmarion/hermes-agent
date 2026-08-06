@@ -1781,12 +1781,19 @@ def init_agent(
     if not isinstance(_agent_section, dict):
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+    # Delegated workers are execution agents by contract: even when the parent
+    # profile disables the user-facing enforcement guidance, a subagent must
+    # still receive the execution semantics needed to complete its assignment.
+    if getattr(agent, "platform", None) == "subagent":
+        agent._tool_use_enforcement = True
 
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of
     # model-name substrings.  Resolved against the active api_mode/model in the
     # conversation loop's intent-ack block.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
+    if getattr(agent, "platform", None) == "subagent":
+        agent._intent_ack_continuation = True
 
     # Universal task-completion guidance toggle.  Default True.  Surfaced
     # as a separate flag from tool_use_enforcement because the guidance

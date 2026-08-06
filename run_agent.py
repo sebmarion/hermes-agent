@@ -3153,6 +3153,7 @@ class AIAgent:
         if _steer_lock is not None:
             with _steer_lock:
                 self._pending_steer = None
+        return True
 
     def steer(self, text: str) -> bool:
         """
@@ -3189,6 +3190,103 @@ class AIAgent:
             else:
                 self._pending_steer = cleaned
         return True
+
+    def redirect(self, text: str) -> bool:
+        """Redirect the active model request without ending the turn.
+
+        A correction arriving while tools run degrades to the existing safe
+        ``steer`` boundary. During a live model request it queues the correction
+        and interrupts only that request; the conversation loop then rebuilds a
+        role-safe checkpoint and retries the same logical iteration.
+        """
+        if not text or not text.strip():
+            return False
+        cleaned = text.strip()
+
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            session = getattr(self, "_codex_session", None)
+            native_steer = getattr(session, "request_steer", None)
+            if callable(native_steer):
+                lock = getattr(self, "_pending_redirect_lock", None)
+                if lock is not None:
+                    with lock:
+                        if self._interrupt_requested:
+                            return False
+                elif self._interrupt_requested:
+                    return False
+                try:
+                    return bool(native_steer(cleaned))
+                except Exception:
+                    logger.debug("Codex app-server turn/steer failed", exc_info=True)
+                    return False
+
+        if getattr(self, "_executing_tools", False):
+            return self.steer(cleaned)
+
+        model_active = getattr(self, "_model_request_active", None)
+        lock = getattr(self, "_pending_redirect_lock", None)
+        if lock is None:
+            if model_active is None or not model_active.is_set():
+                return False
+            existing = getattr(self, "_pending_redirect", None)
+            if self._interrupt_requested and not existing:
+                return False
+            self._pending_redirect = (
+                f"{existing}\n\n[Additional user correction]\n{cleaned}"
+                if existing
+                else cleaned
+            )
+            self._interrupt_requested = True
+            self._interrupt_message = None
+        else:
+            with lock:
+                if model_active is None or not model_active.is_set():
+                    return False
+                if self._interrupt_requested and not self._pending_redirect:
+                    return False
+                if self._pending_redirect:
+                    self._pending_redirect = (
+                        f"{self._pending_redirect}\n\n"
+                        f"[Additional user correction]\n{cleaned}"
+                    )
+                else:
+                    self._pending_redirect = cleaned
+                self._interrupt_requested = True
+                self._interrupt_message = None
+
+        execution_thread_id = getattr(self, "_execution_thread_id", None)
+        if execution_thread_id is not None:
+            _set_interrupt(True, execution_thread_id)
+            self._interrupt_thread_signal_pending = False
+        else:
+            self._interrupt_thread_signal_pending = True
+        abort_active_request = getattr(self, "_active_request_abort", None)
+        if callable(abort_active_request):
+            try:
+                abort_active_request("redirect_abort")
+            except Exception:
+                logger.debug("Failed to abort request for redirect", exc_info=True)
+        return True
+
+    def _has_pending_redirect(self) -> bool:
+        """Return whether an active-turn correction is waiting to be applied."""
+        lock = getattr(self, "_pending_redirect_lock", None)
+        if lock is None:
+            return bool(getattr(self, "_pending_redirect", None))
+        with lock:
+            return bool(self._pending_redirect)
+
+    def _drain_pending_redirect(self) -> Optional[str]:
+        """Return and clear the pending active-turn correction."""
+        lock = getattr(self, "_pending_redirect_lock", None)
+        if lock is None:
+            text = getattr(self, "_pending_redirect", None)
+            self._pending_redirect = None
+            return text
+        with lock:
+            text = self._pending_redirect
+            self._pending_redirect = None
+        return text
 
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
@@ -3626,6 +3724,11 @@ class AIAgent:
     def get_rate_limit_state(self):
         """Return the last captured RateLimitState, or None."""
         return self._rate_limit_state
+
+    def _capture_anthropic_response_headers(self, http_response: Any) -> None:
+        """Capture rate-limit and credits state from an Anthropic response."""
+        self._capture_rate_limits(http_response)
+        self._capture_credits(http_response)
 
     def _capture_credits(self, http_response: Any) -> None:
         """Parse x-nous-credits-* headers, cache CreditsState, fire threshold notices.
@@ -6594,7 +6697,7 @@ class AIAgent:
         else:
             requested_effort = "medium"
 
-        if requested_effort == "xhigh" and "high" in supported_efforts:
+        if requested_effort == "xhigh" and "xhigh" not in supported_efforts and "high" in supported_efforts:
             requested_effort = "high"
         elif requested_effort not in supported_efforts:
             if requested_effort == "minimal" and "low" in supported_efforts:
