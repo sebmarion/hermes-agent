@@ -145,7 +145,7 @@ class TestCronCreateLifecycleBlock:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         scripts_dir = tmp_path / ".hermes" / "scripts"
         scripts_dir.mkdir(parents=True)
-        (scripts_dir / "restart.sh").write_text("#!/bin/bash\nhermes gateway restart\n")
+        (scripts_dir / "restart.sh").write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
         args = Namespace(
             cron_command="create",
             schedule="1h",
@@ -302,7 +302,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         import tools.terminal_tool as tt
 
         script = tmp_path / "delayed-ops.sh"
-        script.write_text("#!/bin/bash\nsleep 45\nhermes gateway restart\n")
+        script.write_text("#!/bin/bash\nsleep 45\nhermes gateway restart\n", encoding="utf-8")
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
@@ -314,7 +314,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         import tools.terminal_tool as tt
 
         script = tmp_path / "health-check.sh"
-        script.write_text("#!/bin/bash\nprintf 'healthy\\n'\n")
+        script.write_text("#!/bin/bash\nprintf 'healthy\\n'\n", encoding="utf-8")
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(
@@ -392,7 +392,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         import tools.terminal_tool as tt
 
         script = tmp_path / "relative.sh"
-        script.write_text("#!/bin/bash\nhermes gateway restart\n")
+        script.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
 
         class _FakeEnv:
             env = {}
@@ -411,7 +411,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         import tools.terminal_tool as tt
 
         script = tmp_path / "delayed.sh"
-        script.write_text("#!/bin/bash\nhermes gateway stop\n")
+        script.write_text("#!/bin/bash\nhermes gateway stop\n", encoding="utf-8")
         script.chmod(0o700)
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
@@ -434,7 +434,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         import tools.terminal_tool as tt
 
         script = tmp_path / "options.sh"
-        script.write_text("#!/bin/bash\nhermes gateway restart\n")
+        script.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(
@@ -447,7 +447,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         import tools.terminal_tool as tt
 
         script = tmp_path / "nested.sh"
-        script.write_text("#!/bin/bash\nlaunchctl submit -l ai.hermes.loop -- /bin/true\n")
+        script.write_text("#!/bin/bash\nlaunchctl submit -l ai.hermes.loop -- /bin/true\n", encoding="utf-8")
 
         class _FakeEnv:
             env = {}
@@ -467,9 +467,9 @@ class TestTerminalToolGatewayLifecycleGuard:
         import tools.terminal_tool as tt
 
         inner = tmp_path / "inner.sh"
-        inner.write_text("#!/bin/bash\nhermes gateway restart\n")
+        inner.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
         outer = tmp_path / "outer.sh"
-        outer.write_text("#!/bin/bash\n/bin/bash inner.sh\n")
+        outer.write_text("#!/bin/bash\n/bin/bash inner.sh\n", encoding="utf-8")
 
         class _FakeEnv:
             env = {}
@@ -521,7 +521,7 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         calls = []
         script = tmp_path / "health-check.sh"
-        script.write_text("#!/bin/bash\nprintf 'healthy\\n'\n")
+        script.write_text("#!/bin/bash\nprintf 'healthy\\n'\n", encoding="utf-8")
 
         class _FakeEnv:
             env = {}
@@ -582,7 +582,7 @@ class TestLifecycleGuardModule:
     def test_script_with_command_raises(self, tmp_path, monkeypatch):
         from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
         script = tmp_path / "restart.sh"
-        script.write_text("#!/bin/bash\nhermes gateway restart\n")
+        script.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("clean prompt", str(script))
 
@@ -606,7 +606,7 @@ class TestLifecycleGuardModule:
     ):
         from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
         script = tmp_path / "persistent.sh"
-        script.write_text(f"#!/bin/bash\n{line}\n")
+        script.write_text(f"#!/bin/bash\n{line}\n", encoding="utf-8")
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("clean prompt", str(script))
 
@@ -615,7 +615,7 @@ class TestLifecycleGuardModule:
         script to slip through."""
         from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
         script = tmp_path / "ops.sh"
-        script.write_text("hermes gateway stop\n")
+        script.write_text("hermes gateway stop\n", encoding="utf-8")
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops job", str(script))
 
@@ -672,7 +672,7 @@ class TestLifecycleGuardModule:
         by the direct regex scan."""
         from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
         script = tmp_path / "evil.py"
-        script.write_text('import os\nos.system("hermes gateway restart")\n')
+        script.write_text('import os\nos.system("hermes gateway restart")\n', encoding="utf-8")
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("clean prompt", str(script))
 
@@ -695,15 +695,201 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_nul_byte_in_path_token_does_not_crash_guard(self):
+        """Residual #76762 class: when a NUL byte survives into the *path
+        token itself* (tokenized binary-adjacent command text), ``os.open``
+        raises ValueError — not OSError — inside
+        ``_read_referenced_script``. The guard must treat it as "nothing to
+        scan", never crash.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash ./run\x00me.sh", cwd="/tmp"
+        )
+        assert result is False
+
+    def test_read_referenced_script_tolerates_nul_in_path(self):
+        """#77703: _read_referenced_script opens by path. A path with an
+        embedded NUL byte (a binary's bytes mis-tokenized into a bogus path by
+        the recursion) makes os.open raise ValueError — not OSError — which used
+        to escape the OSError-only guard and crash the whole terminal tool. It
+        is now caught and reported as nothing-to-scan."""
+        from pathlib import Path
+
+        from cron.lifecycle_guard import _read_referenced_script
+
+        text, unsafe = _read_referenced_script(Path("/tmp/hermes\x00binary"))
+        assert text is None
+        assert unsafe is False
+
+    def test_remote_read_fallback_binary_does_not_crash_guard(self):
+        """#77703: in the gateway the referenced-script walk carries a
+        ``read_remote_script`` fallback (SSH/Modal/Daytona backends read the
+        script over the wire). When the referenced path is an ELF binary, that
+        fallback returned the binary's decoded bytes; the scanner then
+        tokenized machine code into bogus NUL-bearing paths and crashed with
+        ``ValueError: embedded null byte`` (the tool errored out, the command
+        never ran). The guard must tolerate binary content from the fallback
+        and return False without raising."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        # Simulates the pre-fix _read_script_in_env handing back an ELF's
+        # decoded bytes (NUL preserved through errors="replace"). The newline
+        # puts a NUL-bearing absolute path in command position, exactly how the
+        # recursion re-tokenized machine code into a bogus script reference.
+        binary_blob = "\x7fELF\x01\x01\n/opt/bin/tool\x00\x01 --run\n"
+
+        def _remote_read(_path: str):
+            return binary_blob
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "/home/zedi/venv/bin/python --version",
+            read_remote_script=_remote_read,
+        )
+        assert result is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
         from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
         script = tmp_path / "wrapper.sh"
-        script.write_text("#!/bin/bash\n./deploy.sh\n")
-        (tmp_path / "deploy.sh").write_text("#!/bin/bash\nhermes gateway stop\n")
+        script.write_text("#!/bin/bash\n./deploy.sh\n", encoding="utf-8")
+        (tmp_path / "deploy.sh").write_text("#!/bin/bash\nhermes gateway stop\n", encoding="utf-8")
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops", str(script))
+
+    # -- Whole-class regression tests (tilllt's T1-T4 on PR #79454) --------
+
+    def test_tilde_nul_candidate_does_not_crash_terminal_walk(self):
+        """T1: ``Path('~user\\x00...').expanduser()`` raises ValueError one
+        frame *before* ``os.open`` — the per-syscall guards never see it. The
+        ingestion-boundary sanitizer must reject the candidate instead."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "'~jenkins\x00broken/payload.sh' arg", cwd="/tmp"
+        )
+        assert result is False
+
+    def test_tilde_nul_candidate_does_not_crash_cron_script_resolution(self):
+        """T2: the same ``expanduser`` crash via the cron ``script`` path
+        (``_resolve_script_path`` / ``check_gateway_lifecycle``)."""
+        from cron.lifecycle_guard import check_gateway_lifecycle
+
+        # Must neither raise ValueError nor block: an unresolvable script
+        # value has nothing to scan, and scheduler path validation reports
+        # the bad path separately.
+        check_gateway_lifecycle("daily ops", "~jenkins\x00broken/payload.sh")
+
+    def test_binary_from_remote_callback_never_false_positives(self):
+        """T3: a ``read_remote_script`` callback returning NUL-bearing binary
+        text that *happens to contain* a lifecycle-looking fragment must be
+        skipped as binary at the recursion boundary — not matched and
+        blocked. Hardening one callback (#79454) left every other current or
+        future callback exposed; the boundary sanitizer covers them all."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        def _remote_read(_path: str):
+            return "MZ\x00\x00\x90\x00 hermes gateway restart \x00\x00junk"
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /nonexistent/dir/helper.sh",
+            cwd="/tmp",
+            read_remote_script=_remote_read,
+        )
+        assert result is False
+
+    def test_oversized_remote_callback_text_fails_closed(self):
+        """T4: >1 MiB of NUL-free text from a remote callback must follow the
+        local-read contract (oversized regular file → fail closed, #76762)
+        instead of being scanned unbounded — the 179 MiB case from #77729."""
+        from cron.lifecycle_guard import (
+            _MAX_REFERENCED_SCRIPT_BYTES,
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        big = "x" * (_MAX_REFERENCED_SCRIPT_BYTES + 1)
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /nonexistent/dir/big_helper.sh",
+            cwd="/tmp",
+            read_remote_script=lambda _path: big,
+        )
+        assert result is True
+
+    def test_guard_is_total_against_adversarial_inputs(self, monkeypatch):
+        """The public guard is a total function: no input may raise. Covers
+        the residual class beyond the four named sites — including
+        ``expanduser`` RuntimeError when HOME is unset under launchd."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        monkeypatch.delenv("HOME", raising=False)
+        adversarial = [
+            "'~\x00' run",
+            "bash '~user\x00/x.sh'",
+            "source /tmp/e\x00vil.sh",
+            "sh ~/scripts/anything.sh",  # HOME unset → RuntimeError pre-fix
+            ". '\x00\x00\x00'",
+            "bash " + "A" * 5000 + ".sh",  # over-long path → OSError
+        ]
+        for command in adversarial:
+            # Must return a bool, never raise.
+            verdict = contains_gateway_lifecycle_command_or_referenced_script(
+                command, cwd="/tmp"
+            )
+            assert verdict is False
+
+    def test_walk_crash_falls_back_to_direct_scan_verdict(self, monkeypatch):
+        """If the best-effort walk itself crashes, the guard logs and falls
+        back to the direct-scan verdict instead of propagating — a guard
+        crash breaks every terminal command until gateway restart (#77780),
+        strictly worse than either verdict."""
+        import cron.lifecycle_guard as lg
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("sibling site nobody found yet")
+
+        monkeypatch.setattr(lg, "_contains_unsafe_gateway_action", _boom)
+        # Direct scan still blocks a literal lifecycle command...
+        assert lg.contains_gateway_lifecycle_command_or_referenced_script(
+            "hermes gateway restart"
+        ) is True
+        # ...and a benign command fails open instead of crashing.
+        assert lg.contains_gateway_lifecycle_command_or_referenced_script(
+            "echo hello"
+        ) is False
+
+    def test_cron_guard_total_when_home_unresolvable(self, monkeypatch):
+        """`get_hermes_home()` falls back to Path.home(), which raises
+        RuntimeError when neither HERMES_HOME nor HOME resolves
+        (arbitrary-UID containers, launchd). The cron entry point must
+        treat a relative script value as unresolvable — nothing to scan —
+        not crash."""
+        from pathlib import Path
+
+        from cron.lifecycle_guard import check_gateway_lifecycle
+
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setattr(
+            Path,
+            "home",
+            classmethod(
+                lambda cls: (_ for _ in ()).throw(
+                    RuntimeError("Could not determine home directory")
+                )
+            ),
+        )
+        # Must not raise; relative script cannot resolve without a home.
+        check_gateway_lifecycle("daily ops", "relative-script.sh")
 
 
 # ---------------------------------------------------------------------------
@@ -800,7 +986,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         import tools.terminal_tool as tt
 
         # Path only exists on the remote backend; locally it is absent, so the
-        # guard must fall back to env.execute('cat ...') to scan it.
+        # guard must fall back to a bounded env.execute('head -c ...') read.
         script = "/remote/workspace/remote.sh"
         calls = []
 
@@ -809,7 +995,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             cwd = str(tmp_path)
             def execute(self, command, **kwargs):
                 calls.append(command)
-                if "cat" in command and "/remote/workspace/remote.sh" in command:
+                if "head -c" in command and "/remote/workspace/remote.sh" in command:
                     return {"output": "#!/bin/bash\\nhermes gateway restart\\n", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
@@ -821,7 +1007,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
-        assert any("cat" in c for c in calls)
+        assert any("head -c" in c for c in calls)
 
 
 class TestCronCreateLifecycleBlockExtra:
@@ -837,8 +1023,8 @@ class TestCronCreateLifecycleBlockExtra:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         scripts_dir = tmp_path / ".hermes" / "scripts"
         scripts_dir.mkdir(parents=True)
-        (scripts_dir / "inner.sh").write_text("#!/bin/bash\nhermes gateway restart\n")
-        (scripts_dir / "outer.sh").write_text("#!/bin/bash\n/bin/bash inner.sh\n")
+        (scripts_dir / "inner.sh").write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
+        (scripts_dir / "outer.sh").write_text("#!/bin/bash\n/bin/bash inner.sh\n", encoding="utf-8")
         args = Namespace(
             cron_command="create",
             schedule="1h",
