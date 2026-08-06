@@ -1392,6 +1392,35 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertNotIn("acp_args", task_props)
 
 
+class TestChildSessionVisibility(unittest.TestCase):
+    def test_delegate_child_is_marked_for_creation_time_archival(self):
+        """Delegate children must be born archived on every UI surface."""
+        class FakeChild:
+            def __init__(self):
+                self.session_id = "child-session"
+                self._session_init_model_config = {}
+
+        parent = _make_mock_parent(depth=0)
+        parent.session_id = "parent-session"
+        parent.enabled_toolsets = ["terminal"]
+        parent.disabled_toolsets = []
+        parent._current_turn_id = "parent-turn"
+
+        with patch("run_agent.AIAgent", return_value=FakeChild()):
+            child = _build_child_agent(
+                task_index=0,
+                goal="keep this child out of session sidebars",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=3,
+                task_count=1,
+                parent_agent=parent,
+            )
+
+        self.assertIs(child._auto_archive_session, True)
+
+
 # Sentinel used to distinguish "role kwarg omitted" from "role=None".
 _SENTINEL = object()
 

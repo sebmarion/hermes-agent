@@ -1777,6 +1777,12 @@ def _build_child_agent(
     parent_sid = getattr(parent_agent, "session_id", None)
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
+        # Born-archived: delegate subagent sessions should never appear in
+        # sidebars. list_sessions_rich hides them via _delegate_from, but the
+        # desktop app reads from its own in-memory store and bypasses that
+        # filter. Setting archived=1 at row creation ensures all UI surfaces
+        # hide the session without needing a cron sweep.
+        child._auto_archive_session = True
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
