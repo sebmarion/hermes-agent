@@ -36,7 +36,9 @@ import { resolveSessionProfile } from '../use-session-actions/utils'
 
 import { finalizeInterruptedMessages } from './rewind'
 import {
-  _submitInFlight,
+  _submitInFlightAdd,
+  _submitInFlightDelete,
+  _submitInFlightHas,
   type GatewayRequest,
   inlineErrorMessage,
   isGatewayTimeoutError,
@@ -294,17 +296,17 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // session switch; this per-session lock makes that safe.
       const submitLockKey = targetStoredSessionId || sessionId || startingActiveSessionId || '__pending_new__'
 
-      if (_submitInFlight.has(submitLockKey)) {
+      if (_submitInFlightHas(submitLockKey)) {
         return false
       }
 
-      _submitInFlight.add(submitLockKey)
+      _submitInFlightAdd(submitLockKey)
       let submitLockReleased = false
 
       const releaseSubmitLock = () => {
         if (!submitLockReleased) {
           submitLockReleased = true
-          _submitInFlight.delete(submitLockKey)
+          _submitInFlightDelete(submitLockKey)
         }
       }
 

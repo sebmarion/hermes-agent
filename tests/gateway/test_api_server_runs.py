@@ -69,6 +69,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
+    app.router.add_post("/v1/runs/{run_id}/release-checkpoint", adapter._handle_release_checkpoint_steer)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
@@ -473,6 +474,48 @@ class TestRunLifecycleSweep:
 # ---------------------------------------------------------------------------
 # POST /v1/runs/{run_id}/stop — interrupt a running agent
 # ---------------------------------------------------------------------------
+
+
+class TestReleaseCheckpointSteer:
+    @pytest.mark.asyncio
+    async def test_steer_targets_exact_live_run_and_session(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        adapter._active_run_agents["run_exact"] = agent
+        adapter._run_statuses["run_exact"] = {
+            "run_id": "run_exact",
+            "session_id": "session_exact",
+            "status": "running",
+        }
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_exact/release-checkpoint",
+                json={
+                    "session_id": "session_exact",
+                    "text": "HERMES_RELEASE_PAUSED_V1 transaction=tx",
+                },
+            )
+            assert response.status == 200
+            assert (await response.json())["status"] == "accepted"
+        agent.steer.assert_called_once_with(
+            "HERMES_RELEASE_PAUSED_V1 transaction=tx"
+        )
+
+    @pytest.mark.asyncio
+    async def test_steer_rejects_owner_change(self, adapter):
+        app = _create_runs_app(adapter)
+        adapter._run_statuses["run_exact"] = {
+            "run_id": "run_exact",
+            "session_id": "session_other",
+            "status": "running",
+        }
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_exact/release-checkpoint",
+                json={"session_id": "session_exact", "text": "marker"},
+            )
+            assert response.status == 409
 
 
 class TestStopRun:

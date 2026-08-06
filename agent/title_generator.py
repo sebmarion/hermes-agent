@@ -32,6 +32,46 @@ _TITLE_PROMPT = (
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
 
+
+def _fallback_title_from_message(user_message: str) -> Optional[str]:
+    """Derive a fallback title from the first user message.
+
+    Used when LLM title generation fails. Strips skill-injection wrappers
+    (``[IMPORTANT: ...]``, ``[System: ...]``), slash-command prefixes, and
+    collapses whitespace so the session is identifiable in the sidebar
+    instead of showing a generic source-based label.
+    """
+    if not user_message:
+        return None
+    text = str(user_message).strip()
+    if not text:
+        return None
+    # Strip leading ``[IMPORTANT: ...]`` / ``[System: ...]`` blocks that
+    # skill invocations inject — the real user prompt follows them.
+    import re
+    while text.startswith("["):
+        end = text.find("]")
+        if end == -1:
+            break
+        text = text[end + 1:].strip()
+    # Strip YAML frontmatter blocks that follow skill-injection ``---``
+    # markers. A frontmatter block starts with ``---`` and ends at the next
+    # ``---``. Everything inside is metadata (name:, description:, etc.).
+    text = re.sub(r"(?:^|\n)\s*---+\s*\n.*?\n\s*---+\s*(?:\n|$)", " ", text, flags=re.DOTALL)
+    # Also strip any remaining standalone ``---`` separators, including
+    # leading ones at the very start of the text (after bracket stripping).
+    text = re.sub(r"(?:^|\n)\s*---+\s*(?:\n|$)", " ", text)
+    # Strip YAML frontmatter ``key: value`` lines that survived because
+    # the ``---`` block was never closed.
+    text = re.sub(r"^\s*(?:name|description|version|author|license|platforms|metadata|tags|related_skills|category|file_path):\s.*(?:\n|$)", "", text, flags=re.MULTILINE)
+    # Collapse whitespace and take the first meaningful line.
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if len(text) > 80:
+        text = text[:77] + "..."
+    return text
+
 _TITLE_PROMPT_PINNED_LANGUAGE = (
     "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
     "following exchange. The title should capture the main topic or intent. "
@@ -337,7 +377,15 @@ def _auto_title_session(
         runtime_validator=runtime_validator,
     )
     if not title:
-        return
+        # LLM title generation failed (quota, timeout, empty response, etc.).
+        # Fall back to a truncated first user message so the session never
+        # appears as "Desktop Session" / "Cli Session" in the sidebar —
+        # which is what both the WebUI and desktop app substitute when the
+        # title column is NULL. This matches what every chat UI does when
+        # auto-title fails.
+        title = _fallback_title_from_message(user_message)
+        if not title:
+            return
 
     try:
         persisted = _persist_session_title(session_db, session_id, title)

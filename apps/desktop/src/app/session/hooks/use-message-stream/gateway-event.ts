@@ -15,7 +15,6 @@ import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
-import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { type AgentNoticePayload, clearAgentNotice, nativeNoticeInput, showAgentNotice } from '@/store/agent-notices'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
@@ -119,28 +118,6 @@ function surfaceBillingBlock(sessionId: string, raw: unknown): void {
     action: { label: billingCtaLabel(block, ctaCopy), onClick: () => runBillingRecovery(block) }
   })
 }
-
-/**
- * Events that retire a "drafting a tool call" claim.
- *
- * `tool.generating` opens the claim and nothing closes it — a draft can be
- * abandoned without ever reaching `tool.start`, so enumerating the ways one
- * *ends* left the label on screen for the rest of the turn. Inverted: the
- * claim only covers what the model is emitting right now, and any other output
- * from the session proves it moved on. Same rule the TUI applies to its
- * transient trail lines (`turnController.pruneTransient`).
- */
-const DRAFT_SUPERSEDING_EVENT_TYPES = new Set([
-  'error',
-  'message.complete',
-  'message.delta',
-  'message.start',
-  'reasoning.delta',
-  'thinking.delta',
-  'tool.complete',
-  'tool.progress',
-  'tool.start'
-])
 
 const COMPACTION_RESUME_EVENT_TYPES = new Set([
   'message.delta',
@@ -272,6 +249,15 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       const sessionId = route.sessionId
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
+      if (sessionId) {
+        if (event.type === 'tool.generating') {
+          const name = typeof payload?.name === 'string' ? payload.name : ''
+          setSessionDraftingTool(sessionId, sessionInterrupted(sessionId) ? '' : name)
+        } else {
+          setSessionDraftingTool(sessionId, '')
+        }
+      }
+
       // Mid-turn compaction does not emit another message.start. The first
       // model output or tool event proves summarization has finished and the
       // turn has resumed, so retire the phase label without waiting for the
@@ -280,17 +266,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         setSessionCompacting(sessionId, false)
       }
 
-      if (sessionId && DRAFT_SUPERSEDING_EVENT_TYPES.has(event.type)) {
-        setSessionDraftingTool(sessionId, '')
-      }
-
       if (event.type === 'gateway.ready') {
         // Seed the active skin into the desktop theme registry without applying,
         // so a fresh connect never overrides the user's persisted desktop theme.
         ingestBackendSkin((payload as { skin?: HermesSkin } | undefined)?.skin, { apply: false })
-        // Backends with the change watcher broadcast pet/cron/sessions change
-        // events; consumers demote their legacy polls to slow backstops.
-        setChangeEventsAvailable(Boolean((payload as { change_events?: boolean } | undefined)?.change_events))
 
         return
       } else if (event.type === 'skin.changed') {
@@ -539,7 +518,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         flushQueuedDeltas(sessionId)
-        pruneFinishedSessionSubagents(sessionId)
+        clearSessionSubagents(sessionId)
         setSessionCompacting(sessionId, false)
         compactedTurnRef.current.delete(sessionId)
         nativeSubagentSessionsRef.current.delete(sessionId)
@@ -633,7 +612,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           const header = idx && cnt ? `◇ Reference ${idx}/${cnt} — ${label}` : `◇ Reference — ${label}`
           const body = coerceThinkingText(payload?.text)
           const text = `${header}\n${body}\n\n`
-
           if (idx === undefined || idx <= 1) {
             // First reference: clear any stale reasoning left over from
             // before this turn's references start, same as before.
@@ -671,11 +649,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // block, so the progress trail is self-cleaning.
         if (sessionId && typeof payload?.refs_done === 'number' && typeof payload?.refs_total === 'number') {
           const label = coerceGatewayText(payload?.label)
-
           const line = label
             ? `◇ MoA refs ${payload.refs_done}/${payload.refs_total} — ${label}\n`
             : `◇ MoA refs ${payload.refs_done}/${payload.refs_total}\n`
-
           appendReasoningDelta(sessionId, line, payload.refs_done <= 1)
           flushQueuedDeltas(sessionId)
         }
@@ -700,6 +676,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           return
         }
 
+        const autoContinuing = payload?.auto_continuing === true
+
         // Turn ended — drop any blocking prompt still open for THIS session
         // (e.g. interrupted, or the approval already resolved). Scoped to the
         // session so a background turn finishing can't wipe the active chat's
@@ -709,27 +687,26 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // Turn ended without a final `todo` update — drop a still-unfinished
         // list so "Tasks N/M" doesn't stay pinned above the composer with the
         // last item stuck pending/in_progress. Finished lists keep their linger.
-        clearActiveSessionTodos(sessionId)
+        if (!autoContinuing) {
+          clearActiveSessionTodos(sessionId)
+        }
         setSessionCompacting(sessionId, false)
 
         flushQueuedDeltas(sessionId)
 
         // Keyed by session so only one window beeps when several are open.
-        playCompletionSound(sessionId)
+        if (!payload?.auto_continuing) {
+          playCompletionSound(sessionId)
+        }
 
         const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
-
-        // Terminal error frames (status "error") carry the failure in
-        // structured fields: `error` is the message, and `partial` marks
-        // `text` as streamed output to keep rather than the error string.
         const failure =
           payload?.status === 'error'
             ? {
-                error: coerceGatewayText(payload.error).trim() || finalText || 'Hermes reported an error',
-                partial: Boolean(payload.partial)
+                error: typeof payload.error === 'string' && payload.error.trim() ? payload.error : finalText,
+                partial: payload.partial === true
               }
             : undefined
-
         completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure)
 
         // Structured billing wall forwarded by the gateway (out of credits /
@@ -777,26 +754,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (storedId && nextTitle) {
           setSessions(prev => prev.map(s => (sessionMatchesStoredId(s, storedId) ? { ...s, title: nextTitle } : s)))
         }
-      } else if (event.type === 'tool.generating') {
-        // Announced while the model is still emitting the call's JSON, so it
-        // carries a name and nothing else — no id, no args. Materializing a row
-        // from it strands an argless placeholder whenever the bubble is sealed
-        // before the real `tool.start` arrives, because the two can no longer be
-        // reconciled across the boundary. It's a status, so say it as one.
-        // A stopped turn can still emit a frame or two before the backend
-        // notices, and naming a tool we will never run leaves the label up
-        // until something else retires it. `mutateStream` drops late tool rows
-        // on the same condition; the status line has to agree with it.
-        if (!sessionId || sessionInterrupted(sessionId)) {
-          return
-        }
-
-        setSessionDraftingTool(sessionId, typeof payload?.name === 'string' ? payload.name : '')
-
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: false, toolRunning: true })
-        }
-      } else if (event.type === 'tool.start' || event.type === 'tool.progress') {
+      } else if (event.type === 'tool.start' || event.type === 'tool.progress' || event.type === 'tool.generating') {
         if (!sessionId) {
           return
         }
@@ -827,13 +785,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           if (!sessionInterrupted(sessionId) && (payload?.name === 'terminal' || payload?.name === 'process')) {
             void refreshBackgroundProcesses(sessionId)
           }
-        }
-
-        // The agent just created/deleted/renamed a skill, which adds or removes
-        // its `/name` command. Drop the composer's cached `/` list so the new
-        // skill is offerable now rather than after the hour-long TTL.
-        if (payload?.name === 'skill_manage') {
-          invalidateSlashCompletions()
         }
 
         if (typeof payload?.inline_diff === 'string' && payload.inline_diff.trim()) {
@@ -1083,8 +1034,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           // The gateway's notification poller announces background process
           // completions / watch matches here — re-sync the status stack.
           void refreshBackgroundProcesses(sessionId)
-        } else if (sessionId && payload?.kind === 'goal') {
-          applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
         }
       } else if (event.type === 'review.summary') {
         // Self-improvement background review saved something to memory/skills

@@ -38,13 +38,13 @@ gateway:
     prompt_caching_enabled: "Prompt-gyorsítótárazás: bekapcsolva"
     warning_prefix:         "Figyelmeztetés: {warning}"
     saved_global:           "Mentve a config.yaml fájlba (`--global`)"
-    session_only_hint:      "_(csak ehhez a munkamenethez — add hozzá a `--global` opciót a megőrzéshez)_"
+    session_only_hint:      "_(csak ehhez a munkamenethez — a `--global` menti; a `--session` kifejezetten a munkamenetre korlátozza, és elsőbbséget élvez a `--global` opcióval szemben)_"
     current_label:          "Aktuális: `{model}` ezen: {provider}"
     current_tag:            " (aktuális)"
     more_models_suffix:     " (+{count} további)"
-    usage_switch_model:     "`/model <name>` — modell váltása"
+    usage_switch_model:     "`/model <name>` — modellváltás csak ebben a munkamenetben\n`/model <name> --session` — kifejezetten csak a munkamenetre; elsőbbséget élvez a `--global` opcióval szemben"
     usage_switch_provider:  "`/model <name> --provider <slug>` — szolgáltató váltása"
-    usage_persist:          "`/model <name> --global` — megőrzés"
+    usage_persist:          "`/model <name> --global` — szolgáltató/modell/végpont útvonal mentése a config.yaml fájlba"
 
   agents:
     header:                "🤖 **Aktív ügynökök és feladatok**"

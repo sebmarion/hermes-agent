@@ -1,14 +1,18 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
 import logging
+import os
 import sys
 import types
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from hermes_cli import plugins as plugins_mod
 from hermes_cli.plugins import (
     ENTRY_POINTS_GROUP,
     VALID_HOOKS,
@@ -28,6 +32,7 @@ from hermes_cli.middleware import (
     apply_tool_request_middleware,
     run_tool_execution_middleware,
 )
+from hermes_cli.tool_policy import ToolPolicyRegistration
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -230,6 +235,198 @@ class TestPluginDiscovery:
         assert mgr._plugin_skills == {}
         assert mgr._aux_tasks == {}
         assert mgr._slack_action_handlers == []
+
+    def test_force_rediscover_records_the_successful_active_home(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        empty_bundled = tmp_path / "empty-bundled"
+        empty_bundled.mkdir()
+        monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: empty_bundled)
+        monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
+
+        token_a = set_hermes_home_override(home_a)
+        try:
+            manager = PluginManager()
+            manager.discover_and_load()
+            assert manager._discovery_home == str(home_a.resolve())
+
+            token_b = set_hermes_home_override(home_b)
+            try:
+                manager.discover_and_load(force=True)
+                assert manager._discovery_home == str(home_b.resolve())
+            finally:
+                reset_hermes_home_override(token_b)
+        finally:
+            reset_hermes_home_override(token_a)
+
+    def test_discovery_rejects_context_home_drift_and_restores_exact_context(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home = tmp_path / "home-context"
+        drifted_home = tmp_path / "drifted-context"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        token = set_hermes_home_override(home)
+        try:
+            plugin_dir = _make_plugin_dir(
+                home / "plugins",
+                "drifting-plugin",
+            )
+            (plugin_dir / "__init__.py").write_text(
+                "from hermes_constants import set_hermes_home_override\n"
+                f"set_hermes_home_override({str(drifted_home)!r})\n"
+                "def register(ctx):\n    pass\n",
+                encoding="utf-8",
+            )
+            manager = PluginManager()
+
+            with pytest.raises(RuntimeError, match="home changed during discovery"):
+                manager.discover_and_load()
+
+            assert manager._discovery_home is None
+            assert plugins_mod._resolved_hermes_home() == str(home.resolve())
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_discovery_pins_home_across_environment_drift_without_clobber(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home = tmp_path / "home-environment"
+        drifted_home = tmp_path / "drifted-environment"
+        observed_home = tmp_path / "observed-home.txt"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        plugin_dir = _make_plugin_dir(
+            home / "plugins",
+            "drifting-plugin",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "from hermes_constants import get_hermes_home\n"
+            f"os.environ['HERMES_HOME'] = {str(drifted_home)!r}\n"
+            "def register(ctx):\n"
+            f"    Path({str(observed_home)!r}).write_text("
+            "str(get_hermes_home().resolve()), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        manager = PluginManager()
+
+        manager.discover_and_load()
+
+        assert manager._discovery_home == str(home.resolve())
+        assert observed_home.read_text(encoding="utf-8") == str(home.resolve())
+        assert os.environ["HERMES_HOME"] == str(drifted_home)
+
+    def test_force_rediscover_in_safe_mode_clears_prior_home_registries(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        token_a = set_hermes_home_override(home_a)
+        try:
+            manager = PluginManager()
+            manager._discovered = True
+            manager._discovery_home = str(home_a.resolve())
+            manager._plugins["home-a-plugin"] = MagicMock()
+            manager._hooks["pre_llm_call"] = [lambda **_: "home-a"]
+            manager._policy_registrations[("home-a-plugin", "tool_dispatch")] = MagicMock()
+
+            token_b = set_hermes_home_override(home_b)
+            try:
+                monkeypatch.setenv("HERMES_SAFE_MODE", "1")
+                manager.discover_and_load(force=True)
+                assert manager._discovery_home == str(home_b.resolve())
+                assert manager._plugins == {}
+                assert manager._hooks == {}
+                assert manager._policy_registrations == {}
+            finally:
+                reset_hermes_home_override(token_b)
+        finally:
+            reset_hermes_home_override(token_a)
+
+    def test_required_policy_recovery_safe_mode_clears_partial_failed_sweep_state(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        active_home = tmp_path / "active-home"
+        token = set_hermes_home_override(active_home)
+        try:
+            manager = PluginManager()
+            manager._discovered = False
+            manager._discovery_home = None
+            manager._plugins["partial-plugin"] = MagicMock()
+            manager._hooks["pre_llm_call"] = [lambda **_: "partial"]
+            manager._policy_registrations[("partial-plugin", "tool_dispatch")] = MagicMock()
+            monkeypatch.setenv("HERMES_SAFE_MODE", "1")
+
+            manager.discover_and_load()
+
+            assert manager._discovery_home == str(active_home.resolve())
+            assert manager._plugins == {}
+            assert manager._hooks == {}
+            assert manager._policy_registrations == {}
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_required_policy_recovery_replaced_manager_keeps_matching_home_semantics(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hermes_cli.plugins import authorize_required_tool_policies
+        from hermes_cli.tool_policy import PreparedToolRuntime, create_tool_dispatch_policy_input
+
+        home = tmp_path / "home"
+        token = set_hermes_home_override(home)
+        try:
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            _make_plugin_dir(
+                home / "plugins",
+                "ordinary-governor",
+                register_body=(
+                    "ctx.register_policy('tool_dispatch', "
+                    "lambda payload: {'action': 'allow', "
+                    "'policy_binding': payload['policy_binding']})"
+                ),
+                manifest_extra={"policies": ["tool_dispatch"]},
+            )
+            config = yaml.safe_load((home / "config.yaml").read_text())
+            config["plugins"]["required_policies"] = {
+                "ordinary-governor": ["tool_dispatch"]
+            }
+            (home / "config.yaml").write_text(yaml.safe_dump(config))
+
+            manager = PluginManager()
+            manager.discover_and_load()
+            monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+            policy_input = create_tool_dispatch_policy_input(
+                tool_name="terminal",
+                original_args={"command": "true"},
+                effective_args={"command": "true"},
+                task_id="task",
+                session_id="session",
+                turn_id="turn",
+                tool_call_id="call",
+                prepared_runtime=PreparedToolRuntime(
+                    effective_cwd=str(tmp_path),
+                    effective_cwd_source="process_cwd",
+                    effective_cwd_authoritative=True,
+                ),
+            )
+
+            assert authorize_required_tool_policies(policy_input) is None
+        finally:
+            reset_hermes_home_override(token)
 
 
 # ── TestPluginLoading ──────────────────────────────────────────────────────
@@ -1111,3 +1308,263 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+# ── TestRequiredToolPolicy ─────────────────────────────────────────────────
+
+
+class TestRequiredToolPolicy:
+    """Required policies are strict, attributed, and lifecycle-safe."""
+
+    @staticmethod
+    def _parse_manifest(tmp_path, name, manifest_extra):
+        plugin_dir = tmp_path / name
+        plugin_dir.mkdir()
+        manifest_file = plugin_dir / "plugin.yaml"
+        manifest_file.write_text(
+            yaml.safe_dump({"name": name, **manifest_extra}),
+            encoding="utf-8",
+        )
+        return PluginManager()._parse_manifest(
+            manifest_file,
+            plugin_dir,
+            "user",
+            "",
+        )
+
+    @staticmethod
+    def _make_context(*, key="category/test-plugin", declared=True):
+        manager = PluginManager()
+        manifest = PluginManifest(
+            name="test-plugin",
+            key=key,
+            provides_policies=["tool_dispatch"] if declared else [],
+        )
+        return PluginContext(manifest, manager), manager
+
+    def test_manifest_parses_declared_policies_and_defaults_to_empty(
+        self,
+        tmp_path,
+    ):
+        declared = self._parse_manifest(
+            tmp_path,
+            "declared",
+            {"policies": ["tool_dispatch"]},
+        )
+        absent = self._parse_manifest(tmp_path, "absent", {})
+
+        assert declared is not None
+        assert declared.provides_policies == ["tool_dispatch"]
+        assert absent is not None
+        assert absent.provides_policies == []
+
+    @pytest.mark.parametrize(
+        "policies",
+        [
+            None,
+            "tool_dispatch",
+            [1],
+            [""],
+            ["unknown_policy"],
+            ["tool_dispatch", "tool_dispatch"],
+        ],
+    )
+    def test_manifest_rejects_invalid_policy_declarations(
+        self,
+        tmp_path,
+        policies,
+    ):
+        manifest = self._parse_manifest(
+            tmp_path,
+            f"invalid-{len(list(tmp_path.iterdir()))}",
+            {"policies": policies},
+        )
+
+        assert manifest is None
+
+    def test_register_policy_uses_canonical_plugin_key_and_default_timeout(self):
+        callback = lambda payload: {"action": "block", "message": "blocked"}
+        context, manager = self._make_context()
+
+        context.register_policy("tool_dispatch", callback)
+
+        registration = manager.get_policy_registration(
+            "category/test-plugin",
+            "tool_dispatch",
+        )
+        assert registration == ToolPolicyRegistration(
+            plugin_key="category/test-plugin",
+            policy_name="tool_dispatch",
+            callback=callback,
+            timeout_ms=2_000,
+        )
+        assert manager.get_policy_registrations() == (registration,)
+
+    def test_registration_snapshots_are_immutable_and_filtered(self):
+        first_context, manager = self._make_context(key="category/first")
+        second_manifest = PluginManifest(
+            name="second",
+            key="category/second",
+            provides_policies=["tool_dispatch"],
+        )
+        second_context = PluginContext(second_manifest, manager)
+
+        first_context.register_policy("tool_dispatch", lambda payload: None)
+        second_context.register_policy(
+            "tool_dispatch",
+            lambda payload: None,
+            timeout_ms=7_500,
+        )
+
+        snapshot = manager.get_policy_registrations()
+        assert isinstance(snapshot, tuple)
+        assert [item.plugin_key for item in snapshot] == [
+            "category/first",
+            "category/second",
+        ]
+        assert manager.get_policy_registrations("category/second") == (
+            snapshot[1],
+        )
+        with pytest.raises(TypeError):
+            snapshot[0] = snapshot[1]
+        with pytest.raises(FrozenInstanceError):
+            snapshot[0].timeout_ms = 1
+        assert manager.get_policy_registration(
+            "category/first",
+            "tool_dispatch",
+        ).timeout_ms == 2_000
+
+    def test_duplicate_pair_is_rejected_but_different_plugins_can_share_name(self):
+        first_context, manager = self._make_context(key="category/first")
+        second_context = PluginContext(
+            PluginManifest(
+                name="second",
+                key="category/second",
+                provides_policies=["tool_dispatch"],
+            ),
+            manager,
+        )
+
+        first_context.register_policy("tool_dispatch", lambda payload: None)
+        with pytest.raises(ValueError, match="already registered"):
+            first_context.register_policy(
+                "tool_dispatch",
+                lambda payload: None,
+            )
+
+        second_context.register_policy("tool_dispatch", lambda payload: None)
+        assert len(manager.get_policy_registrations()) == 2
+
+    @pytest.mark.parametrize(
+        ("name", "callback", "timeout_ms", "error_type"),
+        [
+            ("unknown", lambda payload: None, 2_000, ValueError),
+            ("tool_dispatch", None, 2_000, TypeError),
+            ("tool_dispatch", lambda payload: None, True, TypeError),
+            ("tool_dispatch", lambda payload: None, 0, ValueError),
+            ("tool_dispatch", lambda payload: None, 10_001, ValueError),
+            ("tool_dispatch", lambda payload: None, 1.5, TypeError),
+        ],
+    )
+    def test_register_policy_rejects_invalid_inputs(
+        self,
+        name,
+        callback,
+        timeout_ms,
+        error_type,
+    ):
+        context, _ = self._make_context()
+
+        with pytest.raises(error_type):
+            context.register_policy(
+                name,
+                callback,
+                timeout_ms=timeout_ms,
+            )
+
+    def test_register_policy_requires_manifest_declaration(self):
+        context, manager = self._make_context(declared=False)
+
+        with pytest.raises(ValueError, match="did not declare"):
+            context.register_policy(
+                "tool_dispatch",
+                lambda payload: None,
+            )
+
+        assert manager.get_policy_registrations() == ()
+
+    def test_force_rediscovery_clears_policy_registrations(self, monkeypatch):
+        context, manager = self._make_context()
+        context.register_policy("tool_dispatch", lambda payload: None)
+        manager._discovered = True
+        monkeypatch.setattr(
+            PluginManager,
+            "_discover_and_load_inner",
+            lambda self: None,
+        )
+
+        manager.discover_and_load(force=True)
+
+        assert manager.get_policy_registrations() == ()
+
+    def test_loaded_plugin_attributes_policy_without_changing_other_counts(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        _make_plugin_dir(
+            hermes_home / "plugins",
+            "policy_plugin",
+            register_body=(
+                "ctx.register_policy('tool_dispatch', lambda payload: None)\n"
+                "    ctx.register_hook('pre_tool_call', lambda **kw: None)\n"
+                "    ctx.register_middleware('tool_request', lambda **kw: None)"
+            ),
+            manifest_extra={"policies": ["tool_dispatch"]},
+        )
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        loaded = manager._plugins["policy_plugin"]
+        info = next(
+            item
+            for item in manager.list_plugins()
+            if item["key"] == "policy_plugin"
+        )
+        assert loaded.policies_registered == ["tool_dispatch"]
+        assert info["policies"] == ["tool_dispatch"]
+        assert info["policy_count"] == 1
+        assert info["hooks"] == 1
+        assert info["middleware"] == 1
+        assert "callback" not in repr(info).lower()
+
+    def test_failed_plugin_load_rolls_back_policy_registration(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        _make_plugin_dir(
+            hermes_home / "plugins",
+            "broken_policy_plugin",
+            register_body=(
+                "ctx.register_policy('tool_dispatch', lambda payload: None)\n"
+                "    raise RuntimeError('boom')"
+            ),
+            manifest_extra={"policies": ["tool_dispatch"]},
+        )
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        loaded = manager._plugins["broken_policy_plugin"]
+        assert loaded.enabled is False
+        assert loaded.error == "boom"
+        assert manager.get_policy_registration(
+            "broken_policy_plugin",
+            "tool_dispatch",
+        ) is None

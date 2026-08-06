@@ -69,7 +69,7 @@ CODING_TOOLSET = "coding"
 # Surfaces where a coding posture makes sense under ``auto``. Messaging
 # platforms (telegram, discord, slack, …) are intentionally absent — a chat bot
 # in a group is not pair-programming.
-INTERACTIVE_CODING_PLATFORMS = {"cli", "tui", "acp", "desktop", ""}
+INTERACTIVE_CODING_PLATFORMS = {"cli", "tui", "acp", "desktop", "api_server", ""}
 
 # Project-root signals that mark a directory as a code workspace even when it
 # isn't (yet) a git repo. Cheap filename checks — no parsing.
@@ -146,8 +146,12 @@ _JS_LOCKFILES = (
 )
 
 # package.json scripts / Makefile targets worth surfacing as verify commands.
-_VERIFY_TARGETS = ("test", "tests", "lint", "typecheck", "check", "build", "fmt", "format")
-_MAX_VERIFY_COMMANDS = 8
+_VERIFY_TARGETS = ("test", "tests", "lint", "typecheck", "check", "build", "fmt", "format", "style")
+# Scripts that start with a verify target followed by a separator are also
+# verify commands (e.g. ``test:unit``, ``test:ci``, ``lint:css``).  This lets
+# projects with namespaced script names produce verification events.
+_VERIFY_PREFIX_SEPARATOR = (":", "-")
+_MAX_VERIFY_COMMANDS = 12
 _MAX_FACT_FILE_BYTES = 256 * 1024
 
 _GIT_TIMEOUT = 2.5
@@ -790,15 +794,52 @@ def detect_project_facts(root: Path) -> ProjectFacts:
     )
 
     verify: list[str] = []
-    if (root / "scripts" / "run_tests.sh").is_file():
-        verify.append("scripts/run_tests.sh")
+    # Common local verify wrapper scripts. Projects routinely wrap the real
+    # suite in scripts/{run_tests,test,check,verify,lint}.sh and AGENTS.md
+    # tells the agent to use the wrapper, so each existing one is a canonical
+    # verify command — otherwise running it records no verification evidence
+    # and the supervision loop re-nags forever.
+    for _script in ("run_tests.sh", "test.sh", "check.sh", "verify.sh", "lint.sh"):
+        if (root / "scripts" / _script).is_file():
+            verify.append(f"scripts/{_script}")
     if (root / "package.json").is_file():
         try:
             scripts = json.loads(_read_small(root / "package.json") or "{}").get("scripts") or {}
         except (json.JSONDecodeError, AttributeError):
             scripts = {}
         js_pm = next((pm for lock, pm in _JS_LOCKFILES if (root / lock).is_file()), "npm")
-        verify.extend(f"{js_pm} run {name}" for name in _VERIFY_TARGETS if name in scripts)
+        # Collect matching script names: exact targets first, then prefixed
+        # variants (test:unit, lint:css, etc.).  Skip nested variants like
+        # ``test:unit:checks`` when ``test:unit`` is already present — they
+        # are typically the underlying command the wrapper delegates to.
+        collected: list[str] = []
+        seen_prefixes: set[str] = set()
+        for name in scripts:
+            is_exact = name in _VERIFY_TARGETS
+            prefixed_by = None
+            for t in _VERIFY_TARGETS:
+                for sep in _VERIFY_PREFIX_SEPARATOR:
+                    if name.startswith(t + sep):
+                        prefixed_by = t
+                        break
+                if prefixed_by:
+                    break
+            if not is_exact and prefixed_by is None:
+                continue
+            # Skip nested variants (test:unit:checks) when the parent (test:unit) exists
+            if prefixed_by and ":" in name[len(prefixed_by) + 1:]:
+                # name is like "test:unit:checks" — skip if "test:unit" is in scripts
+                parent = name.rsplit(":", 1)[0]
+                if parent in scripts:
+                    continue
+            collected.append(name)
+            if prefixed_by:
+                seen_prefixes.add(prefixed_by)
+        # Exact matches take priority, then first-seen prefixed variants
+        exact = [n for n in collected if n in _VERIFY_TARGETS]
+        prefixed = [n for n in collected if n not in _VERIFY_TARGETS]
+        ordered = exact + prefixed
+        verify.extend(f"{js_pm} run {name}" for name in ordered[:_MAX_VERIFY_COMMANDS])
     if (root / "pytest.ini").is_file() or "[tool.pytest" in _read_small(root / "pyproject.toml"):
         verify.append("pytest")
     makefile = _read_small(root / "Makefile")

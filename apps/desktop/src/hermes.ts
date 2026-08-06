@@ -51,6 +51,7 @@ import type {
   ProfilesResponse,
   SessionInfo,
   SessionMessagesResponse,
+  SessionRevisionResponse,
   SessionSearchResponse,
   SkillHubPreview,
   SkillHubScanResult,
@@ -83,6 +84,7 @@ import type {
 export const STARTUP_REQUEST_TIMEOUT_MS = 60_000
 const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
+const SESSION_REVISION_REQUEST_TIMEOUT_MS = 5_000
 // prompt.submit is effectively fire-and-forget: turn completion is signaled by
 // stream / message.complete events, NOT by the RPC return. A long turn (MoA
 // presets running references + aggregator in series, deep reasoning, large tool
@@ -198,6 +200,7 @@ export type {
   SessionMessage,
   SessionMessagesResponse,
   SessionResumeResponse,
+  SessionRevisionResponse,
   SessionRuntimeInfo,
   SessionSearchResponse,
   SessionSearchResult,
@@ -394,6 +397,15 @@ export async function listSessions(
 export interface SessionSourceFilter {
   source?: string
   excludeSources?: string[]
+}
+
+export function getAllProfileSessionsRevision(
+  profile: 'all' | (string & {}) = 'all'
+): Promise<SessionRevisionResponse> {
+  return window.hermesDesktop.api<SessionRevisionResponse>({
+    path: `/api/profiles/sessions/revision?profile=${encodeURIComponent(profile)}`,
+    timeoutMs: SESSION_REVISION_REQUEST_TIMEOUT_MS
+  })
 }
 
 export async function listAllProfileSessions(

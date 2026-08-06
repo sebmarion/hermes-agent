@@ -13,7 +13,14 @@ Pinning ``TERMINAL_CWD`` to the workspace fixes both.
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
+from pathlib import Path
+
+
+_REAL_POPEN = subprocess.Popen
 
 
 def _make_task(kb, *, assignee: str = "w"):

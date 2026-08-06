@@ -140,6 +140,24 @@ process disappears while it is still running is recorded as `unknown`, because
 Hermes cannot prove whether its external side effects happened. Pending and
 delivered records are bounded and profile-local.
 
+## Execution Modes and Lane Routing
+
+Each `tasks[]` item accepts an optional `mode`, `route`, and `model_tier`.
+Routing is deterministic: explicit `route` wins, then a configured
+`model_tier`, then the task mode.
+
+| Mode | Default lane | Completion contract |
+|------|--------------|---------------------|
+| `execute` (default) | `code_worker` | Requires at least one successful tool result |
+| `review` | `smart_reviewer` | Requires at least one successful read/review tool result |
+| `reason` | `local_worker` | May complete from reasoning without tool use |
+
+Execution and review children get one forced continuation if their first reply
+only announces intent. If they still return without successful tool evidence,
+the result is a structured failure (`no_tool_evidence` or
+`tool_execution_failed`); provider failures remain `provider_error`. Explicit
+routes never fall back to the parent model or another lane.
+
 ## Model Override
 
 You can configure a different model for subagents via `config.yaml` — useful for delegating simple tasks to cheaper/faster models:

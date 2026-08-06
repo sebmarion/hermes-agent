@@ -38,13 +38,13 @@ gateway:
     prompt_caching_enabled: "Prompt-Caching: aktiviert"
     warning_prefix:         "Warnung: {warning}"
     saved_global:           "In config.yaml gespeichert (`--global`)"
-    session_only_hint:      "_(nur für diese Sitzung — `--global` ergänzen, um zu speichern)_"
+    session_only_hint:      "_(nur für diese Sitzung — mit `--global` speichern; `--session` bleibt ausdrücklich sitzungsgebunden und hat Vorrang vor `--global`)_"
     current_label:          "Aktuell: `{model}` bei {provider}"
     current_tag:            " (aktuell)"
     more_models_suffix:     " (+{count} weitere)"
-    usage_switch_model:     "`/model <name>` — Modell wechseln"
+    usage_switch_model:     "`/model <name>` — Modell nur für diese Sitzung wechseln\n`/model <name> --session` — ausdrücklich nur für diese Sitzung; hat Vorrang vor `--global`"
     usage_switch_provider:  "`/model <name> --provider <slug>` — Anbieter wechseln"
-    usage_persist:          "`/model <name> --global` — dauerhaft speichern"
+    usage_persist:          "`/model <name> --global` — Anbieter-/Modell-/Endpunkt-Route in config.yaml speichern"
 
   agents:
     header:                "🤖 **Aktive Agenten & Aufgaben**"

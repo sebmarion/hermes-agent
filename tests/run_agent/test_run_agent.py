@@ -949,7 +949,7 @@ class TestBuildSystemPrompt:
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""
 
-    def _make_agent(self, model="openai/gpt-4.1", tool_use_enforcement="auto"):
+    def _make_agent(self, model="openai/gpt-4.1", tool_use_enforcement="auto", platform="cli"):
         """Create an agent with tools and a specific enforcement config."""
         with (
             patch(
@@ -973,6 +973,7 @@ class TestToolUseEnforcementConfig:
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
+                platform=platform,
             )
             a.client = MagicMock()
             return a
@@ -1871,6 +1872,8 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                original_function_args={"q": "test"},
+                on_authorized=None,
             )
             assert result == "result"
 
@@ -1883,7 +1886,7 @@ class TestConcurrentToolExecution:
         agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
 
-        with patch("run_agent.handle_function_call", return_value='{"success": true}'):
+        with patch("model_tools.registry.dispatch", return_value='{"success": true}'):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert starts == [("c1", "web_search", {"query": "hello"})]
@@ -1954,7 +1957,10 @@ class TestConcurrentToolExecution:
         agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
         agent.tool_progress_callback = lambda event, name, preview, args, **kw: progress.append((event, name, preview, args))
 
-        with patch("run_agent.handle_function_call", return_value='{"success": true, "typed": "sk-pro...EFGH"}'):
+        with patch(
+            "model_tools.registry.dispatch",
+            return_value='{"success": true, "typed": "sk-pro...EFGH"}',
+        ):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert starts[0][2]["text"].startswith("sk-pro")

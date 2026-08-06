@@ -5,18 +5,8 @@ import { Codicon } from '@/components/ui/codicon'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import {
-  AudioLines,
-  Ear,
-  EarOff,
-  iconSize,
-  Layers3,
-  Loader2,
-  Square,
-  SteeringWheel,
-  Volume2,
-  VolumeX
-} from '@/lib/icons'
+import { AudioLines, Ear, EarOff, iconSize, Layers3, Loader2, Square, SteeringWheel, Volume2, VolumeX } from '@/lib/icons'
+import { formatCombo } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
 import { $wakeWord, toggleWakeWord } from '@/store/wake-word'
 
@@ -54,62 +44,72 @@ export function ComposerControls({
   autoSpeak,
   busy,
   busyAction,
+  canSteer,
   canSubmit,
   compactModelPill = false,
   conversation,
   disabled,
   hasComposerPayload,
   state,
+  submitting = false,
   voiceStatus,
   onDictate,
-  onQueue,
+  onSteer,
   onToggleAutoSpeak
 }: {
   autoSpeak: boolean
   busy: boolean
-  busyAction: 'steer' | 'queue' | 'stop'
+  busyAction: 'queue' | 'stop'
+  canSteer: boolean
   canSubmit: boolean
   compactModelPill?: boolean
   conversation: ConversationProps
   disabled: boolean
   hasComposerPayload: boolean
   state: ChatBarState
+  submitting?: boolean
   voiceStatus: VoiceStatus
   onDictate: () => void
-  onQueue: () => void
+  onSteer: () => void
   onToggleAutoSpeak: () => void
 }) {
   const { t } = useI18n()
   const c = t.composer
+  const busyLabel = busyAction === 'queue' ? c.queueMessage : c.stop
+  const steerLabel = `${c.steer} (${formatCombo('mod+enter')})`
+
+  const steerTip = <TipKeybindLabel actionId="composer.steer" text={c.steer} />
 
   if (conversation.active) {
     return <ConversationPill {...conversation} disabled={disabled} />
   }
 
   const showVoicePrimary = !busy && !hasComposerPayload
-  const busyLabel = busyAction === 'queue' ? c.queueMessage : busyAction === 'steer' ? c.steer : c.stop
 
   return (
     <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
       <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
-      <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
-      <AutoSpeakButton active={autoSpeak} disabled={disabled} onToggle={onToggleAutoSpeak} />
-      <WakeWordButton disabled={disabled} />
-      {busyAction === 'steer' ? (
-        <Tip label={<TipKeybindLabel actionId="composer.queue" text={c.queueMessage} />}>
+      {/* While the agent runs and the user is typing, steer takes over the mic's
+          slot rather than crowding the row with an extra button. */}
+      {canSteer ? (
+        <Tip label={steerTip}>
           <Button
-            aria-label={c.queueMessage}
+            aria-label={steerLabel}
             className={GHOST_ICON_BTN}
             disabled={disabled}
-            onClick={onQueue}
+            onClick={onSteer}
             size="icon"
             type="button"
             variant="ghost"
           >
-            <Layers3 className={iconSize.sm} />
+            <SteeringWheel className={iconSize.sm} />
           </Button>
         </Tip>
-      ) : null}
+      ) : (
+        <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
+      )}
+      <AutoSpeakButton active={autoSpeak} disabled={disabled} onToggle={onToggleAutoSpeak} />
+      <WakeWordButton disabled={disabled} />
       {showVoicePrimary ? (
         <Tip label={c.startVoice}>
           <Button
@@ -129,33 +129,20 @@ export function ComposerControls({
       ) : (
         <Tip
           label={
-            busy ? (
-              <TipKeybindLabel
-                actionId={
-                  busyAction === 'steer'
-                    ? 'composer.steer'
-                    : busyAction === 'queue'
-                      ? 'composer.queue'
-                      : 'composer.send'
-                }
-                text={busyLabel}
-              />
-            ) : (
-              <TipKeybindLabel actionId="composer.send" text={c.send} />
-            )
+            submitting ? c.sending : busy ? <TipKeybindLabel actionId={busyAction === 'queue' ? 'composer.queue' : 'composer.send'} text={busyLabel} /> : <TipKeybindLabel actionId="composer.send" text={c.send} />
           }
         >
           <Button
-            aria-label={busy ? busyLabel : c.send}
+            aria-label={submitting ? c.sending : busy ? busyLabel : c.send}
             className={PRIMARY_ICON_BTN}
-            disabled={disabled || !canSubmit}
+            disabled={submitting || disabled || !canSubmit}
             type="submit"
           >
-            {busy ? (
+            {submitting ? (
+              <Loader2 className={cn('animate-spin', iconSize.sm)} />
+            ) : busy ? (
               busyAction === 'queue' ? (
                 <Layers3 className={iconSize.sm} />
-              ) : busyAction === 'steer' ? (
-                <SteeringWheel className={iconSize.sm} />
               ) : (
                 <span className="block size-2.5 rounded-[0.1875rem] bg-current" />
               )
@@ -196,8 +183,6 @@ function ConversationPill({
 
   return (
     <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
-      {/* Keep the ear visible during voice chat — shown paused, since the
-          conversation holds the mic (the one time wake must not listen). */}
       <WakeWordButton disabled={disabled} pausedForVoice />
       <Tip label={muted ? c.unmuteMic : c.muteMic}>
         <Button
@@ -225,6 +210,7 @@ function ConversationPill({
             triggerHaptic('submit')
             onStopTurn()
           }}
+          title={c.stopListening}
           type="button"
           variant="ghost"
         >
@@ -240,6 +226,7 @@ function ConversationPill({
           triggerHaptic('close')
           onEnd()
         }}
+        title={c.endConversation}
         type="button"
       >
         <ConversationIndicator level={level} listening={listening} speaking={speaking} />
@@ -312,20 +299,10 @@ function AutoSpeakButton({ active, disabled, onToggle }: { active: boolean; disa
   )
 }
 
-// "Hey Hermes" wake-word toggle. ALWAYS rendered — the ear never hides. A
-// user must always be able to click it to turn passive listening on; if the
-// backend can't start (missing STT/TTS, deps still installing, no mic
-// permission, etc.) the click surfaces the reason in the tooltip and the
-// toggle stays off. States: listening (accent-highlighted), off (muted
-// ear-off), and paused-for-voice (disabled while a voice conversation holds
-// the mic — the one time wake genuinely must not listen). Backend refusals
-// ({started:false, reason}) keep the toggle off and put the reason/hint in
-// the tooltip.
 function WakeWordButton({ disabled, pausedForVoice = false }: { disabled: boolean; pausedForVoice?: boolean }) {
   const { t } = useI18n()
   const c = t.composer
   const wake = useStore($wakeWord)
-
   const phrase = wake.phrase || 'hey hermes'
 
   const label = pausedForVoice

@@ -9,6 +9,7 @@ from tools.budget_config import (
     BudgetConfig,
 )
 from tools.tool_result_storage import (
+    GITNEXUS_RESULT_SIZE_CHARS,
     HEREDOC_MARKER,
     PERSISTED_OUTPUT_TAG,
     PERSISTED_OUTPUT_CLOSING_TAG,
@@ -169,6 +170,35 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
+    def test_gitnexus_has_lower_result_ceiling_than_generic_tools(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        content = "x" * (GITNEXUS_RESULT_SIZE_CHARS + 1)
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="mcp__gitnexus__query",
+            tool_use_id="gitnexus_query_1",
+            env=env,
+        )
+
+        assert PERSISTED_OUTPUT_TAG in result
+        assert "gitnexus_query_1.txt" in result
+        assert len(result) < len(content)
+        env.execute.assert_called_once()
+
+    def test_gitnexus_result_at_ceiling_is_not_spilled(self):
+        content = "x" * GITNEXUS_RESULT_SIZE_CHARS
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="mcp__gitnexus__query",
+            tool_use_id="gitnexus_query_2",
+            env=None,
+        )
+
+        assert result == content
+
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
         result = maybe_persist_tool_result(

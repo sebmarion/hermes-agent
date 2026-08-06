@@ -98,15 +98,18 @@ class TestCoerceValue:
 class TestCoerceToolArgs:
     """Integration tests for coerce_tool_args using the tool registry."""
 
-    def _mock_schema(self, properties):
+    def _mock_schema(self, properties, required=None):
         """Build a minimal tool schema with the given properties."""
+        params = {
+            "type": "object",
+            "properties": properties,
+        }
+        if required:
+            params["required"] = required
         return {
             "name": "test_tool",
             "description": "test",
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-            },
+            "parameters": params,
         }
 
     def test_coerces_integer_arg(self):

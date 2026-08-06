@@ -25,4 +25,14 @@ def build_status_parser(subparsers, *, cmd_status: Callable) -> None:
     status_parser.add_argument(
         "--deep", action="store_true", help="Run deep checks (may take longer)"
     )
+    status_parser.add_argument(
+        "--routing",
+        action="store_true",
+        help="Show effective main/session/delegation routing without credentials",
+    )
+    status_parser.add_argument(
+        "--session",
+        metavar="ID",
+        help="With --routing, show one exact persisted session runtime",
+    )
     status_parser.set_defaults(func=cmd_status)

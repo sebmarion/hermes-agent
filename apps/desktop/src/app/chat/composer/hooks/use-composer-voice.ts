@@ -113,13 +113,14 @@ export function useComposerVoice({
 
   const submitVoiceTurn = async (text: string) => {
     if (busy) {
-      return
+      return false
     }
 
     triggerHaptic('submit')
     resetBrowseState(sessionId)
     clearDraft()
-    await onSubmit(text)
+
+    return onSubmit(text)
   }
 
   const wakePausedRef = useRef(false)
@@ -147,9 +148,6 @@ export function useComposerVoice({
     onSubmit: submitVoiceTurn,
     onTranscribeAudio,
     pendingResponse: pendingTurnResponse,
-    // Before the conversation opens the mic, wait for any in-flight wake.pause
-    // to finish releasing the capture device (see wakePauseBarrierRef).
-    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
   })
 
   // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup

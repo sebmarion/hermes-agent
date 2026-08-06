@@ -1667,6 +1667,7 @@ export interface Translations {
     steer: string
     stop: string
     send: string
+    sending: string
     speaking: string
     transcribing: string
     thinking: string
@@ -2351,6 +2352,7 @@ export interface Translations {
       notReady: string
       gatewayDisconnected: string
       sendFailed: string
+      expired: string
       loadingQuestion: string
       other: string
       placeholder: string

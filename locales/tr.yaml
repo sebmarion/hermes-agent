@@ -38,13 +38,13 @@ gateway:
     prompt_caching_enabled: "Prompt önbelleği: etkin"
     warning_prefix:         "Uyarı: {warning}"
     saved_global:           "config.yaml'a kaydedildi (`--global`)"
-    session_only_hint:      "_(yalnızca bu oturum — kalıcı yapmak için `--global` ekleyin)_"
+    session_only_hint:      "_(yalnızca bu oturum — kaydetmek için `--global` ekleyin; `--session` değişikliği açıkça oturumla sınırlar ve `--global` seçeneğine üstün gelir)_"
     current_label:          "Geçerli: `{model}` ({provider})"
     current_tag:            " (geçerli)"
     more_models_suffix:     " (+{count} tane daha)"
-    usage_switch_model:     "`/model <name>` — modeli değiştir"
+    usage_switch_model:     "`/model <name>` — modeli yalnızca bu oturum için değiştir\n`/model <name> --session` — açıkça yalnızca oturumluk; `--global` seçeneğine üstün gelir"
     usage_switch_provider:  "`/model <name> --provider <slug>` — sağlayıcıyı değiştir"
-    usage_persist:          "`/model <name> --global` — kalıcı kaydet"
+    usage_persist:          "`/model <name> --global` — sağlayıcı/model/uç nokta rotasını config.yaml dosyasına kaydet"
 
   agents:
     header:                "🤖 **Aktif Ajanlar ve Görevler**"

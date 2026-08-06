@@ -33,6 +33,31 @@ from tools.delegate_tool import (
 )
 
 
+_DEFAULT_DELEGATE_CONFIG = {
+    "provider": "custom:test-worker",
+    "model": "test-worker-model",
+    "base_url": "https://delegate.invalid/v1",
+    "api_key": "test-key",
+    "api_mode": "chat_completions",
+}
+_default_config_patcher = None
+
+
+def setUpModule():
+    """Keep unit tests independent from machine config with an explicit lane."""
+    global _default_config_patcher
+    _default_config_patcher = patch(
+        "tools.delegate_tool._load_config",
+        return_value=dict(_DEFAULT_DELEGATE_CONFIG),
+    )
+    _default_config_patcher.start()
+
+
+def tearDownModule():
+    if _default_config_patcher is not None:
+        _default_config_patcher.stop()
+
+
 def _make_mock_parent(depth=0):
     """Create a mock parent agent with the fields delegate_task expects."""
     parent = MagicMock()
@@ -42,6 +67,16 @@ def _make_mock_parent(depth=0):
     parent.api_mode = "chat_completions"
     parent.model = "anthropic/claude-sonnet-4"
     parent.platform = "cli"
+    parent.enabled_toolsets = ["terminal", "file", "web", "delegation"]
+    parent.valid_tool_names = {
+        "terminal",
+        "read_file",
+        "write_file",
+        "search_files",
+        "patch",
+        "web_search",
+        "delegate_task",
+    }
     parent.providers_allowed = None
     parent.providers_ignored = None
     parent.providers_order = None
@@ -213,7 +248,7 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("depth limit", result["error"].lower())
 
 
-    def test_child_inherits_runtime_credentials(self):
+    def test_child_uses_dedicated_delegate_runtime_not_parent_runtime(self):
         parent = _make_mock_parent(depth=0)
         parent.base_url = "https://chatgpt.com/backend-api/codex"
         parent.api_key="***"
@@ -232,10 +267,10 @@ class TestDelegateTask(unittest.TestCase):
             delegate_task(goal="Test runtime inheritance", parent_agent=parent)
 
             _, kwargs = MockAgent.call_args
-            self.assertEqual(kwargs["base_url"], parent.base_url)
-            self.assertEqual(kwargs["api_key"], parent.api_key)
-            self.assertEqual(kwargs["provider"], parent.provider)
-            self.assertEqual(kwargs["api_mode"], parent.api_mode)
+            self.assertEqual(kwargs["base_url"], _DEFAULT_DELEGATE_CONFIG["base_url"])
+            self.assertEqual(kwargs["api_key"], _DEFAULT_DELEGATE_CONFIG["api_key"])
+            self.assertEqual(kwargs["provider"], "custom")
+            self.assertEqual(kwargs["api_mode"], _DEFAULT_DELEGATE_CONFIG["api_mode"])
 
     def test_nous_child_rederives_api_mode_from_model(self):
         """Portal is dual-wire — same provider + different model prefix must
@@ -773,6 +808,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         mock_cfg.return_value = {
             "max_iterations": 45,
             "model": "qwen2.5-coder",
+            "provider": "custom:local",
             "base_url": "http://localhost:1234/v1",
             "api_key": "local-key",
         }
@@ -865,6 +901,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         leased_entry.id = "cred-b"
 
         child = MagicMock()
+        child._delegate_mode = "reason"
         child._credential_pool = MagicMock()
         child._credential_pool.acquire_lease.return_value = "cred-b"
         child._credential_pool.current.return_value = leased_entry
@@ -1020,7 +1057,6 @@ class TestDelegateHeartbeat(unittest.TestCase):
         parent._touch_activity = record
 
         child = MagicMock()
-        # Child is stuck inside a single terminal call for the whole run.
         # api_call_count never advances, current_tool is always set.
         child.get_activity_summary.return_value = {
             "current_tool": "terminal",
@@ -1223,7 +1259,12 @@ class TestConcurrencyDefaults(unittest.TestCase):
                 "hermes_cli.config.load_config_readonly", return_value=active_config
             ):
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
-                self.assertEqual(_get_max_concurrent_children(), 50)
+                # setUpModule replaces the module-global loader for machine-config
+                # isolation. Restore the real loader for this accessor contract.
+                with patch(
+                    "tools.delegate_tool._load_config", side_effect=_load_config
+                ):
+                    self.assertEqual(_get_max_concurrent_children(), 50)
 
 
     @patch("tools.delegate_tool._load_config",
@@ -1285,7 +1326,7 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
+           return_value={"max_spawn_depth": 2, "provider": "test", "model": "test"})
     def _run_with_mock_child(self, role_arg, mock_cfg, mock_creds):
         mock_creds.return_value = {
             "provider": None, "base_url": None,
@@ -1355,7 +1396,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
+           return_value={"max_spawn_depth": 2, "provider": "test", "model": "test"})
     def test_orchestrator_role_keeps_delegation_at_depth_1(
         self, mock_cfg, mock_creds
     ):
@@ -1379,7 +1420,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
+           return_value={"max_spawn_depth": 2, "provider": "test", "model": "test"})
     def test_orchestrator_blocked_at_max_spawn_depth(
         self, mock_cfg, mock_creds
     ):
@@ -1432,7 +1473,7 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_spawn_depth": 2})
+           return_value={"max_spawn_depth": 2, "provider": "test", "model": "test"})
     def test_end_to_end_nested_orchestration(self, mock_cfg, mock_creds):
         mock_creds.return_value = {
             "provider": None, "base_url": None,

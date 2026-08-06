@@ -38,13 +38,13 @@ gateway:
     prompt_caching_enabled: "Кешування промптів: увімкнено"
     warning_prefix:         "Попередження: {warning}"
     saved_global:           "Збережено в config.yaml (`--global`)"
-    session_only_hint:      "_(лише для цього сеансу — додайте `--global`, щоб зберегти)_"
+    session_only_hint:      "_(лише для цього сеансу — додайте `--global`, щоб зберегти; `--session` явно залишає зміну в сеансі й має пріоритет над `--global`)_"
     current_label:          "Поточна: `{model}` на {provider}"
     current_tag:            " (поточна)"
     more_models_suffix:     " (+{count} ще)"
-    usage_switch_model:     "`/model <name>` — змінити модель"
+    usage_switch_model:     "`/model <name>` — змінити модель лише для цього сеансу\n`/model <name> --session` — явно лише для сеансу; має пріоритет над `--global`"
     usage_switch_provider:  "`/model <name> --provider <slug>` — змінити провайдера"
-    usage_persist:          "`/model <name> --global` — зберегти назавжди"
+    usage_persist:          "`/model <name> --global` — зберегти маршрут провайдер/модель/кінцева точка в config.yaml"
 
   agents:
     header:                "🤖 **Активні агенти та завдання**"

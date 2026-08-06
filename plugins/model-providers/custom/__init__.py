@@ -64,7 +64,9 @@ class CustomProfile(ProviderProfile):
                 top_level["reasoning_effort"] = "none"
                 extra_body["think"] = False
             elif _effort:
-                top_level["reasoning_effort"] = _effort
+                # ``ultra`` is a Hermes/Sol execution mode; custom OpenAI-compat
+                # endpoints (GLM-5.2/ARK/vLLM) accept up to ``max``.
+                top_level["reasoning_effort"] = "max" if _effort == "ultra" else _effort
 
         return extra_body, top_level
 

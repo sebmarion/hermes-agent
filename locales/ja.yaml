@@ -38,13 +38,13 @@ gateway:
     prompt_caching_enabled: "プロンプトキャッシュ: 有効"
     warning_prefix:         "警告: {warning}"
     saved_global:           "config.yaml に保存しました (`--global`)"
-    session_only_hint:      "_(このセッションのみ — 永続化するには `--global` を追加)_"
+    session_only_hint:      "_(このセッションのみ — 保存するには `--global` を追加；`--session` は明示的にセッション限定のまま、`--global` と併用時に優先)_"
     current_label:          "現在: `{model}` ({provider})"
     current_tag:            " (現在)"
     more_models_suffix:     " (他 {count} 件)"
-    usage_switch_model:     "`/model <name>` — モデルを切り替え"
+    usage_switch_model:     "`/model <name>` — このセッションのみモデルを切り替え\n`/model <name> --session` — 明示的にセッション限定（`--global` より優先）"
     usage_switch_provider:  "`/model <name> --provider <slug>` — プロバイダーを切り替え"
-    usage_persist:          "`/model <name> --global` — 永続化"
+    usage_persist:          "`/model <name> --global` — プロバイダー/モデル/エンドポイントのルートを config.yaml に保存"
 
   agents:
     header:                "🤖 **アクティブなエージェントとタスク**"

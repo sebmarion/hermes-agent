@@ -1,10 +1,145 @@
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli.model_switch import ModelSwitchResult
 
 
 def _bound(fn, instance):
     return fn.__get__(instance, type(instance))
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_persist_global"),
+    [
+        ("/model", False),
+        ("/model --session", False),
+        ("/model --global", True),
+        ("/model --global --session", False),
+    ],
+)
+def test_prompt_toolkit_model_picker_preserves_command_persistence_intent(
+    monkeypatch, command, expected_persist_global
+):
+    import cli as cli_mod
+
+    help_lines = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_cprint",
+        lambda value, *args, **kwargs: help_lines.append(str(value)),
+    )
+    result = ModelSwitchResult(
+        success=True,
+        new_model="openai/gpt-5.5",
+        target_provider="openrouter",
+        provider_changed=True,
+    )
+    switch_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **kwargs: switch_calls.append(kwargs) or result,
+    )
+
+    picker_context = SimpleNamespace(
+        user_providers=None,
+        custom_providers=None,
+    )
+    picker_context.with_overrides = lambda **_kwargs: picker_context
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: picker_context,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_models_payload",
+        lambda _ctx: {
+            "providers": [
+                {
+                    "slug": "openrouter",
+                    "is_current": True,
+                    "models": ["openai/gpt-5.5"],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.providers.get_label",
+        lambda provider: provider,
+    )
+
+    applied = []
+    self_ = SimpleNamespace(
+        agent=None,
+        provider="openrouter",
+        model="openai/gpt-5.4",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-test",
+        _app=None,
+        _capture_modal_input_snapshot=lambda: None,
+        _restore_modal_input_snapshot=lambda: None,
+        _invalidate=lambda **_kwargs: None,
+    )
+    self_._open_model_picker = _bound(cli_mod.HermesCLI._open_model_picker, self_)
+    self_._close_model_picker = _bound(cli_mod.HermesCLI._close_model_picker, self_)
+    self_._confirm_and_apply_model_switch_result = (
+        lambda switch_result, persist_global: applied.append(
+            (switch_result, persist_global)
+        )
+    )
+
+    _bound(cli_mod.HermesCLI._handle_model_switch, self_)(command)
+
+    selection = _bound(cli_mod.HermesCLI._handle_model_picker_selection, self_)
+    selection()
+    selection()
+
+    assert switch_calls[0]["is_global"] is expected_persist_global
+    assert applied == [(result, expected_persist_global)]
+    picker_help = "\n".join(help_lines)
+    if expected_persist_global:
+        assert (
+            "Picker choice will save the provider/model/endpoint route "
+            "to config.yaml (--global)." in picker_help
+        )
+    else:
+        assert "Picker choices are session-only." in picker_help
+        assert "--session is the explicit session-only override" in picker_help
+        assert "--session wins over --global" in picker_help
+
+
+def test_model_text_help_describes_explicit_persistence_policy(monkeypatch):
+    """The no-provider fallback still exposes the complete persistence policy."""
+    import cli as cli_mod
+
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: (_ for _ in ()).throw(RuntimeError("no inventory")),
+    )
+    monkeypatch.setattr("hermes_cli.providers.get_label", lambda provider: provider)
+    lines = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_cprint",
+        lambda value, *args, **kwargs: lines.append(str(value)),
+    )
+    self_ = SimpleNamespace(
+        agent=None,
+        provider="openrouter",
+        model="openai/gpt-5.4",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-test",
+    )
+
+    _bound(cli_mod.HermesCLI._handle_model_switch, self_)("/model")
+
+    help_text = "\n".join(lines)
+    assert "/model <name>" in help_text
+    assert "switch for this session only" in help_text
+    assert "--session" in help_text
+    assert "explicit session-only override" in help_text
+    assert "--session wins over --global" in help_text
+    assert "--global" in help_text
+    assert "save provider/model/endpoint route to config.yaml" in help_text
 
 
 def test_prompt_toolkit_model_picker_defers_confirmation_off_key_handler(monkeypatch):
@@ -55,8 +190,8 @@ def test_prompt_toolkit_model_picker_defers_confirmation_off_key_handler(monkeyp
         lambda *_args: captured.setdefault("ran_inline", True)
     )
 
-    # The key handler now resolves persistence via resolve_persist_behavior,
-    # which defaults to True (persist-by-default). Simulate that call.
+    # An explicit global picker selection keeps confirmation off the key
+    # handler while preserving persistence intent.
     _bound(cli_mod.HermesCLI._handle_model_picker_selection, self_)(persist_global=True)
 
     assert self_._model_picker_state is None
@@ -65,3 +200,78 @@ def test_prompt_toolkit_model_picker_defers_confirmation_off_key_handler(monkeyp
     # Third arg is the fresh picker custom_providers snapshot (None here).
     assert captured["args"] == (result, True, None)
     assert "ran_inline" not in captured
+
+
+def test_typed_global_switch_warns_when_atomic_route_save_fails(monkeypatch):
+    import cli as cli_mod
+    import hermes_cli.config as config_mod
+
+    result = ModelSwitchResult(
+        success=True,
+        new_model="gpt-5.4",
+        target_provider="openai-codex",
+        provider_changed=True,
+        api_key="resolved-runtime-secret",
+        base_url="",
+        api_mode="codex_responses",
+        provider_label="ChatGPT Codex",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_kwargs: result,
+    )
+    picker_context = SimpleNamespace(
+        user_providers=None,
+        custom_providers=None,
+    )
+    picker_context.with_overrides = lambda **_kwargs: picker_context
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: picker_context,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        config_mod,
+        "persist_main_model_assignment",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("read-only filesystem")),
+        raising=False,
+    )
+
+    lines = []
+    legacy_calls = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda value, *a, **k: lines.append(str(value)))
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda *args, **kwargs: legacy_calls.append((args, kwargs)),
+    )
+
+    self_ = SimpleNamespace(
+        agent=None,
+        conversation_history=[],
+        provider="custom",
+        requested_provider="custom",
+        model="old-model",
+        base_url="https://old.example/v1",
+        api_key="old-secret",
+        api_mode="chat_completions",
+        _explicit_api_key="old-secret",
+        _explicit_base_url="https://old.example/v1",
+        _confirm_expensive_model_switch=lambda _result: True,
+        _pending_model_switch_note="",
+    )
+
+    _bound(cli_mod.HermesCLI._handle_model_switch, self_)(
+        "/model gpt-5.4 --provider openai-codex --global"
+    )
+
+    assert self_.model == "gpt-5.4"
+    assert legacy_calls == []
+    assert any("Model switched" in line for line in lines)
+    assert any(
+        "not saved" in line.lower() and "global" in line.lower() for line in lines
+    )
+    assert not any("Saved to config.yaml" in line for line in lines)

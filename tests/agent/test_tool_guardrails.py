@@ -2,9 +2,12 @@
 
 import json
 
+from hermes_cli.config import DEFAULT_CONFIG
+
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
+    ToolCallObservation,
     ToolCallSignature,
     canonical_tool_args,
     classify_tool_failure,
@@ -40,6 +43,7 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
         {
             "warnings_enabled": False,
             "hard_stop_enabled": True,
+            "terminal_exact_failure_only": True,
             "warn_after": {
                 "exact_failure": 3,
                 "same_tool_failure": 4,
@@ -55,12 +59,28 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
 
     assert cfg.warnings_enabled is False
     assert cfg.hard_stop_enabled is True
+    assert cfg.terminal_exact_failure_only is True
     assert cfg.exact_failure_warn_after == 3
     assert cfg.same_tool_failure_warn_after == 4
     assert cfg.no_progress_warn_after == 5
     assert cfg.exact_failure_block_after == 6
     assert cfg.same_tool_failure_halt_after == 7
     assert cfg.no_progress_block_after == 8
+
+
+def test_config_parses_false_string_for_terminal_exact_failure_mode():
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {"terminal_exact_failure_only": "false"}
+    )
+
+    assert cfg.terminal_exact_failure_only is False
+
+
+def test_cli_default_config_keeps_terminal_exact_failure_mode_disabled():
+    assert (
+        DEFAULT_CONFIG["tool_loop_guardrails"]["terminal_exact_failure_only"]
+        is False
+    )
 
 
 def test_default_repeated_identical_failed_call_warns_without_blocking():

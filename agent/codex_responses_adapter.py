@@ -25,6 +25,42 @@ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 logger = logging.getLogger(__name__)
 
 
+def validate_raw_responses_reasoning_effort(payload: Dict[str, Any]) -> None:
+    """Reject Codex-only Ultra at the final raw Responses boundary.
+
+    ``ultra`` is valid as a Codex app-server turn control, but the shared
+    Responses API accepts provider reasoning efforts only through ``max``.
+    Check both normal kwargs and SDK ``extra_body``/``body`` escape hatches so
+    late middleware or auxiliary adapters cannot reintroduce the invalid value.
+    """
+    if not isinstance(payload, dict):
+        return
+    containers = [payload]
+    seen: set[int] = set()
+    while containers:
+        container = containers.pop()
+        if not isinstance(container, dict) or id(container) in seen:
+            continue
+        seen.add(id(container))
+        candidates = [
+            container.get("reasoning_effort"),
+            container.get("reasoning.effort"),
+        ]
+        reasoning = container.get("reasoning")
+        if isinstance(reasoning, dict):
+            candidates.append(reasoning.get("effort"))
+        if any(str(value or "").strip().lower() == "ultra" for value in candidates):
+            raise ValueError(
+                "Reasoning effort 'ultra' is a Codex app-server control, not a raw "
+                "Responses API effort. Raw provider requests support efforts only "
+                "through 'max'; route Sol Ultra through codex_app_server."
+            )
+        for nested_key in ("extra_body", "body"):
+            nested = container.get(nested_key)
+            if isinstance(nested, dict):
+                containers.append(nested)
+
+
 def _classify_responses_issuer(
     *,
     is_xai_responses: bool = False,
@@ -1077,6 +1113,8 @@ def _preflight_codex_api_kwargs(
     ):
         val = api_kwargs.get(passthrough_key)
         if val is not None:
+            if passthrough_key == "prompt_cache_key" and isinstance(val, str) and len(val) > 64:
+                val = "pck_" + hashlib.sha256(val.encode("utf-8", errors="replace")).hexdigest()[:24]
             normalized[passthrough_key] = val
 
     extra_headers = api_kwargs.get("extra_headers")
@@ -1104,7 +1142,13 @@ def _preflight_codex_api_kwargs(
         # type checks, so it survives Responses.stream() kwarg-signature
         # changes that would otherwise raise TypeError before the wire.
         if extra_body:
-            normalized["extra_body"] = dict(extra_body)
+            normalized_extra_body = dict(extra_body)
+            cache_key = normalized_extra_body.get("prompt_cache_key")
+            if isinstance(cache_key, str) and len(cache_key) > 64:
+                normalized_extra_body["prompt_cache_key"] = (
+                    "pck_" + hashlib.sha256(cache_key.encode("utf-8", errors="replace")).hexdigest()[:24]
+                )
+            normalized["extra_body"] = normalized_extra_body
 
     if allow_stream:
         stream = api_kwargs.get("stream")

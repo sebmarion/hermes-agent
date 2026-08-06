@@ -194,15 +194,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[name]"),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
-    CommandDef("battery", "Toggle a color-coded battery indicator in the status bar",
-               "Configuration", cli_only=True, args_hint="[on|off|status]",
-               subcommands=("on", "off", "status")),
     CommandDef("timestamps", "Toggle [HH:MM] timestamps on messages and /history", "Configuration",
                cli_only=True, args_hint="[on|off|status]",
                subcommands=("on", "off", "status"), aliases=("ts",)),
-    CommandDef("diff", "Show git changes in the working directory", "Info",
-               args_hint="[staged|all|session] [--stat] [path...]",
-               subcommands=("staged", "all", "session")),
     CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose -> log",
                "Configuration", cli_only=True,
                gateway_config_gate="display.tool_progress_command",
@@ -219,11 +213,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Configuration", args_hint="[manual|smart|off]",
                subcommands=("manual", "smart", "off")),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
-               args_hint="[level|show|hide|full|clamp] [--global]",
-               subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp", "--global")),
+               args_hint="[level|show|hide|full|clamp]",
+               subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp")),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
-               args_hint="[normal|fast|status] [--global]",
-               subcommands=("normal", "fast", "status", "on", "off", "--global")),
+               args_hint="[normal|fast|status]",
+               subcommands=("normal", "fast", "status", "on", "off")),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
@@ -231,9 +225,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=INDICATOR_STYLES),
     CommandDef("voice", "Toggle voice mode", "Configuration",
                args_hint="[on|off|tts|status]", subcommands=("on", "off", "tts", "status")),
-    CommandDef("wake", "Toggle the 'Hey Hermes' wake word listener", "Configuration",
-               cli_only=True, args_hint="[on|off|status]",
-               subcommands=("on", "off", "status")),
     CommandDef("busy", "Control what Enter does while Hermes is working", "Configuration",
                cli_only=True, args_hint="[queue|steer|interrupt|status]",
                subcommands=("queue", "steer", "interrupt", "status")),
@@ -260,8 +251,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills", cli_only=True, aliases=("generate-pet",), args_hint="[description]"),
     CommandDef("learn", "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)",
                "Tools & Skills", args_hint="<what to learn from>"),
-    CommandDef("init", "Generate or update AGENTS.md project instructions from a repo scan",
-               "Tools & Skills", args_hint="[notes]"),
     CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
                cli_only=True, args_hint="[subcommand]",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
@@ -269,7 +258,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills", aliases=("suggest",), args_hint="[accept|dismiss N | catalog]",
                subcommands=("accept", "dismiss", "catalog", "clear")),
     CommandDef("blueprint", "Set up an automation from a blueprint template",
-               "Tools & Skills", aliases=("bp",), args_hint="[name] [slot=value ...]"),
+               "Tools & Skills", args_hint="[name] [slot=value ...]"),
     CommandDef("curator", "Background skill maintenance (status, run, pin, archive, list-archived)",
                "Tools & Skills", args_hint="[subcommand]",
                subcommands=("status", "run", "pause", "resume", "pin", "unpin", "restore", "list-archived")),
@@ -635,7 +624,6 @@ _TELEGRAM_MENU_PRIORITY = (
     "new",
     "stop",
     "status",
-    "egress",
     "resume",
     "sessions",
     "model",
@@ -1042,8 +1030,7 @@ def discord_skill_commands_by_category(
 
     Skills whose directory is nested at least 2 levels under a scan root
     (e.g. ``creative/ascii-art/SKILL.md``) are grouped by their top-level
-    category.  Root-level skills (e.g. ``some-skill/SKILL.md`` directly under a
-    scan root) are returned as
+    category.  Root-level skills (e.g. ``dogfood/SKILL.md``) are returned as
     *uncategorized*.
 
     Scan roots include the local ``SKILLS_DIR`` **and** any configured
@@ -1238,26 +1225,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 # surface (CLI, TUI, Telegram, Discord). Keep this list TIGHT and intentional —
 # the telegram-parity test reads it so an entry here is a deliberate
 # "Slack-via-/hermes" decision, not a silent clamp.
-#   - topup: the billing/balance surface; reached via /hermes topup on Slack.
-#     (the rehaul folded the old /credits + /billing surfaces into /topup.)
+#   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
+#   - billing: the terminal-billing surface (buy/auto-reload/limit); /hermes billing.
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-#   - egress: Docker-only proxy status; reachable as /hermes egress on Slack.
-#   - init: repo-scan AGENTS.md bootstrap — a cwd-centric dev command that is
-#     rare from Slack; reachable as /hermes init. Without this entry, adding
-#     /init clamps /version off the native list and breaks Telegram parity.
-#   - version: low-frequency info command; reachable as /hermes version on
-#     Slack. Demoted when /context claimed a native slot (context is a
-#     recurring inspection surface; version is a one-off lookup); the demotion
-#     also absorbs the native slot /approvals now consumes at the 50-cap.
-#   - diff: git working-tree diff; reached via /hermes diff on Slack so it
-#     doesn't displace an existing native slash at the 50-command cap.
-#   - update: low-frequency self-update maintenance command; reached via
-#     /hermes update on Slack. Demoted to free the native slot /approvals now
-#     claims — without this entry /approvals tips the registry past the 50-cap
-#     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

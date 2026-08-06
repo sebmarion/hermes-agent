@@ -1,36 +1,29 @@
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef } from 'react'
+import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useEffect, useRef } from 'react'
 
-import { composerFill, composerFloatingStrip, composerSurfaceGlass } from '@/components/chat/composer-dock'
+import { $submitInFlight } from '@/app/session/hooks/use-prompt-actions/utils'
+import { composerFill, composerSurfaceGlass } from '@/components/chat/composer-dock'
 import { Button } from '@/components/ui/button'
-import { Slot as ContribSlot } from '@/contrib/react/slot'
 import { useI18n } from '@/i18n'
 import { chatMessageText } from '@/lib/chat-messages'
-import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
-import { interceptsTypedVoiceStop } from '@/lib/voice-stop-word'
-import { sessionCompacting } from '@/store/compaction'
+import { $composerAttachments } from '@/store/composer'
 import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
-import { parkQueuedPrompts, removeQueuedPrompt, unparkQueuedPrompts } from '@/store/composer-queue'
+import { removeQueuedPrompt } from '@/store/composer-queue'
+import { $activeSessionAwaitingInput } from '@/store/prompts'
 import { toggleReview } from '@/store/review'
-import { $gatewayState } from '@/store/session'
+import { $gatewayState, $messages } from '@/store/session'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
 import { useTheme } from '@/themes'
 
 import { AttachmentList } from './attachments'
-import {
-  acceptsTriggerCompletion,
-  COMPOSER_FADE_BACKGROUND,
-  type QueueEditState,
-  slashArgStage
-} from './composer-utils'
+import { COMPOSER_FADE_BACKGROUND, type QueueEditState, slashArgStage } from './composer-utils'
 import { ContextMenu } from './context-menu'
-import { COMPOSER_AREAS, runComposerMiddleware } from './contrib'
 import { ComposerControls } from './controls'
 import { ComposerDirectiveActions } from './directive-actions'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-affordance'
@@ -47,7 +40,6 @@ import { useComposerPopout } from './hooks/use-composer-popout'
 import { useComposerQueue } from './hooks/use-composer-queue'
 import { useComposerSubmit } from './hooks/use-composer-submit'
 import { useComposerTrigger } from './hooks/use-composer-trigger'
-import { useComposerUndo } from './hooks/use-composer-undo'
 import { useComposerUrlDialog } from './hooks/use-composer-url-dialog'
 import { useComposerVoice } from './hooks/use-composer-voice'
 import { useEmojiCompletions } from './hooks/use-emoji-completions'
@@ -66,15 +58,12 @@ import {
   normalizeComposerEditorDom,
   RICH_INPUT_SLOT
 } from './rich-editor'
-import { useComposerScope } from './scope'
 import { ComposerStatusStack } from './status-stack'
 import { CodingStatusRow } from './status-stack/coding-row'
 import { extractClipboardImageBlobs, openDirectiveScope } from './text-utils'
 import { ComposerTriggerPopover } from './trigger-popover'
 import type { ChatBarProps } from './types'
-import { isRedoShortcut, isUndoShortcut } from './undo-history'
 import { UrlDialog } from './url-dialog'
-import { chipTypedUrlOnSpace, linkifyUrls } from './url-refs'
 import { VoiceActivity, VoicePlaybackActivity } from './voice-activity'
 
 export function ChatBar({
@@ -97,59 +86,20 @@ export function ChatBar({
   onPickImages,
   onRemoveAttachment,
   onSteer,
-  onSubmit: onSubmitProp,
+  onSubmit,
   onTranscribeAudio
 }: ChatBarProps) {
-  // Typed stop phrase during an active voice conversation ends it — same
-  // semantics as SAYING "stop" (voice-stop-word.ts) or clicking the pill's
-  // end control. Populated after useComposerVoice below (the submit wrapper
-  // is created first); render-time assignment keeps the ref current.
-  const voiceStopRef = useRef<{ active: boolean; end: () => void }>({ active: false, end: () => {} })
-
-  // Every send (typed, queued, voice) passes through the contributed
-  // middleware chain first — rewrite / pass-through / cancel. Empty chain =
-  // exact pass-through, so surfaces without contributions are byte-identical.
-  const onSubmit = useCallback<ChatBarProps['onSubmit']>(
-    async (value, options) => {
-      // Bare stop phrase typed while the voice conversation is live: end the
-      // conversation (mic off, pill dismissed) instead of sending "stop" to
-      // the agent. Spoken transcripts are already stop-checked inside
-      // use-voice-conversation, so this only catches typed/queued sends.
-      // Outside a voice conversation, typed "stop" is a normal message.
-      const voiceStop = voiceStopRef.current
-
-      if (interceptsTypedVoiceStop(voiceStop.active, value, options?.attachments?.length ?? 0)) {
-        voiceStop.end()
-
-        // Consumed (not rejected): report accepted so the submit engine
-        // clears the draft instead of restoring "stop" into the composer.
-        return true
-      }
-
-      const draft = await runComposerMiddleware({ text: value, attachments: options?.attachments })
-
-      if (!draft) {
-        return false
-      }
-
-      return onSubmitProp(draft.text, { ...options, attachments: draft.attachments })
-    },
-    [onSubmitProp]
-  )
-
-  // Which live composer this instance IS (main | tile) — its attachment set,
-  // focus-bus key, and awaiting-input edge. Main scope = the legacy globals.
-  const scope = useComposerScope()
-  const attachments = useStore(scope.attachments.$attachments)
-  const compacting = useStore(useMemo(() => sessionCompacting(sessionId ?? null), [sessionId]))
+  const attachments = useStore($composerAttachments)
   const scrolledUp = useStore($threadScrolledUp)
   const autoSpeak = useStore($autoSpeakReplies)
   // The turn is parked on the user (clarify / approval / sudo / secret). Esc must
   // not interrupt it — there's nothing actively running to stop, and stopping
   // would discard a question the user may want to come back to. The blocking
   // prompt owns its own dismissal (Skip, Reject, dialog close).
-  const awaitingInput = useStore(scope.$awaitingInput)
+  const awaitingInput = useStore($activeSessionAwaitingInput)
   const activeQueueSessionKey = queueSessionKey || sessionId || null
+  const submitInFlightKeys = useStore($submitInFlight)
+  const submitting = !!activeQueueSessionKey && submitInFlightKeys.has(activeQueueSessionKey)
 
   // Status items (subagents, background processes) are keyed by the RUNTIME
   // session id — gateway events and process.list both speak that id. Only the
@@ -159,10 +109,6 @@ export function ChatBar({
   // Coarse edge: re-renders ChatBar only when the stack shows/hides, NOT on
   // every per-item status mutation or other sessions' churn (see the hook).
   const statusPresent = useSessionStatusPresence(statusSessionId)
-
-  // Publishes contributed micro actions for this session; the status stack
-  // renders them as the pill strip at the top of the overlay lane.
-  useComposerMicroActions(statusSessionId, busy)
 
   const composerRef = useRef<HTMLFormElement | null>(null)
   // The dock wraps the strips + status stack + composer; the thread's bottom
@@ -216,23 +162,8 @@ export function ChatBar({
     requestMainFocus,
     sessionIdRef,
     setComposerText,
-    stashAt,
-    syncDraftFromEditor
+    stashAt
   } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled, queueEditRef, sessionId })
-
-  // Undo/redo. The rich editor bypasses Chromium's editing pipeline for speed,
-  // which also bypasses its undo stack — so we own the stack and every edit
-  // path below banks its pre-edit state through `recordUndoPoint`.
-  const { recordUndoPoint, redo, resetUndoHistory, undo, withUndoPoint } = useComposerUndo({
-    editorRef,
-    syncDraftFromEditor
-  })
-
-  // Prior history belongs to the draft that just left — undoing into another
-  // conversation's text is worse than having none.
-  useEffect(() => {
-    resetUndoHistory()
-  }, [activeQueueSessionKey, resetUndoHistory])
 
   // "Add URL" dialog — open/value state, autofocus, and submit (host onAddUrl or
   // an @url: directive into the draft).
@@ -250,7 +181,6 @@ export function ChatBar({
     exitQueuedEdit,
     queueCurrentDraft,
     queueEdit,
-    queueParked,
     queuedPrompts,
     sendQueuedNow,
     stepQueuedEdit
@@ -295,28 +225,23 @@ export function ChatBar({
 
   const hasComposerPayload = hasText || attachments.length > 0
   const canSubmit = busy || hasComposerPayload
+  const busyAction = busy && hasComposerPayload ? 'queue' : 'stop'
 
   // Steer only makes sense mid-turn, text-only (the gateway can't carry images
   // into a tool result) and never for a slash command (those execute inline).
-  const canSteer = busy && !compacting && !!onSteer && attachments.length === 0 && isSteerableText
+  const canSteer = busy && !!onSteer && attachments.length === 0 && isSteerableText
 
-  // While busy: text redirects the live turn (Cursor-style stop-and-correct),
-  // attachments queue for the next turn, an empty composer stops.
-  const busyAction: 'steer' | 'queue' | 'stop' = canSteer
-    ? 'steer'
-    : compacting || hasComposerPayload
-      ? 'queue'
-      : 'stop'
+  const showHelpHint = isHelpHint
 
   // The submit engine — the orchestration seam where draft + queue meet. Owns
   // the submit decision tree, the send-with-restore primitive, and steer.
-  const { queueDraft, steerDraft, submitDraft } = useComposerSubmit({
+  const { steerDraft, submitDraft } = useComposerSubmit({
     activeQueueSessionKey,
     activeQueueSessionKeyRef,
     attachments,
     busy,
-    compacting,
     clearDraft,
+    compacting: false,
     disabled,
     draftRef,
     drainNextQueued,
@@ -325,9 +250,7 @@ export function ChatBar({
     focusInput,
     inputDisabled,
     loadIntoComposer,
-    // The submit engine's only cancel call is the Stop-button branch (busy +
-    // empty composer) — an explicit halt, so it parks the queue.
-    onCancel: haltRun,
+    onCancel,
     onSteer,
     onSubmit,
     queueCurrentDraft,
@@ -335,7 +258,8 @@ export function ChatBar({
     queuedPrompts,
     sessionId,
     setComposerText,
-    stashAt
+    stashAt,
+    submitting
   })
 
   // Resting / reconnecting / starting placeholder text, re-rolled only on a real
@@ -347,17 +271,13 @@ export function ChatBar({
   // this API; keyup uses triggerKeyConsumedRef to skip its refresh.
   const {
     argStageEmpty,
-    ascendTriggerPath,
     closeTrigger,
     commitTypedSlashDirective,
-    moveTriggerActive,
     refreshTrigger,
     replaceTriggerWithChip,
     setTriggerActive,
-    slashFreeTextArgStage,
     trigger,
     triggerActive,
-    triggerActiveExplicit,
     triggerItems,
     triggerKeyConsumedRef,
     triggerLoading
@@ -382,7 +302,7 @@ export function ChatBar({
 
     normalizeComposerEditorDom(editor)
 
-    const nextDraft = sanitizeComposerInput(composerPlainText(editor))
+    const nextDraft = composerPlainText(editor)
 
     if (nextDraft !== draftRef.current) {
       draftRef.current = nextDraft
@@ -426,23 +346,6 @@ export function ChatBar({
     scheduleFlushEditorToDraft(event.currentTarget)
   }
 
-  // Native typing/deleting mutates the DOM through Chromium's editing pipeline,
-  // whose undo stack we've taken over — so bank the pre-edit state here, before
-  // the change lands. `beforeinput` is the only hook that still sees the old
-  // text. Consecutive keystrokes coalesce into one entry, so ⌘Z steps back by a
-  // burst rather than a character.
-  const handleEditorBeforeInput = (event: FormEvent<HTMLDivElement>) => {
-    const inputType = (event.nativeEvent as InputEvent).inputType
-
-    // Undo/redo are ours (handled in useComposerUndo + keydown), and IME preedit
-    // is not a committed edit — compositionend is where that text becomes real.
-    if (inputType === 'historyUndo' || inputType === 'historyRedo' || composingRef.current) {
-      return
-    }
-
-    recordUndoPoint({ coalesce: inputType === 'insertText' || inputType === 'deleteContentBackward' })
-  }
-
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
     const imageBlobs = extractClipboardImageBlobs(event.clipboardData)
 
@@ -464,7 +367,7 @@ export function ChatBar({
     // blank lines (common when selecting from terminals, code blocks, web pages)
     // doesn't dump multiline padding into the composer. Internal newlines are
     // preserved — only the edges are cleaned up.
-    const pastedText = sanitizeComposerInput(event.clipboardData.getData('text').trim())
+    const pastedText = event.clipboardData.getData('text').trim()
 
     if (!pastedText) {
       event.preventDefault()
@@ -513,23 +416,6 @@ export function ChatBar({
       return
     }
 
-    // Undo/redo before anything else — we own the stack (see useComposerUndo),
-    // so these never reach Chromium's native history, which has no record of
-    // the Range-based edits the rich editor makes.
-    if (isUndoShortcut(event.nativeEvent)) {
-      event.preventDefault()
-      undo()
-
-      return
-    }
-
-    if (isRedoShortcut(event.nativeEvent)) {
-      event.preventDefault()
-      redo()
-
-      return
-    }
-
     // Plain Backspace right after a directive chip: remove the chip + its
     // auto-inserted trailing space as one unit, so deleting a directive never
     // leaves an orphaned space. (Modified backspaces stay native.)
@@ -538,7 +424,7 @@ export function ChatBar({
       !event.metaKey &&
       !event.ctrlKey &&
       !event.altKey &&
-      withUndoPoint(() => deleteChipBeforeCaret(event.currentTarget))
+      deleteChipBeforeCaret(event.currentTarget)
     ) {
       event.preventDefault()
       flushEditorToDraft(event.currentTarget)
@@ -548,29 +434,7 @@ export function ChatBar({
 
     // Non-collapsed Backspace/Delete: native selection-delete is ~O(n²) on large
     // drafts (Ctrl+A → Delete froze ~1.3s). Collapsed carets fall through.
-    if (
-      (event.key === 'Backspace' || event.key === 'Delete') &&
-      withUndoPoint(() => deleteSelectionInEditor(event.currentTarget))
-    ) {
-      event.preventDefault()
-      flushEditorToDraft(event.currentTarget)
-
-      return
-    }
-
-    // A typed link finished with a space chips like a pasted one — the space
-    // itself rides along inside the insert.
-    if (withUndoPoint(() => chipTypedUrlOnSpace(event))) {
-      event.preventDefault()
-      flushEditorToDraft(event.currentTarget)
-
-      return
-    }
-
-    // Same for a bare `@path` — a hand-typed or Tab-descended path chips into
-    // the `@file:`/`@folder:` ref it means, instead of submitting as plain text
-    // the backend never resolves.
-    if (withUndoPoint(() => chipTypedPathOnSpace(event))) {
+    if ((event.key === 'Backspace' || event.key === 'Delete') && deleteSelectionInEditor(event.currentTarget)) {
       event.preventDefault()
       flushEditorToDraft(event.currentTarget)
 
@@ -604,7 +468,7 @@ export function ChatBar({
       if (event.key === 'ArrowDown') {
         event.preventDefault()
         triggerKeyConsumedRef.current = true
-        moveTriggerActive(1)
+        setTriggerActive(idx => (idx + 1) % triggerItems.length)
 
         return
       }
@@ -612,21 +476,18 @@ export function ChatBar({
       if (event.key === 'ArrowUp') {
         event.preventDefault()
         triggerKeyConsumedRef.current = true
-        moveTriggerActive(-1)
+        setTriggerActive(idx => (idx - 1 + triggerItems.length) % triggerItems.length)
 
         return
       }
 
-      // Accepting the highlighted item: a no-arg command commits its directive
-      // chip, an arg-taking command expands to its options step, and an arg
-      // option commits the full `/cmd arg` chip.
-      const accept = acceptsTriggerCompletion({
-        activeExplicit: triggerActiveExplicit,
-        freeTextArgStage: slashFreeTextArgStage,
-        key: event.key,
-        kind: trigger.kind,
-        query: trigger.query
-      })
+      // Enter / Tab / Space all accept the highlighted item: a no-arg command
+      // commits its directive chip, an arg-taking command expands to its
+      // options step, and an arg option commits the full `/cmd arg` chip. Space
+      // is slash-only (an `@` mention takes a literal space) and gated to a
+      // non-empty query so a bare `/ ` still types a space.
+      const acceptOnSpace = event.key === ' ' && trigger.kind === '/' && Boolean(trigger.query.trim())
+      const accept = event.key === 'Enter' || event.key === 'Tab' || acceptOnSpace
 
       if (accept) {
         event.preventDefault()
@@ -634,20 +495,8 @@ export function ChatBar({
         const item = triggerItems[triggerActive]
 
         if (item) {
-          // Tab means "go deeper" on a folder; Enter means "I want this one".
-          // Everything else treats them alike.
-          replaceTriggerWithChip(item, { descend: event.key === 'Tab' })
+          replaceTriggerWithChip(item)
         }
-
-        return
-      }
-
-      // Backspace climbs out of an `@` path one segment at a time, mirroring
-      // Tab's one-key descent. Only when the caret sits at the end of the
-      // token — mid-token editing keeps normal character deletion.
-      if (event.key === 'Backspace' && !event.metaKey && !event.altKey && ascendTriggerPath()) {
-        event.preventDefault()
-        triggerKeyConsumedRef.current = true
 
         return
       }
@@ -672,12 +521,11 @@ export function ChatBar({
       slashArgStage(trigger.query) &&
       trigger.query.trim()
     ) {
-      if (commitTypedSlashDirective()) {
-        event.preventDefault()
-        triggerKeyConsumedRef.current = true
+      event.preventDefault()
+      triggerKeyConsumedRef.current = true
+      commitTypedSlashDirective()
 
-        return
-      }
+      return
     }
 
     // ArrowUp/ArrowDown navigate, in priority order: the queue (edit entries in
@@ -714,11 +562,11 @@ export function ChatBar({
 
       // $messages is read imperatively (not subscribed) so the composer
       // doesn't re-render on every streaming delta flush.
-      const history = deriveUserHistory(scope.$messages.get(), chatMessageText)
+      const history = deriveUserHistory($messages.get(), chatMessageText)
       const entry = browseBackward(sessionId, currentDraft, history)
 
       if (entry !== null) {
-        loadIntoComposer(entry, scope.attachments.$attachments.get())
+        loadIntoComposer(entry, $composerAttachments.get())
       }
 
       return
@@ -739,33 +587,25 @@ export function ChatBar({
         event.preventDefault()
         triggerKeyConsumedRef.current = true
 
-        const history = deriveUserHistory(scope.$messages.get(), chatMessageText)
+        const history = deriveUserHistory($messages.get(), chatMessageText)
         const result = browseForward(sessionId, history)
 
         if (result !== null) {
-          loadIntoComposer(result.text, scope.attachments.$attachments.get())
+          loadIntoComposer(result.text, $composerAttachments.get())
         }
       }
 
       return
     }
 
-    // Cmd/Ctrl+Enter queues a follow-up while a turn runs. Plain Enter steers
-    // a text-only draft, so both live-turn actions stay reachable by keyboard.
+    // Cmd/Ctrl+Enter is reserved for steering the live run — never a send.
+    // Steer when there's a steerable draft, otherwise swallow it so it can't
+    // surprise-send. (Plain Enter still queues while busy / sends when idle.)
     if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
       event.preventDefault()
 
-      if (busy && !disabled) {
-        // As with plain Enter, source the just-typed content from the DOM so a
-        // fast keypress cannot queue a stale draft.
-        const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
-
-        if (editorText !== draftRef.current) {
-          draftRef.current = editorText
-          setComposerText(editorText)
-        }
-
-        queueDraft()
+      if (canSteer) {
+        steerDraft()
       }
 
       return
@@ -787,27 +627,18 @@ export function ChatBar({
         return
       }
 
-      if (!busy && !hasLivePayload && queuedPrompts.length > 0) {
+      if (!busy && !submitting && !hasLivePayload && queuedPrompts.length > 0) {
         void drainNextQueued()
 
         return
       }
 
-      // Empty Enter while busy. With prompts queued this is the double-send:
-      // the first Enter put the words in the queue, a second sends them now
-      // (promote + interrupt + drain on settle), mirroring the idle empty-Enter
-      // drain above. With nothing queued it stays a no-op — interrupting is
-      // explicit (Stop/Esc), never a stray Enter after sending. Gate on the live
-      // DOM payload (not the render-lagged composer state) so a message typed
-      // fast / via IME while busy still reaches submitDraft() and gets queued
-      // instead of being mistaken for an empty Enter.
-      if (busy && !hasLivePayload) {
-        const head = queuedPrompts.find(entry => entry.id !== queueEdit?.entryId)
-
-        if (head) {
-          sendQueuedNow(head.id)
-        }
-
+      // Empty Enter while busy is a no-op — interrupting is explicit (Stop/Esc),
+      // never a stray Enter after sending. With a payload, submitDraft queues it.
+      // Gate on the live DOM payload (not the render-lagged composer state) so a
+      // message typed fast / via IME while busy still reaches submitDraft() and
+      // gets queued instead of being mistaken for an empty Enter.
+      if ((busy || submitting) && !hasLivePayload) {
         return
       }
 
@@ -827,11 +658,11 @@ export function ChatBar({
 
       // Otherwise Esc interrupts the running turn (Stop-button parity) — unless
       // the turn is parked waiting on the user, where Esc must not discard the
-      // pending prompt. An explicit halt, so it parks the queue too.
+      // pending prompt.
       if (busy && !awaitingInput) {
         event.preventDefault()
         triggerHaptic('cancel')
-        void Promise.resolve(haltRun())
+        void Promise.resolve(onCancel())
       }
     }
   }
@@ -868,8 +699,7 @@ export function ChatBar({
     useComposerBranch({ clearDraft, cwd, draftRef })
 
   // Global Esc-to-cancel when the chat (not the composer input) has focus.
-  // Same explicit-halt semantics as the Stop button: park the queue.
-  useComposerEscCancel({ awaitingInput, busy, onCancel: haltRun, target: scope.target })
+  useComposerEscCancel({ awaitingInput, busy, onCancel, target: 'main' })
 
   const {
     conversation,
@@ -892,13 +722,8 @@ export function ChatBar({
     onSubmit,
     onTranscribeAudio,
     sessionId,
-    target: scope.target
+    target: 'main'
   })
-
-  // Keep the typed-stop interceptor (see onSubmit above) in sync with the
-  // live conversation state. Render-time ref assignment, same pattern as
-  // dispatchSubmitRef — no effect needed for a plain mirror.
-  voiceStopRef.current = { active: voiceConversationActive, end: endConversation }
 
   const contextMenu = (
     <ContextMenu
@@ -917,8 +742,9 @@ export function ChatBar({
       autoSpeak={autoSpeak}
       busy={busy}
       busyAction={busyAction}
+      canSteer={canSteer}
       canSubmit={canSubmit}
-      compactModelPill={poppedOut || compactPill}
+      compactModelPill={poppedOut}
       conversation={{
         active: voiceConversationActive,
         level: conversation.level,
@@ -932,9 +758,10 @@ export function ChatBar({
       disabled={disabled}
       hasComposerPayload={hasComposerPayload}
       onDictate={dictate}
-      onQueue={queueDraft}
+      onSteer={steerDraft}
       onToggleAutoSpeak={handleToggleAutoSpeak}
       state={state}
+      submitting={submitting}
       voiceStatus={voiceStatus}
     />
   )
@@ -955,7 +782,6 @@ export function ChatBar({
         contentEditable={!inputDisabled}
         data-placeholder={placeholder}
         data-slot={RICH_INPUT_SLOT}
-        onBeforeInput={handleEditorBeforeInput}
         onBlur={() => window.setTimeout(closeTrigger, 80)}
         onCompositionEnd={event => {
           composingRef.current = false
@@ -979,7 +805,7 @@ export function ChatBar({
         }}
         onDragOver={handleInputDragOver}
         onDrop={handleInputDrop}
-        onFocus={() => markActiveComposer(scope.target)}
+        onFocus={() => markActiveComposer('main')}
         onInput={handleEditorInput}
         onKeyDown={handleEditorKeyDown}
         onKeyUp={handleEditorKeyUp}
@@ -1098,17 +924,9 @@ export function ChatBar({
                     }
                   }}
                   onEdit={beginQueuedEdit}
-                  onResume={() => {
-                    unparkQueuedPrompts(activeQueueSessionKey)
-
-                    // Idle → kick the head immediately; busy → the settle drain
-                    // takes over now that the park is lifted.
-                    if (!busy) {
-                      void drainNextQueued()
-                    }
-                  }}
+                  onResume={() => {}}
                   onSendNow={id => void sendQueuedNow(id)}
-                  parked={queueParked}
+                  parked={false}
                 />
               ) : null
             }

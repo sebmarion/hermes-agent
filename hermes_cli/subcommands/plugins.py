@@ -103,4 +103,35 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
         "disable", help="Disable a plugin without removing it"
     )
     plugins_disable.add_argument("name", help="Plugin name to disable")
+
+    plugins_require = plugins_subparsers.add_parser(
+        "require-policy",
+        help="Require a manifest-declared policy before tool dispatch",
+    )
+    plugins_require.add_argument("plugin", help="Installed plugin name or canonical key")
+    plugins_require.add_argument(
+        "policy",
+        choices=("tool_dispatch",),
+        help="Required policy name",
+    )
+
+    plugins_unrequire = plugins_subparsers.add_parser(
+        "unrequire-policy",
+        help="Remove one configured plugin policy requirement",
+    )
+    plugins_unrequire.add_argument("plugin", help="Plugin name or canonical key")
+    plugins_unrequire.add_argument(
+        "policy",
+        choices=("tool_dispatch",),
+        help="Required policy name",
+    )
+
+    plugins_status = plugins_subparsers.add_parser(
+        "policy-status",
+        help="Show configured, loaded, and registered policy status",
+    )
+    plugins_status.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON"
+    )
+
     plugins_parser.set_defaults(func=cmd_plugins)

@@ -12,7 +12,6 @@ import {
 } from '@/lib/voice-playback'
 import { isVoiceStopCommand } from '@/lib/voice-stop-word'
 import { notify, notifyError } from '@/store/notifications'
-import { $voicePlayback } from '@/store/voice-playback'
 
 import { useMicRecorder } from './use-mic-recorder'
 
@@ -36,9 +35,6 @@ interface VoiceConversationOptions {
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   pendingResponse: () => PendingVoiceResponse | null
   consumePendingResponse: () => void
-  /** Awaited right before the mic is opened. Used to let the wake-word listener
-   *  fully release the capture device first, so the two never contend. */
-  beforeMicOpen?: () => Promise<void> | void
 }
 
 /** How long a barge-triggered interrupt may take to settle before we submit
@@ -54,8 +50,7 @@ export function useVoiceConversation({
   onSubmit,
   onTranscribeAudio,
   pendingResponse,
-  consumePendingResponse,
-  beforeMicOpen
+  consumePendingResponse
 }: VoiceConversationOptions) {
   const { t } = useI18n()
   const voiceCopy = t.notifications.voice
@@ -86,37 +81,12 @@ export function useVoiceConversation({
     onInterruptRef.current = onInterrupt
   }, [onInterrupt])
 
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
-  useEffect(() => {
-    onStopWordRef.current = onStopWord
-  }, [onStopWord])
-
-  const beforeMicOpenRef = useRef(beforeMicOpen)
-
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
-  useEffect(() => {
-    beforeMicOpenRef.current = beforeMicOpen
-  }, [beforeMicOpen])
-
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
-  useEffect(() => {
-    enabledRef.current = enabled
-  }, [enabled])
-
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
-  useEffect(() => {
-    mutedRef.current = muted
-  }, [muted])
-
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
-  useEffect(() => {
-    busyRef.current = busy
-  }, [busy])
-
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
-  useEffect(() => {
-    statusRef.current = status
-  }, [status])
+  // Keep callback reads current during render; syncing these reactive inputs in
+  // an effect would leave the refs one render behind.
+  enabledRef.current = enabled
+  mutedRef.current = muted
+  busyRef.current = busy
+  statusRef.current = status
 
   const clearTurnTimeout = () => {
     if (turnTimeoutRef.current) {
@@ -133,6 +103,57 @@ export function useVoiceConversation({
     speechSessionRef.current = null
     responseIdRef.current = null
     spokenSourceLengthRef.current = 0
+    speechBufferRef.current = ''
+  }
+
+  const appendSpeechText = (text: string) => {
+    if (!text) {
+      return
+    }
+
+    speechBufferRef.current = `${speechBufferRef.current}${text}`
+  }
+
+  const takeSpeechChunk = (force = false): string | null => {
+    const buffer = speechBufferRef.current.replace(/\s+/g, ' ').trim()
+
+    if (!buffer) {
+      speechBufferRef.current = ''
+
+      return null
+    }
+
+    const sentence = buffer.match(/^(.+?[.!?。！？])(?:\s+|$)/)
+
+    if (sentence?.[1] && (sentence[1].length >= 8 || force)) {
+      const chunk = sentence[1].trim()
+      speechBufferRef.current = buffer.slice(sentence[1].length).trim()
+
+      return chunk
+    }
+
+    if (!force && buffer.length > 220) {
+      const softBoundary = Math.max(
+        buffer.lastIndexOf(', ', 180),
+        buffer.lastIndexOf('; ', 180),
+        buffer.lastIndexOf(': ', 180)
+      )
+
+      if (softBoundary > 80) {
+        const chunk = buffer.slice(0, softBoundary + 1).trim()
+        speechBufferRef.current = buffer.slice(softBoundary + 1).trim()
+
+        return chunk
+      }
+    }
+
+    if (!force) {
+      return null
+    }
+
+    speechBufferRef.current = ''
+
+    return buffer
   }
 
   const handleTurn = useCallback(
@@ -171,21 +192,21 @@ export function useVoiceConversation({
             return
           }
 
-          // A spoken "stop" (or "never mind", "goodbye", …) ends the
-          // conversation instead of being submitted as a turn. Only whole-
-          // utterance stop commands match, so "stop the container" still goes
-          // through as a real request.
-          if (isVoiceStopCommand(transcript)) {
-            dropSpeechSession()
+          awaitingSpokenResponseRef.current = false
+          resetSpeechBuffer()
+          const submitted = await onSubmit(transcript)
+
+          if (submitted === false) {
+            if (enabledRef.current && !mutedRef.current && !busyRef.current) {
+              pendingStartRef.current = true
+            }
+
             setStatus('idle')
-            onStopWordRef.current?.()
 
             return
           }
 
           awaitingSpokenResponseRef.current = true
-          dropSpeechSession()
-          await onSubmit(transcript)
           setStatus('thinking')
         } catch (error) {
           notifyError(error, voiceCopy.transcriptionFailed)
@@ -210,25 +231,7 @@ export function useVoiceConversation({
       return
     }
 
-    if (bargeCapturePendingRef.current) {
-      return // the barge monitor is mid-capture and owns the mic
-    }
-
     if (statusRef.current !== 'idle') {
-      return
-    }
-
-    // Let the wake-word listener fully release the capture device before we
-    // open ours — opening the mic while wake still holds it makes getUserMedia
-    // fail (the "clicked voice but it never starts listening" bug).
-    try {
-      await beforeMicOpenRef.current?.()
-    } catch {
-      // A pause failure shouldn't block the user's explicit start.
-    }
-
-    // enabled/muted/busy or an interleaved turn may have changed while we waited.
-    if (!enabledRef.current || mutedRef.current || busyRef.current || statusRef.current !== 'idle') {
       return
     }
 
@@ -246,12 +249,6 @@ export function useVoiceConversation({
         onSilence: () => void handleTurn()
       })
       setStatus('listening')
-      // Clear any prior turn-timeout before arming a fresh one. Each listen
-      // cycle reassigns turnTimeoutRef; without clearing first, a stale 60s
-      // timer from an earlier cycle survives and later fires handleTurn() in
-      // the middle of a new listen, cutting it short (or, after enough idle
-      // re-listens, wedging the loop into a state it doesn't re-arm from).
-      clearTurnTimeout()
       turnTimeoutRef.current = window.setTimeout(() => void handleTurn(), 60_000)
     } catch (error) {
       notifyError(error, voiceCopy.couldNotStartSession)
@@ -586,7 +583,7 @@ export function useVoiceConversation({
 
     setMuted(false)
     awaitingSpokenResponseRef.current = false
-    dropSpeechSession()
+    resetSpeechBuffer()
     consumePendingResponse()
     pendingStartRef.current = true
     await startListening()
@@ -606,7 +603,7 @@ export function useVoiceConversation({
     handle.cancel()
     turnClosingRef.current = false
     awaitingSpokenResponseRef.current = false
-    dropSpeechSession()
+    resetSpeechBuffer()
     consumePendingResponse()
     setMuted(false)
     setStatus('idle')
@@ -693,16 +690,40 @@ export function useVoiceConversation({
       const response = pendingResponse()
 
       if (response) {
-        openLiveSpeech(response.id)
+        if (response.id !== responseIdRef.current) {
+          resetSpeechBuffer()
+          responseIdRef.current = response.id
+        }
 
-        return
+        if (response.text.length > spokenSourceLengthRef.current) {
+          appendSpeechText(response.text.slice(spokenSourceLengthRef.current))
+          spokenSourceLengthRef.current = response.text.length
+        }
+
+        const chunk = takeSpeechChunk(!response.pending && !busy)
+
+        if (chunk) {
+          void speak(chunk)
+
+          return
+        }
+
+        if (!response.pending && !busy) {
+          awaitingSpokenResponseRef.current = false
+          consumePendingResponse()
+          resetSpeechBuffer()
+          pendingStartRef.current = true
+          setStatus('idle')
+
+          return
+        }
       }
 
       if (!busy && status === 'thinking' && !bargeCapturePendingRef.current) {
         // Turn finished without any speakable reply (tool-only, error). A
         // live barge capture owns the loop instead — it submits or resumes.
         awaitingSpokenResponseRef.current = false
-        dropSpeechSession()
+        resetSpeechBuffer()
         pendingStartRef.current = true
         setStatus('idle')
 
@@ -719,7 +740,7 @@ export function useVoiceConversation({
     }
   }, [busy, enabled, muted, ensureBargeMonitor, openLiveSpeech, pendingResponse, startListening, status])
 
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
+  // eslint-disable-next-line no-restricted-syntax -- previous enabled state is a transition latch
   useEffect(() => {
     if (enabled && !wasEnabledRef.current) {
       void start()

@@ -115,6 +115,15 @@ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
+# Persisted recovery state is deliberately explicit: a delivery replay is safe
+# because it uses an existing artifact; a model rerun is opt-in and bounded.
+RECOVERY_STATE_IDLE = "idle"
+RECOVERY_STATE_SCHEDULED = "scheduled"
+RECOVERY_STATE_RUNNING = "running"
+RECOVERY_STATE_MANUAL = "manual"
+FAILURE_CLASS_DELIVERY = "delivery"
+FAILURE_CLASS_INFERENCE = "inference"
+
 
 @dataclass(frozen=True)
 class _CronStorePaths:
@@ -468,6 +477,14 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     if not state:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
+    normalized.setdefault("allow_recovery_rerun", False)
+    normalized.setdefault("recovery_state", RECOVERY_STATE_IDLE)
+    normalized.setdefault("failure_class", None)
+    normalized.setdefault("retry_attempt", 0)
+    normalized.setdefault("next_retry_at", None)
+    normalized.setdefault("recovery_output_file", None)
+    normalized.setdefault("recovery_claim", None)
+    normalized.setdefault("manual_action_required", False)
 
     return normalized
 
@@ -1261,6 +1278,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    allow_recovery_rerun: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1421,6 +1439,16 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        # Recovery is explicit and bounded: delivery failures replay saved output;
+        # inference reruns require this opt-in to avoid token-spend loops.
+        "allow_recovery_rerun": bool(allow_recovery_rerun),
+        "recovery_state": "idle",
+        "failure_class": None,
+        "retry_attempt": 0,
+        "next_retry_at": None,
+        "recovery_output_file": None,
+        "recovery_claim": None,
+        "manual_action_required": False,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -1687,7 +1715,7 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None, output_file: Optional[Path] = None):
     """
     Mark a job as having been run.
     
@@ -1707,6 +1735,37 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                recovery_requested = bool(delivery_error) or not success
+                if delivery_error:
+                    job.update({
+                        "recovery_state": "scheduled",
+                        "failure_class": "delivery",
+                        "next_retry_at": (_hermes_now() + timedelta(minutes=1)).isoformat(),
+                        "recovery_output_file": str(output_file) if output_file else None,
+                        "manual_action_required": False,
+                        "recovery_claim": None,
+                    })
+                elif not success and bool(job.get("allow_recovery_rerun")):
+                    job.update({
+                        "recovery_state": "scheduled",
+                        "failure_class": "inference",
+                        "next_retry_at": (_hermes_now() + timedelta(minutes=1)).isoformat(),
+                        "manual_action_required": False,
+                        "recovery_claim": None,
+                    })
+                elif not success:
+                    job.update({
+                        "recovery_state": "manual",
+                        "failure_class": "inference",
+                        "manual_action_required": True,
+                        "enabled": False,
+                        "state": "paused",
+                        "paused_reason": "Inference recovery requires allow_recovery_rerun=True",
+                    })
+                else:
+                    job.update({"recovery_state": "idle", "failure_class": None,
+                                "next_retry_at": None, "recovery_claim": None,
+                                "manual_action_required": False})
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1736,12 +1795,19 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         completed += 1
                         repeat["completed"] = completed
 
-                    # Check if we've hit the repeat limit
-                    if times is not None and times > 0 and completed >= times:
+                    # Recovery retains a completed one-shot until the saved
+                    # artifact has been replayed or an opted-in retry settles.
+                    if times is not None and times > 0 and completed >= times and not recovery_requested:
                         # Remove the job (limit reached)
                         jobs.pop(i)
                         save_jobs(jobs)
                         return
+
+                if recovery_requested:
+                    # Keep the canonical schedule untouched while recovery owns
+                    # the next attempt; get_due_jobs excludes this job meanwhile.
+                    save_jobs(jobs)
+                    return
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -2152,6 +2218,10 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # state still reaches save_jobs() below.
         try:
             if not job.get("enabled", True):
+                continue
+            # A scheduled/running recovery owns the next attempt. Do not
+            # advance or re-fire the canonical schedule until it has settled.
+            if job.get("recovery_state") in {"scheduled", "running", "manual"}:
                 continue
 
             # Cross-process running-claim guard (#59229): if another scheduler

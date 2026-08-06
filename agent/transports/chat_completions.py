@@ -19,13 +19,17 @@ from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
-    """Return the model's wire-compatible reasoning config."""
+    """Return the model's wire-compatible reasoning config.
+
+    ``ultra`` is a Hermes/Sol execution mode, not a value most chat-completion
+    providers accept on the wire. Collapse it to ``max`` for every model on
+    this transport so it never leaks to a provider that doesn't understand it.
+    Sol's native ``ultra`` control uses the Codex app-server path, not
+    chat_completions, so it is unaffected by this normalization.
+    """
     if not isinstance(reasoning_config, dict):
         return reasoning_config
-    if (
-        "gpt-5.6" in (model or "").lower()
-        and str(reasoning_config.get("effort") or "").strip().lower() == "ultra"
-    ):
+    if str(reasoning_config.get("effort") or "").strip().lower() == "ultra":
         normalized = dict(reasoning_config)
         normalized["effort"] = "max"
         return normalized

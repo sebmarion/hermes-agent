@@ -1046,6 +1046,7 @@ def _resolve_named_custom_runtime(
     requested_provider: str,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     # Bare `provider="custom"` with an explicit base_url (e.g. propagated
     # from a `model_aliases:` direct-alias resolution) — build a runtime
@@ -1114,7 +1115,7 @@ def _resolve_named_custom_runtime(
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
-        model_name = custom_provider.get("model")
+        model_name = str(target_model or "").strip() or custom_provider.get("model")
         if model_name:
             pool_result["model"] = model_name
         if isinstance(custom_provider.get("max_output_tokens"), int):
@@ -1159,8 +1160,9 @@ def _resolve_named_custom_runtime(
     }
     # Propagate the model name so callers can override self.model when the
     # provider name differs from the actual model string the API expects.
-    if custom_provider.get("model"):
-        result["model"] = custom_provider["model"]
+    model_name = str(target_model or "").strip() or custom_provider.get("model")
+    if model_name:
+        result["model"] = model_name
     if isinstance(custom_provider.get("max_output_tokens"), int):
         result["max_output_tokens"] = custom_provider["max_output_tokens"]
     # Per-provider extra HTTP headers (proxies, gateways, custom auth).
@@ -1769,6 +1771,7 @@ def resolve_runtime_provider(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        target_model=target_model,
     )
     if custom_runtime:
         custom_runtime["requested_provider"] = requested_provider

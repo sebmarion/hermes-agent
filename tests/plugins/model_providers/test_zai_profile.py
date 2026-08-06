@@ -87,7 +87,7 @@ class TestZaiGLM52ReasoningEffort:
         assert extra_body == {"thinking": {"type": "enabled"}}
         assert top_level == {"reasoning_effort": "high"}
 
-    @pytest.mark.parametrize("effort", ["xhigh", "max"])
+    @pytest.mark.parametrize("effort", ["xhigh", "max", "ultra"])
     def test_strong_efforts_map_to_max(self, zai_profile, effort):
         extra_body, top_level = zai_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": effort},

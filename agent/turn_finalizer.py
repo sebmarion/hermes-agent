@@ -25,45 +25,6 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
-from agent.message_content import flatten_message_text
-
-
-def _is_pure_tool_call_tail(msg: dict) -> bool:
-    """An assistant row with ``tool_calls`` but no visible text content of its own.
-
-    Such a row satisfies the role check (``tail role == "assistant"``) while
-    carrying none of the delivered answer — see the #43849/#44100 invariant
-    block in :func:`finalize_turn`. Uses :func:`flatten_message_text` so that
-    multimodal (list-type) content is evaluated by its text parts, not just
-    its type.
-    """
-    if not msg.get("tool_calls"):
-        return False
-    return not flatten_message_text(msg.get("content")).strip()
-
-
-# Verification continuation scaffolding flags: verify-on-stop / pre_verify
-# inject a synthetic user nudge to keep the agent going one more turn.
-# These nudges must be stripped from returned/live history to avoid
-# role-alternation breaks and poisoning the resumed transcript. The
-# assistant response is real content and is not flagged. (#65919 §7)
-_VERIFICATION_CONTINUATION_FLAGS = (
-    "_verification_stop_synthetic",
-    "_pre_verify_synthetic",
-)
-
-
-def _drop_verification_continuation_scaffolding(messages) -> None:
-    """Remove verification-continuation nudge messages from *messages* in place.
-
-    Only the synthetic nudges carry these flags, so this strips just the
-    nudges while preserving the real attempted-final-answer that was
-    persisted to state.db.
-    """
-    messages[:] = [
-        m for m in messages
-        if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
-    ]
 
 
 def finalize_turn(
@@ -81,8 +42,8 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    preserve_final_response: bool = False,
     _pending_verification_response=None,
-    _pending_verification_response_previewed=False,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -116,11 +77,6 @@ def finalize_turn(
         # fallible model call. The explicit pending value is the provenance
         # guard: unrelated error/recovery exits can never enter this branch.
         final_response = _pending_verification_response
-        # Mark the turn as previewed only when the reused candidate was
-        # actually streamed to the user as interim content. (#65919 review:
-        # response-loss blocker)
-        if _pending_verification_response_previewed:
-            agent._response_was_previewed = True
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         iteration_limit_fallback = True
         preserved_verification_fallback = True
@@ -136,9 +92,36 @@ def finalize_turn(
         if not agent.quiet_mode:
             agent._safe_print(
                 f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— requesting summary..."
+                "— finalizing turn..."
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+        final_response = None
+        try:
+            from agent.verification_stop import build_budget_exhausted_verification_response
+
+            final_response = build_budget_exhausted_verification_response(
+                session_id=getattr(agent, "session_id", None),
+                changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                api_call_count=api_call_count,
+                max_iterations=agent.max_iterations,
+            )
+        except Exception:
+            logger.debug("budget-exhausted verification response failed", exc_info=True)
+            final_response = None
+
+        if final_response is None:
+            final_response = agent._handle_max_iterations(messages, api_call_count)
+
+        # The model-summary path appends its assistant message inside
+        # _handle_max_iterations. The deterministic verification-gap path does
+        # not call the model, so close the in-memory turn here before trajectory
+        # saving/persistence so every sink sees the same final response.
+        if final_response:
+            try:
+                _tail_role = messages[-1].get("role") if messages else None
+            except Exception:
+                _tail_role = None
+            if _tail_role != "assistant":
+                messages.append({"role": "assistant", "content": final_response})
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
@@ -195,41 +178,16 @@ def finalize_turn(
     completed = (
         final_response is not None
         and not failed
+        and not iteration_limit_fallback
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
         )
     )
-
-    # Preflight can seed the display count before the provider receives the
-    # request. Roll that estimate back only when an interrupt wins the race
-    # before any successful provider response. Compaction state remains owned
-    # by the real-usage/post-compaction path, including its ``-1`` sentinel.
-    # Guard rules (test-double density on this path is high):
-    #  - snapshot is type-pinned to a real int — MagicMock agents auto-create
-    #    truthy Mock attributes that must never arm the rollback;
-    #  - the received-response flag is pinned to ``is not True`` — its real
-    #    domain is True/False, and only a literal True means a provider
-    #    response completed;
-    #  - the compressor method gets a getattr+callable guard — SimpleNamespace
-    #    compressor doubles and plugin context engines lack it.
-    _preflight_snapshot = getattr(
-        agent, "_turn_preflight_display_snapshot", None
+    _required_policy_halt = (
+        _turn_exit_reason == "required_policy_halt"
+        and getattr(agent, "_required_policy_halt_block", None) is not None
     )
-    if (
-        interrupted is True
-        and isinstance(_preflight_snapshot, int)
-        and not isinstance(_preflight_snapshot, bool)
-        and getattr(agent, "_turn_received_provider_response", False) is not True
-        and getattr(agent, "context_compressor", None) is not None
-    ):
-        _rollback_fn = getattr(
-            agent.context_compressor,
-            "rollback_interrupted_preflight_display_tokens",
-            None,
-        )
-        if callable(_rollback_fn):
-            _rollback_fn(_preflight_snapshot)
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
@@ -266,12 +224,6 @@ def finalize_turn(
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
-        # Drop verification-continuation nudges (synthetic user messages)
-        # from the live history before the tail-assistant check — only the
-        # nudges need stripping; the assistant candidate persists in
-        # state.db. (#65919 §7)
-        _drop_verification_continuation_scaffolding(messages)
-
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the
         # tool-call sequence. Without this, the session persists a
@@ -301,19 +253,12 @@ def finalize_turn(
         # single chokepoint every recovery ``break`` flows through, so the
         # invariant "delivered final_response ⇒ assistant row in transcript"
         # holds regardless of which path produced it. (#43849 / #44100)
-        #
-        # Compare content (not just role) so a verification candidate that
-        # matches the final response is not duplicated at budget
-        # exhaustion. (#65919 §7)
         if final_response and not interrupted:
             try:
-                _tail = messages[-1] if messages else None
+                _tail_role = messages[-1].get("role") if messages else None
             except Exception:
-                _tail = None
-            _tail_role = _tail.get("role") if isinstance(_tail, dict) else None
+                _tail_role = None
             if _tail_role != "assistant":
-                # Tail is not an assistant row — append the final response
-                # so the durable turn closes with the answer (#43849/#44100).
                 messages.append({"role": "assistant", "content": final_response})
             elif isinstance(_tail, dict) and _tail.get("content") != final_response and _is_pure_tool_call_tail(_tail):
                 # The tail IS an assistant row, but a *pure tool-call turn*:
@@ -471,7 +416,12 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
+    if (
+        final_response
+        and not interrupted
+        and not preserve_final_response
+        and not _required_policy_halt
+    ):
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
@@ -497,7 +447,11 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if (
+        not interrupted
+        and not preserve_final_response
+        and not _required_policy_halt
+    ):
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -544,13 +498,19 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if (
+        final_response
+        and not interrupted
+        and not preserve_final_response
+        and not _required_policy_halt
+    ):
         try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
                 "transform_llm_output",
                 response_text=final_response,
                 session_id=agent.session_id or "",
+                turn_id=turn_id or "",
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
             )
@@ -566,9 +526,9 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _required_policy_halt:
         try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
             _invoke_hook(
                 "post_llm_call",
                 session_id=agent.session_id,
@@ -582,34 +542,6 @@ def finalize_turn(
             )
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
-
-    # Context engine observation hook: notify the active engine that this
-    # turn has finished, with the finalized transcript. Complements the
-    # per-request select_context() hook (selection before the request;
-    # observation after the turn). No-op default, fail-open.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
-        # Forward the turn's canonical usage when the host has it. The loop
-        # stashes the most recent API response's usage dict (the same
-        # canonical buckets fed to ``update_from_response``) on the agent as
-        # ``_last_turn_usage``. It is ``None`` on turns that never reached a
-        # provider response (early failure / interrupt), which is exactly the
-        # contract: real usage when available, ``None`` otherwise.
-        _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
@@ -641,6 +573,7 @@ def finalize_turn(
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
+        "bestplan_receipt_metadata": getattr(agent, "_bestplan_receipt_metadata", None),
         "model": agent.model,
         "provider": agent.provider,
         "base_url": agent.base_url,
@@ -697,23 +630,30 @@ def finalize_turn(
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
+    if (not _required_policy_halt
+            and agent._skill_nudge_interval > 0
             and agent._iters_since_skill >= agent._skill_nudge_interval
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    if not _required_policy_halt:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    if (
+        final_response
+        and not interrupted
+        and not _required_policy_halt
+        and (_should_review_memory or _should_review_skills)
+    ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
@@ -729,28 +669,5 @@ def finalize_turn(
     # provider before the second message. Actual session-end cleanup is
     # handled by the CLI (atexit / /reset) and gateway (session expiry /
     # _reset_session).
-
-    # Plugin hook: on_session_end
-    # Fired at the very end of every run_conversation call.
-    # Plugins can use this for cleanup, flushing buffers, etc.
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=_turn_exit_reason,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_end hook failed: %s", exc)
-
-    agent._turn_preflight_display_snapshot = None
-    agent._turn_received_provider_response = False
 
     return result

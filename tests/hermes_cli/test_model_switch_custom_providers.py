@@ -9,6 +9,7 @@ import hermes_cli.providers as providers_mod
 import pytest
 from hermes_cli.model_switch import list_authenticated_providers, switch_model
 from hermes_cli.providers import resolve_provider_full
+from hermes_cli.runtime_provider import resolve_runtime_provider
 
 
 _MOCK_VALIDATION = {

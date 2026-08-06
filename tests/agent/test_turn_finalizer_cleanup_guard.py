@@ -41,6 +41,8 @@ class _StubAgent:
         self._interrupt_message = None
         self._tool_guardrail_halt_decision = None
         self._response_was_previewed = False
+        self._turn_file_mutation_paths = set()
+        self._handle_max_iterations_called = False
         self._skill_nudge_interval = 0
         self._iters_since_skill = 0
         for attr in (
@@ -82,6 +84,7 @@ class _StubAgent:
         pass
 
     def _handle_max_iterations(self, messages, n):
+        self._handle_max_iterations_called = True
         return "PARTIAL SUMMARY FROM MODEL"
 
     def _file_mutation_verifier_enabled(self):

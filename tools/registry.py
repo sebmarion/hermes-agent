@@ -704,13 +704,7 @@ class ToolRegistry:
 
     @staticmethod
     def _normalize_handler_result(name: str, result):
-        """Enforce the result shapes supported by the agent tool pipeline.
-
-        Normal tool results are strings.  The sole structured exception is the
-        multimodal envelope consumed by the agent executor.  Returning every
-        other value as a string error keeps logging, hooks, budgeting, and
-        persistence from receiving values they cannot safely slice or size.
-        """
+        """Normalize handlers to text or the supported multimodal envelope."""
         if isinstance(result, str):
             return result
         if (
@@ -733,7 +727,15 @@ class ToolRegistry:
             result_type=result_type,
         )
 
-    def dispatch(self, name: str, args: dict, **kwargs) -> str | dict:
+    def dispatch(
+        self,
+        name: str,
+        args: dict,
+        prepared_runtime=None,
+        turn_id=None,
+        tool_call_id=None,
+        **kwargs,
+    ) -> str | dict:
         """Execute a tool handler by name.
 
         * Async handlers are bridged automatically via ``_run_async()``.
@@ -746,11 +748,57 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
-            if entry.is_async:
-                from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
-            else:
-                result = entry.handler(args, **kwargs)
+            from agent.tool_runtime_context import (
+                bind_prepared_tool_runtime,
+                get_prepared_tool_runtime,
+                prepare_tool_runtime,
+            )
+            from hermes_cli.middleware import (
+                get_authorized_tool_dispatch,
+                record_required_policy_block,
+                registry_dispatch_policy_block,
+            )
+
+            runtime = prepared_runtime
+            ambient_runtime = get_prepared_tool_runtime()
+            authorization = get_authorized_tool_dispatch()
+            if (
+                runtime is None
+                and ambient_runtime is not None
+                and authorization is not None
+                and authorization.effective_cwd == ambient_runtime.effective_cwd
+                and authorization.effective_cwd_source
+                == ambient_runtime.effective_cwd_source
+                and authorization.effective_cwd_authoritative
+                == ambient_runtime.effective_cwd_authoritative
+            ):
+                runtime = ambient_runtime
+            if runtime is None:
+                runtime = prepare_tool_runtime(
+                    name,
+                    args,
+                    kwargs.get("task_id"),
+                    kwargs.get("session_id"),
+                )
+            policy_block = registry_dispatch_policy_block(
+                tool_name=name,
+                args=args,
+                task_id=str(kwargs.get("task_id") or ""),
+                session_id=str(kwargs.get("session_id") or ""),
+                turn_id=str(turn_id or ""),
+                tool_call_id=str(tool_call_id or ""),
+                prepared_runtime=runtime,
+            )
+            if policy_block is not None:
+                record_required_policy_block(str(tool_call_id or ""), policy_block)
+                return json.dumps(policy_block.to_result(), ensure_ascii=False)
+            with bind_prepared_tool_runtime(runtime):
+                if entry.is_async:
+                    from model_tools import _run_async
+
+                    result = _run_async(entry.handler(args, **kwargs))
+                else:
+                    result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
