@@ -1,12 +1,14 @@
+import { useStore } from '@nanostores/react'
+
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { KbdCombo } from '@/components/ui/kbd'
-import { Tip } from '@/components/ui/tooltip'
+import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { AudioLines, iconSize, Layers3, Loader2, Square, SteeringWheel, Volume2, VolumeX } from '@/lib/icons'
+import { AudioLines, Ear, EarOff, iconSize, Layers3, Loader2, Square, SteeringWheel, Volume2, VolumeX } from '@/lib/icons'
 import { formatCombo } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
+import { $wakeWord, toggleWakeWord } from '@/store/wake-word'
 
 import type { ConversationStatus } from './hooks/use-voice-conversation'
 import { ModelPill } from './model-pill'
@@ -73,15 +75,10 @@ export function ComposerControls({
 }) {
   const { t } = useI18n()
   const c = t.composer
-  const steerCombo = formatCombo('mod+enter')
-  const steerLabel = `${c.steer} (${steerCombo})`
+  const busyLabel = busyAction === 'queue' ? c.queueMessage : c.stop
+  const steerLabel = `${c.steer} (${formatCombo('mod+enter')})`
 
-  const steerTip = (
-    <span className="inline-flex items-center gap-1.5">
-      {c.steer}
-      <KbdCombo combo="mod+enter" size="sm" variant="inverted" />
-    </span>
-  )
+  const steerTip = <TipKeybindLabel actionId="composer.steer" text={c.steer} />
 
   if (conversation.active) {
     return <ConversationPill {...conversation} disabled={disabled} />
@@ -112,6 +109,7 @@ export function ComposerControls({
         <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
       )}
       <AutoSpeakButton active={autoSpeak} disabled={disabled} onToggle={onToggleAutoSpeak} />
+      <WakeWordButton disabled={disabled} />
       {showVoicePrimary ? (
         <Tip label={c.startVoice}>
           <Button
@@ -129,9 +127,13 @@ export function ComposerControls({
           </Button>
         </Tip>
       ) : (
-        <Tip label={submitting ? c.sending : busy ? (busyAction === 'queue' ? c.queueMessage : c.stop) : c.send}>
+        <Tip
+          label={
+            submitting ? c.sending : busy ? <TipKeybindLabel actionId={busyAction === 'queue' ? 'composer.queue' : 'composer.send'} text={busyLabel} /> : <TipKeybindLabel actionId="composer.send" text={c.send} />
+          }
+        >
           <Button
-            aria-label={submitting ? c.sending : busy ? (busyAction === 'queue' ? c.queueMessage : c.stop) : c.send}
+            aria-label={submitting ? c.sending : busy ? busyLabel : c.send}
             className={PRIMARY_ICON_BTN}
             disabled={submitting || disabled || !canSubmit}
             type="submit"
@@ -181,6 +183,7 @@ function ConversationPill({
 
   return (
     <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
+      <WakeWordButton disabled={disabled} pausedForVoice />
       <Tip label={muted ? c.unmuteMic : c.muteMic}>
         <Button
           aria-label={muted ? c.unmuteMic : c.muteMic}
@@ -291,6 +294,45 @@ function AutoSpeakButton({ active, disabled, onToggle }: { active: boolean; disa
         variant="ghost"
       >
         {active ? <Volume2 className={iconSize.sm} /> : <VolumeX className={iconSize.sm} />}
+      </Button>
+    </Tip>
+  )
+}
+
+function WakeWordButton({ disabled, pausedForVoice = false }: { disabled: boolean; pausedForVoice?: boolean }) {
+  const { t } = useI18n()
+  const c = t.composer
+  const wake = useStore($wakeWord)
+  const phrase = wake.phrase || 'hey hermes'
+
+  const label = pausedForVoice
+    ? c.wakeWordPausedVoice(phrase)
+    : wake.listening
+      ? c.wakeWordListening(phrase)
+      : c.wakeWordOff(phrase)
+
+  const tooltip = !pausedForVoice && wake.notice ? `${label} — ${wake.notice}` : label
+
+  return (
+    <Tip label={tooltip}>
+      <Button
+        aria-label={label}
+        aria-pressed={wake.listening && !pausedForVoice}
+        className={cn(
+          GHOST_ICON_BTN,
+          'p-0',
+          wake.listening && !pausedForVoice && 'bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary'
+        )}
+        disabled={disabled || pausedForVoice || wake.pending}
+        onClick={() => {
+          triggerHaptic(wake.listening ? 'close' : 'open')
+          void toggleWakeWord()
+        }}
+        size="icon"
+        type="button"
+        variant="ghost"
+      >
+        {wake.listening && !pausedForVoice ? <Ear className={iconSize.sm} /> : <EarOff className={iconSize.sm} />}
       </Button>
     </Tip>
   )

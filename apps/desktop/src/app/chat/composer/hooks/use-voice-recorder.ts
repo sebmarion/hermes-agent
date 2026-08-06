@@ -85,7 +85,14 @@ export function useVoiceRecorder({
     }
 
     try {
-      await handle.start({ onError: error => notifyError(error, voiceCopy.recordingFailed) })
+      await handle.start({
+        onError: error => {
+          clearTimers()
+          setVoiceStatus('idle')
+          notifyError(error, voiceCopy.recordingFailed)
+          focusInput()
+        }
+      })
       startedAtRef.current = Date.now()
       setElapsedSeconds(0)
       setVoiceStatus('recording')
@@ -99,7 +106,7 @@ export function useVoiceRecorder({
   }
 
   const dictate = () => {
-    if (recording) {
+    if (recording || voiceStatus === 'recording') {
       void stop()
     } else if (voiceStatus === 'idle') {
       void start()
