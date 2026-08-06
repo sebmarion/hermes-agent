@@ -3172,7 +3172,10 @@ def run_job(
                         _cron_cfg_for_model.get("model_provider") or ""
                     ).strip()
                 if not job.get("model"):
-                    if not _env_model and _cron_default_model:
+                    # A cron-fleet default is explicit and must beat the
+                    # process-wide chat model environment. It is the model
+                    # unattended jobs are meant to follow.
+                    if _cron_default_model:
                         model = _cron_default_model
                     elif isinstance(_model_cfg, str):
                         model = _model_cfg
@@ -3319,7 +3322,7 @@ def run_job(
         _drift: list[str] = []
         _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
         _provider_axis_covered = bool(_cron_default_provider) and not (job.get("provider") or "").strip()
-        _model_axis_covered = bool(_cron_default_model) and not (job.get("model") or "").strip() and not _env_model
+        _model_axis_covered = bool(_cron_default_model) and not (job.get("model") or "").strip()
         try:
             from hermes_cli.config import cron_model_drift_guard_enabled
             _drift_guard_enabled = cron_model_drift_guard_enabled(_cfg)

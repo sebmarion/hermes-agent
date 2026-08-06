@@ -133,6 +133,14 @@ def _non_host_bound_cwd() -> Path | None:
 
 
 def resolve_agent_cwd() -> Path:
+    try:
+        from agent.tool_runtime_context import get_prepared_tool_runtime
+
+        prepared = get_prepared_tool_runtime()
+    except Exception:
+        prepared = None
+    if prepared is not None:
+        return Path(prepared.effective_cwd)
     non_host_cwd = _non_host_bound_cwd()
     if non_host_cwd is not None:
         return non_host_cwd
@@ -152,6 +160,14 @@ def resolve_agent_cwd() -> Path:
 
 
 def resolve_context_cwd() -> Path | None:
+    try:
+        from agent.tool_runtime_context import get_prepared_tool_runtime
+
+        prepared = get_prepared_tool_runtime()
+    except Exception:
+        prepared = None
+    if prepared is not None:
+        return Path(prepared.effective_cwd)
     # None means "no configured cwd": build_context_files_prompt then falls back
     # to the launch dir (os.getcwd()), correct for a local CLI launched inside a
     # real project. A configured path is validated here (previously it was passed
