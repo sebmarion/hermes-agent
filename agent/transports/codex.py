@@ -9,11 +9,66 @@ import hashlib
 import json
 import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
-from agent.codex_responses_adapter import validate_raw_responses_reasoning_effort
+
+
+def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
+    """Return a provider-safe cache key without changing session identity."""
+    if value is None:
+        return None
+    key = str(value).strip()
+    if not key:
+        return None
+    if len(key) <= 64:
+        return key
+    # Match _content_cache_key's compact, collision-resistant routing-key shape.
+    digest = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"pck_{digest}"
+
+
+_EXTENDED_PROMPT_CACHE_MODELS = (
+    "gpt-5.5-pro",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.2",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-chat-latest",
+    "gpt-5.1-codex",
+    "gpt-5.1",
+    "gpt-5-codex",
+    "gpt-5",
+    "gpt-4.1",
+)
+_EXTENDED_PROMPT_CACHE_MODEL_RE = re.compile(
+    rf"(?:^|[./:])(?:{'|'.join(re.escape(name) for name in _EXTENDED_PROMPT_CACHE_MODELS)})"
+    r"(?:-\d{4}-\d{2}-\d{2})?$"
+)
+
+
+def _default_prompt_cache_retention_for_request(
+    model: str,
+    base_url: Any,
+) -> Optional[str]:
+    """Return ``24h`` for supported models on Amazon Bedrock Mantle."""
+    from utils import base_url_hostname
+
+    hostname_parts = base_url_hostname(str(base_url or "")).split(".")
+    is_bedrock_mantle = (
+        len(hostname_parts) == 4
+        and hostname_parts[0] == "bedrock-mantle"
+        and bool(hostname_parts[1])
+        and hostname_parts[2:] == ["api", "aws"]
+    )
+    if not is_bedrock_mantle:
+        return None
+
+    normalized = str(model or "").strip().lower().replace("_", "-")
+    if _EXTENDED_PROMPT_CACHE_MODEL_RE.search(normalized):
+        return "24h"
+    return None
 
 
 def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]]) -> Optional[str]:
@@ -47,31 +102,6 @@ def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]])
     content = f"{instructions or ''}\x00{tools_part}"
     digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:24]
     return f"pck_{digest}"
-
-
-def _bounded_cache_key(value: Any) -> Optional[str]:
-    """Return a provider-safe cache key, hashing values over 64 characters."""
-    if value is None:
-        return None
-    value = str(value)
-    if len(value) <= 64:
-        return value
-    return "pck_" + hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:24]
-
-
-def _is_mantle_extended_cache_model(model: str) -> bool:
-    normalized = str(model or "").lower()
-    # Match known supported families while excluding future/unknown variants
-    # such as gpt-5.6 until Mantle explicitly supports them.
-    return any(
-        re.search(rf"(?<![a-z0-9]){re.escape(family)}(?:$|-)", normalized)
-        for family in ("gpt-5.5", "gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-4.1")
-    )
-
-
-def _is_bedrock_mantle_url(base_url: Any) -> bool:
-    hostname = (urlparse(str(base_url or "")).hostname or "").lower()
-    return bool(re.fullmatch(r"bedrock-mantle\.[a-z0-9-]+\.api\.aws", hostname))
 
 
 class ResponsesApiTransport(ProviderTransport):
@@ -191,13 +221,13 @@ class ResponsesApiTransport(ProviderTransport):
             elif reasoning_config.get("effort"):
                 reasoning_effort = reasoning_config["effort"]
 
-        validate_raw_responses_reasoning_effort(
-            {"reasoning": {"effort": reasoning_effort}}
-        )
         _effort_clamp = {"minimal": "low"}
+        if "gpt-5.6" in (model or "").lower():
+            # Ultra is the Codex product tier; the Responses API wire value is max.
+            _effort_clamp["ultra"] = "max"
         if params.get("is_xai_responses", False):
             # xAI Responses tops out at high; keep generic stronger values usable.
-            _effort_clamp.update({"xhigh": "high", "max": "high"})
+            _effort_clamp.update({"xhigh": "high", "max": "high", "ultra": "high"})
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)
@@ -292,13 +322,18 @@ class ResponsesApiTransport(ProviderTransport):
         # cache-cold. session_id is left untouched for transcript isolation and
         # the cache-scope routing headers below. Falls back to session_id when
         # there is no static content to hash.
-        cache_key = _bounded_cache_key(
-            _content_cache_key(instructions, response_tools) or session_id
-        )
+        cache_key = _content_cache_key(instructions, response_tools) or session_id
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
         if not is_github_responses and not is_xai_responses and cache_key:
             kwargs["prompt_cache_key"] = cache_key
+
+        cache_retention = _default_prompt_cache_retention_for_request(
+            model,
+            params.get("base_url"),
+        )
+        if cache_retention:
+            kwargs.setdefault("prompt_cache_retention", cache_retention)
 
         if reasoning_enabled and is_xai_responses:
             from agent.model_metadata import grok_supports_reasoning_effort
@@ -333,25 +368,13 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
-        if isinstance(kwargs.get("prompt_cache_key"), str):
-            kwargs["prompt_cache_key"] = _bounded_cache_key(kwargs["prompt_cache_key"])
-        if isinstance(kwargs.get("extra_body"), dict):
-            extra_body = dict(kwargs["extra_body"])
-            if isinstance(extra_body.get("prompt_cache_key"), str):
-                extra_body["prompt_cache_key"] = _bounded_cache_key(
-                    extra_body["prompt_cache_key"]
-                )
-            kwargs["extra_body"] = extra_body
 
-        # Bedrock Mantle keeps prompt-cache entries for 24 hours for the
-        # supported model families only. Preserve an explicit override.
-        if (
-            _is_bedrock_mantle_url(params.get("base_url"))
-            and _is_mantle_extended_cache_model(model)
-        ):
-            kwargs.setdefault("prompt_cache_retention", "24h")
-
-        validate_raw_responses_reasoning_effort(kwargs)
+        if "prompt_cache_key" in kwargs:
+            bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
+            if bounded_cache_key:
+                kwargs["prompt_cache_key"] = bounded_cache_key
+            else:
+                kwargs.pop("prompt_cache_key", None)
 
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
         # supported: service_tier") — hit when ``/fast`` priority-processing
@@ -386,7 +409,7 @@ class ResponsesApiTransport(ProviderTransport):
             # remain high.  Send session_id / x-client-request-id as HTTP
             # headers while keeping ``prompt_cache_key`` in the body for
             # standard OpenAI routing as a belt-and-braces fallback.
-            cache_scope_id = _bounded_cache_key(session_id)
+            cache_scope_id = _bounded_prompt_cache_key(session_id)
             if cache_scope_id:
                 existing_extra_headers = kwargs.get("extra_headers")
                 merged_extra_headers: Dict[str, str] = {}
@@ -428,13 +451,16 @@ class ResponsesApiTransport(ProviderTransport):
             merged_extra_body: Dict[str, Any] = {}
             if isinstance(existing_extra_body, dict):
                 merged_extra_body.update(existing_extra_body)
-            if isinstance(merged_extra_body.get("prompt_cache_key"), str):
-                merged_extra_body["prompt_cache_key"] = _bounded_cache_key(
-                    merged_extra_body["prompt_cache_key"]
-                )
-            else:
-                merged_extra_body.setdefault("prompt_cache_key", cache_key)
+            merged_extra_body.setdefault("prompt_cache_key", cache_key)
             kwargs["extra_body"] = merged_extra_body
+
+        extra_body = kwargs.get("extra_body")
+        if isinstance(extra_body, dict) and "prompt_cache_key" in extra_body:
+            bounded_cache_key = _bounded_prompt_cache_key(extra_body["prompt_cache_key"])
+            if bounded_cache_key:
+                extra_body["prompt_cache_key"] = bounded_cache_key
+            else:
+                extra_body.pop("prompt_cache_key", None)
 
         return kwargs
 
@@ -489,19 +515,28 @@ class ResponsesApiTransport(ProviderTransport):
     def validate_response(self, response: Any) -> bool:
         """Check Codex Responses API response has valid output structure.
 
-        Returns True only if response.output is a non-empty list.
-        Does NOT check output_text fallback — the caller handles that
-        with diagnostic logging for stream backfill recovery.
+        Returns True only if response.output is a non-empty list. Also treats
+        terminal content-filter incomplete responses as valid: the Responses API
+        may return status=incomplete with incomplete_details.reason='content_filter'
+        and no output items. That is a provider refusal signal, not a malformed
+        response, and must reach normalization so the agent loop can use the
+        content-policy / fallback path instead of invalid-response retries.
+
+        Does NOT check output_text fallback — the caller handles that with
+        diagnostic logging for stream backfill recovery.
         """
         if response is None:
             return False
         output = getattr(response, "output", None)
-        if isinstance(output, list) and output:
-            return True
-        status = str(getattr(response, "status", "") or "").strip().lower()
-        details = getattr(response, "incomplete_details", None)
-        reason = details.get("reason") if isinstance(details, dict) else getattr(details, "reason", None)
-        return status == "incomplete" and str(reason or "").strip().lower() == "content_filter"
+        if not isinstance(output, list) or not output:
+            status = str(getattr(response, "status", "") or "").strip().lower()
+            incomplete_details = getattr(response, "incomplete_details", None)
+            if isinstance(incomplete_details, dict):
+                reason = str(incomplete_details.get("reason") or "").strip().lower()
+            else:
+                reason = str(getattr(incomplete_details, "reason", "") or "").strip().lower()
+            return status == "incomplete" and reason == "content_filter"
+        return True
 
     def preflight_kwargs(
         self,
@@ -509,17 +544,36 @@ class ResponsesApiTransport(ProviderTransport):
         *,
         allow_stream: bool = False,
         is_github_responses: bool = False,
+        sanitize_harmony_tokens: bool = False,
     ) -> dict:
         """Validate and sanitize Codex API kwargs before the call.
 
         Normalizes input items, strips unsupported fields, validates structure.
+        ``sanitize_harmony_tokens`` is enabled only for the ChatGPT Codex
+        backend, which rejects literal reserved Harmony wire tokens in text.
         """
         from agent.codex_responses_adapter import _preflight_codex_api_kwargs
-        return _preflight_codex_api_kwargs(
+
+        normalized = _preflight_codex_api_kwargs(
             api_kwargs,
             allow_stream=allow_stream,
             is_github_responses=is_github_responses,
+            sanitize_harmony_tokens=sanitize_harmony_tokens,
         )
+        if "prompt_cache_key" in normalized:
+            bounded = _bounded_prompt_cache_key(normalized["prompt_cache_key"])
+            if bounded:
+                normalized["prompt_cache_key"] = bounded
+            else:
+                normalized.pop("prompt_cache_key", None)
+        extra_body = normalized.get("extra_body")
+        if isinstance(extra_body, dict) and "prompt_cache_key" in extra_body:
+            bounded = _bounded_prompt_cache_key(extra_body["prompt_cache_key"])
+            if bounded:
+                extra_body["prompt_cache_key"] = bounded
+            else:
+                extra_body.pop("prompt_cache_key", None)
+        return normalized
 
     def map_finish_reason(self, raw_reason: str) -> str:
         """Map Codex response.status to OpenAI finish_reason.

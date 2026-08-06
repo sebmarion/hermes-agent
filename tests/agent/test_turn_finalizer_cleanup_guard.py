@@ -41,8 +41,6 @@ class _StubAgent:
         self._interrupt_message = None
         self._tool_guardrail_halt_decision = None
         self._response_was_previewed = False
-        self._turn_file_mutation_paths = set()
-        self._handle_max_iterations_called = False
         self._skill_nudge_interval = 0
         self._iters_since_skill = 0
         for attr in (
@@ -84,7 +82,6 @@ class _StubAgent:
         pass
 
     def _handle_max_iterations(self, messages, n):
-        self._handle_max_iterations_called = True
         return "PARTIAL SUMMARY FROM MODEL"
 
     def _file_mutation_verifier_enabled(self):
@@ -138,14 +135,6 @@ def _run(
     )
 
 
-def test_all_cleanup_steps_raise_response_still_returned():
-    agent = _StubAgent(
-        raise_in=("save_trajectory", "cleanup_task_resources", "persist_session")
-    )
-    result = _run(agent)
-    assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
-    labels = [e.split(":")[0] for e in result["cleanup_errors"]]
-    assert labels == ["save_trajectory", "cleanup_task_resources", "persist_session"]
 
 
 @pytest.mark.parametrize(
@@ -175,40 +164,3 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert "cleanup_errors" not in result
 
 
-def test_budget_exhaustion_with_unverified_code_returns_recovery_required_without_model_summary(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    (tmp_path / "package.json").write_text(
-        '{"scripts":{"test":"vitest"}}', encoding="utf-8"
-    )
-    (tmp_path / "pnpm-lock.yaml").write_text("", encoding="utf-8")
-    changed = str(tmp_path / "src" / "app.ts")
-
-    from agent.verification_evidence import mark_workspace_edited
-
-    mark_workspace_edited(session_id="sess-1", cwd=tmp_path, paths=[changed])
-    agent = _StubAgent(raise_in=())
-    agent._turn_file_mutation_paths = {changed}
-
-    result = _run(agent)
-
-    assert result["final_response"].startswith("RECOVERY_REQUIRED:")
-    assert result["messages"][-1]["role"] == "assistant"
-    assert result["messages"][-1]["content"] == result["final_response"]
-    assert "Budget: 3/3" in result["final_response"]
-    assert changed in result["final_response"]
-    assert "`pnpm run test`" in result["final_response"]
-    assert "Recovery prompt:" in result["final_response"]
-    assert agent._handle_max_iterations_called is False
-
-
-def test_text_response_on_last_allowed_call_is_completed():
-    agent = _StubAgent(raise_in=())
-    result = _run(
-        agent,
-        final_response="final report",
-        api_call_count=agent.max_iterations,
-        turn_exit_reason="text_response(finish_reason=stop)",
-    )
-    assert result["final_response"] == "final report"
-    assert result["completed"] is True

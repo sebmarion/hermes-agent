@@ -72,64 +72,24 @@ def _filter_verifiable_paths(paths: Iterable[str]) -> list[str]:
     return [p for p in paths if p and not _is_non_code_path(p)]
 
 
-# Session identities (platform or source) that are NOT human conversational
-# messaging surfaces: interactive coding surfaces (CLI, TUI, desktop, codex,
-# local, gateway) and programmatic callers (API server, webhooks, tools).
-# Verify-on-stop stays ON by default for these. Any other resolved gateway
-# platform is a conversational messaging surface (Telegram, Discord, WhatsApp,
-# Signal, Slack, etc.) where the verification narrative would reach a human as
-# chat noise, so it defaults OFF. Mirrors LOCAL_SESSION_SOURCE_IDS in
-# apps/desktop/src/lib/session-source.ts; keep roughly in sync when adding a
-# local or programmatic surface. Default-deny by design: an unrecognized
-# identity is treated as messaging (OFF) so a new chat platform never leaks the
-# verification receipt before this set is updated.
-_NON_MESSAGING_SESSION_SURFACES = frozenset(
-    {
-        "",
-        "cli",
-        "codex",
-        "desktop",
-        "gateway",
-        "local",
-        "tui",
-        "tool",
-        "api_server",
-        "webhook",
-        "msgraph_webhook",
-    }
-)
-
-
 def _session_is_messaging_surface() -> bool:
-    """Return whether this turn is delivered over a human messaging channel.
+    """Whether this turn is delivered over a human messaging channel.
 
-    The gateway binds the platform value (e.g. ``telegram``) to
-    ``HERMES_SESSION_PLATFORM``; the CLI and TUI set ``HERMES_SESSION_SOURCE``
-    (e.g. ``cli``, ``tui``) instead. Both are consulted via the session-context
-    helper (with an ``os.environ`` fallback), alongside the ``HERMES_PLATFORM``
-    override, matching the sibling platform resolution in
-    ``agent/skill_commands.py`` and ``agent/prompt_builder.py``. A turn is a
-    messaging surface when a resolved identity is present and is not a known
-    non-messaging surface.
+    Verify-on-stop defaults ON for the interactive coding surfaces and
+    programmatic callers, and OFF on a conversational platform (Telegram,
+    Discord, Slack, ...) where the verification narrative reaches a human as
+    chat noise. The surface classification itself is shared with the other
+    consumers of this distinction — see
+    ``gateway.session_context.session_is_messaging_surface``.
     """
     try:
-        from gateway.session_context import get_session_env
+        from gateway.session_context import session_is_messaging_surface
 
-        platform = (
-            os.getenv("HERMES_PLATFORM")
-            or get_session_env("HERMES_SESSION_PLATFORM", "")
-        )
-        source = get_session_env("HERMES_SESSION_SOURCE", "")
+        return session_is_messaging_surface()
     except Exception:
-        platform = os.getenv("HERMES_PLATFORM", "") or os.environ.get(
-            "HERMES_SESSION_PLATFORM", ""
-        )
-        source = os.environ.get("HERMES_SESSION_SOURCE", "")
-    for identity in (platform, source):
-        identity = str(identity or "").strip().lower()
-        if identity and identity not in _NON_MESSAGING_SESSION_SURFACES:
-            return True
-    return False
+        # The gateway package is unreachable, so there is no messaging channel
+        # to be on. Reporting a local surface keeps verify-on-stop enabled.
+        return False
 
 
 def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
@@ -149,9 +109,9 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
         return env.strip().lower() not in {"0", "false", "no", "off"}
     if config is None:
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config import load_config_readonly
 
-            config = load_config()
+            config = load_config_readonly()
         except Exception:
             config = {}
     agent_cfg = (config or {}).get("agent") if isinstance(config, dict) else None
@@ -242,33 +202,6 @@ def _status_detail(status: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _verification_gap_details(
-    *,
-    session_id: str | None,
-    changed_paths: Iterable[str],
-) -> tuple[list[str], dict[str, Any], list[str]] | None:
-    """Return changed paths, status, and commands when edited work lacks proof."""
-    paths = sorted({str(p) for p in _filter_verifiable_paths(changed_paths)})
-    if not paths:
-        return None
-
-    snapshot = _verification_snapshot(session_id=session_id, changed_paths=paths)
-    if snapshot is None:
-        return None
-    status, facts = snapshot
-
-    state = str(status.get("status") or "unverified")
-    if state == "passed":
-        return None
-
-    verify_commands = [
-        str(cmd).strip()
-        for cmd in (facts.get("verifyCommands") or [])
-        if str(cmd).strip()
-    ]
-    return paths, status, verify_commands
-
-
 def build_verify_on_stop_nudge(
     *,
     session_id: str | None,
@@ -280,16 +213,24 @@ def build_verify_on_stop_nudge(
     # Drop documentation/prose paths (markdown, skills, README, LICENSE, ...) —
     # they carry no verifiable behavior, so a turn that touched only those has
     # nothing to verify and must not nudge.
-    if attempts >= max_attempts:
+    paths = sorted({str(p) for p in _filter_verifiable_paths(changed_paths)})
+    if not paths or attempts >= max_attempts:
         return None
 
-    details = _verification_gap_details(
-        session_id=session_id,
-        changed_paths=changed_paths,
-    )
-    if details is None:
+    snapshot = _verification_snapshot(session_id=session_id, changed_paths=paths)
+    if snapshot is None:
         return None
-    paths, status, verify_commands = details
+    status, facts = snapshot
+
+    verify_commands = [
+        str(cmd).strip()
+        for cmd in (facts.get("verifyCommands") or [])
+        if str(cmd).strip()
+    ]
+
+    state = str(status.get("status") or "unverified")
+    if state == "passed":
+        return None
 
     # Optional shipped coding guidance, only paid when this evidence gate fires.
     try:
@@ -329,76 +270,4 @@ def build_verify_on_stop_nudge(
     )
 
 
-def build_budget_exhausted_verification_response(
-    *,
-    session_id: str | None,
-    changed_paths: Iterable[str],
-    api_call_count: int | None = None,
-    max_iterations: int | None = None,
-) -> str | None:
-    """Return a deterministic recovery handoff for budget exhaustion.
-
-    This is the hard stop counterpart to ``build_verify_on_stop_nudge``. The
-    nudge path spends another model turn while budget remains; once the loop is
-    out of iterations, asking the model for a summary can reintroduce the exact
-    false-success failure this guard is meant to prevent. Use deterministic text
-    instead: pending verification means ``RECOVERY_REQUIRED``, plus a compact
-    recovery prompt a fresh run can execute without requiring the user to infer
-    the next step from a passive ``INCOMPLETE`` label.
-    """
-    details = _verification_gap_details(
-        session_id=session_id,
-        changed_paths=changed_paths,
-    )
-    if details is None:
-        return None
-    paths, status, verify_commands = details
-
-    budget = "unknown"
-    if api_call_count is not None and max_iterations is not None:
-        budget = f"{api_call_count}/{max_iterations}"
-
-    if verify_commands:
-        verification_lines = "\n".join(
-            f"- `{cmd}`" for cmd in verify_commands[:5]
-        )
-    else:
-        verification_lines = (
-            "- No canonical command detected; create and run a focused temporary "
-            "`hermes-verify-*` ad-hoc verifier, then report it as ad-hoc evidence."
-        )
-
-    recovery_prompt = (
-        "You are recovering an interrupted Hermes coding turn.\n\n"
-        "Rules:\n"
-        "- Do not plan broadly; verify or repair the existing work.\n"
-        "- First inspect `git status --short --branch` and the relevant diff.\n"
-        "- Run the pending verification gate listed below.\n"
-        "- If a gate fails, repair and rerun it.\n"
-        "- Report PASS only with same-run command/read-back evidence; otherwise "
-        "report FAIL or BLOCKED."
-    )
-
-    return (
-        "RECOVERY_REQUIRED: iteration budget was exhausted before fresh "
-        "verification evidence existed for edited code.\n\n"
-        "The work is deliberately not marked complete. Start a fresh recovery "
-        "turn/session with the prompt below; it is scoped to verification and "
-        "repair, not more planning.\n\n"
-        f"Budget: {budget}\n\n"
-        f"Verification status: {_status_detail(status)}\n\n"
-        f"Changed paths:\n{_format_changed_paths(paths)}\n\n"
-        "Pending verification gate:\n"
-        f"{verification_lines}\n\n"
-        "Recovery prompt:\n"
-        "```text\n"
-        f"{recovery_prompt}\n"
-        "```"
-    )
-
-
-__all__ = [
-    "build_budget_exhausted_verification_response",
-    "build_verify_on_stop_nudge",
-    "verify_on_stop_enabled",
-]
+__all__ = ["build_verify_on_stop_nudge", "verify_on_stop_enabled"]

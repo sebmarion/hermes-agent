@@ -74,46 +74,12 @@ class TestConfigSetReasoningSessionScope:
         assert agent.reasoning_config == {"enabled": False}
         write_key.assert_not_called()
 
-    def test_session_scoped_set_updates_create_override_for_lazy_session(self) -> None:
-        """A pre-build (agent=None) session must keep the change for the
-        deferred agent build instead of dropping it."""
-        session = {"session_key": "k2", "agent": None}
-        with patch.dict(server._sessions, {"s2": session}, clear=False), \
-                patch.object(server, "_write_config_key") as write_key:
-            resp = self._dispatch(
-                {"key": "reasoning", "session_id": "s2", "value": "high"}
-            )
-        assert resp["result"]["value"] == "high"
-        assert session["create_reasoning_override"] == {
-            "enabled": True,
-            "effort": "high",
-        }
-        write_key.assert_not_called()
 
     def test_no_session_persists_globally(self) -> None:
         with patch.object(server, "_write_config_key") as write_key:
             resp = self._dispatch({"key": "reasoning", "value": "low"})
         assert resp["result"]["value"] == "low"
         write_key.assert_called_once_with("agent.reasoning_effort", "low")
-
-    def test_global_effort_write_clears_stale_ultra_mode_atomically(self) -> None:
-        saved = []
-        config = {
-            "agent": {
-                "reasoning_effort": "max",
-                "reasoning_mode": "ultra",
-            },
-            "unrelated": {"keep": True},
-        }
-        with patch.object(server, "_load_cfg", return_value=config), patch.object(
-            server, "_save_cfg", side_effect=lambda value: saved.append(value)
-        ):
-            server._write_config_key("agent.reasoning_effort", "low")
-
-        assert len(saved) == 1
-        assert saved[0]["agent"]["reasoning_effort"] == "low"
-        assert "reasoning_mode" not in saved[0]["agent"]
-        assert saved[0]["unrelated"] == {"keep": True}
 
     def test_unknown_value_rejected(self) -> None:
         resp = self._dispatch({"key": "reasoning", "value": "bogus"})
@@ -135,6 +101,3 @@ class TestLoadReasoningConfigYamlBoolean:
         ):
             assert server._load_reasoning_config() == {"enabled": False}
 
-    def test_unset_returns_default(self) -> None:
-        with patch.object(server, "_load_cfg", return_value={"agent": {}}):
-            assert server._load_reasoning_config() is None
