@@ -2998,12 +2998,38 @@ def compress_context(
                     # instead of under-counting the newly visible rows.
                     approx_tokens = 0
 
-        # The durable projection CAS is captured immediately before the
-        # commit phase, after the read-only summary work.  Validating here
-        # still protects the archive transaction, while allowing a timed-out
-        # worker to enter the summary engine so the host can cancel/fence it
-        # rather than returning early on a stale pre-summary snapshot.
+        # Validate the input prefix before entering the summary engine. A
+        # stale in-memory projection is not recoverable by summarization: the
+        # eventual archive CAS would reject it after spending an entire LLM
+        # call and the caller would surface a misleading context-exhausted
+        # error. Keep the final capture below as the commit-time CAS guard;
+        # this first check only avoids doing expensive work for a snapshot we
+        # already know is unsafe.
         _expected_active_message_ids: Optional[tuple[int, ...]] = None
+        if _durable_in_place:
+            try:
+                _expected_active_message_ids = _capture_active_projection_ids(
+                    _lock_db,
+                    _lock_sid,
+                    messages,
+                )
+            except Exception as _initial_snapshot_err:
+                logger.warning(
+                    "in-place compression skipped: durable projection does not "
+                    "match the input snapshot for session=%s (%s)",
+                    _lock_sid,
+                    _initial_snapshot_err,
+                )
+                agent._cached_system_prompt = _original_cached_system_prompt
+                agent._last_compaction_in_place = False
+                _existing_sp = _original_cached_system_prompt
+                if not _existing_sp:
+                    _existing_sp = system_message or agent._build_system_prompt(
+                        system_message
+                    )
+                    agent._cached_system_prompt = _existing_sp
+                _release_lock()
+                return messages, _existing_sp
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it

@@ -1621,7 +1621,32 @@ def _run_conversation(
             agent.context_compressor, "prune_tool_results_for_dispatch", None
         )
         if callable(_dispatch_pruner):
-            dispatch_projection, pruned_tool_items = _dispatch_pruner(messages)
+            try:
+                _dispatch_result = _dispatch_pruner(messages)
+            except Exception:
+                # Context engines are plugins and older engines may not expose
+                # the current tuple contract.  A dispatch-time optimisation
+                # must never turn a recoverable turn into a terminal context
+                # failure; the authoritative compressor will retry on the
+                # next admission pass.
+                logger.debug(
+                    "dispatch tool-result prune failed; skipping",
+                    exc_info=True,
+                )
+                _dispatch_result = None
+            if (
+                isinstance(_dispatch_result, tuple)
+                and len(_dispatch_result) == 2
+                and isinstance(_dispatch_result[0], list)
+                and isinstance(_dispatch_result[1], int)
+                and _dispatch_result[1] >= 0
+            ):
+                dispatch_projection, pruned_tool_items = _dispatch_result
+            else:
+                # Treat malformed/legacy results as a no-op.  In particular,
+                # do not unpack an empty list or a MagicMock from a test/plugin
+                # double and surface ``compression_exhausted`` to the user.
+                dispatch_projection, pruned_tool_items = messages, 0
         else:
             dispatch_projection, pruned_tool_items = messages, 0
         # A repair must be made durable before provider/tool work can append
@@ -1652,7 +1677,6 @@ def _run_conversation(
                     )
                 )
             if adopted_messages is previous_messages:
-                _refund_untransported_attempt()
                 if repaired_seq > 0 and not pruned_tool_items:
                     persistence_failure = (
                         "Conversation history repair could not be persisted safely."
@@ -1666,21 +1690,38 @@ def _run_conversation(
                     persistence_failure = (
                         "Context budget pruning could not be persisted safely."
                     )
-                return _compression_exhausted_result(
-                    persistence_failure
+                if repaired_seq > 0:
+                    # A repaired role sequence cannot safely be sent until the
+                    # durable transcript accepts the same mutation. Keep the
+                    # existing fail-closed terminal path for that case.
+                    _refund_untransported_attempt()
+                    return _compression_exhausted_result(persistence_failure)
+
+                # Pruning is an optimisation, not the transcript's source of
+                # truth. A stale SessionDB prefix or a brief lock race must
+                # not turn an otherwise serviceable turn into the red
+                # ``compression_exhausted`` error. Leave the original
+                # messages untouched and let the normal provider-admission /
+                # compression guards decide whether the request actually fits.
+                logger.warning(
+                    "dispatch tool-result prune was not persisted; continuing "
+                    "with the unpruned transcript (session=%s)",
+                    agent.session_id or "-",
                 )
-            messages = adopted_messages
-            current_turn_user_idx = reanchor_current_turn_user_idx(
-                messages, original_user_message
-            )
-            agent._persist_user_message_idx = current_turn_user_idx
-            conversation_history = (
-                conversation_history_after_compression(agent, messages)
-                if projection_persisted
-                else None
-            )
-            _refund_untransported_attempt()
-            continue
+                _refund_untransported_attempt()
+            else:
+                messages = adopted_messages
+                current_turn_user_idx = reanchor_current_turn_user_idx(
+                    messages, original_user_message
+                )
+                agent._persist_user_message_idx = current_turn_user_idx
+                conversation_history = (
+                    conversation_history_after_compression(agent, messages)
+                    if projection_persisted
+                    else None
+                )
+                _refund_untransported_attempt()
+                continue
 
         api_messages = []
         for idx, msg in enumerate(messages):
