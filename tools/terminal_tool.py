@@ -2326,6 +2326,7 @@ def _resolve_command_cwd(
     workdir: Optional[str],
     default_cwd: str,
     session_key: Optional[str] = None,
+    env=None,
 ) -> str:
     """Return the cwd for a command. Explicit ``workdir=`` overrides everything.
 
@@ -2336,6 +2337,14 @@ def _resolve_command_cwd(
     record yet (first command) runs in ``default_cwd`` (config/override cwd),
     which is also what seeds a fresh environment.
     """
+    try:
+        from agent.tool_runtime_context import get_prepared_tool_runtime
+
+        prepared = get_prepared_tool_runtime()
+    except Exception:
+        prepared = None
+    if prepared is not None:
+        return prepared.effective_cwd
     if workdir:
         return workdir
     return get_session_cwd(session_key) or default_cwd

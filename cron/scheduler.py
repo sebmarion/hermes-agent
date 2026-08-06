@@ -2844,7 +2844,53 @@ def run_job(
     _session_db = None
     try:
         from hermes_state import SessionDB
-        _session_db = SessionDB()
+
+        # Resolve timeout: env override -> config.yaml -> default 10s. A
+        # zero/negative value explicitly opts into the legacy unbounded path.
+        _session_db_timeout: float | None = None
+        _raw_env_timeout = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
+        if _raw_env_timeout:
+            try:
+                _session_db_timeout = float(_raw_env_timeout)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Invalid HERMES_CRON_SESSION_DB_TIMEOUT=%r; using config/default",
+                    _raw_env_timeout,
+                )
+        if _session_db_timeout is None:
+            try:
+                _timeout_cfg = load_config() or {}
+                _cron_cfg = _timeout_cfg.get("cron", {}) if isinstance(_timeout_cfg, dict) else {}
+                _configured = _cron_cfg.get("session_db_timeout_seconds")
+                if _configured is not None:
+                    _session_db_timeout = float(_configured)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to load cron.session_db_timeout_seconds from config: %s",
+                    exc,
+                )
+        if _session_db_timeout is None:
+            _session_db_timeout = 10.0
+
+        if _session_db_timeout > 0:
+            _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                _session_db = _session_db_pool.submit(SessionDB).result(
+                    timeout=_session_db_timeout
+                )
+            finally:
+                # Do not wait for a wedged sqlite connect to unwind. The agent
+                # run can continue without a session store and the dispatch
+                # guard remains releasable.
+                _session_db_pool.shutdown(wait=False)
+        else:
+            _session_db = SessionDB()
+    except concurrent.futures.TimeoutError:
+        logger.error(
+            "Job '%s': SessionDB init did not return within %.0fs — proceeding "
+            "without a session store for this run instead of blocking it forever",
+            job.get("id", "?"), _session_db_timeout,
+        )
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
@@ -3094,7 +3140,10 @@ def run_job(
         # value is intentionally re-read from storage every tick so a
         # ``cronjob action=update model=...`` after a failed run takes effect
         # on the next tick — there is no in-memory cache.
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        _env_model = os.getenv("HERMES_MODEL") or ""
+        model = job.get("model") or _env_model
+        _cron_default_model = ""
+        _cron_default_provider = ""
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -3116,8 +3165,16 @@ def run_job(
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}
+                _cron_cfg_for_model = _cfg.get("cron") or {}
+                if isinstance(_cron_cfg_for_model, dict):
+                    _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
+                    _cron_default_provider = str(
+                        _cron_cfg_for_model.get("model_provider") or ""
+                    ).strip()
                 if not job.get("model"):
-                    if isinstance(_model_cfg, str):
+                    if not _env_model and _cron_default_model:
+                        model = _cron_default_model
+                    elif isinstance(_model_cfg, str):
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
                         # Mirror the CLI/oneshot resolution: prefer ``default``,
@@ -3208,7 +3265,8 @@ def run_job(
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
-                "requested": job.get("provider"),
+                "requested": job.get("provider") or _cron_default_provider or None,
+                "target_model": model or None,
             }
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
@@ -3220,7 +3278,10 @@ def run_job(
             runtime = None
             for entry in fb_list:
                 try:
-                    fb_kwargs = {"requested": entry.get("provider")}
+                    fb_kwargs = {
+                        "requested": entry.get("provider"),
+                        "target_model": model or None,
+                    }
                     if entry.get("base_url"):
                         fb_kwargs["explicit_base_url"] = entry["base_url"]
                     if entry.get("api_key"):
@@ -3257,14 +3318,21 @@ def run_job(
         # before — the guard never engages for it. Pinned axes are unaffected.
         _drift: list[str] = []
         _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
-        if _provider_snapshot and not (job.get("provider") or "").strip():
+        _provider_axis_covered = bool(_cron_default_provider) and not (job.get("provider") or "").strip()
+        _model_axis_covered = bool(_cron_default_model) and not (job.get("model") or "").strip() and not _env_model
+        try:
+            from hermes_cli.config import cron_model_drift_guard_enabled
+            _drift_guard_enabled = cron_model_drift_guard_enabled(_cfg)
+        except Exception:
+            _drift_guard_enabled = True
+        if _drift_guard_enabled and _provider_snapshot and not (job.get("provider") or "").strip() and not _provider_axis_covered:
             _current_provider = str(runtime.get("provider") or "").strip().lower()
             if _current_provider and _current_provider != _provider_snapshot:
                 _drift.append(
                     f"provider '{_provider_snapshot}' -> '{_current_provider}'"
                 )
         _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
-        if _model_snapshot and not (job.get("model") or "").strip():
+        if _drift_guard_enabled and _model_snapshot and not (job.get("model") or "").strip() and not _model_axis_covered:
             _current_model = str(model or "").strip().lower()
             if _current_model and _current_model != _model_snapshot:
                 _drift.append(

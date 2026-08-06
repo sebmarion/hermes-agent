@@ -1230,9 +1230,8 @@ def _notify_session_finalize(
     reason: str = "shutdown",
 ) -> None:
     try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_finalize",
+        from hermes_cli.lifecycle import finalize_session
+        finalize_session(
             session_id=session_id,
             platform=platform,
             reason=reason,
@@ -1260,8 +1259,8 @@ def _emit_interrupted_session_end(cli, *, reason: str = "keyboard_interrupt") ->
             pass
 
     try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
+        from hermes_cli.lifecycle import invoke_hook
+        invoke_hook(
             "on_session_end",
             session_id=session_id,
             task_id=getattr(agent, "_current_task_id", "") or "",
@@ -3788,10 +3787,10 @@ def save_config_value(key_path: str, value: any) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    # Use the same precedence as load_cli_config: user config first, then project config
-    user_config_path = _hermes_home / 'config.yaml'
-    project_config_path = Path(__file__).parent / 'cli-config.yaml'
-    config_path = user_config_path if user_config_path.exists() else project_config_path
+    # Runtime settings belong to the active Hermes home, even on first launch.
+    # Falling back to the checked-in template makes a successful write vanish
+    # on restart because config readers use HERMES_HOME/config.yaml.
+    config_path = get_hermes_home() / "config.yaml"
     
     try:
         # Ensure parent directory exists (for ~/.hermes/config.yaml on first use)
@@ -3821,6 +3820,14 @@ def save_config_value(key_path: str, value: any) -> bool:
             os.chmod(config_path, 0o600)
         except (OSError, NotImplementedError):
             pass
+
+        if key_path.startswith("model") or key_path in {"provider", "model.provider"}:
+            try:
+                from hermes_cli.config import warn_unpinned_cron_jobs_after_model_config_change
+
+                warn_unpinned_cron_jobs_after_model_config_change(key_path, value)
+            except Exception:
+                logger.debug("Cron drift warning failed after config save", exc_info=True)
         
         return True
     except Exception as e:
@@ -7561,13 +7568,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         lifecycle point (shutdown, /new, /reset).
         """
         try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _invoke_hook(
-                event_type,
-                session_id=self.agent.session_id if self.agent else None,
-                platform=getattr(self, "platform", None) or "cli",
-                reason="new_session" if event_type == "on_session_reset" else "session_boundary",
-            )
+            from hermes_cli.lifecycle import finalize_session, invoke_hook
+            kwargs = {
+                "session_id": self.agent.session_id if self.agent else None,
+                "platform": getattr(self, "platform", None) or "cli",
+            }
+            if event_type == "on_session_finalize":
+                finalize_session(reason="session_boundary", **kwargs)
+            else:
+                invoke_hook(event_type, reason="new_session", **kwargs)
         except Exception:
             pass
 
@@ -7692,6 +7701,64 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._pending_title = None
         self._resumed = False
         _sync_process_session_id(self.session_id)
+
+        # A full session boundary clears all session-only routing overrides.
+        # Re-derive persisted defaults before creating the new DB row so
+        # /fast, /model, /reasoning, and one-turn switches cannot leak across
+        # /new or /clear.
+        self._pending_one_turn_model_restore = None
+        self.service_tier = _parse_service_tier_config(
+            CLI_CONFIG.get("agent", {}).get("service_tier", "")
+        )
+        _model_config = CLI_CONFIG.get("model", {})
+        if isinstance(_model_config, str):
+            _config_model = _model_config
+            _config_provider = ""
+        elif isinstance(_model_config, dict):
+            _config_model = _model_config.get("default") or _model_config.get("model") or ""
+            _config_provider = _model_config.get("provider") or ""
+        else:
+            _config_model = ""
+            _config_provider = ""
+        if _config_model and _config_model != getattr(self, "model", None):
+            try:
+                from hermes_cli.model_switch import switch_model as _switch_model
+
+                reset_result = _switch_model(
+                    raw_input=_config_model,
+                    current_provider=getattr(self, "provider", "") or "",
+                    current_model=getattr(self, "model", "") or "",
+                    current_base_url=getattr(self, "base_url", "") or "",
+                    current_api_key=getattr(self, "api_key", "") or "",
+                    is_global=False,
+                    explicit_provider=_config_provider or "",
+                )
+                if reset_result.success:
+                    if self.agent:
+                        self.agent.switch_model(
+                            new_model=reset_result.new_model,
+                            new_provider=reset_result.target_provider,
+                            api_key=reset_result.api_key,
+                            base_url=reset_result.base_url,
+                            api_mode=reset_result.api_mode,
+                        )
+                    self.model = reset_result.new_model or _config_model
+                    self.provider = reset_result.target_provider or _config_provider or getattr(self, "provider", "")
+                    self.requested_provider = self.provider
+                    if reset_result.api_key is not None:
+                        self.api_key = reset_result.api_key
+                    if reset_result.base_url is not None:
+                        self.base_url = reset_result.base_url
+                    if reset_result.api_mode is not None:
+                        self.api_mode = reset_result.api_mode
+            except Exception:
+                logger.debug("Failed to restore configured model at session boundary", exc_info=True)
+        self.reasoning_config = _resolve_cli_reasoning_config(
+            getattr(self, "model", "") or "",
+            config=CLI_CONFIG,
+        )
+        if self.agent is not None and hasattr(self.agent, "reasoning_config"):
+            self.agent.reasoning_config = self.reasoning_config
 
         if self.agent:
             self.agent.session_id = self.session_id
@@ -11521,7 +11588,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._config_mtime = mtime
         try:
             with open(cfg_path, encoding="utf-8") as f:
-                new_cfg = _yaml.safe_load(f) or {}
+                from hermes_cli.config import _expand_env_vars
+
+                new_cfg = _expand_env_vars(_yaml.safe_load(f) or {})
         except Exception:
             return
 
@@ -11530,6 +11599,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return  # mcp_servers unchanged (some other section was edited)
 
         self._config_mcp_servers = new_mcp
+        mcp_cfg = new_cfg.get("mcp") if isinstance(new_cfg.get("mcp"), dict) else {}
+        if mcp_cfg.get("auto_reload_on_config_change", True) is False:
+            print()
+            print("🔄 MCP server config changed — reload skipped (auto-reload disabled).")
+            print("Run /reload-mcp when ready; this preserves the provider prompt cache.")
+            return
         # Notify user and reload.  Run in a separate thread with a hard
         # timeout so a hung MCP server cannot block the process_loop
         # indefinitely (which would freeze the entire TUI).

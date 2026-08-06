@@ -1797,7 +1797,22 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
                     # Recovery retains a completed one-shot until the saved
                     # artifact has been replayed or an opted-in retry settles.
-                    if times is not None and times > 0 and completed >= times and not recovery_requested:
+                    # A successful one-shot is terminal even when delivery
+                    # failed: the inference result is complete and any retry
+                    # belongs to the persisted recovery state, not the base
+                    # schedule. Keep the completed record inspectable while
+                    # recovery replays the saved artifact. Inference failures
+                    # remain non-terminal so their explicit recovery policy
+                    # can decide whether to rerun.
+                    _delivery_terminal_oneshot = (
+                        kind == "once" and bool(delivery_error)
+                    )
+                    if (
+                        times is not None
+                        and times > 0
+                        and completed >= times
+                        and (not recovery_requested or _delivery_terminal_oneshot)
+                    ):
                         # Check if we've hit the repeat limit. Retain the
                         # terminal record so the last status/error remains
                         # inspectable until the retention sweep prunes it.

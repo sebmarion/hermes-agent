@@ -209,7 +209,10 @@ def _uses_container_paths(task_id: str = "default") -> bool:
         container_backends = _CONTAINER_BACKENDS
     except Exception:
         container_backends = _CONTAINER_PATH_BACKENDS_FALLBACK
-    return _terminal_env_type_for_task(task_id) in container_backends
+    backend = _terminal_env_type_for_task(task_id)
+    # SSH paths are remote POSIX paths too; never resolve them through the
+    # host's Path.resolve(), which can silently rewrite a remote workdir.
+    return backend in container_backends or backend == "ssh"
 
 
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
@@ -269,6 +272,33 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     return _sentinel_free_abs_cwd(overrides.get("cwd"))
 
 
+def _live_cwd_if_owned(env, task_id: str) -> str | None:
+    """Return a shared environment cwd only when this session owns it."""
+    if env is None:
+        return None
+    live = getattr(env, "cwd", None)
+    if not live:
+        return None
+    owner = str(getattr(env, "cwd_owner", "") or "")
+    tid = str(task_id or "")
+    if owner and tid and owner != "default" and tid != "default" and owner != tid:
+        return None
+    return str(live)
+
+
+def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
+    """Return the active terminal environment cwd for an owning session."""
+    try:
+        from tools.terminal_tool import _active_environments, _env_lock, _resolve_container_task_id
+
+        container_key = _resolve_container_task_id(task_id)
+        with _env_lock:
+            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+        return _live_cwd_if_owned(env, task_id)
+    except Exception:
+        return None
+
+
 def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     """Best-effort absolute workspace root for divergence checks.
 
@@ -289,6 +319,9 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     Returns ``None`` only when there is genuinely no reliable anchor, in which
     case callers fall back to the process cwd.
     """
+    live = _get_live_tracking_cwd(task_id)
+    if live:
+        return live
     try:
         from tools.terminal_tool import get_session_cwd
 
@@ -330,6 +363,20 @@ def _resolve_base_dir(
     outright (rather than anchoring them to the process cwd) and fall through to
     the process cwd only as a last resort, deterministically.
     """
+    prepared = None
+    try:
+        from agent.tool_runtime_context import get_prepared_tool_runtime
+
+        prepared = get_prepared_tool_runtime()
+    except Exception:
+        prepared = None
+    if prepared is not None:
+        if not prepared.effective_cwd_authoritative:
+            return _normalize_without_host_deref(prepared.effective_cwd)
+        if container_paths:
+            return _normalize_without_host_deref(prepared.effective_cwd)
+        return Path(prepared.effective_cwd)
+
     root = _authoritative_workspace_root(task_id)
     if container_paths is None:
         container_paths = _uses_container_paths(task_id)

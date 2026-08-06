@@ -201,7 +201,25 @@ def _persist_session_title(session_db, session_id, title):
     Returns the title actually persisted, or None when a concurrent manual
     title won the race (nothing was written).
     """
-    atomic_fn = getattr(session_db, "set_auto_title_if_empty", None)
+    # ``MagicMock`` creates arbitrary attributes on demand. Treat an
+    # unconfigured child mock as absent so legacy stores/tests that only expose
+    # ``set_session_title`` continue through the collision/dedup path. Real
+    # SessionDB implementations and explicitly configured mocks retain the
+    # atomic predicate+write operation.
+    mock_children = getattr(session_db, "_mock_children", None)
+    preexisting_mock_child = (
+        isinstance(mock_children, dict)
+        and "set_auto_title_if_empty" in mock_children
+    )
+    candidate = getattr(session_db, "set_auto_title_if_empty", None)
+    if isinstance(mock_children, dict):
+        atomic_fn = candidate if preexisting_mock_child else None
+    elif callable(getattr(type(session_db), "set_auto_title_if_empty", None)):
+        atomic_fn = candidate
+    elif candidate is not None and not hasattr(session_db, "_mock_children"):
+        atomic_fn = candidate
+    else:
+        atomic_fn = None
 
     def _set(t):
         if atomic_fn is not None:

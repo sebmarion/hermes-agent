@@ -497,7 +497,18 @@ def decode_moa_turn(message: Any) -> tuple[str, dict[str, Any] | None]:
     except Exception:
         return message, None
     prompt = str(payload.get("prompt") or "")
-    return prompt, _normalize_preset(payload.get("config") or {})
+    config = _normalize_preset(payload.get("config") or {})
+    # ``enabled: true`` is the default and was not present in the legacy
+    # encoded shape. Keep explicit false (it is meaningful) while avoiding a
+    # needless shape change for old consumers that decode persisted turns.
+    if isinstance(config, dict):
+        for key in ("reference_models", "aggregator"):
+            slot = config.get(key)
+            slots = slot if isinstance(slot, list) else [slot]
+            for item in slots:
+                if isinstance(item, dict) and item.get("enabled") is True:
+                    item.pop("enabled", None)
+    return prompt, config
 
 
 def build_moa_turn_prompt(user_prompt: str, config: Any = None, preset: str | None = None) -> str:
