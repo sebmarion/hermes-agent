@@ -3008,11 +3008,19 @@ def compress_context(
         _expected_active_message_ids: Optional[tuple[int, ...]] = None
         if _durable_in_place:
             try:
-                _expected_active_message_ids = _capture_active_projection_ids(
-                    _lock_db,
-                    _lock_sid,
-                    messages,
-                )
+                # A live turn can legitimately contain an unflushed tail. In
+                # that shape the durable rows are only a prefix, so leave the
+                # full CAS capture to the commit boundary below (the lock
+                # still prevents a concurrent append). When row counts are
+                # equal—or the durable store is already longer—validate now
+                # and avoid paying for a summary that cannot be committed.
+                _active_rows = _lock_db.get_messages(_lock_sid)
+                if len(_active_rows) >= len(messages):
+                    _expected_active_message_ids = _capture_active_projection_ids(
+                        _lock_db,
+                        _lock_sid,
+                        messages,
+                    )
             except Exception as _initial_snapshot_err:
                 logger.warning(
                     "in-place compression skipped: durable projection does not "
