@@ -42,27 +42,14 @@ import os
 import sys
 import threading
 import types
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
-from hermes_constants import (
-    get_hermes_home,
-    reset_hermes_home_override,
-    set_hermes_home_override,
-)
+from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
-from hermes_cli.tool_policy import (
-    PluginMiddlewareRegistration,
-    RequiredPolicyFailureCode,
-    ToolDispatchPolicyInput,
-    ToolPolicyBlock,
-    ToolPolicyRegistration,
-    run_required_policy,
-)
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -185,17 +172,19 @@ VALID_HOOKS: Set[str] = {
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
-    # command needs user approval -- fires BOTH for CLI-interactive prompts
-    # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).
+    # command needs an approval decision -- fires for CLI-interactive prompts,
+    # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
     # Observers only: return values are ignored. Plugins cannot veto or
     # pre-answer an approval from these hooks (use pre_tool_call to block
     # a tool before it reaches approval).
     #
     # Kwargs for pre_approval_request:
     #   command: str, description: str, pattern_key: str, pattern_keys: list[str],
-    #   session_key: str, surface: "cli" | "gateway"
+    #   session_key: str, surface: "cli" | "gateway" | "smart"
     # Kwargs for post_approval_response: same as above plus
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
+    #           | "smart_approve" | "smart_deny"
+    #   decided_by: "aux_llm"  -- only on surface="smart"
     "pre_approval_request",
     "post_approval_response",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
@@ -233,11 +222,6 @@ _NS_PARENT = "hermes_plugins"
 def _env_enabled(name: str) -> bool:
     """Return True when an env var is set to a truthy opt-in value."""
     return env_var_enabled(name)
-
-
-def _resolved_hermes_home() -> str:
-    """Return the explicit active Hermes home in a stable comparable form."""
-    return str(get_hermes_home().expanduser().resolve(strict=False))
 
 
 def _get_disabled_plugins() -> set:
@@ -291,32 +275,6 @@ def _get_enabled_plugins() -> Optional[set]:
 # ---------------------------------------------------------------------------
 
 _VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
-_VALID_PLUGIN_POLICIES = frozenset({"tool_dispatch"})
-
-
-def _parse_manifest_policies(value: object, plugin_key: str) -> List[str]:
-    """Validate the strict ``policies`` manifest declaration."""
-    if type(value) is not list:
-        raise ValueError(f"Plugin {plugin_key!r}: policies must be a list")
-
-    policies: List[str] = []
-    seen: Set[str] = set()
-    for policy_name in value:
-        if type(policy_name) is not str or not policy_name:
-            raise ValueError(
-                f"Plugin {plugin_key!r}: policy names must be non-empty strings"
-            )
-        if policy_name not in _VALID_PLUGIN_POLICIES:
-            raise ValueError(
-                f"Plugin {plugin_key!r}: unsupported policy {policy_name!r}"
-            )
-        if policy_name in seen:
-            raise ValueError(
-                f"Plugin {plugin_key!r}: duplicate policy {policy_name!r}"
-            )
-        seen.add(policy_name)
-        policies.append(policy_name)
-    return policies
 
 
 @dataclass
@@ -330,7 +288,6 @@ class PluginManifest:
     requires_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
     provides_tools: List[str] = field(default_factory=list)
     provides_hooks: List[str] = field(default_factory=list)
-    provides_policies: List[str] = field(default_factory=list)
     source: str = ""        # "user", "project", or "entrypoint"
     path: Optional[str] = None
     # Plugin kind — see plugins.py module docstring for semantics.
@@ -367,69 +324,12 @@ class LoadedPlugin:
     hooks_registered: List[str] = field(default_factory=list)
     middleware_registered: List[str] = field(default_factory=list)
     commands_registered: List[str] = field(default_factory=list)
-    policies_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
     # True for a bundled platform plugin recorded as a deferred (not-yet-
     # imported) loader. The module loads on first real use via the
     # platform_registry; see PluginManager._register_deferred_platform.
     deferred: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _RequiredPolicyRecoveredPlugin:
-    """Immutable identity for one home-scoped recovered directory plugin."""
-
-    home: str
-    plugin_key: str
-    manifest_name: str
-    source: str
-    path: str
-    module_names: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _RequiredPolicyRecoveredHook:
-    home: str
-    plugin_key: str
-    hook_name: str
-    callback: Callable
-
-
-@dataclass(frozen=True, slots=True)
-class _RequiredPolicyRecoveredPolicy:
-    home: str
-    plugin_key: str
-    policy_name: str
-    registration: ToolPolicyRegistration
-
-
-@dataclass(frozen=True, slots=True)
-class _RequiredPolicyRuntimeSnapshot:
-    """One atomically published hooks+policy recovery generation."""
-
-    generation: int = 0
-    plugins: tuple[_RequiredPolicyRecoveredPlugin, ...] = ()
-    hooks: tuple[_RequiredPolicyRecoveredHook, ...] = ()
-    policies: tuple[_RequiredPolicyRecoveredPolicy, ...] = ()
-    modules: tuple[types.ModuleType, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class _RequiredPolicyRecoveryCapture:
-    active_home: str
-    manager_discovery_home: Optional[str]
-    project_root: str
-    project_plugins_enabled: bool
-    safe_mode: bool
-    required_policies: tuple[tuple[str, tuple[str, ...]], ...]
-    enabled_plugins: Optional[frozenset[str]]
-    disabled_plugins: frozenset[str]
-
-
-_required_policy_recovery_lock = threading.RLock()
-_required_policy_snapshot_lock = threading.Lock()
-_required_policy_runtime_snapshot = _RequiredPolicyRuntimeSnapshot()
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +344,7 @@ class PluginContext:
         self._manager = manager
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
+        self._subagent_lifecycle: Any = None
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -463,6 +364,24 @@ class PluginContext:
             plugin_id = self.manifest.key or self.manifest.name
             self._llm = PluginLlm(plugin_id=plugin_id)
         return self._llm
+
+    @property
+    def subagent_lifecycle(self) -> Any:
+        """Return the public, plugin-safe subagent lifecycle service.
+
+        The service only resolves the active host-owned parent agent when a
+        child is launched. Plugins receive serializable handles and immutable
+        snapshots; they never receive a live agent or a private registry.
+        """
+        if self._subagent_lifecycle is None:
+            from agent.subagent_lifecycle import (
+                SubagentLifecycleService,
+                get_active_subagent_parent,
+            )
+            self._subagent_lifecycle = SubagentLifecycleService(
+                get_active_subagent_parent
+            )
+        return self._subagent_lifecycle
 
     # -- profile awareness --------------------------------------------------
 
@@ -543,40 +462,6 @@ class PluginContext:
         logger.debug(
             "Plugin %s registered tool: %s%s",
             self.manifest.name, name, " (override)" if override else "",
-        )
-
-    # -- policy registration --------------------------------------------------
-
-    def register_policy(
-        self,
-        name: str,
-        callback: Callable,
-        timeout_ms: int = 2_000,
-    ) -> None:
-        """Register one named, manifest-declared required policy."""
-        if name not in _VALID_PLUGIN_POLICIES:
-            supported = ", ".join(sorted(_VALID_PLUGIN_POLICIES))
-            raise ValueError(f"Unsupported policy {name!r}; supported: {supported}")
-        if not callable(callback):
-            raise TypeError("policy callback must be callable")
-        if type(timeout_ms) is not int:
-            raise TypeError("timeout_ms must be an integer")
-        if not 1 <= timeout_ms <= 10_000:
-            raise ValueError("timeout_ms must be between 1 and 10000")
-        if name not in self.manifest.provides_policies:
-            plugin_key = self.manifest.key or self.manifest.name
-            raise ValueError(
-                f"Plugin {plugin_key!r} did not declare policy {name!r}"
-            )
-
-        plugin_key = self.manifest.key or self.manifest.name
-        self._manager._register_policy(
-            ToolPolicyRegistration(
-                plugin_key=plugin_key,
-                policy_name=name,
-                callback=callback,
-                timeout_ms=timeout_ms,
-            )
         )
 
     # -- override trust gate ------------------------------------------------
@@ -1324,14 +1209,7 @@ class PluginContext:
                 kind,
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
-        plugin_key = self.manifest.key or self.manifest.name
-        self._manager._middleware.setdefault(kind, []).append(
-            PluginMiddlewareRegistration(
-                plugin_key=plugin_key,
-                kind=kind,
-                callback=callback,
-            )
-        )
+        self._manager._middleware.setdefault(kind, []).append(callback)
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
 
     # -- skill registration -------------------------------------------------
@@ -1398,16 +1276,7 @@ class PluginManager:
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
-        # Required-policy callbacks stay manager-owned. Public accessors return
-        # frozen registrations in immutable tuple snapshots.
-        self._policy_registrations: Dict[
-            tuple[str, str], ToolPolicyRegistration
-        ] = {}
         self._discovered: bool = False
-        # Provenance for the process-global manager.  This is deliberately
-        # absent until a complete discovery sweep succeeds; required-policy
-        # recovery must never infer ownership from the current process env.
-        self._discovery_home: Optional[str] = None
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
@@ -1426,45 +1295,6 @@ class PluginManager:
     # Public
     # -----------------------------------------------------------------------
 
-    def _register_policy(self, registration: ToolPolicyRegistration) -> None:
-        """Store one plugin-attributed policy registration exactly once."""
-        registry_key = (registration.plugin_key, registration.policy_name)
-        if registry_key in self._policy_registrations:
-            plugin_key, policy_name = registry_key
-            raise ValueError(
-                f"Plugin {plugin_key!r} already registered policy {policy_name!r}"
-            )
-        self._policy_registrations[registry_key] = registration
-
-    def get_policy_registration(
-        self,
-        plugin_key: str,
-        policy_name: str,
-    ) -> Optional[ToolPolicyRegistration]:
-        """Return one frozen registration, or ``None`` when absent."""
-        return self._policy_registrations.get((plugin_key, policy_name))
-
-    def get_policy_registrations(
-        self,
-        plugin_key: Optional[str] = None,
-    ) -> tuple[ToolPolicyRegistration, ...]:
-        """Return a deterministic immutable snapshot of registrations."""
-        registrations = (
-            registration
-            for (registered_plugin, _), registration
-            in self._policy_registrations.items()
-            if plugin_key is None or registered_plugin == plugin_key
-        )
-        return tuple(
-            sorted(
-                registrations,
-                key=lambda registration: (
-                    registration.plugin_key,
-                    registration.policy_name,
-                ),
-            )
-        )
-
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
 
@@ -1472,53 +1302,36 @@ class PluginManager:
         changes or newly-added bundled backends become visible in long-lived
         sessions without requiring a full agent restart.
         """
-        with _required_policy_recovery_lock:
-            if self._discovered and not force:
-                return
-            discovery_home = _resolved_hermes_home()
-            home_token = set_hermes_home_override(discovery_home)
-            try:
-                safe_mode = env_var_enabled("HERMES_SAFE_MODE")
-                if force or safe_mode:
-                    self._discovery_home = None
-                    self._plugins.clear()
-                    self._hooks.clear()
-                    self._middleware.clear()
-                    self._plugin_tool_names.clear()
-                    self._plugin_platform_names.clear()
-                    self._cli_commands.clear()
-                    self._plugin_commands.clear()
-                    self._plugin_skills.clear()
-                    self._aux_tasks.clear()
-                    self._slack_action_handlers.clear()
-                    self._context_engine = None
-                    self._policy_registrations.clear()
-                # Safe mode (--safe-mode / HERMES_SAFE_MODE=1): troubleshooting
-                # run with all customizations disabled. Skip discovery entirely.
-                if safe_mode:
-                    logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
-                    self._discovered = True
-                    self._discovery_home = discovery_home
-                    if force:
-                        _retire_required_policy_recovery_home(discovery_home)
-                    return
-                # Set the flag up front as a re-entrancy guard (a plugin's
-                # register() can transitively trigger discovery again), but
-                # reset it if the complete sweep or home revalidation raises.
-                self._discovered = True
-                try:
-                    self._discover_and_load_inner()
-                    if _resolved_hermes_home() != discovery_home:
-                        raise RuntimeError("plugin home changed during discovery")
-                    self._discovery_home = discovery_home
-                    if force:
-                        _retire_required_policy_recovery_home(discovery_home)
-                except BaseException:
-                    self._discovered = False
-                    self._discovery_home = None
-                    raise
-            finally:
-                reset_hermes_home_override(home_token)
+        if self._discovered and not force:
+            return
+        if env_var_enabled("HERMES_SAFE_MODE"):
+            logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+            self._discovered = True
+            return
+        if force:
+            self._plugins.clear()
+            self._hooks.clear()
+            self._middleware.clear()
+            self._plugin_tool_names.clear()
+            self._plugin_platform_names.clear()
+            self._cli_commands.clear()
+            self._plugin_commands.clear()
+            self._plugin_skills.clear()
+            self._aux_tasks.clear()
+            self._slack_action_handlers.clear()
+            self._context_engine = None
+        # Set the flag up front as a re-entrancy guard (a plugin's register()
+        # can transitively trigger discovery again), but reset it if the sweep
+        # raises so a failed scan is NOT cached as "discovered with an empty
+        # registry" — callers swallow the exception and would otherwise be
+        # permanently stranded on the early-return above (the "No web provider
+        # configured" class of failures).
+        self._discovered = True
+        try:
+            self._discover_and_load_inner()
+        except BaseException:
+            self._discovered = False
+            raise
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -1785,10 +1598,6 @@ class PluginManager:
 
             name = data.get("name", plugin_dir.name)
             key = f"{prefix}/{plugin_dir.name}" if prefix else name
-            provides_policies = _parse_manifest_policies(
-                data.get("policies", []),
-                key,
-            )
 
             raw_kind = data.get("kind", "standalone")
             if not isinstance(raw_kind, str):
@@ -1811,7 +1620,7 @@ class PluginManager:
                 init_file = plugin_dir / "__init__.py"
                 if init_file.exists():
                     try:
-                        source_text = init_file.read_text(errors="replace")[:8192]
+                        source_text = init_file.read_text(errors="replace", encoding="utf-8")[:8192]
                         if (
                             "register_memory_provider" in source_text
                             or "MemoryProvider" in source_text
@@ -1850,7 +1659,6 @@ class PluginManager:
                 requires_env=data.get("requires_env", []),
                 provides_tools=data.get("provides_tools", []),
                 provides_hooks=data.get("provides_hooks", []),
-                provides_policies=provides_policies,
                 source=source,
                 path=str(plugin_dir),
                 kind=kind,
@@ -1971,7 +1779,6 @@ class PluginManager:
             f"{_NS_PARENT}.{_slug}",
             PluginContext(manifest, self)._tool_override_allowed(""),
         )
-        _policy_keys_before = set(self._policy_registrations)
         try:
             if manifest.source in {"user", "project", "bundled"}:
                 module = self._load_directory_module(manifest)
@@ -2016,24 +1823,16 @@ class PluginManager:
                     for kind, cbs in self._middleware.items()
                     if len(cbs) > _mw_counts_before.get(kind, 0)
                 ]
-                loaded.policies_registered = sorted(
-                    policy_name
-                    for plugin_key, policy_name
-                    in set(self._policy_registrations) - _policy_keys_before
-                    if plugin_key == _plugin_id
-                )
                 loaded.commands_registered = [
                     c for c in self._plugin_commands
                     if self._plugin_commands[c].get("plugin") == manifest.name
                 ]
                 loaded.enabled = True
                 logger.debug(
-                    "  registered: %d tool(s), %d hook(s), %d middleware, "
-                    "%d policy, %d slash command(s), %d CLI command(s)",
+                    "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s), %d CLI command(s)",
                     len(loaded.tools_registered),
                     len(loaded.hooks_registered),
                     len(loaded.middleware_registered),
-                    len(loaded.policies_registered),
                     len(loaded.commands_registered),
                     sum(
                         1 for c in self._cli_commands
@@ -2042,8 +1841,6 @@ class PluginManager:
                 )
 
         except Exception as exc:
-            for policy_key in set(self._policy_registrations) - _policy_keys_before:
-                self._policy_registrations.pop(policy_key, None)
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",
@@ -2215,8 +2012,6 @@ class PluginManager:
                     "tools": len(loaded.tools_registered),
                     "hooks": len(loaded.hooks_registered),
                     "middleware": len(loaded.middleware_registered),
-                    "policies": list(loaded.policies_registered),
-                    "policy_count": len(loaded.policies_registered),
                     "commands": len(loaded.commands_registered),
                     "error": loaded.error,
                 }
@@ -2261,818 +2056,6 @@ def get_plugin_manager() -> PluginManager:
     return _plugin_manager
 
 
-def _get_required_policies_for_module() -> dict[str, list[str]]:
-    """Import ``_get_required_policies`` from plugins_cmd lazily.
-
-    Imported inside a function body so the module-level import order stays
-    sane: ``hermes_cli.plugins`` is imported before ``hermes_cli.plugins_cmd``
-    by most call sites, so the circular dependency would otherwise manifest as
-    a ``RuntimeError: module is being imported during execution`` on the first
-    plugin that triggers policy enforcement.
-    """
-    from hermes_cli.plugins_cmd import _get_required_policies
-
-    return _get_required_policies()
-
-
-def _normalize_required_policy_capture(
-    required_policies: object,
-) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """Validate and freeze the dispatch-time required-policy mapping."""
-    if type(required_policies) is not dict:
-        raise TypeError("required policies must be a mapping")
-    normalized: list[tuple[str, tuple[str, ...]]] = []
-    for plugin_key in sorted(required_policies):
-        policy_names = required_policies[plugin_key]
-        if (
-            type(plugin_key) is not str
-            or not plugin_key
-            or type(policy_names) is not list
-            or not policy_names
-            or any(
-                type(policy_name) is not str
-                or policy_name not in _VALID_PLUGIN_POLICIES
-                for policy_name in policy_names
-            )
-        ):
-            raise TypeError("invalid required policy mapping")
-        normalized.append((plugin_key, tuple(sorted(set(policy_names)))))
-    return tuple(normalized)
-
-
-def _capture_required_policy_recovery_state(
-    manager: PluginManager,
-    required_policies: object,
-) -> _RequiredPolicyRecoveryCapture:
-    enabled = _get_enabled_plugins()
-    return _RequiredPolicyRecoveryCapture(
-        active_home=_resolved_hermes_home(),
-        manager_discovery_home=getattr(manager, "_discovery_home", None),
-        project_root=str(Path.cwd().resolve(strict=False)),
-        project_plugins_enabled=_env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"),
-        safe_mode=env_var_enabled("HERMES_SAFE_MODE"),
-        required_policies=_normalize_required_policy_capture(required_policies),
-        enabled_plugins=(
-            None if enabled is None else frozenset(str(item) for item in enabled)
-        ),
-        disabled_plugins=frozenset(str(item) for item in _get_disabled_plugins()),
-    )
-
-
-def _capture_required_policy_runtime_snapshot() -> _RequiredPolicyRuntimeSnapshot:
-    """Capture one complete published generation under the short read lock."""
-    with _required_policy_snapshot_lock:
-        return _required_policy_runtime_snapshot
-
-
-def _retire_required_policy_recovery_home(home: str) -> None:
-    """Atomically retire recovered ownership superseded by a successful force.
-
-    Private modules stay retained after the ownership swap.  A hook or policy
-    reader may already have captured the old generation and can still perform
-    a lazy relative import after ``force=True`` completes.  The private module
-    names are UUID-scoped, so retaining them cannot shadow the newly loaded
-    canonical plugin generation.
-    """
-    global _required_policy_runtime_snapshot
-    with _required_policy_snapshot_lock:
-        current = _required_policy_runtime_snapshot
-        retired_plugins = tuple(
-            plugin for plugin in current.plugins if plugin.home == home
-        )
-        if not retired_plugins:
-            return
-        _required_policy_runtime_snapshot = _RequiredPolicyRuntimeSnapshot(
-            generation=current.generation + 1,
-            plugins=tuple(
-                plugin for plugin in current.plugins if plugin.home != home
-            ),
-            hooks=tuple(hook for hook in current.hooks if hook.home != home),
-            policies=tuple(
-                policy for policy in current.policies if policy.home != home
-            ),
-            modules=current.modules,
-        )
-
-
-def _recovered_plugin_from_snapshot(
-    snapshot: _RequiredPolicyRuntimeSnapshot,
-    home: str,
-    plugin_key: str,
-) -> Optional[_RequiredPolicyRecoveredPlugin]:
-    return next(
-        (
-            plugin
-            for plugin in snapshot.plugins
-            if plugin.home == home and plugin.plugin_key == plugin_key
-        ),
-        None,
-    )
-
-
-def _recovered_policy_from_snapshot(
-    snapshot: _RequiredPolicyRuntimeSnapshot,
-    home: str,
-    plugin_key: str,
-    policy_name: str,
-) -> Optional[ToolPolicyRegistration]:
-    recovered = next(
-        (
-            policy
-            for policy in snapshot.policies
-            if policy.home == home
-            and policy.plugin_key == plugin_key
-            and policy.policy_name == policy_name
-        ),
-        None,
-    )
-    return recovered.registration if recovered is not None else None
-
-
-class _RequiredPolicyRecoveryContext:
-    """Detached registration facade for hooks+policy-only recovery."""
-
-    __slots__ = ("_manifest", "_hooks", "_policies", "_sealed", "_lock")
-
-    def __init__(self, manifest: PluginManifest) -> None:
-        object.__setattr__(self, "_manifest", manifest)
-        object.__setattr__(self, "_hooks", [])
-        object.__setattr__(self, "_policies", {})
-        object.__setattr__(self, "_sealed", False)
-        object.__setattr__(self, "_lock", threading.Lock())
-
-    def __getattribute__(self, name: str) -> Any:
-        if name in {"register_hook", "register_policy"} or name.startswith("__"):
-            return object.__getattribute__(self, name)
-        if name.startswith("register_"):
-            raise PermissionError(
-                f"Required-policy recovery forbids registration surface {name!r}"
-            )
-        raise AttributeError(name)
-
-    def __getattr__(self, name: str) -> Any:
-        if name.startswith("register_"):
-            raise PermissionError(
-                f"Required-policy recovery forbids registration surface {name!r}"
-            )
-        raise AttributeError(name)
-
-    def register_hook(self, hook_name: str, callback: Callable) -> None:
-        lock = object.__getattribute__(self, "_lock")
-        with lock:
-            if object.__getattribute__(self, "_sealed"):
-                raise PermissionError("Required-policy recovery context is sealed")
-            if type(hook_name) is not str or not hook_name:
-                raise TypeError("hook name must be a non-empty string")
-            if not callable(callback):
-                raise TypeError("hook callback must be callable")
-            hooks = object.__getattribute__(self, "_hooks")
-            hooks.append((hook_name, callback))
-
-    def register_policy(
-        self,
-        name: str,
-        callback: Callable,
-        timeout_ms: int = 2_000,
-    ) -> None:
-        lock = object.__getattribute__(self, "_lock")
-        with lock:
-            if object.__getattribute__(self, "_sealed"):
-                raise PermissionError("Required-policy recovery context is sealed")
-            manifest = object.__getattribute__(self, "_manifest")
-            if name not in _VALID_PLUGIN_POLICIES:
-                raise ValueError(f"Unsupported policy {name!r}")
-            if not callable(callback):
-                raise TypeError("policy callback must be callable")
-            if type(timeout_ms) is not int:
-                raise TypeError("timeout_ms must be an integer")
-            if not 1 <= timeout_ms <= 10_000:
-                raise ValueError("timeout_ms must be between 1 and 10000")
-            if name not in manifest.provides_policies:
-                raise ValueError(
-                    f"Plugin {manifest.key or manifest.name!r} did not declare policy {name!r}"
-                )
-            policies = object.__getattribute__(self, "_policies")
-            if name in policies:
-                raise ValueError(f"Policy {name!r} was registered more than once")
-            plugin_key = manifest.key or manifest.name
-            policies[name] = ToolPolicyRegistration(
-                plugin_key=plugin_key,
-                policy_name=name,
-                callback=callback,
-                timeout_ms=timeout_ms,
-            )
-
-    def _seal_and_snapshot(
-        self,
-    ) -> tuple[
-        tuple[tuple[str, Callable], ...],
-        tuple[tuple[str, ToolPolicyRegistration], ...],
-    ]:
-        """Atomically close registration and copy the accepted callbacks."""
-        lock = object.__getattribute__(self, "_lock")
-        with lock:
-            object.__setattr__(self, "_sealed", True)
-            hooks = tuple(object.__getattribute__(self, "_hooks"))
-            policies = tuple(
-                sorted(object.__getattribute__(self, "_policies").items())
-            )
-            return hooks, policies
-
-
-def _candidate_is_enabled(
-    manifest: PluginManifest,
-    capture: _RequiredPolicyRecoveryCapture,
-) -> bool:
-    plugin_key = manifest.key or manifest.name
-    if plugin_key in capture.disabled_plugins or manifest.name in capture.disabled_plugins:
-        return False
-    enabled = capture.enabled_plugins
-    return enabled is not None and (
-        plugin_key in enabled or manifest.name in enabled
-    )
-
-
-def _scan_required_policy_recovery_candidates(
-    manager: PluginManager,
-    capture: _RequiredPolicyRecoveryCapture,
-) -> dict[str, PluginManifest]:
-    """Freshly scan only active-home user and enabled project directories."""
-    winners: dict[str, PluginManifest] = {}
-    for manifest in manager._scan_directory(
-        Path(capture.active_home) / "plugins",
-        source="user",
-    ):
-        winners[manifest.key or manifest.name] = manifest
-    if capture.project_plugins_enabled:
-        for manifest in manager._scan_directory(
-            Path(capture.project_root) / ".hermes" / "plugins",
-            source="project",
-        ):
-            winners[manifest.key or manifest.name] = manifest
-    return winners
-
-
-def _resolve_required_policy_recovery_paths(
-    capture: _RequiredPolicyRecoveryCapture,
-    manifest: PluginManifest,
-) -> Optional[tuple[Path, Path]]:
-    """Resolve a candidate and both required files inside its active root."""
-    if not manifest.path:
-        return None
-    if manifest.source == "user":
-        ownership_root = Path(capture.active_home)
-        allowed_root = Path(capture.active_home) / "plugins"
-    elif manifest.source == "project" and capture.project_plugins_enabled:
-        ownership_root = Path(capture.project_root)
-        allowed_root = Path(capture.project_root) / ".hermes" / "plugins"
-    else:
-        return None
-    try:
-        ownership_root = ownership_root.resolve(strict=True)
-        allowed_root = allowed_root.resolve(strict=True)
-        allowed_root.relative_to(ownership_root)
-        plugin_dir = Path(manifest.path).resolve(strict=True)
-        manifest_path = Path(manifest.path) / "plugin.yaml"
-        if not manifest_path.exists():
-            manifest_path = Path(manifest.path) / "plugin.yml"
-        manifest_file = manifest_path.resolve(strict=True)
-        init_file = (Path(manifest.path) / "__init__.py").resolve(strict=True)
-        for candidate_path in (plugin_dir, manifest_file, init_file):
-            candidate_path.relative_to(allowed_root)
-    except (FileNotFoundError, OSError, ValueError):
-        return None
-    if (
-        not plugin_dir.is_dir()
-        or not manifest_file.is_file()
-        or not init_file.is_file()
-        or manifest_file.parent != plugin_dir
-        or init_file.parent != plugin_dir
-    ):
-        return None
-    return plugin_dir, init_file
-
-
-def _select_required_policy_recovery_candidate(
-    manager: PluginManager,
-    capture: _RequiredPolicyRecoveryCapture,
-    candidates: dict[str, PluginManifest],
-    plugin_key: str,
-    policy_names: tuple[str, ...],
-) -> Optional[PluginManifest]:
-    """Choose one current directory candidate without replacing loaded code."""
-    loaded = manager._plugins.get(plugin_key)
-    if loaded is not None and loaded.module is not None:
-        return None
-    if loaded is not None:
-        if loaded.manifest.source in {"bundled", "entrypoint"}:
-            return None
-        load_error = loaded.error if type(loaded.error) is str else ""
-        if loaded.enabled or not (
-            load_error == "disabled via config"
-            or load_error.startswith("not enabled in config")
-        ):
-            return None
-
-    manifest = candidates.get(plugin_key)
-    if manifest is None:
-        return None
-    if manifest.source == "entrypoint" or not manifest.path:
-        return None
-    # Recovery executes the module before the sealed registration facade can
-    # inspect ``register(ctx)``.  Refuse plugin kinds routed through another
-    # lifecycle, and manifests that advertise global tool registration, before
-    # import so their module-level code cannot mutate those global registries.
-    if manifest.kind != "standalone" or bool(manifest.provides_tools):
-        return None
-    if _resolve_required_policy_recovery_paths(capture, manifest) is None:
-        return None
-    if not _candidate_is_enabled(manifest, capture):
-        return None
-    if any(policy_name not in manifest.provides_policies for policy_name in policy_names):
-        return None
-    return manifest
-
-
-def _discard_required_policy_staging_modules(module_name: str) -> None:
-    for loaded_name in tuple(sys.modules):
-        if loaded_name == module_name or loaded_name.startswith(f"{module_name}."):
-            sys.modules.pop(loaded_name, None)
-
-
-def _stage_required_policy_recovery_plugin(
-    capture: _RequiredPolicyRecoveryCapture,
-    manifest: PluginManifest,
-    required_policy_names: tuple[str, ...],
-) -> tuple[
-    _RequiredPolicyRecoveredPlugin,
-    tuple[_RequiredPolicyRecoveredHook, ...],
-    tuple[_RequiredPolicyRecoveredPolicy, ...],
-    tuple[types.ModuleType, ...],
-    str,
-]:
-    """Execute one directory plugin privately against the sealed facade."""
-    resolved_paths = _resolve_required_policy_recovery_paths(capture, manifest)
-    if resolved_paths is None:
-        raise PermissionError("required policy plugin escaped its active root")
-    plugin_dir, init_file = resolved_paths
-    module_name = f"_hermes_required_policy_recovery_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(
-        module_name,
-        init_file,
-        submodule_search_locations=[str(plugin_dir)],
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot stage required policy plugin {manifest.key!r}")
-    module = importlib.util.module_from_spec(spec)
-    module.__package__ = module_name
-    module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
-    sys.modules[module_name] = module
-    try:
-        home_token = set_hermes_home_override(capture.active_home)
-        try:
-            spec.loader.exec_module(module)
-            if _resolved_hermes_home() != capture.active_home:
-                raise RuntimeError(
-                    "required policy recovery context changed during import"
-                )
-            register_fn = getattr(module, "register", None)
-            if not callable(register_fn):
-                raise TypeError("required policy plugin has no callable register()")
-            context = _RequiredPolicyRecoveryContext(manifest)
-            try:
-                result = register_fn(context)
-            finally:
-                seal_and_snapshot = object.__getattribute__(
-                    context,
-                    "_seal_and_snapshot",
-                )
-                staged_hooks, staged_policies = seal_and_snapshot()
-            if _resolved_hermes_home() != capture.active_home:
-                raise RuntimeError(
-                    "required policy recovery context changed during register()"
-                )
-            if inspect.isawaitable(result):
-                close = getattr(result, "close", None)
-                if callable(close):
-                    close()
-                raise TypeError("required policy recovery register() must be synchronous")
-            registered_policy_names = {
-                policy_name for policy_name, _registration in staged_policies
-            }
-            if any(
-                name not in registered_policy_names
-                for name in required_policy_names
-            ):
-                raise ValueError("required policy callback was not registered")
-            private_modules = tuple(
-                sys.modules[name]
-                for name in sorted(sys.modules)
-                if name == module_name or name.startswith(f"{module_name}.")
-            )
-            plugin_key = manifest.key or manifest.name
-            recovered_plugin = _RequiredPolicyRecoveredPlugin(
-                home=capture.active_home,
-                plugin_key=plugin_key,
-                manifest_name=manifest.name,
-                source=manifest.source,
-                path=str(plugin_dir),
-                module_names=tuple(
-                    private_module.__name__
-                    for private_module in private_modules
-                ),
-            )
-            recovered_hooks = tuple(
-                _RequiredPolicyRecoveredHook(
-                    home=capture.active_home,
-                    plugin_key=plugin_key,
-                    hook_name=hook_name,
-                    callback=callback,
-                )
-                for hook_name, callback in staged_hooks
-            )
-            recovered_policies = tuple(
-                _RequiredPolicyRecoveredPolicy(
-                    home=capture.active_home,
-                    plugin_key=plugin_key,
-                    policy_name=policy_name,
-                    registration=registration,
-                )
-                for policy_name, registration in staged_policies
-            )
-        finally:
-            reset_hermes_home_override(home_token)
-        return (
-            recovered_plugin,
-            recovered_hooks,
-            recovered_policies,
-            private_modules,
-            module_name,
-        )
-    except BaseException:
-        _discard_required_policy_staging_modules(module_name)
-        raise
-
-
-def _publish_required_policy_recovery(
-    staged: list[
-        tuple[
-            _RequiredPolicyRecoveredPlugin,
-            tuple[_RequiredPolicyRecoveredHook, ...],
-            tuple[_RequiredPolicyRecoveredPolicy, ...],
-            tuple[types.ModuleType, ...],
-            str,
-        ]
-    ],
-) -> bool:
-    """Publish every staged plugin with one immutable reference swap."""
-    global _required_policy_runtime_snapshot
-    if not staged:
-        return True
-    with _required_policy_snapshot_lock:
-        current = _required_policy_runtime_snapshot
-        existing = {(item.home, item.plugin_key) for item in current.plugins}
-        additions = [item for item in staged if (item[0].home, item[0].plugin_key) not in existing]
-        if not additions:
-            return False
-        _required_policy_runtime_snapshot = _RequiredPolicyRuntimeSnapshot(
-            generation=current.generation + 1,
-            plugins=current.plugins + tuple(item[0] for item in additions),
-            hooks=current.hooks + tuple(hook for item in additions for hook in item[1]),
-            policies=current.policies
-            + tuple(policy for item in additions for policy in item[2]),
-            modules=current.modules
-            + tuple(module for item in additions for module in item[3]),
-        )
-        return True
-
-
-def recover_required_policy_plugins() -> bool:
-    """Best-effort monotonic recovery for late hooks+policy directory plugins."""
-    with _required_policy_recovery_lock:
-        staged: list[Any] = []
-        keep_staged_modules = False
-        try:
-            required_policies = _get_required_policies_for_module()
-            normalized = _normalize_required_policy_capture(required_policies)
-            if not normalized:
-                return True
-            manager = get_plugin_manager()
-            manager.discover_and_load()
-            capture = _capture_required_policy_recovery_state(
-                manager,
-                required_policies,
-            )
-            if (
-                capture.safe_mode
-                or capture.manager_discovery_home is None
-                or capture.manager_discovery_home != capture.active_home
-            ):
-                return False
-            snapshot = _capture_required_policy_runtime_snapshot()
-            pending: list[tuple[str, tuple[str, ...]]] = []
-            for plugin_key, policy_names in capture.required_policies:
-                if _recovered_plugin_from_snapshot(
-                    snapshot,
-                    capture.active_home,
-                    plugin_key,
-                ) is not None:
-                    continue
-                ordinary = manager._plugins.get(plugin_key)
-                if ordinary is not None and ordinary.enabled:
-                    if all(
-                        manager.get_policy_registration(plugin_key, policy_name)
-                        is not None
-                        for policy_name in policy_names
-                    ):
-                        continue
-                    return False
-                pending.append((plugin_key, policy_names))
-
-            if not pending:
-                return True
-            candidates = _scan_required_policy_recovery_candidates(manager, capture)
-            for plugin_key, policy_names in pending:
-                manifest = _select_required_policy_recovery_candidate(
-                    manager,
-                    capture,
-                    candidates,
-                    plugin_key,
-                    policy_names,
-                )
-                if manifest is None:
-                    return False
-                staged.append(
-                    _stage_required_policy_recovery_plugin(
-                        capture,
-                        manifest,
-                        policy_names,
-                    )
-                )
-
-            current_required_policies = _get_required_policies_for_module()
-            if _capture_required_policy_recovery_state(
-                manager,
-                current_required_policies,
-            ) != capture:
-                return False
-            if not _publish_required_policy_recovery(staged):
-                return False
-            keep_staged_modules = True
-            return True
-        except Exception:
-            logger.warning(
-                "Required-policy plugin recovery failed; enforcement remains fail-closed",
-                exc_info=_PLUGINS_DEBUG,
-            )
-            return False
-        finally:
-            if not keep_staged_modules:
-                for item in staged:
-                    _discard_required_policy_staging_modules(item[4])
-
-
-def _required_policy_system_block(
-    policy_name: str,
-    policy_code: str,
-    message: str,
-) -> ToolPolicyBlock:
-    return ToolPolicyBlock(
-        policy=policy_name,
-        policy_code=policy_code,
-        message=message,
-    )
-
-
-def authorize_required_tool_policies(
-    policy_input: ToolDispatchPolicyInput,
-) -> ToolPolicyBlock | None:
-    """Return a ``ToolPolicyBlock`` when any required policy blocks the call.
-
-    Returns ``None`` only when every configured policy explicitly allows
-    execution. System-facing failure messages never include loaded-plugin
-    error detail — those details stay out of the LLM prompt.
-    """
-    try:
-        required_policies = _get_required_policies_for_module()
-        required_policy_items = _normalize_required_policy_capture(
-            required_policies
-        )
-    except Exception:
-        return _required_policy_system_block(
-            "tool_dispatch",
-            RequiredPolicyFailureCode.CONFIG_INVALID,
-            "Required policy configuration is invalid.",
-        )
-
-    if not required_policy_items:
-        return None
-
-    # Reconcile at dispatch time so first discovery and any late install/enable
-    # share the same process-wide serialization boundary.
-    recover_required_policy_plugins()
-
-    # A forced discovery can replace the global manager's home and callback
-    # maps.  Select every callback from one manager/snapshot generation while
-    # holding the same lock used by discovery and recovery, then release it
-    # before executing arbitrary policy code.  This prevents a turn bound to
-    # home A from validating A's provenance and then invoking home B's same-key
-    # callback after a concurrent force reload.
-    selected_decisions: list[ToolPolicyRegistration | ToolPolicyBlock] = []
-    with _required_policy_recovery_lock:
-        manager = get_plugin_manager()
-        try:
-            current_required_policies = _get_required_policies_for_module()
-            current_required_policy_items = _normalize_required_policy_capture(
-                current_required_policies
-            )
-            confirmed_required_policies = _get_required_policies_for_module()
-            confirmed_required_policy_items = _normalize_required_policy_capture(
-                confirmed_required_policies
-            )
-            if confirmed_required_policy_items != current_required_policy_items:
-                raise ValueError(
-                    "required policy configuration changed during dispatch"
-                )
-            dispatch_capture = _capture_required_policy_recovery_state(
-                manager,
-                confirmed_required_policies,
-            )
-        except Exception:
-            return _required_policy_system_block(
-                "tool_dispatch",
-                RequiredPolicyFailureCode.CONFIG_INVALID,
-                "Required policy configuration is invalid.",
-            )
-
-        if not confirmed_required_policy_items:
-            return None
-        active_home = dispatch_capture.active_home
-        if (
-            dispatch_capture.safe_mode
-            or dispatch_capture.manager_discovery_home is None
-            or dispatch_capture.manager_discovery_home != active_home
-        ):
-            return _required_policy_system_block(
-                "tool_dispatch",
-                RequiredPolicyFailureCode.PLUGIN_LOAD_ERROR,
-                "Required policy plugin failed to load.",
-            )
-
-        snapshot = _capture_required_policy_runtime_snapshot()
-        enabled_plugins = dispatch_capture.enabled_plugins
-        disabled_plugins = dispatch_capture.disabled_plugins
-        scanned_candidates: Optional[dict[str, PluginManifest]] = None
-
-        for plugin_key, policy_names in confirmed_required_policy_items:
-            recovered_plugin = _recovered_plugin_from_snapshot(
-                snapshot,
-                active_home,
-                plugin_key,
-            )
-            for policy_name in policy_names:
-                if recovered_plugin is not None:
-                    if (
-                        plugin_key in disabled_plugins
-                        or recovered_plugin.manifest_name in disabled_plugins
-                        or enabled_plugins is None
-                        or (
-                            plugin_key not in enabled_plugins
-                            and recovered_plugin.manifest_name not in enabled_plugins
-                        )
-                    ):
-                        selected_decisions.append(
-                            _required_policy_system_block(
-                                policy_name,
-                                RequiredPolicyFailureCode.PLUGIN_DISABLED,
-                                "Required policy plugin is disabled.",
-                            )
-                        )
-                        break
-                    registration = _recovered_policy_from_snapshot(
-                        snapshot,
-                        active_home,
-                        plugin_key,
-                        policy_name,
-                    )
-                    if registration is None:
-                        selected_decisions.append(
-                            _required_policy_system_block(
-                                policy_name,
-                                RequiredPolicyFailureCode.REGISTRATION_MISSING,
-                                "Required policy is not registered.",
-                            )
-                        )
-                        break
-                    selected_decisions.append(registration)
-                    continue
-
-                loaded = manager._plugins.get(plugin_key)
-                if loaded is None:
-                    if scanned_candidates is None:
-                        scanned_candidates = (
-                            _scan_required_policy_recovery_candidates(
-                                manager,
-                                dispatch_capture,
-                            )
-                        )
-                    candidate = scanned_candidates.get(plugin_key)
-                    if candidate is not None:
-                        if not _candidate_is_enabled(candidate, dispatch_capture):
-                            selected_decisions.append(
-                                _required_policy_system_block(
-                                    policy_name,
-                                    RequiredPolicyFailureCode.PLUGIN_DISABLED,
-                                    "Required policy plugin is disabled.",
-                                )
-                            )
-                        elif policy_name not in candidate.provides_policies:
-                            selected_decisions.append(
-                                _required_policy_system_block(
-                                    policy_name,
-                                    RequiredPolicyFailureCode.REGISTRATION_MISSING,
-                                    "Required policy is not registered.",
-                                )
-                            )
-                        else:
-                            selected_decisions.append(
-                                _required_policy_system_block(
-                                    policy_name,
-                                    RequiredPolicyFailureCode.PLUGIN_LOAD_ERROR,
-                                    "Required policy plugin failed to load.",
-                                )
-                            )
-                    else:
-                        selected_decisions.append(
-                            _required_policy_system_block(
-                                policy_name,
-                                RequiredPolicyFailureCode.PLUGIN_MISSING,
-                                "Required policy plugin is not installed.",
-                            )
-                        )
-                    break
-
-                if not loaded.enabled:
-                    load_error = loaded.error if type(loaded.error) is str else ""
-                    if load_error == "disabled via config" or load_error.startswith(
-                        "not enabled in config"
-                    ):
-                        selected_decisions.append(
-                            _required_policy_system_block(
-                                policy_name,
-                                RequiredPolicyFailureCode.PLUGIN_DISABLED,
-                                "Required policy plugin is disabled.",
-                            )
-                        )
-                    else:
-                        selected_decisions.append(
-                            _required_policy_system_block(
-                                policy_name,
-                                RequiredPolicyFailureCode.PLUGIN_LOAD_ERROR,
-                                "Required policy plugin failed to load.",
-                            )
-                        )
-                    break
-
-                registration = manager.get_policy_registration(
-                    plugin_key,
-                    policy_name,
-                )
-                if registration is None:
-                    selected_decisions.append(
-                        _required_policy_system_block(
-                            policy_name,
-                            RequiredPolicyFailureCode.REGISTRATION_MISSING,
-                            "Required policy is not registered.",
-                        )
-                    )
-                    break
-                selected_decisions.append(registration)
-
-            if selected_decisions and isinstance(
-                selected_decisions[-1],
-                ToolPolicyBlock,
-            ):
-                break
-
-    for decision in selected_decisions:
-        if isinstance(decision, ToolPolicyBlock):
-            return decision
-        registration = decision
-        try:
-            block = run_required_policy(registration, policy_input)
-        except Exception:
-            return _required_policy_system_block(
-                registration.policy_name,
-                RequiredPolicyFailureCode.CALLBACK_ERROR,
-                "Required policy callback failed.",
-            )
-        if block is not None:
-            return block
-
-    return None
-
-
 def discover_plugins(force: bool = False) -> None:
     """Discover and load all plugins.
 
@@ -3083,51 +2066,11 @@ def discover_plugins(force: bool = False) -> None:
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke a lifecycle hook on all loaded plugins.
+    """Invoke a lifecycle hook on loaded plugins.
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    if env_var_enabled("HERMES_SAFE_MODE"):
-        return []
-    kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
-    # Ordinary force-discovery transfers ownership from the recovered overlay
-    # to the manager. Capture both sides under the same lock so a reader sees
-    # exactly one complete generation, then release it before calling arbitrary
-    # plugin code.
-    with _required_policy_recovery_lock:
-        manager = get_plugin_manager()
-        active_home = _resolved_hermes_home()
-        ordinary_callbacks: tuple[Callable, ...] = ()
-        if getattr(manager, "_discovery_home", None) == active_home:
-            ordinary_callbacks = tuple(
-                getattr(manager, "_hooks", {}).get(hook_name, ())
-            )
-        snapshot = _capture_required_policy_runtime_snapshot()
-        recovered_callbacks = tuple(
-            recovered.callback
-            for recovered in snapshot.hooks
-            if recovered.home == active_home
-            and recovered.hook_name == hook_name
-        )
-
-    results: List[Any] = []
-    for callback, recovered in (
-        *((callback, False) for callback in ordinary_callbacks),
-        *((callback, True) for callback in recovered_callbacks),
-    ):
-        try:
-            result = callback(**kwargs)
-            if result is not None:
-                results.append(result)
-        except Exception as exc:
-            logger.warning(
-                "%sHook '%s' callback %s raised: %s",
-                "Recovered " if recovered else "",
-                hook_name,
-                getattr(callback, "__name__", repr(callback)),
-                exc,
-            )
-    return results
+    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
@@ -3148,23 +2091,8 @@ def has_middleware(kind: str) -> bool:
 
 
 def has_hook(hook_name: str) -> bool:
-    """Return True when a hook has registered callbacks."""
-    if env_var_enabled("HERMES_SAFE_MODE"):
-        return False
-    with _required_policy_recovery_lock:
-        manager = get_plugin_manager()
-        active_home = _resolved_hermes_home()
-        if (
-            getattr(manager, "_discovery_home", None) == active_home
-            and bool(getattr(manager, "_hooks", {}).get(hook_name))
-        ):
-            return True
-        snapshot = _capture_required_policy_runtime_snapshot()
-        return any(
-            recovered.home == active_home
-            and recovered.hook_name == hook_name
-            for recovered in snapshot.hooks
-        )
+    """Return True when a loaded plugin handles a hook."""
+    return get_plugin_manager().has_hook(hook_name)
 
 
 _thread_tool_whitelist = threading.local()
@@ -3370,7 +2298,6 @@ def resolve_pre_tool_block(
 def get_pre_verify_continue_message(
     *,
     session_id: str = "",
-    turn_id: str = "",
     platform: str = "",
     model: str = "",
     coding: bool = False,
@@ -3398,7 +2325,6 @@ def get_pre_verify_continue_message(
     hook_results = invoke_hook(
         "pre_verify",
         session_id=session_id,
-        turn_id=turn_id,
         platform=platform,
         model=model,
         coding=coding,

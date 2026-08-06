@@ -238,16 +238,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import (
-    advance_next_run,
-    claim_dispatch,
-    claim_due_recovery_jobs,
-    finish_recovery_job,
-    get_due_jobs,
-    heartbeat_run_claim,
-    mark_job_run,
-    save_job_output,
-)
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2269,26 +2260,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
 
-    # Inject budget-exhaustion recovery context if the previous run(s) of
-    # this job exhausted max_iterations.  The recovery record persists the
-    # RECOVERY_REQUIRED text (changed paths, verification status, recovery
-    # prompt) so the agent knows it's resuming interrupted work and should
-    # prioritize verification over re-planning.  See cron/recovery.py.
-    try:
-        from cron.recovery import get_recovery_record, build_recovery_prompt_prefix
-
-        _recovery = get_recovery_record(job.get("id", ""))
-        if _recovery:
-            prompt = build_recovery_prompt_prefix(_recovery) + prompt
-            has_injected_data = True
-            logger.info(
-                "Job '%s': injecting recovery context (consecutive=%d)",
-                job.get("id", "?"),
-                _recovery.get("consecutive_exhaustions", 1),
-            )
-    except Exception:
-        logger.debug("Recovery context injection failed", exc_info=True)
-
     # Always prepend cron execution guidance so the agent knows how
     # delivery works and can suppress delivery when appropriate.
     cron_hint = (
@@ -2646,10 +2617,44 @@ def run_job(
 
     # Initialize SQLite session store so cron job messages are persisted
     # and discoverable via session_search (same pattern as gateway/run.py).
+    #
+    # Bounded with its own timeout (separate from HERMES_CRON_TIMEOUT, which
+    # only watches the agent's run_conversation below): SessionDB.__init__
+    # opens/migrates state.db synchronously and has no timeout of its own
+    # against a wedged sqlite3.connect (e.g. a stale flock left by a crashed
+    # sibling process). An unbounded hang here is invisible to every other
+    # cron safeguard, because it happens BEFORE _submit_with_guard's future
+    # exists — the finally block that releases the job from
+    # _running_job_ids never runs, so the job stays wedged "running" until
+    # the whole gateway process is restarted, silently skipping every
+    # scheduled fire in between with "already running — skipping".
     _session_db = None
     try:
         from hermes_state import SessionDB
-        _session_db = SessionDB()
+        _raw_session_db_timeout = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
+        try:
+            _session_db_timeout = float(_raw_session_db_timeout) if _raw_session_db_timeout else 10.0
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_SESSION_DB_TIMEOUT=%r; using default 10s",
+                _raw_session_db_timeout,
+            )
+            _session_db_timeout = 10.0
+        _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            _session_db = _session_db_pool.submit(SessionDB).result(timeout=_session_db_timeout)
+        finally:
+            # Don't wait for a wedged connect() to unwind — abandon the
+            # worker thread (same pattern as the agent inactivity timeout
+            # further down) rather than blocking shutdown on it too.
+            _session_db_pool.shutdown(wait=False)
+    except concurrent.futures.TimeoutError:
+        logger.error(
+            "Job '%s': SessionDB init did not return within %.0fs — proceeding "
+            "without a session store for this run instead of blocking it "
+            "forever",
+            job.get("id", "?"), _session_db_timeout,
+        )
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
@@ -2674,47 +2679,6 @@ def run_job(
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
             return True, silent_doc, SILENT_MARKER, None
-
-    # Auto-pause circuit breaker: if this job has chronically exhausted its
-    # iteration budget over consecutive runs, pause it so it stops burning
-    # tokens with no progress.  The operator gets a clear alert instead of
-    # a silent infinite loop.
-    from cron.recovery import DEFAULT_EXHAUSTION_THRESHOLD as _recovery_threshold
-    _recovery_record_pre = None
-    try:
-        from cron.recovery import get_recovery_record, should_auto_pause
-
-        _recovery_record_pre = get_recovery_record(job_id)
-        if should_auto_pause(_recovery_record_pre, _recovery_threshold):
-            _consecutive = _recovery_record_pre.get("consecutive_exhaustions", 0)
-            logger.warning(
-                "Job '%s': auto-pausing after %d consecutive budget exhaustions",
-                job_id, _consecutive,
-            )
-            # Mark the job as paused in the store so it doesn't fire again.
-            try:
-                from cron.jobs import pause_job
-                pause_job(job_id, reason="budget_exhaustion_circuit_breaker")
-            except Exception:
-                logger.debug("Job '%s': failed to auto-pause", job_id, exc_info=True)
-            alert = (
-                f"⚠️ Cron '{job_name}' auto-paused: exhausted iteration budget "
-                f"{_consecutive} consecutive times. The job is stuck in a "
-                f"budget-exhaustion loop with no progress. Review the job "
-                f"prompt, increase max_iterations, or restructure the task. "
-                f"\n\nJob ID: {job_id}\n"
-                f"Consecutive exhaustions: {_consecutive}"
-            )
-            alert_doc = (
-                f"# Cron Job: {job_name} (AUTO-PAUSED)\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"**Reason:** Budget-exhaustion circuit breaker "
-                f"(consecutive={_consecutive})\n"
-            )
-            return False, alert_doc, alert, "budget_exhaustion_circuit_breaker"
-    except Exception:
-        logger.debug("Recovery auto-pause check failed", exc_info=True)
 
     try:
         prompt = _build_job_prompt(job, prerun_script=prerun_script)
@@ -3314,35 +3278,6 @@ def run_job(
                 "delivering the response instead of failing the cron run",
                 job_name,
             )
-            # Persist recovery state so the next tick prepends it as context.
-            # Without this, the RECOVERY_REQUIRED text is delivered once and
-            # lost — the next tick starts fresh, re-hits the limit, and loops.
-            try:
-                from cron.recovery import save_recovery_record
-
-                _recovery_text = final_response_text
-                _changed = list(getattr(agent, "_turn_file_mutation_paths", set()) or set())
-                save_recovery_record(
-                    job_id,
-                    recovery_text=_recovery_text,
-                    budget_used=api_call_count,
-                    budget_max=agent.max_iterations,
-                    changed_paths=_changed,
-                )
-            except Exception:
-                logger.debug(
-                    "Job '%s': failed to persist recovery record", job_id, exc_info=True
-                )
-
-        # Clear any stale recovery record on a non-exhausted successful run.
-        # If the agent completed within budget, the previous exhaustion is
-        # resolved — the next tick should start fresh.
-        if not max_iteration_summary and result.get("completed"):
-            try:
-                from cron.recovery import clear_recovery_record
-                clear_recovery_record(job_id)
-            except Exception:
-                logger.debug("Job '%s': failed to clear recovery record", job_id, exc_info=True)
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
@@ -3656,42 +3591,14 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
-def _recovery_delivery_content(output_path: str | None) -> str:
-    """Read only the saved response body for artifact replay."""
-    if not output_path:
-        raise ValueError("delivery recovery has no saved output artifact")
-    text = Path(output_path).read_text(encoding="utf-8")
-    marker = "## Response"
-    if marker in text:
-        text = text.split(marker, 1)[1].lstrip("\r\n")
-    if not text.strip():
-        raise ValueError("delivery recovery artifact has no response body")
-    return text.strip()
-
-
-def _run_recovery_job(job: dict, *, adapters=None, loop=None) -> bool:
-    """Settle one claimed recovery without disturbing its base schedule."""
-    try:
-        if job.get("failure_class") == "delivery":
-            delivery_error = _deliver_result(
-                job, _recovery_delivery_content(job.get("recovery_output_file")), adapters=adapters, loop=loop,
-            )
-            finish_recovery_job(job["id"], success=not delivery_error, delivery_error=delivery_error)
-            return True
-        success, output, final_response, error = run_job(job)
-        output_file = save_job_output(job["id"], output)
-        delivery_error = None
-        if success and final_response.strip() and not _is_cron_silence_response(final_response):
-            delivery_error = _deliver_result(job, final_response, adapters=adapters, loop=loop)
-        finish_recovery_job(job["id"], success=bool(success and not delivery_error), delivery_error=delivery_error)
-        return True
-    except Exception as exc:
-        logger.error("Recovery failed for job %s: %s", job.get("id"), exc)
-        finish_recovery_job(job["id"], success=False, delivery_error=str(exc))
-        return False
-
-
-def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
+def tick(
+    verbose: bool = True,
+    adapters=None,
+    loop=None,
+    sync: bool = True,
+    *,
+    can_dispatch=None,
+):
     """
     Check and run all due jobs.
     
@@ -3702,7 +3609,9 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         verbose: Whether to print status messages
         adapters: Optional dict mapping Platform → live adapter (from gateway)
         loop: Optional asyncio event loop (from gateway) for live adapter sends
-    
+        can_dispatch: Optional synchronous gate; false leaves due jobs untouched
+            for the next allowed tick
+
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
@@ -3724,19 +3633,18 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         return 0
 
     try:
-        recovery_jobs = claim_due_recovery_jobs()
-        recovery_results = [
-            _run_recovery_job(job, adapters=adapters, loop=loop)
-            for job in recovery_jobs
-        ]
+        if can_dispatch is not None and not can_dispatch():
+            logger.debug("Cron dispatch paused while gateway drains existing work")
+            return 0
+
         due_jobs = get_due_jobs()
 
-        if verbose and not due_jobs and not recovery_jobs:
+        if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
             return 0
 
         if verbose:
-            logger.info("%s - %s job(s) due, %s recovery job(s) claimed", _hermes_now().strftime('%H:%M:%S'), len(due_jobs), len(recovery_jobs))
+            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
@@ -3789,7 +3697,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
         parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
 
-        _results: list = list(recovery_results)
+        _results: list = []
         _all_futures: list = []
 
         def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor):
