@@ -2277,6 +2277,7 @@ def resolve_pre_tool_block(
 def get_pre_verify_continue_message(
     *,
     session_id: str = "",
+    turn_id: str = "",
     platform: str = "",
     model: str = "",
     coding: bool = False,
@@ -2304,6 +2305,7 @@ def get_pre_verify_continue_message(
     hook_results = invoke_hook(
         "pre_verify",
         session_id=session_id,
+        turn_id=turn_id,
         platform=platform,
         model=model,
         coding=coding,

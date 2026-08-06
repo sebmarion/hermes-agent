@@ -1154,6 +1154,7 @@ def run_conversation(
                     pass  # Never let rate guard break the agent loop
 
             try:
+                api_start_time = time.time()
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
@@ -5244,6 +5245,7 @@ def run_conversation(
                             agent._resolved_is_coding = coding
                         _verify_nudge2 = get_pre_verify_continue_message(
                             session_id=getattr(agent, "session_id", None) or "",
+                            turn_id=getattr(agent, "_current_turn_id", "") or "",
                             platform=getattr(agent, "platform", "") or "",
                             model=getattr(agent, "model", "") or "",
                             coding=coding,
