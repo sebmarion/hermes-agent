@@ -36,7 +36,7 @@ import webbrowser
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -364,6 +364,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="https://integrate.api.nvidia.com/v1",
         api_key_env_vars=("NVIDIA_API_KEY",),
         base_url_env_var="NVIDIA_BASE_URL",
+    ),
+    "ai-gateway": ProviderConfig(
+        id="ai-gateway",
+        name="Vercel AI Gateway",
+        auth_type="api_key",
+        inference_base_url="https://ai-gateway.vercel.sh/v1",
+        api_key_env_vars=("AI_GATEWAY_API_KEY",),
+        base_url_env_var="AI_GATEWAY_BASE_URL",
     ),
     "opencode-zen": ProviderConfig(
         id="opencode-zen",
@@ -803,22 +811,14 @@ def is_rate_limited_auth_error(error: Exception) -> bool:
 def _parse_retry_after_seconds(headers: Any) -> Optional[int]:
     """Best-effort parse of a ``Retry-After`` header into whole seconds.
 
-    Supports the delta-seconds form (e.g. ``"120"``). HTTP-date forms and
-    missing/unparseable values return ``None`` rather than guessing.
+    Thin wrapper around :func:`agent.retry_utils.parse_retry_after_seconds`
+    (delta-seconds and HTTP-date forms; negatives clamp to 0; missing or
+    unparseable values return ``None``).
     """
-    if headers is None:
-        return None
-    try:
-        raw = headers.get("retry-after")
-    except Exception:
-        return None
-    if raw is None:
-        return None
-    try:
-        seconds = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return None
-    return seconds if seconds >= 0 else None
+    from agent.retry_utils import parse_retry_after_seconds
+
+    seconds = parse_retry_after_seconds(headers)
+    return None if seconds is None else int(seconds)
 
 
 def format_auth_error(error: Exception) -> str:
@@ -1124,18 +1124,45 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
     try:
         raw = json.loads(auth_file.read_text(encoding="utf-8"))
+    except OSError:
+        # The file exists (checked above) but could not be READ: EMFILE under
+        # fd exhaustion, EACCES, EIO, a stalled network mount. None of those
+        # mean the contents are bad, and this module does read-modify-write in
+        # ~15 places, so degrading to an empty store here is one
+        # _save_auth_store() away from erasing every stored credential.
+        # Fail loudly instead and leave the file on disk untouched.
+        logger.warning(
+            "auth: could not read %s, leaving the store on disk untouched "
+            "rather than degrading to an empty one",
+            auth_file, exc_info=True,
+        )
+        raise
     except Exception as exc:
+        # Genuine corruption: unparseable JSON, or bytes that are not UTF-8.
         corrupt_path = auth_file.with_suffix(".json.corrupt")
+        preserved = False
         try:
             import shutil
             shutil.copy2(auth_file, corrupt_path)
+            preserved = True
         except Exception:
-            pass
-        logger.warning(
-            "auth: failed to parse %s (%s) — starting with empty store. "
-            "Corrupt file preserved at %s",
-            auth_file, exc, corrupt_path,
-        )
+            logger.debug(
+                "auth: could not preserve a copy of the corrupt store at %s",
+                corrupt_path, exc_info=True,
+            )
+        if preserved:
+            logger.warning(
+                "auth: failed to parse %s (%s), starting with empty store. "
+                "Corrupt file preserved at %s",
+                auth_file, exc, corrupt_path,
+            )
+        else:
+            # Do not advertise a backup that was never written.
+            logger.warning(
+                "auth: failed to parse %s (%s), starting with empty store. "
+                "A copy could NOT be preserved at %s",
+                auth_file, exc, corrupt_path,
+            )
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     if isinstance(raw, dict) and (
@@ -1897,6 +1924,7 @@ def resolve_provider(
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
+        "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
@@ -4470,8 +4498,17 @@ def _save_xai_oauth_tokens(
         # grant through _load_provider_state's fallback. When such a profile
         # refreshes the (rotating) grant, we must write the rotated chain back
         # to root too, or root is left holding a revoked refresh token (#43589).
-        write_through_to_root = not _profile_has_own_xai_oauth_state(auth_store)
-        state = _load_provider_state(auth_store, "xai-oauth") or {}
+        # #74339: the old key-presence check (_profile_has_own_xai_oauth_state)
+        # decided write-through based on whether the profile had a
+        # providers.xai-oauth key BEFORE the save — but _store_provider_state
+        # unconditionally creates that key below. Use
+        # _load_provider_state_with_source to learn where the grant was
+        # resolved from and write back only to that source.
+        state, source_path = _load_provider_state_with_source(
+            auth_store, "xai-oauth"
+        )
+        if state is None:
+            state = {}
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = auth_mode
@@ -4479,12 +4516,24 @@ def _save_xai_oauth_tokens(
             state["discovery"] = discovery
         if redirect_uri:
             state["redirect_uri"] = redirect_uri
-        _store_provider_state(
-            auth_store, "xai-oauth", state, set_active=set_active
+        global_root = _global_auth_file_path()
+        is_from_root = bool(
+            source_path is not None
+            and global_root is not None
+            and _same_path(source_path, global_root)
         )
-        _save_auth_store(auth_store)
-        if write_through_to_root:
+        if is_from_root:
+            # Grant was resolved from root — write back to root only.
+            # Do NOT call _store_provider_state on the profile auth_store
+            # (it would create a shadowing providers.xai-oauth key that
+            # disables write-through on the next refresh — #74339).
             _write_through_xai_oauth_to_global_root(state)
+        else:
+            # Profile genuinely owns this — write to profile store.
+            _store_provider_state(
+                auth_store, "xai-oauth", state, set_active=set_active
+            )
+            _save_auth_store(auth_store)
 
 
 def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> bool:
@@ -5009,6 +5058,25 @@ def _request_device_code(
     return data
 
 
+def _nous_device_auth_timeout_message(portal_base_url: str) -> str:
+    """Actionable timeout text for Nous device-code login failures.
+
+    A bare "Timed out waiting for device authorization" gives the user
+    nothing to act on. The most common cause is Portal sign-in failing in
+    the opened browser tab (including the server-side CAPTCHA loop from
+    #20605), so point at the Portal login page and the retry command.
+    """
+    portal = (portal_base_url or DEFAULT_NOUS_PORTAL_URL).rstrip("/")
+    return (
+        "Timed out waiting for device authorization.\n"
+        "  Portal sign-in is required before the device code can be approved.\n"
+        "  If the browser showed a CAPTCHA / 'You did not pass CAPTCHA' error,\n"
+        "  finish signing in at the Portal in a normal browser tab, then retry:\n"
+        "    hermes portal\n"
+        f"  Portal login: {portal}/login"
+    )
+
+
 def _poll_for_token(
     client: httpx.Client,
     portal_base_url: str,
@@ -5055,7 +5123,10 @@ def _poll_for_token(
         description = error_payload.get("error_description") or "Unknown authentication error"
         raise RuntimeError(f"{error_code}: {description}")
 
-    raise TimeoutError("Timed out waiting for device authorization")
+    # Enriched at the SOURCE so every caller inherits the guidance:
+    # the CLI login (_nous_device_code_login) and the dashboard/desktop
+    # poller (web_server._nous_poller, which surfaces str(e) to the UI).
+    raise TimeoutError(_nous_device_auth_timeout_message(portal_base_url))
 
 
 # =============================================================================

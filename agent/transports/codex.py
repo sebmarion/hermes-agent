@@ -509,16 +509,20 @@ class ResponsesApiTransport(ProviderTransport):
         *,
         allow_stream: bool = False,
         is_github_responses: bool = False,
+        sanitize_harmony_tokens: bool = False,
     ) -> dict:
         """Validate and sanitize Codex API kwargs before the call.
 
         Normalizes input items, strips unsupported fields, validates structure.
+        ``sanitize_harmony_tokens`` is enabled only for the ChatGPT Codex
+        backend, which rejects literal reserved Harmony wire tokens in text.
         """
         from agent.codex_responses_adapter import _preflight_codex_api_kwargs
         return _preflight_codex_api_kwargs(
             api_kwargs,
             allow_stream=allow_stream,
             is_github_responses=is_github_responses,
+            sanitize_harmony_tokens=sanitize_harmony_tokens,
         )
 
     def map_finish_reason(self, raw_reason: str) -> str:
