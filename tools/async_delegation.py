@@ -39,13 +39,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 import tempfile
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
@@ -72,6 +74,10 @@ _records_lock = threading.Lock()
 # delegation_id -> record dict. Kept for the lifetime of the run plus a short
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
+_DB_LOCK = threading.Lock()
+_DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_MAX_DURABLE_PENDING = 1000
+_MAX_DELIVERY_ATTEMPTS = 8
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _ACTIVE_STATUSES = frozenset({
@@ -367,7 +373,9 @@ def _read_persisted_unlocked(path: str | Path | None = None) -> Dict[str, Any]:
 def _write_persisted_unlocked(data: Dict[str, Any], path: str | Path | None = None) -> None:
     path = Path(_persistence_path() if path is None else _persistence_path(path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2)
+    payload = json.dumps(
+        data, ensure_ascii=False, sort_keys=True, indent=2, default=str
+    )
     fd, temporary_name = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -391,12 +399,270 @@ def _write_persisted_unlocked(data: Dict[str, Any], path: str | Path | None = No
             pass
 
 
-def _persistable_record(record: Dict[str, Any]) -> Dict[str, Any]:
+def _db_path() -> Path:
+    """Return the legacy SQLite ledger path used by durable delivery APIs."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()) / "state.db"
+    except Exception:
+        return Path(os.path.expanduser("~/.hermes")) / "state.db"
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    try:
+        from hermes_state import apply_wal_with_fallback
+
+        apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
+    except Exception:
+        # Journaling is an optimization; schema creation remains authoritative.
+        logger.debug("Async delegation WAL setup failed", exc_info=True)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS async_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            origin_session TEXT NOT NULL,
+            origin_ui_session_id TEXT NOT NULL DEFAULT '',
+            parent_session_id TEXT,
+            state TEXT NOT NULL,
+            dispatched_at REAL NOT NULL,
+            completed_at REAL,
+            updated_at REAL NOT NULL,
+            event_json TEXT,
+            result_json TEXT,
+            delivery_state TEXT NOT NULL DEFAULT 'pending',
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            delivered_at REAL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER,
+            task_json TEXT,
+            delivery_claim TEXT,
+            delivery_claimed_at REAL,
+            origin_session_id TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
+    for name, sql_type in (
+        ("owner_pid", "INTEGER"),
+        ("owner_started_at", "INTEGER"),
+        ("task_json", "TEXT"),
+        ("delivery_claim", "TEXT"),
+        ("delivery_claimed_at", "REAL"),
+        ("origin_session_id", "TEXT"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+
+
+def _connect() -> sqlite3.Connection:
+    path = Path(_db_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=10)
+    try:
+        _initialize_schema(conn)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+@contextmanager
+def _transaction() -> Iterator[sqlite3.Connection]:
+    """Commit or roll back and always close the legacy ledger connection."""
+    conn = _connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def _persist_dispatch(record: Dict[str, Any]) -> None:
+    """Persist the compatibility dispatch shape to the SQLite ledger."""
+    now = time.time()
+    try:
+        from gateway.status import get_process_start_time
+
+        owner_started_at = get_process_start_time(os.getpid())
+    except Exception:
+        owner_started_at = None
+    task_payload = {
+        key: record.get(key)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
+        if key in record
+    }
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO async_delegations
+               (delegation_id, origin_session, origin_ui_session_id,
+                parent_session_id, state, dispatched_at, updated_at,
+                delivery_state, delivery_attempts, owner_pid,
+                owner_started_at, task_json, origin_session_id)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+            (
+                record["delegation_id"],
+                str(record.get("session_key", "") or ""),
+                str(record.get("origin_ui_session_id", "") or ""),
+                record.get("parent_session_id"),
+                record["dispatched_at"],
+                now,
+                os.getpid(),
+                owner_started_at,
+                json.dumps(task_payload, default=str),
+                str(record.get("origin_session_id", "") or ""),
+            ),
+        )
+
+
+def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+               event_json=?, result_json=?, delivery_state='pending'
+               WHERE delegation_id=?""",
+            (
+                event.get("status", "completed"),
+                event.get("completed_at", now),
+                now,
+                json.dumps(event, default=str),
+                json.dumps(result, default=str),
+                event["delegation_id"],
+            ),
+        )
+
+
+def recover_abandoned_delegations() -> int:
+    """Classify SQLite records whose owner process disappeared."""
+    try:
+        from gateway.status import _pid_exists, get_process_start_time
+    except Exception:
+        return 0
+    now = time.time()
+    recovered = 0
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, origin_session, origin_ui_session_id,
+                      parent_session_id, dispatched_at, owner_pid,
+                      owner_started_at, task_json, origin_session_id
+               FROM async_delegations WHERE state IN ('running','finalizing')"""
+        ).fetchall()
+        for row in rows:
+            (
+                delegation_id,
+                session_key,
+                origin_ui,
+                parent_id,
+                dispatched_at,
+                pid,
+                started,
+                task_json,
+                origin_session_id,
+            ) = row
+            live = False
+            if pid:
+                live = _pid_exists(int(pid))
+                if live and started is not None:
+                    live = get_process_start_time(int(pid)) == int(started)
+            if live:
+                continue
+            try:
+                task = json.loads(task_json or "{}")
+            except (TypeError, ValueError):
+                task = {}
+            event = {
+                "type": "async_delegation",
+                "delegation_id": delegation_id,
+                "session_key": session_key,
+                "origin_ui_session_id": origin_ui,
+                "origin_session_id": origin_session_id or "",
+                "parent_session_id": parent_id,
+                "goal": task.get("goal", ""),
+                "goals": task.get("goals"),
+                "context": task.get("context"),
+                "toolsets": task.get("toolsets"),
+                "role": task.get("role"),
+                "model": task.get("model"),
+                "is_batch": bool(task.get("is_batch")),
+                "status": "unknown",
+                "summary": None,
+                "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
+                "dispatched_at": dispatched_at,
+                "completed_at": now,
+            }
+            result = {"status": "unknown", "summary": None, "error": event["error"]}
+            conn.execute(
+                """UPDATE async_delegations SET state='unknown', completed_at=?,
+                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   WHERE delegation_id=?""",
+                (
+                    now,
+                    now,
+                    json.dumps(event, default=str),
+                    json.dumps(result, default=str),
+                    delegation_id,
+                ),
+            )
+            recovered += 1
+    return recovered
+
+
+def _restore_sqlite_undelivered(target_queue) -> int:
+    recover_abandoned_delegations()
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT event_json FROM async_delegations
+               WHERE state != 'running' AND delivery_state='pending'
+                 AND event_json IS NOT NULL
+               ORDER BY completed_at, delegation_id"""
+        ).fetchall()
+    restored = 0
+    for (payload,) in rows:
+        try:
+            event = json.loads(payload)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(event, dict):
+            event["restored"] = True
+            target_queue.put(event)
+            restored += 1
+    return restored
+
+
+def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT origin_session, state, dispatched_at, completed_at,
+                      result_json, delivery_state, delivery_attempts,
+                      origin_session_id
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+    if row is None:
+        return None
     return {
+        "delegation_id": delegation_id,
+        "origin_session": row[0],
+        "state": row[1],
+        "dispatched_at": row[2],
+        "completed_at": row[3],
+        "result": json.loads(row[4]) if row[4] else None,
+        "delivery_state": row[5],
+        "delivery_attempts": row[6],
+        "origin_session_id": row[7] or "",
+    }
+
+
+def _persistable_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a JSON-safe record for the portable checkpoint."""
+    filtered = {
         k: v
         for k, v in record.items()
         if k not in {"interrupt_fn", "heartbeat_stop", "progress_fn"}
     }
+    try:
+        return json.loads(json.dumps(filtered, ensure_ascii=False, default=str))
+    except Exception:
+        return {str(k): str(v) for k, v in filtered.items()}
 
 
 def _load_delegation_config() -> Dict[str, Any]:
@@ -689,11 +955,27 @@ def mark_completion_delivered(delegation_id: str | Dict[str, Any]) -> bool:
             tracker_path = str(record.get("origin_tracker_path") or "") or None
         else:
             tracker_path = None
-    return _mark_persisted_delivery(
+    updated = _mark_persisted_delivery(
         resolved_id,
         "delivered",
         tracker_path=tracker_path,
     )
+    if updated:
+        return True
+    # Compatibility for callers that still use the SQLite durable ledger.
+    try:
+        now = time.time()
+        with _DB_LOCK, _transaction() as conn:
+            cur = conn.execute(
+                """UPDATE async_delegations SET delivery_state='delivered',
+                   delivered_at=?, updated_at=?
+                   WHERE delegation_id=? AND delivery_state!='delivered'""",
+                (now, now, resolved_id),
+            )
+            return cur.rowcount == 1
+    except Exception:
+        logger.debug("SQLite async completion ACK failed", exc_info=True)
+        return False
 
 
 def _tracker_path_for_delegation(delegation_id: str) -> str | None:
@@ -715,7 +997,9 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             data = _read_persisted_unlocked(tracker_path)
             entry = (data.get("records") or {}).get(delegation_id)
             if not isinstance(entry, dict):
-                return False
+                entry = None
+            if entry is None:
+                raise KeyError("not in JSON tracker")
             existing = str(entry.get("delivery_claim") or "")
             if existing and existing != claim_id:
                 return False
@@ -730,8 +1014,27 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                 == claim_id
             )
     except Exception:
-        logger.warning("Failed to claim async completion %s", delegation_id, exc_info=True)
-        return False
+        try:
+            now = time.time()
+            with _DB_LOCK, _transaction() as conn:
+                row = conn.execute(
+                    "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+                    (delegation_id,),
+                ).fetchone()
+                if row is None:
+                    # Legacy, non-durable events do not need a claim token.
+                    return True
+                cur = conn.execute(
+                    """UPDATE async_delegations SET delivery_claim=?,
+                       delivery_claimed_at=?, delivery_attempts=delivery_attempts+1,
+                       updated_at=? WHERE delegation_id=? AND delivery_state='pending'
+                       AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+                    (claim_id, now, now, delegation_id, now - 300),
+                )
+                return cur.rowcount == 1
+        except Exception:
+            logger.warning("Failed to claim async completion %s", delegation_id, exc_info=True)
+            return False
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -999,7 +1302,16 @@ def recover_async_delegations(
 def restore_undelivered_completions(target_queue) -> int:
     """Restore durable completion events onto the registry's supplied queue."""
     result = recover_async_delegations(target_queue=target_queue, mark_restored=True)
-    return int(result.get("queued", 0))
+    queued = int(result.get("queued", 0))
+    # Older gateway producers persisted their completion in SQLite. Read that
+    # ledger only when it exists so normal JSON checkpoint startup remains
+    # side-effect free, while restart recovery still covers both formats.
+    try:
+        if Path(_db_path()).exists():
+            queued += _restore_sqlite_undelivered(target_queue)
+    except Exception:
+        logger.debug("SQLite async completion restore failed", exc_info=True)
+    return queued
 
 
 def _recover_once() -> None:

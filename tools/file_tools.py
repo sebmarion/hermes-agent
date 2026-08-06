@@ -807,6 +807,11 @@ def _is_expected_write_exception(exc: Exception) -> bool:
 
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
+# Compatibility handle for older embedded callers that clear the former
+# process-local cwd mirror during test/session teardown.  Runtime path
+# resolution is authoritative through terminal_tool's per-session records;
+# this empty registry is intentionally not consulted by production code.
+_last_known_cwd: dict = {}
 
 # Track files read per task to detect re-read loops and deduplicate reads.
 # Per task_id we store:

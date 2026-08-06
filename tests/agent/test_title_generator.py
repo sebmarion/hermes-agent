@@ -367,4 +367,4 @@ class TestAutoTitleDuplicateHandling:
         db = MagicMock()
         db.set_session_title.return_value = False
         with pytest.raises(RuntimeError):
-        _persist_session_title(db, "missing", "Some Title")
+            _persist_session_title(db, "missing", "Some Title")
