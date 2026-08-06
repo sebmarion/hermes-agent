@@ -165,7 +165,7 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # (gateway/run.py); the file/terminal-tool layer must do likewise so CLI
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
-_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona"})
+_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
@@ -453,6 +453,79 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
         return None
 
 
+def _file_ops_uses_host_paths(file_ops) -> bool:
+    """Return True when *file_ops* targets the same host filesystem as Hermes.
+
+    Only then may we rewrite V4A header paths to resolved host-absolute
+    paths: a container/remote backend has its own filesystem namespace where
+    a host-absolute path would be meaningless.
+    """
+    env = getattr(file_ops, "env", None)
+    if env is None:
+        return True
+    try:
+        from tools.environments.local import LocalEnvironment
+    except ImportError:
+        return True
+    return isinstance(env, LocalEnvironment)
+
+
+def _rewrite_v4a_patch_paths_for_host(
+    patch: str,
+    path_to_resolved: dict,
+    file_ops,
+) -> str:
+    """Rewrite V4A file headers to the exact host paths the tool layer resolved.
+
+    ``patch_tool`` resolves every header path against the task's workspace for
+    locking, staleness, and reporting, but historically handed the *original*
+    patch text to ``file_ops.patch_v4a`` — so the shell layer re-resolved the
+    (often relative) header against its own cwd, which can differ from the
+    tool layer's workspace (the git-worktree cwd bug). That made a relative
+    header land in a different directory than everything else the tool
+    reported. This rewrites ``*** Update/Add/Delete/Move File:`` headers to the
+    resolved absolute paths so both layers agree on the target.
+
+    Header patterns mirror ``patch_parser`` (``\\s*`` after ``***`` accepts the
+    no-space ``***Update File:`` form) and cover ``Move File: src -> dst``.
+    Only applied when *file_ops* targets the host filesystem.
+    """
+    if not _file_ops_uses_host_paths(file_ops):
+        return patch
+
+    import re as _re
+
+    def _resolved_or_original(raw: str) -> str:
+        raw = raw.strip()
+        return path_to_resolved.get(raw) or raw
+
+    def _replace_single(match):
+        prefix = match.group(1)
+        resolved = _resolved_or_original(match.group(2))
+        return f"{prefix}{resolved}"
+
+    patch = _re.sub(
+        r'^(\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*)(.+)$',
+        _replace_single,
+        patch,
+        flags=_re.MULTILINE,
+    )
+
+    def _replace_move(match):
+        prefix = match.group(1)
+        src = _resolved_or_original(match.group(2))
+        dst = _resolved_or_original(match.group(3))
+        return f"{prefix}{src} -> {dst}"
+
+    patch = _re.sub(
+        r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$',
+        _replace_move,
+        patch,
+        flags=_re.MULTILINE,
+    )
+    return patch
+
+
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
     normalized = os.path.normpath(_expand_tilde(path))
@@ -582,7 +655,13 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
 # terminal tool's approval system.  These match prefixes after os.path.realpath.
 _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
-    "/private/etc/", "/private/var/",
+    "/private/etc/",
+    # macOS: /private/var mirrors /var. Block the sensitive subtrees, NOT the
+    # whole thing — a blanket "/private/var/" refused every legitimate temp-file
+    # write, because $TMPDIR, /tmp, and /var/folders all realpath() into
+    # /private/var/folders/... on macOS (and _resolve_path_for_task resolves
+    # symlinks), and /private/var/tmp is a normal temp dir.
+    "/private/var/db/", "/private/var/root/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
@@ -1092,12 +1171,13 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona"}:
+            if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
                     "container_disk": config.get("container_disk", 51200),
                     "container_persistent": config.get("container_persistent", True),
+                    "vercel_runtime": config.get("vercel_runtime", ""),
                     "docker_volumes": config.get("docker_volumes", []),
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                     "docker_forward_env": config.get("docker_forward_env", []),
@@ -1166,12 +1246,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # blocking on input).  Pure path check — no I/O.
         device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
         if _is_blocked_device(path, base_dir=device_base):
-            return json.dumps({
-                "error": (
-                    f"Cannot read '{path}': this is a device file that would "
-                    "block or produce infinite output."
-                ),
-            })
+            return tool_error(
+                f"Cannot read '{path}': this is a device file that would "
+                "block or produce infinite output."
+            )
 
         _resolved = _resolve_path_for_task(path, task_id)
 
@@ -1238,12 +1316,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # Block binary files by extension (no I/O).
         if has_binary_extension(str(_resolved)):
             _ext = _resolved.suffix.lower()
-            return json.dumps({
-                "error": (
-                    f"Cannot read binary file '{path}' ({_ext}). "
-                    "Use vision_analyze for images, or terminal to inspect binary files."
-                ),
-            })
+            return tool_error(
+                f"Cannot read binary file '{path}' ({_ext}). "
+                "Use vision_analyze for images, or terminal to inspect binary files."
+            )
 
         # ── Hermes internal path guard ────────────────────────────────
         # Prevent prompt injection via catalog or hub metadata files,
@@ -1254,7 +1330,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # the Python process cwd, which can differ.
         block_error = get_read_block_error(str(_resolved))
         if block_error:
-            return json.dumps({"error": block_error})
+            return tool_error(block_error)
 
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
@@ -1292,19 +1368,17 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                         _cap_read_tracker_data(task_data)
 
                     if hits >= 2:
-                        return json.dumps({
-                            "error": (
-                                f"BLOCKED: You have called read_file on this "
-                                f"exact region {hits + 1} times and the file "
-                                "has NOT changed. STOP calling read_file for "
-                                "this path — the content from your earlier "
-                                "read_file result in this conversation is "
-                                "still current. Proceed with your task using "
-                                "the information you already have."
-                            ),
-                            "path": path,
-                            "already_read": hits + 1,
-                        }, ensure_ascii=False)
+                        return tool_error(
+                            f"BLOCKED: You have called read_file on this "
+                            f"exact region {hits + 1} times and the file "
+                            "has NOT changed. STOP calling read_file for "
+                            "this path — the content from your earlier "
+                            "read_file result in this conversation is "
+                            "still current. Proceed with your task using "
+                            "the information you already have.",
+                            path=path,
+                            already_read=hits + 1,
+                        )
 
                     return json.dumps({
                         "status": "unchanged",
@@ -1430,15 +1504,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         if count >= 4:
             # Hard block: stop returning content to break the loop
-            return json.dumps({
-                "error": (
-                    f"BLOCKED: You have read this exact file region {count} times in a row. "
-                    "The content has NOT changed. You already have this information. "
-                    "STOP re-reading and proceed with your task."
-                ),
-                "path": path,
-                "already_read": count,
-            }, ensure_ascii=False)
+            return tool_error(
+                f"BLOCKED: You have read this exact file region {count} times in a row. "
+                "The content has NOT changed. You already have this information. "
+                "STOP re-reading and proceed with your task.",
+                path=path,
+                already_read=count,
+            )
         elif count >= 3:
             result_dict["_warning"] = (
                 f"You have read this exact file region {count} times consecutively. "
@@ -1514,7 +1586,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     internally.
     """
     try:
-        resolved = str(_resolve_path(filepath))
+        resolved = str(_resolve_path(filepath, task_id))
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
@@ -1825,7 +1897,15 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                # Rewrite V4A headers to the resolved absolute paths so the
+                # shell layer patches the exact files the tool layer resolved
+                # (locked/reported). Without this a relative header re-resolves
+                # against the shell's cwd, which can differ from the workspace
+                # (git-worktree cwd bug) — landing the edit elsewhere.
+                patch_for_ops = _rewrite_v4a_patch_paths_for_host(
+                    patch, _path_to_resolved, file_ops
+                )
+                result = file_ops.patch_v4a(patch_for_ops)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
@@ -1928,15 +2008,13 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             count = task_data["consecutive"]
 
         if count >= 4:
-            return json.dumps({
-                "error": (
-                    f"BLOCKED: You have run this exact search {count} times in a row. "
-                    "The results have NOT changed. You already have this information. "
-                    "STOP re-searching and proceed with your task."
-                ),
-                "pattern": pattern,
-                "already_searched": count,
-            }, ensure_ascii=False)
+            return tool_error(
+                f"BLOCKED: You have run this exact search {count} times in a row. "
+                "The results have NOT changed. You already have this information. "
+                "STOP re-searching and proceed with your task.",
+                pattern=pattern,
+                already_searched=count,
+            )
 
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
@@ -1944,7 +2022,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             resolved_path = None
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
-            return json.dumps({"error": block_error}, ensure_ascii=False)
+            return tool_error(block_error)
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(

@@ -208,7 +208,9 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     """Produce the scrubbed child-process env for execute_code.
 
     Rules (order matters):
-      1. Passthrough vars (skill- or config-declared) always pass.
+      1. Passthrough vars (skill- or config-declared) pass through the active
+         profile secret scope; an absent scoped value is omitted and an
+         unscoped multiplex read fails closed.
       2. Secret-substring names (KEY/TOKEN/DSN/WEBHOOK/etc.) are blocked.
       3. Names matching a safe prefix pass.
       4. Operational HERMES_* vars (_HERMES_CHILD_ALLOWED) pass by exact name.
@@ -219,12 +221,22 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     Extracted into a helper so tests can exercise the logic without
     spawning a subprocess.
     """
+    resolve_passthrough_value = None
     if is_passthrough is None:
         try:
-            from tools.env_passthrough import is_env_passthrough as _ep
+            from tools.env_passthrough import (
+                is_env_passthrough as _ep,
+                resolve_passthrough_value,
+            )
         except Exception:
             _ep = lambda _: False  # noqa: E731
+            resolve_passthrough_value = lambda _name, _fallback: None  # noqa: E731
         is_passthrough = _ep
+    else:
+        try:
+            from tools.env_passthrough import resolve_passthrough_value
+        except Exception:
+            resolve_passthrough_value = lambda _name, _fallback: None  # noqa: E731
     if is_windows is None:
         is_windows = _IS_WINDOWS
 
@@ -239,7 +251,9 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     _dropped_hermes = []
     for k, v in source_env.items():
         if is_passthrough(k):
-            scrubbed[k] = v
+            resolved = resolve_passthrough_value(k, v)
+            if resolved is not None:
+                scrubbed[k] = resolved
             continue
         if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
             continue
@@ -288,6 +302,21 @@ def check_sandbox_requirements() -> bool:
     """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
     if not SANDBOX_AVAILABLE:
         return False
+
+    try:
+        from tools.terminal_tool import (
+            _check_vercel_sandbox_requirements,
+            _get_env_config,
+        )
+
+        config = _get_env_config()
+    except Exception:
+        logger.debug("Could not resolve terminal config for execute_code availability", exc_info=True)
+        return False
+
+    if config.get("env_type") == "vercel_sandbox":
+        return _check_vercel_sandbox_requirements(config)
+
     return True
 
 
@@ -621,7 +650,7 @@ def _rpc_server_loop(
                     # sandbox-script-supplied JSON.
                     str(request.get("token") or "").encode(), rpc_token.encode()
                 ):
-                    resp = json.dumps({"error": "Unauthorized RPC request"})
+                    resp = tool_error("Unauthorized RPC request")
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -631,23 +660,19 @@ def _rpc_server_loop(
                 # Enforce the allow-list
                 if tool_name not in allowed_tools:
                     available = ", ".join(sorted(allowed_tools))
-                    resp = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
+                    resp = tool_error(
+                        f"Tool '{tool_name}' is not available in execute_code. "
+                        f"Available: {available}"
+                    )
                     conn.sendall((resp + "\n").encode())
                     continue
 
                 # Enforce tool call limit
                 if tool_call_counter[0] >= max_tool_calls:
-                    resp = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
+                    resp = tool_error(
+                        f"Tool call limit reached ({max_tool_calls}). "
+                        "No more tool calls allowed in this execution."
+                    )
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -756,12 +781,13 @@ def _get_or_create_env(task_id: str):
         cwd = overrides.get("cwd") or config["cwd"]
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona"}:
+        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
             container_config = {
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),
                 "container_persistent": config.get("container_persistent", True),
+                "vercel_runtime": config.get("vercel_runtime", ""),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_network": config.get("docker_network", True),
@@ -923,20 +949,16 @@ def _rpc_poll_loop(
                 # Enforce allow-list
                 if tool_name not in allowed_tools:
                     available = ", ".join(sorted(allowed_tools))
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
+                    tool_result = tool_error(
+                        f"Tool '{tool_name}' is not available in execute_code. "
+                        f"Available: {available}"
+                    )
                 # Enforce tool call limit
                 elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
+                    tool_result = tool_error(
+                        f"Tool call limit reached ({max_tool_calls}). "
+                        "No more tool calls allowed in this execution."
+                    )
                 else:
                     # Strip forbidden terminal parameters
                     if tool_name == "terminal" and isinstance(tool_args, dict):
@@ -1207,10 +1229,10 @@ def execute_code(
         JSON string with execution results.
     """
     if not SANDBOX_AVAILABLE:
-        return json.dumps({
-            "error": "execute_code sandbox is unavailable in this environment. "
-                     "Use normal tool calls (terminal, read_file, write_file, ...) instead."
-        })
+        return tool_error(
+            "execute_code sandbox is unavailable in this environment. "
+            "Use normal tool calls (terminal, read_file, write_file, ...) instead."
+        )
 
     if not code or not code.strip():
         return tool_error("No code provided.")
