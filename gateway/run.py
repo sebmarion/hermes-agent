@@ -5432,7 +5432,21 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            # BestPlan is executable only on its dedicated, capability-bound
+            # host.  Keep this ingress wrapper at the production choke point so
+            # a bare ``go`` can never bypass the unsupported-host guard.
+            from agent.bestplan_state import run_planning_only_bestplan_turn
+
+            def _run_gateway_model_turn():
+                return agent.run_conversation(_api_run_message, **_conversation_kwargs)
+
+            result = run_planning_only_bestplan_turn(
+                invocation_message=ctx.message,
+                conversation_history=agent_history,
+                host_name=f"messaging gateway ({getattr(ctx.source, 'platform', 'gateway')})",
+                host_agent=agent,
+                run_model_turn=_run_gateway_model_turn,
+            )
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent

@@ -9669,7 +9669,21 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-            result = agent.run_conversation(run_message, **run_kwargs)
+            # Route every TUI turn through the shared BestPlan ingress guard.
+            # The TUI is planning-only: executable V1 envelopes and bare
+            # ``go`` must be rejected before they reach the model/dispatcher.
+            from agent.bestplan_state import run_planning_only_bestplan_turn
+
+            def _run_tui_model_turn():
+                return agent.run_conversation(run_message, **run_kwargs)
+
+            result = run_planning_only_bestplan_turn(
+                invocation_message=prompt,
+                conversation_history=history,
+                host_name="tui",
+                host_agent=agent,
+                run_model_turn=_run_tui_model_turn,
+            )
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")

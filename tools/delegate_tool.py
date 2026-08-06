@@ -19,16 +19,20 @@ never the child's intermediate tool calls or reasoning.
 
 import enum
 import contextvars
+import hashlib
 import json
 import logging
 
 logger = logging.getLogger(__name__)
 import os
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
+from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -3915,6 +3919,327 @@ def _load_config() -> dict:
         return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Strict BestPlan runtime identity and sandbox dispatch
+# ---------------------------------------------------------------------------
+
+def _normalize_bestplan_toolsets(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        names = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple, set)) and all(isinstance(part, str) for part in value):
+        names = [part.strip() for part in value if part.strip()]
+    else:
+        return None
+    if not names:
+        return None
+    try:
+        from toolsets import validate_toolset
+
+        if any(not validate_toolset(name) for name in names):
+            return None
+    except Exception:
+        return None
+    return names
+
+
+def _endpoint_identity(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("/"):
+        return raw
+    explicit_scheme = "://" in raw
+    parsed = urlsplit(raw if explicit_scheme else f"//{raw}")
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    path = parsed.path.rstrip("/")
+    if not explicit_scheme:
+        return f"{host.lower()}{path}"
+    return urlunsplit((parsed.scheme.lower(), host.lower(), path, "", ""))
+
+
+def _nonsecret_runtime_value(value: Any) -> Any:
+    try:
+        from agent.bestplan_state import sanitize_runtime_metadata
+
+        return sanitize_runtime_metadata(value)
+    except Exception:
+        if isinstance(value, dict):
+            return {
+                str(key): _nonsecret_runtime_value(item)
+                for key, item in sorted(value.items())
+                if not any(
+                    marker in str(key).casefold()
+                    for marker in ("key", "token", "secret", "credential", "password")
+                )
+            }
+        if isinstance(value, (list, tuple)):
+            return [_nonsecret_runtime_value(item) for item in value]
+        return value
+
+
+def _bestplan_runtime_identity(task: Dict[str, Any], runtime: Dict[str, Any]) -> Dict[str, Any]:
+    from agent.bestplan_sandbox import sandbox_backend_identity
+
+    workspace = str(task.get("_bestplan_workspace") or task.get("workspace") or "")
+    if not workspace:
+        for line in str(task.get("context") or "").splitlines():
+            if line.startswith("Workspace: "):
+                workspace = line.removeprefix("Workspace: ").strip()
+                break
+    sandbox = sandbox_backend_identity(
+        workspace=workspace,
+        allowed_paths=task.get("_bestplan_leases") or [],
+        read_only=bool(task.get("_bestplan_read_only")),
+    )
+    if sandbox.get("backend") == "unavailable":
+        raise ValueError(
+            "strict BestPlan execution has no enforceable OS sandbox backend on this host"
+        )
+    toolsets = (
+        ["read_only_files"]
+        if bool(task.get("_bestplan_read_only"))
+        else (_normalize_bestplan_toolsets(runtime.get("toolsets")) or ["terminal", "file"])
+    )
+    identity = {
+        "route": str(runtime.get("route") or task.get("route") or ""),
+        "provider": str(runtime.get("provider") or ""),
+        "model": str(runtime.get("model") or ""),
+        "endpoint": _endpoint_identity(runtime.get("base_url") or runtime.get("endpoint")),
+        "api_mode": str(runtime.get("api_mode") or ""),
+        "toolsets": sorted(toolsets),
+        "command": str(runtime.get("command") or runtime.get("acp_command") or ""),
+        "args": [str(item) for item in (runtime.get("args") or runtime.get("acp_args") or [])],
+        "max_output_tokens": runtime.get("max_output_tokens"),
+        "request_overrides": _nonsecret_runtime_value(runtime.get("request_overrides") or {}),
+        "sandbox_backend": sandbox.get("backend", ""),
+        "sandbox_policy_digest": sandbox.get("policy_digest", ""),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "runtime_identity": identity,
+        "runtime_fingerprint": fingerprint,
+        "sandbox_backend": sandbox.get("backend", ""),
+        "sandbox_policy_digest": sandbox.get("policy_digest", ""),
+        "bestplan_toolsets": identity["toolsets"],
+    }
+
+
+def _bestplan_sandbox_workspace(workspace: str, plan_id: str) -> Path:
+    """Create or reuse a clean detached worktree for an approved plan."""
+    canonical = Path(workspace).expanduser().resolve()
+    try:
+        root = Path(
+            subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=canonical,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            ).stdout.strip()
+        ).resolve()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("BestPlan workspace must be inside a Git repository") from exc
+    try:
+        relative = canonical.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("BestPlan workspace is outside its Git repository root") from exc
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout
+    if dirty:
+        raise ValueError(
+            "BestPlan isolated execution requires a clean Git workspace; "
+            "the approved dirty baseline cannot be reproduced safely in a worktree"
+        )
+    from hermes_constants import get_hermes_home
+
+    sandbox_root = Path(get_hermes_home()) / "bestplan" / "worktrees"
+    sandbox_root.mkdir(parents=True, exist_ok=True)
+    safe_id = str(plan_id or "plan").replace("/", "_")
+    sandbox = sandbox_root / safe_id
+    if sandbox.exists():
+        probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=sandbox,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if probe.returncode != 0 or probe.stdout.strip() != "true":
+            raise ValueError(f"BestPlan sandbox path exists but is not a worktree: {sandbox}")
+    else:
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(sandbox), "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+    sandbox_workspace = (sandbox / relative).resolve()
+    if not sandbox_workspace.is_dir():
+        raise ValueError(
+            "BestPlan approved workspace subdirectory is absent from the detached worktree"
+        )
+    return sandbox_workspace
+
+
+def resolve_bestplan_runtime_specs(
+    tasks: List[Dict[str, Any]],
+    parent_agent: Any,
+    *,
+    expected: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Resolve each approved BestPlan lane and bind its runtime identity."""
+    cfg = _load_config()
+    lanes = cfg.get("lanes") if isinstance(cfg.get("lanes"), dict) else {}
+    resolved: list[dict[str, Any]] = []
+    for index, task in enumerate(tasks):
+        route = str(task.get("route") or "").strip()
+        lane_cfg = lanes.get(route) if route else None
+        if lane_cfg is None and route == "code_worker" and cfg.get("provider") and cfg.get("model"):
+            lane_cfg = cfg
+        if not isinstance(lane_cfg, dict):
+            raise ValueError(f"BestPlan task {index} requires configured lane {route!r}")
+        runtime = dict(_resolve_delegation_credentials(lane_cfg, parent_agent))
+        runtime["route"] = route
+        if "toolsets" in lane_cfg:
+            toolsets = _normalize_bestplan_toolsets(lane_cfg.get("toolsets"))
+            if not toolsets:
+                raise ValueError(f"Delegation lane {route} has invalid toolsets")
+            runtime["toolsets"] = toolsets
+        if not str(runtime.get("provider") or "").strip():
+            raise ValueError(f"delegation lane {route} resolved without a provider")
+        if not str(runtime.get("model") or "").strip():
+            raise ValueError(f"delegation lane {route} resolved without a model")
+        runtime.update(_bestplan_runtime_identity(task, runtime))
+        if expected and index < len(expected):
+            wanted = str((expected[index] or {}).get("runtime_fingerprint") or "")
+            if not wanted or runtime["runtime_fingerprint"] != wanted:
+                raise ValueError(f"delegation lane {route} changed since approval")
+        resolved.append(runtime)
+    return resolved
+
+
+def dispatch_bestplan_tasks_async(
+    *,
+    tasks: List[Dict[str, Any]],
+    parent_agent: Any,
+    dispatch_id: str,
+    plan_id: str,
+    workspace: str,
+    resolved_runtimes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Admit strict BestPlan workers only on a versioned delivery host."""
+    from agent.bestplan_sandbox import create_bestplan_sandbox_launch
+    from tools.async_delegation import dispatch_async_delegation_batch
+    try:
+        from gateway.session_context import get_delivery_context_identity
+
+        identity = get_delivery_context_identity()
+    except Exception:
+        identity = {}
+    if int(identity.get("capability_version") or 0) < 1:
+        return {
+            "status": "rejected",
+            "error": "strict async delivery capability/version handshake failed",
+        }
+    if len(tasks) != len(resolved_runtimes):
+        return {"status": "rejected", "error": "BestPlan task/runtime count mismatch"}
+    try:
+        sandbox = _bestplan_sandbox_workspace(workspace, plan_id)
+        launches = []
+        for index, (task, runtime) in enumerate(zip(tasks, resolved_runtimes)):
+            expected_identity = _bestplan_runtime_identity(task, runtime)
+            if runtime.get("runtime_fingerprint") != expected_identity["runtime_fingerprint"]:
+                raise ValueError(f"BestPlan runtime fingerprint mismatch for slice {index}")
+            runtime_dir = sandbox / ".bestplan-runtime" / f"slice-{index}"
+            launch = create_bestplan_sandbox_launch(
+                workspace=sandbox,
+                allowed_paths=task.get("_bestplan_leases") or [],
+                read_only=bool(task.get("_bestplan_read_only")),
+                runtime_dir=runtime_dir,
+            )
+            if launch.policy_digest != runtime.get("sandbox_policy_digest"):
+                launch.close()
+                raise ValueError(f"BestPlan sandbox policy changed for slice {index}")
+            launches.append(launch)
+
+        def runner() -> Dict[str, Any]:
+            results = []
+            try:
+                for index, (launch, task, runtime) in enumerate(
+                    zip(launches, tasks, resolved_runtimes)
+                ):
+                    runtime_dir = sandbox / ".bestplan-runtime" / f"slice-{index}"
+                    payload = {
+                        "goal": str(task.get("goal") or ""),
+                        "workspace": str(sandbox),
+                        "runtime_home": str(runtime_dir),
+                        "runtime": dict(runtime),
+                        "task_id": f"{dispatch_id}-{index}",
+                    }
+                    env = dict(os.environ)
+                    env["PYTHONPATH"] = os.pathsep.join(
+                        part for part in (str(Path(__file__).resolve().parent.parent), env.get("PYTHONPATH", "")) if part
+                    )
+                    process = launch.popen(
+                        [sys.executable, "-m", "agent.bestplan_worker"],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=env,
+                        start_new_session=True,
+                    )
+                    stdout, stderr = process.communicate(json.dumps(payload), timeout=_get_child_timeout() or None)
+                    marker = "HERMES_BESTPLAN_RESULT="
+                    line = next((item for item in reversed(stdout.splitlines()) if item.startswith(marker)), "")
+                    if line:
+                        results.append(json.loads(line[len(marker):]))
+                    else:
+                        results.append({"status": "error", "summary": "", "error": stderr[-1000:]})
+            finally:
+                for launch in launches:
+                    launch.close()
+            return {"results": results}
+
+        result = dispatch_async_delegation_batch(
+            goals=[str(task.get("goal") or "") for task in tasks],
+            context="OS-sandboxed BestPlan execution",
+            toolsets=None,
+            role="leaf",
+            model=str(resolved_runtimes[0].get("model") or "") if resolved_runtimes else "",
+            session_key=str(identity.get("session_key") or ""),
+            parent_session_id=str(identity.get("session_id") or ""),
+            origin_ui_session_id=str(identity.get("ui_session_id") or ""),
+            runner=runner,
+            max_async_children=_get_max_async_children(),
+            delegation_id=dispatch_id,
+            origin_profile=str(identity.get("profile") or ""),
+            origin_tracker_path=str(identity.get("tracker_path") or ""),
+            bestplan_plan_id=plan_id,
+            resolved_runtimes=[_nonsecret_runtime_value(runtime) for runtime in resolved_runtimes],
+        )
+        result["sandbox_workspace"] = str(sandbox)
+        return result
+    except Exception as exc:
+        logger.warning("strict BestPlan dispatch rejected before acceptance", exc_info=True)
+        return {"status": "rejected", "error": f"{type(exc).__name__}: {exc}"}
 
 
 # ---------------------------------------------------------------------------
