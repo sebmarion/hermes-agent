@@ -364,7 +364,9 @@ def test_fully_managed_install_rejects_with_zero_writes(
     path = config_home / "config.yaml"
     path.write_text("model:\n  default: old\n", encoding="utf-8")
     before = path.read_bytes()
-    monkeypatch.setenv("HERMES_MANAGED", "homebrew")
+    # ``homebrew`` is a historical value that is deliberately ignored; the
+    # fully-managed lock is represented by the supported truthy signal.
+    monkeypatch.setenv("HERMES_MANAGED", "true")
     calls = _spy_atomic_updates(monkeypatch)
 
     with pytest.raises(RuntimeError, match="managed"):

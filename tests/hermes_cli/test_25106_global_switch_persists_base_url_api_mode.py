@@ -66,10 +66,12 @@ def _run_switch(monkeypatch, result, cmd="/model MiniMax-M3 --global"):
     monkeypatch.setattr(cli_mod, "_cprint", lambda *a, **k: None)
     saved: dict[str, object] = {}
 
-    def _fake_save(key, value):
-        saved[key] = value
+    def _fake_persist(**kwargs):
+        saved.update(kwargs)
 
-    monkeypatch.setattr(cli_mod, "save_config_value", _fake_save)
+    monkeypatch.setattr(
+        "hermes_cli.config.persist_main_model_assignment", _fake_persist
+    )
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kw: result)
     monkeypatch.setattr(
         "hermes_cli.inventory.load_picker_context",
@@ -84,10 +86,12 @@ def test_global_switch_persists_base_url_and_api_mode(monkeypatch):
     write the newly resolved base_url and api_mode, not just default/provider."""
     saved = _run_switch(monkeypatch, _make_result())
 
-    assert saved["model.default"] == "MiniMax-M3"
-    assert saved["model.provider"] == "custom:minimax"
-    assert saved["model.base_url"] == "https://api.minimax.io/v1"
-    assert saved["model.api_mode"] == "chat_completions"
+    assert saved == {
+        "provider": "custom:minimax",
+        "model": "MiniMax-M3",
+        "base_url": "https://api.minimax.io/v1",
+        "api_mode": "chat_completions",
+    }
 
 
 def test_session_only_switch_does_not_touch_config(monkeypatch):
@@ -120,13 +124,14 @@ def _run_apply(monkeypatch, result, persist_global=True):
     monkeypatch.setattr(cli_mod, "_cprint", lambda *a, **k: None)
     saved: dict[str, object] = {}
 
-    def _fake_save(key, value):
-        saved[key] = value
+    def _fake_persist(**kwargs):
+        saved.update(kwargs)
 
-    monkeypatch.setattr(cli_mod, "save_config_value", _fake_save)
+    monkeypatch.setattr(
+        "hermes_cli.config.persist_main_model_assignment", _fake_persist
+    )
     cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, persist_global)
     return saved
-
 
 
 

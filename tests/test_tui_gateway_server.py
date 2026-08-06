@@ -15421,7 +15421,7 @@ def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch
     # save_config_value() resolves the config path from get_hermes_home() (live
     # env var), always targeting HERMES_HOME/config.yaml — point it at tmp_path.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(cli, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
 
     result = types.SimpleNamespace(
         new_model="new-model",
@@ -15456,7 +15456,7 @@ def test_persist_model_switch_clears_stale_base_url(tmp_path, monkeypatch):
         "  base_url: http://localhost:1234/v1\n"
     )
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(cli, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
 
     # Switch to a native provider with no base_url.
     result = types.SimpleNamespace(

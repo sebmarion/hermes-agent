@@ -1067,6 +1067,52 @@ def clear_model_endpoint_credentials(
     return model_cfg
 
 
+def apply_main_model_assignment(
+    model_cfg: Any,
+    provider: str,
+    model: str,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Assign the main model route and reconcile endpoint-owned fields.
+
+    Endpoint settings belong to the provider route that supplied them. A
+    provider change therefore drops settings the target route did not
+    explicitly supply, while a same-provider model change preserves them.
+    """
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+
+    previous_provider = str(model_cfg.get("provider") or "").strip().lower()
+    new_provider = str(provider or "").strip().lower()
+    provider_changed = new_provider != previous_provider
+
+    if provider_changed:
+        for field in ("base_url", "api_mode", "api_key", "api"):
+            model_cfg.pop(field, None)
+
+    model_cfg["provider"] = provider
+    model_cfg["default"] = model
+
+    for field, value in (
+        ("base_url", base_url),
+        ("api_mode", api_mode),
+        ("api_key", api_key),
+    ):
+        normalized = str(value or "").strip()
+        if normalized:
+            model_cfg[field] = normalized
+
+    if str(api_key or "").strip():
+        model_cfg.pop("api", None)
+
+    # Context limits are owned by the previous route and cannot silently pin
+    # the newly selected model.
+    model_cfg.pop("context_length", None)
+    return model_cfg
+
+
 _MISSING = object()
 
 

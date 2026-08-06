@@ -6022,6 +6022,48 @@ class AIAgent:
             streamed == visible_content or visible_content.startswith(streamed)
         )
 
+    def _extract_codex_interim_visible_text(
+        self, assistant_msg: Dict[str, Any]
+    ) -> str:
+        """Extract visible Codex commentary without exposing final-answer state.
+
+        Responses messages can carry both provider replay items and a top-level
+        content field.  Only commentary/analysis-phase output is eligible for
+        interim delivery; final-answer and encrypted reasoning items remain
+        replay state and must not be shown while tools are pending.
+        """
+        if not isinstance(assistant_msg, dict):
+            return ""
+        items = assistant_msg.get("codex_message_items")
+        if not isinstance(items, list):
+            return ""
+        visible: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            phase = str(item.get("phase") or "").strip().lower()
+            if phase not in {"commentary", "analysis"}:
+                continue
+            text = flatten_message_text(item.get("content")).strip()
+            if text and text not in visible:
+                visible.append(text)
+        return "\n".join(visible)
+
+    def _interim_assistant_visible_text(self, assistant_msg: Dict[str, Any]) -> str:
+        """Return the text eligible for an interim assistant projection.
+
+        Normalize multimodal/list content before applying string-only think
+        tag handling.  Structured Codex commentary wins over top-level content
+        so a final answer cannot leak ahead of a pending tool call.
+        """
+        if not isinstance(assistant_msg, dict):
+            return ""
+        visible = self._extract_codex_interim_visible_text(assistant_msg)
+        if visible:
+            return self._strip_think_blocks(visible).strip()
+        content = flatten_message_text(assistant_msg.get("content"))
+        return self._strip_think_blocks(content).strip()
+
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer."""
         cb = getattr(self, "interim_assistant_callback", None)
@@ -6075,8 +6117,8 @@ class AIAgent:
                     logger.debug("interim_assistant_callback error", exc_info=True)
             return
 
-        content = assistant_msg.get("content")
-        visible = self._strip_think_blocks(content or "").strip()
+        content = flatten_message_text(assistant_msg.get("content"))
+        visible = self._strip_think_blocks(content).strip()
         if not visible or visible == "(empty)":
             return
         already_streamed = self._interim_content_was_streamed(visible)

@@ -1236,6 +1236,9 @@ def _run_conversation(
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
+    # A failed canonical append halts only this turn.  The cached agent can
+    # recover on the next message if the session store becomes writable again.
+    agent._incremental_persistence_failed = False
     compression_attempts = _ctx.compression_attempts
     max_compression_attempts = max(
         1, int(getattr(agent, "max_compression_attempts", 3) or 3)
@@ -5836,46 +5839,47 @@ def _run_conversation(
                     or interim_has_codex_message_items
                 ):
                     last_msg = messages[-1] if messages else None
-                    # Duplicate detection: two consecutive incomplete assistant
-                    # messages with identical content AND reasoning are collapsed.
-                    # For provider-state-only changes (encrypted reasoning
-                    # items or replayable message ids/phases/statuses differ
-                    # while visible content/reasoning are unchanged), compare
-                    # those opaque payloads too so we don't silently drop the
-                    # newer continuation state.
-                    def _interim_visible_signature(message):
-                        if not isinstance(message, dict):
-                            return None
-                        content = message.get("content") or ""
-                        commentary = []
-                        for item in message.get("codex_message_items") or []:
-                            if not isinstance(item, dict):
-                                continue
-                            if str(item.get("phase") or "").strip().lower() not in {"commentary", "analysis"}:
-                                continue
-                            parts = item.get("content") or []
-                            text = "".join(
-                                str(part.get("text") or "")
-                                for part in parts
-                                if isinstance(part, dict) and part.get("type") == "output_text"
-                            ).strip()
-                            if text:
-                                commentary.append(text)
-                        # Hidden reasoning summaries are provider state, not
-                        # visible progress; do not let them defeat dedup.
-                        return (content, tuple(commentary)) if commentary else (content,)
+                    # Duplicate detection is keyed by the exact text eligible
+                    # for interim delivery.  Provider replay fields may change
+                    # between retries, but must not create a second visible
+                    # bubble; multimodal content is normalized before any
+                    # string-only processing (#66267).
+                    last_interim_visible = (
+                        agent._interim_assistant_visible_text(last_msg)
+                        if isinstance(last_msg, dict)
+                        else ""
+                    )
+                    current_interim_visible = agent._interim_assistant_visible_text(interim_msg)
+                    if last_interim_visible or current_interim_visible:
+                        same_visible_output = last_interim_visible == current_interim_visible
+                    else:
+                        # Preserve reasoning-only deduplication when neither
+                        # message has user-visible text.
+                        same_visible_output = (
+                            isinstance(last_msg, dict)
+                            and (last_msg.get("content") or "") == (interim_msg.get("content") or "")
+                            and (last_msg.get("reasoning") or "") == (interim_msg.get("reasoning") or "")
+                        )
 
                     duplicate_interim = (
                         isinstance(last_msg, dict)
                         and last_msg.get("role") == "assistant"
                         and last_msg.get("finish_reason") == "incomplete"
-                        and _interim_visible_signature(last_msg) == _interim_visible_signature(interim_msg)
+                        and same_visible_output
                     )
                     if duplicate_interim:
-                        # Visible progress is the deduplication key. Replace
-                        # the prior message in place so the newest encrypted
-                        # reasoning/message item remains replayable.
-                        messages[-1] = interim_msg
+                        # Keep the newest provider replay state without
+                        # re-emitting the same visible progress.
+                        for _key in (
+                            "content",
+                            "reasoning",
+                            "reasoning_content",
+                            "reasoning_details",
+                            "codex_reasoning_items",
+                            "codex_message_items",
+                        ):
+                            if _key in interim_msg:
+                                last_msg[_key] = interim_msg[_key]
                     else:
                         messages.append(interim_msg)
                         agent._emit_interim_assistant_message(interim_msg)
@@ -6342,21 +6346,52 @@ def _run_conversation(
                 # a LATER tool round.
                 agent._post_tool_empty_retried = False
 
+                previous_msg = messages[-1] if messages else None
+                current_interim_visible = agent._interim_assistant_visible_text(assistant_msg)
+                previous_interim_visible = (
+                    agent._interim_assistant_visible_text(previous_msg)
+                    if isinstance(previous_msg, dict)
+                    else ""
+                )
+                duplicate_previous_interim = (
+                    bool(current_interim_visible)
+                    and isinstance(previous_msg, dict)
+                    and previous_msg.get("role") == "assistant"
+                    and previous_msg.get("finish_reason") == "incomplete"
+                    and previous_interim_visible == current_interim_visible
+                )
                 messages.append(assistant_msg)
-                agent._emit_interim_assistant_message(assistant_msg)
+
+                _tool_turn_persisted = None
                 try:
                     # Persist the assistant tool-call turn before any tool
                     # side effects run. If a destructive tool restarts or
                     # terminates Hermes mid-turn, resume logic still sees the
                     # exact tool-call block that already executed.
-                    agent._flush_messages_to_session_db(messages, conversation_history)
+                    _tool_turn_persisted = agent._flush_messages_to_session_db(
+                        messages, conversation_history
+                    )
                 except Exception as exc:
+                    _tool_turn_persisted = False
                     logger.warning(
                         "Incremental tool-call persistence failed before execution "
                         "(session=%s): %s",
                         agent.session_id or "none",
                         exc,
                     )
+
+                if _tool_turn_persisted is False:
+                    # Do not project or execute a tool-call row that exists only
+                    # in memory.  Stop the turn rather than retrying the same
+                    # unpersisted request until the iteration budget is spent.
+                    _turn_exit_reason = "session_persistence_failed"
+                    final_response = ""
+                    failed = True
+                    break
+
+                # UI projection is downstream of the canonical SessionDB append.
+                if not duplicate_previous_interim:
+                    agent._emit_interim_assistant_message(assistant_msg)
 
                 # Close any open streaming display (response box, reasoning
                 # box) before tool execution begins.  Intermediate turns may
@@ -6371,6 +6406,14 @@ def _run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                if getattr(agent, "_incremental_persistence_failed", False):
+                    # A tool result that could not be persisted is not safe to
+                    # send back to the provider or project to the UI.
+                    _turn_exit_reason = "session_persistence_failed"
+                    final_response = ""
+                    failed = True
+                    break
 
                 if agent._required_policy_halt_block is not None:
                     block = agent._required_policy_halt_block

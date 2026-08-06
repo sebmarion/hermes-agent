@@ -125,14 +125,16 @@ def test_picker_path_falls_back_to_model_info_when_resolver_empty(monkeypatch):
 
 def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
     import cli as cli_mod
+    import hermes_cli.config as config_mod
 
-    writes = []
     monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        cli_mod,
-        "save_config_value",
-        lambda key, value: writes.append((key, value)),
+        config_mod,
+        "persist_main_model_assignment",
+        lambda **kwargs: calls.append(kwargs),
+        raising=False,
     )
+    calls = []
     cli = _StubCLI()
     cli.model = "shared-model"
     cli.provider = "custom"
@@ -171,7 +173,14 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
     ):
         cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
 
-    assert ("model.context_length", None) in writes
+    assert calls == [
+        {
+            "provider": "custom",
+            "model": "shared-model",
+            "base_url": "https://small.example/v1",
+            "api_mode": "chat_completions",
+        }
+    ]
 
 def test_picker_runtime_switch_failure_performs_zero_config_writes(monkeypatch):
     import cli as cli_mod

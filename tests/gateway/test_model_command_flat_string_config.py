@@ -20,6 +20,9 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
 
+_MISSING = object()
+
+
 def _make_runner():
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
@@ -61,10 +64,10 @@ def _setup_isolated_home(tmp_path, monkeypatch, model_yaml_value):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
     cfg_path = hermes_home / "config.yaml"
-    cfg_path.write_text(
-        yaml.safe_dump({"model": model_yaml_value, "providers": {}}),
-        encoding="utf-8",
-    )
+    config = {"providers": {}}
+    if model_yaml_value is not _MISSING:
+        config["model"] = model_yaml_value
+    cfg_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
     monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
