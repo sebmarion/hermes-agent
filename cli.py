@@ -3883,6 +3883,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Inline diff previews for write actions (display.inline_diffs in config.yaml)
         self._inline_diffs_enabled = CLI_CONFIG["display"].get("inline_diffs", True)
 
+        # Per-turn accounting is display-only and observes the existing tool
+        # progress stream; it does not add state to the model loop.
+        self._turn_summary_enabled = bool(CLI_CONFIG["display"].get("turn_summary", True))
+        self._spinner_token_flow_enabled = bool(
+            CLI_CONFIG["display"].get("spinner_token_flow", True)
+        )
+        self._turn_summary_collector = None
+        self._turn_summary_start = 0.0
+        self._turn_token_baseline = 0
+        self._interactive_turn = False
+
         # Submitted multiline user-message preview (display.user_message_preview in config.yaml)
         _ump = CLI_CONFIG["display"].get("user_message_preview", {})
         if not isinstance(_ump, dict):
@@ -4918,6 +4929,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         txt = getattr(self, "_spinner_text", "")
         if not txt:
             return ""
+        flow = self._spinner_token_flow()
         t0 = getattr(self, "_tool_start_time", 0) or 0
         if t0 > 0:
             elapsed = time.monotonic() - t0
@@ -4929,8 +4941,74 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             else:
                 # Keep width stable before the 60s rollover as well.
                 elapsed_str = f"{elapsed:5.1f}s"
-            return f"  {txt}  ({elapsed_str})"
-        return f"  {txt}"
+            return f"  {txt}  ({elapsed_str}{' · ' + flow if flow else ''})"
+        return f"  {txt}  ({flow})" if flow else f"  {txt}"
+
+    def _spinner_token_flow(self) -> str:
+        if not getattr(self, "_spinner_token_flow_enabled", False):
+            return ""
+        if not getattr(self, "_agent_running", False):
+            return ""
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return ""
+        try:
+            from agent.turn_summary import format_token_flow
+
+            produced = (getattr(agent, "session_output_tokens", 0) or 0) - (
+                getattr(self, "_turn_token_baseline", 0) or 0
+            )
+            return format_token_flow(produced)
+        except Exception:
+            return ""
+
+    def _turn_summary_is_active(self) -> bool:
+        if not getattr(self, "_turn_summary_enabled", False):
+            return False
+        if getattr(self, "tool_progress_mode", "all") == "off":
+            return False
+        agent = getattr(self, "agent", None)
+        if agent is not None and getattr(agent, "quiet_mode", False):
+            return False
+        return bool(getattr(self, "_interactive_turn", False))
+
+    def _turn_summary_begin(self) -> None:
+        try:
+            from agent.turn_summary import TurnSummaryCollector
+
+            collector = getattr(self, "_turn_summary_collector", None)
+            if collector is None:
+                collector = TurnSummaryCollector()
+                self._turn_summary_collector = collector
+            collector.begin()
+            self._turn_summary_start = time.monotonic()
+            agent = getattr(self, "agent", None)
+            self._turn_token_baseline = (
+                getattr(agent, "session_output_tokens", 0) or 0
+            ) if agent is not None else 0
+        except Exception:
+            self._turn_summary_collector = None
+
+    def _turn_summary_record(self, function_name, result, is_error: bool) -> None:
+        collector = getattr(self, "_turn_summary_collector", None)
+        if collector is None:
+            return
+        try:
+            collector.record_tool(function_name, result=result, is_error=bool(is_error))
+        except Exception:
+            pass
+
+    def _turn_summary_emit(self) -> None:
+        collector = getattr(self, "_turn_summary_collector", None)
+        if collector is None or not self._turn_summary_is_active():
+            return
+        try:
+            elapsed = max(0.0, time.monotonic() - (getattr(self, "_turn_summary_start", 0.0) or 0.0))
+            line = collector.render(elapsed)
+            if line:
+                _cprint(f"  {_DIM}{line}{_RST}")
+        except Exception:
+            logger.debug("Turn summary render failed", exc_info=True)
 
     # ── Petdex mascot (base-CLI pet pane) ───────────────────────────────
     #
@@ -6235,9 +6313,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         return _COMMAND_SPINNER_FRAMES[frame_idx]
 
     @contextmanager
-    def _busy_command(self, status: str):
-        """Expose a temporary busy state in the TUI while a slash command runs."""
+    def _busy_command(self, status: str, *, blocks_input: bool = True):
+        """Expose a temporary busy state while a slash command runs.
+
+        Most commands make the composer read-only while they mutate CLI
+        state.  Context compression is intentionally different: it keeps the
+        spinner/status visible but lets the user draft the next prompt, which
+        is queued and drained after the compacted history is committed.
+        """
+        previous_blocks_input = getattr(self, "_command_blocks_input", False)
         self._command_running = True
+        self._command_blocks_input = bool(blocks_input)
         self._command_status = status
         self._invalidate(min_interval=0.0)
         try:
@@ -6245,6 +6331,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             yield
         finally:
             self._command_running = False
+            self._command_blocks_input = bool(previous_blocks_input)
             self._command_status = ""
             self._invalidate(min_interval=0.0)
 
@@ -10143,16 +10230,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             print("(._.) No active agent -- send a message first.")
             return
 
-        if not self.agent.compression_enabled:
-            print("(._.) Compression is disabled in config.")
-            return
-
         from hermes_cli.partial_compress import (
             extract_compress_flags,
             parse_partial_compress_args,
             rejoin_compressed_head_and_tail,
             split_history_for_partial_compress,
             summarize_compress_preview,
+        )
+        from agent.conversation_compression import (
+            finalize_context_engine_compression_notification,
         )
 
         # Args after the command word (e.g. "/compress here 3" -> "here 3").
@@ -10199,7 +10285,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return
 
         original_count = len(self.conversation_history)
-        with self._busy_command("Compressing context..."):
+        with self._busy_command("Compressing context...", blocks_input=False):
             try:
                 from agent.model_metadata import estimate_request_tokens_rough
                 from agent.manual_compression_feedback import summarize_manual_compression
@@ -10253,7 +10339,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     approx_tokens=approx_tokens,
                     focus_topic=focus_topic or None,
                     force=True,
+                    defer_context_engine_notification=True,
                 )
+                lock_signal = getattr(
+                    self.agent, "_compression_skipped_due_to_lock", None
+                )
+                if lock_signal is True or isinstance(lock_signal, str):
+                    from agent.manual_compression_feedback import (
+                        describe_compression_lock_skip,
+                    )
+
+                    print(f"  {describe_compression_lock_skip(lock_signal)}")
+                    # This is a one-shot handoff signal; leaving it set would
+                    # make the next manual command report a stale lock skip.
+                    self.agent._compression_skipped_due_to_lock = None
+                    finalize_context_engine_compression_notification(
+                        self.agent, committed=False
+                    )
+                    return
                 # Re-append the verbatim tail after the compressed head.
                 # The split guarantees `tail` begins on a user turn, so the
                 # compressed-head -> tail boundary is normally valid
@@ -10280,6 +10383,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     # compressed handoff for the child session. Persist it from
                     # offset 0 so resume can recover the continuation after exit.
                     self.agent._flush_messages_to_session_db(self.conversation_history, None)
+                finalize_context_engine_compression_notification(
+                    self.agent, committed=True
+                )
                 new_tokens = estimate_request_tokens_rough(
                     self.conversation_history,
                     system_prompt=_sys_prompt,
@@ -10298,6 +10404,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     print(f"     {summary['note']}")
 
             except Exception as e:
+                finalize_context_engine_compression_notification(
+                    self.agent, committed=False
+                )
                 print(f"  ❌ Compression failed: {e}")
 
 
@@ -11678,6 +11787,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         if event_type == "tool.completed":
             self._tool_start_time = 0.0
+            self._turn_summary_record(
+                function_name, kwargs.get("result"), kwargs.get("is_error", False)
+            )
             # Print stacked scrollback line for "new" / "all" / "verbose" modes.
             # "verbose" was previously omitted here, so non-streaming model
             # calls (MoA aggregator, copilot-acp) rendered each tool only into
@@ -13107,6 +13219,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 from agent.model_metadata import get_model_context_length
                 _ctx_len = get_model_context_length(
                     self.model, base_url=self.base_url or "", api_key=self.api_key or "",
+                    provider=self.provider or "",
                     config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None)
                 _ctx_result = preprocess_context_references(
                     message, cwd=os.getcwd(), context_length=_ctx_len)
@@ -16598,13 +16711,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
                     # Regular chat - run agent
                     self._agent_running = True
+                    self._interactive_turn = True
                     self._pet_turn_error = False
                     self._pet_reasoning = False
+                    self._turn_summary_begin()
                     app.invalidate()  # Refresh status line
 
                     try:
                         self.chat(user_input, images=submit_images or None)
                     finally:
+                        self._turn_summary_emit()
+                        self._interactive_turn = False
                         self._agent_running = False
                         self._spinner_text = ""
                         self._tool_start_time = 0.0

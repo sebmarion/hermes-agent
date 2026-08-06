@@ -22,6 +22,8 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+
 logger = logging.getLogger(__name__)
 
 
@@ -888,6 +890,24 @@ def run_codex_app_server_turn(
             "error": str(exc),
         }
 
+    # Capture and clear the host interrupt latch at the runtime boundary.
+    # Codex reports the interrupted turn separately, but the correction text
+    # lives on the agent and must survive long enough to be returned to the
+    # gateway before the latch is reset for the next turn.
+    # Type-pin the latch: MagicMock/embedded agent doubles auto-create
+    # truthy attributes, which must not turn an ordinary successful turn into
+    # a false interrupt.
+    interrupt_requested = getattr(agent, "_interrupt_requested", False) is True
+    interrupt_message = getattr(agent, "_interrupt_message", None)
+    interrupted = bool(getattr(turn, "interrupted", False) or interrupt_requested)
+    if interrupted:
+        clear_interrupt = getattr(agent, "clear_interrupt", None)
+        if callable(clear_interrupt):
+            try:
+                clear_interrupt()
+            except Exception:
+                logger.debug("codex app-server interrupt clear failed", exc_info=True)
+
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
     # exited), retire the session so the next turn respawns codex
@@ -959,7 +979,7 @@ def run_codex_app_server_turn(
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if not interrupted and turn.error is None:
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
@@ -975,7 +995,7 @@ def run_codex_app_server_turn(
     # we have a real final response.
     if (
         turn.final_text
-        and not turn.interrupted
+        and not interrupted
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -991,9 +1011,11 @@ def run_codex_app_server_turn(
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
-        "partial": turn.interrupted or turn.error is not None,
+        "completed": not interrupted and turn.error is None,
+        "partial": interrupted or turn.error is not None,
         "error": turn.error,
+        "interrupted": interrupted,
+        "interrupt_message": interrupt_message if interrupted else None,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after
@@ -1348,6 +1370,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # execution middleware may have replaced the payload built by transport.
     validate_raw_responses_reasoning_effort(api_kwargs)
 
+    using_external_client = client is not None
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
@@ -1399,6 +1422,24 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 continue
             raise
 
+        # Claim the delta sink for this Responses attempt. A retry or
+        # concurrent stream supersedes the older token, and the consumer stops
+        # before a stale event can interleave into the current answer.
+        _writer_token = claim_stream_writer(agent)
+
+        def _interrupt_or_superseded(_tok=_writer_token) -> bool:
+            if agent._interrupt_requested:
+                return True
+            if not stream_writer_is_current(agent, _tok):
+                logger.warning(
+                    "Codex streaming attempt superseded by a newer stream; "
+                    "stopping consumption to preserve the single-writer invariant "
+                    "(model=%s).",
+                    api_kwargs.get("model", "unknown"),
+                )
+                return True
+            return False
+
         try:
             # Compatibility: some mocks/providers return a concrete response
             # instead of an iterable.  Pass it straight through.
@@ -1418,7 +1459,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     ),
                     on_first_delta=on_first_delta,
                     on_event=_on_event,
-                    interrupt_check=_interrupt_check,
+                    interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
@@ -1466,7 +1507,22 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 try:
                     close_fn()
                 except Exception:
-                    pass
+                    # A failed close leaves the external request client's
+                    # connection checked out. Poison that reuse slot so the
+                    # worker's normal request-finalization path cannot cache
+                    # a client carrying a leaked stream. The primary shared
+                    # client is process-owned and must not be aborted here.
+                    if using_external_client:
+                        try:
+                            agent._abort_request_openai_client(
+                                active_client,
+                                reason="codex_stream_close_failed",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "failed to poison Codex stream client after close error",
+                                exc_info=True,
+                            )
 
 
 def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):

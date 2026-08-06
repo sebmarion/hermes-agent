@@ -5438,6 +5438,21 @@ class TurnRunner:
             from agent.bestplan_state import run_planning_only_bestplan_turn
 
             def _run_gateway_model_turn():
+                # Autonomy planning is shadow-only at gateway ingress. It is
+                # deliberately fail-open and asynchronous: the normal model
+                # turn remains the authoritative execution path.
+                try:
+                    from agent.autonomy_shadow import submit_shadow_observation
+
+                    submit_shadow_observation(
+                        ctx.message,
+                        session_id=ctx.session_id,
+                        source=f"gateway:{source.platform}",
+                        workspace=os.getcwd(),
+                        parent_agent=agent,
+                    )
+                except Exception as _shadow_exc:
+                    logger.debug("autonomy ingress failed open: %s", _shadow_exc)
                 return agent.run_conversation(_api_run_message, **_conversation_kwargs)
 
             result = run_planning_only_bestplan_turn(

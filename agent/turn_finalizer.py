@@ -52,6 +52,11 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_pre_verify_synthetic",
 )
 
+_DROPPED_TOOLCALL_FLAGS = (
+    "_dropped_toolcall_nudge",
+    "_dropped_toolcall_interim",
+)
+
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
@@ -63,6 +68,14 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     messages[:] = [
         m for m in messages
         if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
+    ]
+
+
+def _drop_dropped_toolcall_scaffolding(messages) -> None:
+    """Remove the assistant/user pair used to recover a dropped tool call."""
+    messages[:] = [
+        m for m in messages
+        if not (isinstance(m, dict) and any(m.get(f) for f in _DROPPED_TOOLCALL_FLAGS))
     ]
 
 
@@ -143,8 +156,22 @@ def finalize_turn(
         # Do not make an unadmitted provider call from finalization. The
         # turn's request budget is already exhausted, so a model-generated
         # summary here could resend the oversized transcript that caused the
-        # exhaustion. Use the deterministic recovery response instead.
+        # exhaustion. Use the deterministic recovery response instead. The
+        # overdrawn-counter branch is only a repair path for an impossible
+        # invariant violation (the live IterationBudget never permits
+        # ``used > max_total``); it preserves an already-available summary
+        # while cleanup is being reported and does not reopen normal turns.
         final_response = None
+        _budget = getattr(agent, "iteration_budget", None)
+        _used = getattr(_budget, "used", None)
+        _max_total = getattr(_budget, "max_total", None)
+        _overdrawn_budget = (
+            isinstance(_used, int)
+            and not isinstance(_used, bool)
+            and isinstance(_max_total, int)
+            and not isinstance(_max_total, bool)
+            and _used > _max_total
+        )
         try:
             from agent.verification_stop import build_budget_exhausted_verification_response
 
@@ -157,6 +184,14 @@ def finalize_turn(
         except Exception:
             logger.debug("budget-exhausted verification response failed", exc_info=True)
             final_response = None
+
+        if final_response is None and _overdrawn_budget:
+            _summary_fn = getattr(agent, "_handle_max_iterations", None)
+            if callable(_summary_fn):
+                try:
+                    final_response = _summary_fn(messages, api_call_count)
+                except Exception:
+                    logger.debug("overdrawn-budget summary failed", exc_info=True)
 
         if final_response is None:
             final_response = (
@@ -314,6 +349,7 @@ def finalize_turn(
         # nudges need stripping; the assistant candidate persists in
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
+        _drop_dropped_toolcall_scaffolding(messages)
 
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the

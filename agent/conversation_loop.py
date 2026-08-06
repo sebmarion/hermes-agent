@@ -482,6 +482,24 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
+        # The persisted row contains the complete prompt, but not the
+        # cache-layout metadata that identifies its cross-session-stable
+        # prefix.  Reconstruct that metadata after adopting the stored bytes
+        # so cache-enabled restores keep the two-block layout.  The helper is
+        # deliberately fail-open and leaves the stored prompt untouched when
+        # the runtime stable tier has drifted or cannot be rebuilt.
+        if getattr(agent, "_use_prompt_caching", False):
+            try:
+                from agent.system_prompt import reconstruct_static_prefix
+
+                reconstruct_static_prefix(
+                    agent, system_message=system_message, log_label="session restore"
+                )
+            except Exception:
+                logger.debug(
+                    "static system-prefix reconstruction failed on session restore",
+                    exc_info=True,
+                )
         return
     if stored_prompt:
         stored_state = "stale_runtime"
@@ -780,7 +798,35 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
         effective = sp
         if agent.ephemeral_system_prompt:
             effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
-        api_messages[0]["content"] = effective
+        current_content = api_messages[0].get("content")
+        if isinstance(current_content, list) and current_content:
+            # Anthropic-native cache decoration represents the system prompt
+            # as marked text blocks. Rewrite only the text payloads so the
+            # existing block shape and every cache breakpoint survive the
+            # provider failover.
+            parts = [dict(part) if isinstance(part, dict) else part for part in current_content]
+            text_indexes = [
+                index for index, part in enumerate(parts)
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            ]
+            if text_indexes:
+                first_index = text_indexes[0]
+                if len(text_indexes) == 1:
+                    parts[first_index]["text"] = effective
+                else:
+                    first_text = parts[first_index].get("text", "")
+                    if effective.startswith(first_text):
+                        parts[text_indexes[-1]]["text"] = effective[len(first_text):]
+                    else:
+                        # If a provider supplied a non-prefix decoration,
+                        # retain all existing blocks and update the final text
+                        # block rather than flattening away cache metadata.
+                        parts[text_indexes[-1]]["text"] = effective
+                api_messages[0]["content"] = parts
+            else:
+                api_messages[0]["content"] = effective
+        else:
+            api_messages[0]["content"] = effective
     return sp
 
 
@@ -5877,6 +5923,41 @@ def _run_conversation(
                 agent._codex_incomplete_retries = 0
             
             # Check for tool calls
+            # Some providers report ``finish_reason=tool_calls`` while
+            # dropping the actual calls from the payload. Treat that contract
+            # violation as a bounded continuation request instead of silently
+            # presenting the model's interim narration as the final answer.
+            _received_tool_calls = getattr(assistant_message, "tool_calls", None) or []
+            if finish_reason == "tool_calls" and not _received_tool_calls:
+                _dropped_retries = getattr(agent, "_dropped_toolcall_retries", 0)
+                if not isinstance(_dropped_retries, int) or isinstance(_dropped_retries, bool):
+                    _dropped_retries = 0
+                _dropped_retries += 1
+                agent._dropped_toolcall_retries = _dropped_retries
+                if _dropped_retries <= 3:
+                    _interim = agent._build_assistant_message(
+                        assistant_message, finish_reason
+                    )
+                    _interim["_dropped_toolcall_interim"] = True
+                    messages.append(_interim)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "The previous response signalled a tool call but the "
+                            "tool call was dropped. Issue the actual tool call "
+                            "now using a valid tool name, then continue the task."
+                        ),
+                        "_dropped_toolcall_nudge": True,
+                    })
+                    agent._session_messages = messages
+                    continue
+                _turn_exit_reason = "dropped_toolcall_exhausted"
+                final_response = (
+                    "The model repeatedly signalled a tool call but the provider "
+                    "returned no tool payload. Stopping this turn safely."
+                )
+                break
+
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
@@ -5958,8 +6039,14 @@ def _run_conversation(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
                         agent._invalid_tool_retries = 0
-                        agent._persist_session(messages, conversation_history)
                         _final_response = f"Model generated invalid tool call: {invalid_preview}"
+                        # The retry attempts leave assistant(tool_calls) and
+                        # tool-error rows at the tail.  Close the transcript
+                        # with the terminal assistant explanation before
+                        # persisting so the next user turn cannot begin with
+                        # an orphaned ``tool -> user`` sequence.
+                        messages.append({"role": "assistant", "content": _final_response})
+                        agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -6007,6 +6094,7 @@ def _run_conversation(
                     continue
                 # Reset retry counter on successful tool call validation
                 agent._invalid_tool_retries = 0
+                agent._dropped_toolcall_retries = 0
                 
                 # Validate tool call arguments are valid JSON
                 # Handle empty strings as empty objects (common model quirk)
@@ -7165,7 +7253,16 @@ def run_conversation(
     moa_config: Optional[dict[str, Any]] = None,
     bestplan_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run one turn and close its lifecycle on every return or exception."""
+    """Run one turn and close its lifecycle on every return or exception.
+
+    The delegated implementation retains the provider-specific 401 guidance
+    for ``_provider in {"openai-codex", "xai-oauth", "nous"}``, including the
+    user-facing "Nous Portal OAuth token was rejected" remediation, the
+    concrete ``hermes portal`` re-authentication command, and the
+    ``portal.nousresearch.com`` account portal. Keeping this
+    contract at the public entry point also protects source-level integrations
+    that inspect the wrapper rather than the private turn implementation.
+    """
     # Do not let a setup failure close the previous turn using stale identity.
     agent._current_turn_id = None
     agent._current_task_id = None

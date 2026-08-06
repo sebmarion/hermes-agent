@@ -248,6 +248,11 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # transcript and breaks prompt-prefix cache reuse on later turns. (#55733)
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    # Provider contract recovery: a finish_reason=tool_calls response with
+    # no actual calls gets an assistant echo + synthetic user nudge.  Neither
+    # belongs in the durable transcript.
+    "_dropped_toolcall_nudge",
+    "_dropped_toolcall_interim",
 )
 
 
@@ -1881,6 +1886,18 @@ class AIAgent:
         self._drop_trailing_empty_response_scaffolding(messages)
         self._session_messages = messages
         self._save_session_log(messages)
+        # Token/cost deltas are normally queued off the turn thread.  Session
+        # finalization is the durability boundary: drain that queue before
+        # returning so a clean turn exit (or crash immediately afterwards)
+        # cannot leave the session row behind the transcript we just saved.
+        if self._session_db is not None:
+            try:
+                self._session_db.flush_token_counts()
+            except Exception:
+                logger.warning(
+                    "session token-accounting flush failed during persist",
+                    exc_info=True,
+                )
         self._flush_messages_to_session_db(messages, conversation_history)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
@@ -2438,6 +2455,17 @@ class AIAgent:
         str(error) for everything else.
         """
         raw = str(error)
+
+        # Native Gemini adapters compose actionable quota/key guidance onto
+        # the exception message.  Do not re-parse ``response.text`` here:
+        # that would replace the composed message with Google's terse raw
+        # error and silently discard the guidance before it reaches the user.
+        try:
+            from agent.gemini_native_adapter import GeminiAPIError
+        except Exception:  # pragma: no cover - defensive import fallback
+            GeminiAPIError = ()  # type: ignore[assignment]
+        if GeminiAPIError and isinstance(error, GeminiAPIError):
+            return redact_sensitive_text(raw[:1200])
 
         if (
             isinstance(error, ValueError)
@@ -4114,6 +4142,10 @@ class AIAgent:
                 self.client = None
         except Exception:
             pass
+        try:
+            self._close_cached_request_openai_client(reason="cache_evict")
+        except Exception:
+            pass
 
     def close(self) -> None:
         """Release all resources held by this agent instance.
@@ -4850,6 +4882,18 @@ class AIAgent:
 
         return copilot_request_headers(is_agent_turn=True, is_vision=is_vision)
 
+    _REQUEST_CLIENT_REUSE_REASONS = frozenset({
+        "request_complete",
+        "stream_request_complete",
+    })
+
+    def _request_client_cache_ref(self) -> dict:
+        cache = getattr(self, "_request_client_cache", None)
+        if cache is None:
+            cache = {"client": None, "kwargs": None, "poisoned": False, "in_use": False}
+            self._request_client_cache = cache
+        return cache
+
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
 
@@ -4876,10 +4920,66 @@ class AIAgent:
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
-        return self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        stale = None
+        with self._openai_client_lock():
+            cache = self._request_client_cache_ref()
+            cached = cache["client"]
+            if cached is not None and not cache["in_use"]:
+                if (
+                    not cache["poisoned"]
+                    and cache["kwargs"] == request_kwargs
+                    and not self._is_openai_client_closed(cached)
+                ):
+                    cache["in_use"] = True
+                    return cached
+                stale = cached
+                cache["client"] = None
+                cache["kwargs"] = None
+                cache["poisoned"] = False
+        if stale is not None:
+            self._close_openai_client(stale, reason=f"reuse_evict:{reason}", shared=False)
+        client = self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        with self._openai_client_lock():
+            cache = self._request_client_cache_ref()
+            if cache["client"] is None:
+                cache["client"] = client
+                cache["kwargs"] = {
+                    key: dict(value) if isinstance(value, dict) else value
+                    for key, value in request_kwargs.items()
+                }
+                cache["poisoned"] = False
+                cache["in_use"] = True
+        return client
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+        with self._openai_client_lock():
+            cache = self._request_client_cache_ref()
+            if cache["client"] is client:
+                if reason in self._REQUEST_CLIENT_REUSE_REASONS and not cache["poisoned"]:
+                    cache["in_use"] = False
+                    return
+                cache["client"] = None
+                cache["kwargs"] = None
+                cache["poisoned"] = False
+                cache["in_use"] = False
         self._close_openai_client(client, reason=reason, shared=False)
+
+    def _close_cached_request_openai_client(self, *, reason: str) -> None:
+        with self._openai_client_lock():
+            cache = getattr(self, "_request_client_cache", None)
+            client = cache["client"] if cache else None
+            in_use = bool(cache["in_use"]) if cache else False
+            if cache is not None:
+                cache["client"] = None
+                cache["kwargs"] = None
+                cache["poisoned"] = False
+                cache["in_use"] = False
+        if client is None:
+            return
+        if in_use:
+            self._abort_request_openai_client(client, reason=f"{reason}_in_flight")
+        else:
+            self._close_openai_client(client, reason=reason, shared=False)
 
     def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
         """Cross-thread abort: shut sockets down without releasing FDs.
@@ -4897,6 +4997,10 @@ class AIAgent:
         """
         if client is None:
             return
+        with self._openai_client_lock():
+            cache = self._request_client_cache_ref()
+            if cache["client"] is client:
+                cache["poisoned"] = True
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
             if shutdown_count == 0:
@@ -5846,9 +5950,57 @@ class AIAgent:
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
+        if self._stream_writer_superseded():
+            return
         if isinstance(text, str) and text:
             self._current_streamed_assistant_text = (
                 getattr(self, "_current_streamed_assistant_text", "") + text
+            )
+
+    def _ensure_stream_writer_state(self) -> None:
+        """Lazily initialize the single-writer fence for partial agents."""
+        if getattr(self, "_stream_writer_lock", None) is None:
+            self._stream_writer_lock = threading.Lock()
+        if not hasattr(self, "_stream_writer_token"):
+            self._stream_writer_token = 0
+        if getattr(self, "_stream_writer_tls", None) is None:
+            self._stream_writer_tls = threading.local()
+        if not hasattr(self, "_stream_writer_dropped"):
+            self._stream_writer_dropped = 0
+
+    def _claim_stream_writer(self) -> int:
+        """Claim the delta sink and supersede any older stream attempt."""
+        self._ensure_stream_writer_state()
+        with self._stream_writer_lock:
+            self._stream_writer_token += 1
+            token = self._stream_writer_token
+        self._stream_writer_tls.token = token
+        return token
+
+    def _stream_writer_is_current(self, token: int) -> bool:
+        """Return whether *token* is still the active stream writer."""
+        return token == getattr(self, "_stream_writer_token", token)
+
+    def _stream_writer_superseded(self) -> bool:
+        """Return true only for a claimed writer superseded by a newer one."""
+        tls = getattr(self, "_stream_writer_tls", None)
+        token = getattr(tls, "token", None) if tls is not None else None
+        if token is None:
+            return False
+        return token != getattr(self, "_stream_writer_token", token)
+
+    def _note_dropped_stream_writer(self, where: str) -> None:
+        """Record a stale-writer drop without making the stream fail."""
+        try:
+            self._stream_writer_dropped = int(getattr(self, "_stream_writer_dropped", 0)) + 1
+        except Exception:
+            self._stream_writer_dropped = 1
+        count = self._stream_writer_dropped
+        if count == 1 or (count & (count - 1)) == 0:
+            logger.warning(
+                "Dropped delta from a superseded stream writer at %s (discarded=%d)",
+                where,
+                count,
             )
 
     @staticmethod
@@ -5935,6 +6087,9 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        if self._stream_writer_superseded():
+            self._note_dropped_stream_writer("_fire_stream_delta")
+            return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -5988,6 +6143,9 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        if self._stream_writer_superseded():
+            self._note_dropped_stream_writer("_fire_reasoning_delta")
+            return
         cb = self.reasoning_callback
         if cb is not None:
             try:

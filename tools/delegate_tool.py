@@ -2956,7 +2956,25 @@ def _finalize_child_results(
 
         parent_session_id = getattr(parent_agent, "session_id", None)
         try:
-            from hermes_cli.plugins import invoke_hook as invoke_hook
+            from hermes_cli import plugins as _plugins
+
+            # Normal runtime dispatch goes through the module-level helper,
+            # which enforces the discovered-home ownership fence.  A parent
+            # may, however, install an in-process lifecycle callback before
+            # plugin discovery (common for embedded callers and tests).  In
+            # that narrow pre-discovery case the callback is already owned by
+            # the current manager, so invoke its snapshot directly rather
+            # than silently dropping the lifecycle event.
+            _manager = _plugins.get_plugin_manager()
+            if (
+                getattr(_manager, "_discovery_home", None) is None
+                and getattr(_manager, "_hooks", {}).get("subagent_stop")
+                and str(os.environ.get("HERMES_SAFE_MODE", "")).strip().lower()
+                not in {"1", "true", "yes", "on"}
+            ):
+                invoke_hook = _manager.invoke_hook
+            else:
+                invoke_hook = _plugins.invoke_hook
         except Exception:
             invoke_hook = None
 

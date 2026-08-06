@@ -61,11 +61,11 @@ gateway:
     prompt_caching_enabled: "التخزين المؤقت للموجِّه: مُفعّل"
     warning_prefix:         "تحذير: {warning}"
     saved_global:           "حُفظ في config.yaml (‏`--global`)"
-    session_only_hint:      "_(هذه الجلسة فقط — أضف `--global` للحفظ الدائم)_"
+    session_only_hint:      "_(هذه الجلسة فقط — استخدم `--session` للجلسة أو أضف `--global` للحفظ الدائم)_"
     current_label:          "الحالي: `{model}` على {provider}"
     current_tag:            " (الحالي)"
     more_models_suffix:     " (+{count} آخر)"
-    usage_switch_model:     "`/model <name>` — تبديل النموذج"
+    usage_switch_model:     "`/model <name>` — تبديل النموذج لهذه الجلسة فقط\n`/model <name> --session` — تجاوز خاص بالجلسة؛ يتقدم على `--global`"
     usage_switch_provider:  "`/model <name> --provider <slug>` — تبديل المزوّد"
     usage_persist:          "`/model <name> --global` — حفظ دائم"
 
