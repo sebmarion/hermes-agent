@@ -66,6 +66,19 @@ def test_detects_simple_progress_with_demonstrative_target():
 @pytest.mark.parametrize(
     "content",
     [
+        "Let me look at that file.",
+        "I’ll look into that issue.",
+    ],
+)
+def test_detects_multiword_action_with_demonstrative_target(content):
+    agent = _detector_agent()
+
+    assert agent._looks_like_post_tool_progress_update(content, _tool_tail())
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
         "  Now I'll inspect the logs now.  ",
         "Next I’ll inspect the logs now.",
     ],
@@ -125,6 +138,7 @@ def test_detects_leading_whitespace_and_now_or_next_future_action_form(content):
         ("I’ll inspect the logs therefore the next step is clear.", _tool_tail()),
         ("I’ll inspect the logs which contain recent entries.", _tool_tail()),
         ("I’ll inspect the logs that contain recent entries.", _tool_tail()),
+        ("I’ll inspect the logs that are failing.", _tool_tail()),
         ("I’ll inspect the directory where recent entries appear.", _tool_tail()),
         ("I will review it now; the output shows success.", _tool_tail()),
         ("Let me check it now. The result indicates a failure.", _tool_tail()),
@@ -170,6 +184,7 @@ def test_detects_leading_whitespace_and_now_or_next_future_action_form(content):
         "therefore-clause",
         "which-relative-clause",
         "that-relative-clause",
+        "that-relative-clause-failing",
         "where-relative-clause",
         "shows-success",
         "indicates-failure",

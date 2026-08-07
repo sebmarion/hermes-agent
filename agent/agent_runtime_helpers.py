@@ -3616,37 +3616,6 @@ def looks_like_post_tool_progress_update(
         return False
 
     future_action = assistant_text[future_match.end():]
-    if re.search(
-        r"\b(?:and|but|because|although|while|since|whereas|so|yet|"
-        r"however|therefore)\b",
-        future_action,
-    ):
-        return False
-
-    # Relative starters are compound only after an action already named an
-    # object ("inspect the logs that ..."). Keep a simple demonstrative target
-    # such as "inspect that log" eligible.
-    for relative_match in re.finditer(r"\b(?:which|that|where)\b", future_action):
-        preceding_words = re.findall(
-            r"\b[\w'-]+\b", future_action[:relative_match.start()]
-        )
-        if len(preceding_words) >= 2 and re.search(
-            r"\b\w+\b", future_action[relative_match.end():]
-        ):
-            return False
-
-    # Result/finality language anywhere in the visible reply makes it
-    # substantive, even when the model follows the result with another future
-    # action ("Found two failures. I'll inspect the remaining logs.").
-    if re.search(
-        r"\b(?:found|shows?|indicates?|complete|completed|healthy|success|"
-        r"successful|error|failure)\b",
-        assistant_text,
-    ) or re.search(
-        r"\btests?\s+(?:pass(?:ed|es)?|fail(?:ed|s|ing)?)\b",
-        assistant_text,
-    ):
-        return False
     action_markers = (
         "look into",
         "look at",
@@ -3669,7 +3638,53 @@ def looks_like_post_tool_progress_update(
         "report back",
         "summarize",
     )
-    return any(marker in future_action for marker in action_markers)
+    action_candidates = [
+        (offset, marker)
+        for marker in action_markers
+        if (offset := future_action.find(marker)) >= 0
+    ]
+    matched_action = min(
+        action_candidates,
+        key=lambda candidate: (candidate[0], -len(candidate[1])),
+        default=None,
+    )
+    if matched_action is None:
+        return False
+    action_offset, action_marker = matched_action
+    object_text = future_action[action_offset + len(action_marker):]
+
+    if re.search(
+        r"\b(?:and|but|because|although|while|since|whereas|so|yet|"
+        r"however|therefore)\b",
+        future_action,
+    ):
+        return False
+
+    # Relative starters are compound only after an action already named an
+    # object ("inspect the logs that ..."). Keep a simple demonstrative target
+    # such as "inspect that log" eligible.
+    for relative_match in re.finditer(r"\b(?:which|that|where)\b", object_text):
+        preceding_words = re.findall(
+            r"\b[\w'-]+\b", object_text[:relative_match.start()]
+        )
+        if preceding_words and re.search(
+            r"\b\w+\b", object_text[relative_match.end():]
+        ):
+            return False
+
+    # Result/finality language anywhere in the visible reply makes it
+    # substantive, even when the model follows the result with another future
+    # action ("Found two failures. I'll inspect the remaining logs.").
+    if re.search(
+        r"\b(?:found|shows?|indicates?|complete|completed|healthy|success|"
+        r"successful|error|failure)\b",
+        assistant_text,
+    ) or re.search(
+        r"\btests?\s+(?:pass(?:ed|es)?|fail(?:ed|s|ing)?)\b",
+        assistant_text,
+    ):
+        return False
+    return matched_action is not None
 
 
 def intent_ack_continuation_mode(agent) -> str:
