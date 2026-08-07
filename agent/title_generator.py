@@ -5,6 +5,7 @@ adds latency to the user-facing reply.
 """
 
 import logging
+import re
 import threading
 from typing import Callable, Optional
 
@@ -90,6 +91,42 @@ def _summarize_user_message(user_message: str) -> str:
         logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)
         return user_message
     return described if described is not None else user_message
+
+
+_FALLBACK_WRAPPER_PREFIXES = ("[IMPORTANT:", "[System:")
+_SKILL_METADATA_KEY_RE = re.compile(
+    r"^(?:name|description|version|author|license|platforms|metadata|tags|"
+    r"related_skills|category|file_path)\s*:",
+    re.MULTILINE,
+)
+_LEADING_SKILL_FRONTMATTER_RE = re.compile(
+    r"^---[ \t]*\r?\n(?P<metadata>.*?)(?:\r?\n)?---[ \t]*(?:\r?\n|$)",
+    re.DOTALL,
+)
+
+
+def _fallback_title_from_message(user_message: str) -> Optional[str]:
+    """Derive a safe title from the substantive portion of a user message."""
+    if not user_message:
+        return None
+
+    text = _summarize_user_message(str(user_message)).strip()
+    while text.startswith(_FALLBACK_WRAPPER_PREFIXES):
+        end = text.find("]")
+        if end < 0:
+            break
+        text = text[end + 1 :].lstrip()
+
+    frontmatter = _LEADING_SKILL_FRONTMATTER_RE.match(text)
+    if frontmatter and _SKILL_METADATA_KEY_RE.search(frontmatter.group("metadata")):
+        text = text[frontmatter.end() :].lstrip()
+
+    title = " ".join(text.split())
+    if not title:
+        return None
+    if len(title) > 80:
+        return title[:77] + "..."
+    return title
 
 
 def generate_title(
@@ -355,7 +392,25 @@ def _auto_title_session(
         runtime_validator=runtime_validator,
     )
     if not title:
-        return
+        # ``None`` also represents intentionally skipped title generation:
+        # disabled configuration or a stale runtime. Do not let the local
+        # fallback bypass either of those gates.
+        if not _auto_title_enabled():
+            return
+        if runtime_validator is not None:
+            try:
+                if not runtime_validator():
+                    return
+            except Exception:
+                # Match generate_title(): a broken validator must not disable
+                # a fallback for an otherwise valid session.
+                logger.debug(
+                    "Title runtime validator raised during fallback; proceeding",
+                    exc_info=True,
+                )
+        title = _fallback_title_from_message(user_message)
+        if not title:
+            return
 
     try:
         persisted = _persist_session_title(session_db, session_id, title)

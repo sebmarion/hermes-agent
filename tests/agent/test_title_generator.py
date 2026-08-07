@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.title_generator import (
+    _fallback_title_from_message,
     generate_title,
     auto_title_session,
     maybe_auto_title,
@@ -120,6 +121,110 @@ class TestGenerateTitle:
 
 class TestAutoTitleSession:
     """Tests for auto_title_session() — the sync worker function."""
+
+    def test_uses_user_message_fallback_when_generation_returns_none(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.set_auto_title_if_empty.return_value = True
+        seen = []
+
+        with patch("agent.title_generator.generate_title", return_value=None):
+            auto_title_session(
+                db,
+                "sess-1",
+                "Fix the failing login redirect",
+                "I will investigate it.",
+                title_callback=seen.append,
+            )
+
+        db.set_auto_title_if_empty.assert_called_once_with(
+            "sess-1", "Fix the failing login redirect"
+        )
+        assert seen == ["Fix the failing login redirect"]
+
+    def test_fallback_removes_only_leading_skill_metadata_and_wrappers(self):
+        message = (
+            "[IMPORTANT: injected skill context]\n"
+            "[System: follow the loaded skill]\n"
+            "---\n"
+            "name: debugging\n"
+            "description: Debug a problem\n"
+            "metadata:\n"
+            "  category: engineering\n"
+            "---\n"
+            "  Fix the production login redirect  "
+        )
+
+        assert _fallback_title_from_message(message) == "Fix the production login redirect"
+        assert _fallback_title_from_message("[Note] Keep this real prompt") == (
+            "[Note] Keep this real prompt"
+        )
+
+    def test_fallback_truncates_user_message_to_eighty_characters(self):
+        title = _fallback_title_from_message("A" * 100)
+
+        assert title == ("A" * 77) + "..."
+        assert len(title) == 80
+
+    def test_fallback_ignores_empty_or_metadata_only_messages(self):
+        metadata_only = "---\nname: debugging\ndescription: Debug a problem\n---"
+
+        assert _fallback_title_from_message("") is None
+        assert _fallback_title_from_message(metadata_only) is None
+
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        with patch("agent.title_generator.generate_title", return_value=None):
+            auto_title_session(db, "sess-1", metadata_only, "I can help.")
+        db.set_auto_title_if_empty.assert_not_called()
+        db.set_session_title.assert_not_called()
+
+    def test_fallback_preserves_atomic_manual_title_race_protection(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.set_auto_title_if_empty.return_value = False
+        seen = []
+
+        with patch("agent.title_generator.generate_title", return_value=None):
+            auto_title_session(
+                db,
+                "sess-1",
+                "Fix the failing login redirect",
+                "I will investigate it.",
+                title_callback=seen.append,
+            )
+
+        db.set_auto_title_if_empty.assert_called_once_with(
+            "sess-1", "Fix the failing login redirect"
+        )
+        db.set_session_title.assert_not_called()
+        assert seen == []
+
+    @pytest.mark.parametrize(
+        ("enabled", "runtime_validator"),
+        [(False, None), (True, lambda: False)],
+        ids=("disabled", "runtime-validator-rejected"),
+    )
+    def test_fallback_does_not_bypass_title_generation_gates(
+        self, enabled, runtime_validator
+    ):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.set_auto_title_if_empty.return_value = True
+
+        with patch("agent.title_generator.generate_title", return_value=None), patch(
+            "agent.title_generator._auto_title_enabled", return_value=enabled
+        ):
+            auto_title_session(
+                db,
+                "sess-1",
+                "Fix the failing login redirect",
+                "I will investigate it.",
+                runtime_validator=runtime_validator,
+            )
+
+        db.set_auto_title_if_empty.assert_not_called()
+        db.set_session_title.assert_not_called()
 
 
 
