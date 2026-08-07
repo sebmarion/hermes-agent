@@ -3592,10 +3592,13 @@ def looks_like_post_tool_progress_update(
     ).strip().lower()
     if not assistant_text or len(assistant_text) > 600:
         return False
-    # Progress-only replies are plain, single-line narration. Structured or
-    # result-bearing content is already doing the work of an answer; fail
-    # closed rather than hiding it behind another synthetic continuation.
-    if "\n" in assistant_text or "```" in assistant_text or ":" in assistant_text:
+    # Progress-only replies are plain, single-clause narration. Structured,
+    # compound, or result-bearing content is already doing the work of an
+    # answer; fail closed rather than hiding it behind another continuation.
+    if "```" in assistant_text or any(
+        separator in assistant_text
+        for separator in ("\n", ",", ";", ":", "—", "–")
+    ):
         return False
 
     future_match = re.match(
