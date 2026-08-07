@@ -261,6 +261,38 @@ def test_radar_window_bounds_evidence_by_message_timestamp(tmp_path):
     }
 
 
+def test_routing_candidate_hosted_cap_keeps_newest_session(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    now = time.time()
+    try:
+        for index in range(51):
+            session_id = f"hosted-{index:03d}"
+            db.create_session(session_id, "cli", model="gpt-test")
+            db.update_token_counts(
+                session_id,
+                input_tokens=1,
+                output_tokens=1,
+                billing_provider="openai-codex",
+            )
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (now - (51 - index), session_id),
+            )
+        db._conn.commit()
+        report = TrajectoryRadar(db).generate(days=1, limit=0)
+    finally:
+        db.close()
+
+    candidate = next(
+        item
+        for item in report["candidates"]
+        if item["id"] == "local-first-dispatch-firewall"
+    )
+    assert "hosted-050" in {
+        ref["session_id"] for ref in candidate["evidence_refs"]
+    }
+
+
 @pytest.mark.parametrize("days", [0, -1])
 def test_radar_rejects_nonpositive_observation_windows(tmp_path, days):
     db = _seed_db(tmp_path / "state.db")
@@ -362,6 +394,63 @@ def test_candidate_store_does_not_regress_for_unseen_pre_action_evidence(tmp_pat
 
     assert store.sync_from_report(historical) == []
     assert store.get("candidate-a").status == "resolved"
+
+
+def test_candidate_store_does_not_regress_from_report_generated_before_action(
+    tmp_path,
+):
+    store = CandidateStore(path=tmp_path / "radar_candidates.json")
+    store.sync_from_report(_candidate_report("candidate-a"))
+    resolved = store.transition("candidate-a", "resolved")
+    action_at = resolved.last_action_at
+
+    pre_action_report = _candidate_report(
+        "candidate-a",
+        evidence_suffix="post-action-from-pre-action-report",
+        evidence_observed_at=action_at + 0.1,
+        scan_time=action_at + 0.25,
+    )
+    pre_action_report["generated_at"] = datetime.fromtimestamp(
+        action_at - 0.25,
+        tz=timezone.utc,
+    ).isoformat()
+
+    assert store.sync_from_report(pre_action_report) == []
+    assert store.get("candidate-a").status == "resolved"
+
+
+def test_candidate_ref_cap_keeps_newest_post_action_evidence(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    now = time.time()
+    try:
+        db.create_session("capped-session", "cli", model="qwen")
+        for index in range(20):
+            db.append_message(
+                "capped-session",
+                "assistant",
+                "Done.",
+                timestamp=now - (20 - index),
+            )
+        initial = TrajectoryRadar(db).generate(days=1, limit=0)
+
+        store = CandidateStore(path=tmp_path / "radar_candidates.json")
+        store.sync_from_report(initial)
+        store.transition("done-means-proven-gatekeeper", "resolved")
+
+        db.append_message(
+            "capped-session",
+            "user",
+            "Did you check the newest evidence?",
+            timestamp=time.time(),
+        )
+        refreshed = TrajectoryRadar(db).generate(days=1, limit=0)
+    finally:
+        db.close()
+
+    assert store.sync_from_report(refreshed) == [
+        "done-means-proven-gatekeeper"
+    ]
+    assert store.get("done-means-proven-gatekeeper").status == "regressed"
 
 
 def test_candidate_store_tracks_fresh_evidence_after_report_ref_cap(tmp_path):

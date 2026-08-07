@@ -289,10 +289,12 @@ class TrajectoryRadar:
         sessions: list[dict[str, Any]],
         by_label: dict[str, list[dict[str, Any]]],
     ) -> list[ActionCandidate]:
-        hosted_sessions = [s for s in sessions if _looks_hosted(s)]
+        hosted_sessions = _chronological_rows(
+            session for session in sessions if _looks_hosted(session)
+        )[-50:]
         local_rows = by_label.get("provider_drift", [])
         refs = list(local_rows)
-        for session in hosted_sessions[:50]:
+        for session in hosted_sessions:
             refs.append(
                 {
                     "label": "hosted_model_usage",
@@ -384,7 +386,7 @@ class TrajectoryRadar:
         proof: str,
         safety: str,
     ) -> ActionCandidate:
-        evidence = _dedupe_refs(rows)
+        evidence = _dedupe_refs(_chronological_rows(rows))
         sources = Counter(row.get("source") or "unknown" for row in rows)
         models = Counter(row.get("model") or "unknown" for row in rows)
         projects = [name for name, _count in Counter(row.get("project") or "unknown" for row in rows).most_common(5)]
@@ -992,6 +994,7 @@ class CandidateStore:
                     )[-256:]
                     if (
                         record.status in _REGRESSIBLE_CANDIDATE_STATUSES
+                        and generated_at > record.last_action_at
                         and any(
                             observed > record.last_action_at
                             for observed in fresh_observed_at
@@ -1151,6 +1154,31 @@ def _merge_signal_rows(by_label: dict[str, list[dict[str, Any]]], labels: Iterab
     for label in labels:
         rows.extend(by_label.get(label, []))
     return rows
+
+
+def _chronological_rows(
+    rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Order oldest-to-newest with deterministic ties before applying caps."""
+
+    def _key(row: dict[str, Any]) -> tuple[float, str, str, str, str, str]:
+        try:
+            observed_at = float(row.get("observed_at") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            observed_at = 0.0
+        if not math.isfinite(observed_at):
+            observed_at = 0.0
+        message_id = row.get("message_id")
+        return (
+            observed_at,
+            str(row.get("session_id") or row.get("id") or ""),
+            str(message_id if message_id is not None else ""),
+            str(row.get("label") or ""),
+            str(row.get("source") or ""),
+            str(row.get("model") or ""),
+        )
+
+    return sorted(rows, key=_key)
 
 
 def _dedupe_refs(rows: Iterable[dict[str, Any]]) -> list[EvidenceRef]:
