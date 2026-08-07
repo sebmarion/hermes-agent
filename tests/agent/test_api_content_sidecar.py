@@ -628,6 +628,7 @@ class TestPrologueMoaAndInPlaceBackfill:
         agent = _FakeAgent()
         agent.compression_enabled = True
         agent._session_db = MagicMock()
+        agent._session_db.set_latest_user_api_content.return_value = 1
 
         calls = {"n": 0}
 
@@ -678,6 +679,55 @@ class TestPrologueMoaAndInPlaceBackfill:
         agent._session_db.set_latest_user_api_content.assert_called_once_with(
             "sess-1", "hello", "hello\n\nPLUGIN-CTX"
         )
+
+    def test_inplace_compaction_fails_closed_when_backfill_matches_no_row(self):
+        """Do not send provider bytes that cannot be replayed after restart."""
+        agent = _FakeAgent()
+        agent.compression_enabled = True
+        agent._session_db = MagicMock()
+        agent._session_db.set_latest_user_api_content.return_value = 0
+
+        calls = {"n": 0}
+
+        def _should_compress(_tokens):
+            calls["n"] += 1
+            return calls["n"] == 1
+
+        agent.context_compressor = types.SimpleNamespace(
+            protect_first_n=0,
+            protect_last_n=0,
+            threshold_tokens=1,
+            context_length=1000,
+            last_prompt_tokens=-1,
+            should_compress=_should_compress,
+            should_defer_preflight_to_real_usage=lambda _t: False,
+            get_active_compression_failure_cooldown=lambda: None,
+        )
+
+        def _compress(messages, _system, approx_tokens=None, task_id=None):
+            agent._last_compaction_in_place = True
+            return (
+                [
+                    {"role": "assistant", "content": "compaction summary"},
+                    dict(messages[-1]),
+                ],
+                "SYSTEM",
+            )
+
+        agent._compress_context = _compress
+        history = [
+            {"role": "user", "content": "x" * 4000},
+            {"role": "assistant", "content": "x" * 4000},
+        ]
+
+        with (
+            patch(
+                "hermes_cli.plugins.invoke_hook",
+                return_value=[{"context": "PLUGIN-CTX"}],
+            ),
+            pytest.raises(RuntimeError, match="api_content backfill did not match"),
+        ):
+            _build(agent, conversation_history=history)
 
 
 class TestSetLatestUserApiContent:

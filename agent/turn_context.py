@@ -1246,18 +1246,30 @@ def build_turn_context(
                 _db = getattr(agent, "_session_db", None)
                 if _db is not None:
                     try:
-                        _db.set_latest_user_api_content(
+                        _updated = _db.set_latest_user_api_content(
                             agent.session_id,
                             _turn_user_msg.get("content"),
                             _api_content,
                         )
-                    except Exception:
-                        logger.warning(
+                        if _updated != 1:
+                            raise RuntimeError(
+                                "in-place compaction api_content backfill did not "
+                                "match the durable current-turn row"
+                            )
+                    except Exception as exc:
+                        # Continuing would send bytes that a restarted session
+                        # cannot replay, silently invalidating the provider
+                        # prefix. Fail before dispatch instead of claiming a
+                        # durable turn that does not exist.
+                        logger.error(
                             "in-place compaction api_content backfill failed "
                             "for session=%s",
                             agent.session_id or "none",
                             exc_info=True,
                         )
+                        raise RuntimeError(
+                            "api_content backfill did not match durable session state"
+                        ) from exc
 
     # Crash-resilience: persist the inbound user turn before the first LLM
     # call. Runs after preflight compression (which rewrites history anyway)
