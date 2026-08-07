@@ -90,6 +90,17 @@ class TestCodingSelection:
         # …while the prompt posture is still active.
         assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is True
 
+    def test_focus_mcp_servers_follow_the_runtime_surface(self):
+        cfg = {
+            "mcp_servers": {
+                "cli-only": {"enabled": True, "allowed_platforms": ["cli"]},
+                "cron-only": {"enabled": True, "allowed_platforms": ["cron"]},
+            },
+        }
+
+        assert cc._enabled_mcp_servers(cfg, platform="cli") == ["cli-only"]
+        assert cc._enabled_mcp_servers(cfg, platform="cron") == ["cron-only"]
+
 
 
 

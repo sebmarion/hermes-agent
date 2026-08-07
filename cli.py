@@ -6755,7 +6755,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._show_status()
         else:
             # Get tools for display
-            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+            tools = get_tool_definitions(
+                enabled_toolsets=self.enabled_toolsets,
+                quiet_mode=True,
+                platform=getattr(self, "platform", None) or "cli",
+            )
             
             # Get terminal working directory (where commands will execute)
             cwd = os.getenv("TERMINAL_CWD", os.getcwd())
@@ -7124,7 +7128,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1":
             tool_status = "tools deferred"
         else:
-            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+            tools = get_tool_definitions(
+                enabled_toolsets=self.enabled_toolsets,
+                quiet_mode=True,
+                platform=getattr(self, "platform", None) or "cli",
+            )
             tool_count = len(tools) if tools else 0
             tool_status = f"{tool_count} tools"
 
@@ -7298,6 +7306,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             enabled_toolsets=self.enabled_toolsets,
             quiet_mode=True,
             skip_tool_search_assembly=True,
+            platform=getattr(self, "platform", None) or "cli",
         )
         
         if not tools:
@@ -9361,7 +9370,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if self.compact or term_w < 80:
                     cc.print(_build_compact_banner())
                 else:
-                    tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+                    tools = get_tool_definitions(
+                        enabled_toolsets=self.enabled_toolsets,
+                        quiet_mode=True,
+                        platform=getattr(self, "platform", None) or "cli",
+                    )
                     cwd = os.getenv("TERMINAL_CWD", os.getcwd())
                     ctx_len = None
                     if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
@@ -11859,7 +11872,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # (name-diff, thread-safe, and — critically — additive-preserving so
             # memory-provider and context-engine tools survive the rebuild).
             if self.agent is not None:
-                from tools.mcp_tool import refresh_agent_mcp_tools
+                from tools.mcp_tool import (
+                    get_registered_mcp_server_names,
+                    refresh_agent_mcp_tools,
+                )
                 # Explicit reload: pick up MCP servers the user ENABLED in config
                 # this session. self.enabled_toolsets was resolved once at
                 # startup; merge in any now-connected server names (unless the
@@ -11869,8 +11885,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 enabled_override = None
                 et = self.enabled_toolsets
                 if et and "all" not in et and "*" not in et:
-                    merged = list(et)
-                    for _name in sorted(connected_servers):
+                    from hermes_cli.config import read_raw_config
+                    from hermes_cli.tools_config import (
+                        enabled_mcp_server_names,
+                        filter_mcp_toolsets_for_platform,
+                    )
+
+                    latest_config = read_raw_config()
+                    policy_platform = getattr(self.agent, "platform", None) or "cli"
+                    merged = filter_mcp_toolsets_for_platform(
+                        list(et), latest_config, platform=policy_platform
+                    )
+                    allowed_registered = (
+                        get_registered_mcp_server_names()
+                        & enabled_mcp_server_names(
+                            latest_config, platform=policy_platform
+                        )
+                    )
+                    for _name in sorted(allowed_registered):
                         if _name not in merged:
                             merged.append(_name)
                     enabled_override = merged

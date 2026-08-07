@@ -1462,10 +1462,19 @@ def _(rid, params: dict) -> dict:
             if session
             else _load_enabled_toolsets()
         )
+        platform = (
+            getattr(session["agent"], "platform", None)
+            if session
+            else _resolve_session_platform()
+        )
         # Pre-assembly list: /tools is a discovery surface and must show
         # tools deferred behind the tool_search bridge (same as the CLI).
-        tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True,
-                                     skip_tool_search_assembly=True)
+        tools = get_tool_definitions(
+            enabled_toolsets=enabled,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+            platform=platform,
+        )
         sections = {}
 
         for tool in sorted(tools, key=lambda t: t["function"]["name"]):

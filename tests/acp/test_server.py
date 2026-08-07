@@ -637,8 +637,12 @@ class TestRegisterSessionMcpServers:
         )
 
         registered_config = {}
-        def capture_register(config_map):
+        captured_source = None
+
+        def capture_register(config_map, *, source):
+            nonlocal captured_source
             registered_config.update(config_map)
+            captured_source = source
             return ["mcp_test_server_tool1"]
 
         with patch("tools.mcp_tool.register_mcp_servers", side_effect=capture_register), \
@@ -650,6 +654,7 @@ class TestRegisterSessionMcpServers:
         assert cfg["command"] == "/usr/bin/test"
         assert cfg["args"] == ["--flag"]
         assert cfg["env"] == {"KEY": "val"}
+        assert captured_source == "acp"
 
 
     @pytest.mark.asyncio
@@ -683,6 +688,7 @@ class TestRegisterSessionMcpServers:
         ]
 
         with patch("tools.mcp_tool.register_mcp_servers", return_value=["mcp_srv_search"]), \
+             patch("tools.mcp_tool.get_mcp_server_registration_source", return_value="acp"), \
              patch("model_tools.get_tool_definitions", return_value=fake_tools) as mock_defs:
             await agent._register_session_mcp_servers(state, [server])
 
@@ -690,6 +696,7 @@ class TestRegisterSessionMcpServers:
             enabled_toolsets=["hermes-acp", "mcp-srv"],
             disabled_toolsets=None,
             quiet_mode=True,
+            platform="acp",
         )
         assert state.agent.enabled_toolsets == ["hermes-acp", "mcp-srv"]
         assert state.agent.tools is fake_tools
@@ -709,6 +716,38 @@ class TestRegisterSessionMcpServers:
         }
         # _invalidate_system_prompt should have been called
         state.agent._invalidate_system_prompt.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_rejects_other_source_name_collision_from_acp_toolsets(
+        self, agent, mock_manager
+    ):
+        from acp.schema import McpServerStdio
+
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.enabled_toolsets = ["hermes-acp", "mcp-srv"]
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+        server = McpServerStdio(name="srv", command="/bin/test", args=[], env=[])
+
+        with (
+            patch("tools.mcp_tool.register_mcp_servers", return_value=[]),
+            patch(
+                "tools.mcp_tool.get_mcp_server_registration_source",
+                return_value="config",
+                create=True,
+            ),
+            patch("model_tools.get_tool_definitions", return_value=[]) as mock_defs,
+        ):
+            await agent._register_session_mcp_servers(state, [server])
+
+        mock_defs.assert_called_once_with(
+            enabled_toolsets=["hermes-acp"],
+            disabled_toolsets=None,
+            quiet_mode=True,
+            platform="acp",
+        )
+        assert state.agent.enabled_toolsets == ["hermes-acp"]
 
     @pytest.mark.asyncio
     async def test_register_failure_logs_warning(self, agent, mock_manager):

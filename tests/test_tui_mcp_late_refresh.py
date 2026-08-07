@@ -12,6 +12,7 @@ import time
 import types
 
 import model_tools
+import tools.mcp_tool as mcp_tool
 from tui_gateway import server
 from tui_gateway import entry
 
@@ -41,6 +42,14 @@ def _install(monkeypatch, *, in_flight, join_result, new_defs):
     monkeypatch.setattr(entry, "mcp_discovery_in_flight", lambda: in_flight)
     monkeypatch.setattr(entry, "join_mcp_discovery", lambda timeout=None: join_result)
     monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: list(new_defs))
+    # This suite isolates late-refresh publication mechanics. Platform-policy
+    # behavior is covered by the dedicated MCP refresh tests; keep its
+    # synthetic, unregistered MCP schemas visible here.
+    monkeypatch.setattr(
+        mcp_tool,
+        "filter_mcp_tool_definitions_for_platform",
+        lambda definitions, _platform: definitions,
+    )
     monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_kw: None)
     monkeypatch.setattr(server, "_session_info", lambda agent, session: {"tools_len": len(agent.tools)})
 

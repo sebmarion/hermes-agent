@@ -50,6 +50,37 @@ def _make_mock_server(name, session=None, tools=None):
     return server
 
 
+@pytest.fixture(autouse=True)
+def _restore_mcp_registration_provenance():
+    """Keep process-global MCP registration provenance isolated per test."""
+    import tools.mcp_tool as mcp_tool
+
+    tracked_names = (
+        "_mcp_tool_server_names",
+        "_mcp_tool_server_origins",
+        "_mcp_server_origins",
+        "_mcp_connecting_origins",
+    )
+    with mcp_tool._lock:
+        saved_connecting = set(mcp_tool._server_connecting)
+        saved = {
+            name: dict(getattr(mcp_tool, name, {}))
+            for name in tracked_names
+        }
+    try:
+        yield
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._server_connecting.clear()
+            mcp_tool._server_connecting.update(saved_connecting)
+            for name, values in saved.items():
+                mapping = getattr(mcp_tool, name, None)
+                if mapping is None:
+                    continue
+                mapping.clear()
+                mapping.update(values)
+
+
 class TestFilterMCPChildren:
     def test_filters_gateway_children_by_argv_marker(self, monkeypatch):
         """Non-MCP children start with an interpreter/binary, not the marker."""
@@ -2895,7 +2926,7 @@ class TestMCPDiscoveryCrossProcessLock:
              patch("tools.mcp_tool._existing_tool_names", return_value=[]):
             result = discover_mcp_tools()
         # Must still run local discovery
-        reg_spy.assert_called_once_with(mock_config)
+        reg_spy.assert_called_once_with(mock_config, source="config")
 
     def test_posix_flock_acquire_and_release(self):
         """_acquire_lock_on_fh uses fcntl.flock on POSIX."""
@@ -2926,3 +2957,155 @@ class TestMCPDiscoveryCrossProcessLock:
                 os.unlink(lock_path)
             except Exception:
                 pass
+
+
+class TestMCPPlatformPolicy:
+    def _set_provenance(self, mcp_tool, tool_name, server_name, source):
+        with mcp_tool._lock:
+            mcp_tool._mcp_tool_server_names[tool_name] = server_name
+            mcp_tool._mcp_tool_server_origins[tool_name] = source
+
+    def test_platform_access_uses_raw_configured_server_name(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        tool_name = "mcp__zeus_browser__open"
+        self._set_provenance(mcp_tool, tool_name, "zeus-browser", "config")
+        monkeypatch.setattr(
+            mcp_tool,
+            "_load_mcp_config",
+            lambda: {"zeus-browser": {"allowed_platforms": ["cli"]}},
+        )
+
+        assert mcp_tool.get_mcp_tool_server_name(tool_name) == "zeus-browser"
+        assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (True, None)
+        assert mcp_tool.mcp_tool_platform_access(tool_name, "cron") == (
+            False,
+            "mcp_platform_denied",
+        )
+
+    def test_acp_registration_is_acp_only_even_with_same_named_config(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        tool_name = "mcp__zeus__open"
+        self._set_provenance(mcp_tool, tool_name, "zeus", "acp")
+        monkeypatch.setattr(
+            mcp_tool,
+            "_load_mcp_config",
+            lambda: {"zeus": {"allowed_platforms": ["cli"]}},
+        )
+
+        assert mcp_tool.mcp_tool_platform_access(tool_name, "acp") == (True, None)
+        assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (
+            False,
+            "mcp_platform_denied",
+        )
+
+    def test_config_registration_removed_from_config_fails_closed(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        tool_name = "mcp__zeus__open"
+        self._set_provenance(mcp_tool, tool_name, "zeus", "config")
+        monkeypatch.setattr(mcp_tool, "_load_mcp_config", lambda: {})
+
+        assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (
+            False,
+            "mcp_server_missing",
+        )
+
+    def test_config_registration_disabled_after_snapshot_fails_closed(
+        self, monkeypatch
+    ):
+        import tools.mcp_tool as mcp_tool
+
+        tool_name = "mcp__zeus__open"
+        self._set_provenance(mcp_tool, tool_name, "zeus", "config")
+        monkeypatch.setattr(
+            mcp_tool,
+            "_load_mcp_config",
+            lambda: {"zeus": {"enabled": False}},
+        )
+
+        assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (
+            False,
+            "mcp_server_disabled",
+        )
+
+    def test_competing_registration_reserves_inflight_source_once(self):
+        import tools.mcp_tool as mcp_tool
+
+        barrier = threading.Barrier(2)
+        run_calls = []
+        errors = []
+
+        def synchronized_filter(servers):
+            barrier.wait(timeout=2)
+            return servers
+
+        def register(source):
+            try:
+                mcp_tool.register_mcp_servers(
+                    {"same-name": {"command": "ignored"}}, source=source
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            patch("tools.mcp_tool._MCP_AVAILABLE", True),
+            patch(
+                "tools.mcp_tool._filter_suspicious_mcp_servers",
+                side_effect=synchronized_filter,
+            ),
+            patch("tools.mcp_tool._ensure_mcp_loop"),
+            patch(
+                "tools.mcp_tool._run_on_mcp_loop",
+                side_effect=lambda *args, **kwargs: run_calls.append(args),
+            ),
+        ):
+            config_thread = threading.Thread(target=register, args=("config",))
+            acp_thread = threading.Thread(target=register, args=("acp",))
+            config_thread.start()
+            acp_thread.start()
+            config_thread.join(timeout=5)
+            acp_thread.join(timeout=5)
+
+        assert not config_thread.is_alive()
+        assert not acp_thread.is_alive()
+        assert not errors
+        assert len(run_calls) == 1
+        assert mcp_tool.get_mcp_server_registration_source("same-name") in {
+            "acp",
+            "config",
+        }
+
+    def test_shutdown_clears_registration_reservations(self):
+        import tools.mcp_tool as mcp_tool
+
+        with mcp_tool._lock:
+            mcp_tool._servers.clear()
+            mcp_tool._server_connecting.add("inflight")
+            mcp_tool._mcp_server_origins["stale"] = "config"
+            mcp_tool._mcp_connecting_origins["inflight"] = "acp"
+
+        with patch("tools.mcp_tool._stop_mcp_loop"):
+            mcp_tool.shutdown_mcp_servers()
+
+        with mcp_tool._lock:
+            assert not mcp_tool._server_connecting
+            assert not mcp_tool._mcp_server_origins
+            assert not mcp_tool._mcp_connecting_origins
+
+    def test_schema_filter_failure_preserves_native_and_drops_mcp(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        native = {"type": "function", "function": {"name": "terminal"}}
+        remote = {"type": "function", "function": {"name": "mcp__zeus__open"}}
+        self._set_provenance(mcp_tool, "mcp__zeus__open", "zeus", "config")
+        monkeypatch.setattr(
+            mcp_tool,
+            "mcp_tool_platform_access",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        assert mcp_tool.filter_mcp_tool_definitions_for_platform(
+            [native, remote], "cli"
+        ) == [native]

@@ -17,22 +17,32 @@ import tools.mcp_tool as mcp
 
 @pytest.fixture(autouse=True)
 def _reset_mcp_state():
-    old_servers = dict(mcp._servers)
-    old_lazy = dict(mcp._lazy_server_configs)
-    old_fps = dict(mcp._lazy_server_fingerprints)
-    old_names = dict(mcp._lazy_server_tool_names)
-    old_connecting = set(mcp._server_connecting)
+    with mcp._lock:
+        old_servers = dict(mcp._servers)
+        old_lazy = dict(mcp._lazy_server_configs)
+        old_fps = dict(mcp._lazy_server_fingerprints)
+        old_names = dict(mcp._lazy_server_tool_names)
+        old_connecting = set(mcp._server_connecting)
+        old_tool_servers = dict(mcp._mcp_tool_server_names)
+        old_tool_origins = dict(mcp._mcp_tool_server_origins)
+        old_server_origins = dict(mcp._mcp_server_origins)
+        old_connecting_origins = dict(mcp._mcp_connecting_origins)
     yield
-    mcp._servers.clear()
-    mcp._servers.update(old_servers)
-    mcp._lazy_server_configs.clear()
-    mcp._lazy_server_configs.update(old_lazy)
-    mcp._lazy_server_fingerprints.clear()
-    mcp._lazy_server_fingerprints.update(old_fps)
-    mcp._lazy_server_tool_names.clear()
-    mcp._lazy_server_tool_names.update(old_names)
-    mcp._server_connecting.clear()
-    mcp._server_connecting.update(old_connecting)
+    with mcp._lock:
+        for mapping, saved in (
+            (mcp._servers, old_servers),
+            (mcp._lazy_server_configs, old_lazy),
+            (mcp._lazy_server_fingerprints, old_fps),
+            (mcp._lazy_server_tool_names, old_names),
+            (mcp._mcp_tool_server_names, old_tool_servers),
+            (mcp._mcp_tool_server_origins, old_tool_origins),
+            (mcp._mcp_server_origins, old_server_origins),
+            (mcp._mcp_connecting_origins, old_connecting_origins),
+        ):
+            mapping.clear()
+            mapping.update(saved)
+        mcp._server_connecting.clear()
+        mcp._server_connecting.update(old_connecting)
 
 
 def _fake_cache_entry():
@@ -60,6 +70,63 @@ def _lazy_config():
 
 
 class TestLazyMcpRegistration:
+    def test_cached_registration_keeps_config_source_ownership(self):
+        config = _lazy_config()
+        with (
+            patch("tools.mcp_tool._MCP_AVAILABLE", True),
+            patch("tools.mcp_schema_cache.config_fingerprint", return_value="abc"),
+            patch("tools.mcp_schema_cache.get_cached_entry", return_value=_fake_cache_entry()),
+            patch(
+                "tools.mcp_tool._register_from_cache_sync",
+                return_value=["mcp__playwright__browser_navigate"],
+            ) as mock_register,
+        ):
+            mcp.register_mcp_servers(config, source="config")
+
+        assert mock_register.call_args.kwargs["source"] == "config"
+        assert mcp.get_mcp_server_registration_source("playwright") == "config"
+        with mcp._lock:
+            assert "playwright" not in mcp._mcp_connecting_origins
+
+    def test_reconnect_after_shutdown_recovers_cached_tool_source(self):
+        """Cleared reservations must not relabel cached config tools external."""
+        config = _lazy_config()["playwright"]
+        tool_name = "mcp__playwright__browser_navigate"
+        fake_server = SimpleNamespace(
+            session=object(),
+            _registered_tool_names=[tool_name],
+        )
+        captured = {}
+
+        with mcp._lock:
+            mcp._lazy_server_configs["playwright"] = dict(config)
+            mcp._lazy_server_tool_names["playwright"] = [tool_name]
+            mcp._mcp_tool_server_names[tool_name] = "playwright"
+            mcp._mcp_tool_server_origins[tool_name] = "config"
+            mcp._mcp_server_origins.pop("playwright", None)
+            mcp._mcp_connecting_origins.pop("playwright", None)
+
+        def fake_run_on_loop(*_args, **_kwargs):
+            with mcp._lock:
+                captured["source"] = mcp._mcp_connecting_origins["playwright"]
+                mcp._mcp_server_origins["playwright"] = (
+                    mcp._mcp_connecting_origins.pop("playwright")
+                )
+                mcp._servers["playwright"] = fake_server
+            return []
+
+        with (
+            patch("tools.mcp_tool._ensure_mcp_loop"),
+            patch(
+                "tools.mcp_tool._run_on_mcp_loop",
+                side_effect=fake_run_on_loop,
+            ),
+        ):
+            assert mcp._ensure_lazy_server_connected("playwright") is True
+
+        assert captured["source"] == "config"
+        assert mcp.get_mcp_server_registration_source("playwright") == "config"
+
     def test_registers_from_cache_without_connect(self):
         config = _lazy_config()
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \

@@ -1,5 +1,6 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
+import builtins
 import json
 from types import SimpleNamespace
 from unittest.mock import ANY, call, patch
@@ -7,6 +8,7 @@ from unittest.mock import ANY, call, patch
 
 from model_tools import (
     handle_function_call,
+    get_tool_definitions,
     get_all_tool_names,
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
@@ -19,6 +21,78 @@ from model_tools import (
 # handle_function_call
 # =========================================================================
 
+
+def test_tool_definition_assembly_filters_mcp_before_tool_search(monkeypatch):
+    import tools.mcp_tool as mcp_tool
+
+    native = {
+        "type": "function",
+        "function": {"name": "terminal", "description": "", "parameters": {}},
+    }
+    remote = {
+        "type": "function",
+        "function": {"name": "mcp__zeus__open", "description": "", "parameters": {}},
+    }
+    with mcp_tool._lock:
+        mcp_tool._mcp_tool_server_names["mcp__zeus__open"] = "zeus"
+        mcp_tool._mcp_tool_server_origins["mcp__zeus__open"] = "config"
+    monkeypatch.setattr(
+        mcp_tool,
+        "_load_mcp_config",
+        lambda: {"zeus": {"allowed_platforms": ["cli"]}},
+    )
+    monkeypatch.setattr("model_tools.registry.get_definitions", lambda *_args, **_kwargs: [native, remote])
+
+    try:
+        result = get_tool_definitions(
+            quiet_mode=False,
+            skip_tool_search_assembly=True,
+            platform="telegram",
+        )
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._mcp_tool_server_names.pop("mcp__zeus__open", None)
+            mcp_tool._mcp_tool_server_origins.pop("mcp__zeus__open", None)
+
+    assert [tool["function"]["name"] for tool in result] == ["terminal"]
+
+
+def test_tool_definition_policy_import_failure_keeps_native_and_drops_mcp(
+    monkeypatch,
+):
+    native = {
+        "type": "function",
+        "function": {"name": "terminal", "description": "", "parameters": {}},
+    }
+    remote = {
+        "type": "function",
+        "function": {
+            "name": "mcp__zeus__open",
+            "description": "",
+            "parameters": {},
+        },
+    }
+    real_import = builtins.__import__
+
+    def fail_policy_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "tools.mcp_tool":
+            raise ImportError("policy unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(
+        "model_tools.registry.get_definitions",
+        lambda *_args, **_kwargs: [native, remote],
+    )
+    monkeypatch.setattr(builtins, "__import__", fail_policy_import)
+
+    result = get_tool_definitions(
+        quiet_mode=False,
+        skip_tool_search_assembly=True,
+        platform="cli",
+    )
+
+    assert [tool["function"]["name"] for tool in result] == ["terminal"]
+
 class TestHandleFunctionCall:
     def test_agent_loop_tool_returns_error(self):
         for tool_name in _AGENT_LOOP_TOOLS:
@@ -30,6 +104,63 @@ class TestHandleFunctionCall:
         result = json.loads(handle_function_call("totally_fake_tool_xyz", {}))
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
+
+    def test_platform_is_forwarded_to_registry_dispatch(self, monkeypatch):
+        seen = {}
+
+        def fake_dispatch(name, args, **kwargs):
+            seen.update({"name": name, "args": args, "platform": kwargs.get("platform")})
+            return '{"ok":true}'
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+
+        result = handle_function_call(
+            "web_search", {"q": "test"}, task_id="platform-test", platform="cli"
+        )
+
+        assert result == '{"ok":true}'
+        assert seen == {"name": "web_search", "args": {"q": "test"}, "platform": "cli"}
+
+    def test_tool_call_bridge_preserves_platform_for_underlying_dispatch(self, monkeypatch):
+        from tools import tool_search
+
+        seen = {}
+        monkeypatch.setattr(
+            "model_tools.get_tool_definitions",
+            lambda **kwargs: [{
+                "type": "function",
+                "function": {"name": "mcp__zeus__open", "description": "", "parameters": {}},
+            }],
+        )
+        monkeypatch.setattr(
+            tool_search,
+            "resolve_underlying_call",
+            lambda _args: ("mcp__zeus__open", {"url": "https://example.com"}, None),
+        )
+        monkeypatch.setattr(
+            tool_search,
+            "scoped_deferrable_names",
+            lambda _defs: frozenset({"mcp__zeus__open"}),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda name, args, **kwargs: seen.update(
+                {"name": name, "args": args, "platform": kwargs.get("platform")}
+            ) or '{"ok":true}',
+        )
+
+        result = handle_function_call(
+            "tool_call",
+            {"name": "mcp__zeus__open", "arguments": {"url": "https://example.com"}},
+            platform="cli",
+        )
+
+        assert result == '{"ok":true}'
+        assert seen == {
+            "name": "mcp__zeus__open",
+            "args": {"url": "https://example.com"},
+            "platform": "cli",
+        }
 
 
 

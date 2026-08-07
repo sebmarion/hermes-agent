@@ -44,6 +44,36 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_refresh_filters_restricted_mcp_schema_even_for_all_toolsets(monkeypatch):
+    agent = _agent(["read_file"], enabled=["all"])
+    agent.platform = "telegram"
+    tool_name = "mcp__zeus__open"
+
+    with mcp_tool._lock:
+        mcp_tool._mcp_tool_server_names[tool_name] = "zeus"
+        mcp_tool._mcp_tool_server_origins[tool_name] = "config"
+    monkeypatch.setattr(
+        mcp_tool,
+        "_load_mcp_config",
+        lambda: {"zeus": {"allowed_platforms": ["cli"]}},
+    )
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("read_file"), _tool(tool_name)],
+    )
+
+    try:
+        mcp_tool.refresh_agent_mcp_tools(agent)
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._mcp_tool_server_names.pop(tool_name, None)
+            mcp_tool._mcp_tool_server_origins.pop(tool_name, None)
+
+    assert agent.valid_tool_names == {"read_file"}
+
+
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
     """B1 regression: a rebuild must NOT drop post-build-injected tools.
 

@@ -614,11 +614,11 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
-        configured_mcp_servers = [
-            name
-            for name, cfg in (config.get("mcp_servers") or {}).items()
-            if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
-        ]
+        from hermes_cli.tools_config import enabled_mcp_server_names
+
+        configured_mcp_servers = sorted(
+            enabled_mcp_server_names(config, platform="acp")
+        )
 
         kwargs = {
             "platform": "acp",

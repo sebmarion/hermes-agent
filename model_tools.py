@@ -308,6 +308,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    platform: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -323,6 +324,8 @@ def get_tool_definitions(
             tool_search / tool_describe bridge handlers so they can read the
             real catalog, not the already-collapsed one. Public callers should
             leave this False.
+        platform: Runtime surface used to authorize MCP schemas. A missing
+            surface denies servers that declare ``allowed_platforms``.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -353,6 +356,7 @@ def get_tool_definitions(
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),
+                platform,
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
@@ -367,8 +371,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        platform=platform,
+    )
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -394,6 +403,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    platform: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -483,6 +493,33 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+
+    # MCP authorization is applied before dynamic schema rewriting and Tool
+    # Search assembly, so neither an explicit ``all`` selection nor the
+    # deferred catalog can advertise a denied endpoint. Native tools survive a
+    # policy import/evaluation failure; MCP entries fail closed.
+    try:
+        from tools.mcp_tool import filter_mcp_tool_definitions_for_platform
+
+        filtered_tools = filter_mcp_tool_definitions_for_platform(
+            filtered_tools, platform
+        )
+    except Exception:
+        logger.exception("MCP platform schema filtering failed")
+        native_tools = []
+        for tool_def in filtered_tools:
+            function = tool_def.get("function") if isinstance(tool_def, dict) else None
+            tool_name = function.get("name") if isinstance(function, dict) else None
+            toolset = registry.get_toolset_for_tool(tool_name) if isinstance(tool_name, str) else None
+            if not (
+                isinstance(tool_name, str)
+                and (
+                    tool_name.startswith("mcp__")
+                    or (isinstance(toolset, str) and toolset.startswith("mcp-"))
+                )
+            ):
+                native_tools.append(tool_def)
+        filtered_tools = native_tools
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -1208,6 +1245,7 @@ def handle_function_call(
     disabled_toolsets: Optional[List[str]] = None,
     original_function_args: Optional[Dict[str, Any]] = None,
     on_authorized: Optional[Callable[[Dict[str, Any]], None]] = None,
+    platform: Optional[str] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1229,6 +1267,8 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        platform: Runtime surface propagated to MCP authorization and nested
+                       execute-code calls.
 
     Returns:
         Function result as a JSON string.
@@ -1285,7 +1325,9 @@ def handle_function_call(
             current_defs = get_tool_definitions(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
-                quiet_mode=True, skip_tool_search_assembly=True,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+                platform=platform,
             ) or []
         except Exception:
             current_defs = []
@@ -1349,6 +1391,7 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
                 original_function_args=underlying_args,
                 on_authorized=on_authorized,
+                platform=platform,
             )
 
     _tool_original_args = dict(
@@ -1508,26 +1551,34 @@ def handle_function_call(
                     dispatch_block = _prepare_authorized_dispatch(next_args)
                     if dispatch_block is not None:
                         return dispatch_block
+                    dispatch_kwargs = {
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "tool_call_id": tool_call_id,
+                        "enabled_tools": sandbox_enabled,
+                    }
+                    if platform is not None:
+                        dispatch_kwargs["platform"] = platform
                     return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        tool_call_id=tool_call_id,
-                        enabled_tools=sandbox_enabled,
+                        function_name, next_args, **dispatch_kwargs
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     dispatch_block = _prepare_authorized_dispatch(next_args)
                     if dispatch_block is not None:
                         return dispatch_block
+                    dispatch_kwargs = {
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "tool_call_id": tool_call_id,
+                        "user_task": user_task,
+                    }
+                    if platform is not None:
+                        dispatch_kwargs["platform"] = platform
                     return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        tool_call_id=tool_call_id,
-                        user_task=user_task,
+                        function_name, next_args, **dispatch_kwargs
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 

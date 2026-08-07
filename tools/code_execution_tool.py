@@ -655,6 +655,7 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    execution_platform: Optional[str] = None,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -746,8 +747,11 @@ def _rpc_server_loop(
                     try:
                         sys.stdout = devnull
                         sys.stderr = devnull
+                        dispatch_kwargs = {"task_id": task_id}
+                        if execution_platform is not None:
+                            dispatch_kwargs["platform"] = execution_platform
                         result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
+                            tool_name, tool_args, **dispatch_kwargs
                         )
                     finally:
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -932,6 +936,7 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    execution_platform: Optional[str] = None,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -1028,8 +1033,11 @@ def _rpc_poll_loop(
                         try:
                             sys.stdout = devnull
                             sys.stderr = devnull
+                            dispatch_kwargs = {"task_id": task_id}
+                            if execution_platform is not None:
+                                dispatch_kwargs["platform"] = execution_platform
                             tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                                tool_name, tool_args, **dispatch_kwargs
                             )
                         finally:
                             sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -1075,6 +1083,7 @@ def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    execution_platform: Optional[str] = None,
 ) -> str:
     """Run a script on the remote terminal backend via file-based RPC.
 
@@ -1147,7 +1156,7 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event, rpc_token,
+                sandbox_tools, stop_event, rpc_token, execution_platform,
             ),
             daemon=True,
         )
@@ -1267,6 +1276,7 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    execution_platform: Optional[str] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -1280,6 +1290,7 @@ def execute_code(
         task_id:       Session task ID for tool isolation (terminal env, etc.).
         enabled_tools: Tool names enabled in the current session. The sandbox
                        gets the intersection with SANDBOX_ALLOWED_TOOLS.
+        execution_platform: Runtime surface inherited by nested sandbox calls.
 
     Returns:
         JSON string with execution results.
@@ -1328,6 +1339,13 @@ def execute_code(
         clear_current_thread_interrupt()
 
     if env_type != "local":
+        if execution_platform is not None:
+            return _execute_remote(
+                code,
+                task_id,
+                enabled_tools,
+                execution_platform=execution_platform,
+            )
         return _execute_remote(code, task_id, enabled_tools)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
@@ -1423,6 +1441,7 @@ def execute_code(
             args=(
                 server_sock, task_id, tool_call_log,
                 tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
+                execution_platform,
             ),
             daemon=True,
         )
@@ -2080,7 +2099,8 @@ registry.register(
     handler=lambda args, **kw: execute_code(
         code=args.get("code", ""),
         task_id=kw.get("task_id"),
-        enabled_tools=kw.get("enabled_tools")),
+        enabled_tools=kw.get("enabled_tools"),
+        execution_platform=kw.get("execution_platform")),
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,
