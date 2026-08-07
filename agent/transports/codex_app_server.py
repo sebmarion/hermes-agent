@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -30,6 +31,17 @@ from tools.environments.local import hermes_subprocess_env
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
+
+
+def _resolve_codex_bin(codex_bin: str, *, env: dict[str, str]) -> str:
+    """Resolve the standard user-local install when a daemon PATH is minimal."""
+    if codex_bin != "codex" or shutil.which(codex_bin, path=env.get("PATH")):
+        return codex_bin
+    home = str(env.get("HOME") or "").strip()
+    candidate = os.path.join(home, ".local", "bin", "codex")
+    if home and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return codex_bin
 
 
 @dataclass
@@ -123,6 +135,7 @@ class CodexAppServerClient:
                 ]
             )
 
+        codex_bin = _resolve_codex_bin(codex_bin, env=spawn_env)
         cmd = [codex_bin, "app-server"] + app_server_args
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")

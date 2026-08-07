@@ -92,6 +92,90 @@ class TestMaybeApplyCodexAppServerRuntime:
 class TestCodexAppServerModule:
     """Module-surface tests for the JSON-RPC speaker. Don't require codex CLI."""
 
+    @staticmethod
+    def _capture_spawn_cmd(monkeypatch, **client_kwargs):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        client = cas.CodexAppServerClient(**client_kwargs)
+        client._closed = True
+        return captured["cmd"]
+
+    def test_default_binary_resolves_user_local_install_for_minimal_daemon_path(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        codex = tmp_path / "spawn-home" / ".local" / "bin" / "codex"
+        codex.parent.mkdir(parents=True)
+        codex.write_text("#!/bin/sh\n")
+        codex.chmod(0o755)
+
+        cmd = self._capture_spawn_cmd(
+            monkeypatch,
+            env={
+                "HOME": str(tmp_path / "spawn-home"),
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            },
+        )
+
+        assert cmd[:2] == [str(codex), "app-server"]
+
+    def test_explicit_binary_and_path_resolved_default_are_unchanged(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        local_codex = tmp_path / "home" / ".local" / "bin" / "codex"
+        local_codex.parent.mkdir(parents=True)
+        local_codex.write_text("#!/bin/sh\n")
+        local_codex.chmod(0o755)
+        path_codex = tmp_path / "path" / "codex"
+        path_codex.parent.mkdir()
+        path_codex.write_text("#!/bin/sh\n")
+        path_codex.chmod(0o755)
+        env = {"HOME": str(tmp_path / "home"), "PATH": str(path_codex.parent)}
+
+        assert self._capture_spawn_cmd(
+            monkeypatch, codex_bin="/custom/codex", env=env
+        )[:2] == ["/custom/codex", "app-server"]
+        assert self._capture_spawn_cmd(monkeypatch, env=env)[:2] == [
+            "codex",
+            "app-server",
+        ]
+
+    @pytest.mark.parametrize("executable", [False, None])
+    def test_default_binary_falls_back_when_user_local_candidate_is_unusable(
+        self, monkeypatch, tmp_path, executable
+    ) -> None:
+        home = tmp_path / "home"
+        candidate = home / ".local" / "bin" / "codex"
+        if executable is not None:
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text("#!/bin/sh\n")
+            candidate.chmod(0o644)
+
+        cmd = self._capture_spawn_cmd(
+            monkeypatch,
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        )
+
+        assert cmd[:2] == ["codex", "app-server"]
+
 
 
 
@@ -339,4 +423,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-
