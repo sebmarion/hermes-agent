@@ -142,8 +142,16 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
         parent_turn_id="turn-1",
         child_session_id="child-session",
         child_role="leaf",
+        child_goal="aggregate me",
         child_summary="aggregated",
         child_status="completed",
+        child_lane="",
+        child_provider="test",
+        child_model="test-model",
+        child_mode="",
+        child_failure_kind="",
+        child_exit_reason="completed",
+        child_successful_tool_count=0,
         # Redacted tool history rides the shared finalization pipeline
         # (#62011/#72403); empty here because the fabricated result carries
         # no tool_trace.
@@ -153,6 +161,45 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     assert parent.session_estimated_cost_usd == 3.5
     assert parent.session_cost_source == "subagent"
     assert parent.session_cost_status == "estimated"
+
+
+def test_public_lifecycle_exception_emits_terminal_stop_once(monkeypatch):
+    parent = SimpleNamespace(
+        session_id="parent-exception",
+        enabled_toolsets=["file"],
+        _current_turn_id="turn-exception",
+    )
+    child = FakeChild("sa-exception")
+    child.session_id = "child-exception"
+    hook = Mock()
+    observe = Mock()
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("runner exploded")),
+    )
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+    monkeypatch.setattr("hermes_cli.observability.observe_lifecycle", observe)
+
+    service = SubagentLifecycleService(lambda: parent)
+    handle = service.launch(SubagentLaunchRequest(goal="explode safely"))
+    terminal = service.wait(handle, timeout_seconds=1)
+
+    assert terminal.state is SubagentState.FAILED
+    hook.assert_called_once()
+    observe.assert_called_once()
+    assert hook.call_args.args == ("subagent_stop",)
+    emitted = hook.call_args.kwargs
+    assert emitted["parent_session_id"] == "parent-exception"
+    assert emitted["child_session_id"] == "child-exception"
+    assert emitted["child_goal"] == "explode safely"
+    assert emitted["child_status"] == "failed"
+    assert emitted["child_provider"] == "test"
+    assert emitted["child_model"] == "test-model"
+    assert emitted["child_mode"] == ""
+    assert emitted["child_failure_kind"] == "RuntimeError"
+    assert emitted["child_exit_reason"] == "public_lifecycle_exception"
 
 
 

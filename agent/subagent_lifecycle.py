@@ -452,12 +452,36 @@ class SubagentLifecycleService:
                 else {},
             )
         except Exception as exc:
+            completed_at = time.time()
+            try:
+                from tools.delegate_tool import _emit_subagent_stop_once
+
+                _emit_subagent_stop_once(
+                    parent,
+                    record.agent,
+                    child_goal=goal,
+                    result={
+                        "status": "failed",
+                        "summary": None,
+                        "failure_kind": type(exc).__name__,
+                        "exit_reason": "public_lifecycle_exception",
+                        "duration_seconds": max(
+                            0.0, completed_at - (record.started_at or completed_at)
+                        ),
+                        "evidence": {
+                            "tool_turn_count": 0,
+                            "successful_tool_count": 0,
+                        },
+                    },
+                )
+            except Exception:
+                pass
             result = SubagentResult(
                 record.handle,
                 SubagentState.FAILED,
                 True,
                 started_at=record.started_at,
-                completed_at=time.time(),
+                completed_at=completed_at,
                 error_classification=type(exc).__name__,
                 error_message=str(exc)[:_MAX_RESULT_CHARS],
             )

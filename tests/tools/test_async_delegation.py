@@ -821,7 +821,14 @@ def test_recovery_marks_running_record_lost_when_owner_dead():
 
 # Review-round regressions: ownership proof, truthful interruption, and durability.
 
-def _review_record(delegation_id, *, status="running", is_batch=False, interrupt_fn=None):
+def _review_record(
+    delegation_id,
+    *,
+    status="running",
+    is_batch=False,
+    interrupt_fn=None,
+    terminal_callback=None,
+):
     now = time.time()
     record = {
         "delegation_id": delegation_id,
@@ -836,6 +843,8 @@ def _review_record(delegation_id, *, status="running", is_batch=False, interrupt
         "is_batch": is_batch,
         "owner_pid": os.getpid(),
     }
+    if terminal_callback is not None:
+        record["_terminal_callback"] = terminal_callback
     ad._records[delegation_id] = record
     return record
 
@@ -1064,6 +1073,102 @@ def test_scheduled_batch_interrupt_uses_batch_event_shape():
     assert event["is_batch"] is True
     assert event["goals"] == ["a", "b"]
     assert event["results"] == []
+
+
+def test_scheduled_batch_interrupt_invokes_process_local_terminal_callback_once():
+    observed = []
+    record = _review_record(
+        "deleg_batch_scheduled_callback",
+        status="scheduled",
+        is_batch=True,
+        interrupt_fn=lambda: None,
+        terminal_callback=lambda result, status: observed.append((result, status)),
+    )
+
+    assert ad.interrupt_all(reason="test") == 1
+    assert observed == [
+        ({"results": [], "error": "interrupted before execution"}, "interrupted")
+    ]
+
+    ad._finalize_batch(
+        record["delegation_id"],
+        {"results": [{"status": "completed", "summary": "late"}]},
+        "completed",
+    )
+    assert len(observed) == 1
+
+
+def test_forced_stall_invokes_process_local_terminal_callback_once():
+    observed = []
+    record = _review_record(
+        "deleg_batch_stalled_callback",
+        status="stalling",
+        is_batch=True,
+        terminal_callback=lambda result, status: observed.append((result, status)),
+    )
+    record["_stall_quiet_seconds"] = 120
+    record["_stall_threshold_seconds"] = 60
+    record["_stall_in_tool"] = False
+
+    ad._finalize_stalled(record["delegation_id"])
+
+    assert len(observed) == 1
+    result, status = observed[0]
+    assert status == "stalled"
+    assert result["status"] == "stalled"
+    assert result["exit_reason"] == "stalled"
+    event = _drain_for(record["delegation_id"])
+    assert event is not None
+    assert event["is_batch"] is True
+    assert event["results"] == []
+    ad._finalize(record["delegation_id"], {"status": "completed"}, "completed")
+    assert len(observed) == 1
+
+
+def test_batch_runner_crash_invokes_process_local_terminal_callback_once():
+    observed = []
+    callback_ran = threading.Event()
+
+    def runner():
+        raise RuntimeError("runner crashed")
+
+    def terminal_callback(result, status):
+        observed.append((result, status))
+        callback_ran.set()
+
+    dispatch = ad.dispatch_async_delegation_batch(
+        goals=["crash safely"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+        max_async_children=1,
+        terminal_callback=terminal_callback,
+    )
+
+    assert dispatch["status"] == "dispatched"
+    assert callback_ran.wait(timeout=2)
+    assert len(observed) == 1
+    result, status = observed[0]
+    assert status == "error"
+    assert result["results"] == []
+    assert "RuntimeError: runner crashed" in result["error"]
+    assert _drain_for(dispatch["delegation_id"]) is not None
+
+
+def test_process_local_terminal_callback_is_excluded_from_durable_records():
+    record = _review_record(
+        "deleg_process_local_callback",
+        terminal_callback=lambda _result, _status: None,
+    )
+    without_callback = dict(record)
+    without_callback.pop("_terminal_callback")
+
+    assert "_terminal_callback" not in ad._persistable_record(record)
+    assert "_terminal_callback" not in ad._serialise_record(record, time.time())
+    assert ad._record_size_bytes(record) == ad._record_size_bytes(without_callback)
 
 
 def test_single_dispatch_rejects_when_initial_persistence_fails(monkeypatch):

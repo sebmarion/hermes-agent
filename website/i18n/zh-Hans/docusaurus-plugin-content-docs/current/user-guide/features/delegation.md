@@ -131,6 +131,41 @@ delegate_task(
 
 这不会在崩溃后恢复子智能体执行。如果委派仍在运行时其所有者进程消失，Hermes 会将其记录为 `unknown`，因为无法证明外部副作用是否已经发生。待处理和已交付记录都有界，并按 profile 隔离。
 
+## 执行模式与通道路由
+
+每个 `tasks[]` 项都可指定可选的 `mode`、`route` 和 `model_tier`。路由顺序固定：显式 `route` 优先，其次是已配置的 `model_tier`，最后是任务模式。
+
+| 模式 | 未配置 `mode_routes` 时的内置通道 | 完成契约 |
+|------|----------------------------------|---------|
+| `execute`（默认） | `code_worker` | 至少需要一个成功的工具结果 |
+| `review` | `smart_reviewer` | 至少需要一个成功的读取或审查工具结果 |
+| `reason` | `local_worker` | 可以仅通过推理完成，无需工具调用 |
+
+配置 `delegation.mode_routes` 时，它必须**恰好**包含 `execute`、`review` 和 `reason` 三个键。每个值都必须是 `delegation.lanes` 中已配置且无首尾空格的通道名；任何缺失或格式错误都会在构造子 agent 前失败。
+
+```yaml
+delegation:
+  lanes:
+    zeus_local:
+      provider: custom:zeus
+      model: local-coder
+    remote_reviewer:
+      provider: openrouter
+      model: review-model
+  mode_routes:
+    execute: zeus_local
+    review: remote_reviewer
+    reason: zeus_local
+  local_first:
+    enabled: true
+    state_file: /var/run/hermes-controller.json
+    local_lane: zeus_local
+    degraded_lane: remote_reviewer
+    max_state_age_seconds: 1800
+```
+
+`local_first` 只覆盖已解析到 `local_lane` 的任务；其他显式或模式路由保持原通道。控制器文件必须是小于等于 64 KiB 的普通非符号链接 JSON 文件，并包含新鲜状态，例如 `{"mode":"local","updated_epoch":1786118400}`。默认新鲜度窗口为 1800 秒。文件缺失、格式错误、过期、时间戳远超当前时间、过大、被替换或不是普通文件时，都会选择 `degraded_lane`；结构配置错误则直接失败。`local_lane` 与 `degraded_lane` 必须是两个不同的已配置通道。
+
 ## 模型覆盖
 
 你可以通过 `config.yaml` 为子智能体配置不同的模型——适用于将简单任务委派给更便宜/更快的模型：

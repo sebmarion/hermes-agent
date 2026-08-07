@@ -2261,17 +2261,76 @@ Configure subagent behavior for the delegate tool:
 
 ```yaml
 delegation:
-  # model: "google/gemini-3-flash-preview"  # Override model (empty = inherit parent)
-  # provider: "openrouter"                  # Override provider (empty = inherit parent)
-  # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
-  # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
-  # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
+  # Legacy execute-route override (an empty block inherits the parent runtime):
+  # model: "google/gemini-3-flash-preview"
+  # provider: "openrouter"
+  # base_url: "http://localhost:1234/v1"
+  # api_key: "local-key"
+  # api_mode: "chat_completions"
+
+  lanes:
+    zeus_local:
+      provider: "custom:zeus"
+      model: "local-coder"
+      base_url: "http://127.0.0.1:8000/v1"
+      api_key: "local-key"
+      api_mode: "chat_completions"
+      toolsets: [terminal, file]
+    remote_reviewer:
+      provider: "openrouter"
+      model: "review-model"
+      toolsets: [file]
+
+  # If present, this map must contain exactly these three keys.
+  mode_routes:
+    execute: zeus_local
+    review: remote_reviewer
+    reason: zeus_local
+
+  tier_routes:
+    large: remote_reviewer
+
+  # Optional controller-gated failover for only the selected local_lane.
+  local_first:
+    enabled: true
+    state_file: "/var/run/hermes-controller.json"
+    local_lane: zeus_local
+    degraded_lane: remote_reviewer
+    max_state_age_seconds: 1800
+
   max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
-  max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
+  max_spawn_depth: 1                        # Delegation tree depth cap (floor 1, no ceiling). 1 = flat; 2 enables one nested orchestrator level.
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
 ```
 
-**Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+Each `lanes` entry is a named runtime and must contain a non-empty `provider`
+and `model`. It may also set `base_url`, `api_key`, `api_mode`, output/context
+limits, and `toolsets`. Lane toolsets can only narrow capabilities already
+available to the parent. Execute and review tasks fail before child
+construction if the selected lane has no usable tools.
+
+**Routing precedence:** a task's explicit `route` wins, then its `model_tier`
+through `tier_routes`, then its `mode`. The default modes are `execute`,
+`review`, and `reason`, which map to `code_worker`, `smart_reviewer`, and
+`local_worker` when `mode_routes` is omitted. If `mode_routes` is present, it
+must map exactly those three modes to existing lane names. Unknown routes,
+unmapped tiers, malformed maps, and missing lanes fail closed; Hermes does not
+silently use another lane or the parent runtime.
+
+`local_first` runs after that deterministic selection. It can replace only a
+result equal to `local_lane`; all other selected lanes remain unchanged. The
+controller state must be a regular, non-symlink JSON file no larger than 64
+KiB with a fresh payload such as
+`{"mode":"local","updated_epoch":1786118400}`. Missing, malformed, stale,
+far-future, oversized, replaced, or non-regular state selects
+`degraded_lane`. Structural policy errors fail closed, and the local and
+degraded lanes must be distinct configured lanes.
+
+**Legacy provider:model override:** With no lane routing configured, an empty
+delegation block inherits the parent runtime. Top-level `delegation.provider`,
+`model`, and endpoint fields define the compatibility `code_worker` execution
+route. Routed tasks use their selected lane as the authoritative runtime; they
+do not merge in a different top-level or parent route.
 
 **Direct endpoint override:** If you want the obvious custom-endpoint path, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. That sends subagents directly to that OpenAI-compatible endpoint and takes precedence over `delegation.provider`. If `delegation.api_key` is omitted, Hermes falls back to `OPENAI_API_KEY` only.
 
@@ -2279,9 +2338,13 @@ delegation:
 
 The delegation provider uses the same credential resolution as CLI/gateway startup. All configured providers are supported: `openrouter`, `nous`, `copilot`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`. When a provider is set, the system automatically resolves the correct base URL, API key, and API mode — no manual credential wiring needed.
 
-**Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
+**Legacy runtime precedence:** `delegation.base_url` →
+`delegation.provider` → inherited parent provider, and `delegation.model` →
+inherited parent model. Setting only `model` keeps the parent's credentials.
+For lane-routed tasks, apply the same endpoint/provider resolution inside the
+selected lane instead.
 
-**Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
+**Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (default `1`, floor of 1, no ceiling). At `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively, so raise depth deliberately. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
 
 ## Clarify
 

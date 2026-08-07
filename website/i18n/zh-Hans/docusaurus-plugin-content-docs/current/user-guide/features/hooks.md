@@ -807,25 +807,49 @@ def my_callback(session_id: str, platform: str, **kwargs):
 
 ### `subagent_stop`
 
-`delegate_task` 完成后，**每个子 agent 触发一次**。无论你委托了单个任务还是三个任务的批次，此 hook 对每个子 agent 各触发一次，在父线程上串行执行。
+当已构造子 agent 的终止结果确定后，**每个子 agent 触发一次**。无论委托单个任务还是三个任务的批次，每个父 agent 的锁都会串行化本次委托的回调。如果后续同级子 agent 构造失败，已构造的子 agent 会在关闭前收到 `construction_aborted` 停止回执。
 
 **回调签名：**
 
 ```python
-def my_callback(parent_session_id: str, child_role: str | None,
-                child_summary: str | None, child_status: str,
-                duration_ms: int, **kwargs):
+def my_callback(parent_session_id: str | None, parent_turn_id: str,
+                child_session_id: str | None, child_role: str | None,
+                child_goal: str, child_summary: str | None,
+                child_status: str, child_lane: str,
+                child_provider: str, child_model: str, child_mode: str,
+                child_failure_kind: str, child_exit_reason: str,
+                child_successful_tool_count: int,
+                tool_call_history: list[dict], duration_ms: int, **kwargs):
 ```
 
 | 参数 | 类型 | 描述 |
 |-----|------|------|
-| `parent_session_id` | `str` | 委托父 agent 的会话 ID |
+| `parent_session_id` | `str \| None` | 委托父 agent 的会话 ID（若可用） |
+| `parent_turn_id` | `str` | 请求委托的父轮次 ID（若可用） |
+| `child_session_id` | `str \| None` | 分配给子 agent 的会话 ID |
 | `child_role` | `str \| None` | 子 agent 上设置的编排角色标签（若功能未启用则为 `None`） |
+| `child_goal` | `str` | 由宿主持有的子 agent 委托目标 |
 | `child_summary` | `str \| None` | 子 agent 返回给父 agent 的最终响应 |
-| `child_status` | `str` | `"completed"`、`"failed"`、`"interrupted"` 或 `"error"` |
+| `child_status` | `str` | 终止状态，例如 `"completed"`、`"failed"`、`"interrupted"`、`"timeout"` 或 `"error"` |
+| `child_lane` | `str` | 权威解析通道；仅旧版父运行时继承路径可能为空 |
+| `child_provider` | `str` | 子 agent 实际使用的 provider |
+| `child_model` | `str` | 子 agent 实际使用的模型 |
+| `child_mode` | `str` | 实际任务模式：`"execute"`、`"review"` 或 `"reason"` |
+| `child_failure_kind` | `str` | 标准化失败类别；成功时为空字符串 |
+| `child_exit_reason` | `str` | 具体终止原因；后续同级构造失败时为 `"construction_aborted"` |
+| `child_successful_tool_count` | `int` | 成功返回结果的工具调用数 |
+| `tool_call_history` | `list[dict]` | 按顺序排列的仅元数据工具调用；不包含原始输入输出 |
 | `duration_ms` | `int` | 运行子 agent 的挂钟时间，单位毫秒 |
 
-**触发位置：** `tools/delegate_tool.py` 中，`ThreadPoolExecutor.as_completed()` 排空所有子 future 后。触发被编排到父线程，因此 hook 作者无需考虑并发回调执行问题。
+**触发位置：** `tools/delegate_tool.py` 中，单个子 agent 返回后或批次子 future 聚合后；当后续同级构造导致批次中止时，也会为每个已构造子 agent 触发。每个父 agent 的锁会阻止同一次委托并发执行生命周期副作用；后台回调可能在异步工作线程上运行。
+
+**进程边界：** 每个子 agent 仅触发一次的保证，作用域是构造该子 agent
+的进程及其子对象。后台完成记录是持久化的，但 Python 观察器/插件回调仅限
+当前进程，绝不会序列化到这些记录中。重启后，待处理完成事件可能再次投递
+到对话，但不会重建或重放 `subagent_stop`。如果子 agent 仍在运行时所有者
+进程消失，恢复流程会报告丢失/未知的完成证据，而不会合成此 hook。需要跨
+重启可靠计费或审计的消费者还必须读取持久化完成记录，并显式处理丢失/未知
+结果。
 
 **返回值：** 忽略。
 

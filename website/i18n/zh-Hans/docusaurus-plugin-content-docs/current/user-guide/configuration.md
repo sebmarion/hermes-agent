@@ -1683,17 +1683,72 @@ checkpoints:
 
 ```yaml
 delegation:
-  # model: "google/gemini-3-flash-preview"  # 覆盖模型（空 = 继承父级）
-  # provider: "openrouter"                  # 覆盖 provider（空 = 继承父级）
-  # base_url: "http://localhost:1234/v1"    # 直接 OpenAI 兼容端点（优先于 provider）
-  # api_key: "local-key"                    # base_url 的 API 密钥（回退到 OPENAI_API_KEY）
-  # api_mode: ""                            # base_url 的线路协议："chat_completions"、"codex_responses" 或 "anthropic_messages"。空 = 从 URL 自动检测（例如 /anthropic 后缀 → anthropic_messages）。对启发式无法检测的非标准端点显式设置。
+  # 旧版 execute 路由覆盖（空配置块会继承父级运行时）：
+  # model: "google/gemini-3-flash-preview"
+  # provider: "openrouter"
+  # base_url: "http://localhost:1234/v1"
+  # api_key: "local-key"
+  # api_mode: "chat_completions"
+
+  lanes:
+    zeus_local:
+      provider: "custom:zeus"
+      model: "local-coder"
+      base_url: "http://127.0.0.1:8000/v1"
+      api_key: "local-key"
+      api_mode: "chat_completions"
+      toolsets: [terminal, file]
+    remote_reviewer:
+      provider: "openrouter"
+      model: "review-model"
+      toolsets: [file]
+
+  # 配置后必须恰好包含以下三个键。
+  mode_routes:
+    execute: zeus_local
+    review: remote_reviewer
+    reason: zeus_local
+
+  tier_routes:
+    large: remote_reviewer
+
+  # 可选：仅为已选中的 local_lane 启用控制器门控故障转移。
+  local_first:
+    enabled: true
+    state_file: "/var/run/hermes-controller.json"
+    local_lane: zeus_local
+    degraded_lane: remote_reviewer
+    max_state_age_seconds: 1800
+
   max_concurrent_children: 3                # 每批并行子 agent 数（下限 1，无上限）。也可通过 DELEGATION_MAX_CONCURRENT_CHILDREN 环境变量设置。
-  max_spawn_depth: 1                        # 委托树深度上限（1-3，截断）。1 = 扁平（默认）：父级生成无法委托的叶子。2 = 编排器子级可以生成叶子孙级。3 = 三级。
+  max_spawn_depth: 1                        # 委托树深度上限（下限 1，无上限）。1 = 扁平；2 = 启用一层嵌套编排器。
   orchestrator_enabled: true                # 全局终止开关。为 false 时，role="orchestrator" 被忽略，每个子级无论 max_spawn_depth 如何都被强制为叶子。
 ```
 
-**子 agent provider:model 覆盖：** 默认情况下，子 agent 继承父 agent 的 provider 和模型。设置 `delegation.provider` 和 `delegation.model` 将子 agent 路由到不同的 provider:model 对 —— 例如，在您的主 agent 运行昂贵推理模型时，为范围较窄的子任务使用便宜/快速的模型。
+`lanes` 中的每个条目都是一个命名运行时，必须包含非空的 `provider`
+和 `model`。还可以设置 `base_url`、`api_key`、`api_mode`、输出/上下文
+限制以及 `toolsets`。通道工具集只能缩小父 agent 已有的能力。如果选中
+通道没有可用工具，`execute` 和 `review` 任务会在构造子 agent 前失败。
+
+**路由优先级：** 任务的显式 `route` 优先，其次是通过 `tier_routes`
+解析的 `model_tier`，最后是 `mode`。默认模式为 `execute`、`review` 和
+`reason`；未配置 `mode_routes` 时分别映射到 `code_worker`、
+`smart_reviewer` 和 `local_worker`。配置 `mode_routes` 后，它必须把这三个
+模式恰好映射到已存在的通道名。未知路由、未映射层级、格式错误的映射或
+缺失通道都会封闭失败；Hermes 不会静默改用其他通道或父运行时。
+
+`local_first` 在上述确定性选择之后执行。它只能替换等于 `local_lane` 的
+结果，其他已选通道保持不变。控制器状态必须是普通的非符号链接 JSON
+文件，大小不超过 64 KiB，并包含新鲜载荷，例如
+`{"mode":"local","updated_epoch":1786118400}`。文件缺失、格式错误、
+过期、时间戳远超当前时间、过大、被替换或不是普通文件时，都会选择
+`degraded_lane`。策略结构错误会封闭失败，且本地与降级通道必须是两个
+不同的已配置通道。
+
+**旧版 provider:model 覆盖：** 未配置通道路由时，空的 delegation
+配置块会继承父运行时。顶层 `delegation.provider`、`model` 和端点字段定义
+兼容的 `code_worker` 执行路由。经过路由的任务以选中通道作为权威运行时；
+不会合并其他顶层路由或父路由。
 
 **直接端点覆盖：** 如果您想要明显的自定义端点路径，请设置 `delegation.base_url`、`delegation.api_key` 和 `delegation.model`。这将子 agent 直接发送到该 OpenAI 兼容端点，并优先于 `delegation.provider`。如果省略 `delegation.api_key`，Hermes 仅回退到 `OPENAI_API_KEY`。
 
@@ -1701,9 +1756,12 @@ delegation:
 
 委托 provider 使用与 CLI/gateway 启动相同的凭据解析。所有配置的 provider 均受支持：`openrouter`、`nous`、`copilot`、`zai`、`kimi-coding`、`minimax`、`minimax-cn`。设置 provider 时，系统自动解析正确的基础 URL、API 密钥和 API 模式 —— 无需手动凭据连接。
 
-**优先级：** 配置中的 `delegation.base_url` → 配置中的 `delegation.provider` → 父 provider（继承）。配置中的 `delegation.model` → 父模型（继承）。仅设置 `model` 而不设置 `provider` 仅更改模型名称，同时保留父级凭据（适用于在同一 provider（如 OpenRouter）内切换模型）。
+**旧版运行时优先级：** `delegation.base_url` → `delegation.provider` →
+继承的父 provider；`delegation.model` → 继承的父模型。仅设置 `model`
+会保留父级凭据。对于通道路由任务，请在选中通道内部应用相同的端点/provider
+解析顺序。
 
-**宽度和深度：** `max_concurrent_children` 限制每批并行运行的子 agent 数量（默认 `3`，下限 1，无上限）。也可通过 `DELEGATION_MAX_CONCURRENT_CHILDREN` 环境变量设置。当模型提交的 `tasks` 数组超过上限时，`delegate_task` 返回工具错误解释限制，而不是静默截断。`max_spawn_depth` 控制委托树深度（截断到 1-3）。在默认 `1` 时，委托是扁平的：子级无法生成孙级，传递 `role="orchestrator"` 静默降级为 `leaf`。提升到 `2` 使编排器子级可以生成叶子孙级；`3` 用于三级树。Agent 通过 `role="orchestrator"` 按调用选择编排；`orchestrator_enabled: false` 强制每个子级回到叶子，无论如何。成本呈乘法增长 —— 在 `max_spawn_depth: 3` 和 `max_concurrent_children: 3` 时，树可以达到 3×3×3 = 27 个并发叶子 agent。使用模式请参阅[子 Agent 委托 → 深度限制和嵌套编排](features/delegation.md#depth-limit-and-nested-orchestration)。
+**宽度和深度：** `max_concurrent_children` 限制每批并行运行的子 agent 数量（默认 `3`，下限 1，无上限）。也可通过 `DELEGATION_MAX_CONCURRENT_CHILDREN` 环境变量设置。当模型提交的 `tasks` 数组超过上限时，`delegate_task` 返回工具错误解释限制，而不是静默截断。`max_spawn_depth` 控制委托树深度（默认 `1`，下限 1，无上限）。在 `1` 时，委托是扁平的：子级无法生成孙级，传递 `role="orchestrator"` 静默降级为 `leaf`。提升到 `2` 使编排器子级可以生成叶子孙级。Agent 通过 `role="orchestrator"` 按调用选择编排；`orchestrator_enabled: false` 强制每个子级回到叶子。成本随深度成倍增加，请谨慎提升。使用模式请参阅[子 Agent 委托 → 深度限制和嵌套编排](features/delegation.md#depth-limit-and-nested-orchestration)。
 
 ## 澄清
 

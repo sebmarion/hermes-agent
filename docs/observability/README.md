@@ -223,14 +223,26 @@ Subagent hooks describe delegated child-agent work:
 and `child_goal`.
 
 `subagent_stop` fields include parent/child session IDs, role/status fields,
-`child_summary`, `duration_ms`, and a metadata-only `tool_call_history`. Each
-history entry contains the tool name, argument names, bounded side-effect
-targets, input/output byte counts, and outcome. URL query strings and fragments
-are removed; raw arguments, prompts, commands, contents, headers, and results
-are intentionally excluded.
+`child_goal`, `child_summary`, `child_lane`, `child_provider`, `child_model`,
+`child_mode`, `child_failure_kind`, `child_exit_reason`,
+`child_successful_tool_count`, `duration_ms`, and a metadata-only
+`tool_call_history`. These route and outcome fields are host-owned so an
+observer can bind the result to the runtime that actually ran instead of
+trusting prose in the child summary. Each history entry contains the tool name,
+argument names, bounded side-effect targets, input/output byte counts, and
+outcome. URL query strings and fragments are removed; raw arguments, prompts,
+commands, contents, headers, and results are intentionally excluded.
 
 Observers can use these hooks to model nested trajectories while keeping child
 agent execution linked to the parent turn that spawned it.
+
+The exact-once `subagent_stop` claim is process-local to the constructed child
+object. Durable async completion records do not serialize Python observer or
+plugin callbacks, and recovery never reconstructs or replays the hook. A
+pending completion event may still be redelivered after restart; an in-flight
+child whose owner disappears is recovered as lost/unknown evidence without a
+synthetic `subagent_stop`. Restart-safe consumers must pair hook telemetry with
+the durable completion record and handle that uncertainty explicitly.
 
 ## Payload Safety
 
