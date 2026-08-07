@@ -3536,12 +3536,14 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    route: Optional[str] = None,
+    model_tier: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context and role)
+      - Single: provide goal (+ optional context, role, route, or model_tier)
       - Batch:  provide tasks array [{goal, context, role}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
@@ -3625,12 +3627,17 @@ def delegate_task(
             )
         task_list = list(tasks)
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{
+        single_task = {
             "goal": goal,
             "context": context,
             "role": top_role,
             "mode": "execute",
-        }]
+        }
+        if isinstance(route, str) and route.strip():
+            single_task["route"] = route.strip()
+        if isinstance(model_tier, str) and model_tier.strip():
+            single_task["model_tier"] = model_tier.strip()
+        task_list = [single_task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -5321,6 +5328,14 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "route": {
+                            "type": "string",
+                            "description": "Explicit delegation lane for this task.",
+                        },
+                        "model_tier": {
+                            "type": "string",
+                            "description": "Model tier mapped through delegation.tier_routes.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -5333,6 +5348,20 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "route": {
+                "type": "string",
+                "description": (
+                    "Explicit lane name for single-task routing. It must match "
+                    "a configured delegation.lanes key."
+                ),
+            },
+            "model_tier": {
+                "type": "string",
+                "description": (
+                    "Model tier for single-task routing, mapped through "
+                    "delegation.tier_routes."
+                ),
             },
             "background": {
                 "type": "boolean",
@@ -5407,6 +5436,8 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
+        route=args.get("route"),
+        model_tier=args.get("model_tier"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

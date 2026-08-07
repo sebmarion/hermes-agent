@@ -491,3 +491,69 @@ def test_explicit_lane_disables_parent_fallback_when_building_child(monkeypatch)
     assert result["results"][0]["status"] == "completed"
     assert captured["model"] == "glm-5.2"
     assert captured["inherit_parent_fallback"] is False
+
+
+def test_single_task_route_is_propagated_into_task_resolution(monkeypatch):
+    """Single-task selectors must reach the same lane resolver as batches."""
+    cfg = _lane_cfg()
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent._active_children = []
+    parent._active_children_lock = None
+    parent.enabled_toolsets = ["terminal", "file", "web", "delegation"]
+    parent.valid_tool_names = {"terminal", "read_file", "write_file", "delegate_task"}
+    parent.tool_progress_callback = None
+    parent._session_db = None
+    parent._memory_manager = None
+    parent.session_estimated_cost_usd = 0.0
+
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: cfg)
+    captured = {}
+
+    def resolve_credentials(_cfg, _parent, task):
+        captured["task"] = dict(task)
+        return {
+            "model": "glm-5.2",
+            "provider": "neuralwatt",
+            "base_url": "https://lane.example/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+            "toolsets": ["file"],
+            "lane": "smart_reviewer",
+        }
+
+    monkeypatch.setattr(
+        delegate_tool,
+        "_resolve_delegation_credentials_for_task",
+        resolve_credentials,
+    )
+    monkeypatch.setattr(
+        delegate_tool,
+        "_build_child_agent",
+        lambda **_kwargs: MagicMock(_delegate_role="leaf"),
+    )
+    monkeypatch.setattr(
+        delegate_tool,
+        "_run_single_child",
+        lambda *_args, **_kwargs: {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "reviewed",
+            "api_calls": 1,
+            "duration_seconds": 0.01,
+            "_child_role": "leaf",
+        },
+    )
+
+    result = json.loads(
+        delegate_tool.delegate_task(
+            goal="Review the repository",
+            route="smart_reviewer",
+            model_tier="large",
+            parent_agent=parent,
+        )
+    )
+
+    assert result["results"][0]["status"] == "completed"
+    assert captured["task"]["route"] == "smart_reviewer"
+    assert captured["task"]["model_tier"] == "large"
