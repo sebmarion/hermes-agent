@@ -409,9 +409,36 @@ def test_materials_accessibility_sections() -> None:
     assert "solid surfaces" in rt_lower
     assert re.search(r"(?:remove|disable) backdrop-filter", rt_lower)
     assert re.search(r"(?:remove|disable|disables)(?:\s+\w+){0,2}\s+blur", rt_lower)
-    assert "opaque" in rt_lower
-    assert "unsupported" in rt_lower or "unavailable" in rt_lower
-    assert "application-level" in rt_lower or "in-app" in rt_lower
+    rt_sentences = re.split(r"(?<=[.!?])\s+", rt_lower)
+    assert any(
+        "opaque solid surfaces" in sentence
+        and "safe default" in sentence
+        and ("unknown" in sentence or "unavailable" in sentence)
+        and ("support" in sentence or "preference" in sentence)
+        for sentence in rt_sentences
+    )
+    assert any(
+        ("unsupported" in sentence or "unavailable" in sentence)
+        and "opaque" in sentence
+        and "surface" in sentence
+        and re.search(r"\b(?:keep|retain|use|remain)\w*\b", sentence)
+        for sentence in rt_sentences
+    )
+    in_app_controls = [
+        sentence
+        for sentence in rt_sentences
+        if "application-level" in sentence or "in-app" in sentence
+    ]
+    assert in_app_controls
+    for control in in_app_controls:
+        assert (
+            "existing" in control or "already" in control
+        ) and "settings" in control
+        assert "appropriate" in control
+        assert "context" in control and re.search(r"\bjustif\w*\b", control)
+        assert re.search(r"\b(?:may|can)\b", control)
+        assert "same" in control and "opaque" in control and "surface" in control
+        assert not re.search(r"\b(?:must|provide|required?)\b", control)
 
     # Increased Contrast
     increased_contrast = _section_body(src, "Increased Contrast")
