@@ -6208,6 +6208,55 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
+def _publish_mcp_toolset_alias(
+    registry: Any,
+    server_name: str,
+    toolset_name: str,
+) -> None:
+    """Publish the raw server alias only when that name is unclaimed.
+
+    The canonical ``mcp-{server}`` toolset is always registered independently.
+    A raw server name is only a convenience alias, so an incumbent static,
+    plugin/custom alias, or registry-native canonical toolset must win.
+    """
+    from toolsets import TOOLSETS
+
+    # Keep the check and publication atomic with registry registrations. The
+    # registry lock is re-entrant, so its snapshot/accessor methods are safe to
+    # call while holding it.
+    with registry._lock:
+        existing_target = registry.get_toolset_alias_target(server_name)
+        if existing_target == toolset_name:
+            return
+        if existing_target is not None:
+            logger.warning(
+                "MCP server '%s': raw toolset alias is already owned by '%s'; "
+                "preserving it and exposing MCP tools only as '%s'",
+                server_name,
+                existing_target,
+                toolset_name,
+            )
+            return
+        if server_name in TOOLSETS:
+            logger.warning(
+                "MCP server '%s': raw toolset name is a static toolset; "
+                "preserving it and exposing MCP tools only as '%s'",
+                server_name,
+                toolset_name,
+            )
+            return
+        if server_name in registry.get_registered_toolset_names():
+            logger.warning(
+                "MCP server '%s': raw toolset name is already registered; "
+                "preserving it and exposing MCP tools only as '%s'",
+                server_name,
+                toolset_name,
+            )
+            return
+
+        registry.register_toolset_alias(server_name, toolset_name)
+
+
 def _register_server_tools(
     name: str,
     server: MCPServerTask,
@@ -6402,7 +6451,7 @@ def _register_server_tools(
         registered_names.append(registry_name)
 
     if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
+        _publish_mcp_toolset_alias(registry, name, toolset_name)
         # Write-through (#56832): refresh the on-disk schema cache after a
         # live connect so the next startup can lazily register this server
         # without spawning it. Cache failures never break registration.
@@ -6564,7 +6613,7 @@ def _register_from_cache_sync(
         registered_names.append(util_name)
 
     if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
+        _publish_mcp_toolset_alias(registry, name, toolset_name)
         with _lock:
             _lazy_server_configs[name] = dict(config)
             _lazy_server_fingerprints[name] = fingerprint

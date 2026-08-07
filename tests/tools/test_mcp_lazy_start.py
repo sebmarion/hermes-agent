@@ -250,6 +250,84 @@ class TestLazyMcpRegistration:
         assert "mcp_playwright_browser_navigate" in names
 
 
+class TestLazyMCPRawToolsetAliasPublication:
+    @pytest.mark.parametrize(
+        ("server_name", "collision_kind"),
+        [
+            ("collision-lazy-alias", "alias"),
+            ("collision-lazy-canonical", "canonical"),
+            ("web", "static"),
+        ],
+    )
+    def test_cached_registration_preserves_non_mcp_raw_toolset(
+        self, server_name, collision_kind
+    ):
+        from tools.registry import ToolRegistry
+        from toolsets import resolve_toolset
+
+        registry = ToolRegistry()
+        incumbent_tool = f"incumbent_{collision_kind}_tool"
+        incumbent_alias_target = None
+
+        if collision_kind == "alias":
+            incumbent_alias_target = f"plugin-{server_name}"
+            registry.register(
+                name=incumbent_tool,
+                toolset=incumbent_alias_target,
+                schema={
+                    "name": incumbent_tool,
+                    "description": "Incumbent plugin tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                handler=lambda _args, **_kwargs: "{}",
+            )
+            registry.register_toolset_alias(server_name, incumbent_alias_target)
+        elif collision_kind == "canonical":
+            registry.register(
+                name=incumbent_tool,
+                toolset=server_name,
+                schema={
+                    "name": incumbent_tool,
+                    "description": "Incumbent canonical tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                handler=lambda _args, **_kwargs: "{}",
+            )
+
+        entry = {
+            "tools": [
+                {
+                    "name": "remote",
+                    "description": "Remote MCP tool",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ],
+            "utility_tools": [],
+        }
+
+        with patch("tools.registry.registry", registry):
+            registered = mcp._register_from_cache_sync(
+                server_name,
+                {"command": "fake"},
+                entry,
+                source="config",
+            )
+            raw_tools = resolve_toolset(server_name)
+            mcp_tools = resolve_toolset(f"mcp-{server_name}")
+
+        assert len(registered) == 1
+        mcp_tool = registered[0]
+        assert registry.get_toolset_alias_target(server_name) == (
+            incumbent_alias_target
+        )
+        assert mcp_tool not in raw_tools
+        assert mcp_tools == [mcp_tool]
+        if collision_kind == "static":
+            assert "web_search" in raw_tools
+        else:
+            assert incumbent_tool in raw_tools
+
+
 class TestLazyFirstUseConnect:
     def _connected_server(self):
         mock_session = MagicMock()
