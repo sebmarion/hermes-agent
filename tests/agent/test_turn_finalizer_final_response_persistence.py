@@ -32,6 +32,8 @@ class FakeAgent:
         self._iters_since_skill = 0
         self.valid_tool_names = []
         self.persisted_messages: list[dict[str, Any]] | None = None
+        self.trajectory_messages: list[dict[str, Any]] | None = None
+        self.save_trajectories = False
         self._persist_user_message_idx: int | None = None
         self._persist_user_message_override: Any = None
         self._persist_user_message_timestamp: float | None = None
@@ -45,8 +47,9 @@ class FakeAgent:
     def _safe_print(self, *_args, **_kwargs):
         pass
 
-    def _save_trajectory(self, *_args, **_kwargs):
-        pass
+    def _save_trajectory(self, messages, *_args, **_kwargs):
+        if self.save_trajectories:
+            self.trajectory_messages = [dict(message) for message in messages]
 
     def _cleanup_task_resources(self, *_args, **_kwargs):
         pass
@@ -83,6 +86,54 @@ class FakeAgent:
 
 
 
+
+
+def test_post_tool_progress_scaffolding_is_removed_before_trajectory_save(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent.save_trajectories = True
+    messages = [
+        {"role": "user", "content": "inspect it"},
+        {"role": "tool", "tool_call_id": "call-1", "content": "tool result"},
+        {
+            "role": "assistant",
+            "content": "I will inspect the remaining logs.",
+            "_post_tool_progress_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": "continue from the tool result",
+            "_post_tool_progress_synthetic": True,
+        },
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="inspect it",
+        original_user_message="inspect it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(stop)",
+    )
+
+    assert agent.trajectory_messages is not None
+    assert all(
+        not message.get("_post_tool_progress_synthetic")
+        for message in agent.trajectory_messages
+    )
+    assert [message["content"] for message in agent.trajectory_messages] == [
+        "inspect it",
+        "tool result",
+        "Done.",
+    ]
 
 
 def test_final_response_closes_tool_tail_before_persistence(monkeypatch):

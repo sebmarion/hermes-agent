@@ -3606,17 +3606,17 @@ def looks_like_post_tool_progress_update(
     if future_match is None:
         return False
 
-    # Search after the future-tense phrase, not across the whole reply. This
-    # prevents final answers such as "The check is complete. Let me know..."
-    # from borrowing an earlier action word and looking like progress.
+    # Result/finality language anywhere in the visible reply makes it
+    # substantive, even when the model follows the result with another future
+    # action ("Found two failures. I'll inspect the remaining logs.").
     future_action = assistant_text[future_match.end():]
     if re.search(
         r"\b(?:found|shows?|indicates?|complete|completed|healthy|success|"
         r"successful|error|failure)\b",
-        future_action,
+        assistant_text,
     ) or re.search(
         r"\btests?\s+(?:pass(?:ed|es)?|fail(?:ed|s|ing)?)\b",
-        future_action,
+        assistant_text,
     ):
         return False
     action_markers = (

@@ -70,6 +70,7 @@ def test_detects_short_future_action_after_tool_result():
             _tool_tail(),
         ),
         ("Let me inspect the report. I found two errors.", _tool_tail()),
+        ("Found two failures. I’ll inspect the remaining logs.", _tool_tail()),
         ("I will review it now; the output shows success.", _tool_tail()),
         ("Let me check it now. The result indicates a failure.", _tool_tail()),
         ("I will inspect it now. Analysis complete.", _tool_tail()),
@@ -93,6 +94,7 @@ def test_detects_short_future_action_after_tool_result():
         "final",
         "colon-results",
         "found",
+        "result-before-future-action",
         "shows-success",
         "indicates-failure",
         "complete",
@@ -197,6 +199,91 @@ def _run(agent, responses, requests, prompt="inspect the project"):
         patch("hermes_cli.plugins.invoke_hook", return_value=[]),
     ):
         return agent.run_conversation(prompt)
+
+
+def _progress_pair(label):
+    return [
+        {
+            "role": "assistant",
+            "content": f"I will inspect {label}.",
+            "_post_tool_progress_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": f"continue after {label}",
+            "_post_tool_progress_synthetic": True,
+        },
+    ]
+
+
+def test_compression_archive_input_excludes_progress_scaffolding_and_noop_preserves_live_identity(
+    loop_agent,
+):
+    messages = _tool_tail() + _progress_pair("the first result")
+    original_snapshot = [dict(message) for message in messages]
+    archive_inputs = []
+
+    def _fake_archive_and_commit(_agent, compression_input, system_message, **_kwargs):
+        archive_inputs.append([dict(message) for message in compression_input])
+        return compression_input, system_message
+
+    with (
+        patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0, 0),
+        ),
+        patch(
+            "agent.conversation_compression.compress_context",
+            side_effect=_fake_archive_and_commit,
+        ),
+    ):
+        returned, prompt = loop_agent._compress_context(messages, "system prompt")
+
+    assert returned is messages
+    assert returned == original_snapshot
+    assert prompt == "system prompt"
+    assert archive_inputs
+    assert all(
+        not message.get("_post_tool_progress_synthetic")
+        for message in archive_inputs[0]
+    )
+
+
+def test_successful_compression_reattaches_only_latest_trailing_progress_pair(
+    loop_agent,
+):
+    old_pair = _progress_pair("the first result")
+    latest_pair = _progress_pair("the remaining result")
+    messages = _tool_tail() + old_pair + latest_pair
+    commit_inputs = []
+
+    def _fake_archive_and_commit(_agent, compression_input, _system_message, **_kwargs):
+        commit_inputs.append([dict(message) for message in compression_input])
+        return ([{"role": "user", "content": "compressed summary"}], "compressed prompt")
+
+    with (
+        patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0, 0),
+        ),
+        patch(
+            "agent.conversation_compression.compress_context",
+            side_effect=_fake_archive_and_commit,
+        ),
+    ):
+        returned, prompt = loop_agent._compress_context(messages, "system prompt")
+
+    assert prompt == "compressed prompt"
+    assert commit_inputs
+    assert all(
+        not message.get("_post_tool_progress_synthetic")
+        for message in commit_inputs[0]
+    )
+    assert returned == [
+        {"role": "user", "content": "compressed summary"},
+        *latest_pair,
+    ]
+    assert all(message not in returned for message in old_pair)
 
 
 def test_chat_completions_continues_after_post_tool_progress(loop_agent):

@@ -336,8 +336,10 @@ def finalize_turn(
     _cleanup_errors = []
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
-    # list of parts; the trajectory format wants a plain string.
+    # list of parts; the trajectory format wants a plain string. Progress
+    # continuation rows are API-only and must be gone before any durable sink.
     try:
+        _drop_post_tool_progress_scaffolding(messages)
         agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
     except Exception as _save_err:
         _cleanup_errors.append(f"save_trajectory: {_save_err}")
@@ -363,7 +365,6 @@ def finalize_turn(
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
         _drop_dropped_toolcall_scaffolding(messages)
-        _drop_post_tool_progress_scaffolding(messages)
 
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the

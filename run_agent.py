@@ -259,6 +259,47 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
 )
 
 
+def _prepare_post_tool_progress_compression(messages: list) -> tuple[list, list]:
+    """Return durable compression input and the one live retry pair to retain."""
+    progress_flag = "_post_tool_progress_synthetic"
+    compression_input = [
+        message
+        for message in messages
+        if not (isinstance(message, dict) and message.get(progress_flag))
+    ]
+    if len(compression_input) == len(messages):
+        compression_input = messages
+
+    trailing_pair = []
+    if len(messages) >= 2:
+        assistant_message, user_message = messages[-2:]
+        if (
+            isinstance(assistant_message, dict)
+            and assistant_message.get("role") == "assistant"
+            and assistant_message.get(progress_flag)
+            and isinstance(user_message, dict)
+            and user_message.get("role") == "user"
+            and user_message.get(progress_flag)
+        ):
+            trailing_pair = [assistant_message, user_message]
+    return compression_input, trailing_pair
+
+
+def _restore_post_tool_progress_after_compression(
+    original_messages: list,
+    compression_input: list,
+    compression_result: tuple,
+    trailing_pair: list,
+) -> tuple:
+    """Preserve no-op identity or restore only the retry pair still in use."""
+    result_messages, result_prompt = compression_result
+    if result_messages is compression_input:
+        return original_messages, result_prompt
+    if trailing_pair:
+        result_messages = [*result_messages, *trailing_pair]
+    return result_messages, result_prompt
+
+
 def _is_ephemeral_scaffolding(msg: Any) -> bool:
     """Return True when ``msg`` is internal recovery scaffolding that must never
     be persisted to the durable transcript (SQLite session store or JSON log)."""
@@ -7126,6 +7167,9 @@ class AIAgent:
             root = self._conversation_root_id()
             if root:
                 token = set_conversation_context(root)
+        compression_input, trailing_progress_pair = (
+            _prepare_post_tool_progress_compression(messages)
+        )
         # Every AIAgent compression has a fence, including ordinary in-turn and
         # manual paths. hard_interrupt() uses this exact instance to serialize
         # cancel admission against begin_commit().
@@ -7146,7 +7190,11 @@ class AIAgent:
             def _run(fence=None, target_messages=None):
                 return compress_context(
                     self,
-                    target_messages if target_messages is not None else messages,
+                    (
+                        target_messages
+                        if target_messages is not None
+                        else compression_input
+                    ),
                     system_message,
                     approx_tokens=approx_tokens, task_id=task_id,
                     focus_topic=focus_topic,
@@ -7160,11 +7208,21 @@ class AIAgent:
             # Callers that already own a progress-aware wait (gateway session
             # hygiene) pass commit_fence and must not be double-wrapped.
             if commit_fence is not None:
-                return _run(active_fence)
+                return _restore_post_tool_progress_after_compression(
+                    messages,
+                    compression_input,
+                    _run(active_fence),
+                    trailing_progress_pair,
+                )
 
             idle_timeout, total_ceiling = resolve_context_compression_timeouts()
             if idle_timeout <= 0:
-                return _run(active_fence)
+                return _restore_post_tool_progress_after_compression(
+                    messages,
+                    compression_input,
+                    _run(active_fence),
+                    trailing_progress_pair,
+                )
 
             def _snapshot_worker(fence=None):
                 # #76354 review F3: the pooled worker must NEVER share the
@@ -7179,16 +7237,16 @@ class AIAgent:
                 # value of an ADMITTED commit (the host discards results on
                 # timeout/cancel); durable SessionDB mutation is already
                 # gated behind the commit fence inside compress_context.
-                snapshot = copy.deepcopy(messages)
+                snapshot = copy.deepcopy(compression_input)
                 result_msgs, result_prompt = _run(
                     fence, target_messages=snapshot
                 )
                 if result_msgs is snapshot:
-                    # No-op/abort path returned the snapshot unchanged: hand
-                    # back the caller's ORIGINAL list so identity-based
-                    # semantics (len/identity no-op detection, flush dedup
-                    # by id()) keep working.
-                    return messages, result_prompt
+                    # No-op/abort path returned the snapshot unchanged. Hand
+                    # back the prefiltered input; the outer helper restores
+                    # the caller's original list identity after the worker
+                    # boundary.
+                    return compression_input, result_prompt
                 return result_msgs, result_prompt
 
             # Resolve the fallback prompt lazily on timeout only. Eager
@@ -7273,7 +7331,7 @@ class AIAgent:
 
             result = run_compress_context_with_progress_timeout(
                 worker=_snapshot_worker,
-                messages=messages,
+                messages=compression_input,
                 system_prompt_fallback=_fallback_prompt,
                 idle_timeout_seconds=idle_timeout,
                 total_ceiling_seconds=total_ceiling,
@@ -7308,7 +7366,12 @@ class AIAgent:
                     "post-compression session ContextVar rebind failed",
                     exc_info=True,
                 )
-            return result
+            return _restore_post_tool_progress_after_compression(
+                messages,
+                compression_input,
+                result,
+                trailing_progress_pair,
+            )
         finally:
             with fence_registration_lock:
                 if previous_fence is missing_fence:
