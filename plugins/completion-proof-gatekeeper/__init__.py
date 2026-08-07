@@ -31,28 +31,30 @@ _DIRECT_COMPLETION_RE = re.compile(
 )
 _EXPLICIT_BLOCKER_RE = re.compile(
     r"\b(?:could\s+not|couldn't|cannot|can't|unable\s+to|blocked|"
-    r"not\s+(?:done|complete|completed|verified|confirmed|tested|run|"
-    r"deployed|published)|needs?\s+follow[- ]?up|not\s+ready)\b",
+    r"(?:not|\w+n['’]t)\s+(?:be(?:en)?\s+)?(?:done|fixed|working|"
+    r"verified|deployed|pushed|published|"
+    r"resolved|complete(?:d)?|pass(?:ed|ing)?|green|confirmed|tested|run)|"
+    r"did\s+not\s+pass|needs?\s+follow[- ]?up|not\s+ready)\b",
     re.IGNORECASE,
 )
 _COMMAND_PROOF_RE = re.compile(
-    r"(?:`[^`\n]+`|\b(?:pytest|tox|nox|ruff|mypy|eslint|tsc|vitest|"
-    r"jest|npm|pnpm|yarn|bun|cargo|go|make|curl|httpie)\b)",
+    r"\b(?:pytest|tox|nox|ruff|mypy|eslint|tsc|vitest|jest|npm|pnpm|"
+    r"yarn|bun|cargo|go|make|curl|httpie)\b(?![.\w-])",
     re.IGNORECASE,
 )
 _API_PROOF_RE = re.compile(
-    r"\b(?:GET|POST|PUT|PATCH|DELETE)\s+/[^\s,;)]*"
-    r"|\b(?:API|endpoint|health(?:\s+check)?)\b",
+    r"\b(?:GET|POST|PUT|PATCH|DELETE)\s+/[^\s,;)]*",
     re.IGNORECASE,
 )
 _SUCCESS_RE = re.compile(
     r"\b(?:pass(?:ed|es|ing)?|green|successful(?:ly)?|success|"
-    r"exit(?:ed)?\s+(?:with\s+)?0|0\s+(?:failures?|errors?)|"
+    r"exit(?:ed)?\s+(?:with\s+)?(?:code\s+)?0|0\s+(?:failures?|errors?)|"
     r"HTTP\s*2\d\d|status\s*[:=]?\s*2\d\d|"
     r"returned\s+2\d\d|healthy|read[- ]back[^.\n]*(?:match|confirm)|"
     r"matches?[^.\n]*(?:expected|recorded|source))\b",
     re.IGNORECASE,
 )
+_PROOF_BOUNDARY_RE = re.compile(r"(?:[.!?](?=\s+|$)|;|\n)+\s*")
 _WARNING = (
     "[Proof gatekeeper — report-only: a completion claim was detected without "
     "same-response command/API/read-back proof. Run the relevant check or "
@@ -69,12 +71,15 @@ def _has_completion_claim(response_text: str) -> bool:
 
 
 def _has_successful_proof(response_text: str) -> bool:
-    has_proof_source = bool(
-        _COMMAND_PROOF_RE.search(response_text)
-        or _API_PROOF_RE.search(response_text)
-        or re.search(r"\bread[- ]back\b", response_text, re.IGNORECASE)
-    )
-    return has_proof_source and bool(_SUCCESS_RE.search(response_text))
+    for clause in _PROOF_BOUNDARY_RE.split(response_text):
+        has_proof_source = bool(
+            _COMMAND_PROOF_RE.search(clause)
+            or _API_PROOF_RE.search(clause)
+            or re.search(r"\bread[- ]back\b", clause, re.IGNORECASE)
+        )
+        if has_proof_source and _SUCCESS_RE.search(clause):
+            return True
+    return False
 
 
 def transform_llm_output(

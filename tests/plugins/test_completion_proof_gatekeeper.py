@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 PLUGIN_PATH = (
     Path(__file__).parents[2]
@@ -50,6 +52,89 @@ def test_api_readback_proof_is_left_unchanged():
 def test_honest_blocker_is_left_unchanged():
     plugin = _load_plugin()
     response = "I fixed the handler, but I could not verify it because the test service is unavailable."
+
+    assert plugin.transform_llm_output(response_text=response) is None
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "The work is not done.",
+        "The bug is not fixed.",
+        "The bug isn't fixed.",
+        "The implementation is not working.",
+        "The implementation isn't working.",
+        "The result is not verified.",
+        "The change is not deployed.",
+        "The commit is not pushed.",
+        "The release is not published.",
+        "The bug is not resolved.",
+        "The implementation is not complete.",
+        "The work is not completed.",
+        "The tests are not passing.",
+        "The checks are not green.",
+        "The build did not pass.",
+    ],
+)
+def test_explicit_negated_completion_claim_is_left_unchanged(response):
+    plugin = _load_plugin()
+
+    assert plugin.transform_llm_output(response_text=response) is None
+
+
+def test_generic_api_mention_with_unrelated_success_is_not_proof():
+    plugin = _load_plugin()
+    response = "Fixed the API bug; the migration was successful."
+
+    result = plugin.transform_llm_output(response_text=response)
+
+    assert result is not None
+    assert "report-only" in result
+
+
+def test_arbitrary_inline_code_with_unrelated_success_is_not_proof():
+    plugin = _load_plugin()
+    response = "Fixed the handler in `handler.py`; the migration was successful."
+
+    result = plugin.transform_llm_output(response_text=response)
+
+    assert result is not None
+    assert "report-only" in result
+
+
+def test_command_named_inline_file_with_unrelated_success_is_not_proof():
+    plugin = _load_plugin()
+    response = "Fixed the handler in `pytest.ini` and the migration was successful."
+
+    result = plugin.transform_llm_output(response_text=response)
+
+    assert result is not None
+    assert "report-only" in result
+
+
+@pytest.mark.parametrize(
+    "proof_source",
+    [
+        "Ran pytest.",
+        "GET /health was called.",
+        "Captured a read-back.",
+    ],
+)
+def test_proof_source_and_unrelated_success_in_different_clauses_is_not_proof(
+    proof_source,
+):
+    plugin = _load_plugin()
+    response = f"Fixed the handler. {proof_source} The migration was successful."
+
+    result = plugin.transform_llm_output(response_text=response)
+
+    assert result is not None
+    assert "report-only" in result
+
+
+def test_command_exited_with_code_zero_is_proof():
+    plugin = _load_plugin()
+    response = "Fixed the handler. `pytest tests/test_api.py` exited with code 0."
 
     assert plugin.transform_llm_output(response_text=response) is None
 
