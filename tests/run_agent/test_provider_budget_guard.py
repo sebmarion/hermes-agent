@@ -339,6 +339,92 @@ def test_old_tool_history_is_persisted_then_rebuilt_before_dispatch(
     compress.assert_not_called()
 
 
+def test_dispatch_prune_persistence_failure_uses_original_transcript(
+    agent, monkeypatch
+):
+    """A failed optimization write must not terminate a serviceable turn."""
+    old_tool_result = "old tool output " + "x" * 10_000
+    bounded_tool_result = "[tool result pruned before dispatch]"
+    history = [
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_old",
+            "content": old_tool_result,
+        },
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    def _prune(messages):
+        projected = [dict(message) for message in messages]
+        projected[2] = {**projected[2], "content": bounded_tool_result}
+        return projected, 1
+
+    monkeypatch.setattr(
+        agent.context_compressor,
+        "prune_tool_results_for_dispatch",
+        _prune,
+    )
+
+    def _reject_projection(_agent, previous, _projected):
+        return previous, False
+
+    monkeypatch.setattr(
+        conversation_loop,
+        "persist_in_place_projection",
+        _reject_projection,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_provider_request_admission_receipt",
+        lambda *_args, **_kwargs: _receipt(
+            "admit", "within_effective_input_ceiling"
+        ),
+        raising=False,
+    )
+
+    dispatched = []
+
+    def _transport(request):
+        dispatched.append(request)
+        assert old_tool_result in str(request)
+        assert bounded_tool_result not in str(request)
+        return _chat_response("continued with original transcript")
+
+    agent._disable_streaming = True
+    monkeypatch.setattr(agent, "_interruptible_api_call", _transport)
+    compress = MagicMock()
+    monkeypatch.setattr(agent, "_compress_context", compress)
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "current request",
+            conversation_history=history,
+        )
+
+    assert result["completed"] is True
+    assert not result.get("compression_exhausted")
+    assert result["final_response"] == "continued with original transcript"
+    assert len(dispatched) == 1
+    compress.assert_not_called()
+
+
 def test_repaired_history_uses_pre_repair_snapshot_for_dispatch_persistence(
     agent, monkeypatch
 ):
