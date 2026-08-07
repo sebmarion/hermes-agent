@@ -442,6 +442,31 @@ def _capture_authoritative_cooldown_under_lease(
     return True, copy.deepcopy(durable_state)
 
 
+def _rebind_compressor_session_db_if_reopened(agent: Any) -> None:
+    """Keep durable compressor guards on the agent's current DB handle.
+
+    A long-lived agent can survive a SessionDB close/reopen (for example when
+    a durable compression boundary is followed by a restart-aware retry). The
+    agent owns the authoritative DB object, while the compressor retains the
+    handle it was originally bound to. Rebind only when the session identity is
+    unchanged and the object was replaced; the normal session-boundary path
+    still owns identity changes and full state transitions.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    session_db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    if compressor is None or session_db is None or not session_id:
+        return
+    if getattr(compressor, "_session_id", "") != session_id:
+        return
+    if getattr(compressor, "_session_db", None) is session_db:
+        return
+    binder = getattr(compressor, "bind_session_state", None)
+    if not callable(binder):
+        return
+    binder(session_db=session_db, session_id=session_id)
+
+
 class CompressionCommitFence:
     """Fence timeout cancellation against post-summary session mutation.
 
@@ -2415,6 +2440,7 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    _rebind_compressor_session_db_if_reopened(agent)
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )

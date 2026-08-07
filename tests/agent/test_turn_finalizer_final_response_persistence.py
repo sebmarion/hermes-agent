@@ -180,6 +180,112 @@ def test_final_response_fills_pure_tool_call_tail(monkeypatch):
 
 
 
+def test_final_response_does_not_clobber_tool_call_tail_with_text(monkeypatch):
+    """A tail tool-call turn that already carries model text must be left alone."""
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "partial text",
+            "tool_calls": [
+                {"id": "t1", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}
+            ],
+        },
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="Here is your answer.",
+        api_call_count=3,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="t",
+        turn_id="tid",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert agent.persisted_messages[-1]["content"] == "partial text"
+
+
+def test_compression_exhausted_rejection_is_not_persisted_as_assistant_message(monkeypatch):
+    """A local budget failure belongs in the gateway error surface, not context."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    messages = [{"role": "user", "content": "oversized request"}]
+    rejection = "Context budget rejected locally: compaction_made_no_progress."
+
+    result = finalize_turn(
+        agent,
+        final_response=rejection,
+        api_call_count=1,
+        interrupted=False,
+        failed=True,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="oversized request",
+        original_user_message="oversized request",
+        _should_review_memory=False,
+        _turn_exit_reason="compression_exhausted",
+        preserve_final_response=True,
+    )
+
+    assert agent.persisted_messages == [{"role": "user", "content": "oversized request"}]
+    assert result["messages"] == agent.persisted_messages
+
+
+def test_fill_pops_db_persisted_marker_for_durable_rewrite(monkeypatch):
+    """The incremental tool-call persist stamps ``_db_persisted`` on the row.
+
+    If finalize_turn fills the tail's content but leaves the marker, the next
+    ``_flush_messages_to_session_db`` skips the row and the durable SQLite
+    store keeps ``content=\"\"`` — so /resume reloads the empty content and
+    the bug resurfaces cross-session. The fix pops the marker so the filled
+    content is re-written.
+    """
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "t1", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}
+            ],
+            "_db_persisted": True,
+        },
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="Here is your answer.",
+        api_call_count=3,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="t",
+        turn_id="tid",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    persisted = agent.persisted_messages
+    assert persisted is not None
+    assert persisted[-1]["content"] == "Here is your answer."
+    assert persisted[-1]["tool_calls"]
+    assert "_db_persisted" not in persisted[-1]
 
 
 def test_final_response_fill_invalidates_flush_scan_cursor():
