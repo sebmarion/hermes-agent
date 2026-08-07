@@ -75,6 +75,60 @@ def test_filter_mcp_toolsets_for_platform_prunes_stale_and_denied_aliases():
     ) == ["web", "custom"]
 
 
+def test_filter_mcp_toolsets_for_platform_preserves_native_name_collision():
+    config = {
+        "mcp_servers": {
+            "web": {"enabled": True, "allowed_platforms": ["cli"]},
+        }
+    }
+
+    assert filter_mcp_toolsets_for_platform(
+        ["web", "terminal", "mcp-web"], config, platform="cron"
+    ) == ["web", "terminal"]
+
+
+def test_get_platform_tools_prefixes_mcp_alias_on_native_name_collision():
+    config = {
+        "platform_toolsets": {"telegram": ["web"]},
+        "mcp_servers": {
+            "web": {"enabled": True, "allowed_platforms": ["telegram"]},
+        },
+    }
+
+    enabled = _get_platform_tools(config, "telegram")
+
+    assert "web" in enabled
+    assert "mcp-web" in enabled
+
+
+def test_get_platform_tools_preserves_custom_name_collision(monkeypatch):
+    from toolsets import TOOLSETS
+
+    monkeypatch.setitem(
+        TOOLSETS,
+        "private-tools",
+        {
+            "description": "Custom tools",
+            "tools": ["private_custom_tool"],
+            "includes": [],
+        },
+    )
+    config = {
+        "platform_toolsets": {"telegram": ["private-tools", "no_mcp"]},
+        "mcp_servers": {
+            "private-tools": {
+                "enabled": True,
+                "allowed_platforms": ["telegram"],
+            }
+        },
+    }
+
+    enabled = _get_platform_tools(config, "telegram")
+
+    assert "private-tools" in enabled
+    assert "mcp-private-tools" not in enabled
+
+
 def test_get_platform_tools_explicit_mcp_name_cannot_bypass_allowed_platforms():
     config = {
         "platform_toolsets": {"telegram": ["web", "zeus", "mcp-zeus"]},
@@ -91,6 +145,28 @@ def test_get_platform_tools_explicit_mcp_name_cannot_bypass_allowed_platforms():
     assert "web" in enabled
     assert "zeus" not in enabled
     assert "mcp-zeus" not in enabled
+
+
+def test_get_platform_tools_denied_explicit_mcp_does_not_enable_other_servers():
+    config = {
+        "platform_toolsets": {"telegram": ["web", "blocked"]},
+        "mcp_servers": {
+            "blocked": {
+                "url": "https://example.com/blocked",
+                "allowed_platforms": ["cli"],
+            },
+            "other": {
+                "url": "https://example.com/other",
+                "allowed_platforms": ["telegram"],
+            },
+        },
+    }
+
+    enabled = _get_platform_tools(config, "telegram")
+
+    assert "web" in enabled
+    assert "blocked" not in enabled
+    assert "other" not in enabled
 
 
 

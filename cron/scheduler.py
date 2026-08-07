@@ -199,12 +199,14 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
       * otherwise -> union in every globally-enabled MCP server
     """
     from hermes_cli.tools_config import (
+        configured_mcp_toolset_selections,
         enabled_mcp_server_names,
         filter_mcp_toolsets_for_platform,
+        mcp_server_toolset_name,
     )
 
+    requested_mcp = configured_mcp_toolset_selections(per_job, cfg)
     enabled_mcp = enabled_mcp_server_names(cfg, platform="cron")
-    enabled_aliases = enabled_mcp | {f"mcp-{name}" for name in enabled_mcp}
     result = [
         toolset
         for toolset in filter_mcp_toolsets_for_platform(
@@ -217,11 +219,12 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     # lazy import: avoid heavy hermes_cli import at cron module load (matches
     # _resolve_cron_enabled_toolsets' fallback) and share one MCP-membership
     # computation with the gateway/CLI platform resolver.
-    if set(result) & enabled_aliases:
+    if requested_mcp:
         return result
     for name in sorted(enabled_mcp):
-        if name not in result:
-            result.append(name)
+        toolset_name = mcp_server_toolset_name(name)
+        if toolset_name not in result:
+            result.append(toolset_name)
     return result
 
 

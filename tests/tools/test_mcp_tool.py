@@ -60,6 +60,7 @@ def _restore_mcp_registration_provenance():
         "_mcp_tool_server_origins",
         "_mcp_server_origins",
         "_mcp_connecting_origins",
+        "_mcp_server_registration_identities",
     )
     with mcp_tool._lock:
         saved_connecting = set(mcp_tool._server_connecting)
@@ -3077,6 +3078,80 @@ class TestMCPPlatformPolicy:
             "config",
         }
 
+    def test_cross_source_collision_has_no_incumbent_side_effects(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        incumbent = SimpleNamespace(session=None, _registered_tool_names=[])
+        with mcp_tool._lock:
+            saved_servers = dict(mcp_tool._servers)
+            saved_parallel = set(mcp_tool._parallel_safe_servers)
+            mcp_tool._servers.clear()
+            mcp_tool._servers["shared"] = incumbent
+            mcp_tool._mcp_server_origins["shared"] = "config"
+            mcp_tool._parallel_safe_servers.discard("shared")
+
+        reconnect = MagicMock()
+        try:
+            monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+            monkeypatch.setattr(
+                mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
+            )
+            monkeypatch.setattr(mcp_tool, "_signal_reconnect", reconnect)
+
+            mcp_tool.register_mcp_servers(
+                {
+                    "shared": {
+                        "command": "ignored",
+                        "supports_parallel_tool_calls": True,
+                    }
+                },
+                source="acp",
+            )
+
+            assert mcp_tool.get_mcp_server_registration_source("shared") == "config"
+            assert "shared" not in mcp_tool._parallel_safe_servers
+            reconnect.assert_not_called()
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.clear()
+                mcp_tool._servers.update(saved_servers)
+                mcp_tool._parallel_safe_servers.clear()
+                mcp_tool._parallel_safe_servers.update(saved_parallel)
+
+    def test_same_acp_source_requires_identical_server_config(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        run_calls = []
+        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr(
+            mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
+        )
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr(
+            mcp_tool,
+            "_run_on_mcp_loop",
+            lambda *args, **kwargs: run_calls.append(args),
+        )
+
+        first = {"url": "https://one.example/mcp", "headers": {"X-Key": "one"}}
+        different = {
+            "url": "https://one.example/mcp",
+            "headers": {"X-Key": "two"},
+            "supports_parallel_tool_calls": True,
+        }
+
+        mcp_tool.register_mcp_servers({"shared": first}, source="acp")
+        mcp_tool.register_mcp_servers({"shared": different}, source="acp")
+
+        assert len(run_calls) == 1
+        assert mcp_tool.mcp_server_registration_matches(
+            "shared", first, source="acp"
+        )
+        assert not mcp_tool.mcp_server_registration_matches(
+            "shared", different, source="acp"
+        )
+        assert "shared" not in mcp_tool._parallel_safe_servers
+
     def test_shutdown_clears_registration_reservations(self):
         import tools.mcp_tool as mcp_tool
 
@@ -3085,6 +3160,7 @@ class TestMCPPlatformPolicy:
             mcp_tool._server_connecting.add("inflight")
             mcp_tool._mcp_server_origins["stale"] = "config"
             mcp_tool._mcp_connecting_origins["inflight"] = "acp"
+            mcp_tool._mcp_server_registration_identities["inflight"] = "digest"
 
         with patch("tools.mcp_tool._stop_mcp_loop"):
             mcp_tool.shutdown_mcp_servers()
@@ -3093,6 +3169,33 @@ class TestMCPPlatformPolicy:
             assert not mcp_tool._server_connecting
             assert not mcp_tool._mcp_server_origins
             assert not mcp_tool._mcp_connecting_origins
+            assert not mcp_tool._mcp_server_registration_identities
+
+    def test_failed_acp_registration_releases_identity_reservation(
+        self, monkeypatch
+    ):
+        import tools.mcp_tool as mcp_tool
+
+        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr(
+            mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
+        )
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr(
+            mcp_tool,
+            "_run_on_mcp_loop",
+            MagicMock(side_effect=TimeoutError("timed out")),
+        )
+
+        with pytest.raises(TimeoutError):
+            mcp_tool.register_mcp_servers(
+                {"retryable": {"url": "https://one.example/mcp"}},
+                source="acp",
+            )
+
+        assert mcp_tool.get_mcp_server_registration_source("retryable") is None
+        with mcp_tool._lock:
+            assert "retryable" not in mcp_tool._mcp_server_registration_identities
 
     def test_schema_filter_failure_preserves_native_and_drops_mcp(self, monkeypatch):
         import tools.mcp_tool as mcp_tool

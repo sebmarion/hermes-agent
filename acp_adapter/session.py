@@ -170,6 +170,11 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    # Canonical toolset labels added specifically for the most recent ACP MCP
+    # list.  This is intentionally session-local and ephemeral: a later
+    # explicit empty/shrunk list can revoke only its own aliases without
+    # removing native or config-owned toolsets with similar names.
+    acp_mcp_toolset_aliases: set[str] = field(default_factory=set)
 
 
 class SessionManager:

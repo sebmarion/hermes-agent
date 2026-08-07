@@ -611,11 +611,102 @@ class TestRegisterSessionMcpServers:
 
     @pytest.mark.asyncio
     async def test_noop_when_no_servers(self, agent, mock_manager):
-        """No-op when mcp_servers is None or empty."""
+        """An omitted MCP list leaves the existing session policy unchanged."""
         state = mock_manager.create_session(cwd="/tmp")
-        # Should not raise
+        state.agent.enabled_toolsets = ["hermes-acp", "mcp-old"]
+        state.acp_mcp_toolset_aliases = {"mcp-old"}
         await agent._register_session_mcp_servers(state, None)
-        await agent._register_session_mcp_servers(state, [])
+        assert state.agent.enabled_toolsets == ["hermes-acp", "mcp-old"]
+        assert state.acp_mcp_toolset_aliases == {"mcp-old"}
+
+    @pytest.mark.asyncio
+    async def test_explicit_empty_revokes_only_prior_acp_aliases(
+        self, agent, mock_manager
+    ):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.enabled_toolsets = [
+            "hermes-acp",
+            "terminal",
+            "mcp-config",
+            "mcp-old",
+        ]
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+        state.acp_mcp_toolset_aliases = {"mcp-old"}
+
+        with patch("model_tools.get_tool_definitions", return_value=[]) as mock_defs:
+            await agent._register_session_mcp_servers(state, [])
+
+        assert state.agent.enabled_toolsets == [
+            "hermes-acp",
+            "terminal",
+            "mcp-config",
+        ]
+        assert state.acp_mcp_toolset_aliases == set()
+        mock_defs.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_shrink_reconciles_prior_acp_aliases_and_preserves_others(
+        self, agent, mock_manager
+    ):
+        from acp.schema import McpServerStdio
+
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.enabled_toolsets = [
+            "hermes-acp",
+            "mcp-config",
+            "mcp-old",
+            "mcp-keep",
+        ]
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+        state.acp_mcp_toolset_aliases = {"mcp-old", "mcp-keep"}
+        keep = McpServerStdio(name="keep", command="/bin/keep", args=[], env=[])
+
+        with (
+            patch("tools.mcp_tool.register_mcp_servers", return_value=[]),
+            patch(
+                "tools.mcp_tool.mcp_server_registration_matches",
+                return_value=True,
+            ),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+        ):
+            await agent._register_session_mcp_servers(state, [keep])
+
+        assert state.agent.enabled_toolsets == [
+            "hermes-acp",
+            "mcp-config",
+            "mcp-keep",
+        ]
+        assert state.acp_mcp_toolset_aliases == {"mcp-keep"}
+
+    @pytest.mark.asyncio
+    async def test_registration_failure_still_revokes_prior_acp_aliases(
+        self, agent, mock_manager
+    ):
+        from acp.schema import McpServerStdio
+
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.enabled_toolsets = ["hermes-acp", "terminal", "mcp-old"]
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+        state.acp_mcp_toolset_aliases = {"mcp-old"}
+        bad = McpServerStdio(name="bad", command="/missing", args=[], env=[])
+
+        with (
+            patch(
+                "tools.mcp_tool.register_mcp_servers",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+        ):
+            await agent._register_session_mcp_servers(state, [bad])
+
+        assert state.agent.enabled_toolsets == ["hermes-acp", "terminal"]
+        assert state.acp_mcp_toolset_aliases == set()
 
     @pytest.mark.asyncio
     async def test_registers_stdio_servers(self, agent, mock_manager):
@@ -688,7 +779,7 @@ class TestRegisterSessionMcpServers:
         ]
 
         with patch("tools.mcp_tool.register_mcp_servers", return_value=["mcp_srv_search"]), \
-             patch("tools.mcp_tool.get_mcp_server_registration_source", return_value="acp"), \
+             patch("tools.mcp_tool.mcp_server_registration_matches", return_value=True), \
              patch("model_tools.get_tool_definitions", return_value=fake_tools) as mock_defs:
             await agent._register_session_mcp_servers(state, [server])
 
@@ -728,14 +819,14 @@ class TestRegisterSessionMcpServers:
         state.agent.disabled_toolsets = None
         state.agent.tools = []
         state.agent.valid_tool_names = set()
+        state.acp_mcp_toolset_aliases = {"mcp-srv"}
         server = McpServerStdio(name="srv", command="/bin/test", args=[], env=[])
 
         with (
             patch("tools.mcp_tool.register_mcp_servers", return_value=[]),
             patch(
-                "tools.mcp_tool.get_mcp_server_registration_source",
-                return_value="config",
-                create=True,
+                "tools.mcp_tool.mcp_server_registration_matches",
+                return_value=False,
             ),
             patch("model_tools.get_tool_definitions", return_value=[]) as mock_defs,
         ):

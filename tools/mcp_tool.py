@@ -94,6 +94,7 @@ import contextvars
 import concurrent.futures
 import errno
 import fnmatch
+import hashlib
 import inspect
 import json
 import logging
@@ -4244,6 +4245,12 @@ _mcp_tool_server_origins: Dict[str, str] = {}
 _mcp_server_origins: Dict[str, str] = {}
 _mcp_connecting_origins: Dict[str, str] = {}
 
+# Immutable connection identity paired with each live or in-flight server
+# reservation.  Source alone is insufficient for ACP: two editor sessions can
+# submit the same public name for different endpoints, and the second must not
+# silently inherit the first session's connection.
+_mcp_server_registration_identities: Dict[str, str] = {}
+
 # Short-lived cache for GitNexus repository discovery. Repository identity is
 # stable during a normal coding turn, while the TTL keeps manual re-indexing
 # and multi-project sessions from serving stale data indefinitely.
@@ -5939,6 +5946,57 @@ def _forget_mcp_tool_server(tool_name: str) -> None:
         _mcp_tool_server_origins.pop(tool_name, None)
 
 
+def _clear_lazy_mcp_registrations() -> None:
+    """Drop every in-memory registration restored from the schema cache.
+
+    Lazy servers have no ``MCPServerTask`` for ``shutdown()`` to clean up, so
+    their registry entries and provenance must be removed explicitly during a
+    full bridge shutdown.  Snapshot the ownership tuple before releasing the
+    MCP state lock, then validate both the registry toolset and provenance at
+    deletion time so an unrelated replacement is never removed.
+    """
+    with _lock:
+        lazy_servers = (
+            set(_lazy_server_configs)
+            | set(_lazy_server_fingerprints)
+            | set(_lazy_server_tool_names)
+        )
+        lazy_tools = [
+            (
+                server_name,
+                tool_name,
+                _mcp_tool_server_origins.get(tool_name),
+            )
+            for server_name, tool_names in _lazy_server_tool_names.items()
+            for tool_name in tool_names
+        ]
+        _lazy_server_configs.clear()
+        _lazy_server_fingerprints.clear()
+        _lazy_server_tool_names.clear()
+        _parallel_safe_servers.difference_update(lazy_servers)
+
+    from tools.registry import registry
+
+    for server_name, tool_name, source in lazy_tools:
+        with _lock:
+            still_owned = (
+                _mcp_tool_server_names.get(tool_name) == server_name
+                and _mcp_tool_server_origins.get(tool_name) == source
+            )
+        if (
+            still_owned
+            and registry.get_toolset_for_tool(tool_name) == f"mcp-{server_name}"
+        ):
+            registry.deregister(tool_name)
+        with _lock:
+            if (
+                _mcp_tool_server_names.get(tool_name) == server_name
+                and _mcp_tool_server_origins.get(tool_name) == source
+            ):
+                _mcp_tool_server_names.pop(tool_name, None)
+                _mcp_tool_server_origins.pop(tool_name, None)
+
+
 def get_mcp_tool_server_name(tool_name: str) -> Optional[str]:
     """Return the exact raw server name that registered an MCP tool."""
     with _lock:
@@ -5950,6 +6008,50 @@ def get_mcp_server_registration_source(server_name: str) -> Optional[str]:
     with _lock:
         return _mcp_server_origins.get(server_name) or _mcp_connecting_origins.get(
             server_name
+        )
+
+
+def _mcp_server_config_identity(config: dict) -> Optional[str]:
+    """Return a stable, secret-safe identity for one complete server config."""
+    if not isinstance(config, dict):
+        return None
+    try:
+        encoded = json.dumps(
+            config,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def mcp_server_registration_matches(
+    server_name: str,
+    config: dict,
+    *,
+    source: str,
+) -> bool:
+    """Return whether *source* owns *server_name* with exactly *config*.
+
+    This is the acceptance check used by session-scoped callers after the
+    process-global registration attempt.  Missing identity is a denial, never
+    permission to reuse a possibly unrelated endpoint.
+    """
+    normalized_source = source if source in {"config", "acp"} else "external"
+    expected_identity = _mcp_server_config_identity(config)
+    if expected_identity is None:
+        return False
+    with _lock:
+        registration_source = _mcp_server_origins.get(
+            server_name
+        ) or _mcp_connecting_origins.get(server_name)
+        return (
+            registration_source == normalized_source
+            and _mcp_server_registration_identities.get(server_name)
+            == expected_identity
         )
 
 
@@ -6520,6 +6622,8 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             _server_connecting.discard(name)
             if adopted:
                 _mcp_server_origins.setdefault(name, registration_source)
+            else:
+                _mcp_server_registration_identities.pop(name, None)
         raise
     finally:
         _connect_server_claim.reset(claim_token)
@@ -6582,8 +6686,11 @@ def register_mcp_servers(
     # from multiple entry-points before the first batch finishes (#58862).
     normalized_source = source if source in {"config", "acp"} else "external"
     source_conflicts: List[str] = []
+    identity_conflicts: List[str] = []
     with _lock:
         new_servers: Dict[str, dict] = {}
+        new_identities: Dict[str, str] = {}
+        owned_existing: set[str] = set()
         for name, server_cfg in servers.items():
             if not isinstance(server_cfg, dict):
                 continue
@@ -6599,28 +6706,53 @@ def register_mcp_servers(
                 or existing_source is not None
             )
             if already_owned:
-                if existing_source and existing_source != normalized_source:
+                if existing_source == normalized_source or (
+                    existing_source is None and normalized_source == "external"
+                ):
+                    identity = _mcp_server_config_identity(server_cfg)
+                    existing_identity = _mcp_server_registration_identities.get(
+                        name
+                    )
+                    if normalized_source != "acp" or (
+                        identity is not None and identity == existing_identity
+                    ):
+                        owned_existing.add(name)
+                    else:
+                        identity_conflicts.append(name)
+                elif existing_source and existing_source != normalized_source:
                     source_conflicts.append(name)
                 continue
             if _connect_cooldown_active(name):
                 continue
+            identity = _mcp_server_config_identity(server_cfg)
+            if normalized_source == "acp" and identity is None:
+                identity_conflicts.append(name)
+                continue
             new_servers[name] = server_cfg
+            if identity is not None:
+                new_identities[name] = identity
         # Cached entries with no live session are parked or mid-reconnect.
         # Their tools are deregistered, so nothing else can reach
         # _signal_reconnect — without this nudge a new session silently
         # waits up to _PARKED_RETRY_INTERVAL for the next self-probe
         # (#50170). Wake them now so their tools come back promptly.
+        accepted_names = set(new_servers) | owned_existing
         stale_cached = [
             _servers[k]
-            for k in servers
+            for k in accepted_names
             if k in _servers and getattr(_servers[k], "session", None) is None
         ]
         _server_connecting.update(new_servers)
         for srv_name in new_servers:
             _mcp_connecting_origins[srv_name] = normalized_source
+            if srv_name in new_identities:
+                _mcp_server_registration_identities[srv_name] = new_identities[
+                    srv_name
+                ]
             _server_connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
-        for srv_name, srv_cfg in servers.items():
+        for srv_name in accepted_names:
+            srv_cfg = servers[srv_name]
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
                 _parallel_safe_servers.add(srv_name)
             else:
@@ -6632,6 +6764,13 @@ def register_mcp_servers(
             "refusing %s registration: %s",
             normalized_source,
             ", ".join(sorted(source_conflicts)),
+        )
+    if identity_conflicts:
+        logger.warning(
+            "MCP server name(s) already owned with a different or invalid "
+            "connection identity; refusing %s registration: %s",
+            normalized_source,
+            ", ".join(sorted(identity_conflicts)),
         )
 
     for srv in stale_cached:
@@ -6711,6 +6850,8 @@ def register_mcp_servers(
                 with _lock:
                     _server_connecting.discard(name)
                     _mcp_connecting_origins.pop(name, None)
+                    if name not in _servers and name not in _lazy_server_configs:
+                        _mcp_server_registration_identities.pop(name, None)
                     _server_connect_errors[name] = message
                     # Arm the per-server backoff so the next discovery pass
                     # doesn't immediately re-spawn this failing server
@@ -6759,6 +6900,8 @@ def register_mcp_servers(
                 _server_connecting.difference_update(stale)
                 for _sn in stale:
                     _mcp_connecting_origins.pop(_sn, None)
+                    if _sn not in _servers and _sn not in _lazy_server_configs:
+                        _mcp_server_registration_identities.pop(_sn, None)
                     _server_connect_errors.setdefault(
                         _sn,
                         f"Connection attempt {'timed out' if isinstance(_e, TimeoutError) else 'interrupted'} during discovery",
@@ -7289,10 +7432,12 @@ def shutdown_mcp_servers():
     # entries exist. Clear them so a post-shutdown restart re-attempts every
     # configured server immediately.
     if not servers_snapshot:
+        _clear_lazy_mcp_registrations()
         with _lock:
             _server_connecting.clear()
             _mcp_server_origins.clear()
             _mcp_connecting_origins.clear()
+            _mcp_server_registration_identities.clear()
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
         _stop_mcp_loop()
@@ -7313,6 +7458,7 @@ def shutdown_mcp_servers():
             _server_connecting.clear()
             _mcp_server_origins.clear()
             _mcp_connecting_origins.clear()
+            _mcp_server_registration_identities.clear()
             # Drop connect-retry cooldowns too: a full shutdown/restart
             # should re-attempt every server immediately, not honour a
             # stale per-server backoff from before the restart (#50394).
@@ -7338,10 +7484,12 @@ def shutdown_mcp_servers():
     # timed out, or was never scheduled (loop already stopped), a full
     # shutdown must leave no stale connect-cooldown state behind — the
     # next start should re-attempt every server immediately (#50394).
+    _clear_lazy_mcp_registrations()
     with _lock:
         _server_connecting.clear()
         _mcp_server_origins.clear()
         _mcp_connecting_origins.clear()
+        _mcp_server_registration_identities.clear()
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
 

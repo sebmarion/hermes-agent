@@ -64,6 +64,41 @@ class TestPerJobToolsetMcpMerge:
 
         assert _merge_mcp_into_per_job_toolsets(["web", "cli-only"], cfg) == ["web"]
 
+    def test_explicit_disallowed_mcp_does_not_enable_other_cron_servers(self):
+        cfg = {
+            "mcp_servers": {
+                "cli-only": {"enabled": True, "allowed_platforms": ["cli"]},
+                "cron-only": {"enabled": True, "allowed_platforms": ["cron"]},
+            }
+        }
+
+        assert _merge_mcp_into_per_job_toolsets(["web", "cli-only"], cfg) == [
+            "web"
+        ]
+
+    def test_mcp_raw_name_collision_does_not_strip_native_cron_toolset(self):
+        cfg = {
+            "mcp_servers": {
+                "web": {"enabled": True, "allowed_platforms": ["cli"]},
+            }
+        }
+
+        assert _merge_mcp_into_per_job_toolsets(
+            ["web", "terminal", "no_mcp"], cfg
+        ) == ["web", "terminal"]
+
+    def test_mcp_native_name_collision_uses_prefixed_cron_alias(self):
+        cfg = {
+            "mcp_servers": {
+                "web": {"enabled": True, "allowed_platforms": ["cron"]},
+            }
+        }
+
+        assert _merge_mcp_into_per_job_toolsets(["terminal"], cfg) == [
+            "terminal",
+            "mcp-web",
+        ]
+
     def test_no_mcp_sentinel_opts_out_and_is_stripped(self):
         result = _merge_mcp_into_per_job_toolsets(["web", "no_mcp"], self.CFG)
         assert result == ["web"]

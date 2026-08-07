@@ -1469,6 +1469,7 @@ export interface McpServer {
   env: Record<string, string>;
   auth: "header" | "oauth" | null;
   enabled: boolean;
+  allowed_platforms: string[] | null;
   tools: string[] | null;
 }
 
@@ -1512,6 +1513,7 @@ export interface McpServerCreate {
   env?: Record<string, string>;
   auth?: McpHttpAuth;
   bearer_token?: string;
+  allowed_platforms?: string[];
 }
 
 export interface McpTestResult {

@@ -12025,6 +12025,19 @@ def _normalize_mcp_server_create(
         raise ValueError(f"Unsupported auth mode: {auth}")
 
     server_config: Dict[str, Any] = {}
+    if body.allowed_platforms is not None:
+        if not body.allowed_platforms:
+            raise ValueError("allowed_platforms must be a non-empty list")
+        normalized_platforms: List[str] = []
+        for platform in body.allowed_platforms:
+            if not isinstance(platform, str) or not platform.strip():
+                raise ValueError(
+                    "allowed_platforms entries must be non-empty strings"
+                )
+            normalized = platform.strip().lower()
+            if normalized not in normalized_platforms:
+                normalized_platforms.append(normalized)
+        server_config["allowed_platforms"] = normalized_platforms
     if url:
         if body.args:
             raise ValueError("Arguments are only supported for stdio MCP servers")
@@ -12088,6 +12101,8 @@ def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         "env": _redact_mcp_env(cfg.get("env") or {}),
         "auth": auth,
         "enabled": cfg.get("enabled", True) is not False,
+        # Runtime-surface allowlist; None means unrestricted.
+        "allowed_platforms": cfg.get("allowed_platforms"),
         # Tool selection: list of enabled tool names, or None = all.
         "tools": cfg.get("tools"),
     }

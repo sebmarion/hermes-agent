@@ -27,6 +27,9 @@ def _reset_mcp_state():
         old_tool_origins = dict(mcp._mcp_tool_server_origins)
         old_server_origins = dict(mcp._mcp_server_origins)
         old_connecting_origins = dict(mcp._mcp_connecting_origins)
+        old_registration_identities = dict(
+            mcp._mcp_server_registration_identities
+        )
     yield
     with mcp._lock:
         for mapping, saved in (
@@ -38,6 +41,10 @@ def _reset_mcp_state():
             (mcp._mcp_tool_server_origins, old_tool_origins),
             (mcp._mcp_server_origins, old_server_origins),
             (mcp._mcp_connecting_origins, old_connecting_origins),
+            (
+                mcp._mcp_server_registration_identities,
+                old_registration_identities,
+            ),
         ):
             mapping.clear()
             mapping.update(saved)
@@ -126,6 +133,63 @@ class TestLazyMcpRegistration:
 
         assert captured["source"] == "config"
         assert mcp.get_mcp_server_registration_source("playwright") == "config"
+
+    def test_full_shutdown_clears_lazy_registration_for_source_transfer(self):
+        from tools.registry import registry
+
+        tool_name = "mcp__playwright__browser_navigate"
+        registry.register(
+            name=tool_name,
+            toolset="mcp-playwright",
+            schema={
+                "name": tool_name,
+                "description": "Navigate",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda *_args, **_kwargs: "{}",
+        )
+        registry.register_toolset_alias("playwright", "mcp-playwright")
+        with mcp._lock:
+            mcp._servers.clear()
+            mcp._lazy_server_configs["playwright"] = _lazy_config()["playwright"]
+            mcp._lazy_server_fingerprints["playwright"] = "abc"
+            mcp._lazy_server_tool_names["playwright"] = [tool_name]
+            mcp._mcp_tool_server_names[tool_name] = "playwright"
+            mcp._mcp_tool_server_origins[tool_name] = "config"
+            mcp._mcp_server_origins["playwright"] = "config"
+            mcp._mcp_server_registration_identities["playwright"] = "old"
+
+        try:
+            with patch("tools.mcp_tool._stop_mcp_loop"):
+                mcp.shutdown_mcp_servers()
+
+            with mcp._lock:
+                assert "playwright" not in mcp._lazy_server_configs
+                assert "playwright" not in mcp._lazy_server_fingerprints
+                assert "playwright" not in mcp._lazy_server_tool_names
+                assert tool_name not in mcp._mcp_tool_server_names
+                assert tool_name not in mcp._mcp_tool_server_origins
+                assert "playwright" not in mcp._mcp_server_registration_identities
+            assert tool_name not in registry.get_all_tool_names()
+
+            with (
+                patch("tools.mcp_tool._MCP_AVAILABLE", True),
+                patch(
+                    "tools.mcp_tool._filter_suspicious_mcp_servers",
+                    side_effect=lambda servers: servers,
+                ),
+                patch("tools.mcp_tool._ensure_mcp_loop"),
+                patch("tools.mcp_tool._run_on_mcp_loop") as mock_run,
+            ):
+                mcp.register_mcp_servers(
+                    {"playwright": {"command": "new-acp-server"}},
+                    source="acp",
+                )
+
+            mock_run.assert_called_once()
+            assert mcp.get_mcp_server_registration_source("playwright") == "acp"
+        finally:
+            registry.deregister(tool_name)
 
     def test_registers_from_cache_without_connect(self):
         config = _lazy_config()

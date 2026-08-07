@@ -306,6 +306,7 @@ block in `config.yaml` that `hermes mcp` reads from.
 **Your MCP servers:**
 
 - **Add** — register an HTTP/SSE server (URL) or a stdio server (command + args), with optional `KEY=VALUE` environment variables for stdio servers
+- **Runtime policy** — API clients may set `allowed_platforms` to a non-empty list such as `["cli", "cron"]`; omit it to leave the server unrestricted
 - **Enable / disable** — toggle a server on or off without deleting it. A disabled server stays in config so you can re-enable it later. Takes effect on the next gateway restart.
 - **Test** — connect to a server, list its tools, and disconnect — verifies the connection before the agent depends on it
 - **Remove** — delete a server from the config
@@ -514,8 +515,8 @@ same auth gate as the rest of `/api/`.
 
 | Method & path | Purpose |
 |---------------|---------|
-| `GET /api/mcp/servers` | List configured MCP servers (env values redacted) |
-| `POST /api/mcp/servers` | Add a server. Body: `{name, url?, command?, args?, env?, auth?}` |
+| `GET /api/mcp/servers` | List configured MCP servers (env values redacted), including `allowed_platforms` (`null` = unrestricted) |
+| `POST /api/mcp/servers` | Add a server. Body: `{name, url?, command?, args?, env?, auth?, allowed_platforms?}`; the policy must be a non-empty string list when present |
 | `POST /api/mcp/servers/{name}/test` | Connect, list tools, disconnect |
 | `PUT /api/mcp/servers/{name}/enabled` | Enable / disable a server |
 | `DELETE /api/mcp/servers/{name}` | Remove a server |
