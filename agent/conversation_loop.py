@@ -1207,7 +1207,7 @@ def _run_conversation(
             "BestPlan unavailable: " + str(outcome.get("error", "unknown error"))
         )
         agent._bestplan_receipt_metadata = {
-            "bestplan_receipt_version": 1,
+            "bestplan_receipt_version": 2,
             "run_id": outcome.get("run_id"),
             "body_sha256": outcome.get("body") and __import__("hashlib").sha256(outcome["body"].encode()).hexdigest(),
         }

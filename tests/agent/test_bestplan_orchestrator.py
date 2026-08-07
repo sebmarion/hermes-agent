@@ -67,10 +67,15 @@ def _synth_plan_envelope(*, workspace="/tmp/work", review=False):
 
 
 def _runtime_config(lanes, **overrides):
+    explorers = [
+        {key: lane[key] for key in _REQUIRED_LANE_KEYS}
+        for lane in lanes
+    ]
     config = {
-        "lanes": lanes,
-        "explorer_timeout": 0.05,
-        "synthesizer_timeout": 0.05,
+        "explorers": explorers,
+        "synthesizer": explorers[-1]["name"],
+        "explorer_timeout": 1.0,
+        "synthesizer_timeout": 1.0,
         "overall_timeout": 2.0,
     }
     config.update(overrides)
@@ -95,12 +100,12 @@ def test_count_and_quorum():
 
 
 def _default_lanes_by_name() -> dict:
-    return {lane["name"]: lane for lane in DEFAULT_RUNTIME["lanes"]}
+    return {lane["name"]: lane for lane in DEFAULT_RUNTIME["explorers"]}
 
 
 def test_default_runtime_has_one_validated_lane():
     """DEFAULT_RUNTIME uses the remaining supported Codex lane."""
-    lanes = DEFAULT_RUNTIME["lanes"]
+    lanes = DEFAULT_RUNTIME["explorers"]
     assert len(lanes) == 1
     names = {lane["name"] for lane in lanes}
     assert names == {"sol"}
@@ -113,8 +118,9 @@ def test_default_runtime_has_one_validated_lane():
 def test_validate_runtime_accepts_default_config():
     """validate_runtime() with no config must succeed (uses DEFAULT_RUNTIME)."""
     cfg = validate_runtime()
-    assert len(cfg["lanes"]) == 1
-    assert {lane["name"] for lane in cfg["lanes"]} == {"sol"}
+    assert len(cfg["explorers"]) == 1
+    assert {lane["name"] for lane in cfg["explorers"]} == {"sol"}
+    assert cfg["synthesizer"] == "sol"
 
 
 def test_validate_runtime_accepts_config_lanes_with_arbitrary_models():
@@ -126,15 +132,16 @@ def test_validate_runtime_accepts_config_lanes_with_arbitrary_models():
         {"name": "sol", "provider": "openai-codex", "model": "gpt-6-sol",
          "api_mode": "codex_app_server", "reasoning_effort": "ultra"},
     ]
-    cfg = validate_runtime({"lanes": custom_lanes})
-    assert cfg["lanes"][0]["model"] == "glm-5.3-fast"
-    assert cfg["lanes"][1]["model"] == "gpt-6-sol"
+    cfg = validate_runtime({"explorers": custom_lanes, "synthesizer": "sol"})
+    assert cfg["explorers"][0]["model"] == "glm-5.3-fast"
+    assert cfg["explorers"][1]["model"] == "gpt-6-sol"
 
 
-def test_validate_runtime_accepts_mapping_lanes():
-    """YAML mappings such as {glm: {...}, sol: {...}} normalize to named lanes."""
-    cfg = validate_runtime({
-        "lanes": {
+def test_validate_runtime_rejects_legacy_mapping_lanes():
+    """Only the canonical ordered explorer list is accepted."""
+    try:
+        validate_runtime({
+            "lanes": {
             "primary": {
                 "provider": "provider-a",
                 "model": "model-a",
@@ -147,9 +154,12 @@ def test_validate_runtime_accepts_mapping_lanes():
                 "api_mode": "chat_completions",
                 "reasoning_effort": "medium",
             },
-        }
-    })
-    assert [lane["name"] for lane in cfg["lanes"]] == ["primary", "secondary"]
+            }
+        })
+    except BestPlanUnavailable:
+        pass
+    else:
+        raise AssertionError("legacy mapping lanes were accepted")
 
 
 def test_lane_credentials_forward_explicit_overrides(monkeypatch):
@@ -252,7 +262,7 @@ def test_sol_ultra_requires_codex_app_server():
          "api_mode": "codex_responses", "reasoning_effort": "ultra"},
     ]
     try:
-        validate_runtime({"lanes": bad_lanes})
+        validate_runtime({"explorers": bad_lanes, "synthesizer": "sol"})
     except BestPlanUnavailable as exc:
         assert "codex_app_server" in str(exc)
         return
@@ -263,7 +273,7 @@ def test_empty_lane_count_rejected():
     """An empty lane list must raise BestPlanUnavailable."""
     empty_lanes = []
     try:
-        validate_runtime({"lanes": empty_lanes})
+        validate_runtime({"explorers": empty_lanes, "synthesizer": "sol"})
     except BestPlanUnavailable:
         pass
     else:
@@ -272,8 +282,8 @@ def test_empty_lane_count_rejected():
 
 def test_single_lane_is_valid():
     """A single configured lane is valid; runtime availability is separate."""
-    lane = [{"name": "top", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h"}]
-    assert validate_runtime({"lanes": lane})["lanes"] == lane
+    lane = [{"name": "top", "provider": "p", "model": "m", "api_mode": "chat_completions", "reasoning_effort": "high"}]
+    assert validate_runtime({"explorers": lane, "synthesizer": "top"})["explorers"] == lane
 
 
 def test_missing_required_lane_key_rejected():
@@ -283,7 +293,7 @@ def test_missing_required_lane_key_rejected():
         {"name": "sol", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h"},
     ]
     try:
-        validate_runtime({"lanes": bad_lanes})
+        validate_runtime({"explorers": bad_lanes, "synthesizer": "sol"})
     except BestPlanUnavailable as exc:
         assert "reasoning_effort" in str(exc) or "missing" in str(exc)
         return
@@ -293,10 +303,10 @@ def test_missing_required_lane_key_rejected():
 def test_lane_names_are_config_owned():
     """BestPlan accepts arbitrary lane names; provider resolution owns activity."""
     lanes = [
-        {"name": "fast", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h"},
-        {"name": "slow", "provider": "p", "model": "m", "api_mode": "c", "reasoning_effort": "h"},
+        {"name": "fast", "provider": "p", "model": "m", "api_mode": "chat_completions", "reasoning_effort": "high"},
+        {"name": "slow", "provider": "p", "model": "m", "api_mode": "chat_completions", "reasoning_effort": "high"},
     ]
-    assert validate_runtime({"lanes": lanes})["lanes"] == lanes
+    assert validate_runtime({"explorers": lanes, "synthesizer": "slow"})["explorers"] == lanes
 
 
 def _record(name, provider, model, index, priority):
@@ -510,7 +520,7 @@ def test_strict_v1_envelope_accepts_only_executable_implementation_or_review():
     assert _validated_plan_envelope(mixed_body, workspace="/tmp/work") is None
 
 
-def test_synthesis_fails_over_all_resolved_same_provider_lanes(monkeypatch, tmp_path):
+def test_synthesis_uses_only_named_lane_without_failover(monkeypatch, tmp_path):
     import agent.bestplan_orchestrator as orchestrator
     import run_agent
 
@@ -564,17 +574,17 @@ def test_synthesis_fails_over_all_resolved_same_provider_lanes(monkeypatch, tmp_
         SimpleNamespace(session_id="parent"),
         "plan it",
         count=5,
-        config=_runtime_config(lanes, synthesizer_timeout=0.02),
+        config=_runtime_config(lanes),
     )
 
-    assert result["status"] == "completed"
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "synthesizer_failed"
     assert result["provider_mode"] == "single_provider_moe"
     assert result["successes"] == 3
-    assert synth_models == ["exception", "timeout", "empty", "invalid", "valid"]
-    assert result["runtime"]["lane"] == "valid"
+    assert synth_models == ["exception"]
 
 
-def test_repairs_last_nonempty_codex_invalid_on_first_resolved_no_tools_lane(
+def test_codex_synthesizer_does_not_repair_on_an_alternate_lane(
     monkeypatch, tmp_path
 ):
     import agent.bestplan_orchestrator as orchestrator
@@ -638,30 +648,15 @@ def test_repairs_last_nonempty_codex_invalid_on_first_resolved_no_tools_lane(
         config=_runtime_config(lanes),
     )
 
-    repair_calls = [(model, prompt) for model, prompt in calls if "BestPlan envelope repair" in prompt]
-    assert len(repair_calls) == 1
-    repair_model, repair_prompt = repair_calls[0]
-    assert repair_model == "repair-model"
-    assert "LAST NONEMPTY INVALID" in repair_prompt
-    assert "Do not use tools" in repair_prompt
-    assert instances[-1].kwargs["enabled_toolsets"] == []
-    assert instances[-1].tools == []
-    assert instances[-1].valid_tool_names == set()
-    assert instances[-1]._kanban_worker_guidance == ""
-    assert result["status"] == "completed"
-    assert result["runtime"] == {
-        "lane": "repairable",
-        "provider": "resolved-provider-a",
-        "model": "repair-model",
-        "api_mode": "chat_completions",
-    }
-    receipt = json.loads(result["final_response"].splitlines()[1])
-    assert (receipt["lane"], receipt["provider"], receipt["model"], receipt["api_mode"]) == (
-        "repairable",
-        "resolved-provider-a",
-        "repair-model",
-        "chat_completions",
-    )
+    repair_calls = [
+        (model, prompt)
+        for model, prompt in calls
+        if "BestPlan envelope repair" in prompt
+    ]
+    assert repair_calls == []
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "synthesizer_failed"
+    assert result["attempts"]
 
 
 def test_repair_stays_on_invalid_no_tools_lane_and_attempts_once(monkeypatch):
@@ -933,7 +928,7 @@ def test_synth_transport_close_runs_on_its_owner_thread(monkeypatch):
 
 
 def test_run_bestplan_single_provider_uses_three_top_model_instances(monkeypatch, tmp_path):
-    """Live orchestration keeps one-provider MoE resilient below quorum."""
+    """Single-provider mode runs exactly three replicas and requires quorum."""
     import agent.bestplan_orchestrator as orchestrator
     import run_agent
 
@@ -971,25 +966,56 @@ def test_run_bestplan_single_provider_uses_three_top_model_instances(monkeypatch
         "plan this test",
         count=5,
         config={
-            "lanes": [
-                {"name": "small", "provider": "provider-a", "model": "small", "api_mode": "chat_completions", "reasoning_effort": "high", "priority": 1},
-                {"name": "top", "provider": "provider-a", "model": "top", "api_mode": "chat_completions", "reasoning_effort": "high", "priority": 2},
-            ]
+            "explorers": [
+                {"name": "small", "provider": "provider-a", "model": "small", "api_mode": "chat_completions", "reasoning_effort": "high"},
+                {"name": "top", "provider": "provider-a", "model": "top", "api_mode": "chat_completions", "reasoning_effort": "high"},
+            ],
+            "synthesizer": "top",
         },
     )
 
-    assert outcome["status"] == "completed"
+    assert outcome["status"] == "failed"
     assert outcome["provider_mode"] == "single_provider_moe"
-    assert outcome["active_providers"] == 1
     assert outcome["successes"] == 1
-    assert outcome["degraded"] is True
-    assert len(calls) == 4  # three explorers + one synthesizer
+    assert outcome["reason_code"] == "quorum_unavailable"
+    assert len(calls) == 4  # one synth preflight + three explorers
     assert {call["model"] for call in calls} == {"top"}
 
 
 def test_receipt_has_canonical_markers_and_hash():
     body = "plan body"
-    receipt = make_receipt("run-1", model="gpt-5.6-sol", quorum="3/3", synth_status="success", body=body, lane="sol")
+    attempts = [
+        {
+            "index": index,
+            "strategy": "evidence-first",
+            "explorer": "sol",
+            "configured": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            "resolved": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            "status": "success",
+            "reason_code": None,
+        }
+        for index in range(3)
+    ]
+    synthesizer = {
+        "name": "sol",
+        "configured": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "resolved": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "status": "success",
+        "reason_code": None,
+    }
+    receipt = make_receipt(
+        "run-1",
+        model="gpt-5.6-sol",
+        quorum="3/3",
+        synth_status="success",
+        body=body,
+        lane="sol",
+        requested_count=3,
+        effective_count=3,
+        quorum_required=2,
+        attempts=attempts,
+        synthesizer=synthesizer,
+    )
     assert receipt.startswith(RECEIPT_BEGIN)
     assert receipt.endswith(RECEIPT_END)
     assert validate_receipt(receipt, body)

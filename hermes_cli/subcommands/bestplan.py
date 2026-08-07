@@ -1,6 +1,6 @@
 """``hermes bestplan`` subcommand parser.
 
-Read-only view of the configured BestPlan SOTA lanes plus validation.
+Read-only view of the configured BestPlan explorers plus validation.
 The orchestrator code lives in ``agent.bestplan_orchestrator``; this CLI
 surface lets the operator inspect and validate the active configuration
 without running an actual ``/bestplan``.
@@ -19,12 +19,14 @@ def build_bestplan_parser(subparsers, *, cmd_bestplan: Callable) -> None:
     """Attach the ``bestplan`` subcommand to ``subparsers``."""
     bestplan_parser = subparsers.add_parser(
         "bestplan",
-        help="Inspect BestPlan SOTA lane configuration",
+        help="Inspect BestPlan explorer configuration",
         description=(
-            "View and validate the heterogeneous intelligence lanes that "
+            "View and validate the configured explorer pool and named "
+            "synthesizer that "
             "the /bestplan orchestration uses for explorer dispatch and "
-            "synthesis.  Lane definitions live in config.yaml under "
-            "'bestplan.lanes'.\n\n"
+            "synthesis. Explorer definitions live in config.yaml under "
+            "'bestplan.explorers', with 'bestplan.synthesizer' naming one "
+            "configured explorer.\n\n"
             "This is a read-only view — update config.yaml directly to "
             "change the active SOTA models."
         ),
@@ -51,9 +53,7 @@ def cmd_bestplan(args) -> int:
         return 1
 
     from hermes_cli.config import load_config
-    from agent.bestplan_orchestrator import (
-        BestPlanUnavailable, DEFAULT_RUNTIME, normalize_lanes, validate_runtime,
-    )
+    from agent.bestplan_orchestrator import BestPlanUnavailable, validate_runtime
 
     config = None
     try:
@@ -61,32 +61,20 @@ def cmd_bestplan(args) -> int:
     except Exception:
         pass
 
-    # Resolve lanes: config overrides default
-    resolved = dict(DEFAULT_RUNTIME)
-    if config is not None:
-        if not isinstance(config, dict):
-            source = "config.yaml"
-            print(f"\n  BestPlan SOTA Lanes — source: {source}")
-            print("  Validation: FAIL — BestPlan config must be a mapping\n")
-            return 1
-        resolved.update(config)
-
     source = "config.yaml" if config is not None else "DEFAULT (no bestplan config block)"
     try:
-        lanes = normalize_lanes(resolved.get("lanes"))
-    except BestPlanUnavailable as exc:
-        print(f"\n  BestPlan SOTA Lanes — source: {source}")
-        print(f"  Validation: FAIL — {exc}\n")
+        resolved = validate_runtime(config)
+    except BestPlanUnavailable:
+        print(f"\n  BestPlan SOTA Explorers — source: {source}")
+        print("  Validation: FAIL — invalid BestPlan configuration\n")
         return 1
-    synthesizer = resolved.get("synthesizer", "strongest")
+    explorers = resolved["explorers"]
+    synthesizer = resolved["synthesizer"]
 
-    print(f"\n  BestPlan SOTA Lanes — source: {source}")
+    print(f"\n  BestPlan SOTA Explorers — source: {source}")
     print(f"  {'Name':<8} {'Provider':<22} {'Model':<20} {'API Mode':<22} {'Reasoning':<12}")
     print(f"  {'─'*8} {'─'*22} {'─'*20} {'─'*22} {'─'*12}")
-    for lane in lanes:
-        if not isinstance(lane, dict):
-            print(f"  <invalid lane: {lane!r}>")
-            continue
+    for lane in explorers:
         print(
             f"  {lane.get('name',''):<8} "
             f"{lane.get('provider',''):<22} "
@@ -94,13 +82,6 @@ def cmd_bestplan(args) -> int:
             f"{lane.get('api_mode',''):<22} "
             f"{lane.get('reasoning_effort',''):<12}"
         )
-    print(f"\n  Synthesizer: {synthesizer} (strongest available lane)")
-
-    # Validate
-    try:
-        validate_runtime(config)
-        print("  Validation: PASS\n")
-        return 0
-    except BestPlanUnavailable as exc:
-        print(f"  Validation: FAIL — {exc}\n")
-        return 1
+    print(f"\n  Synthesizer: {synthesizer}")
+    print("  Validation: PASS\n")
+    return 0

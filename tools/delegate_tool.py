@@ -2500,9 +2500,9 @@ def _run_single_child(
     # mutated the global. This is the correct parent toolset, not the child's.
     import model_tools
 
-    _saved_tool_names = getattr(
-        child, "_delegate_saved_tool_names", list(model_tools._last_resolved_tool_names)
-    )
+    _saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
+    if not isinstance(_saved_tool_names, list):
+        _saved_tool_names = model_tools.get_last_resolved_tool_names()
 
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
@@ -3202,7 +3202,7 @@ def _run_single_child(
 
         saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
         if isinstance(saved_tool_names, list):
-            model_tools._last_resolved_tool_names = list(saved_tool_names)
+            model_tools.set_last_resolved_tool_names(saved_tool_names)
 
         # Remove child from active tracking
 
@@ -3247,19 +3247,14 @@ def _run_single_child(
 
 _PARENT_FINALIZATION_LOCK_GUARD = threading.Lock()
 _PARENT_FINALIZATION_FALLBACK_LOCK = threading.RLock()
-_CHILD_CONSTRUCTION_LOCK = threading.RLock()
 
 
 def _build_child_preserving_parent_tools(**kwargs):
     """Build a child without leaking its resolved toolset into the parent."""
     import model_tools
 
-    with _CHILD_CONSTRUCTION_LOCK:
-        parent_tool_names = list(model_tools._last_resolved_tool_names)
-        try:
-            child = _build_child_agent(**kwargs)
-        finally:
-            model_tools._last_resolved_tool_names = parent_tool_names
+    with model_tools.preserve_last_resolved_tool_names() as parent_tool_names:
+        child = _build_child_agent(**kwargs)
     child._delegate_saved_tool_names = parent_tool_names
     return child
 
@@ -3676,7 +3671,7 @@ def delegate_task(
     # children partially spawned and preserves the selected route in errors.
     import model_tools as _model_tools
 
-    _parent_tool_names = list(_model_tools._last_resolved_tool_names)
+    _parent_tool_names = _model_tools.get_last_resolved_tool_names()
     task_specs = []
     for task_index, task in enumerate(task_list):
         lane_name = None
@@ -3917,7 +3912,7 @@ def delegate_task(
             children.append((i, t, child))
             child_models.append(task_creds.get("model"))
     finally:
-        _model_tools._last_resolved_tool_names = _parent_tool_names
+        _model_tools.set_last_resolved_tool_names(_parent_tool_names)
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
