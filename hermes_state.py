@@ -3906,7 +3906,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_branch: str = None,
         git_repo_root: str = None,
         replace_git_meta: bool = False,
-    ) -> None:
+        expected_cwd: str = None,
+        expected_started_at: float = None,
+    ) -> bool:
         """Persist the session working directory when a frontend knows it.
 
         ``git_branch`` records the git branch checked out in ``cwd`` at the time
@@ -3925,9 +3927,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         MOVE (re-homing a session into another project) must overwrite the old
         repo identity even when the new cwd resolves to none — keeping the stale
         root would leave the session grouped under the project it just left.
+
+        ``expected_cwd`` and ``expected_started_at`` make asynchronous metadata
+        enrichment a compare-and-set operation. A late worker must not rewrite a
+        session that has moved or a new row that reused the same session id.
         """
         if not session_id or not cwd:
-            return
+            return False
 
         branch = (git_branch or "").strip()
         repo_root = (git_repo_root or "").strip()
@@ -3940,12 +3946,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if repo_root or replace_git_meta:
             sets.append("git_repo_root = ?")
             params.append(repo_root or None)
+        predicates = ["id = ?"]
         params.append(session_id)
+        if expected_cwd is not None:
+            predicates.append("cwd = ?")
+            params.append(expected_cwd)
+        if expected_started_at is not None:
+            predicates.append("started_at = ?")
+            params.append(expected_started_at)
 
         def _do(conn):
-            conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params)
+            cursor = conn.execute(
+                f"UPDATE sessions SET {', '.join(sets)} "
+                f"WHERE {' AND '.join(predicates)}",
+                params,
+            )
+            return cursor.rowcount
 
-        self._execute_write(_do)
+        return bool(self._execute_write(_do))
 
     def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
         """Persist resolved git repo roots for cwds that don't have one yet.

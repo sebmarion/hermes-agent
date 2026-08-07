@@ -670,6 +670,7 @@ class AIAgent:
             return
         source = _session_source_for_agent(self.platform)
         try:
+            launch_cwd = _launch_cwd_for_session(source)
             try:
                 from hermes_cli.profiles import get_active_profile_name
                 _profile_for_session = get_active_profile_name()
@@ -698,9 +699,25 @@ class AIAgent:
                 system_prompt=self._cached_system_prompt,
                 user_id=None,
                 parent_session_id=self._parent_session_id,
-                cwd=_launch_cwd_for_session(source),
+                cwd=launch_cwd,
             )
             self._session_db_created = True
+            if launch_cwd:
+                try:
+                    from agent.session_workspace import persist_git_metadata_async
+
+                    created_session = self._session_db.get_session(self.session_id)
+                    persist_git_metadata_async(
+                        db_path=self._session_db.db_path,
+                        session_id=self.session_id,
+                        cwd=launch_cwd,
+                        session_started_at=(created_session or {}).get("started_at"),
+                    )
+                except Exception:
+                    logger.debug(
+                        "failed to dispatch session git metadata persistence",
+                        exc_info=True,
+                    )
             # Auto-archive delegate subagent sessions at row creation so they
             # never appear in any sidebar (desktop app, WebUI, CLI).
             if getattr(self, "_auto_archive_session", False):

@@ -7222,3 +7222,32 @@ class TestRequiredPolicyDispatchBoundary:
         assert len(post_calls) == 1
         assert post_calls[0][1]["error_type"] == "required_policy_block"
         assert json.loads(messages[0]["content"]) == block.to_result()
+
+
+def test_ensure_db_session_dispatches_git_metadata_without_blocking_startup(
+    agent, tmp_path
+):
+    workspace = str(tmp_path.resolve())
+    agent._session_db = MagicMock()
+    agent._session_db.db_path = tmp_path / "state.db"
+    agent._session_db.get_session.return_value = {"started_at": 123.0}
+    agent._session_db_created = False
+
+    with (
+        patch("run_agent._session_source_for_agent", return_value="cli"),
+        patch("run_agent._launch_cwd_for_session", return_value=workspace),
+        patch(
+            "agent.session_workspace.persist_git_metadata_async",
+            side_effect=RuntimeError("probe dispatch failed"),
+        ) as persist,
+    ):
+        agent._ensure_db_session()
+
+    assert agent._session_db_created is True
+    agent._session_db.create_session.assert_called_once()
+    persist.assert_called_once_with(
+        db_path=agent._session_db.db_path,
+        session_id=agent.session_id,
+        cwd=workspace,
+        session_started_at=123.0,
+    )
