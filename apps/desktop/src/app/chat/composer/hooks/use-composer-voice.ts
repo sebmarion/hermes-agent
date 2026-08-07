@@ -147,7 +147,7 @@ export function useComposerVoice({
     onStopWord: () => setVoiceConversationActive(false),
     onSubmit: submitVoiceTurn,
     onTranscribeAudio,
-    pendingResponse: pendingTurnResponse,
+    pendingResponse: pendingTurnResponse
   })
 
   // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup

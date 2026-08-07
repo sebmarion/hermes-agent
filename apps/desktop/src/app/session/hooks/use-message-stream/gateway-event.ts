@@ -616,6 +616,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           const header = idx && cnt ? `◇ Reference ${idx}/${cnt} — ${label}` : `◇ Reference — ${label}`
           const body = coerceThinkingText(payload?.text)
           const text = `${header}\n${body}\n\n`
+
           if (idx === undefined || idx <= 1) {
             // First reference: clear any stale reasoning left over from
             // before this turn's references start, same as before.
@@ -653,9 +654,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // block, so the progress trail is self-cleaning.
         if (sessionId && typeof payload?.refs_done === 'number' && typeof payload?.refs_total === 'number') {
           const label = coerceGatewayText(payload?.label)
+
           const line = label
             ? `◇ MoA refs ${payload.refs_done}/${payload.refs_total} — ${label}\n`
             : `◇ MoA refs ${payload.refs_done}/${payload.refs_total}\n`
+
           appendReasoningDelta(sessionId, line, payload.refs_done <= 1)
           flushQueuedDeltas(sessionId)
         }
@@ -688,12 +691,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // prompt, and vice versa.
         clearAllPrompts(sessionId)
         clearClarifyRequest(undefined, sessionId)
+
         // Turn ended without a final `todo` update — drop a still-unfinished
         // list so "Tasks N/M" doesn't stay pinned above the composer with the
         // last item stuck pending/in_progress. Finished lists keep their linger.
         if (!autoContinuing) {
           clearActiveSessionTodos(sessionId)
         }
+
         setSessionCompacting(sessionId, false)
 
         flushQueuedDeltas(sessionId)
@@ -704,6 +709,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
+
         const failure =
           payload?.status === 'error'
             ? {
@@ -711,6 +717,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
                 partial: payload.partial === true
               }
             : undefined
+
         completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure)
 
         // Structured billing wall forwarded by the gateway (out of credits /

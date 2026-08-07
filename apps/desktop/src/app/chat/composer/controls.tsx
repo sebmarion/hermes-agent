@@ -5,7 +5,18 @@ import { Codicon } from '@/components/ui/codicon'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { AudioLines, Ear, EarOff, iconSize, Layers3, Loader2, Square, SteeringWheel, Volume2, VolumeX } from '@/lib/icons'
+import {
+  AudioLines,
+  Ear,
+  EarOff,
+  iconSize,
+  Layers3,
+  Loader2,
+  Square,
+  SteeringWheel,
+  Volume2,
+  VolumeX
+} from '@/lib/icons'
 import { formatCombo } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
 import { $wakeWord, toggleWakeWord } from '@/store/wake-word'
@@ -129,7 +140,16 @@ export function ComposerControls({
       ) : (
         <Tip
           label={
-            submitting ? c.sending : busy ? <TipKeybindLabel actionId={busyAction === 'queue' ? 'composer.queue' : 'composer.send'} text={busyLabel} /> : <TipKeybindLabel actionId="composer.send" text={c.send} />
+            submitting ? (
+              c.sending
+            ) : busy ? (
+              <TipKeybindLabel
+                actionId={busyAction === 'queue' ? 'composer.queue' : 'composer.send'}
+                text={busyLabel}
+              />
+            ) : (
+              <TipKeybindLabel actionId="composer.send" text={c.send} />
+            )
           }
         >
           <Button

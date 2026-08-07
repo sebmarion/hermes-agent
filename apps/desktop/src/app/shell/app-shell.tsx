@@ -66,6 +66,6 @@ export function useGroupRegistry<T>(): GroupHandle<T> {
 
   return {
     flat: { left: group, right: group },
-    set: () => {},
+    set: () => {}
   }
 }

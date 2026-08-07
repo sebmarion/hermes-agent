@@ -15,33 +15,37 @@ const state: ChatBarState = {
   voice: { active: false, enabled: false }
 }
 
-function renderControls(overrides: Partial<React.ComponentProps<typeof ComposerControls>> = {}): ReturnType<typeof render> {
+function renderControls(
+  overrides: Partial<React.ComponentProps<typeof ComposerControls>> = {}
+): ReturnType<typeof render> {
   return render(
     <I18nProvider configClient={null} initialLocale="en">
-      <ComposerControls {...({
-        autoSpeak: false,
-        busy: false,
-        busyAction: 'stop',
-        canSteer: false,
-        canSubmit: true,
-        conversation: {
-          active: false,
-          level: 0,
-          muted: false,
-          onEnd: vi.fn(),
-          onStart: vi.fn(),
-          onStopTurn: vi.fn(),
-          onToggleMute: vi.fn(),
-          status: 'idle'
-        },
-        disabled: false,
-        hasComposerPayload: true,
-        onDictate: vi.fn(),
-        onToggleAutoSpeak: vi.fn(),
-        state,
-        voiceStatus: 'idle',
-        ...overrides
-      } as React.ComponentProps<typeof ComposerControls>)} />
+      <ComposerControls
+        {...({
+          autoSpeak: false,
+          busy: false,
+          busyAction: 'stop',
+          canSteer: false,
+          canSubmit: true,
+          conversation: {
+            active: false,
+            level: 0,
+            muted: false,
+            onEnd: vi.fn(),
+            onStart: vi.fn(),
+            onStopTurn: vi.fn(),
+            onToggleMute: vi.fn(),
+            status: 'idle'
+          },
+          disabled: false,
+          hasComposerPayload: true,
+          onDictate: vi.fn(),
+          onToggleAutoSpeak: vi.fn(),
+          state,
+          voiceStatus: 'idle',
+          ...overrides
+        } as React.ComponentProps<typeof ComposerControls>)}
+      />
     </I18nProvider>
   )
 }

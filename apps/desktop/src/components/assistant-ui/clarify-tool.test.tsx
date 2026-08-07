@@ -11,7 +11,9 @@ vi.mock('@assistant-ui/react', async () => {
   return {
     ...actual,
     useAuiState: vi.fn((selector?: (s: unknown) => unknown) =>
-      typeof selector === 'function' ? selector({ thread: { isRunning: true }, message: { status: { type: 'running' } } }) : true
+      typeof selector === 'function'
+        ? selector({ thread: { isRunning: true }, message: { status: { type: 'running' } } })
+        : true
     )
   }
 })
@@ -123,7 +125,11 @@ describe('ClarifyTool settled view', () => {
   it('labels an empty response as Skipped', () => {
     renderClarify(
       <ClarifyTool
-        {...settledClarifyProps({ question: 'Anything else?' }, { question: 'Anything else?', user_response: '' }, 'clarify-2')}
+        {...settledClarifyProps(
+          { question: 'Anything else?' },
+          { question: 'Anything else?', user_response: '' },
+          'clarify-2'
+        )}
       />
     )
 

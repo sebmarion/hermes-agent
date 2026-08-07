@@ -192,9 +192,11 @@ export function useVoiceConversation({
           // assistant row can be spoken on the next render.
           if (submitted === false) {
             consumePendingResponse()
+
             if (enabledRef.current && !mutedRef.current && !busyRef.current) {
               pendingStartRef.current = true
             }
+
             setStatus('idle')
 
             return

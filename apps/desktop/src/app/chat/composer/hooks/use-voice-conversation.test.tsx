@@ -267,6 +267,7 @@ describe('useVoiceConversation full-duplex barge-in', () => {
   it('does not speak a stale assistant response when voice submit is rejected', async () => {
     const consumePendingResponse = vi.fn()
     const onSubmit = vi.fn(async () => false)
+
     const hook = renderHook(() =>
       useVoiceConversation({
         busy: false,

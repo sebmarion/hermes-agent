@@ -76,11 +76,7 @@ import { isSecondaryWindow } from '../store/windows'
 import { ChatView } from './chat'
 import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
 import { useComposerActions } from './chat/hooks/use-composer-actions'
-import {
-  ChatPreviewRail,
-  PREVIEW_RAIL_MAX_WIDTH,
-  PREVIEW_RAIL_MIN_WIDTH
-} from './chat/right-rail'
+import { ChatPreviewRail, PREVIEW_RAIL_MAX_WIDTH, PREVIEW_RAIL_MIN_WIDTH } from './chat/right-rail'
 import { ChatSidebar } from './chat/sidebar'
 import { CommandPalette } from './command-palette'
 import { useGatewayBoot } from './gateway/hooks/use-gateway-boot'
@@ -461,7 +457,7 @@ export function DesktopController() {
   })
 
   const { refreshHermesConfig, sttEnabled, voiceMaxRecordingSeconds } = useHermesConfig({
-    activeSessionIdRef,
+    activeSessionIdRef
   })
 
   const { refreshCurrentModel, selectModel } = useModelControls({
@@ -1013,7 +1009,7 @@ export function DesktopController() {
           .then(() => refreshCronJobs())
           .catch(() => undefined)
       }}
-      {...{ 'data-sidebar': true } as any}
+      {...({ 'data-sidebar': true } as any)}
     />
   )
 
@@ -1042,7 +1038,11 @@ export function DesktopController() {
       )}
       <ModelPickerOverlay gateway={gatewayRef.current || undefined} onSelect={selectModel} profile={profileScope} />
       <SessionPickerOverlay onResume={resumeSession} />
-      <ModelVisibilityOverlay gateway={gatewayRef.current || undefined} onOpenProviders={openProviderSettings} profile={profileScope} />
+      <ModelVisibilityOverlay
+        gateway={gatewayRef.current || undefined}
+        onOpenProviders={openProviderSettings}
+        profile={profileScope}
+      />
       <UpdatesOverlay />
       <GatewayConnectingOverlay />
       <BootFailureOverlay />
@@ -1218,7 +1218,7 @@ export function DesktopController() {
       resizable
       side={railSide}
       width={FILE_BROWSER_DEFAULT_WIDTH}
-      {...{} as any}
+      {...({} as any)}
     >
       <ReviewPane key={currentCwd || 'no-cwd'} />
     </Pane>
@@ -1240,7 +1240,7 @@ export function DesktopController() {
       resizable
       side={railSide}
       width="42vw"
-      {...{} as any}
+      {...({} as any)}
     >
       {/* As a column the terminal clears the titlebar; as a bottom row it sits
           below the rail's panes (so it fills its row edge-to-edge) and gets a
