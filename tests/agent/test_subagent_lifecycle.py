@@ -1,5 +1,6 @@
 """Contract tests for the public plugin subagent lifecycle API."""
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -14,6 +15,7 @@ from agent.subagent_lifecycle import (
     bind_subagent_parent,
     get_active_subagent_parent,
 )
+from agent import subagent_lifecycle as lifecycle_module
 
 
 class FakeChild:
@@ -200,6 +202,71 @@ def test_public_lifecycle_exception_emits_terminal_stop_once(monkeypatch):
     assert emitted["child_mode"] == ""
     assert emitted["child_failure_kind"] == "RuntimeError"
     assert emitted["child_exit_reason"] == "public_lifecycle_exception"
+
+
+def test_launch_submit_failure_rolls_back_child_and_emits_terminal_stop_once(
+    monkeypatch,
+):
+    parent = SimpleNamespace(
+        session_id="parent-submit-failure",
+        enabled_toolsets=["file"],
+        _current_turn_id="turn-submit-failure",
+        _active_children=[],
+        _active_children_lock=threading.RLock(),
+    )
+    child = FakeChild("sa-submit-failure")
+    child.session_id = "child-submit-failure"
+    close = Mock()
+
+    def close_after_detach():
+        assert child not in parent._active_children
+
+    close.side_effect = close_after_detach
+    child.close = close
+    hook = Mock()
+    observe = Mock()
+
+    def build(**_kwargs):
+        parent._active_children.append(child)
+        return child
+
+    def fail_submit(*_args, **_kwargs):
+        raise RuntimeError("executor unavailable")
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    monkeypatch.setattr(lifecycle_module._EXECUTOR, "submit", fail_submit)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+    monkeypatch.setattr("hermes_cli.observability.observe_lifecycle", observe)
+
+    service = SubagentLifecycleService(lambda: parent)
+    request = SubagentLaunchRequest(
+        goal="schedule safely", correlation_id="submit-failure"
+    )
+
+    with pytest.raises(RuntimeError, match="executor unavailable"):
+        service.launch(request)
+
+    assert parent._active_children == []
+    close.assert_called_once_with()
+    with lifecycle_module._REGISTRY.lock:
+        assert child._subagent_id not in lifecycle_module._REGISTRY.records
+        assert (
+            parent.session_id,
+            request.correlation_id,
+        ) not in lifecycle_module._REGISTRY.correlations
+
+    hook.assert_called_once()
+    observe.assert_called_once()
+    assert hook.call_args.args == ("subagent_stop",)
+    emitted = hook.call_args.kwargs
+    assert emitted["parent_session_id"] == "parent-submit-failure"
+    assert emitted["child_session_id"] == "child-submit-failure"
+    assert emitted["child_goal"] == "schedule safely"
+    assert emitted["child_status"] == "failed"
+    assert emitted["child_failure_kind"] == "lifecycle_scheduling_failed"
+    assert emitted["child_exit_reason"] == "scheduling_failed"
+    assert emitted["child_successful_tool_count"] == 0
+    assert emitted["tool_call_history"] == []
 
 
 
