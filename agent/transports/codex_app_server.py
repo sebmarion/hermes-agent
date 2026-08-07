@@ -403,6 +403,8 @@ def check_codex_binary(
     """Verify codex CLI is installed and meets minimum version.
 
     Returns (ok, message). Used by setup wizard and runtime startup."""
+    check_env = hermes_subprocess_env()
+    codex_bin = _resolve_codex_bin(codex_bin, env=check_env)
     try:
         proc = subprocess.run(
             [codex_bin, "--version"],
@@ -410,6 +412,7 @@ def check_codex_binary(
             text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
+            env=check_env,
         )
     except FileNotFoundError:
         return False, (

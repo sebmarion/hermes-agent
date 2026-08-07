@@ -176,6 +176,86 @@ class TestCodexAppServerModule:
 
         assert cmd[:2] == ["codex", "app-server"]
 
+    @staticmethod
+    def _capture_binary_check(monkeypatch, *, codex_bin="codex"):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["env"] = kwargs.get("env", {}).copy()
+            return subprocess.CompletedProcess(
+                cmd, returncode=0, stdout="codex-cli 0.125.0\n", stderr=""
+            )
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = cas.check_codex_binary(codex_bin=codex_bin)
+        return captured, result
+
+    def test_check_binary_resolves_user_local_install_with_sanitized_env(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        codex = tmp_path / ".local" / "bin" / "codex"
+        codex.parent.mkdir(parents=True)
+        codex.write_text("#!/bin/sh\n")
+        codex.chmod(0o755)
+        daemon_path = str(tmp_path / "daemon-bin")
+        (tmp_path / "daemon-bin").mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("PATH", daemon_path)
+        monkeypatch.setenv("GH_TOKEN", "must-not-reach-preflight")
+        monkeypatch.setenv("OPENAI_API_KEY", "not-needed-for-version")
+
+        captured, result = self._capture_binary_check(monkeypatch)
+
+        assert result == (True, "0.125.0")
+        assert captured["cmd"] == [str(codex), "--version"]
+        assert captured["env"]["HOME"] == str(tmp_path)
+        assert captured["env"]["PATH"] == daemon_path
+        assert "GH_TOKEN" not in captured["env"]
+        assert "OPENAI_API_KEY" not in captured["env"]
+
+    def test_check_binary_preserves_explicit_binary_and_path_hit(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        local_codex = tmp_path / "home" / ".local" / "bin" / "codex"
+        local_codex.parent.mkdir(parents=True)
+        local_codex.write_text("#!/bin/sh\n")
+        local_codex.chmod(0o755)
+        path_codex = tmp_path / "path" / "codex"
+        path_codex.parent.mkdir()
+        path_codex.write_text("#!/bin/sh\n")
+        path_codex.chmod(0o755)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("PATH", str(path_codex.parent))
+
+        explicit, _ = self._capture_binary_check(
+            monkeypatch, codex_bin="/custom/codex"
+        )
+        path_hit, _ = self._capture_binary_check(monkeypatch)
+
+        assert explicit["cmd"] == ["/custom/codex", "--version"]
+        assert path_hit["cmd"] == ["codex", "--version"]
+
+    @pytest.mark.parametrize("create_candidate", [True, False])
+    def test_check_binary_falls_back_for_unusable_user_local_candidate(
+        self, monkeypatch, tmp_path, create_candidate
+    ) -> None:
+        candidate = tmp_path / ".local" / "bin" / "codex"
+        if create_candidate:
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text("#!/bin/sh\n")
+            candidate.chmod(0o644)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("PATH", str(tmp_path / "daemon-bin"))
+
+        captured, result = self._capture_binary_check(monkeypatch)
+
+        assert result == (True, "0.125.0")
+        assert captured["cmd"] == ["codex", "--version"]
+
 
 
 
