@@ -272,7 +272,7 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     return _sentinel_free_abs_cwd(overrides.get("cwd"))
 
 
-def _live_cwd_if_owned(env, task_id: str) -> str | None:
+def _live_cwd_if_owned(env, task_id: str, *, environment_key: str | None = None) -> str | None:
     """Return a shared environment cwd only when this session owns it."""
     if env is None:
         return None
@@ -281,6 +281,12 @@ def _live_cwd_if_owned(env, task_id: str) -> str | None:
         return None
     owner = str(getattr(env, "cwd_owner", "") or "")
     tid = str(task_id or "")
+    # A CWD-only session is normally collapsed onto the shared ``default``
+    # environment.  Without an owner stamp, that environment's live cwd is
+    # ambiguous for every other session; fail closed and let the per-session
+    # record/override or process cwd decide instead.
+    if tid and tid != "default" and not owner and (environment_key or "default") == "default":
+        return None
     if owner and tid and owner != "default" and tid != "default" and owner != tid:
         return None
     return str(live)
@@ -293,8 +299,16 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
 
         container_key = _resolve_container_task_id(task_id)
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
-        return _live_cwd_if_owned(env, task_id)
+            if container_key in _active_environments:
+                environment_key = container_key
+                env = _active_environments[container_key]
+            elif task_id in _active_environments:
+                environment_key = task_id
+                env = _active_environments[task_id]
+            else:
+                environment_key = None
+                env = None
+        return _live_cwd_if_owned(env, task_id, environment_key=environment_key)
     except Exception:
         return None
 
@@ -319,9 +333,6 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     Returns ``None`` only when there is genuinely no reliable anchor, in which
     case callers fall back to the process cwd.
     """
-    live = _get_live_tracking_cwd(task_id)
-    if live:
-        return live
     try:
         from tools.terminal_tool import get_session_cwd
 
@@ -330,6 +341,13 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
         recorded = None
     if recorded:
         return recorded
+    # The per-session record is the authoritative value.  A live environment
+    # can be shared under the default key and may therefore carry another
+    # session's last ``cd`` when ownership metadata is absent.  Consult it
+    # only after the session has no recorded cwd of its own.
+    live = _get_live_tracking_cwd(task_id)
+    if live:
+        return live
     registered = _registered_task_cwd_override(task_id)
     if registered:
         return registered
