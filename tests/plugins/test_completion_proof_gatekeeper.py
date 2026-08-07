@@ -42,6 +42,22 @@ def test_successful_command_proof_is_left_unchanged():
     assert plugin.transform_llm_output(response_text=response) is None
 
 
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        "`scripts/run_tests.sh tests/plugins/test_gatekeeper.py` passed.",
+        "`git diff --check` exited with code 0.",
+        "`python -m unittest` passed.",
+        "git diff --check passed.",
+    ],
+)
+def test_repository_command_receipt_is_left_unchanged(receipt):
+    plugin = _load_plugin()
+    response = f"Fixed the handler. {receipt}"
+
+    assert plugin.transform_llm_output(response_text=response) is None
+
+
 def test_api_readback_proof_is_left_unchanged():
     plugin = _load_plugin()
     response = "Fixed the health route; GET /health returned HTTP 200 and the read-back matched."
@@ -73,6 +89,7 @@ def test_honest_blocker_is_left_unchanged():
         "The work is not completed.",
         "The tests are not passing.",
         "The checks are not green.",
+        "The build is not green.",
         "The build did not pass.",
     ],
 )
@@ -137,6 +154,23 @@ def test_command_exited_with_code_zero_is_proof():
     response = "Fixed the handler. `pytest tests/test_api.py` exited with code 0."
 
     assert plugin.transform_llm_output(response_text=response) is None
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "The tests are passing.",
+        "The checks are green.",
+        "The build is green.",
+    ],
+)
+def test_linking_verb_completion_claim_is_reported_without_proof(response):
+    plugin = _load_plugin()
+
+    result = plugin.transform_llm_output(response_text=response)
+
+    assert result is not None
+    assert "report-only" in result
 
 
 def test_failed_verification_keeps_the_claim_reportable():

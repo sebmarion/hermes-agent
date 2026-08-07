@@ -16,12 +16,13 @@ from typing import Any
 _COMPLETION_CLAIM_RE = re.compile(
     r"\b(?:done|fixed|working|verified|deployed|pushed|published|resolved|"
     r"complete|completed)\b"
-    r"|\b(?:tests?|checks?|build)\s+(?:pass|passed|passing|green)\b",
+    r"|\b(?:tests?|checks?|build)\s+(?:(?:is|are|was|were)\s+)?"
+    r"(?:pass|passed|passing|green)\b",
     re.IGNORECASE,
 )
 _WORK_CONTEXT_RE = re.compile(
-    r"\b(?:bug|code|commit|deploy|file|fix|handler|implementation|lint|"
-    r"patch|pr|repo(?:sitory)?|route|test|build|change|edited|implemented)\b",
+    r"\b(?:bug|checks?|code|commit|deploy|file|fix|handler|implementation|lint|"
+    r"patch|pr|repo(?:sitory)?|route|tests?|build|change|edited|implemented)\b",
     re.IGNORECASE,
 )
 _DIRECT_COMPLETION_RE = re.compile(
@@ -37,10 +38,24 @@ _EXPLICIT_BLOCKER_RE = re.compile(
     r"did\s+not\s+pass|needs?\s+follow[- ]?up|not\s+ready)\b",
     re.IGNORECASE,
 )
-_COMMAND_PROOF_RE = re.compile(
+_BARE_COMMAND_PROOF_RE = re.compile(
     r"\b(?:pytest|tox|nox|ruff|mypy|eslint|tsc|vitest|jest|npm|pnpm|"
-    r"yarn|bun|cargo|go|make|curl|httpie)\b(?![.\w-])",
+    r"yarn|bun|cargo|go|make|curl|httpie|git|python(?:3(?:\.\d+)?)?)"
+    r"\b(?![.\w-])",
     re.IGNORECASE,
+)
+_BACKTICK_SPAN_RE = re.compile(r"`([^`\n]+)`")
+_COMMAND_TOKEN_RE = re.compile(
+    r"(?:\.{0,2}/)?[A-Za-z0-9_+.-]+(?:/[A-Za-z0-9_+.-]+)*"
+)
+_INLINE_DATA_SUFFIXES = (
+    ".ini",
+    ".json",
+    ".md",
+    ".py",
+    ".txt",
+    ".yaml",
+    ".yml",
 )
 _API_PROOF_RE = re.compile(
     r"\b(?:GET|POST|PUT|PATCH|DELETE)\s+/[^\s,;)]*",
@@ -70,10 +85,33 @@ def _has_completion_claim(response_text: str) -> bool:
     return bool(_WORK_CONTEXT_RE.search(response_text))
 
 
+def _is_command_like_backtick_span(span: str) -> bool:
+    parts = span.strip().split()
+    if not parts or not _COMMAND_TOKEN_RE.fullmatch(parts[0]):
+        return False
+    executable = parts[0]
+    if executable.endswith(_INLINE_DATA_SUFFIXES) and not executable.startswith("./"):
+        return False
+    if len(parts) > 1:
+        return True
+    return executable.startswith("./") or (
+        "/" in executable and executable.endswith((".bash", ".sh", ".zsh"))
+    )
+
+
+def _has_command_proof_source(clause: str) -> bool:
+    if _BARE_COMMAND_PROOF_RE.search(clause):
+        return True
+    return any(
+        _is_command_like_backtick_span(span)
+        for span in _BACKTICK_SPAN_RE.findall(clause)
+    )
+
+
 def _has_successful_proof(response_text: str) -> bool:
     for clause in _PROOF_BOUNDARY_RE.split(response_text):
         has_proof_source = bool(
-            _COMMAND_PROOF_RE.search(clause)
+            _has_command_proof_source(clause)
             or _API_PROOF_RE.search(clause)
             or re.search(r"\bread[- ]back\b", clause, re.IGNORECASE)
         )
