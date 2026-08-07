@@ -1122,6 +1122,8 @@ platform_toolsets:
 # Optional per-server settings:
 #   timeout: tool call timeout in seconds (default: 120)
 #   connect_timeout: initial connection timeout (default: 60)
+#   allowed_platforms: optional non-empty runtime-surface allowlist such as
+#     [cli, cron]. Omit for unrestricted access. TUI/Desktop use cli.
 #   keepalive_interval: liveness ping cadence in seconds (default: 180).
 #     Lower it below the server's session TTL for servers that expire idle
 #     sessions quickly (e.g. Unreal Engine editor MCP, ~15s), otherwise idle
@@ -1134,6 +1136,7 @@ platform_toolsets:
 #   filesystem:
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
+#     allowed_platforms: [cli]
 #   notion:
 #     url: https://mcp.notion.com/mcp
 #   github:

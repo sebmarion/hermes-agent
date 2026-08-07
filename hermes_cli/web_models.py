@@ -398,6 +398,9 @@ class MCPServerCreate(BaseModel):
     auth: Optional[str] = None
     # One-time provisioning input; persisted only to the profile's .env.
     bearer_token: Optional[SecretStr] = None
+    # Omission means unrestricted. An explicit list is validated and
+    # normalized by the shared Dashboard/Profile Builder create path.
+    allowed_platforms: Optional[List[str]] = None
     profile: Optional[str] = None
 
 
@@ -722,4 +725,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

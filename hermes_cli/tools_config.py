@@ -2120,22 +2120,163 @@ def _parse_enabled_flag(value, default: bool = True) -> bool:
     return default
 
 
-def enabled_mcp_server_names(config: dict) -> Set[str]:
-    """Names of MCP servers globally enabled in config.yaml.
+def _mcp_policy_platform(platform: Optional[str]) -> Optional[str]:
+    """Normalize a runtime tag to the MCP policy surface it uses."""
+    if not isinstance(platform, str):
+        return None
+    normalized = platform.strip().lower()
+    if not normalized:
+        return None
+    return {"tui": "cli", "desktop": "cli"}.get(normalized, normalized)
+
+
+def mcp_server_allowed_on_platform(
+    server_cfg: dict, platform: Optional[str]
+) -> bool:
+    """Return whether one MCP server is authorized for a runtime surface.
+
+    Omitting ``allowed_platforms`` preserves the historical all-surface
+    behavior. Once present, the value is a fail-closed non-empty list of
+    non-empty runtime names.
+    """
+    if not isinstance(server_cfg, dict):
+        return False
+    if "allowed_platforms" not in server_cfg:
+        return True
+
+    allowed_values = server_cfg.get("allowed_platforms")
+    if not isinstance(allowed_values, (list, tuple)) or not allowed_values:
+        return False
+    normalized_allowed: Set[str] = set()
+    for value in allowed_values:
+        if not isinstance(value, str):
+            return False
+        normalized = value.strip().lower()
+        if not normalized:
+            return False
+        normalized_allowed.add(normalized)
+
+    normalized_platform = _mcp_policy_platform(platform)
+    return bool(normalized_platform and normalized_platform in normalized_allowed)
+
+
+def configured_mcp_server_names(config: dict) -> Set[str]:
+    """Configured MCP server names, regardless of enablement or platform."""
+    mcp_servers = (config or {}).get("mcp_servers") or {}
+    if not isinstance(mcp_servers, dict):
+        return set()
+    return {
+        str(name)
+        for name, server_cfg in mcp_servers.items()
+        if isinstance(server_cfg, dict)
+    }
+
+
+def enabled_mcp_server_names(
+    config: dict, platform: Optional[str] = None
+) -> Set[str]:
+    """Names of MCP servers enabled for an optional runtime surface.
 
     Shared by the gateway/CLI platform resolver (``_get_platform_tools``) and
     the cron per-job toolset resolver (``cron.scheduler``) so every path agrees
     on MCP membership. A server is enabled unless its config sets an explicitly
     falsey ``enabled`` (per ``_parse_enabled_flag``: false/0/no/off) — a missing
-    flag or an unrecognized value is treated as enabled.
+    flag or an unrecognized value is treated as enabled. A present
+    ``allowed_platforms`` field must authorize ``platform``.
     """
     mcp_servers = (config or {}).get("mcp_servers") or {}
+    if not isinstance(mcp_servers, dict):
+        return set()
     return {
         str(name)
         for name, server_cfg in mcp_servers.items()
         if isinstance(server_cfg, dict)
         and _parse_enabled_flag(server_cfg.get("enabled", True), default=True)
+        and mcp_server_allowed_on_platform(server_cfg, platform)
     }
+
+
+def _non_mcp_toolset_names() -> Set[str]:
+    """Toolset spellings whose native/custom meaning outranks an MCP alias."""
+    from toolsets import TOOLSETS
+
+    # Read only already-known definitions here. In particular, do not trigger
+    # plugin discovery from lightweight cron/toolset filtering; loaded plugin
+    # and custom names are represented by the live registry below.
+    names = set(TOOLSETS)
+    try:
+        from tools.registry import registry
+
+        names.update(
+            name
+            for name in registry.get_registered_toolset_names()
+            if not name.startswith("mcp-")
+        )
+        names.update(
+            alias
+            for alias, target in registry.get_registered_toolset_aliases().items()
+            if not target.startswith("mcp-")
+        )
+    except Exception:
+        pass
+    return names
+
+
+def _mcp_toolset_server_name(
+    toolset: str,
+    configured: Set[str],
+    non_mcp_toolsets: Set[str],
+) -> Optional[str]:
+    """Resolve one unambiguous MCP toolset spelling to its raw server name."""
+    if toolset in non_mcp_toolsets:
+        return None
+    if toolset.startswith("mcp-") and toolset[4:] in configured:
+        return toolset[4:]
+    if toolset in configured:
+        return toolset
+    return None
+
+
+def configured_mcp_toolset_selections(
+    toolsets: List[str], config: dict
+) -> Set[str]:
+    """Explicit MCP toolset spellings, excluding native/custom collisions."""
+    configured = configured_mcp_server_names(config)
+    non_mcp_toolsets = _non_mcp_toolset_names()
+    return {
+        toolset
+        for toolset in toolsets
+        if _mcp_toolset_server_name(toolset, configured, non_mcp_toolsets)
+        is not None
+    }
+
+
+def mcp_server_toolset_name(server_name: str) -> str:
+    """Return the unambiguous selectable toolset name for one MCP server."""
+    if server_name in _non_mcp_toolset_names():
+        return f"mcp-{server_name}"
+    return server_name
+
+
+def filter_mcp_toolsets_for_platform(
+    toolsets: List[str], config: dict, *, platform: Optional[str]
+) -> List[str]:
+    """Remove configured MCP aliases disabled for ``platform``.
+
+    Native and custom toolsets are preserved verbatim. Both raw server names
+    and their ``mcp-`` aliases are treated as config-owned identities.
+    """
+    configured = configured_mcp_server_names(config)
+    enabled = enabled_mcp_server_names(config, platform=platform)
+    non_mcp_toolsets = _non_mcp_toolset_names()
+    filtered = []
+    for toolset in toolsets:
+        server_name = _mcp_toolset_server_name(
+            toolset, configured, non_mcp_toolsets
+        )
+        if server_name is None or server_name in enabled:
+            filtered.append(toolset)
+    return filtered
 
 
 def _exempt_explicit_platform_native(
@@ -2464,19 +2605,48 @@ def _get_platform_tools(
     # If the platform explicitly lists one or more MCP server names, treat that
     # as an allowlist. Otherwise include every globally enabled MCP server.
     # Special sentinel: "no_mcp" in the toolset list disables all MCP servers.
-    enabled_mcp_servers = enabled_mcp_server_names(config)
+    configured_mcp_servers = configured_mcp_server_names(config)
+    enabled_mcp_servers = enabled_mcp_server_names(config, platform=platform)
+    non_mcp_toolsets = _non_mcp_toolset_names()
+
+    def _selected_mcp_server(toolset: str) -> Optional[str]:
+        return _mcp_toolset_server_name(
+            toolset, configured_mcp_servers, non_mcp_toolsets
+        )
+
     # Allow "no_mcp" sentinel to opt out of all MCP servers for this platform
     if "no_mcp" in toolset_names:
+        requested_mcp_toolsets = set()
         explicit_mcp_servers = set()
-        enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers - {"no_mcp"})
+        enabled_toolsets.update(
+            toolset
+            for toolset in explicit_passthrough
+            if toolset != "no_mcp" and _selected_mcp_server(toolset) is None
+        )
     else:
-        explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
-        enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers)
+        requested_mcp_toolsets = {
+            toolset
+            for toolset in explicit_passthrough
+            if _selected_mcp_server(toolset) is not None
+        }
+        explicit_mcp_servers = {
+            toolset
+            for toolset in requested_mcp_toolsets
+            if _selected_mcp_server(toolset) in enabled_mcp_servers
+        }
+        enabled_toolsets.update(
+            toolset
+            for toolset in explicit_passthrough
+            if _selected_mcp_server(toolset) is None
+        )
     if include_default_mcp_servers:
-        if explicit_mcp_servers or "no_mcp" in toolset_names:
+        if requested_mcp_toolsets or "no_mcp" in toolset_names:
             enabled_toolsets.update(explicit_mcp_servers)
         else:
-            enabled_toolsets.update(enabled_mcp_servers)
+            enabled_toolsets.update(
+                f"mcp-{name}" if name in non_mcp_toolsets else name
+                for name in enabled_mcp_servers
+            )
     else:
         enabled_toolsets.update(explicit_mcp_servers)
 

@@ -1,5 +1,6 @@
 """Tests for the central tool registry."""
 
+import builtins
 import json
 import logging
 import threading
@@ -33,8 +34,112 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
 
+    def test_dispatch_blocks_platform_restricted_mcp_tool_before_handler(self, monkeypatch):
+        reg = ToolRegistry()
+        calls = {"count": 0}
 
-    def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):
+        def handler(args, **kwargs):
+            calls["count"] += 1
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="mcp__zeus__open",
+            toolset="mcp-zeus",
+            schema=_make_schema("mcp__zeus__open"),
+            handler=handler,
+        )
+        monkeypatch.setattr(
+            "tools.mcp_tool.mcp_tool_platform_access",
+            lambda tool_name, platform: (False, "mcp_platform_denied"),
+            raising=False,
+        )
+
+        result = json.loads(reg.dispatch("mcp__zeus__open", {}, platform="telegram"))
+
+        assert result["error_type"] == "mcp_platform_denied"
+        assert calls["count"] == 0
+
+    def test_dispatch_allows_matching_platform_mcp_tool(self, monkeypatch):
+        reg = ToolRegistry()
+        calls = {"count": 0}
+
+        def handler(args, **kwargs):
+            calls["count"] += 1
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="mcp__zeus__open",
+            toolset="mcp-zeus",
+            schema=_make_schema("mcp__zeus__open"),
+            handler=handler,
+        )
+        monkeypatch.setattr(
+            "tools.mcp_tool.mcp_tool_platform_access",
+            lambda tool_name, platform: (True, None),
+            raising=False,
+        )
+
+        assert json.loads(
+            reg.dispatch("mcp__zeus__open", {}, platform="cli")
+        ) == {"ok": True}
+        assert calls["count"] == 1
+
+    def test_dispatch_fails_closed_for_mcp_tool_without_provenance(self):
+        reg = ToolRegistry()
+        calls = {"count": 0}
+        tool_name = "mcp__untracked__open"
+        reg.register(
+            name=tool_name,
+            toolset="mcp-untracked",
+            schema=_make_schema(tool_name),
+            handler=lambda args, **kwargs: calls.__setitem__("count", calls["count"] + 1),
+        )
+
+        result = json.loads(reg.dispatch(tool_name, {}, platform="cli"))
+
+        assert result["error_type"] == "mcp_provenance_missing"
+        assert calls["count"] == 0
+
+    def test_policy_import_failure_drops_mcp_but_native_still_dispatches(self):
+        reg = ToolRegistry()
+        calls = {"native": 0, "mcp": 0}
+        reg.register(
+            name="native",
+            toolset="core",
+            schema=_make_schema("native"),
+            handler=lambda args, **kwargs: calls.__setitem__(
+                "native", calls["native"] + 1
+            )
+            or json.dumps({"ok": True}),
+        )
+        reg.register(
+            name="mcp__zeus__open",
+            toolset="mcp-zeus",
+            schema=_make_schema("mcp__zeus__open"),
+            handler=lambda args, **kwargs: calls.__setitem__(
+                "mcp", calls["mcp"] + 1
+            )
+            or json.dumps({"ok": True}),
+        )
+        real_import = builtins.__import__
+
+        def fail_policy_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "tools.mcp_tool":
+                raise ImportError("policy unavailable")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch.object(builtins, "__import__", side_effect=fail_policy_import):
+            native_result = json.loads(reg.dispatch("native", {}, platform="cli"))
+            mcp_result = json.loads(
+                reg.dispatch("mcp__zeus__open", {}, platform="cli")
+            )
+
+        assert native_result == {"ok": True}
+        assert mcp_result["error_type"] == "mcp_policy_unavailable"
+        assert calls == {"native": 1, "mcp": 0}
+
+
+    def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog, monkeypatch):
         """Parallel MCP registrations with one name leave exactly one owner."""
         reg = ToolRegistry()
         barrier = threading.Barrier(3)
@@ -75,6 +180,10 @@ class TestRegisterAndDispatch:
         entry = reg.get_entry("mcp__foo_bar__search")
         assert entry is not None
         assert entry.toolset in {"mcp-foo-bar", "mcp-foo_bar"}
+        monkeypatch.setattr(
+            "tools.mcp_tool.mcp_tool_platform_access",
+            lambda *_args: (True, None),
+        )
         assert json.loads(reg.dispatch("mcp__foo_bar__search", {}))["owner"] in {
             "dash",
             "underscore",

@@ -1976,6 +1976,7 @@ class TestConcurrentToolExecution:
                 tool_request_middleware_trace=[],
                 original_function_args={"q": "test"},
                 on_authorized=None,
+                platform=agent.platform,
             )
             assert result == "result"
 
@@ -1993,6 +1994,18 @@ class TestConcurrentToolExecution:
 
         assert starts == [("c1", "web_search", {"query": "hello"})]
         assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
+
+    def test_sequential_tool_dispatch_passes_agent_platform(self, agent):
+        agent.platform = "cron"
+        tool_call = _mock_tool_call(
+            name="web_search", arguments='{"query":"hello"}', call_id="c1"
+        )
+        message = _mock_assistant_msg(content="", tool_calls=[tool_call])
+
+        with patch("model_tools.registry.dispatch", return_value='{"success": true}') as dispatch:
+            agent._execute_tool_calls_sequential(message, [], "task-1")
+
+        assert dispatch.call_args.kwargs["platform"] == "cron"
 
     @pytest.mark.parametrize("quiet_mode", [True, False])
     def test_sequential_registry_tool_forwards_request_middleware_trace(

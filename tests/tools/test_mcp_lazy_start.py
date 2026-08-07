@@ -17,22 +17,39 @@ import tools.mcp_tool as mcp
 
 @pytest.fixture(autouse=True)
 def _reset_mcp_state():
-    old_servers = dict(mcp._servers)
-    old_lazy = dict(mcp._lazy_server_configs)
-    old_fps = dict(mcp._lazy_server_fingerprints)
-    old_names = dict(mcp._lazy_server_tool_names)
-    old_connecting = set(mcp._server_connecting)
+    with mcp._lock:
+        old_servers = dict(mcp._servers)
+        old_lazy = dict(mcp._lazy_server_configs)
+        old_fps = dict(mcp._lazy_server_fingerprints)
+        old_names = dict(mcp._lazy_server_tool_names)
+        old_connecting = set(mcp._server_connecting)
+        old_tool_servers = dict(mcp._mcp_tool_server_names)
+        old_tool_origins = dict(mcp._mcp_tool_server_origins)
+        old_server_origins = dict(mcp._mcp_server_origins)
+        old_connecting_origins = dict(mcp._mcp_connecting_origins)
+        old_registration_identities = dict(
+            mcp._mcp_server_registration_identities
+        )
     yield
-    mcp._servers.clear()
-    mcp._servers.update(old_servers)
-    mcp._lazy_server_configs.clear()
-    mcp._lazy_server_configs.update(old_lazy)
-    mcp._lazy_server_fingerprints.clear()
-    mcp._lazy_server_fingerprints.update(old_fps)
-    mcp._lazy_server_tool_names.clear()
-    mcp._lazy_server_tool_names.update(old_names)
-    mcp._server_connecting.clear()
-    mcp._server_connecting.update(old_connecting)
+    with mcp._lock:
+        for mapping, saved in (
+            (mcp._servers, old_servers),
+            (mcp._lazy_server_configs, old_lazy),
+            (mcp._lazy_server_fingerprints, old_fps),
+            (mcp._lazy_server_tool_names, old_names),
+            (mcp._mcp_tool_server_names, old_tool_servers),
+            (mcp._mcp_tool_server_origins, old_tool_origins),
+            (mcp._mcp_server_origins, old_server_origins),
+            (mcp._mcp_connecting_origins, old_connecting_origins),
+            (
+                mcp._mcp_server_registration_identities,
+                old_registration_identities,
+            ),
+        ):
+            mapping.clear()
+            mapping.update(saved)
+        mcp._server_connecting.clear()
+        mcp._server_connecting.update(old_connecting)
 
 
 def _fake_cache_entry():
@@ -60,6 +77,120 @@ def _lazy_config():
 
 
 class TestLazyMcpRegistration:
+    def test_cached_registration_keeps_config_source_ownership(self):
+        config = _lazy_config()
+        with (
+            patch("tools.mcp_tool._MCP_AVAILABLE", True),
+            patch("tools.mcp_schema_cache.config_fingerprint", return_value="abc"),
+            patch("tools.mcp_schema_cache.get_cached_entry", return_value=_fake_cache_entry()),
+            patch(
+                "tools.mcp_tool._register_from_cache_sync",
+                return_value=["mcp__playwright__browser_navigate"],
+            ) as mock_register,
+        ):
+            mcp.register_mcp_servers(config, source="config")
+
+        assert mock_register.call_args.kwargs["source"] == "config"
+        assert mcp.get_mcp_server_registration_source("playwright") == "config"
+        with mcp._lock:
+            assert "playwright" not in mcp._mcp_connecting_origins
+
+    def test_reconnect_after_shutdown_recovers_cached_tool_source(self):
+        """Cleared reservations must not relabel cached config tools external."""
+        config = _lazy_config()["playwright"]
+        tool_name = "mcp__playwright__browser_navigate"
+        fake_server = SimpleNamespace(
+            session=object(),
+            _registered_tool_names=[tool_name],
+        )
+        captured = {}
+
+        with mcp._lock:
+            mcp._lazy_server_configs["playwright"] = dict(config)
+            mcp._lazy_server_tool_names["playwright"] = [tool_name]
+            mcp._mcp_tool_server_names[tool_name] = "playwright"
+            mcp._mcp_tool_server_origins[tool_name] = "config"
+            mcp._mcp_server_origins.pop("playwright", None)
+            mcp._mcp_connecting_origins.pop("playwright", None)
+
+        def fake_run_on_loop(*_args, **_kwargs):
+            with mcp._lock:
+                captured["source"] = mcp._mcp_connecting_origins["playwright"]
+                mcp._mcp_server_origins["playwright"] = (
+                    mcp._mcp_connecting_origins.pop("playwright")
+                )
+                mcp._servers["playwright"] = fake_server
+            return []
+
+        with (
+            patch("tools.mcp_tool._ensure_mcp_loop"),
+            patch(
+                "tools.mcp_tool._run_on_mcp_loop",
+                side_effect=fake_run_on_loop,
+            ),
+        ):
+            assert mcp._ensure_lazy_server_connected("playwright") is True
+
+        assert captured["source"] == "config"
+        assert mcp.get_mcp_server_registration_source("playwright") == "config"
+
+    def test_full_shutdown_clears_lazy_registration_for_source_transfer(self):
+        from tools.registry import registry
+
+        tool_name = "mcp__playwright__browser_navigate"
+        registry.register(
+            name=tool_name,
+            toolset="mcp-playwright",
+            schema={
+                "name": tool_name,
+                "description": "Navigate",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda *_args, **_kwargs: "{}",
+        )
+        registry.register_toolset_alias("playwright", "mcp-playwright")
+        with mcp._lock:
+            mcp._servers.clear()
+            mcp._lazy_server_configs["playwright"] = _lazy_config()["playwright"]
+            mcp._lazy_server_fingerprints["playwright"] = "abc"
+            mcp._lazy_server_tool_names["playwright"] = [tool_name]
+            mcp._mcp_tool_server_names[tool_name] = "playwright"
+            mcp._mcp_tool_server_origins[tool_name] = "config"
+            mcp._mcp_server_origins["playwright"] = "config"
+            mcp._mcp_server_registration_identities["playwright"] = "old"
+
+        try:
+            with patch("tools.mcp_tool._stop_mcp_loop"):
+                mcp.shutdown_mcp_servers()
+
+            with mcp._lock:
+                assert "playwright" not in mcp._lazy_server_configs
+                assert "playwright" not in mcp._lazy_server_fingerprints
+                assert "playwright" not in mcp._lazy_server_tool_names
+                assert tool_name not in mcp._mcp_tool_server_names
+                assert tool_name not in mcp._mcp_tool_server_origins
+                assert "playwright" not in mcp._mcp_server_registration_identities
+            assert tool_name not in registry.get_all_tool_names()
+
+            with (
+                patch("tools.mcp_tool._MCP_AVAILABLE", True),
+                patch(
+                    "tools.mcp_tool._filter_suspicious_mcp_servers",
+                    side_effect=lambda servers: servers,
+                ),
+                patch("tools.mcp_tool._ensure_mcp_loop"),
+                patch("tools.mcp_tool._run_on_mcp_loop") as mock_run,
+            ):
+                mcp.register_mcp_servers(
+                    {"playwright": {"command": "new-acp-server"}},
+                    source="acp",
+                )
+
+            mock_run.assert_called_once()
+            assert mcp.get_mcp_server_registration_source("playwright") == "acp"
+        finally:
+            registry.deregister(tool_name)
+
     def test_registers_from_cache_without_connect(self):
         config = _lazy_config()
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
@@ -117,6 +248,84 @@ class TestLazyMcpRegistration:
         mock_register.assert_not_called()
         mock_run.assert_not_called()
         assert "mcp_playwright_browser_navigate" in names
+
+
+class TestLazyMCPRawToolsetAliasPublication:
+    @pytest.mark.parametrize(
+        ("server_name", "collision_kind"),
+        [
+            ("collision-lazy-alias", "alias"),
+            ("collision-lazy-canonical", "canonical"),
+            ("web", "static"),
+        ],
+    )
+    def test_cached_registration_preserves_non_mcp_raw_toolset(
+        self, server_name, collision_kind
+    ):
+        from tools.registry import ToolRegistry
+        from toolsets import resolve_toolset
+
+        registry = ToolRegistry()
+        incumbent_tool = f"incumbent_{collision_kind}_tool"
+        incumbent_alias_target = None
+
+        if collision_kind == "alias":
+            incumbent_alias_target = f"plugin-{server_name}"
+            registry.register(
+                name=incumbent_tool,
+                toolset=incumbent_alias_target,
+                schema={
+                    "name": incumbent_tool,
+                    "description": "Incumbent plugin tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                handler=lambda _args, **_kwargs: "{}",
+            )
+            registry.register_toolset_alias(server_name, incumbent_alias_target)
+        elif collision_kind == "canonical":
+            registry.register(
+                name=incumbent_tool,
+                toolset=server_name,
+                schema={
+                    "name": incumbent_tool,
+                    "description": "Incumbent canonical tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                handler=lambda _args, **_kwargs: "{}",
+            )
+
+        entry = {
+            "tools": [
+                {
+                    "name": "remote",
+                    "description": "Remote MCP tool",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ],
+            "utility_tools": [],
+        }
+
+        with patch("tools.registry.registry", registry):
+            registered = mcp._register_from_cache_sync(
+                server_name,
+                {"command": "fake"},
+                entry,
+                source="config",
+            )
+            raw_tools = resolve_toolset(server_name)
+            mcp_tools = resolve_toolset(f"mcp-{server_name}")
+
+        assert len(registered) == 1
+        mcp_tool = registered[0]
+        assert registry.get_toolset_alias_target(server_name) == (
+            incumbent_alias_target
+        )
+        assert mcp_tool not in raw_tools
+        assert mcp_tools == [mcp_tool]
+        if collision_kind == "static":
+            assert "web_search" in raw_tools
+        else:
+            assert incumbent_tool in raw_tools
 
 
 class TestLazyFirstUseConnect:

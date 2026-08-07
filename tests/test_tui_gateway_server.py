@@ -2037,6 +2037,34 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     assert "using configured CLI toolsets" in err
 
 
+def test_load_enabled_toolsets_rejects_mcp_env_disallowed_for_cli_surface(monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_TUI_TOOLSETS", "zeus")
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(discover_plugins=lambda: None),
+    )
+
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "read_raw_config",
+        lambda: {"mcp_servers": {"zeus": {"allowed_platforms": ["telegram"]}}},
+    )
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"platform_toolsets": {"cli": ["memory"]}},
+    )
+
+    resolved = server._load_enabled_toolsets()
+
+    assert resolved is not None
+    assert "zeus" not in resolved
+    assert "not allowed on the CLI surface" in capsys.readouterr().err
+
+
 def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, capsys):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "nope")
     monkeypatch.setitem(

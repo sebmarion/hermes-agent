@@ -46,6 +46,61 @@ class TestMcpEndpoints:
         srv = self.client.get("/api/mcp/servers").json()["servers"][0]
         assert srv["env"]["API_KEY"] != "sk-secret-1234567890"
 
+    def test_allowed_platforms_round_trips_through_create_and_list(self):
+        response = self.client.post(
+            "/api/mcp/servers",
+            json={
+                "name": "scoped",
+                "command": "npx",
+                "args": ["-y", "pkg"],
+                "allowed_platforms": [" CLI ", "cron", "cli"],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["allowed_platforms"] == ["cli", "cron"]
+
+        from hermes_cli.mcp_config import _get_mcp_servers
+
+        assert _get_mcp_servers()["scoped"]["allowed_platforms"] == [
+            "cli",
+            "cron",
+        ]
+        listed = self.client.get("/api/mcp/servers").json()["servers"]
+        assert listed[0]["allowed_platforms"] == ["cli", "cron"]
+
+    def test_allowed_platforms_omission_remains_unrestricted(self):
+        response = self.client.post(
+            "/api/mcp/servers",
+            json={"name": "unrestricted", "command": "npx"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["allowed_platforms"] is None
+
+        from hermes_cli.mcp_config import _get_mcp_servers
+
+        assert "allowed_platforms" not in _get_mcp_servers()["unrestricted"]
+
+    @pytest.mark.parametrize(
+        "allowed_platforms",
+        [[], [""], ["cli", "   "]],
+    )
+    def test_allowed_platforms_rejects_empty_or_blank_policy(
+        self, allowed_platforms
+    ):
+        response = self.client.post(
+            "/api/mcp/servers",
+            json={
+                "name": "bad-policy",
+                "command": "npx",
+                "allowed_platforms": allowed_platforms,
+            },
+        )
+
+        assert response.status_code == 400
+        assert "allowed_platforms" in response.json()["detail"]
+
     def test_http_bearer_auth_separates_secret_from_config(
         self, _isolate_hermes_home
     ):

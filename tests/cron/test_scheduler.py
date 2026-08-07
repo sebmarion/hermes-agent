@@ -35,12 +35,69 @@ class TestPerJobToolsetMcpMerge:
         assert result[:2] == ["web", "terminal"]
         assert set(result) == {"web", "terminal"} | self._enabled_names()
 
+    def test_native_only_list_excludes_mcp_servers_disallowed_for_cron(self):
+        cfg = {
+            "mcp_servers": {
+                "cli-only": {"enabled": True, "allowed_platforms": ["cli"]},
+                "cron-only": {"enabled": True, "allowed_platforms": ["cron"]},
+            }
+        }
+
+        result = _merge_mcp_into_per_job_toolsets(["web"], cfg)
+
+        assert "cron-only" in result
+        assert "cli-only" not in result
+
 
     def test_explicit_mcp_name_is_treated_as_allowlist(self):
         # User named one server -> add nothing further.
         result = _merge_mcp_into_per_job_toolsets(["web", "finnhub"], self.CFG)
         assert result == ["web", "finnhub"]
         assert "playwright" not in result
+
+    def test_explicit_disallowed_mcp_name_is_removed_from_cron_toolsets(self):
+        cfg = {
+            "mcp_servers": {
+                "cli-only": {"enabled": True, "allowed_platforms": ["cli"]},
+            }
+        }
+
+        assert _merge_mcp_into_per_job_toolsets(["web", "cli-only"], cfg) == ["web"]
+
+    def test_explicit_disallowed_mcp_does_not_enable_other_cron_servers(self):
+        cfg = {
+            "mcp_servers": {
+                "cli-only": {"enabled": True, "allowed_platforms": ["cli"]},
+                "cron-only": {"enabled": True, "allowed_platforms": ["cron"]},
+            }
+        }
+
+        assert _merge_mcp_into_per_job_toolsets(["web", "cli-only"], cfg) == [
+            "web"
+        ]
+
+    def test_mcp_raw_name_collision_does_not_strip_native_cron_toolset(self):
+        cfg = {
+            "mcp_servers": {
+                "web": {"enabled": True, "allowed_platforms": ["cli"]},
+            }
+        }
+
+        assert _merge_mcp_into_per_job_toolsets(
+            ["web", "terminal", "no_mcp"], cfg
+        ) == ["web", "terminal"]
+
+    def test_mcp_native_name_collision_uses_prefixed_cron_alias(self):
+        cfg = {
+            "mcp_servers": {
+                "web": {"enabled": True, "allowed_platforms": ["cron"]},
+            }
+        }
+
+        assert _merge_mcp_into_per_job_toolsets(["terminal"], cfg) == [
+            "terminal",
+            "mcp-web",
+        ]
 
     def test_no_mcp_sentinel_opts_out_and_is_stripped(self):
         result = _merge_mcp_into_per_job_toolsets(["web", "no_mcp"], self.CFG)

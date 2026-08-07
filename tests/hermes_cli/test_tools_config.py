@@ -16,6 +16,9 @@ from hermes_cli.tools_config import (
     _configure_provider,
     _reconfigure_provider,
     _get_platform_tools,
+    enabled_mcp_server_names,
+    filter_mcp_toolsets_for_platform,
+    mcp_server_allowed_on_platform,
     _platform_toolset_summary,
     _reconfigure_tool,
     _run_post_setup,
@@ -29,6 +32,141 @@ from hermes_cli.tools_config import (
     provider_readiness_status,
     tools_command,
 )
+
+
+def test_enabled_mcp_server_names_filters_allowed_platforms():
+    config = {
+        "mcp_servers": {
+            "legacy": {"url": "https://example.com/legacy"},
+            "cli-only": {"url": "https://example.com/cli", "allowed_platforms": [" CLI "]},
+            "telegram-only": {"url": "https://example.com/telegram", "allowed_platforms": ["telegram"]},
+            "empty": {"url": "https://example.com/empty", "allowed_platforms": []},
+            "malformed": {"url": "https://example.com/malformed", "allowed_platforms": "cli"},
+            "mixed": {"url": "https://example.com/mixed", "allowed_platforms": ["cli", 42]},
+        }
+    }
+
+    assert enabled_mcp_server_names(config, platform="cli") == {"legacy", "cli-only"}
+    assert enabled_mcp_server_names(config, platform="telegram") == {"legacy", "telegram-only"}
+    assert enabled_mcp_server_names(config, platform=None) == {"legacy"}
+
+
+def test_mcp_platform_policy_uses_cli_surface_for_tui_and_desktop():
+    server_cfg = {"allowed_platforms": ["cli"]}
+
+    assert mcp_server_allowed_on_platform(server_cfg, "cli") is True
+    assert mcp_server_allowed_on_platform(server_cfg, "tui") is True
+    assert mcp_server_allowed_on_platform(server_cfg, "desktop") is True
+    assert mcp_server_allowed_on_platform(server_cfg, "telegram") is False
+
+
+def test_filter_mcp_toolsets_for_platform_prunes_stale_and_denied_aliases():
+    config = {
+        "mcp_servers": {
+            "zeus": {"enabled": True, "allowed_platforms": ["cli"]},
+            "disabled": {"enabled": False},
+        }
+    }
+
+    assert filter_mcp_toolsets_for_platform(
+        ["web", "zeus", "mcp-zeus", "disabled", "mcp-disabled", "custom"],
+        config,
+        platform="telegram",
+    ) == ["web", "custom"]
+
+
+def test_filter_mcp_toolsets_for_platform_preserves_native_name_collision():
+    config = {
+        "mcp_servers": {
+            "web": {"enabled": True, "allowed_platforms": ["cli"]},
+        }
+    }
+
+    assert filter_mcp_toolsets_for_platform(
+        ["web", "terminal", "mcp-web"], config, platform="cron"
+    ) == ["web", "terminal"]
+
+
+def test_get_platform_tools_prefixes_mcp_alias_on_native_name_collision():
+    config = {
+        "platform_toolsets": {"telegram": ["web"]},
+        "mcp_servers": {
+            "web": {"enabled": True, "allowed_platforms": ["telegram"]},
+        },
+    }
+
+    enabled = _get_platform_tools(config, "telegram")
+
+    assert "web" in enabled
+    assert "mcp-web" in enabled
+
+
+def test_get_platform_tools_preserves_custom_name_collision(monkeypatch):
+    from toolsets import TOOLSETS
+
+    monkeypatch.setitem(
+        TOOLSETS,
+        "private-tools",
+        {
+            "description": "Custom tools",
+            "tools": ["private_custom_tool"],
+            "includes": [],
+        },
+    )
+    config = {
+        "platform_toolsets": {"telegram": ["private-tools", "no_mcp"]},
+        "mcp_servers": {
+            "private-tools": {
+                "enabled": True,
+                "allowed_platforms": ["telegram"],
+            }
+        },
+    }
+
+    enabled = _get_platform_tools(config, "telegram")
+
+    assert "private-tools" in enabled
+    assert "mcp-private-tools" not in enabled
+
+
+def test_get_platform_tools_explicit_mcp_name_cannot_bypass_allowed_platforms():
+    config = {
+        "platform_toolsets": {"telegram": ["web", "zeus", "mcp-zeus"]},
+        "mcp_servers": {
+            "zeus": {
+                "url": "https://example.com/zeus",
+                "allowed_platforms": ["cli"],
+            },
+        },
+    }
+
+    enabled = _get_platform_tools(config, "telegram")
+
+    assert "web" in enabled
+    assert "zeus" not in enabled
+    assert "mcp-zeus" not in enabled
+
+
+def test_get_platform_tools_denied_explicit_mcp_does_not_enable_other_servers():
+    config = {
+        "platform_toolsets": {"telegram": ["web", "blocked"]},
+        "mcp_servers": {
+            "blocked": {
+                "url": "https://example.com/blocked",
+                "allowed_platforms": ["cli"],
+            },
+            "other": {
+                "url": "https://example.com/other",
+                "allowed_platforms": ["telegram"],
+            },
+        },
+    }
+
+    enabled = _get_platform_tools(config, "telegram")
+
+    assert "web" in enabled
+    assert "blocked" not in enabled
+    assert "other" not in enabled
 
 
 

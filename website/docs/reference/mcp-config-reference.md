@@ -31,6 +31,7 @@ mcp_servers:
     # client_key: "/path/to/key.pem"  # optional, when key lives in a separate file
 
     enabled: true
+    allowed_platforms: [cli, cron]
     timeout: 120
     connect_timeout: 60
     supports_parallel_tool_calls: false
@@ -54,6 +55,7 @@ mcp_servers:
 | `client_cert` | string or list | HTTP | mTLS client certificate. String = path to a PEM file containing cert + key. List `[cert, key]` = separate files. List `[cert, key, password]` = encrypted key |
 | `client_key` | string | HTTP | Path to the client private key, when `client_cert` is a string and the key is in a separate file |
 | `enabled` | bool | both | Skip the server entirely when false |
+| `allowed_platforms` | non-empty list of strings | both | Runtime surfaces allowed to expose and execute this server. Omit for unrestricted access; malformed or empty values deny every surface |
 | `timeout` | number | both | Tool call timeout in seconds (default: `300`) |
 | `connect_timeout` | number | both | Initial connection timeout in seconds (default: `60`) |
 | `supports_parallel_tool_calls` | bool | both | Allow tools from this server to run concurrently |
@@ -174,6 +176,35 @@ Behavior:
 - no discovery
 - no tool registration
 - config remains in place for later reuse
+
+## Runtime platform policy
+
+`allowed_platforms` restricts a server by Hermes runtime surface, not by
+operating system:
+
+```yaml
+mcp_servers:
+  browser:
+    command: npx
+    args: ["-y", "@playwright/mcp"]
+    allowed_platforms: [cli, cron]
+```
+
+Common surface names are `cli`, `acp`, `cron`, `telegram`, `discord`, and
+`slack`. TUI and Desktop use the `cli` policy surface. Omit the key to preserve
+the historical unrestricted behavior. Once the key is present it must be a
+non-empty list of non-empty strings; malformed input denies every surface
+until corrected. Comparisons trim whitespace and ignore case.
+
+Policy is applied during selection, schema assembly, live refresh, and again
+immediately before execution. Removing, disabling, or restricting a server
+therefore revokes an already-built agent snapshot on its next attempted call.
+
+If a server name collides with a native/plugin/custom toolset, select the MCP
+server with `mcp-<name>` (`mcp-web`, for example); the raw spelling retains its
+non-MCP meaning. An explicit but denied MCP selection does not fall back to all
+other allowed servers. Omit MCP selections to inherit allowed servers, or use
+`no_mcp` to opt out.
 
 ## Empty result behavior
 

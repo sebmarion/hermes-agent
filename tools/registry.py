@@ -771,6 +771,7 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        execution_platform = kwargs.pop("platform", None)
         try:
             from agent.tool_runtime_context import (
                 bind_prepared_tool_runtime,
@@ -816,6 +817,29 @@ class ToolRegistry:
             if policy_block is not None:
                 record_required_policy_block(str(tool_call_id or ""), policy_block)
                 return json.dumps(policy_block.to_result(), ensure_ascii=False)
+
+            if entry.toolset.startswith("mcp-"):
+                try:
+                    from tools.mcp_tool import mcp_tool_platform_access
+
+                    allowed, denial_reason = mcp_tool_platform_access(
+                        name, execution_platform
+                    )
+                except Exception:
+                    logger.exception(
+                        "MCP platform authorization failed for tool %s", name
+                    )
+                    allowed, denial_reason = False, "mcp_policy_unavailable"
+                if not allowed:
+                    reason = denial_reason or "mcp_platform_denied"
+                    return tool_error(
+                        f"MCP tool '{name}' is not available on this runtime surface.",
+                        error_type=reason,
+                        tool=name,
+                    )
+
+            if name == "execute_code" and execution_platform is not None:
+                kwargs["execution_platform"] = execution_platform
             with bind_prepared_tool_runtime(runtime):
                 if entry.is_async:
                     from model_tools import _run_async

@@ -170,6 +170,11 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    # Canonical toolset labels added specifically for the most recent ACP MCP
+    # list.  This is intentionally session-local and ephemeral: a later
+    # explicit empty/shrunk list can revoke only its own aliases without
+    # removing native or config-owned toolsets with similar names.
+    acp_mcp_toolset_aliases: set[str] = field(default_factory=set)
 
 
 class SessionManager:
@@ -614,11 +619,11 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
-        configured_mcp_servers = [
-            name
-            for name, cfg in (config.get("mcp_servers") or {}).items()
-            if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
-        ]
+        from hermes_cli.tools_config import enabled_mcp_server_names
+
+        configured_mcp_servers = sorted(
+            enabled_mcp_server_names(config, platform="acp")
+        )
 
         kwargs = {
             "platform": "acp",

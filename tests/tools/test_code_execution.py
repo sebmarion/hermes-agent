@@ -49,7 +49,7 @@ from tools.code_execution_tool import (
 )
 
 
-def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
+def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None, **kwargs):
     """Mock dispatcher that returns canned responses for each tool."""
     if function_name == "terminal":
         cmd = function_args.get("command", "")
@@ -117,6 +117,31 @@ class TestHermesToolsGeneration(unittest.TestCase):
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
+    def test_execute_remote_threads_execution_platform_into_file_rpc(self):
+        class FakeEnv:
+            def execute(self, command, cwd=None, timeout=None):
+                if "command -v python3" in command:
+                    return {"output": "OK\n"}
+                if "python3 script.py" in command:
+                    return {"output": "hello\n", "returncode": 0}
+                return {"output": ""}
+
+        fake_thread = MagicMock()
+        with (
+            patch("tools.code_execution_tool._load_config", return_value={"timeout": 30, "max_tool_calls": 5}),
+            patch("tools.code_execution_tool._get_or_create_env", return_value=(FakeEnv(), "ssh")),
+            patch("tools.code_execution_tool._ship_file_to_remote"),
+            patch("tools.code_execution_tool.threading.Thread", return_value=fake_thread) as thread_cls,
+        ):
+            result = json.loads(
+                _execute_remote(
+                    "print('hello')", "task-1", ["terminal"], execution_platform="cli"
+                )
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(thread_cls.call_args.kwargs["args"][-1], "cli")
+
     def test_execute_remote_uses_backend_temp_dir_for_sandbox(self):
         class FakeEnv:
             def __init__(self):
@@ -706,7 +731,14 @@ class TestRpcTokenAuthorization(unittest.TestCase):
     round-trips normally.
     """
 
-    def _drive_server(self, rpc_token, requests):
+    def _drive_server(
+        self,
+        rpc_token,
+        requests,
+        *,
+        execution_platform=None,
+        handle_function_call=_mock_handle_function_call,
+    ):
         """Run _rpc_server_loop against a real AF_UNIX socketpair.
 
         Sends each dict in *requests* as a newline-delimited JSON message
@@ -742,17 +774,22 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         def _run():
             with patch(
                 "model_tools.handle_function_call",
-                side_effect=_mock_handle_function_call,
+                side_effect=handle_function_call,
             ):
+                kwargs = dict(
+                    max_tool_calls=10,
+                    allowed_tools=frozenset({"terminal"}),
+                    stop_event=stop_event,
+                    rpc_token=rpc_token,
+                )
+                if execution_platform is not None:
+                    kwargs["execution_platform"] = execution_platform
                 _rpc_server_loop(
                     listener,
                     "test-task",
                     tool_call_log,
                     tool_call_counter,
-                    max_tool_calls=10,
-                    allowed_tools=frozenset({"terminal"}),
-                    stop_event=stop_event,
-                    rpc_token=rpc_token,
+                    **kwargs,
                 )
 
         t = threading.Thread(target=_run, daemon=True)
@@ -788,6 +825,87 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         )
         self.assertEqual(len(resp), 1)
         self.assertIn("Unauthorized", resp[0].get("error", ""))
+
+    def test_rpc_server_forwards_execution_platform(self):
+        seen = {}
+
+        def handler(tool_name, tool_args, **kwargs):
+            seen.update(
+                {"tool_name": tool_name, "tool_args": tool_args, "platform": kwargs.get("platform")}
+            )
+            return json.dumps({"ok": True})
+
+        responses = self._drive_server(
+            "secret-token",
+            [{"tool": "terminal", "args": {"command": "echo hi"}, "token": "secret-token"}],
+            execution_platform="cli",
+            handle_function_call=handler,
+        )
+
+        self.assertEqual(responses, [{"ok": True}])
+        self.assertEqual(seen["tool_name"], "terminal")
+        self.assertEqual(seen["platform"], "cli")
+
+    def test_remote_rpc_poll_forwards_execution_platform(self):
+        from tools.code_execution_tool import _rpc_poll_loop
+
+        stop_event = threading.Event()
+        seen = {}
+
+        class _RemoteEnv:
+            consumed = False
+
+            def execute(self, command, **kwargs):
+                if command.startswith("ls -1 "):
+                    return {
+                        "output": "" if self.consumed else "/tmp/rpc/req_000001\n"
+                    }
+                if command.startswith("cat "):
+                    return {
+                        "output": json.dumps(
+                            {
+                                "tool": "terminal",
+                                "args": {"command": "echo hi"},
+                                "seq": 1,
+                                "token": "secret-token",
+                            }
+                        )
+                    }
+                if command.startswith("echo "):
+                    stop_event.set()
+                    return {"output": "", "returncode": 0}
+                if command.startswith("rm -f "):
+                    self.consumed = True
+                    return {"output": "", "returncode": 0}
+                raise AssertionError(f"unexpected remote command: {command}")
+
+        def handler(tool_name, tool_args, **kwargs):
+            seen.update(
+                {
+                    "tool_name": tool_name,
+                    "tool_args": tool_args,
+                    "platform": kwargs.get("platform"),
+                }
+            )
+            return json.dumps({"ok": True})
+
+        with patch("model_tools.handle_function_call", side_effect=handler):
+            _rpc_poll_loop(
+                _RemoteEnv(),
+                "/tmp/rpc",
+                "test-task",
+                [],
+                [0],
+                5,
+                frozenset({"terminal"}),
+                stop_event,
+                "secret-token",
+                execution_platform="cli",
+            )
+
+        self.assertEqual(seen["tool_name"], "terminal")
+        self.assertEqual(seen["tool_args"], {"command": "echo hi"})
+        self.assertEqual(seen["platform"], "cli")
 
 
     def test_generated_module_sends_token(self):

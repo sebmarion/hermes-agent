@@ -973,11 +973,15 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list[McpServerStdio | McpServerHttp | McpServerSse] | None,
     ) -> None:
         """Register ACP-provided MCP servers and refresh the agent tool surface."""
-        if not mcp_servers:
+        if mcp_servers is None:
             return
 
+        accepted_server_names: list[str] = []
         try:
-            from tools.mcp_tool import register_mcp_servers
+            from tools.mcp_tool import (
+                mcp_server_registration_matches,
+                register_mcp_servers,
+            )
 
             config_map: dict[str, dict] = {}
             for server in mcp_servers:
@@ -993,31 +997,58 @@ class HermesACPAgent(acp.Agent):
                         "url": server.url,
                         "headers": {item.name: item.value for item in server.headers},
                     }
+                    if isinstance(server, McpServerSse):
+                        config["transport"] = "sse"
+                previous = config_map.get(name)
+                if previous is not None and previous != config:
+                    raise ValueError(
+                        f"ACP MCP server name {name!r} has conflicting definitions"
+                    )
                 config_map[name] = config
 
-            await asyncio.to_thread(register_mcp_servers, config_map)
+            if config_map:
+                await asyncio.to_thread(register_mcp_servers, config_map, source="acp")
+            accepted_server_names = [
+                name
+                for name, config in config_map.items()
+                if mcp_server_registration_matches(name, config, source="acp")
+            ]
         except Exception:
             logger.warning(
                 "Session %s: failed to register ACP MCP servers",
                 state.session_id,
                 exc_info=True,
             )
-            return
 
         try:
             from model_tools import get_tool_definitions
             from agent.memory_manager import inject_memory_provider_tools
 
+            prior_acp_aliases = set(state.acp_mcp_toolset_aliases)
+            base_toolsets = [
+                toolset
+                for toolset in (
+                    getattr(state.agent, "enabled_toolsets", None)
+                    or ["hermes-acp"]
+                )
+                if toolset not in prior_acp_aliases
+            ]
             enabled_toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
-                mcp_server_names=[server.name for server in mcp_servers],
+                base_toolsets,
+                mcp_server_names=accepted_server_names,
             )
             state.agent.enabled_toolsets = enabled_toolsets
+            state.acp_mcp_toolset_aliases = {
+                f"mcp-{name}"
+                for name in accepted_server_names
+                if f"mcp-{name}" not in base_toolsets
+            }
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
             state.agent.tools = get_tool_definitions(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True,
+                platform="acp",
             )
             state.agent.valid_tool_names = {
                 tool["function"]["name"] for tool in state.agent.tools or []
@@ -1032,6 +1063,10 @@ class HermesACPAgent(acp.Agent):
                 len(state.agent.tools or []),
             )
         except Exception:
+            # A failed rebuild must not leave the prior request's MCP schemas
+            # executable after its aliases were revoked.
+            state.agent.tools = []
+            state.agent.valid_tool_names = set()
             logger.warning(
                 "Session %s: failed to refresh tool surface after ACP MCP registration",
                 state.session_id,
@@ -2222,7 +2257,11 @@ class HermesACPAgent(acp.Agent):
             toolsets = _expand_acp_enabled_toolsets(
                 getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
             )
-            tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
+            tools = get_tool_definitions(
+                enabled_toolsets=toolsets,
+                quiet_mode=True,
+                platform="acp",
+            )
             tool_view = SimpleNamespace(
                 tools=list(tools or []),
                 valid_tool_names={

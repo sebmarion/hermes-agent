@@ -1358,6 +1358,7 @@ export interface McpServerSummary {
   args: string[]
   url: string | null
   enabled: boolean
+  allowed_platforms: string[] | null
   tools: string[] | null
 }
 

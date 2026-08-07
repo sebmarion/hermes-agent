@@ -21,6 +21,7 @@ The `mcpServers` block in your `~/.claude.json` maps to `mcp_servers` in Hermes'
 - Automatic tool discovery and registration at startup
 - Utility wrappers for MCP resources and prompts when supported by the server
 - Per-server filtering so you can expose only the MCP tools you actually want Hermes to see
+- Per-server runtime policy so an MCP can be limited to selected surfaces such as CLI or cron
 
 ## Quick start
 
@@ -50,6 +51,25 @@ List the files in /home/user/projects and summarize the repo structure.
 ```
 
 Hermes will discover the MCP server's tools and use them like any other tool.
+
+### Restrict a server to runtime surfaces
+
+Use `allowed_platforms` when a server should be available only on selected
+Hermes surfaces:
+
+```yaml
+mcp_servers:
+  filesystem:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/projects"]
+    allowed_platforms: [cli]
+```
+
+Common values are `cli`, `acp`, `cron`, `telegram`, `discord`, and `slack`.
+TUI and Desktop use `cli`. Omit the key for unrestricted access. If the key is
+present, it must be a non-empty list of non-empty strings; malformed values
+deny access until corrected. See the [MCP Config Reference](/reference/mcp-config-reference#runtime-platform-policy)
+for selection and name-collision details.
 
 ## Catalog: one-click install for Nous-approved MCPs
 
