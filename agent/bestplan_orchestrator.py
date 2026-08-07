@@ -672,52 +672,96 @@ def _validated_plan_envelope(body: str, *, workspace: str) -> str | None:
     )
 
 
-def _force_retire_child_transport(child: Any) -> None:
-    """Best-effort abort of a provider transport on a daemon teardown thread."""
-    abort = getattr(child, "_active_request_abort", None)
-    if callable(abort):
+class _ManagedChildRun:
+    """Synchronize controller cancellation with worker-owned finalization.
+
+    ``AIAgent.interrupt`` targets process-global per-thread tool state, while
+    SDK client ``close`` must run on the thread that owned the provider call.
+    The lifecycle lock closes the race where a controller observes a pending
+    future just as ``run_conversation`` clears its interrupt bit and returns.
+    Any admitted interrupt is therefore followed by an owner-thread clear,
+    and the owner always performs the final transport close.
+    """
+
+    def __init__(self, child: Any) -> None:
+        self.child = child
+        self.future: Future[Any] | None = None
+        self._lock = threading.Lock()
+        self._state = "created"
+        self._stop_requested = False
+        self.finished = threading.Event()
+
+    def bind(self, future: Future[Any]) -> Future[Any]:
+        self.future = future
+        return future
+
+    def run(self, prompt: str) -> str:
+        with self._lock:
+            cancelled_before_start = self._stop_requested
+            self._state = "finishing" if cancelled_before_start else "running"
         try:
-            abort("bestplan_hard_deadline")
+            if cancelled_before_start:
+                raise RuntimeError("BestPlan child cancelled before dispatch")
+            return _run_child_agent(self.child, prompt)
+        finally:
+            # The lifecycle lock pairs with request_stop(). If an interrupt
+            # won the race after turn finalization, clear it here before this
+            # worker tid can be recycled for an unrelated tool.
+            with self._lock:
+                self._state = "finishing"
+                clear_interrupt = getattr(self.child, "clear_interrupt", None)
+                if callable(clear_interrupt):
+                    try:
+                        clear_interrupt()
+                    except Exception:
+                        pass
+            try:
+                # Never close an SDK transport from the controller thread.
+                self.child.close()
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    self._state = "finished"
+                self.finished.set()
+
+    def request_stop(self) -> bool:
+        """Admit a hard stop only while the owner can still clear it."""
+        from agent.interrupt_compat import request_hard_interrupt
+
+        with self._lock:
+            if self._state == "created":
+                self._stop_requested = True
+                return True
+            if self._state != "running":
+                return False
+            try:
+                return request_hard_interrupt(
+                    self.child,
+                    "BestPlan deadline cleanup",
+                )
+            except Exception:
+                return False
+
+    def close_unstarted(self) -> None:
+        """Close a constructed child whose future never acquired a worker."""
+        with self._lock:
+            if self._state != "created":
+                return
+            self._state = "finishing"
+        try:
+            self.child.close()
         except Exception:
             pass
-
-    client = getattr(child, "client", None)
-    if client is not None:
-        force_close = getattr(child, "_force_close_tcp_sockets", None)
-        if callable(force_close):
-            try:
-                force_close(client)
-            except Exception:
-                pass
-        close_client = getattr(client, "close", None)
-        if callable(close_client):
-            try:
-                close_client()
-            except Exception:
-                pass
-
-    codex_session = getattr(child, "_codex_session", None)
-    codex_client = getattr(codex_session, "_client", None)
-    close_codex = getattr(codex_client, "close", None)
-    if callable(close_codex):
-        try:
-            close_codex(timeout=0.5)
-        except TypeError:
-            try:
-                close_codex()
-            except Exception:
-                pass
-        except Exception:
-            pass
+        finally:
+            with self._lock:
+                self._state = "finished"
+            self.finished.set()
 
 
-def _stop_child_agents(
-    children: Iterable[Any],
-    futures: Iterable[Future[Any]] = (),
-) -> bool:
-    """Retire child work within a finite hard teardown deadline."""
-    unique = list({id(child): child for child in children}.values())
-    submitted = list(dict.fromkeys(futures))
+def _stop_child_runs(runs: Iterable[_ManagedChildRun]) -> bool:
+    """Stop child work without cross-thread SDK close or stale interrupts."""
+    unique = list({id(run): run for run in runs}.values())
     teardown_threads: list[threading.Thread] = []
 
     def start_teardown(target: Any, *, name: str) -> None:
@@ -725,7 +769,8 @@ def _stop_child_agents(
         thread.start()
         teardown_threads.append(thread)
 
-    for child in unique:
+    for run in unique:
+        child = run.child
         try:
             child._persist_disabled = True
             child.tool_progress_callback = None
@@ -734,25 +779,15 @@ def _stop_child_agents(
         except Exception:
             pass
 
-        def interrupt_one(target: Any = child) -> None:
-            try:
-                target.interrupt("BestPlan deadline or completion cleanup")
-            except TypeError:
-                try:
-                    target.interrupt()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        def close_one(target: Any = child) -> None:
-            try:
-                target.close()
-            except Exception:
-                pass
-
-        start_teardown(interrupt_one, name="bestplan-interrupt")
-        start_teardown(close_one, name="bestplan-close")
+        future = run.future
+        if future is None or future.cancelled():
+            # No provider call can be in flight, so this daemon becomes the
+            # sole teardown owner for the never-started child.
+            start_teardown(run.close_unstarted, name="bestplan-close-unstarted")
+        elif not future.done():
+            # request_stop uses the managed lifecycle lock; the worker clears
+            # every admitted interrupt and owns client.close() while unwinding.
+            start_teardown(run.request_stop, name="bestplan-hard-interrupt")
 
     started = time.monotonic()
     hard_deadline = started + max(0.0, float(_CHILD_CLEANUP_HARD_SECONDS))
@@ -760,6 +795,7 @@ def _stop_child_agents(
         hard_deadline,
         started + max(0.0, float(_CHILD_CLEANUP_GRACE_SECONDS)),
     )
+    submitted = [run.future for run in unique if run.future is not None]
     pending = [future for future in submitted if not future.done()]
     if pending:
         wait(pending, timeout=max(0.0, grace_deadline - time.monotonic()))
@@ -767,14 +803,6 @@ def _stop_child_agents(
         thread.join(timeout=max(0.0, grace_deadline - time.monotonic()))
 
     still_running = [future for future in submitted if not future.done()]
-    still_tearing_down = [thread for thread in teardown_threads if thread.is_alive()]
-    if still_running or still_tearing_down:
-        for child in unique:
-            start_teardown(
-                lambda target=child: _force_retire_child_transport(target),
-                name="bestplan-force-retire",
-            )
-
     if still_running:
         wait(still_running, timeout=max(0.0, hard_deadline - time.monotonic()))
     for thread in teardown_threads:
@@ -782,7 +810,8 @@ def _stop_child_agents(
 
     still_running = [future for future in submitted if not future.done()]
     still_tearing_down = [thread for thread in teardown_threads if thread.is_alive()]
-    complete = not still_running and not still_tearing_down
+    unclosed = [run for run in unique if not run.finished.is_set()]
+    complete = not still_running and not still_tearing_down and not unclosed
     if not complete:
         logger.error(
             "BestPlan hard teardown deadline reached; quarantined %d provider "
@@ -987,7 +1016,8 @@ def run_bestplan(
             max_workers=1,
             thread_name_prefix="bestplan-synthesizer",
         )
-        synth_future = synth_pool.submit(_run_child_agent, synth_child, synth_prompt)
+        synth_run = _ManagedChildRun(synth_child)
+        synth_future = synth_run.bind(synth_pool.submit(synth_run.run, synth_prompt))
         synth_deadline = min(
             overall_deadline,
             time.monotonic() + float(resolved["synthesizer_timeout"]),
@@ -1004,9 +1034,7 @@ def run_bestplan(
         except Exception as exc:
             synth_error = exc
         finally:
-            synth_cleanup_complete = _stop_child_agents(
-                [synth_child], [synth_future]
-            )
+            synth_cleanup_complete = _stop_child_runs([synth_run])
             synth_pool.shutdown(wait=False, cancel_futures=True)
 
         lane_name = candidate_record["lane"].get(
@@ -1079,9 +1107,10 @@ def run_bestplan(
         except Exception as exc:
             synth_errors.append(f"repair construction: {type(exc).__name__}")
         else:
+            repair_run = _ManagedChildRun(repair_child)
             dispatch_remaining = overall_deadline - time.monotonic()
             if dispatch_remaining < _SYNTHESIS_REPAIR_MIN_REMAINING_SECONDS:
-                repair_cleanup_complete = _stop_child_agents([repair_child])
+                repair_cleanup_complete = _stop_child_runs([repair_run])
                 if not repair_cleanup_complete:
                     return {
                         "status": "failed",
@@ -1106,8 +1135,8 @@ def run_bestplan(
                     max_workers=1,
                     thread_name_prefix="bestplan-synthesis-repair",
                 )
-                repair_future = repair_pool.submit(
-                    _run_child_agent, repair_child, repair_prompt
+                repair_future = repair_run.bind(
+                    repair_pool.submit(repair_run.run, repair_prompt)
                 )
                 repair_deadline = min(
                     overall_deadline,
@@ -1125,9 +1154,7 @@ def run_bestplan(
                 except Exception as exc:
                     repair_error = exc
                 finally:
-                    repair_cleanup_complete = _stop_child_agents(
-                        [repair_child], [repair_future]
-                    )
+                    repair_cleanup_complete = _stop_child_runs([repair_run])
                     repair_pool.shutdown(wait=False, cancel_futures=True)
 
                 if not repair_cleanup_complete:

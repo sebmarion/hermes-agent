@@ -815,6 +815,123 @@ def test_repair_timeout_interrupts_closes_and_returns_within_hard_deadline(monke
     assert repair_instances[0].closed is True
 
 
+def test_completed_synth_cleanup_does_not_poison_recycled_tool_thread(monkeypatch):
+    """Completion cleanup must not interrupt a worker after turn finalization.
+
+    AIAgent clears its process-global tool interrupt bit before
+    ``run_conversation`` returns.  Interrupting that completed child from the
+    controller thread re-adds the now-stale worker tid and poisons whichever
+    unrelated tool later reuses it.
+    """
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+    from tools.interrupt import _interrupted_threads, set_interrupt
+
+    lane = {
+        "name": "local",
+        "provider": "provider-a",
+        "model": "local-model",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "high",
+    }
+    worker_tids = set()
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            self._execution_thread_id = None
+
+        def run_conversation(self, prompt):
+            self._execution_thread_id = threading.current_thread().ident
+            worker_tids.add(self._execution_thread_id)
+            set_interrupt(False, self._execution_thread_id)
+            try:
+                if "active BestPlan synthesizer" in prompt:
+                    return {"final_response": _synth_plan_envelope()}
+                return {"final_response": _candidate_text()}
+            finally:
+                # Mirrors AIAgent turn finalization.
+                set_interrupt(False, self._execution_thread_id)
+
+        def interrupt(self, *_args, **_kwargs):
+            set_interrupt(True, self._execution_thread_id)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured: _identity(configured),
+    )
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+
+    try:
+        result = run_bestplan(
+            SimpleNamespace(session_id="parent"),
+            "plan it",
+            config=_runtime_config([lane]),
+        )
+        assert result["status"] == "completed"
+        assert worker_tids.isdisjoint(_interrupted_threads)
+    finally:
+        for tid in worker_tids:
+            set_interrupt(False, tid)
+
+
+def test_synth_transport_close_runs_on_its_owner_thread(monkeypatch):
+    """A live SDK transport is closed only by the worker that used it."""
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    lane = {
+        "name": "local",
+        "provider": "provider-a",
+        "model": "local-model",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "high",
+    }
+    synth_instances = []
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            self.owner_tid = None
+            self.close_tid = None
+            self.is_synth = False
+
+        def run_conversation(self, prompt):
+            self.owner_tid = threading.current_thread().ident
+            self.is_synth = "active BestPlan synthesizer" in prompt
+            if self.is_synth:
+                synth_instances.append(self)
+                return {"final_response": _synth_plan_envelope()}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            self.close_tid = threading.current_thread().ident
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured: _identity(configured),
+    )
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan it",
+        config=_runtime_config([lane]),
+    )
+
+    assert result["status"] == "completed"
+    assert len(synth_instances) == 1
+    assert synth_instances[0].close_tid == synth_instances[0].owner_tid
+
+
 def test_run_bestplan_single_provider_uses_three_top_model_instances(monkeypatch, tmp_path):
     """Live orchestration keeps one-provider MoE resilient below quorum."""
     import agent.bestplan_orchestrator as orchestrator
