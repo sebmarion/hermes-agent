@@ -3932,14 +3932,27 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
+            # Keep the legacy positional callback contract when no gateway
+            # ownership metadata exists.  In-process callers and older test
+            # doubles may intentionally provide a four-argument runner; pass
+            # the ownership fields only when they carry real authority.
+            owner_kwargs = {}
+            if (
+                _origin_ui_session_id
+                or _origin_owner_transport is not None
+                or _origin_owner_session_record is not None
+            ):
+                owner_kwargs = {
+                    "owner_session_id": _origin_ui_session_id or None,
+                    "owner_transport": _origin_owner_transport,
+                    "owner_session_record": _origin_owner_session_record,
+                }
             result = _run_single_child(
                 _i,
                 _t["goal"],
                 child,
                 parent_agent,
-                owner_session_id=_origin_ui_session_id or None,
-                owner_transport=_origin_owner_transport,
-                owner_session_record=_origin_owner_session_record,
+                **owner_kwargs,
             )
             results.append(result)
         else:

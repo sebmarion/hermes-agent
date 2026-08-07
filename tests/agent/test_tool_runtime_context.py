@@ -94,6 +94,31 @@ def test_live_persistent_terminal_cwd_wins(monkeypatch, tmp_path):
     assert runtime.effective_cwd_authoritative is True
 
 
+def test_session_cwd_record_precedes_shared_live_cwd(monkeypatch, tmp_path):
+    from tools import terminal_tool
+
+    recorded = tmp_path / "recorded"
+    shared_live = tmp_path / "shared-live"
+    recorded.mkdir()
+    shared_live.mkdir()
+    terminal_tool.record_session_cwd("session-record", str(recorded))
+    terminal_tool._active_environments["default"] = SimpleNamespace(
+        cwd=str(shared_live),
+        cwd_owner="",
+    )
+
+    runtime = prepare_tool_runtime(
+        "read_file",
+        {},
+        "default",
+        "session-record",
+    )
+
+    assert runtime.effective_cwd == str(recorded.resolve())
+    assert runtime.effective_cwd_source == "session_record"
+    assert runtime.effective_cwd_authoritative is True
+
+
 def test_gateway_task_override_precedes_terminal_config(monkeypatch, tmp_path):
     from tools.terminal_tool import register_task_env_overrides
 
@@ -112,7 +137,7 @@ def test_gateway_task_override_precedes_terminal_config(monkeypatch, tmp_path):
     )
 
     assert runtime.effective_cwd == str(workspace.resolve())
-    assert runtime.effective_cwd_source == "task_override"
+    assert runtime.effective_cwd_source == "session_record"
     assert runtime.effective_cwd_authoritative is True
 
 
@@ -443,9 +468,9 @@ def test_shared_terminal_live_cwd_is_used_only_by_its_owner(tmp_path):
     runtime_b = prepare_tool_runtime("read_file", {}, "default", "session-b")
 
     assert runtime_a.effective_cwd == str(live_a.resolve())
-    assert runtime_a.effective_cwd_source == "live_terminal"
+    assert runtime_a.effective_cwd_source == "session_record"
     assert runtime_b.effective_cwd == str(workspace_b.resolve())
-    assert runtime_b.effective_cwd_source == "task_override"
+    assert runtime_b.effective_cwd_source == "session_record"
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is unavailable")

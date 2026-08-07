@@ -97,6 +97,23 @@ def _live_terminal_cwd(task_key: str) -> str | None:
     return str(value).strip() if value else None
 
 
+def _session_record_cwd(task_key: str) -> str | None:
+    """Return the exact per-session cwd record, when one exists.
+
+    The shared terminal environment is only a cache of the last process cwd;
+    it can be driven by another session when CWD-only sessions share the
+    ``default`` environment.  A session record is the durable owner of that
+    session's cwd and must therefore be consulted before the shared cache.
+    """
+    try:
+        from tools.terminal_tool import get_session_cwd
+
+        value = get_session_cwd(task_key)
+    except Exception:
+        return None
+    return str(value).strip() if value else None
+
+
 def _task_override_cwd(task_key: str, backend: str) -> str | None:
     if backend == "local":
         try:
@@ -161,6 +178,10 @@ def _select_runtime_cwd(
         workdir = args.get("workdir")
         if type(workdir) is str and workdir.strip():
             return workdir.strip(), "explicit_workdir"
+
+    recorded = _session_record_cwd(task_key)
+    if recorded:
+        return recorded, "session_record"
 
     live = _live_terminal_cwd(task_key)
     if live:
