@@ -16,7 +16,8 @@ from typing import Any
 _COMPLETION_CLAIM_RE = re.compile(
     r"\b(?:done|fixed|working|verified|deployed|pushed|published|resolved|"
     r"complete|completed)\b"
-    r"|\b(?:tests?|checks?|build)\s+(?:(?:is|are|was|were)\s+)?"
+    r"|\b(?:tests?|checks?|build)\s+(?:(?:is|are|was|were)\s+|"
+    r"(?:has|have|had)(?:\s+been)?\s+)?"
     r"(?:pass|passed|passing|green)\b",
     re.IGNORECASE,
 )
@@ -38,24 +39,29 @@ _EXPLICIT_BLOCKER_RE = re.compile(
     r"did\s+not\s+pass|needs?\s+follow[- ]?up|not\s+ready)\b",
     re.IGNORECASE,
 )
-_BARE_COMMAND_PROOF_RE = re.compile(
-    r"\b(?:pytest|tox|nox|ruff|mypy|eslint|tsc|vitest|jest|npm|pnpm|"
-    r"yarn|bun|cargo|go|make|curl|httpie|git|python(?:3(?:\.\d+)?)?)"
-    r"\b(?![.\w-])",
+_KNOWN_COMMAND_TOKEN_RE = re.compile(
+    r"(?:pytest|tox|nox|ruff|mypy|eslint|tsc|vitest|jest|npm|pnpm|"
+    r"yarn|bun|cargo|make|curl|httpie|git|go|pre-commit|"
+    r"python(?:3(?:\.\d+)?)?)",
     re.IGNORECASE,
 )
 _BACKTICK_SPAN_RE = re.compile(r"`([^`\n]+)`")
 _COMMAND_TOKEN_RE = re.compile(
     r"(?:\.{0,2}/)?[A-Za-z0-9_+.-]+(?:/[A-Za-z0-9_+.-]+)*"
 )
-_INLINE_DATA_SUFFIXES = (
-    ".ini",
-    ".json",
-    ".md",
-    ".py",
-    ".txt",
-    ".yaml",
-    ".yml",
+_BARE_RECEIPT_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:pass|command)\s*:\s*|(?:ran|run|running|executed)\s+)?",
+    re.IGNORECASE,
+)
+_SCRIPT_SUFFIXES = (".bash", ".command", ".sh", ".zsh")
+_GO_SUBCOMMANDS = frozenset(
+    "build clean env fmt generate get install list mod run test tool "
+    "version vet work".split()
+)
+_GIT_SUBCOMMANDS = frozenset(
+    "add apply branch checkout cherry-pick clean clone commit diff fetch init "
+    "log merge pull push rebase remote reset restore revert show stash status "
+    "switch tag worktree".split()
 )
 _API_PROOF_RE = re.compile(
     r"\b(?:GET|POST|PUT|PATCH|DELETE)\s+/[^\s,;)]*",
@@ -85,27 +91,64 @@ def _has_completion_claim(response_text: str) -> bool:
     return bool(_WORK_CONTEXT_RE.search(response_text))
 
 
+def _is_executable_script_path(token: str) -> bool:
+    if not _COMMAND_TOKEN_RE.fullmatch(token):
+        return False
+    if token.startswith(("./", "../", "/")):
+        return True
+    if "/" not in token:
+        return False
+    basename = token.rsplit("/", 1)[-1]
+    return basename.endswith(_SCRIPT_SUFFIXES) or "." not in basename
+
+
+def _is_known_command_token(token: str) -> bool:
+    return bool(_KNOWN_COMMAND_TOKEN_RE.fullmatch(token))
+
+
 def _is_command_like_backtick_span(span: str) -> bool:
     parts = span.strip().split()
-    if not parts or not _COMMAND_TOKEN_RE.fullmatch(parts[0]):
+    if not parts:
         return False
     executable = parts[0]
-    if executable.endswith(_INLINE_DATA_SUFFIXES) and not executable.startswith("./"):
-        return False
-    if len(parts) > 1:
-        return True
-    return executable.startswith("./") or (
-        "/" in executable and executable.endswith((".bash", ".sh", ".zsh"))
+    return _is_known_command_token(executable) or _is_executable_script_path(
+        executable
     )
+
+
+def _is_command_like_bare_clause(clause: str) -> bool:
+    candidate = _BARE_RECEIPT_PREFIX_RE.sub("", clause, count=1)
+    parts = candidate.split()
+    if not parts:
+        return False
+    executable = parts[0]
+    if _is_executable_script_path(executable):
+        return True
+    if not _is_known_command_token(executable):
+        return False
+    command = executable.casefold()
+    if command == "go":
+        return len(parts) > 1 and (
+            parts[1].startswith("-") or parts[1].casefold() in _GO_SUBCOMMANDS
+        )
+    if command.startswith("python"):
+        return len(parts) > 1 and (
+            parts[1].startswith("-") or parts[1].endswith(".py")
+        )
+    if command == "git":
+        return len(parts) > 1 and (
+            parts[1].startswith("-") or parts[1].casefold() in _GIT_SUBCOMMANDS
+        )
+    return True
 
 
 def _has_command_proof_source(clause: str) -> bool:
-    if _BARE_COMMAND_PROOF_RE.search(clause):
-        return True
-    return any(
+    if any(
         _is_command_like_backtick_span(span)
         for span in _BACKTICK_SPAN_RE.findall(clause)
-    )
+    ):
+        return True
+    return _is_command_like_bare_clause(clause)
 
 
 def _has_successful_proof(response_text: str) -> bool:

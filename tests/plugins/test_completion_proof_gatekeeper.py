@@ -48,7 +48,11 @@ def test_successful_command_proof_is_left_unchanged():
         "`scripts/run_tests.sh tests/plugins/test_gatekeeper.py` passed.",
         "`git diff --check` exited with code 0.",
         "`python -m unittest` passed.",
+        "`pre-commit` passed.",
+        "`go` passed.",
         "git diff --check passed.",
+        "python -m unittest passed.",
+        "go test passed.",
     ],
 )
 def test_repository_command_receipt_is_left_unchanged(receipt):
@@ -91,6 +95,10 @@ def test_honest_blocker_is_left_unchanged():
         "The checks are not green.",
         "The build is not green.",
         "The build did not pass.",
+        "The tests have not passed.",
+        "The tests have not been passing.",
+        "The check has not passed.",
+        "The build had not passed.",
     ],
 )
 def test_explicit_negated_completion_claim_is_left_unchanged(response):
@@ -112,6 +120,40 @@ def test_generic_api_mention_with_unrelated_success_is_not_proof():
 def test_arbitrary_inline_code_with_unrelated_success_is_not_proof():
     plugin = _load_plugin()
     response = "Fixed the handler in `handler.py`; the migration was successful."
+
+    result = plugin.transform_llm_output(response_text=response)
+
+    assert result is not None
+    assert "report-only" in result
+
+
+@pytest.mark.parametrize(
+    "inline_receipt",
+    [
+        "`feature flag` was successful.",
+        "`expected value` matched the expected source.",
+    ],
+)
+def test_arbitrary_multiword_inline_code_is_not_command_proof(inline_receipt):
+    plugin = _load_plugin()
+    response = f"Fixed the handler. {inline_receipt}"
+
+    result = plugin.transform_llm_output(response_text=response)
+
+    assert result is not None
+    assert "report-only" in result
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "Everything was successful and good to go.",
+        "The Python migration was successful.",
+    ],
+)
+def test_english_command_word_is_not_bare_command_proof(prose):
+    plugin = _load_plugin()
+    response = f"Fixed the handler. {prose}"
 
     result = plugin.transform_llm_output(response_text=response)
 
@@ -162,6 +204,12 @@ def test_command_exited_with_code_zero_is_proof():
         "The tests are passing.",
         "The checks are green.",
         "The build is green.",
+        "The tests have passed.",
+        "The check has passed.",
+        "The checks have passed.",
+        "The build had passed.",
+        "The tests have been passing.",
+        "The build has been green.",
     ],
 )
 def test_linking_verb_completion_claim_is_reported_without_proof(response):
