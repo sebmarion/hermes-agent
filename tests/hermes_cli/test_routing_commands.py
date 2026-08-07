@@ -82,6 +82,31 @@ def test_classify_delegated_session_matches_any_configured_lane_without_inventin
     }
 
 
+def test_classify_generic_custom_runtime_reports_ambiguous_matching_lanes():
+    routes = {
+        "main": {"provider": "custom:zeus", "model": "qwen"},
+        "delegation": {
+            "complete": True,
+            "candidates": [
+                {"provider": "custom:zeus-a", "model": "qwen"},
+                {"provider": "custom:zeus-b", "model": "qwen"},
+            ],
+        },
+    }
+    session = {
+        "source": "subagent",
+        "billing_provider": "custom",
+        "model": "qwen",
+    }
+
+    explained = classify_session_route(session, routes)
+
+    assert explained["reason_code"] == "ambiguous_route"
+    assert explained["expected_route"] is None
+    assert explained["configured_route_count"] == 2
+    assert "multiple configured delegation routes" in explained["note"]
+
+
 def _run_routing(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
     root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()

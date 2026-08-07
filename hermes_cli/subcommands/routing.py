@@ -160,18 +160,33 @@ def classify_session_route(
                 "expected_route": None,
                 "note": "Configured delegation routes are incomplete.",
             }
+        matching_candidates: list[dict[str, str]] = []
         for candidate in safe_candidates:
-            if observed_model == candidate["model"] and _provider_compatible(
-                observed_provider, candidate["provider"]
+            if (
+                observed_model == candidate["model"]
+                and _provider_compatible(observed_provider, candidate["provider"])
+                and candidate not in matching_candidates
             ):
-                return {
-                    "reason_code": "matches_delegation",
-                    "expected_route": candidate,
-                    "note": (
-                        "Runtime matches a configured delegation route; "
-                        "lane identity was not persisted."
-                    ),
-                }
+                matching_candidates.append(candidate)
+        if len(matching_candidates) > 1:
+            return {
+                "reason_code": "ambiguous_route",
+                "expected_route": None,
+                "configured_route_count": len(safe_candidates),
+                "note": (
+                    "Persisted runtime matches multiple configured delegation "
+                    "routes; the specific custom provider was not persisted."
+                ),
+            }
+        if matching_candidates:
+            return {
+                "reason_code": "matches_delegation",
+                "expected_route": matching_candidates[0],
+                "note": (
+                    "Runtime matches a configured delegation route; "
+                    "lane identity was not persisted."
+                ),
+            }
         return {
             "reason_code": "unexplained",
             "expected_route": None,

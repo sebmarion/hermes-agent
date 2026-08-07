@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 from pathlib import Path
@@ -31,10 +32,24 @@ def persist_git_metadata_async(
     db_path: str | os.PathLike[str],
     session_id: str,
     cwd: str | os.PathLike[str] | None,
+    session_started_at: float,
 ) -> threading.Thread | None:
     """Enrich a session row with git facts without blocking its creation path."""
     workspace = normalize_local_workspace(cwd)
-    if not session_id or not workspace or not isinstance(db_path, (str, Path)):
+    expected_cwd = str(cwd).strip() if cwd is not None else ""
+    if (
+        not session_id
+        or not workspace
+        or not isinstance(db_path, (str, Path))
+        or isinstance(session_started_at, bool)
+        or not isinstance(session_started_at, (int, float))
+    ):
+        return None
+    try:
+        generation = float(session_started_at)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(generation) or generation <= 0:
         return None
     database = Path(db_path).expanduser()
 
@@ -54,6 +69,8 @@ def persist_git_metadata_async(
                     workspace,
                     git_branch=git_branch,
                     git_repo_root=git_root,
+                    expected_cwd=expected_cwd,
+                    expected_started_at=generation,
                 )
             finally:
                 db.close()

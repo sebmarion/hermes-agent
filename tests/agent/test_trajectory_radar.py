@@ -24,6 +24,7 @@ from hermes_state import SessionDB
 def _candidate_report(
     *candidate_ids: str,
     evidence_suffix: str = "initial",
+    evidence_observed_at: float | None = None,
     complete: bool = True,
     source: str | None = None,
     scan_time: float | None = None,
@@ -57,6 +58,11 @@ def _candidate_report(
                         "session_id": f"private-session-{candidate_id}",
                         "message_id": 7,
                         "signal": f"signal-{evidence_suffix}",
+                        "observed_at": (
+                            scanned_at
+                            if evidence_observed_at is None
+                            else evidence_observed_at
+                        ),
                         "snippet": "seb@example.com /Users/seb/private",
                     }
                 ],
@@ -216,6 +222,45 @@ def test_radar_reports_whether_candidate_set_is_complete(tmp_path):
     assert truncated["candidate_count_before_limit"] > len(truncated["candidates"])
 
 
+def test_radar_window_bounds_evidence_by_message_timestamp(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    now = time.time()
+    try:
+        db.create_session("old-session", "cli", model="qwen")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (now - (2 * 86400), "old-session"),
+        )
+        db._conn.commit()
+        db.append_message(
+            "old-session",
+            "user",
+            "Did you check the recent regression?",
+            timestamp=now - 10,
+        )
+
+        db.create_session("future-session", "cli", model="qwen")
+        db.append_message(
+            "future-session",
+            "user",
+            "Did you check the future regression?",
+            timestamp=now + 3600,
+        )
+
+        report = TrajectoryRadar(db).generate(days=1, limit=0)
+    finally:
+        db.close()
+
+    candidate = next(
+        item
+        for item in report["candidates"]
+        if item["id"] == "done-means-proven-gatekeeper"
+    )
+    assert {ref["session_id"] for ref in candidate["evidence_refs"]} == {
+        "old-session"
+    }
+
+
 @pytest.mark.parametrize("days", [0, -1])
 def test_radar_rejects_nonpositive_observation_windows(tmp_path, days):
     db = _seed_db(tmp_path / "state.db")
@@ -301,6 +346,24 @@ def test_candidate_store_regresses_only_for_fresh_evidence(tmp_path):
     assert store.get("candidate-a").resolved_at is None
 
 
+def test_candidate_store_does_not_regress_for_unseen_pre_action_evidence(tmp_path):
+    store = CandidateStore(path=tmp_path / "radar_candidates.json")
+    initial = _candidate_report("candidate-a")
+    store.sync_from_report(initial)
+    resolved = store.transition("candidate-a", "resolved")
+
+    later_scan = time.time()
+    historical = _candidate_report(
+        "candidate-a",
+        evidence_suffix="historical",
+        evidence_observed_at=(resolved.last_action_at or 0.0) - 100,
+        scan_time=later_scan,
+    )
+
+    assert store.sync_from_report(historical) == []
+    assert store.get("candidate-a").status == "resolved"
+
+
 def test_candidate_store_tracks_fresh_evidence_after_report_ref_cap(tmp_path):
     store = CandidateStore(path=tmp_path / "radar_candidates.json")
     db_path = tmp_path / "state.db"
@@ -311,7 +374,7 @@ def test_candidate_store_tracks_fresh_evidence_after_report_ref_cap(tmp_path):
             "s-verify",
             "user",
             f"Did you check capped evidence {index}?",
-            timestamp=now + index,
+            timestamp=now - (25 - index),
         )
     try:
         report = TrajectoryRadar(db).generate(days=1, limit=0)
@@ -333,7 +396,7 @@ def test_candidate_store_tracks_fresh_evidence_after_report_ref_cap(tmp_path):
         "s-verify",
         "user",
         "Did you check evidence after the cap?",
-        timestamp=time.time() + 100,
+        timestamp=time.time(),
     )
     try:
         refreshed = TrajectoryRadar(db).generate(days=1, limit=0)
@@ -378,13 +441,26 @@ def test_resolution_absence_confirmation_requires_complete_unfiltered_report(tmp
         store.sync_from_report(missing_scope)
     assert store.get("candidate-a").confirmation == "pending"
 
+    post_action_scan = time.time()
     store.sync_from_report(
         _candidate_report(
             complete=True,
-            scan_time=resolved_at + 10,
-            window_from=resolved_at + 1,
+            scan_time=post_action_scan,
+            window_from=(resolved_at + post_action_scan) / 2,
         )
     )
+    assert store.get("candidate-a").confirmation == "pending"
+
+    forged_post_action_window = _candidate_report(
+        complete=True,
+        scan_time=resolved_at + 1,
+        window_from=resolved_at - 10,
+    )
+    forged_post_action_window["generated_at"] = datetime.fromtimestamp(
+        resolved_at - 1, tz=timezone.utc
+    ).isoformat()
+    with pytest.raises(CandidateStoreError, match="timestamp/window"):
+        store.sync_from_report(forged_post_action_window)
     assert store.get("candidate-a").confirmation == "pending"
 
     store.sync_from_report(_candidate_report(complete=True))
@@ -414,6 +490,57 @@ def test_candidate_store_rejects_malformed_report_envelope_without_writing(tmp_p
         store.sync_from_report(nonfinite)
 
     assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda report: report["window"].__setitem__("days", 2),
+            "window span",
+        ),
+        (
+            lambda report: report.__setitem__(
+                "generated_at",
+                datetime.fromtimestamp(
+                    report["window"]["to_epoch"] - 60,
+                    tz=timezone.utc,
+                ).isoformat(),
+            ),
+            "timestamp/window",
+        ),
+    ],
+)
+def test_candidate_store_rejects_internally_inconsistent_report_time(
+    tmp_path, mutation, error
+):
+    store = CandidateStore(path=tmp_path / "radar_candidates.json")
+    report = _candidate_report("candidate-a")
+    mutation(report)
+
+    with pytest.raises(CandidateStoreError, match=error):
+        store.sync_from_report(report)
+
+    assert not store.path.exists()
+
+
+@pytest.mark.parametrize(
+    ("scan_offset", "error"),
+    [(-600, "stale"), (5, "future")],
+)
+def test_candidate_store_rejects_stale_or_future_report(
+    tmp_path, scan_offset, error
+):
+    store = CandidateStore(path=tmp_path / "radar_candidates.json")
+    report = _candidate_report(
+        "candidate-a",
+        scan_time=time.time() + scan_offset,
+    )
+
+    with pytest.raises(CandidateStoreError, match=error):
+        store.sync_from_report(report)
+
+    assert not store.path.exists()
 
 
 def test_candidate_store_fails_closed_on_corrupt_or_ambiguous_state(tmp_path):

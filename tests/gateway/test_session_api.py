@@ -323,6 +323,7 @@ async def test_create_session_persists_normalized_cwd_without_waiting_for_git_pr
         db_path=session_db.db_path,
         session_id="cwd-session",
         cwd=str(workspace.resolve()),
+        session_started_at=row["started_at"],
     )
 
 

@@ -706,10 +706,12 @@ class AIAgent:
                 try:
                     from agent.session_workspace import persist_git_metadata_async
 
+                    created_session = self._session_db.get_session(self.session_id)
                     persist_git_metadata_async(
                         db_path=self._session_db.db_path,
                         session_id=self.session_id,
                         cwd=launch_cwd,
+                        session_started_at=(created_session or {}).get("started_at"),
                     )
                 except Exception:
                     logger.debug(

@@ -7217,6 +7217,7 @@ def test_ensure_db_session_dispatches_git_metadata_without_blocking_startup(
     workspace = str(tmp_path.resolve())
     agent._session_db = MagicMock()
     agent._session_db.db_path = tmp_path / "state.db"
+    agent._session_db.get_session.return_value = {"started_at": 123.0}
     agent._session_db_created = False
 
     with (
@@ -7235,4 +7236,5 @@ def test_ensure_db_session_dispatches_git_metadata_without_blocking_startup(
         db_path=agent._session_db.db_path,
         session_id=agent.session_id,
         cwd=workspace,
+        session_started_at=123.0,
     )

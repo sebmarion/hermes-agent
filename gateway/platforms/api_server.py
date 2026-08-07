@@ -3469,6 +3469,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     db_path=db.db_path,
                     session_id=session_id,
                     cwd=cwd,
+                    session_started_at=session.get("started_at"),
                 )
             except Exception:
                 logger.debug(

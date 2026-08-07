@@ -67,6 +67,7 @@ class EvidenceRef:
     session_id: str
     message_id: int | None = None
     signal: str = ""
+    observed_at: float = 0.0
     snippet: str | None = None
 
 
@@ -113,17 +114,29 @@ class TrajectoryRadar:
             raise ValueError("days must be positive")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be zero or positive")
-        cutoff = time.time() - (days * 86400)
-        sessions = self._sessions(cutoff, source)
-        signals = self._signals(cutoff, source, include_snippets=include_snippets)
+        snapshot_to = time.time()
+        cutoff = snapshot_to - (days * 86400)
+        sessions = self._sessions(cutoff, snapshot_to, source)
+        signals = self._signals(
+            cutoff,
+            snapshot_to,
+            source,
+            include_snippets=include_snippets,
+        )
         candidates = self._build_candidates(sessions, signals)
         candidates.sort(key=lambda item: (-item.score, item.title))
         total_candidate_count = len(candidates)
         if limit > 0:
             candidates = candidates[:limit]
         return {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "window": {"days": days, "from_epoch": cutoff, "to_epoch": time.time()},
+            "generated_at": datetime.fromtimestamp(
+                snapshot_to, tz=timezone.utc
+            ).isoformat(),
+            "window": {
+                "days": days,
+                "from_epoch": cutoff,
+                "to_epoch": snapshot_to,
+            },
             "source_filter": source,
             "privacy": {
                 "raw_transcripts_included": bool(include_snippets),
@@ -135,32 +148,53 @@ class TrajectoryRadar:
             "candidates": [candidate.to_dict() for candidate in candidates],
         }
 
-    def _sessions(self, cutoff: float, source: str | None) -> list[dict[str, Any]]:
+    def _sessions(
+        self,
+        cutoff: float,
+        snapshot_to: float,
+        source: str | None,
+    ) -> list[dict[str, Any]]:
         cols = (
-            "id, source, model, started_at, ended_at, message_count, tool_call_count, "
-            "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cwd, "
-            "git_repo_root, billing_provider, billing_base_url, title"
+            "s.id, s.source, s.model, s.started_at, s.ended_at, s.message_count, "
+            "s.tool_call_count, s.input_tokens, s.output_tokens, s.cache_read_tokens, "
+            "s.cache_write_tokens, s.cwd, s.git_repo_root, s.billing_provider, "
+            "s.billing_base_url, s.title, "
+            "COALESCE(activity.observed_at, s.started_at) AS observed_at"
         )
+        params: list[Any] = [cutoff, snapshot_to, cutoff, snapshot_to]
+        source_clause = ""
         if source:
-            cursor = self._conn.execute(
-                f"SELECT {cols} FROM sessions WHERE started_at >= ? AND source = ?",
-                (cutoff, source),
-            )
-        else:
-            cursor = self._conn.execute(
-                f"SELECT {cols} FROM sessions WHERE started_at >= ?",
-                (cutoff,),
-            )
+            source_clause = " AND s.source = ?"
+            params.append(source)
+        cursor = self._conn.execute(
+            f"""
+            SELECT {cols}
+              FROM sessions s
+              LEFT JOIN (
+                    SELECT session_id, MAX(timestamp) AS observed_at
+                      FROM messages
+                     WHERE active = 1
+                       AND timestamp BETWEEN ? AND ?
+                     GROUP BY session_id
+              ) activity ON activity.session_id = s.id
+             WHERE (
+                       s.started_at BETWEEN ? AND ?
+                       OR activity.observed_at IS NOT NULL
+                   ){source_clause}
+            """,
+            tuple(params),
+        )
         return [dict(row) for row in cursor.fetchall()]
 
     def _signals(
         self,
         cutoff: float,
+        snapshot_to: float,
         source: str | None,
         *,
         include_snippets: bool,
     ) -> list[dict[str, Any]]:
-        params: list[Any] = [cutoff]
+        params: list[Any] = [cutoff, snapshot_to]
         source_clause = ""
         if source:
             source_clause = " AND s.source = ?"
@@ -168,11 +202,12 @@ class TrajectoryRadar:
         cursor = self._conn.execute(
             f"""
             SELECT m.id AS message_id, m.session_id, m.role, m.content,
+                   m.timestamp AS observed_at,
                    m.tool_name, m.tool_calls, s.source, s.model, s.cwd, s.git_repo_root,
                    s.billing_provider
               FROM messages m
               JOIN sessions s ON s.id = m.session_id
-             WHERE s.started_at >= ?{source_clause}
+             WHERE m.timestamp BETWEEN ? AND ?{source_clause}
                AND m.active = 1
                AND m.role IN ('user', 'assistant', 'tool')
              ORDER BY m.timestamp ASC
@@ -206,6 +241,7 @@ class TrajectoryRadar:
             "source": row.get("source") or "unknown",
             "model": row.get("model") or "unknown",
             "project": _project_label(row),
+            "observed_at": float(row.get("observed_at") or 0.0),
         }
         if include_snippets:
             signal["snippet"] = _safe_snippet(row.get("content") or "")
@@ -265,6 +301,7 @@ class TrajectoryRadar:
                     "source": session.get("source") or "unknown",
                     "model": session.get("model") or "unknown",
                     "project": _project_label(session),
+                    "observed_at": float(session.get("observed_at") or 0.0),
                 }
             )
         return [
@@ -399,6 +436,10 @@ _VALID_CONFIRMATIONS: frozenset[str] = frozenset(
 )
 _CANDIDATE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,127}\Z")
 _EVIDENCE_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+_REPORT_MAX_AGE_SECONDS = 300.0
+_REPORT_FUTURE_SKEW_SECONDS = 0.0
+_REPORT_TIMESTAMP_TOLERANCE_SECONDS = 1.0
+_REPORT_SPAN_TOLERANCE_SECONDS = 0.001
 _THREAD_LOCKS: dict[str, threading.RLock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
 
@@ -494,7 +535,12 @@ def _candidate_store_transaction_lock(path: Path) -> Iterator[None]:
 def _finite_number(value: Any, *, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CandidateStoreError(f"corrupt candidate store field: {field_name}")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise CandidateStoreError(
+            f"corrupt candidate store field: {field_name}"
+        ) from exc
     if not math.isfinite(number):
         raise CandidateStoreError(f"corrupt candidate store field: {field_name}")
     return number
@@ -594,10 +640,14 @@ def _privacy_safe_candidate_title(value: Any) -> str:
     return title
 
 
-def _candidate_evidence_hashes(
-    candidate: dict[str, Any], fingerprint: str
-) -> list[str]:
-    hashes: list[str] = []
+def _candidate_evidence_facts(
+    candidate: dict[str, Any],
+    fingerprint: str,
+    *,
+    report_from: float,
+    report_to: float,
+) -> list[tuple[str, float]]:
+    facts: dict[str, float] = {}
     refs = candidate.get("evidence_refs") or []
     if not isinstance(refs, list):
         raise CandidateStoreError("candidate evidence refs must be a list")
@@ -613,13 +663,35 @@ def _candidate_evidence_hashes(
             )
         )
         if raw.strip("\x1f") != fingerprint:
-            hashes.append(hashlib.sha256(raw.encode("utf-8")).hexdigest())
-    return list(dict.fromkeys(hashes))
+            observed_raw = ref.get("observed_at")
+            if isinstance(observed_raw, bool) or not isinstance(
+                observed_raw, (int, float)
+            ):
+                raise CandidateStoreError(
+                    "candidate evidence ref observed_at must be a finite timestamp"
+                )
+            try:
+                observed_at = float(observed_raw)
+            except OverflowError as exc:
+                raise CandidateStoreError(
+                    "candidate evidence ref observed_at must be a finite timestamp"
+                ) from exc
+            if (
+                not math.isfinite(observed_at)
+                or observed_at <= 0
+                or not report_from <= observed_at <= report_to
+            ):
+                raise CandidateStoreError(
+                    "candidate evidence ref observed_at is outside the report window"
+                )
+            digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            facts[digest] = max(facts.get(digest, observed_at), observed_at)
+    return list(facts.items())
 
 
 def _validated_report_envelope(
     report: dict[str, Any],
-) -> tuple[list[dict[str, Any]], float, float]:
+) -> tuple[list[dict[str, Any]], float, float, float]:
     """Validate the facts required for safe regression/absence decisions."""
     if not isinstance(report, dict):
         raise CandidateStoreError("candidate report must be an object")
@@ -662,11 +734,17 @@ def _validated_report_envelope(
     if not isinstance(window, dict):
         raise CandidateStoreError("candidate report window must be an object")
     days = window.get("days")
+    try:
+        day_count = float(days)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CandidateStoreError(
+            "candidate report window days must be positive"
+        ) from exc
     if (
         isinstance(days, bool)
         or not isinstance(days, (int, float))
-        or not math.isfinite(float(days))
-        or days <= 0
+        or not math.isfinite(day_count)
+        or day_count <= 0
     ):
         raise CandidateStoreError("candidate report window days must be positive")
     window_from = _finite_number(
@@ -675,6 +753,14 @@ def _validated_report_envelope(
     window_to = _finite_number(window.get("to_epoch"), field_name="window.to_epoch")
     if window_from >= window_to:
         raise CandidateStoreError("candidate report window is invalid")
+    expected_span = day_count * 86400
+    if not math.isfinite(expected_span) or not math.isclose(
+        window_to - window_from,
+        expected_span,
+        rel_tol=0.0,
+        abs_tol=_REPORT_SPAN_TOLERANCE_SECONDS,
+    ):
+        raise CandidateStoreError("candidate report window span is inconsistent")
 
     generated_at = report.get("generated_at")
     if not isinstance(generated_at, str) or not generated_at.strip():
@@ -684,10 +770,19 @@ def _validated_report_envelope(
         generated_epoch = generated.timestamp()
     except (ValueError, OverflowError, OSError) as exc:
         raise CandidateStoreError("candidate report generated_at is invalid") from exc
-    # ISO microseconds can round a float epoch a fraction above ``to_epoch``.
-    if generated.tzinfo is None or not window_from <= generated_epoch <= window_to + 1:
+    if generated.tzinfo is None or not math.isclose(
+        generated_epoch,
+        window_to,
+        rel_tol=0.0,
+        abs_tol=_REPORT_TIMESTAMP_TOLERANCE_SECONDS,
+    ):
         raise CandidateStoreError("candidate report timestamp/window is inconsistent")
-    return candidates, window_from, window_to
+    now = time.time()
+    if generated_epoch < now - _REPORT_MAX_AGE_SECONDS:
+        raise CandidateStoreError("candidate report is stale")
+    if generated_epoch > now + _REPORT_FUTURE_SKEW_SECONDS:
+        raise CandidateStoreError("candidate report is from the future")
+    return candidates, window_from, window_to, generated_epoch
 
 
 class CandidateStore:
@@ -784,7 +879,9 @@ class CandidateStore:
 
     def sync_from_report(self, report: dict[str, Any]) -> list[str]:
         """Merge one report without losing concurrent lifecycle mutations."""
-        candidates, report_from, report_to = _validated_report_envelope(report)
+        candidates, report_from, report_to, generated_at = (
+            _validated_report_envelope(report)
+        )
 
         with _candidate_store_transaction_lock(self._path):
             records = self._read_records_unlocked()
@@ -806,7 +903,13 @@ class CandidateStore:
                         f"duplicate candidate in report: {fingerprint}"
                     )
                 seen.add(fingerprint)
-                incoming_hashes = _candidate_evidence_hashes(candidate, fingerprint)
+                incoming_evidence = _candidate_evidence_facts(
+                    candidate,
+                    fingerprint,
+                    report_from=report_from,
+                    report_to=report_to,
+                )
+                incoming_hashes = [digest for digest, _observed in incoming_evidence]
                 record = records.get(fingerprint)
                 if not isinstance(candidate.get("title"), str):
                     raise CandidateStoreError(
@@ -864,6 +967,11 @@ class CandidateStore:
                 fresh_hashes = [
                     value for value in incoming_hashes if value not in old_hashes
                 ]
+                fresh_observed_at = [
+                    observed
+                    for digest, observed in incoming_evidence
+                    if digest not in old_hashes
+                ]
                 metadata_changed = any(
                     (
                         record.title != title,
@@ -884,7 +992,10 @@ class CandidateStore:
                     )[-256:]
                     if (
                         record.status in _REGRESSIBLE_CANDIDATE_STATUSES
-                        and report_to > record.last_action_at
+                        and any(
+                            observed > record.last_action_at
+                            for observed in fresh_observed_at
+                        )
                     ):
                         record.status = "regressed"
                         record.confirmation = "regressed"
@@ -894,7 +1005,7 @@ class CandidateStore:
                     record.status == "resolved"
                     and record.confirmation == "confirmed"
                     and record.resolved_at is not None
-                    and report_to > record.resolved_at
+                    and generated_at > record.resolved_at
                 ):
                     record.confirmation = "pending"
                     record.last_seen = now
@@ -910,6 +1021,7 @@ class CandidateStore:
                         and record.confirmation != "confirmed"
                         and record.resolved_at is not None
                         and report_from <= record.resolved_at < report_to
+                        and generated_at > record.resolved_at
                     ):
                         record.confirmation = "confirmed"
 
@@ -1057,6 +1169,7 @@ def _dedupe_refs(rows: Iterable[dict[str, Any]]) -> list[EvidenceRef]:
                 session_id=sid,
                 message_id=mid,
                 signal=label,
+                observed_at=float(row.get("observed_at") or 0.0),
                 snippet=row.get("snippet"),
             )
         )
