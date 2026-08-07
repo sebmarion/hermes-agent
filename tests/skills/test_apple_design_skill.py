@@ -409,6 +409,9 @@ def test_materials_accessibility_sections() -> None:
     assert "solid surfaces" in rt_lower
     assert re.search(r"(?:remove|disable) backdrop-filter", rt_lower)
     assert re.search(r"(?:remove|disable|disables)(?:\s+\w+){0,2}\s+blur", rt_lower)
+    assert "opaque" in rt_lower
+    assert "unsupported" in rt_lower or "unavailable" in rt_lower
+    assert "application-level" in rt_lower or "in-app" in rt_lower
 
     # Increased Contrast
     increased_contrast = _section_body(src, "Increased Contrast")
