@@ -166,6 +166,13 @@ def test_v1_review_manifest_requires_exact_sota_high_read_only_shape():
         with pytest.raises(Exception):
             _v1_plan_constraints(compile_execution_plan(changed), workspace="/tmp/work")
 
+    with_paths = _manifest(capability="frontier_review")
+    with_paths["slices"][0]["allowed_paths"] = ["src/"]
+    with pytest.raises(Exception, match="allowed_paths"):
+        _v1_plan_constraints(
+            compile_execution_plan(with_paths), workspace="/tmp/work"
+        )
+
 
 def test_capture_requires_explicit_valid_envelope(tmp_path):
     store = _store(tmp_path)

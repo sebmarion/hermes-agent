@@ -408,6 +408,10 @@ def _v1_plan_constraints(plan: ExecutionPlan, *, workspace: Optional[str] = None
                 raise BestplanError(
                     f"V1 review slice {item.id} requires frontier_review/read_only=true"
                 )
+            if item.allowed_paths:
+                raise BestplanError(
+                    f"V1 review slice {item.id} requires allowed_paths=[]"
+                )
 
 
 def _plan_to_delegate_tasks(
