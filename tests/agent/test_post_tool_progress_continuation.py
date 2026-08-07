@@ -54,6 +54,15 @@ def test_detects_genuine_single_sentence_progress_update():
     )
 
 
+def test_detects_simple_progress_with_demonstrative_target():
+    agent = _detector_agent()
+
+    assert agent._looks_like_post_tool_progress_update(
+        "I'll inspect that log now.",
+        _tool_tail(),
+    )
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -103,6 +112,20 @@ def test_detects_leading_whitespace_and_now_or_next_future_action_form(content):
         ("I will inspect the logs now, deployment is down.", _tool_tail()),
         ("I will inspect the logs now — deployment is down.", _tool_tail()),
         ("I will inspect the logs now – deployment is down.", _tool_tail()),
+        ("I’ll inspect the logs because the service is offline.", _tool_tail()),
+        ("I’ll inspect the logs and the deployment is down.", _tool_tail()),
+        ("I’ll inspect the logs but the service is offline.", _tool_tail()),
+        ("I’ll inspect the logs although the service is offline.", _tool_tail()),
+        ("I’ll inspect the logs while the service is restarting.", _tool_tail()),
+        ("I’ll inspect the logs since the service is offline.", _tool_tail()),
+        ("I’ll inspect the logs whereas the service is offline.", _tool_tail()),
+        ("I’ll inspect the logs so the next step is clear.", _tool_tail()),
+        ("I’ll inspect the logs yet the service is offline.", _tool_tail()),
+        ("I’ll inspect the logs however the service is offline.", _tool_tail()),
+        ("I’ll inspect the logs therefore the next step is clear.", _tool_tail()),
+        ("I’ll inspect the logs which contain recent entries.", _tool_tail()),
+        ("I’ll inspect the logs that contain recent entries.", _tool_tail()),
+        ("I’ll inspect the directory where recent entries appear.", _tool_tail()),
         ("I will review it now; the output shows success.", _tool_tail()),
         ("Let me check it now. The result indicates a failure.", _tool_tail()),
         ("I will inspect it now. Analysis complete.", _tool_tail()),
@@ -134,6 +157,20 @@ def test_detects_leading_whitespace_and_now_or_next_future_action_form(content):
         "comma-clause",
         "em-dash-clause",
         "en-dash-clause",
+        "because-clause",
+        "and-clause",
+        "but-clause",
+        "although-clause",
+        "while-clause",
+        "since-clause",
+        "whereas-clause",
+        "so-clause",
+        "yet-clause",
+        "however-clause",
+        "therefore-clause",
+        "which-relative-clause",
+        "that-relative-clause",
+        "where-relative-clause",
         "shows-success",
         "indicates-failure",
         "complete",

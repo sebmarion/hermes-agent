@@ -3615,10 +3615,29 @@ def looks_like_post_tool_progress_update(
     if re.search(r"[.!?](?:[\"')\]]*)\s+\S", assistant_text):
         return False
 
+    future_action = assistant_text[future_match.end():]
+    if re.search(
+        r"\b(?:and|but|because|although|while|since|whereas|so|yet|"
+        r"however|therefore)\b",
+        future_action,
+    ):
+        return False
+
+    # Relative starters are compound only after an action already named an
+    # object ("inspect the logs that ..."). Keep a simple demonstrative target
+    # such as "inspect that log" eligible.
+    for relative_match in re.finditer(r"\b(?:which|that|where)\b", future_action):
+        preceding_words = re.findall(
+            r"\b[\w'-]+\b", future_action[:relative_match.start()]
+        )
+        if len(preceding_words) >= 2 and re.search(
+            r"\b\w+\b", future_action[relative_match.end():]
+        ):
+            return False
+
     # Result/finality language anywhere in the visible reply makes it
     # substantive, even when the model follows the result with another future
     # action ("Found two failures. I'll inspect the remaining logs.").
-    future_action = assistant_text[future_match.end():]
     if re.search(
         r"\b(?:found|shows?|indicates?|complete|completed|healthy|success|"
         r"successful|error|failure)\b",
