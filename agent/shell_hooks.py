@@ -98,8 +98,16 @@ emitted by each built-in hook site.
     parent_turn_id  – parent agent's current turn id
     child_session_id – child (subagent) session id
     child_role      – role string of the child agent
+    child_goal      – exact delegated goal
     child_summary   – summary of the child's work
     child_status    – exit status string (e.g. "success", "error")
+    child_lane      – resolved delegation lane
+    child_provider  – resolved provider identifier
+    child_model     – routed model identifier
+    child_mode      – execute | review | reason
+    child_failure_kind – normalized failure category, if any
+    child_exit_reason – child loop exit reason
+    child_successful_tool_count – successful tool-result evidence count
     tool_call_history – redacted tool name/input summary/byte counts/status list
     duration_ms     – wall-clock time of the child run in milliseconds
 """

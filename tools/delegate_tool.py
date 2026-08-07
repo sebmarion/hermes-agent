@@ -22,9 +22,11 @@ import contextvars
 import hashlib
 import json
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -3247,6 +3249,7 @@ def _run_single_child(
 
 _PARENT_FINALIZATION_LOCK_GUARD = threading.Lock()
 _PARENT_FINALIZATION_FALLBACK_LOCK = threading.RLock()
+_CHILD_STOP_LOCK_GUARD = threading.Lock()
 
 
 def _build_child_preserving_parent_tools(**kwargs):
@@ -3275,6 +3278,137 @@ def _parent_finalization_lock(parent_agent) -> threading.RLock:
             except Exception:
                 return _PARENT_FINALIZATION_FALLBACK_LOCK
     return lock
+
+
+def _emit_subagent_stop_once(
+    parent_agent,
+    child,
+    *,
+    child_goal: str,
+    result: Dict[str, Any],
+) -> bool:
+    """Emit one process-local terminal lifecycle event for a built child.
+
+    The claim lives on the child rather than on a particular runner or result
+    container, so normal aggregation and exceptional async/public lifecycle
+    exits can safely converge here.  The claim is made before either observer
+    runs: a failing or re-entrant callback must not produce duplicate terminal
+    events.
+    """
+    if child is None:
+        return False
+    try:
+        child_state = vars(child)
+    except TypeError:
+        return False
+
+    with _CHILD_STOP_LOCK_GUARD:
+        stop_lock = child_state.get("_subagent_stop_lock")
+        if stop_lock is None:
+            stop_lock = threading.RLock()
+            child_state["_subagent_stop_lock"] = stop_lock
+
+    with _parent_finalization_lock(parent_agent), stop_lock:
+        if child_state.get("_subagent_stop_emitted") is True:
+            return False
+        child_state["_subagent_stop_emitted"] = True
+
+        child_status = str(result.get("status") or "")
+        child_failure_kind = str(result.get("failure_kind") or "")
+        if not child_failure_kind:
+            child_failure_kind = {
+                "timeout": "timeout",
+                "interrupted": "interrupted",
+                "stalled": "stalled",
+                "error": "child_execution_failed",
+                "failed": "child_execution_failed",
+            }.get(child_status, "")
+        evidence = result.get("evidence")
+        if not isinstance(evidence, dict):
+            evidence = {}
+        try:
+            successful_tool_count = int(
+                evidence.get("successful_tool_count", 0) or 0
+            )
+        except (TypeError, ValueError):
+            successful_tool_count = 0
+        try:
+            duration_ms = int(float(result.get("duration_seconds") or 0) * 1000)
+        except (TypeError, ValueError):
+            duration_ms = 0
+
+        child_role = (
+            result.get("_child_role")
+            if "_child_role" in result
+            else child_state.get("_delegate_role")
+        )
+        payload = {
+            "parent_session_id": getattr(parent_agent, "session_id", None),
+            "parent_turn_id": (
+                getattr(parent_agent, "_current_turn_id", "") or ""
+            ),
+            "child_session_id": child_state.get("session_id"),
+            "child_role": child_role,
+            "child_goal": child_goal,
+            "child_summary": result.get("summary"),
+            "child_status": child_status,
+            "child_lane": (
+                result.get("lane") or child_state.get("_delegate_lane") or ""
+            ),
+            "child_provider": (
+                result.get("provider")
+                or child_state.get("_delegate_provider")
+                or child_state.get("provider")
+                or ""
+            ),
+            "child_model": (
+                result.get("routed_model")
+                or result.get("model")
+                or child_state.get("_delegate_model")
+                or child_state.get("model")
+                or ""
+            ),
+            "child_mode": (
+                result.get("mode") or child_state.get("_delegate_mode") or ""
+            ),
+            "child_failure_kind": child_failure_kind,
+            "child_exit_reason": result.get("exit_reason") or child_status,
+            "child_successful_tool_count": successful_tool_count,
+            "tool_call_history": _subagent_stop_tool_call_history(
+                result.get("tool_trace")
+            ),
+            "duration_ms": duration_ms,
+        }
+
+        try:
+            from hermes_cli.observability import observe_lifecycle
+
+            observe_lifecycle("subagent_stop", **payload)
+        except Exception:
+            logger.debug(
+                "first-party subagent_stop observer failed", exc_info=True
+            )
+
+        try:
+            from hermes_cli import plugins as _plugins
+
+            # Embedded callers may register an in-process hook before plugin
+            # discovery.  Preserve that supported narrow path while retaining
+            # the discovered-home ownership fence in normal runtime dispatch.
+            manager = _plugins.get_plugin_manager()
+            if (
+                getattr(manager, "_discovery_home", None) is None
+                and getattr(manager, "_hooks", {}).get("subagent_stop")
+                and str(os.environ.get("HERMES_SAFE_MODE", "")).strip().lower()
+                not in {"1", "true", "yes", "on"}
+            ):
+                invoke_hook = manager.invoke_hook
+            else:
+                invoke_hook = _plugins.invoke_hook
+            invoke_hook("subagent_stop", **payload)
+        except Exception:
+            logger.debug("subagent_stop plugin hook failed", exc_info=True)
+        return True
 
 
 def _finalize_child_results(
@@ -3307,59 +3441,29 @@ def _finalize_child_results(
                 except Exception:
                     pass
 
-        parent_session_id = getattr(parent_agent, "session_id", None)
-        try:
-            from hermes_cli import plugins as _plugins
-
-            # Normal runtime dispatch goes through the module-level helper,
-            # which enforces the discovered-home ownership fence.  A parent
-            # may, however, install an in-process lifecycle callback before
-            # plugin discovery (common for embedded callers and tests).  In
-            # that narrow pre-discovery case the callback is already owned by
-            # the current manager, so invoke its snapshot directly rather
-            # than silently dropping the lifecycle event.
-            _manager = _plugins.get_plugin_manager()
-            if (
-                getattr(_manager, "_discovery_home", None) is None
-                and getattr(_manager, "_hooks", {}).get("subagent_stop")
-                and str(os.environ.get("HERMES_SAFE_MODE", "")).strip().lower()
-                not in {"1", "true", "yes", "on"}
-            ):
-                invoke_hook = _manager.invoke_hook
-            else:
-                invoke_hook = _plugins.invoke_hook
-        except Exception:
-            invoke_hook = None
-
         children_cost_total = 0.0
         for entry in results:
-            child_role = entry.pop("_child_role", None)
+            child_index = entry.get("task_index", -1)
+            child = child_by_index.get(child_index)
+            child_goal = (
+                task_list[child_index].get("goal", "")
+                if isinstance(child_index, int)
+                and 0 <= child_index < len(task_list)
+                else ""
+            )
+            _emit_subagent_stop_once(
+                parent_agent,
+                child,
+                child_goal=child_goal,
+                result=entry,
+            )
+            entry.pop("_child_role", None)
             child_cost = entry.pop("_child_cost_usd", 0.0)
             try:
                 if child_cost:
                     children_cost_total += float(child_cost)
             except (TypeError, ValueError):
                 pass
-            if invoke_hook is None:
-                continue
-            try:
-                child_index = entry.get("task_index", -1)
-                child = child_by_index.get(child_index)
-                invoke_hook(
-                    "subagent_stop",
-                    parent_session_id=parent_session_id,
-                    parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
-                    child_session_id=getattr(child, "session_id", None),
-                    child_role=child_role,
-                    child_summary=entry.get("summary"),
-                    child_status=entry.get("status"),
-                    tool_call_history=_subagent_stop_tool_call_history(
-                        entry.get("tool_trace")
-                    ),
-                    duration_ms=int((entry.get("duration_seconds") or 0) * 1000),
-                )
-            except Exception:
-                logger.debug("subagent_stop hook invocation failed", exc_info=True)
 
         if children_cost_total > 0.0:
             try:
@@ -3490,6 +3594,8 @@ def _structured_delegate_batch_failure(
     failed_kind: str,
     failed_credentials: Optional[dict] = None,
     task_specs: Optional[List[Any]] = None,
+    aborted_kind: str = "batch_preflight_aborted",
+    aborted_reason: str = "failed validation",
 ) -> str:
     """Fail an unstarted batch with one structured result per task."""
     resolved = {
@@ -3506,10 +3612,10 @@ def _structured_delegate_batch_failure(
         else:
             entry_message = (
                 f"Batch aborted before execution because task {failed_index} "
-                f"failed validation: {message}"
+                f"{aborted_reason}: {message}"
             )
             lane, credentials = resolved.get(index, (None, None))
-            failure_kind = "batch_preflight_aborted"
+            failure_kind = aborted_kind
         entries.append(
             _structured_delegate_failure_entry(
                 entry_message,
@@ -3677,7 +3783,10 @@ def delegate_task(
         lane_name = None
         task_creds = None
         try:
-            has_lane_config = isinstance(cfg.get("lanes"), dict) and bool(cfg.get("lanes"))
+            local_first_policy = cfg.get("local_first")
+            local_first_disabled = isinstance(
+                local_first_policy, dict
+            ) and local_first_policy.get("enabled", False) is False
             has_global_runtime = bool(
                 isinstance(cfg.get("provider"), str) and cfg.get("provider", "").strip()
                 or isinstance(cfg.get("model"), str) and cfg.get("model", "").strip()
@@ -3688,8 +3797,10 @@ def delegate_task(
             # direct route inspection, but an omitted runtime is explicitly
             # the legacy "use the parent" contract.
             if (
-                not has_lane_config
+                "lanes" not in cfg
                 and "tier_routes" not in cfg
+                and "mode_routes" not in cfg
+                and ("local_first" not in cfg or local_first_disabled)
                 and not has_global_runtime
                 and not task.get("route")
                 and not task.get("model_tier")
@@ -3715,7 +3826,10 @@ def delegate_task(
             else:
                 lane_name = _resolve_lane_for_task(task, cfg)
                 task_creds = _resolve_delegation_credentials_for_task(
-                    cfg, parent_agent, task
+                    cfg,
+                    parent_agent,
+                    task,
+                    resolved_lane=lane_name,
                 )
             lane_toolsets = _normalize_lane_toolsets(task_creds.get("toolsets"))
             # ``code_worker`` is the compatibility label for the legacy
@@ -3833,7 +3947,7 @@ def delegate_task(
                 # A child may already have registered itself with the parent
                 # before a later sibling fails. Balance that lifecycle before
                 # returning the batch-aborted result.
-                for _, _, built_child in children:
+                for _built_index, built_task, built_child in children:
                     try:
                         active = getattr(parent_agent, "_active_children", None)
                         if active is not None:
@@ -3865,21 +3979,22 @@ def delegate_task(
                             )
                         except Exception:
                             logger.debug("Failed to complete child lifecycle after batch abort", exc_info=True)
-                    try:
-                        from hermes_cli.plugins import invoke_hook as _invoke_hook
-
-                        _invoke_hook(
-                            "subagent_stop",
-                            parent_session_id=getattr(parent_agent, "session_id", None),
-                            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
-                            child_session_id=getattr(built_child, "session_id", None),
-                            child_role=getattr(built_child, "_delegate_role", None),
-                            child_summary=None,
-                            child_status="failed",
-                            duration_ms=0,
-                        )
-                    except Exception:
-                        logger.debug("subagent_stop hook failed after batch construction abort", exc_info=True)
+                    _emit_subagent_stop_once(
+                        parent_agent,
+                        built_child,
+                        child_goal=built_task.get("goal", ""),
+                        result={
+                            "status": "failed",
+                            "summary": None,
+                            "failure_kind": "batch_construction_aborted",
+                            "exit_reason": "construction_aborted",
+                            "duration_seconds": 0,
+                            "evidence": {
+                                "tool_turn_count": 0,
+                                "successful_tool_count": 0,
+                            },
+                        },
+                    )
                     try:
                         built_child.close()
                     except Exception:
@@ -3892,12 +4007,32 @@ def delegate_task(
                     failed_kind="provider_error",
                     failed_credentials=task_creds,
                     task_specs=task_specs,
+                    aborted_kind="batch_construction_aborted",
+                    aborted_reason="failed construction",
                 )
             child._delegate_saved_tool_names = _parent_tool_names
             child._delegate_mode = t["mode"]
             child._delegate_lane = lane_name
-            child._delegate_provider = task_creds.get("provider")
-            child._delegate_model = task_creds.get("model")
+            configured_provider = task_creds.get("provider")
+            effective_provider = (
+                configured_provider.strip()
+                if isinstance(configured_provider, str) and configured_provider.strip()
+                else None
+            )
+            child_provider = getattr(child, "provider", None)
+            if effective_provider is None and isinstance(child_provider, str):
+                effective_provider = child_provider.strip() or None
+            configured_model = task_creds.get("model")
+            effective_model = (
+                configured_model.strip()
+                if isinstance(configured_model, str) and configured_model.strip()
+                else None
+            )
+            child_model = getattr(child, "model", None)
+            if effective_model is None and isinstance(child_model, str):
+                effective_model = child_model.strip() or None
+            child._delegate_provider = effective_provider
+            child._delegate_model = effective_model
             child._tool_use_enforcement = t["mode"] in {"execute", "review"}
             child._intent_ack_continuation = t["mode"] in {"execute", "review"}
             _writer = live_writers[i] if i < len(live_writers) else None
@@ -3910,7 +4045,7 @@ def delegate_task(
                 )
                 child._live_transcript_path = str(_writer.path)
             children.append((i, t, child))
-            child_models.append(task_creds.get("model"))
+            child_models.append(effective_model)
     finally:
         _model_tools.set_last_resolved_tool_names(_parent_tool_names)
 
@@ -4280,6 +4415,66 @@ def delegate_task(
                     parts.append(None)
             return tuple(parts), in_tool
 
+        def _batch_terminal_callback(
+            combined: Dict[str, Any], terminal_status: str
+        ) -> None:
+            """Balance built-child stop events on every in-process async exit."""
+            raw_results = combined.get("results")
+            result_by_index: Dict[int, Dict[str, Any]] = {}
+            if isinstance(raw_results, list):
+                for result_position, raw_result in enumerate(raw_results):
+                    if not isinstance(raw_result, dict):
+                        continue
+                    result = dict(raw_result)
+                    task_index = result.get("task_index", result_position)
+                    if isinstance(task_index, int):
+                        result.setdefault("task_index", task_index)
+                        result_by_index[task_index] = result
+
+            normalized_status = str(terminal_status or "error").strip().lower()
+            for child_index, child_task, child_agent in children:
+                child_result = result_by_index.get(child_index)
+                if child_result is None:
+                    if normalized_status == "interrupted":
+                        child_status = "interrupted"
+                        failure_kind = "interrupted"
+                        exit_reason = "interrupted_before_execution"
+                    elif normalized_status == "stalled":
+                        child_status = "stalled"
+                        failure_kind = "stalled"
+                        exit_reason = "stalled"
+                    elif normalized_status in {"completed", "success"}:
+                        child_status = "failed"
+                        failure_kind = "async_missing_terminal_result"
+                        exit_reason = "completed_without_child_result"
+                    else:
+                        child_status = "failed"
+                        failure_kind = "async_runner_crash"
+                        exit_reason = "error"
+                    child_result = {
+                        "task_index": child_index,
+                        "status": child_status,
+                        "summary": combined.get("summary"),
+                        "error": combined.get("error"),
+                        "failure_kind": failure_kind,
+                        "exit_reason": combined.get("exit_reason") or exit_reason,
+                        "duration_seconds": (
+                            combined.get("duration_seconds")
+                            or combined.get("total_duration_seconds")
+                            or 0
+                        ),
+                        "evidence": {
+                            "tool_turn_count": 0,
+                            "successful_tool_count": 0,
+                        },
+                    }
+                _emit_subagent_stop_once(
+                    parent_agent,
+                    child_agent,
+                    child_goal=child_task.get("goal", ""),
+                    result=child_result,
+                )
+
         _goals = [t["goal"] for t in task_list]
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
@@ -4300,6 +4495,7 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            terminal_callback=_batch_terminal_callback,
         )
 
         if dispatch.get("status") == "dispatched":
@@ -4584,16 +4780,142 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _apply_local_first_lane_policy(lane: str, cfg: dict, lanes: dict) -> str:
+    """Overlay the local lane only when controller health is provably fresh.
+
+    Missing, malformed, stale, oversized, non-regular, and symlinked state all
+    select the configured degraded lane. The state is opened once and then
+    validated/read through that handle so a path replacement cannot change
+    the object between the size check and JSON parse.
+    """
+    if "local_first" not in cfg:
+        return lane
+    policy = cfg.get("local_first")
+    if not isinstance(policy, dict):
+        raise ValueError("delegation.local_first must be a mapping when configured.")
+    enabled = policy.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("delegation.local_first.enabled must be true or false.")
+    if not enabled:
+        return lane
+
+    required: dict[str, str] = {}
+    for key in ("state_file", "local_lane", "degraded_lane"):
+        value = policy.get(key)
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            raise ValueError(
+                f"delegation.local_first.{key} must be a non-empty trimmed string."
+            )
+        required[key] = value
+
+    local_lane = required["local_lane"]
+    degraded_lane = required["degraded_lane"]
+    if local_lane == degraded_lane:
+        raise ValueError(
+            "delegation.local_first.local_lane and degraded_lane must be different lanes."
+        )
+    for policy_lane in (local_lane, degraded_lane):
+        if policy_lane not in lanes:
+            raise ValueError(
+                f"delegation.local_first references lane '{policy_lane}', which is "
+                "not in delegation.lanes "
+                f"(available: {', '.join(sorted(lanes))})."
+            )
+    max_state_age = policy.get("max_state_age_seconds", 1800)
+    if isinstance(max_state_age, bool) or not isinstance(max_state_age, int):
+        raise ValueError(
+            "delegation.local_first.max_state_age_seconds must be a positive integer."
+        )
+    if max_state_age <= 0:
+        raise ValueError(
+            "delegation.local_first.max_state_age_seconds must be a positive integer."
+        )
+    if lane != local_lane:
+        return lane
+
+    state_path = os.path.expanduser(required["state_file"])
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    try:
+        path_stat = os.lstat(state_path)
+        if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+            return degraded_lane
+        fd = os.open(state_path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1  # fdopen owns the descriptor from this point onward.
+            opened = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != (path_stat.st_dev, path_stat.st_ino)
+                or opened.st_size > 65_536
+            ):
+                return degraded_lane
+            raw_state_bytes = handle.read(65_537)
+            if len(raw_state_bytes) > 65_536:
+                return degraded_lane
+            raw_state = raw_state_bytes.decode("utf-8")
+            state = json.loads(raw_state)
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return degraded_lane
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    updated_epoch = state.get("updated_epoch") if isinstance(state, dict) else None
+    if isinstance(updated_epoch, bool) or not isinstance(
+        updated_epoch, (int, float)
+    ):
+        return degraded_lane
+    try:
+        updated_epoch_float = float(updated_epoch)
+    except (TypeError, ValueError, OverflowError):
+        return degraded_lane
+    if not math.isfinite(updated_epoch_float):
+        return degraded_lane
+    state_age = time.time() - updated_epoch_float
+    if state.get("mode") != "local" or state_age > max_state_age or state_age < -300:
+        return degraded_lane
+    return local_lane
+
+
 def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
-    """Resolve a task to one validated delegation lane."""
+    """Resolve one task through explicit route, tier, then validated mode."""
     raw_lanes = cfg.get("lanes")
     lanes_configured = "lanes" in cfg
     raw_tier_routes = cfg.get("tier_routes")
     tier_routes_configured = "tier_routes" in cfg
+    raw_mode_routes = cfg.get("mode_routes")
+    mode_routes_configured = "mode_routes" in cfg
     route = str(task.get("route") or "").strip()
     tier = str(task.get("model_tier") or "").strip()
     mode = str(task.get("mode") or "execute").strip().lower()
-    mode_routes = {"execute": "code_worker", "review": "smart_reviewer", "reason": "local_worker"}
+    mode_routes = {
+        "execute": "code_worker",
+        "review": "smart_reviewer",
+        "reason": "local_worker",
+    }
+    if mode_routes_configured:
+        required_modes = set(mode_routes)
+        if not isinstance(raw_mode_routes, dict) or set(raw_mode_routes) != required_modes:
+            raise ValueError(
+                "delegation.mode_routes must map exactly execute, review, and reason."
+            )
+        for lane_name in raw_mode_routes.values():
+            if (
+                not isinstance(lane_name, str)
+                or not lane_name.strip()
+                or lane_name != lane_name.strip()
+            ):
+                raise ValueError(
+                    "delegation.mode_routes values must be non-empty trimmed lane names."
+                )
+        mode_routes = dict(raw_mode_routes)
     if mode not in mode_routes:
         raise ValueError(
             f"Task mode '{mode}' is invalid (expected: execute, review, reason)."
@@ -4621,6 +4943,10 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
             raise ValueError(
                 "delegation.tier_routes was configured but delegation.lanes is not configured."
             )
+        if mode_routes_configured:
+            raise ValueError(
+                "delegation.mode_routes was configured but delegation.lanes is not configured."
+            )
         if route:
             raise ValueError(
                 f"Task route '{route}' was requested but delegation.lanes is not configured."
@@ -4644,7 +4970,7 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
                 or (isinstance(explicit_base_url, str) and explicit_base_url.strip())
             )
         ):
-            return "code_worker"
+            return _apply_local_first_lane_policy("code_worker", cfg, lanes)
         raise ValueError(
             f"Task mode '{mode}' requires delegation.lanes.{mode_routes[mode]} "
             "with provider/model configuration."
@@ -4671,6 +4997,15 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
                 f"Delegation lane '{lane_name}' has empty, unknown, or invalid toolsets."
             )
 
+    if mode_routes_configured:
+        for mode_name, lane_name in mode_routes.items():
+            if lane_name not in lanes:
+                raise ValueError(
+                    f"delegation.mode_routes.{mode_name} maps to lane '{lane_name}', "
+                    "which is not in delegation.lanes "
+                    f"(available: {', '.join(sorted(lanes))})."
+                )
+
     if tier_routes_configured:
         for tier_name, lane_name in raw_tier_routes.items():
             if (
@@ -4694,11 +5029,11 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
                 f"Task route '{route}' not found in delegation.lanes "
                 f"(available: {', '.join(sorted(lanes))})."
             )
-        return route
+        return _apply_local_first_lane_policy(route, cfg, lanes)
     if tier:
         lane = (cfg.get("tier_routes") or {}).get(tier)
         if lane:
-            return lane
+            return _apply_local_first_lane_policy(lane, cfg, lanes)
         raise ValueError(f"Task model_tier '{tier}' is not mapped in delegation.tier_routes.")
     lane = mode_routes[mode]
     if lane not in lanes:
@@ -4706,7 +5041,7 @@ def _resolve_lane_for_task(task: dict, cfg: dict) -> Optional[str]:
             f"Task mode '{mode}' requires lane '{lane}', which is not in "
             f"delegation.lanes (available: {', '.join(sorted(lanes))})."
         )
-    return lane
+    return _apply_local_first_lane_policy(lane, cfg, lanes)
 
 
 def _normalize_lane_toolsets(value) -> Optional[list[str]]:
@@ -4769,13 +5104,22 @@ def _preflight_lane_toolsets(
         )
 
 
+_UNRESOLVED_DELEGATION_LANE = object()
+
+
 def _resolve_delegation_credentials_for_task(
-    cfg: dict, parent_agent, task: Optional[dict] = None
+    cfg: dict,
+    parent_agent,
+    task: Optional[dict] = None,
+    *,
+    resolved_lane: Any = _UNRESOLVED_DELEGATION_LANE,
 ) -> dict:
-    """Resolve credentials and toolsets for one deterministic lane."""
-    if task is not None:
-        lane_name = _resolve_lane_for_task(task, cfg)
-        if lane_name is not None and isinstance(cfg.get("lanes"), dict):
+    """Resolve credentials/toolsets for one authoritative lane decision."""
+    lane_name = resolved_lane
+    if lane_name is _UNRESOLVED_DELEGATION_LANE:
+        lane_name = _resolve_lane_for_task(task, cfg) if task is not None else None
+    if lane_name is not None:
+        if isinstance(cfg.get("lanes"), dict):
             lane_cfg = cfg["lanes"][lane_name]
             lane_creds = _resolve_delegation_credentials(lane_cfg, parent_agent)
             if "toolsets" in lane_cfg:
@@ -5207,8 +5551,12 @@ def _build_top_level_description() -> str:
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
+        "- Routing precedence is explicit route, then model_tier, then mode. "
+        "Mode resolves through delegation.mode_routes when configured; the "
+        "mapping must name exactly execute, review, and reason and every target "
+        "must exist in delegation.lanes. Arbitrary provider/model values are "
+        "never accepted per call; legacy execute-only installations may pin "
+        "delegation.provider / delegation.model globally. "
         "Results are returned as an array, one entry per task."
     )
 
@@ -5343,6 +5691,14 @@ DELEGATE_TASK_SCHEMA = {
                         "model_tier": {
                             "type": "string",
                             "description": "Model tier mapped through delegation.tier_routes.",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["execute", "review", "reason"],
+                            "description": (
+                                "Task intent used by delegation.mode_routes when route and "
+                                "model_tier are omitted."
+                            ),
                         },
                     },
                     "required": ["goal"],

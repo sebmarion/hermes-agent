@@ -146,7 +146,7 @@ Each `tasks[]` item accepts an optional `mode`, `route`, and `model_tier`.
 Routing is deterministic: explicit `route` wins, then a configured
 `model_tier`, then the task mode.
 
-| Mode | Default lane | Completion contract |
+| Mode | Built-in lane when `mode_routes` is omitted | Completion contract |
 |------|--------------|---------------------|
 | `execute` (default) | `code_worker` | Requires at least one successful tool result |
 | `review` | `smart_reviewer` | Requires at least one successful read/review tool result |
@@ -157,6 +157,47 @@ only announces intent. If they still return without successful tool evidence,
 the result is a structured failure (`no_tool_evidence` or
 `tool_execution_failed`); provider failures remain `provider_error`. Explicit
 routes never fall back to the parent model or another lane.
+
+### Exact mode routes and local-first failover
+
+When `delegation.mode_routes` is present, it must contain **exactly** the three
+keys `execute`, `review`, and `reason`. Every value must be a trimmed name in
+`delegation.lanes`; malformed or missing mappings fail before any child is
+constructed.
+
+```yaml
+delegation:
+  lanes:
+    zeus_local:
+      provider: custom:zeus
+      model: local-coder
+    remote_reviewer:
+      provider: openrouter
+      model: review-model
+  mode_routes:
+    execute: zeus_local
+    review: remote_reviewer
+    reason: zeus_local
+  local_first:
+    enabled: true
+    state_file: /var/run/hermes-controller.json
+    local_lane: zeus_local
+    degraded_lane: remote_reviewer
+    max_state_age_seconds: 1800
+```
+
+`local_first` only overlays tasks that resolved to `local_lane`; explicit or
+mode-routed tasks on other lanes stay on those lanes. The controller file must
+be a regular, non-symlink JSON file no larger than 64 KiB with a fresh payload:
+
+```json
+{"mode": "local", "updated_epoch": 1786118400}
+```
+
+The default freshness window is 1800 seconds. A missing, malformed, stale,
+far-future, oversized, replaced, or non-regular state file selects
+`degraded_lane`. Structural configuration errors fail closed. `local_lane` and
+`degraded_lane` must be different configured lanes.
 
 ## Model Override
 

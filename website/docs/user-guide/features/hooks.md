@@ -962,26 +962,51 @@ def register(ctx):
 
 ### `subagent_stop`
 
-Fires **once per child agent** after `delegate_task` finishes. Whether you delegated a single task or a batch of three, this hook fires once for each child, serialised on the parent thread.
+Fires **once per constructed child agent** when that child's terminal outcome is known. Whether you delegated a single task or a batch of three, a per-parent lock serialises callbacks for that delegation. If a later sibling fails during construction, already-constructed children receive a `construction_aborted` stop receipt before they are closed.
 
 **Callback signature:**
 
 ```python
-def my_callback(parent_session_id: str, child_role: str | None,
-                child_summary: str | None, child_status: str,
+def my_callback(parent_session_id: str | None, parent_turn_id: str,
+                child_session_id: str | None, child_role: str | None,
+                child_goal: str, child_summary: str | None,
+                child_status: str, child_lane: str,
+                child_provider: str, child_model: str, child_mode: str,
+                child_failure_kind: str, child_exit_reason: str,
+                child_successful_tool_count: int,
                 tool_call_history: list[dict], duration_ms: int, **kwargs):
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `parent_session_id` | `str` | Session ID of the delegating parent agent |
+| `parent_session_id` | `str \| None` | Session ID of the delegating parent agent, if available |
+| `parent_turn_id` | `str` | Turn ID that requested delegation, if available |
+| `child_session_id` | `str \| None` | Session ID allocated for the child agent |
 | `child_role` | `str \| None` | Orchestrator role tag set on the child (`None` if the feature isn't enabled) |
+| `child_goal` | `str` | Host-owned delegated goal for this child |
 | `child_summary` | `str \| None` | The final response the child returned to the parent |
-| `child_status` | `str` | `"completed"`, `"failed"`, `"interrupted"`, or `"error"` |
+| `child_status` | `str` | Terminal status such as `"completed"`, `"failed"`, `"interrupted"`, `"timeout"`, or `"error"` |
+| `child_lane` | `str` | Authoritative resolved lane; empty only for legacy parent-runtime inheritance |
+| `child_provider` | `str` | Effective provider used by the child |
+| `child_model` | `str` | Effective model used by the child |
+| `child_mode` | `str` | Effective task mode: `"execute"`, `"review"`, or `"reason"` |
+| `child_failure_kind` | `str` | Normalized failure class, or an empty string on success |
+| `child_exit_reason` | `str` | Concrete terminal reason, including `"construction_aborted"` when a later sibling cannot be built |
+| `child_successful_tool_count` | `int` | Number of tool calls with successful results |
 | `tool_call_history` | `list[dict]` | Ordered metadata-only tool calls: `tool_name`, bounded `tool_input`, `input_bytes`, `output_bytes`, and `status`; raw inputs and outputs are excluded |
 | `duration_ms` | `int` | Wall-clock time spent running the child, in milliseconds |
 
-**Fires:** In `tools/delegate_tool.py`, after `ThreadPoolExecutor.as_completed()` drains all child futures. Firing is marshalled to the parent thread so hook authors don't have to reason about concurrent callback execution.
+**Fires:** In `tools/delegate_tool.py`, after a single child returns or after a batch's child futures have been aggregated. It also fires for each already-built child when later sibling construction aborts the batch. A per-parent lock prevents concurrent lifecycle side effects for one delegation; background callbacks may run on the async worker thread.
+
+**Process boundary:** The once-per-child guarantee applies to the child object in
+the process that constructed it. Background completion records are durable,
+but Python observer/plugin callbacks are process-local and are never serialized
+into those records. A restart may redeliver a pending completion event to the
+conversation, but it does not reconstruct or replay `subagent_stop`. If the
+owner process disappears while a child is still running, recovery reports
+lost/unknown completion evidence; it does not synthesize this hook. Consumers
+that need restart-safe accounting must also consume the durable completion
+record and handle lost/unknown outcomes explicitly.
 
 **Return value:** Ignored.
 

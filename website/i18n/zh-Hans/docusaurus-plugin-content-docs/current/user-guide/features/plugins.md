@@ -199,7 +199,7 @@ hermes plugins disable <name>     # 从允许列表移除并添加到禁用列�
 | [`on_session_end`](/user-guide/features/hooks#on_session_end) | 每次 `run_conversation` 调用结束时 + CLI 退出处理器 |
 | [`on_session_finalize`](/user-guide/features/hooks#on_session_finalize) | CLI/gateway 销毁活跃会话时（`/new`、GC、CLI 退出） |
 | [`on_session_reset`](/user-guide/features/hooks#on_session_reset) | Gateway 换入新会话 key 时（`/new`、`/reset`、`/clear`、空闲轮换） |
-| [`subagent_stop`](/user-guide/features/hooks#subagent_stop) | `delegate_task` 完成后每个子 agent 触发一次 |
+| [`subagent_stop`](/user-guide/features/hooks#subagent_stop) | 每个已构造子 agent 达到终止结果时触发 |
 | [`pre_gateway_dispatch`](/user-guide/features/hooks#pre_gateway_dispatch) | Gateway 收到用户消息，在认证和调度之前。返回 `{"action": "skip" \| "rewrite" \| "allow", ...}` 以影响流程。 |
 
 ## 插件类型

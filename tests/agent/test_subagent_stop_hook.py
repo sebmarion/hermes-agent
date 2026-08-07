@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import tools.delegate_tool as delegate_tool
 from tools.delegate_tool import _summarize_tool_arguments, delegate_task
 from hermes_cli import plugins
 
@@ -137,6 +140,65 @@ class TestSingleTask:
 
         assert captured[0]["parent_session_id"] == "sess-xyz"
 
+    def test_reaches_first_party_observer_and_plugin_once(self):
+        captured = _register_capturing_hook()
+
+        with (
+            patch("tools.delegate_tool._run_single_child") as mock_run,
+            patch("hermes_cli.observability.observe_lifecycle") as observe,
+        ):
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "Done!",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+                "_child_role": "leaf",
+            }
+            delegate_task(goal="do X", parent_agent=_make_parent())
+
+        assert len(captured) == 1
+        observe.assert_called_once()
+        assert observe.call_args.args == ("subagent_stop",)
+        assert observe.call_args.kwargs["child_goal"] == "do X"
+
+    def test_shared_emitter_is_exact_once_under_concurrency(self):
+        captured = _register_capturing_hook()
+        child = SimpleNamespace(
+            session_id="child-1",
+            _delegate_role="leaf",
+            _delegate_lane="code_worker",
+            _delegate_provider="local",
+            _delegate_model="worker-model",
+            _delegate_mode="execute",
+        )
+        result = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "duration_seconds": 0.1,
+        }
+        emitter = getattr(delegate_tool, "_emit_subagent_stop_once")
+
+        with patch("hermes_cli.observability.observe_lifecycle") as observe:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                emitted = list(
+                    executor.map(
+                        lambda _: emitter(
+                            _make_parent(),
+                            child,
+                            child_goal="race-safe",
+                            result=dict(result),
+                        ),
+                        range(8),
+                    )
+                )
+
+        assert emitted.count(True) == 1
+        assert emitted.count(False) == 7
+        assert len(captured) == 1
+        observe.assert_called_once()
+
 
 # ── batch mode ────────────────────────────────────────────────────────────
 
@@ -189,11 +251,160 @@ class TestBatchMode:
         for payload in captured:
             assert payload["_thread"] is main_thread
 
+    @pytest.mark.parametrize(
+        (
+            "goals",
+            "parent_depth",
+            "combined",
+            "terminal_status",
+            "expected_status",
+            "expected_failure_kind",
+            "expected_exit_reason",
+        ),
+        [
+            (
+                ["one scheduled child"],
+                0,
+                {"results": [], "error": "interrupted before execution"},
+                "interrupted",
+                "interrupted",
+                "interrupted",
+                "interrupted_before_execution",
+            ),
+            (
+                ["nested child A", "nested child B"],
+                1,
+                {"results": [], "error": "RuntimeError: runner crashed"},
+                "error",
+                "failed",
+                "async_runner_crash",
+                "error",
+            ),
+            (
+                ["stalled child A", "stalled child B"],
+                0,
+                {
+                    "status": "stalled",
+                    "summary": None,
+                    "error": "detached subagent stopped making progress",
+                    "duration_seconds": 10,
+                    "exit_reason": "stalled",
+                },
+                "stalled",
+                "stalled",
+                "stalled",
+                "stalled",
+            ),
+        ],
+    )
+    def test_background_terminal_exits_emit_once_per_built_child(
+        self,
+        monkeypatch,
+        goals,
+        parent_depth,
+        combined,
+        terminal_status,
+        expected_status,
+        expected_failure_kind,
+        expected_exit_reason,
+    ):
+        captured = _register_capturing_hook()
+        built_children = []
+        dispatch_kwargs = {}
+
+        def build_child(task_index, **_kwargs):
+            child = SimpleNamespace(
+                session_id=f"child-{task_index}",
+                _delegate_role="leaf",
+                provider="local-provider",
+                model="local-model",
+            )
+            built_children.append(child)
+            return child
+
+        def dispatch_batch(**kwargs):
+            dispatch_kwargs.update(kwargs)
+            return {"status": "dispatched", "delegation_id": "deleg-test"}
+
+        monkeypatch.setattr(delegate_tool, "_build_child_agent", build_child)
+        monkeypatch.setattr(delegate_tool, "_get_max_spawn_depth", lambda: 2)
+        monkeypatch.setattr(
+            "gateway.session_context.async_delivery_supported", lambda: True
+        )
+        monkeypatch.setattr(
+            "tools.async_delegation.dispatch_async_delegation_batch", dispatch_batch
+        )
+        parent = _make_parent(depth=parent_depth, session_id="nested-parent")
+
+        with patch("hermes_cli.observability.observe_lifecycle") as observe:
+            if len(goals) == 1:
+                raw = delegate_task(
+                    goal=goals[0], background=True, parent_agent=parent
+                )
+            else:
+                raw = delegate_task(
+                    tasks=[{"goal": goal} for goal in goals],
+                    background=True,
+                    parent_agent=parent,
+                )
+            assert json.loads(raw)["status"] == "dispatched"
+            terminal_callback = dispatch_kwargs["terminal_callback"]
+            terminal_callback(dict(combined), terminal_status)
+            terminal_callback(dict(combined), terminal_status)
+
+        assert len(built_children) == len(goals)
+        assert len(captured) == len(goals)
+        assert observe.call_count == len(goals)
+        assert [payload["child_goal"] for payload in captured] == goals
+        for child, payload in zip(built_children, captured):
+            assert payload["parent_session_id"] == "nested-parent"
+            assert payload["child_status"] == expected_status
+            assert payload["child_lane"] == (child._delegate_lane or "")
+            assert payload["child_provider"] == child._delegate_provider
+            assert payload["child_model"] == child._delegate_model
+            assert payload["child_mode"] == "execute"
+            assert payload["child_failure_kind"] == expected_failure_kind
+            assert payload["child_exit_reason"] == expected_exit_reason
+
 
 # ── payload shape ─────────────────────────────────────────────────────────
 
 
 class TestPayloadShape:
+    def test_includes_host_owned_route_goal_and_outcome_evidence(self):
+        captured = _register_capturing_hook()
+
+        with patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "failed",
+                "summary": "provider stopped",
+                "api_calls": 2,
+                "duration_seconds": 0.25,
+                "mode": "review",
+                "lane": "review_lane",
+                "provider": "review-provider",
+                "routed_model": "review-model",
+                "failure_kind": "provider_error",
+                "exit_reason": "error",
+                "evidence": {
+                    "tool_turn_count": 2,
+                    "successful_tool_count": 1,
+                },
+                "_child_role": "reviewer",
+            }
+            delegate_task(goal="Review the exact diff", parent_agent=_make_parent())
+
+        payload = captured[0]
+        assert payload["child_goal"] == "Review the exact diff"
+        assert payload["child_lane"] == "review_lane"
+        assert payload["child_provider"] == "review-provider"
+        assert payload["child_model"] == "review-model"
+        assert payload["child_mode"] == "review"
+        assert payload["child_failure_kind"] == "provider_error"
+        assert payload["child_exit_reason"] == "error"
+        assert payload["child_successful_tool_count"] == 1
+
     def test_includes_redacted_tool_call_history(self):
         captured = _register_capturing_hook()
 

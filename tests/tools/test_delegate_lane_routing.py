@@ -1,6 +1,8 @@
 """Regression tests for delegate_task per-task lane routing."""
 
 import json
+import os
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -70,6 +72,33 @@ def test_explicit_global_provider_model_is_treated_as_code_worker_compat_lane():
     lane = delegate_tool._resolve_lane_for_task({}, cfg)
 
     assert lane == "code_worker"
+
+
+@pytest.mark.parametrize(
+    ("policy", "message"),
+    [
+        ("bad", "local_first must be a mapping"),
+        (
+            {
+                "enabled": True,
+                "state_file": "/missing/controller.json",
+                "local_lane": "code_worker",
+                "degraded_lane": "remote_worker",
+                "max_state_age_seconds": 60,
+            },
+            "references lane 'code_worker'",
+        ),
+    ],
+)
+def test_global_runtime_never_bypasses_configured_local_first(policy, message):
+    cfg = {
+        "provider": "custom:test",
+        "model": "test-model",
+        "local_first": policy,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        delegate_tool._resolve_lane_for_task({}, cfg)
 
 
 def test_missing_lanes_and_explicit_delegate_runtime_fails_closed():
@@ -188,6 +217,222 @@ def test_lanes_without_default_use_execute_mode():
     del cfg["default_lane"]
 
     assert delegate_tool._resolve_lane_for_task({}, cfg) == "code_worker"
+
+
+def test_exact_mode_routes_replace_legacy_lane_names():
+    cfg = _lane_cfg()
+    cfg["mode_routes"] = {
+        "execute": "local_worker",
+        "review": "code_worker",
+        "reason": "smart_reviewer",
+    }
+
+    assert delegate_tool._resolve_lane_for_task({"mode": "execute"}, cfg) == "local_worker"
+    assert delegate_tool._resolve_lane_for_task({"mode": "review"}, cfg) == "code_worker"
+    assert delegate_tool._resolve_lane_for_task({"mode": "reason"}, cfg) == "smart_reviewer"
+
+
+@pytest.mark.parametrize(
+    "bad_routes",
+    [
+        [],
+        "execute: code_worker",
+        {},
+        {"execute": "code_worker", "review": "smart_reviewer"},
+        {
+            "execute": "code_worker",
+            "review": "smart_reviewer",
+            "reason": "local_worker",
+            "extra": "local_worker",
+        },
+        {
+            "execute": " code_worker ",
+            "review": "smart_reviewer",
+            "reason": "local_worker",
+        },
+        {
+            "execute": 42,
+            "review": "smart_reviewer",
+            "reason": "local_worker",
+        },
+    ],
+)
+def test_mode_routes_are_an_exact_fail_closed_mapping(bad_routes):
+    cfg = _lane_cfg()
+    cfg["mode_routes"] = bad_routes
+
+    with pytest.raises(ValueError, match="mode_routes"):
+        delegate_tool._resolve_lane_for_task({}, cfg)
+
+
+def test_mode_routes_require_configured_lanes_and_existing_targets():
+    routes = {
+        "execute": "code_worker",
+        "review": "smart_reviewer",
+        "reason": "local_worker",
+    }
+    with pytest.raises(ValueError, match="mode_routes.*lanes is not configured"):
+        delegate_tool._resolve_lane_for_task({}, {"mode_routes": routes})
+
+    cfg = _lane_cfg()
+    cfg["mode_routes"] = {**routes, "reason": "missing"}
+    with pytest.raises(ValueError, match="mode_routes.reason.*missing"):
+        delegate_tool._resolve_lane_for_task({}, cfg)
+
+
+def _local_first_cfg(state_file):
+    cfg = _lane_cfg()
+    cfg["local_first"] = {
+        "enabled": True,
+        "state_file": str(state_file),
+        "local_lane": "code_worker",
+        "degraded_lane": "smart_reviewer",
+        "max_state_age_seconds": 60,
+    }
+    return cfg
+
+
+def test_local_first_uses_fresh_controller_local_state(tmp_path):
+    state_file = tmp_path / "controller.json"
+    state_file.write_text(
+        json.dumps({"mode": "local", "updated_epoch": time.time()}),
+        encoding="utf-8",
+    )
+
+    assert delegate_tool._resolve_lane_for_task({}, _local_first_cfg(state_file)) == "code_worker"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        "not-json",
+        {},
+        {"mode": "remote", "updated_epoch": 1},
+        {"mode": "local", "updated_epoch": 1},
+        {"mode": "local", "updated_epoch": True},
+        {"mode": "local", "updated_epoch": float("nan")},
+        {"mode": "local", "updated_epoch": float("inf")},
+    ],
+)
+def test_local_first_degrades_on_untrusted_or_unhealthy_state(tmp_path, payload):
+    state_file = tmp_path / "controller.json"
+    if payload is not None:
+        state_file.write_text(
+            payload if isinstance(payload, str) else json.dumps(payload),
+            encoding="utf-8",
+        )
+
+    assert (
+        delegate_tool._resolve_lane_for_task({}, _local_first_cfg(state_file))
+        == "smart_reviewer"
+    )
+
+
+def test_local_first_degrades_on_far_future_oversized_and_symlink_state(tmp_path):
+    future = tmp_path / "future.json"
+    future.write_text(
+        json.dumps({"mode": "local", "updated_epoch": time.time() + 301}),
+        encoding="utf-8",
+    )
+    assert delegate_tool._resolve_lane_for_task({}, _local_first_cfg(future)) == "smart_reviewer"
+
+    oversized = tmp_path / "oversized.json"
+    oversized.write_text(" " * 65_537, encoding="utf-8")
+    assert delegate_tool._resolve_lane_for_task({}, _local_first_cfg(oversized)) == "smart_reviewer"
+
+    real = tmp_path / "real.json"
+    real.write_text(
+        json.dumps({"mode": "local", "updated_epoch": time.time()}),
+        encoding="utf-8",
+    )
+    link = tmp_path / "link.json"
+    try:
+        os.symlink(real, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable on this platform")
+    assert delegate_tool._resolve_lane_for_task({}, _local_first_cfg(link)) == "smart_reviewer"
+
+
+def test_local_first_enforces_byte_cap_at_the_open_handle(tmp_path, monkeypatch):
+    state_file = tmp_path / "multibyte-growth.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "mode": "local",
+                "updated_epoch": time.time(),
+                "padding": "é" * 40_000,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    real_fstat = os.fstat
+
+    def stale_small_fstat(fd):
+        current = list(real_fstat(fd))
+        current[6] = 1
+        return os.stat_result(current)
+
+    monkeypatch.setattr(delegate_tool.os, "fstat", stale_small_fstat)
+
+    assert (
+        delegate_tool._resolve_lane_for_task({}, _local_first_cfg(state_file))
+        == "smart_reviewer"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_state",
+    [
+        "[" * 1_500 + "0" + "]" * 1_500,
+        '{"mode":"local","updated_epoch":' + "1" * 5_000 + "}",
+        '{"mode":"local","updated_epoch":' + "9" * 309 + "}",
+    ],
+)
+def test_local_first_degrades_on_pathological_json_parser_inputs(
+    tmp_path, raw_state
+):
+    state_file = tmp_path / "pathological.json"
+    state_file.write_text(raw_state, encoding="utf-8")
+
+    assert (
+        delegate_tool._resolve_lane_for_task({}, _local_first_cfg(state_file))
+        == "smart_reviewer"
+    )
+
+
+def test_local_first_policy_is_strict_and_only_overlays_its_local_lane(tmp_path):
+    state_file = tmp_path / "missing.json"
+    cfg = _local_first_cfg(state_file)
+    assert (
+        delegate_tool._resolve_lane_for_task({"mode": "review"}, cfg)
+        == "smart_reviewer"
+    )
+
+    cfg["local_first"]["enabled"] = "yes"
+    with pytest.raises(ValueError, match="enabled must be true or false"):
+        delegate_tool._resolve_lane_for_task({}, cfg)
+
+    cfg = _local_first_cfg(state_file)
+    cfg["local_first"]["max_state_age_seconds"] = 1.5
+    with pytest.raises(ValueError, match="positive integer"):
+        delegate_tool._resolve_lane_for_task({}, cfg)
+
+    cfg = _local_first_cfg(state_file)
+    cfg["local_first"]["degraded_lane"] = "missing"
+    with pytest.raises(ValueError, match="references lane 'missing'"):
+        delegate_tool._resolve_lane_for_task({}, cfg)
+
+    cfg = _local_first_cfg(state_file)
+    cfg["local_first"]["max_state_age_seconds"] = "bad"
+    with pytest.raises(ValueError, match="positive integer"):
+        delegate_tool._resolve_lane_for_task({"mode": "review"}, cfg)
+
+    cfg = _local_first_cfg(state_file)
+    cfg["local_first"]["degraded_lane"] = "code_worker"
+    with pytest.raises(ValueError, match="must be different lanes"):
+        delegate_tool._resolve_lane_for_task({"mode": "review"}, cfg)
 
 
 def test_unmapped_tier_fails_closed_without_mode_fallback():
@@ -449,7 +694,7 @@ def test_explicit_lane_disables_parent_fallback_when_building_child(monkeypatch)
     monkeypatch.setattr(
         delegate_tool,
         "_resolve_delegation_credentials_for_task",
-        lambda _cfg, _parent, _task: {
+        lambda _cfg, _parent, _task, *, resolved_lane: {
             "model": "glm-5.2",
             "provider": "neuralwatt",
             "base_url": "https://lane.example/v1",
@@ -510,8 +755,9 @@ def test_single_task_route_is_propagated_into_task_resolution(monkeypatch):
     monkeypatch.setattr(delegate_tool, "_load_config", lambda: cfg)
     captured = {}
 
-    def resolve_credentials(_cfg, _parent, task):
+    def resolve_credentials(_cfg, _parent, task, *, resolved_lane):
         captured["task"] = dict(task)
+        captured["resolved_lane"] = resolved_lane
         return {
             "model": "glm-5.2",
             "provider": "neuralwatt",
@@ -557,3 +803,4 @@ def test_single_task_route_is_propagated_into_task_resolution(monkeypatch):
     assert result["results"][0]["status"] == "completed"
     assert captured["task"]["route"] == "smart_reviewer"
     assert captured["task"]["model_tier"] == "large"
+    assert captured["resolved_lane"] == "smart_reviewer"

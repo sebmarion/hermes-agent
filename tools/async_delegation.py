@@ -657,7 +657,13 @@ def _persistable_record(record: Dict[str, Any]) -> Dict[str, Any]:
     filtered = {
         k: v
         for k, v in record.items()
-        if k not in {"interrupt_fn", "heartbeat_stop", "progress_fn"}
+        if k
+        not in {
+            "interrupt_fn",
+            "heartbeat_stop",
+            "progress_fn",
+            "_terminal_callback",
+        }
     }
     try:
         return json.loads(json.dumps(filtered, ensure_ascii=False, default=str))
@@ -732,7 +738,7 @@ def _record_size_bytes(record: Dict[str, Any]) -> int:
     serialisable = {
         k: v
         for k, v in record.items()
-        if k not in {"interrupt_fn", "heartbeat_stop"}
+        if k not in {"interrupt_fn", "heartbeat_stop", "_terminal_callback"}
     }
     try:
         return len(json.dumps(serialisable, ensure_ascii=False, default=str).encode("utf-8"))
@@ -1537,32 +1543,41 @@ def _finalize_stalled(delegation_id: str) -> None:
         quiet_seconds = record.get("_stall_quiet_seconds")
         threshold_seconds = record.get("_stall_threshold_seconds")
         stall_in_tool = record.get("_stall_in_tool")
+        is_batch = bool(record.get("is_batch"))
     error = (
         f"Async delegation {delegation_id} stalled: the detached subagent "
         "stopped making progress (no new API calls, tool activity, or "
         "streamed tokens), did not respond to interruption, and never "
         "produced a completion event. Re-dispatch the task if it is still needed."
     )
-    _finalize(
-        delegation_id,
-        {
-            "status": "stalled",
-            "summary": None,
-            "error": error,
-            "api_calls": 0,
-            "duration_seconds": duration,
-            "exit_reason": "stalled",
-            "stalled_after_quiet_seconds": quiet_seconds,
-            "stall_threshold_seconds": threshold_seconds,
-            "stall_phase": (
-                "in_tool" if stall_in_tool
-                else "idle" if stall_in_tool is not None
-                else None
-            ),
-            "stall_grace_seconds": _STALL_GRACE_SECONDS,
-        },
-        "stalled",
-    )
+    terminal_result = {
+        "status": "stalled",
+        "summary": None,
+        "error": error,
+        "api_calls": 0,
+        "duration_seconds": duration,
+        "exit_reason": "stalled",
+        "stalled_after_quiet_seconds": quiet_seconds,
+        "stall_threshold_seconds": threshold_seconds,
+        "stall_phase": (
+            "in_tool" if stall_in_tool
+            else "idle" if stall_in_tool is not None
+            else None
+        ),
+        "stall_grace_seconds": _STALL_GRACE_SECONDS,
+    }
+    if is_batch:
+        _finalize_batch(
+            delegation_id,
+            {
+                **terminal_result,
+                "results": [],
+                "total_duration_seconds": duration,
+            },
+            "stalled",
+        )
+    else:
+        _finalize(delegation_id, terminal_result, "stalled")
 
 
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
@@ -1593,7 +1608,13 @@ def _serialise_record(record: Dict[str, Any], now: float) -> Dict[str, Any]:
     out = {
         k: v
         for k, v in record.items()
-        if k not in {"interrupt_fn", "heartbeat_stop", "progress_fn"}
+        if k
+        not in {
+            "interrupt_fn",
+            "heartbeat_stop",
+            "progress_fn",
+            "_terminal_callback",
+        }
         and not k.startswith("_")
     }
     dispatched_at = float(record.get("dispatched_at") or now)
@@ -1876,12 +1897,32 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         if hasattr(hb_stop, "set"):
             hb_stop.set()
         record["interrupt_fn"] = None  # drop the closure; child is done
+        terminal_callback = record.get("_terminal_callback")
+        record["_terminal_callback"] = None
         # Snapshot fields needed for the event while holding the lock.
         event_record = dict(record)
         _prune_completed_locked()
         _cleanup_locked(now=record["completed_at"])
 
+    _invoke_terminal_callback(terminal_callback, result, status)
     _push_completion_event(event_record, result, status)
+
+
+def _invoke_terminal_callback(
+    callback: Optional[Callable[[Dict[str, Any], str], None]],
+    result: Dict[str, Any],
+    status: str,
+) -> None:
+    """Invoke one non-durable terminal callback without breaking delivery."""
+    if not callable(callback):
+        return
+    try:
+        callback(result, status)
+    except Exception:
+        logger.warning(
+            "Async delegation process-local terminal callback failed",
+            exc_info=True,
+        )
 
 
 def _push_completion_event(
@@ -2002,6 +2043,9 @@ def dispatch_async_delegation_batch(
     origin_tracker_path: str = "",
     bestplan_plan_id: str = "",
     resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
+    terminal_callback: Optional[
+        Callable[[Dict[str, Any], str], None]
+    ] = None,
 ) -> Dict[str, Any]:
     """Atomically admit one deterministic-ID batch dispatch."""
     resolved_id = str(delegation_id or _new_delegation_id())
@@ -2028,6 +2072,7 @@ def dispatch_async_delegation_batch(
             origin_tracker_path=origin_tracker_path,
             bestplan_plan_id=bestplan_plan_id,
             resolved_runtimes=resolved_runtimes,
+            terminal_callback=terminal_callback,
         )
 
 
@@ -2051,6 +2096,9 @@ def _dispatch_async_delegation_batch_admitted(
     origin_tracker_path: str = "",
     bestplan_plan_id: str = "",
     resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
+    terminal_callback: Optional[
+        Callable[[Dict[str, Any], str], None]
+    ] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -2159,6 +2207,7 @@ def _dispatch_async_delegation_batch_admitted(
         "heartbeat_count": 0,
         "delivery_status": "intent",
         "interrupt_fn": interrupt_fn,
+        "_terminal_callback": terminal_callback,
         "is_batch": True,
         "owner_pid": os.getpid(),
         "owner_started_at": _process_start_time(os.getpid()),
@@ -2417,10 +2466,13 @@ def _finalize_batch(
         if hasattr(hb_stop, "set"):
             hb_stop.set()
         record["interrupt_fn"] = None
+        terminal_callback = record.get("_terminal_callback")
+        record["_terminal_callback"] = None
         event_record = dict(record)
         _prune_completed_locked()
         _cleanup_locked(now=record["completed_at"])
 
+    _invoke_terminal_callback(terminal_callback, combined, status)
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
     evt = {

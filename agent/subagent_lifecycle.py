@@ -13,6 +13,7 @@ import enum
 import hashlib
 import hmac
 import json
+import logging
 import math
 import secrets
 import threading
@@ -22,6 +23,8 @@ from concurrent.futures import Future, TimeoutError
 from typing import Any, Callable, Mapping, Optional
 
 from agent.interrupt_compat import request_hard_interrupt
+
+logger = logging.getLogger(__name__)
 
 PUBLIC_CONTRACT_VERSION = 1
 _MAX_GOAL_CHARS = 16_000
@@ -256,7 +259,70 @@ class SubagentLifecycleService:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
                 _REGISTRY.correlations[correlation_key] = subagent_id
-        record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        try:
+            record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        except Exception:
+            completed_at = time.time()
+            try:
+                from tools.delegate_tool import _emit_subagent_stop_once
+
+                _emit_subagent_stop_once(
+                    parent,
+                    child,
+                    child_goal=request.goal,
+                    result={
+                        "status": "failed",
+                        "summary": None,
+                        "failure_kind": "lifecycle_scheduling_failed",
+                        "exit_reason": "scheduling_failed",
+                        "duration_seconds": max(0.0, completed_at - created),
+                        "evidence": {
+                            "tool_turn_count": 0,
+                            "successful_tool_count": 0,
+                        },
+                    },
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to emit subagent_stop after lifecycle scheduling failure",
+                    exc_info=True,
+                )
+
+            try:
+                active = getattr(parent, "_active_children", None)
+                if active is not None:
+                    lock = getattr(parent, "_active_children_lock", None)
+                    if lock is not None:
+                        with lock:
+                            if child in active:
+                                active.remove(child)
+                    elif child in active:
+                        active.remove(child)
+            except Exception:
+                logger.debug(
+                    "Failed to detach child after lifecycle scheduling failure",
+                    exc_info=True,
+                )
+
+            try:
+                close = getattr(child, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                logger.debug(
+                    "Failed to close child after lifecycle scheduling failure",
+                    exc_info=True,
+                )
+
+            with _REGISTRY.lock:
+                if _REGISTRY.records.get(subagent_id) is record:
+                    _REGISTRY.records.pop(subagent_id, None)
+                if (
+                    request.correlation_id
+                    and _REGISTRY.correlations.get(correlation_key) == subagent_id
+                ):
+                    _REGISTRY.correlations.pop(correlation_key, None)
+            raise
         return handle
 
     def status(self, handle: SubagentHandle) -> SubagentStatus:
@@ -452,12 +518,36 @@ class SubagentLifecycleService:
                 else {},
             )
         except Exception as exc:
+            completed_at = time.time()
+            try:
+                from tools.delegate_tool import _emit_subagent_stop_once
+
+                _emit_subagent_stop_once(
+                    parent,
+                    record.agent,
+                    child_goal=goal,
+                    result={
+                        "status": "failed",
+                        "summary": None,
+                        "failure_kind": type(exc).__name__,
+                        "exit_reason": "public_lifecycle_exception",
+                        "duration_seconds": max(
+                            0.0, completed_at - (record.started_at or completed_at)
+                        ),
+                        "evidence": {
+                            "tool_turn_count": 0,
+                            "successful_tool_count": 0,
+                        },
+                    },
+                )
+            except Exception:
+                pass
             result = SubagentResult(
                 record.handle,
                 SubagentState.FAILED,
                 True,
                 started_at=record.started_at,
-                completed_at=time.time(),
+                completed_at=completed_at,
                 error_classification=type(exc).__name__,
                 error_message=str(exc)[:_MAX_RESULT_CHARS],
             )

@@ -214,9 +214,19 @@ _DEFAULT_PAYLOADS = {
     },
     "subagent_stop": {
         "parent_session_id": "parent-sess",
+        "parent_turn_id": "parent-turn",
+        "child_session_id": "child-sess",
         "child_role": None,
+        "child_goal": "Inspect the exact delegated scope",
         "child_summary": "Synthetic summary for hooks test",
         "child_status": "completed",
+        "child_lane": "code_worker",
+        "child_provider": "custom:local",
+        "child_model": "local-model",
+        "child_mode": "execute",
+        "child_failure_kind": "",
+        "child_exit_reason": "completed",
+        "child_successful_tool_count": 1,
         "tool_call_history": [
             {
                 "tool_name": "write_file",
