@@ -130,6 +130,7 @@ class TestCodexAppServerModule:
         cmd = self._capture_spawn_cmd(
             monkeypatch,
             env={
+                "HERMES_REAL_HOME": str(tmp_path / "spawn-home"),
                 "HOME": str(tmp_path / "spawn-home"),
                 "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             },
@@ -171,7 +172,11 @@ class TestCodexAppServerModule:
 
         cmd = self._capture_spawn_cmd(
             monkeypatch,
-            env={"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            env={
+                "HERMES_REAL_HOME": str(home),
+                "HOME": str(home),
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            },
         )
 
         assert cmd[:2] == ["codex", "app-server"]
@@ -255,6 +260,194 @@ class TestCodexAppServerModule:
 
         assert result == (True, "0.125.0")
         assert captured["cmd"] == ["codex", "--version"]
+
+    def test_resolver_uses_only_spawn_env_home_trust_order(self, tmp_path) -> None:
+        from agent.transports.codex_app_server import _resolve_codex_bin
+
+        homes = {
+            "real": tmp_path / "real-home",
+            "home": tmp_path / "home",
+            "profile": tmp_path / "user-profile",
+            "drive": tmp_path / "drive-home",
+        }
+        for home in homes.values():
+            codex = home / ".local" / "bin" / "codex"
+            codex.parent.mkdir(parents=True)
+            codex.write_text("#!/bin/sh\n")
+            codex.chmod(0o755)
+
+        base_env = {"PATH": str(tmp_path / "empty-path")}
+        cases = [
+            (
+                {
+                    "HERMES_REAL_HOME": str(homes["real"]),
+                    "HOME": str(homes["home"]),
+                    "USERPROFILE": str(homes["profile"]),
+                    "HOMEDRIVE": str(tmp_path),
+                    "HOMEPATH": "/drive-home",
+                },
+                homes["real"],
+            ),
+            (
+                {
+                    "HOME": str(homes["home"]),
+                    "USERPROFILE": str(homes["profile"]),
+                    "HOMEDRIVE": str(tmp_path),
+                    "HOMEPATH": "/drive-home",
+                },
+                homes["home"],
+            ),
+            (
+                {
+                    "USERPROFILE": str(homes["profile"]),
+                    "HOMEDRIVE": str(tmp_path),
+                    "HOMEPATH": "/drive-home",
+                },
+                homes["profile"],
+            ),
+            (
+                {"HOMEDRIVE": str(tmp_path), "HOMEPATH": "/drive-home"},
+                homes["drive"],
+            ),
+        ]
+
+        for home_env, expected_home in cases:
+            resolved = _resolve_codex_bin("codex", env={**base_env, **home_env})
+            assert resolved == str(expected_home / ".local" / "bin" / "codex")
+
+    def test_resolver_does_not_consult_ambient_home(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from agent.transports.codex_app_server import _resolve_codex_bin
+
+        ambient_codex = tmp_path / ".local" / "bin" / "codex"
+        ambient_codex.parent.mkdir(parents=True)
+        ambient_codex.write_text("#!/bin/sh\n")
+        ambient_codex.chmod(0o755)
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        assert _resolve_codex_bin(
+            "codex", env={"PATH": str(tmp_path / "empty-path")}
+        ) == "codex"
+
+    def test_resolver_supports_userprofile_and_pathext_real_file(
+        self, tmp_path
+    ) -> None:
+        from agent.transports.codex_app_server import _resolve_codex_bin
+
+        profile = tmp_path / "windows-profile"
+        launcher = profile / ".local" / "bin" / "codex.CMD"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("@echo off\n")
+        launcher.chmod(0o755)
+
+        resolved = _resolve_codex_bin(
+            "codex",
+            env={
+                "PATH": str(tmp_path / "empty-path"),
+                "USERPROFILE": str(profile),
+                "PATHEXT": ".EXE;.CMD;.BAT",
+            },
+        )
+
+        assert resolved == str(launcher)
+
+    def test_resolver_allows_executable_symlink_in_user_local_bin(
+        self, tmp_path
+    ) -> None:
+        from agent.transports.codex_app_server import _resolve_codex_bin
+
+        target = tmp_path / "installed" / "codex"
+        target.parent.mkdir()
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o755)
+        link = tmp_path / "home" / ".local" / "bin" / "codex"
+        link.parent.mkdir(parents=True)
+        try:
+            link.symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        resolved = _resolve_codex_bin(
+            "codex",
+            env={
+                "HOME": str(tmp_path / "home"),
+                "PATH": str(tmp_path / "empty-path"),
+            },
+        )
+
+        assert resolved == str(link)
+
+    def test_preflight_and_client_spawn_same_user_local_shim(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import os
+        import time
+        from agent.transports import codex_app_server as cas
+
+        real_home = tmp_path / "real-home"
+        shim_name = "codex.CMD" if os.name == "nt" else "codex"
+        shim = real_home / ".local" / "bin" / shim_name
+        marker = tmp_path / "app-server-invoked"
+        empty_path = tmp_path / "empty-path"
+        shim.parent.mkdir(parents=True)
+        empty_path.mkdir()
+        if os.name == "nt":
+            shim.write_text(
+                "@echo off\r\n"
+                'if "%~1"=="--version" (\r\n'
+                "  echo codex-cli 0.125.0\r\n"
+                "  exit /b 0\r\n"
+                ")\r\n"
+                'if "%~1"=="app-server" (\r\n'
+                '  >"%CODEX_SHIM_MARKER%" echo %~f0\r\n'
+                "  set /p _line=\r\n"
+                "  exit /b 0\r\n"
+                ")\r\n"
+                "exit /b 2\r\n"
+            )
+        else:
+            shim.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--version\" ]; then\n"
+                "  printf '%s\\n' 'codex-cli 0.125.0'\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [ \"$1\" = \"app-server\" ]; then\n"
+                "  printf '%s\\n' \"$0\" > \"$CODEX_SHIM_MARKER\"\n"
+                "  while IFS= read -r _line; do :; done\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 2\n"
+            )
+        shim.chmod(0o755)
+        monkeypatch.setenv("HERMES_REAL_HOME", str(real_home))
+        monkeypatch.setenv("HOME", str(tmp_path / "decoy-home"))
+        monkeypatch.setenv("PATH", str(empty_path))
+        monkeypatch.setenv("PATHEXT", ".EXE;.CMD;.BAT")
+
+        assert cas.check_codex_binary() == (True, "0.125.0")
+
+        client = cas.CodexAppServerClient(
+            env={
+                "HERMES_REAL_HOME": str(real_home),
+                "HOME": str(tmp_path / "decoy-home"),
+                "PATH": str(empty_path),
+                "PATHEXT": ".EXE;.CMD;.BAT",
+                "CODEX_SHIM_MARKER": str(marker),
+            }
+        )
+        try:
+            deadline = time.monotonic() + 2.0
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            invoked = os.path.normcase(os.path.normpath(marker.read_text().strip()))
+            expected = os.path.normcase(os.path.normpath(str(shim)))
+            assert invoked == expected
+        finally:
+            client.close(timeout=2.0)
+
+        assert client._proc.poll() is not None
 
 
 

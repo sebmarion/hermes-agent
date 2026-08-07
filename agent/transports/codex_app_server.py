@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import os
 import queue
-import shutil
 import subprocess
 import threading
 import time
@@ -33,14 +32,60 @@ from tools.environments.local import hermes_subprocess_env
 MIN_CODEX_VERSION = (0, 125, 0)
 
 
+def _codex_launcher_names(env: dict[str, str]) -> list[str]:
+    """Return extensionless plus PATHEXT-declared Codex launcher names."""
+    names = ["codex"]
+    seen = {"codex"}
+    raw_pathext = str(env.get("PATHEXT") or "")
+    for raw_extension in raw_pathext.replace(os.pathsep, ";").split(";"):
+        extension = raw_extension.strip()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        name = f"codex{extension}"
+        normalized = os.path.normcase(name)
+        if normalized not in seen:
+            names.append(name)
+            seen.add(normalized)
+    return names
+
+
+def _codex_user_home(env: dict[str, str]) -> str:
+    """Resolve user home strictly from the supplied subprocess environment."""
+    for key in ("HERMES_REAL_HOME", "HOME", "USERPROFILE"):
+        home = str(env.get(key) or "").strip()
+        if home:
+            return home
+    home_drive = str(env.get("HOMEDRIVE") or "").strip()
+    home_path = str(env.get("HOMEPATH") or "").strip()
+    return f"{home_drive}{home_path}" if home_drive and home_path else ""
+
+
+def _is_executable_file(path: str) -> bool:
+    """Match PATH execution checks; executable symlinks are intentionally allowed."""
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
 def _resolve_codex_bin(codex_bin: str, *, env: dict[str, str]) -> str:
     """Resolve the standard user-local install when a daemon PATH is minimal."""
-    if codex_bin != "codex" or shutil.which(codex_bin, path=env.get("PATH")):
+    if codex_bin != "codex":
         return codex_bin
-    home = str(env.get("HOME") or "").strip()
-    candidate = os.path.join(home, ".local", "bin", "codex")
-    if home and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-        return candidate
+
+    launcher_names = _codex_launcher_names(env)
+    path = str(env.get("PATH") or "")
+    for directory in path.split(os.pathsep) if path else ():
+        for name in launcher_names:
+            if _is_executable_file(os.path.join(directory, name)):
+                return codex_bin
+
+    home = _codex_user_home(env)
+    for name in launcher_names:
+        candidate = os.path.join(home, ".local", "bin", name)
+        # ~/.local/bin is same-user state. Follow executable symlinks here just
+        # as ordinary PATH resolution does; broken/non-executable links fail.
+        if home and _is_executable_file(candidate):
+            return candidate
     return codex_bin
 
 
