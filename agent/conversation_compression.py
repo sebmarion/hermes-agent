@@ -459,7 +459,12 @@ def _rebind_compressor_session_db_if_reopened(agent: Any) -> None:
         return
     if getattr(compressor, "_session_id", "") != session_id:
         return
-    if getattr(compressor, "_session_db", None) is session_db:
+    bound_session_db = getattr(compressor, "_session_db", None)
+    # A compressor that has never been bound is still on the normal first-use
+    # path.  Do not call bind_session_state just because the host supplied its
+    # first DB handle: that hook resets per-session accounting before the
+    # normal session-start lifecycle has established durable state.
+    if bound_session_db is None or bound_session_db is session_db:
         return
     binder = getattr(compressor, "bind_session_state", None)
     if not callable(binder):
