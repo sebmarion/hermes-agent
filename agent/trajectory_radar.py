@@ -114,7 +114,8 @@ class TrajectoryRadar:
             raise ValueError("days must be positive")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be zero or positive")
-        snapshot_to = time.time()
+        snapshot_at = datetime.fromtimestamp(time.time(), tz=timezone.utc)
+        snapshot_to = snapshot_at.timestamp()
         cutoff = snapshot_to - (days * 86400)
         sessions = self._sessions(cutoff, snapshot_to, source)
         signals = self._signals(
@@ -129,9 +130,7 @@ class TrajectoryRadar:
         if limit > 0:
             candidates = candidates[:limit]
         return {
-            "generated_at": datetime.fromtimestamp(
-                snapshot_to, tz=timezone.utc
-            ).isoformat(),
+            "generated_at": snapshot_at.isoformat(),
             "window": {
                 "days": days,
                 "from_epoch": cutoff,
@@ -772,11 +771,11 @@ def _validated_report_envelope(
         generated_epoch = generated.timestamp()
     except (ValueError, OverflowError, OSError) as exc:
         raise CandidateStoreError("candidate report generated_at is invalid") from exc
-    if generated.tzinfo is None or not math.isclose(
-        generated_epoch,
-        window_to,
-        rel_tol=0.0,
-        abs_tol=_REPORT_TIMESTAMP_TOLERANCE_SECONDS,
+    generated_after_window = generated_epoch - window_to
+    if (
+        generated.tzinfo is None
+        or generated_after_window < 0
+        or generated_after_window > _REPORT_TIMESTAMP_TOLERANCE_SECONDS
     ):
         raise CandidateStoreError("candidate report timestamp/window is inconsistent")
     now = time.time()

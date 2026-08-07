@@ -30,12 +30,12 @@ def _candidate_report(
     scan_time: float | None = None,
     window_from: float | None = None,
 ) -> dict:
-    scanned_at = time.time() if scan_time is None else scan_time
+    raw_scanned_at = time.time() if scan_time is None else scan_time
+    generated = datetime.fromtimestamp(raw_scanned_at, tz=timezone.utc)
+    scanned_at = generated.timestamp()
     observed_from = scanned_at - 86400 if window_from is None else window_from
     return {
-        "generated_at": datetime.fromtimestamp(
-            scanned_at, tz=timezone.utc
-        ).isoformat(),
+        "generated_at": generated.isoformat(),
         "window": {
             "days": (scanned_at - observed_from) / 86400,
             "from_epoch": observed_from,
@@ -222,6 +222,23 @@ def test_radar_reports_whether_candidate_set_is_complete(tmp_path):
     assert truncated["candidate_count_before_limit"] > len(truncated["candidates"])
 
 
+def test_radar_generated_timestamp_never_precedes_window_end(
+    tmp_path, monkeypatch
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    monkeypatch.setattr(
+        "agent.trajectory_radar.time.time",
+        lambda: 1786126460.9114702,
+    )
+    try:
+        report = TrajectoryRadar(db).generate(days=1, limit=0)
+    finally:
+        db.close()
+
+    generated_at = datetime.fromisoformat(report["generated_at"]).timestamp()
+    assert generated_at >= report["window"]["to_epoch"]
+
+
 def test_radar_window_bounds_evidence_by_message_timestamp(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     now = time.time()
@@ -396,7 +413,7 @@ def test_candidate_store_does_not_regress_for_unseen_pre_action_evidence(tmp_pat
     assert store.get("candidate-a").status == "resolved"
 
 
-def test_candidate_store_does_not_regress_from_report_generated_before_action(
+def test_candidate_store_rejects_report_generated_before_action(
     tmp_path,
 ):
     store = CandidateStore(path=tmp_path / "radar_candidates.json")
@@ -415,7 +432,8 @@ def test_candidate_store_does_not_regress_from_report_generated_before_action(
         tz=timezone.utc,
     ).isoformat()
 
-    assert store.sync_from_report(pre_action_report) == []
+    with pytest.raises(CandidateStoreError, match="timestamp/window"):
+        store.sync_from_report(pre_action_report)
     assert store.get("candidate-a").status == "resolved"
 
 
@@ -611,6 +629,65 @@ def test_candidate_store_rejects_internally_inconsistent_report_time(
         store.sync_from_report(report)
 
     assert not store.path.exists()
+
+
+def test_candidate_store_rejects_evidence_after_report_generation(tmp_path):
+    store = CandidateStore(path=tmp_path / "radar_candidates.json")
+    store.sync_from_report(_candidate_report("candidate-a"))
+    store.transition("candidate-a", "resolved")
+    generated_at = time.time()
+    future_evidence = _candidate_report(
+        "candidate-a",
+        evidence_suffix="future-evidence",
+        evidence_observed_at=generated_at + 0.75,
+        scan_time=generated_at + 0.75,
+    )
+    future_evidence["generated_at"] = datetime.fromtimestamp(
+        generated_at,
+        tz=timezone.utc,
+    ).isoformat()
+
+    with pytest.raises(CandidateStoreError, match="timestamp/window"):
+        store.sync_from_report(future_evidence)
+
+    assert store.get("candidate-a").status == "resolved"
+
+
+def test_candidate_store_rejects_future_empty_window_for_confirmation(tmp_path):
+    store = CandidateStore(path=tmp_path / "radar_candidates.json")
+    store.sync_from_report(_candidate_report("candidate-a"))
+    resolved = store.transition("candidate-a", "resolved")
+    generated_at = time.time()
+    future_empty = _candidate_report(
+        complete=True,
+        scan_time=generated_at + 0.75,
+        window_from=resolved.last_action_at - 1,
+    )
+    future_empty["generated_at"] = datetime.fromtimestamp(
+        generated_at,
+        tz=timezone.utc,
+    ).isoformat()
+
+    with pytest.raises(CandidateStoreError, match="timestamp/window"):
+        store.sync_from_report(future_empty)
+
+    assert store.get("candidate-a").confirmation == "pending"
+
+
+def test_candidate_store_accepts_generation_after_window_within_tolerance(tmp_path):
+    store = CandidateStore(path=tmp_path / "radar_candidates.json")
+    generated_at = time.time()
+    report = _candidate_report(
+        "candidate-a",
+        scan_time=generated_at - 0.75,
+    )
+    report["generated_at"] = datetime.fromtimestamp(
+        generated_at,
+        tz=timezone.utc,
+    ).isoformat()
+
+    assert store.sync_from_report(report) == []
+    assert store.get("candidate-a") is not None
 
 
 @pytest.mark.parametrize(
