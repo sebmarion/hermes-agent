@@ -3592,6 +3592,11 @@ def looks_like_post_tool_progress_update(
     ).strip().lower()
     if not assistant_text or len(assistant_text) > 600:
         return False
+    # Progress-only replies are plain, single-line narration. Structured or
+    # result-bearing content is already doing the work of an answer; fail
+    # closed rather than hiding it behind another synthetic continuation.
+    if "\n" in assistant_text or "```" in assistant_text or ":" in assistant_text:
+        return False
 
     future_match = re.search(
         r"\b(?:let me|i['’]ll|i will|i(?:'|’)m going to|i am going to|"
@@ -3605,6 +3610,15 @@ def looks_like_post_tool_progress_update(
     # prevents final answers such as "The check is complete. Let me know..."
     # from borrowing an earlier action word and looking like progress.
     future_action = assistant_text[future_match.end():]
+    if re.search(
+        r"\b(?:found|shows?|indicates?|complete|completed|healthy|success|"
+        r"successful|error|failure)\b",
+        future_action,
+    ) or re.search(
+        r"\btests?\s+(?:pass(?:ed|es)?|fail(?:ed|s|ing)?)\b",
+        future_action,
+    ):
+        return False
     action_markers = (
         "look into",
         "look at",
