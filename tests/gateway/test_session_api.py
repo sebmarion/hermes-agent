@@ -300,6 +300,48 @@ async def test_create_session_respects_browser_source_and_model_lock(adapter, se
 
 
 @pytest.mark.asyncio
+async def test_create_session_persists_normalized_cwd_without_waiting_for_git_probe(
+    adapter, session_db, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    app = _create_session_app(adapter)
+
+    with patch(
+        "agent.session_workspace.persist_git_metadata_async", return_value=None
+    ) as persist:
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/api/sessions",
+                json={"id": "cwd-session", "cwd": str(workspace)},
+            )
+
+    assert response.status == 201, await response.text()
+    row = session_db.get_session("cwd-session")
+    assert row["cwd"] == str(workspace.resolve())
+    persist.assert_called_once_with(
+        db_path=session_db.db_path,
+        session_id="cwd-session",
+        cwd=str(workspace.resolve()),
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_session_rejects_nonlocal_cwd(adapter, session_db):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/sessions",
+            json={"id": "bad-cwd-session", "cwd": "relative/path"},
+        )
+        payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "invalid_cwd"
+    assert session_db.get_session("bad-cwd-session") is None
+
+
+@pytest.mark.asyncio
 async def test_session_model_lock_endpoint_then_chat_reuses_persisted_lock_and_provider_credentials(
     adapter,
     session_db,
@@ -606,5 +648,3 @@ async def test_require_model_lock_hard_fails_when_global_default_would_be_used(a
             body = await resp.json()
             assert body["error"]["code"] in {"model_lock_unavailable", "invalid_model_lock", "missing_model"}
     mock_run.assert_not_called()
-
-

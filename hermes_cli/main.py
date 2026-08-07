@@ -451,6 +451,7 @@ from hermes_cli.subcommands.login import build_login_parser
 from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
+from hermes_cli.subcommands.routing import build_routing_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
@@ -9202,6 +9203,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "mcp",
         "sessions",
         "insights",
+        "routing",
         "version",
         "update",
         "uninstall",
@@ -10609,7 +10611,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
+        "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights", "routing",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pets", "plugins", "portal", "profile",
@@ -11102,31 +11104,94 @@ def cmd_insights(args):
 
 
 def cmd_trajectory(args):
+    command = getattr(args, "trajectory_command", None)
+    if command == "radar":
+        return _cmd_trajectory_radar(args)
+    if command == "candidates":
+        return _cmd_trajectory_candidates(args)
+    raise SystemExit(f"Unknown trajectory command: {command!r}")
+
+
+def _cmd_trajectory_radar(args):
+    db = None
     try:
-        if getattr(args, "trajectory_command", None) not in ("radar", None):
-            print("Unknown trajectory command")
-            return
         from hermes_state import SessionDB
-        from agent.trajectory_radar import TrajectoryRadar, write_report
+        from agent.trajectory_radar import CandidateStore, TrajectoryRadar, write_report
 
         db = SessionDB()
-        try:
-            radar = TrajectoryRadar(db)
-            report = radar.generate(
-                days=args.days,
-                source=args.source,
-                limit=args.limit,
-                include_snippets=args.include_snippets,
+        radar = TrajectoryRadar(db)
+        report = radar.generate(
+            days=args.days,
+            source=args.source,
+            limit=args.limit,
+            include_snippets=args.include_snippets,
+        )
+        regressed: list[str] = []
+        if getattr(args, "sync_store", True):
+            regressed = CandidateStore().sync_from_report(report)
+
+        rendered_or_path = write_report(report, fmt=args.format, out=args.out)
+        if args.out:
+            print(f"Trajectory radar written to: {rendered_or_path}")
+        else:
+            print(rendered_or_path, end="")
+        if regressed:
+            print(
+                f"{len(regressed)} candidate(s) regressed: {', '.join(regressed)}",
+                file=sys.stderr,
             )
-            rendered_or_path = write_report(report, fmt=args.format, out=args.out)
-            if args.out:
-                print(f"Trajectory radar written to: {rendered_or_path}")
-            else:
-                print(rendered_or_path, end="")
-        finally:
+    except Exception as exc:
+        print(f"Error generating trajectory radar: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    finally:
+        if db is not None:
             db.close()
-    except Exception as e:
-        print(f"Error generating trajectory radar: {e}")
+
+
+def _cmd_trajectory_candidates(args):
+    from agent.trajectory_radar import CandidateStore, render_candidates_markdown
+
+    store = CandidateStore()
+    command = getattr(args, "candidates_command", None)
+    if command in {"list", "ls"}:
+        status_filter = getattr(args, "status", None)
+        records = store.list(status=status_filter)
+        if not getattr(args, "all", False) and status_filter is None:
+            records = [
+                record
+                for record in records
+                if record.status not in {"resolved", "ignored"}
+            ]
+        if getattr(args, "json", False):
+            print(json.dumps([record.to_dict() for record in records], indent=2, sort_keys=True))
+        else:
+            print(render_candidates_markdown(records), end="")
+        return
+
+    fingerprint = getattr(args, "fingerprint", "")
+    if command == "show":
+        record = store.get(fingerprint)
+        if record is None:
+            raise SystemExit(f"No candidate found with fingerprint: {fingerprint!r}")
+        print(json.dumps(record.to_dict(), indent=2, sort_keys=True))
+        return
+
+    status_by_command = {
+        "accept": "accepted",
+        "defer": "deferred",
+        "resolve": "resolved",
+        "ignore": "ignored",
+    }
+    new_status = status_by_command.get(command)
+    if new_status is None:
+        raise SystemExit(f"Unknown candidates command: {command!r}")
+    try:
+        record = store.transition(fingerprint, new_status)
+    except KeyError as exc:
+        raise SystemExit(
+            f"No candidate found with fingerprint: {fingerprint!r}"
+        ) from exc
+    print(f"Candidate `{fingerprint}` -> {record.status}")
 
 
 def cmd_bestplan(args):
@@ -11516,6 +11581,7 @@ def main():
     # status command  (parser built in hermes_cli/subcommands/status.py)
     # =========================================================================
     build_status_parser(subparsers, cmd_status=cmd_status)
+    build_routing_parser(subparsers)
 
     # =========================================================================
     # cron command  (parser built in hermes_cli/subcommands/cron.py)

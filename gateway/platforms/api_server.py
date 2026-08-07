@@ -3370,6 +3370,21 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
+        from agent.session_workspace import (
+            normalize_local_workspace,
+            persist_git_metadata_async,
+        )
+
+        raw_cwd = body.get("cwd")
+        cwd = normalize_local_workspace(raw_cwd)
+        if raw_cwd is not None and cwd is None:
+            return web.json_response(
+                _openai_error(
+                    "cwd must be an existing absolute local directory",
+                    code="invalid_cwd",
+                ),
+                status=400,
+            )
         source = self._normalize_session_source(body.get("source") or "api_server")
         runtime_request = self._session_runtime_request_from_body(body)
         lock_error = self._runtime_lock_error(runtime_request)
@@ -3406,8 +3421,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 import time as _time
                 conn.execute(
                     """INSERT INTO sessions (
-                       id, source, model, model_config, system_prompt, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                       id, source, model, model_config, system_prompt, started_at, cwd
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         source,
@@ -3415,6 +3430,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         json.dumps(model_config) if model_config else None,
                         system_prompt,
                         _time.time(),
+                        cwd,
                     ),
                 )
                 if title is not None:
@@ -3447,6 +3463,18 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
         if err and err.startswith("title:"):
             return web.json_response(_openai_error(err[len("title:"):], code="invalid_title"), status=400)
+        if cwd:
+            try:
+                persist_git_metadata_async(
+                    db_path=db.db_path,
+                    session_id=session_id,
+                    cwd=cwd,
+                )
+            except Exception:
+                logger.debug(
+                    "failed to dispatch session git metadata persistence",
+                    exc_info=True,
+                )
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)}, status=201)
 
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
