@@ -76,8 +76,9 @@ def _resolve_codex_bin(codex_bin: str, *, env: dict[str, str]) -> str:
     path = str(env.get("PATH") or "")
     for directory in path.split(os.pathsep) if path else ():
         for name in launcher_names:
-            if _is_executable_file(os.path.join(directory, name)):
-                return codex_bin
+            candidate = os.path.join(directory, name)
+            if _is_executable_file(candidate):
+                return candidate
 
     home = _codex_user_home(env)
     for name in launcher_names:

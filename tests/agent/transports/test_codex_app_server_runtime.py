@@ -138,7 +138,7 @@ class TestCodexAppServerModule:
 
         assert cmd[:2] == [str(codex), "app-server"]
 
-    def test_explicit_binary_and_path_resolved_default_are_unchanged(
+    def test_explicit_binary_stays_literal_and_path_default_resolves_exactly(
         self, monkeypatch, tmp_path
     ) -> None:
         local_codex = tmp_path / "home" / ".local" / "bin" / "codex"
@@ -155,7 +155,7 @@ class TestCodexAppServerModule:
             monkeypatch, codex_bin="/custom/codex", env=env
         )[:2] == ["/custom/codex", "app-server"]
         assert self._capture_spawn_cmd(monkeypatch, env=env)[:2] == [
-            "codex",
+            str(path_codex),
             "app-server",
         ]
 
@@ -222,7 +222,7 @@ class TestCodexAppServerModule:
         assert "GH_TOKEN" not in captured["env"]
         assert "OPENAI_API_KEY" not in captured["env"]
 
-    def test_check_binary_preserves_explicit_binary_and_path_hit(
+    def test_check_binary_preserves_explicit_binary_and_resolves_path_hit_exactly(
         self, monkeypatch, tmp_path
     ) -> None:
         local_codex = tmp_path / "home" / ".local" / "bin" / "codex"
@@ -242,7 +242,7 @@ class TestCodexAppServerModule:
         path_hit, _ = self._capture_binary_check(monkeypatch)
 
         assert explicit["cmd"] == ["/custom/codex", "--version"]
-        assert path_hit["cmd"] == ["codex", "--version"]
+        assert path_hit["cmd"] == [str(path_codex), "--version"]
 
     @pytest.mark.parametrize("create_candidate", [True, False])
     def test_check_binary_falls_back_for_unusable_user_local_candidate(
@@ -352,6 +352,31 @@ class TestCodexAppServerModule:
 
         assert resolved == str(launcher)
 
+    def test_resolver_returns_exact_path_pathext_launcher_before_home_fallback(
+        self, tmp_path
+    ) -> None:
+        from agent.transports.codex_app_server import _resolve_codex_bin
+
+        path_launcher = tmp_path / "path-bin" / "codex.CMD"
+        path_launcher.parent.mkdir()
+        path_launcher.write_text("@echo off\n")
+        path_launcher.chmod(0o755)
+        home_launcher = tmp_path / "home" / ".local" / "bin" / "codex"
+        home_launcher.parent.mkdir(parents=True)
+        home_launcher.write_text("#!/bin/sh\n")
+        home_launcher.chmod(0o755)
+
+        resolved = _resolve_codex_bin(
+            "codex",
+            env={
+                "PATH": str(path_launcher.parent),
+                "HOME": str(tmp_path / "home"),
+                "PATHEXT": ".EXE;.CMD;.BAT",
+            },
+        )
+
+        assert resolved == str(path_launcher)
+
     def test_resolver_allows_executable_symlink_in_user_local_bin(
         self, tmp_path
     ) -> None:
@@ -444,6 +469,72 @@ class TestCodexAppServerModule:
             invoked = os.path.normcase(os.path.normpath(marker.read_text().strip()))
             expected = os.path.normcase(os.path.normpath(str(shim)))
             assert invoked == expected
+        finally:
+            client.close(timeout=2.0)
+
+        assert client._proc.poll() is not None
+
+    def test_preflight_and_client_spawn_same_pathext_path_shim(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import os
+        import time
+        from agent.transports import codex_app_server as cas
+
+        shim = tmp_path / "path-bin" / "codex.CMD"
+        marker = tmp_path / "path-app-server-invoked"
+        shim.parent.mkdir()
+        if os.name == "nt":
+            shim.write_text(
+                "@echo off\r\n"
+                'if "%~1"=="--version" (\r\n'
+                "  echo codex-cli 0.125.0\r\n"
+                "  exit /b 0\r\n"
+                ")\r\n"
+                'if "%~1"=="app-server" (\r\n'
+                '  >"%CODEX_SHIM_MARKER%" echo %~f0\r\n'
+                "  set /p _line=\r\n"
+                "  exit /b 0\r\n"
+                ")\r\n"
+                "exit /b 2\r\n"
+            )
+        else:
+            shim.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--version\" ]; then\n"
+                "  printf '%s\\n' 'codex-cli 0.125.0'\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [ \"$1\" = \"app-server\" ]; then\n"
+                "  printf '%s\\n' \"$0\" > \"$CODEX_SHIM_MARKER\"\n"
+                "  while IFS= read -r _line; do :; done\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 2\n"
+            )
+        shim.chmod(0o755)
+        env = {
+            "HERMES_REAL_HOME": str(tmp_path / "no-local-codex"),
+            "HOME": str(tmp_path / "no-local-codex"),
+            "PATH": str(shim.parent),
+            "PATHEXT": ".EXE;.CMD;.BAT",
+            "CODEX_SHIM_MARKER": str(marker),
+        }
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+
+        assert cas.check_codex_binary() == (True, "0.125.0")
+
+        client = cas.CodexAppServerClient(env=env)
+        try:
+            invoked_binary = os.path.normcase(os.path.normpath(client._proc.args[0]))
+            expected_binary = os.path.normcase(os.path.normpath(str(shim)))
+            assert invoked_binary == expected_binary
+            deadline = time.monotonic() + 2.0
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            invoked = os.path.normcase(os.path.normpath(marker.read_text().strip()))
+            assert invoked == expected_binary
         finally:
             client.close(timeout=2.0)
 
@@ -612,7 +703,8 @@ class TestSpawnEnvIsolation:
         client._closed = True
 
         cmd = captured["cmd"]
-        assert cmd[:2] == ["codex", "app-server"]
+        assert cmd[0] == cas._resolve_codex_bin("codex", env=captured["env"])
+        assert cmd[1] == "app-server"
         assert 'sandbox_mode="workspace-write"' in cmd
         assert (
             'sandbox_workspace_write.writable_roots=["/users/alice/.hermes/kanban/boards/smoke"]'
