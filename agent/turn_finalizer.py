@@ -57,6 +57,8 @@ _DROPPED_TOOLCALL_FLAGS = (
     "_dropped_toolcall_interim",
 )
 
+_POST_TOOL_PROGRESS_FLAGS = ("_post_tool_progress_synthetic",)
+
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
@@ -76,6 +78,17 @@ def _drop_dropped_toolcall_scaffolding(messages) -> None:
     messages[:] = [
         m for m in messages
         if not (isinstance(m, dict) and any(m.get(f) for f in _DROPPED_TOOLCALL_FLAGS))
+    ]
+
+
+def _drop_post_tool_progress_scaffolding(messages) -> None:
+    """Remove post-tool progress continuation pairs on every turn exit."""
+    messages[:] = [
+        m for m in messages
+        if not (
+            isinstance(m, dict)
+            and any(m.get(f) for f in _POST_TOOL_PROGRESS_FLAGS)
+        )
     ]
 
 
@@ -350,6 +363,7 @@ def finalize_turn(
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
         _drop_dropped_toolcall_scaffolding(messages)
+        _drop_post_tool_progress_scaffolding(messages)
 
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the

@@ -1233,6 +1233,7 @@ def _run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    post_tool_progress_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -1772,8 +1773,11 @@ def _run_conversation(
             # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
             if "finish_reason" in api_msg:
                 api_msg.pop("finish_reason")
-            # Strip internal thinking-prefill marker
+            # Strip internal retry-scaffolding markers. The messages remain in
+            # this request to preserve assistant/user alternation, but strict
+            # providers must never see Hermes-private bookkeeping fields.
             api_msg.pop("_thinking_prefill", None)
+            api_msg.pop("_post_tool_progress_synthetic", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields
@@ -7046,6 +7050,50 @@ def _run_conversation(
                 agent._emit_pending_fallback_notice()
                 agent._clear_status_buffer()
 
+                if (
+                    agent.valid_tool_names
+                    and post_tool_progress_continuations < 2
+                    and agent._looks_like_post_tool_progress_update(
+                        assistant_content=final_response,
+                        messages=messages,
+                    )
+                ):
+                    post_tool_progress_continuations += 1
+                    logger.warning(
+                        "Progress-only response after tool calls; nudging model "
+                        "to continue. model=%s provider=%s attempt=%d/2",
+                        agent.model,
+                        agent.provider,
+                        post_tool_progress_continuations,
+                    )
+                    agent._emit_status(
+                        "↪️ Model paused after tool results; asking it to continue."
+                    )
+
+                    interim_msg = agent._build_assistant_message(
+                        assistant_message, "incomplete"
+                    )
+                    interim_msg["_post_tool_progress_synthetic"] = True
+                    messages.append(interim_msg)
+                    agent._emit_interim_assistant_message(interim_msg)
+
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[System: You just received tool results but replied with a "
+                            "progress update instead of completing the task. Continue from "
+                            "the tool results now. Either execute the next needed tool call "
+                            "or provide the final answer requested by the user.]"
+                        ),
+                        "_post_tool_progress_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    # Progress narration is explicitly non-final. If the
+                    # ordinary iteration budget is exhausted here, the normal
+                    # deterministic handoff owns finalization.
+                    final_response = None
+                    continue
+
                 from agent.agent_runtime_helpers import (
                     intent_ack_continuation_mode,
                 )
@@ -7125,6 +7173,7 @@ def _run_conversation(
                     and (
                         messages[-1].get("_thinking_prefill")
                         or messages[-1].get("_empty_recovery_synthetic")
+                        or messages[-1].get("_post_tool_progress_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
                     )
                 ):

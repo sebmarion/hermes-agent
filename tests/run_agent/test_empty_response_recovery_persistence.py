@@ -154,6 +154,38 @@ def test_flush_never_writes_buried_empty_recovery_scaffolding():
     assert persisted[-1]["content"] == "All done."
 
 
+def test_flush_never_writes_buried_post_tool_progress_scaffolding():
+    agent = _agent_with_capturing_db()
+    messages = [
+        {"role": "user", "content": "run the task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "type": "function",
+                            "function": {"name": "x", "arguments": "{}"}}],
+        },
+        {"role": "tool", "content": "{}", "tool_call_id": "call_1"},
+        {
+            "role": "assistant",
+            "content": "Let me inspect the result.",
+            "_post_tool_progress_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": "Continue from the tool results.",
+            "_post_tool_progress_synthetic": True,
+        },
+        {"role": "assistant", "content": "All done."},
+    ]
+
+    agent._flush_messages_to_session_db(messages, conversation_history=[])
+
+    persisted = agent._session_db.rows
+    assert [row["content"] for row in persisted] == [
+        "run the task", "", "{}", "All done.",
+    ]
+
+
 def test_flush_skips_thinking_prefill_scaffolding():
     agent = _agent_with_capturing_db()
     messages = [

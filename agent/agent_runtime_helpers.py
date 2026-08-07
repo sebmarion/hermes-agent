@@ -3565,6 +3565,71 @@ def looks_like_codex_intermediate_ack(
     return user_targets_workspace or assistant_targets_workspace
 
 
+def looks_like_post_tool_progress_update(
+    agent,
+    assistant_content: str,
+    messages: List[Dict[str, Any]],
+) -> bool:
+    """Detect a short future-action update after actual tool results.
+
+    A prior progress nudge may leave an ephemeral assistant/user pair at the
+    tail. Skip only that owned scaffolding when locating the tool result so a
+    repeated progress reply can consume the second (and final) retry.
+    """
+    prior_message = None
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            return False
+        if message.get("_post_tool_progress_synthetic"):
+            continue
+        prior_message = message
+        break
+    if prior_message is None or prior_message.get("role") != "tool":
+        return False
+
+    assistant_text = agent._strip_think_blocks(
+        assistant_content or ""
+    ).strip().lower()
+    if not assistant_text or len(assistant_text) > 600:
+        return False
+
+    future_match = re.search(
+        r"\b(?:let me|i['’]ll|i will|i(?:'|’)m going to|i am going to|"
+        r"i need to|now i['’]ll|next i['’]ll)\b",
+        assistant_text,
+    )
+    if future_match is None:
+        return False
+
+    # Search after the future-tense phrase, not across the whole reply. This
+    # prevents final answers such as "The check is complete. Let me know..."
+    # from borrowing an earlier action word and looking like progress.
+    future_action = assistant_text[future_match.end():]
+    action_markers = (
+        "look into",
+        "look at",
+        "inspect",
+        "scan",
+        "check",
+        "analyz",
+        "review",
+        "explore",
+        "read",
+        "open",
+        "run",
+        "test",
+        "fix",
+        "debug",
+        "search",
+        "find",
+        "verify",
+        "investigate",
+        "report back",
+        "summarize",
+    )
+    return any(marker in future_action for marker in action_markers)
+
+
 def intent_ack_continuation_mode(agent) -> str:
     """Classify the resolved intent-ack continuation mode for this turn.
 

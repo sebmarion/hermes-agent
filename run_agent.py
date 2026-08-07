@@ -241,6 +241,9 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_empty_recovery_synthetic",
     "_empty_terminal_sentinel",
     "_thinking_prefill",
+    # A short future-tense progress reply after tool results gets an
+    # assistant/user continuation pair. Both rows are API-only scaffolding.
+    "_post_tool_progress_synthetic",
     # verify-on-stop and pre_verify nudges append a synthetic assistant
     # "done" plus a synthetic user nudge to keep the agent going one more
     # turn before it can claim completion. Those messages exist only to
@@ -1747,6 +1750,17 @@ class AIAgent:
         return looks_like_codex_intermediate_ack(
             self, user_message, assistant_content, messages, require_workspace
         )
+
+    def _looks_like_post_tool_progress_update(
+        self,
+        assistant_content: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Forwarder for the post-tool progress-only detector."""
+        from agent.agent_runtime_helpers import (
+            looks_like_post_tool_progress_update,
+        )
+        return looks_like_post_tool_progress_update(self, assistant_content, messages)
 
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
         """Forwarder — see ``agent.agent_runtime_helpers.extract_reasoning``."""
