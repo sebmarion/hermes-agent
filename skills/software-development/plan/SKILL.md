@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [planning, plan-mode, implementation, workflow, design, documentation]
-    related_skills: [subagent-driven-development, test-driven-development, requesting-code-review]
+    related_skills: [subagent-driven-development, test-driven-development, requesting-code-review, product-design-review, iterateux]
 ---
 
 # Plan Mode
@@ -39,6 +39,8 @@ Include, when relevant:
 - Risks, tradeoffs, and open questions
 
 If the task is code-related, include exact file paths, likely test targets, and verification steps.
+
+For UX/UI/product-surface requests, include a reference-backed design taste gate: target user/job, reference basis, semantic color roles, negative taste filter, responsive screenshot criteria, and an explicit aesthetic verdict requirement. Load `product-design-review` when available, and use `iterateux` instead of plan-only output when the user asks for implemented visible iterations.
 
 ## Save location
 

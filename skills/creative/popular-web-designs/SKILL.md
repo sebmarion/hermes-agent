@@ -26,6 +26,11 @@ system, shadows, responsive behavior, and practical agent prompts with exact CSS
 
 ## Related design skills
 
+- **`product-design-review`** — use as the taste gate for product UI work before
+  applying a visual template. It defines the product job, reference basis,
+  semantic color roles, negative taste filter, and final aesthetic verdict.
+  Templates supply vocabulary; the review gate decides whether the direction is
+  appropriate and restrained.
 - **`claude-design`** — use for the design *process and taste* (scoping a brief,
   producing variants, verifying a local HTML artifact, avoiding AI-design slop).
   Pair it with this skill when the user wants a thoughtfully-designed page styled
