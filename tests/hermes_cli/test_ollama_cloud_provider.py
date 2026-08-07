@@ -112,6 +112,37 @@ class TestOllamaCloudModelCatalog:
 # ── Model Picker (list_authenticated_providers) ──
 
 class TestOllamaCloudModelPicker:
+    def test_setup_bypasses_fresh_disk_cache_before_model_picker(self, tmp_path, monkeypatch):
+        """Provider setup must show live models even while a stale list is fresh."""
+        from hermes_cli import model_setup_flows
+        from hermes_cli.models import _save_ollama_cloud_cache
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
+        _save_ollama_cloud_cache(["cache-only-model"])
+
+        selected_models = []
+
+        def capture_picker(models, **_kwargs):
+            selected_models.extend(models)
+            return None
+
+        monkeypatch.setattr(
+            model_setup_flows,
+            "_existing_api_key_for_model_flow",
+            lambda *_args: ("test-key", "environment"),
+        )
+        monkeypatch.setattr("hermes_cli.main._prompt_api_key", lambda *_args, **_kwargs: ("test-key", False))
+        monkeypatch.setattr("builtins.input", lambda *_args, **_kwargs: "")
+        monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *_args, **_kwargs: ["live-new-model"])
+        monkeypatch.setattr("agent.models_dev.list_agentic_models", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr("hermes_cli.models.get_pricing_for_provider", lambda *_args, **_kwargs: {})
+        monkeypatch.setattr("hermes_cli.auth._prompt_model_selection", capture_picker)
+
+        model_setup_flows._model_flow_api_key_provider({}, "ollama-cloud")
+
+        assert selected_models == ["live-new-model"]
+
     def test_ollama_cloud_shows_model_count(self, tmp_path, monkeypatch):
         """Ollama Cloud should show non-zero model count in provider picker."""
         from hermes_cli.model_switch import list_authenticated_providers
