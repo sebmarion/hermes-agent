@@ -45,6 +45,31 @@ def test_detects_short_future_action_after_tool_result():
     )
 
 
+def test_detects_genuine_single_sentence_progress_update():
+    agent = _detector_agent()
+
+    assert agent._looks_like_post_tool_progress_update(
+        "Let me inspect the logs now.",
+        _tool_tail(),
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "  Now I'll inspect the logs now.  ",
+        "Next I’ll inspect the logs now.",
+    ],
+)
+def test_detects_leading_whitespace_and_now_or_next_future_action_form(content):
+    agent = _detector_agent()
+
+    assert agent._looks_like_post_tool_progress_update(
+        content,
+        _tool_tail(),
+    )
+
+
 @pytest.mark.parametrize(
     ("content", "messages"),
     [
@@ -71,6 +96,9 @@ def test_detects_short_future_action_after_tool_result():
         ),
         ("Let me inspect the report. I found two errors.", _tool_tail()),
         ("Found two failures. I’ll inspect the remaining logs.", _tool_tail()),
+        ("The deployment is down. I will inspect the logs now.", _tool_tail()),
+        ("I will inspect the logs now. The deployment is down.", _tool_tail()),
+        ("Let me inspect the logs. I will review the config.", _tool_tail()),
         ("I will review it now; the output shows success.", _tool_tail()),
         ("Let me check it now. The result indicates a failure.", _tool_tail()),
         ("I will inspect it now. Analysis complete.", _tool_tail()),
@@ -95,6 +123,9 @@ def test_detects_short_future_action_after_tool_result():
         "colon-results",
         "found",
         "result-before-future-action",
+        "future-action-after-prior-sentence",
+        "result-after-future-action",
+        "multiple-progress-sentences",
         "shows-success",
         "indicates-failure",
         "complete",

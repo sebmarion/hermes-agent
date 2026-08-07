@@ -3598,12 +3598,18 @@ def looks_like_post_tool_progress_update(
     if "\n" in assistant_text or "```" in assistant_text or ":" in assistant_text:
         return False
 
-    future_match = re.search(
-        r"\b(?:let me|i['’]ll|i will|i(?:'|’)m going to|i am going to|"
+    future_match = re.match(
+        r"(?:let me|i['’]ll|i will|i(?:'|’)m going to|i am going to|"
         r"i need to|now i['’]ll|next i['’]ll)\b",
         assistant_text,
     )
     if future_match is None:
+        return False
+
+    # A progress update is one short announcement, not a compound response.
+    # Keep any content before or after a completed sentence visible instead of
+    # discarding it behind another automatic continuation.
+    if re.search(r"[.!?](?:[\"')\]]*)\s+\S", assistant_text):
         return False
 
     # Result/finality language anywhere in the visible reply makes it
