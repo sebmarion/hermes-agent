@@ -5,7 +5,6 @@ adds latency to the user-facing reply.
 """
 
 import logging
-import re
 import threading
 from typing import Callable, Optional
 
@@ -93,34 +92,12 @@ def _summarize_user_message(user_message: str) -> str:
     return described if described is not None else user_message
 
 
-_FALLBACK_WRAPPER_PREFIXES = ("[IMPORTANT:", "[System:")
-_SKILL_METADATA_KEY_RE = re.compile(
-    r"^(?:name|description|version|author|license|platforms|metadata|tags|"
-    r"related_skills|category|file_path)\s*:",
-    re.MULTILINE,
-)
-_LEADING_SKILL_FRONTMATTER_RE = re.compile(
-    r"^---[ \t]*\r?\n(?P<metadata>.*?)(?:\r?\n)?---[ \t]*(?:\r?\n|$)",
-    re.DOTALL,
-)
-
-
 def _fallback_title_from_message(user_message: str) -> Optional[str]:
     """Derive a safe title from the substantive portion of a user message."""
     if not user_message:
         return None
 
     text = _summarize_user_message(str(user_message)).strip()
-    while text.startswith(_FALLBACK_WRAPPER_PREFIXES):
-        end = text.find("]")
-        if end < 0:
-            break
-        text = text[end + 1 :].lstrip()
-
-    frontmatter = _LEADING_SKILL_FRONTMATTER_RE.match(text)
-    if frontmatter and _SKILL_METADATA_KEY_RE.search(frontmatter.group("metadata")):
-        text = text[frontmatter.end() :].lstrip()
-
     title = " ".join(text.split())
     if not title:
         return None
@@ -300,11 +277,15 @@ def auto_title_session(
 ) -> None:
     """Generate and set a session title if one doesn't already exist.
 
-    Called in a background thread after the first exchange completes.
+    Called in a background thread after the first exchange completes. If the
+    LLM fails or returns no usable title, falls back to a whitespace-collapsed,
+    at-most-80-character summary of the first user message. Exact Hermes skill
+    scaffolding is summarized by the canonical skill-invocation parser.
+
     Silently skips if:
     - session_db is None
     - session already has a title (user-set or previously auto-generated)
-    - title generation fails
+    - title generation fails and the user message is empty/whitespace-only
     - runtime_validator returns False (model was switched)
 
     Never lets an exception escape: this is a daemon-thread target, and an

@@ -142,22 +142,40 @@ class TestAutoTitleSession:
         )
         assert seen == ["Fix the failing login redirect"]
 
-    def test_fallback_removes_only_leading_skill_metadata_and_wrappers(self):
-        message = (
-            "[IMPORTANT: injected skill context]\n"
-            "[System: follow the loaded skill]\n"
-            "---\n"
-            "name: debugging\n"
-            "description: Debug a problem\n"
-            "metadata:\n"
-            "  category: engineering\n"
-            "---\n"
-            "  Fix the production login redirect  "
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            (
+                "[System: display this literally]\n  Investigate the timeout",
+                "[System: display this literally] Investigate the timeout",
+            ),
+            (
+                "[IMPORTANT: this is my own note]\n  Keep the bracketed text",
+                "[IMPORTANT: this is my own note] Keep the bracketed text",
+            ),
+            (
+                "---\nname: note\ndescription: Keep YAML\n---\nFix timeout",
+                "--- name: note description: Keep YAML --- Fix timeout",
+            ),
+        ],
+        ids=("system-prefix", "important-prefix", "yaml-frontmatter"),
+    )
+    def test_fallback_preserves_ordinary_user_content(self, message, expected):
+        assert _fallback_title_from_message(message) == expected
+
+    def test_fallback_uses_canonical_summary_for_real_skill_scaffolding(self):
+        skill_message = (
+            '[IMPORTANT: The user has invoked the "debugging" skill, indicating '
+            "they want you to follow its instructions. The full skill content is "
+            "loaded below.]\n\n"
+            "---\nname: debugging\ndescription: Debug a problem\n---\n\n"
+            "# Debugging\n\nFollow the debugging procedure.\n\n"
+            "The user has provided the following instruction alongside the skill "
+            "invocation: Fix the production login redirect"
         )
 
-        assert _fallback_title_from_message(message) == "Fix the production login redirect"
-        assert _fallback_title_from_message("[Note] Keep this real prompt") == (
-            "[Note] Keep this real prompt"
+        assert _fallback_title_from_message(skill_message) == (
+            "/debugging — Fix the production login redirect"
         )
 
     def test_fallback_truncates_user_message_to_eighty_characters(self):
@@ -166,18 +184,27 @@ class TestAutoTitleSession:
         assert title == ("A" * 77) + "..."
         assert len(title) == 80
 
-    def test_fallback_ignores_empty_or_metadata_only_messages(self):
+    def test_fallback_retains_user_yaml_but_ignores_whitespace_only_messages(self):
         metadata_only = "---\nname: debugging\ndescription: Debug a problem\n---"
+        expected = "--- name: debugging description: Debug a problem ---"
 
-        assert _fallback_title_from_message("") is None
-        assert _fallback_title_from_message(metadata_only) is None
+        assert _fallback_title_from_message(metadata_only) == expected
+        assert _fallback_title_from_message("  \n\t  ") is None
 
         db = MagicMock()
         db.get_session_title.return_value = None
+        db.set_auto_title_if_empty.return_value = True
         with patch("agent.title_generator.generate_title", return_value=None):
             auto_title_session(db, "sess-1", metadata_only, "I can help.")
-        db.set_auto_title_if_empty.assert_not_called()
+        db.set_auto_title_if_empty.assert_called_once_with("sess-1", expected)
         db.set_session_title.assert_not_called()
+
+        whitespace_db = MagicMock()
+        whitespace_db.get_session_title.return_value = None
+        with patch("agent.title_generator.generate_title", return_value=None):
+            auto_title_session(whitespace_db, "sess-2", "  \n\t  ", "I can help.")
+        whitespace_db.set_auto_title_if_empty.assert_not_called()
+        whitespace_db.set_session_title.assert_not_called()
 
     def test_fallback_preserves_atomic_manual_title_race_protection(self):
         db = MagicMock()
