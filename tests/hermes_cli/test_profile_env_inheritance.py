@@ -346,6 +346,42 @@ def test_inherited_novita_prunes_stale_child_env_pool_row(profile_tree):
     assert stored.get("credential_pool", {}).get("novita", []) == []
 
 
+def test_empty_child_novita_mask_prunes_stale_child_env_pool_row(profile_tree):
+    root, profile = profile_tree
+    _write_profile_configs(root, profile)
+    (root / ".env").write_text("NOVITA_API_KEY=root-novita\n", encoding="utf-8")
+    (profile / ".env").write_text("NOVITA_API_KEY=\n", encoding="utf-8")
+    auth_path = profile / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "novita": [
+                        {
+                            "id": "stale-child-env",
+                            "label": "NOVITA_API_KEY",
+                            "auth_type": "api_key",
+                            "priority": 0,
+                            "source": "env:NOVITA_API_KEY",
+                            "access_token": "stale-child-novita",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_mod.invalidate_env_cache()
+
+    from agent.credential_pool import load_pool
+
+    assert load_pool("novita").entries() == []
+    stored = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert stored.get("credential_pool", {}).get("novita", []) == []
+
+
 def test_novita_pricing_honors_child_empty_key_mask(profile_tree, monkeypatch):
     root, profile = profile_tree
     _write_profile_configs(root, profile)

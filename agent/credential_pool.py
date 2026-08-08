@@ -14,8 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import OPENROUTER_BASE_URL
-from hermes_cli.config import get_inherited_env_keys, load_env
+from hermes_constants import OPENROUTER_BASE_URL, PROFILE_INHERITED_ENV_KEYS
+from hermes_cli.config import (
+    get_inherited_env_keys,
+    load_env,
+    resolve_profile_env_layers,
+)
 from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
     is_borrowed_credential_source,
@@ -2849,7 +2853,9 @@ def get_env_prefer_dotenv(key: str) -> str:
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
+    env_file = load_env()
     inherited_env_keys = get_inherited_env_keys()
+    is_named_profile = len(resolve_profile_env_layers()) == 2
 
     # Copilot has its own dedicated seeding branch (see `_seed_credentials`
     # for provider == "copilot") which exchanges the raw ghu_ OAuth token
@@ -2950,7 +2956,13 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         # Root-inherited values remain owned by the default profile. Runtime
         # resolution can use them through load_env(), but seeding them here
         # would materialize a credential row into every child auth.json.
-        if env_var in inherited_env_keys:
+        is_explicit_empty_profile_mask = (
+            is_named_profile
+            and env_var in PROFILE_INHERITED_ENV_KEYS
+            and env_var in env_file
+            and not env_file[env_var]
+        )
+        if env_var in inherited_env_keys or is_explicit_empty_profile_mask:
             source = f"env:{env_var}"
             retained = [entry for entry in entries if entry.source != source]
             if len(retained) != len(entries):
