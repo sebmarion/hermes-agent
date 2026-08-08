@@ -437,6 +437,66 @@ def test_run_bestplan_binds_recent_context_without_granting_inspection(monkeypat
         assert "do not recursively scan" in prompt.lower()
 
 
+def test_minimum_change_contract_reaches_every_planning_stage(monkeypatch, tmp_path):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    prompts = []
+    lane = {
+        "name": "local",
+        "provider": "provider-a",
+        "model": "local-model",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "high",
+    }
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self.tools = []
+            self.valid_tool_names = set()
+            self._kanban_worker_guidance = ""
+
+        def run_conversation(self, prompt):
+            prompts.append(prompt)
+            if "BestPlan envelope repair" in prompt:
+                return {"final_response": _synth_plan_envelope()}
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": "invalid synthesis"}
+            return {"final_response": _candidate_text(self.model)}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured: _identity(configured),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "Change the one existing default and its direct test only.",
+        config=_runtime_config([lane]),
+    )
+
+    assert result["status"] == "completed"
+    assert len(prompts) == 5
+    assert all("smallest viable change" in prompt.lower() for prompt in prompts)
+
+    synth_prompt = next(
+        prompt for prompt in prompts if "active BestPlan synthesizer" in prompt
+    )
+    assert "candidate plans are alternatives" in synth_prompt.lower()
+    assert "do not union" in synth_prompt.lower()
+
+
 def test_conversation_loop_passes_prior_canonical_messages_to_bestplan(monkeypatch):
     from agent import bestplan_orchestrator, conversation_loop, turn_finalizer
     from agent.turn_context import TurnContext
