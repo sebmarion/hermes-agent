@@ -46,6 +46,8 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -78,6 +80,7 @@ _DB_LOCK = threading.Lock()
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 _MAX_DELIVERY_ATTEMPTS = 8
+_DELIVERY_CLAIM_LEASE_SECONDS = 300.0
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _ACTIVE_STATUSES = frozenset({
@@ -122,6 +125,70 @@ _PERSISTENCE_VERSION = 1
 # re-entry event.
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
 _HEARTBEAT_STALE_SECONDS = _HEARTBEAT_INTERVAL_SECONDS * 3
+
+# Managed WebUI startup imports these immutable receipt types from the Agent
+# checkout.  Keep the public wire types available across the Agent's durable
+# tracker implementation changes; the WebUI receipt codec deliberately
+# serializes nested frozen dataclasses and enums without importing internals.
+class ManagedAsyncDelegationRecoveryOutcome(str, Enum):
+    ABSENT = "ABSENT"
+    COMPLETE = "COMPLETE"
+    PARTIAL = "PARTIAL"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+@dataclass(frozen=True)
+class ManagedAsyncDelegationProfile:
+    profile_id: str
+    tracker_path: Path
+
+
+@dataclass(frozen=True)
+class ManagedAsyncDelegationProfileManifest:
+    generation: str
+    profiles: tuple[ManagedAsyncDelegationProfile, ...]
+    expected_profile_ids: tuple[str, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True)
+class ManagedAsyncEventPostcondition:
+    event_id: str
+    kind: str
+    state: str
+    row_sha256: str
+    event_sha256: str
+    immutable_sha256: str
+    created_at: Optional[float]
+    last_replay_epoch: str
+
+
+@dataclass(frozen=True)
+class ManagedAsyncDelegationRecoveryReceipt:
+    outcome: ManagedAsyncDelegationRecoveryOutcome
+    tracker_paths: tuple[str, ...]
+    tracker_hashes_before: tuple[tuple[str, Optional[str]], ...] = ()
+    tracker_hashes_after: tuple[tuple[str, Optional[str]], ...] = ()
+    tracker_identities_before: tuple[tuple[str, Optional[dict]], ...] = ()
+    tracker_identities_after: tuple[tuple[str, Optional[dict]], ...] = ()
+    outbox_path: str = ""
+    outbox_hash_before: Optional[str] = None
+    outbox_hash_after: Optional[str] = None
+    delegation_ids: tuple[str, ...] = ()
+    event_ids: tuple[str, ...] = ()
+    queued_event_ids: tuple[str, ...] = ()
+    deduped_event_ids: tuple[str, ...] = ()
+    status_transitions: tuple[tuple[str, str, str], ...] = ()
+    recovery_epoch: str = ""
+    process_pid: int = 0
+    process_start_token: str = ""
+    runtime_generation: str = ""
+    manifest_generation: str = ""
+    manifest_source_digest: str = ""
+    record_classifications: tuple[tuple[str, str], ...] = ()
+    event_postconditions: tuple[ManagedAsyncEventPostcondition, ...] = ()
+    verification_sha256: str = ""
+    errors: tuple[str, ...] = ()
 
 # Progress-based stale-delegation detection. A frozen progress token is
 # interrupted first, then force-finalized after a grace window if the runner
@@ -629,18 +696,48 @@ def _restore_sqlite_undelivered(target_queue) -> int:
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
+    # The JSON tracker is the authoritative store for current delegations.
+    # Keep this read API aligned with recovery and delivery-claim paths; the
+    # SQLite ledger below is retained only for records written by older Agent
+    # versions.
+    resolved_id = str(delegation_id or "")
+    if not resolved_id:
+        return None
+    try:
+        with _persist_lock:
+            data = _read_persisted_unlocked()
+            entry = (data.get("records") or {}).get(resolved_id)
+        if isinstance(entry, dict):
+            record = entry.get("record") if isinstance(entry.get("record"), dict) else entry
+            result = entry.get("result")
+            return {
+                "delegation_id": resolved_id,
+                "origin_session": record.get("session_key") or record.get("origin_session") or "",
+                "state": entry.get("status") or record.get("status"),
+                "dispatched_at": record.get("dispatched_at"),
+                "completed_at": record.get("completed_at"),
+                "result": result,
+                "delivery_state": entry.get("delivery_status") or record.get("delivery_status"),
+                "delivery_attempts": entry.get("delivery_attempts", record.get("delivery_attempts", 0)),
+                "delivery_claim": entry.get("delivery_claim") or "",
+                "delivery_claimed_at": entry.get("delivery_claimed_at"),
+                "origin_session_id": record.get("origin_session_id") or "",
+            }
+    except Exception:
+        logger.debug("JSON async delegation lookup failed", exc_info=True)
+
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
                       origin_session_id
                FROM async_delegations WHERE delegation_id=?""",
-            (delegation_id,),
+            (resolved_id,),
         ).fetchone()
     if row is None:
         return None
     return {
-        "delegation_id": delegation_id,
+        "delegation_id": resolved_id,
         "origin_session": row[0],
         "state": row[1],
         "dispatched_at": row[2],
@@ -1008,9 +1105,20 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                 raise KeyError("not in JSON tracker")
             existing = str(entry.get("delivery_claim") or "")
             if existing and existing != claim_id:
-                return False
+                claimed_at = entry.get("delivery_claimed_at")
+                try:
+                    claim_is_live = (
+                        claimed_at is not None
+                        and time.time() - float(claimed_at)
+                        < _DELIVERY_CLAIM_LEASE_SECONDS
+                    )
+                except (TypeError, ValueError):
+                    claim_is_live = True
+                if claim_is_live:
+                    return False
             entry["delivery_claim"] = claim_id
             entry["delivery_claimed_at"] = time.time()
+            entry["delivery_attempts"] = int(entry.get("delivery_attempts") or 0) + 1
             _write_persisted_unlocked(data, tracker_path)
             verify = _read_persisted_unlocked(tracker_path)
             return (
@@ -1273,11 +1381,25 @@ def recover_async_delegations(
                 delivery_status = "pending"
                 lost += 1
             replay_identity = (str(_persistence_path(tracker_path)), str(rid))
+            delivery_claim = str(entry.get("delivery_claim") or "")
+            claim_stale = False
+            if delivery_claim:
+                try:
+                    claim_stale = (
+                        entry.get("delivery_claimed_at") is None
+                        or now - float(entry.get("delivery_claimed_at"))
+                        >= _DELIVERY_CLAIM_LEASE_SECONDS
+                    )
+                except (TypeError, ValueError):
+                    claim_stale = True
             if (
                 status not in _ACTIVE_STATUSES
                 and delivery_status != "delivered"
                 and event
-                and replay_identity not in _replayed_persisted_ids
+                and (
+                    replay_identity not in _replayed_persisted_ids
+                    or claim_stale
+                )
             ):
                 # Persist queued delivery before publishing.  The queue is an
                 # in-process notification rail; disk is the recovery truth.
