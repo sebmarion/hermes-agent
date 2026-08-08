@@ -4052,7 +4052,14 @@ def _run_recovery_job(job: dict, *, adapters=None, loop=None) -> bool:
         return False
 
 
-def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
+def tick(
+    verbose: bool = True,
+    adapters=None,
+    loop=None,
+    sync: bool = True,
+    *,
+    can_dispatch=None,
+) -> int:
     """
     Check and run all due jobs.
     
@@ -4063,6 +4070,8 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         verbose: Whether to print status messages
         adapters: Optional dict mapping Platform → live adapter (from gateway)
         loop: Optional asyncio event loop (from gateway) for live adapter sends
+        can_dispatch: Optional synchronous gate; false leaves recovery and due
+            jobs untouched for the next allowed tick
     
     Returns:
         Number of jobs executed (0 if another tick is already running)
@@ -4085,6 +4094,10 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         return 0
 
     try:
+        if can_dispatch is not None and not can_dispatch():
+            logger.debug("Cron dispatch paused while gateway drains existing work")
+            return 0
+
         recovery_jobs = claim_due_recovery_jobs()
         recovery_results = [
             _run_recovery_job(job, adapters=adapters, loop=loop)
