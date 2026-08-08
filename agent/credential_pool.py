@@ -2856,6 +2856,25 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     env_file = load_env()
     inherited_env_keys = get_inherited_env_keys()
     is_named_profile = len(resolve_profile_env_layers()) == 2
+    local_provider_sources: Optional[Set[str]] = None
+
+    def _active_store_owns_source(source: str) -> bool:
+        """Return whether the active profile, not the root fallback, owns source."""
+        nonlocal local_provider_sources
+        if local_provider_sources is None:
+            local_provider_sources = set()
+            active_store = _load_auth_store()
+            active_pool = active_store.get("credential_pool")
+            active_entries = (
+                active_pool.get(provider) if isinstance(active_pool, dict) else None
+            )
+            if isinstance(active_entries, list):
+                local_provider_sources.update(
+                    str(entry.get("source") or "")
+                    for entry in active_entries
+                    if isinstance(entry, dict)
+                )
+        return source in local_provider_sources
 
     # Copilot has its own dedicated seeding branch (see `_seed_credentials`
     # for provider == "copilot") which exchanges the raw ghu_ OAuth token
@@ -2967,7 +2986,14 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             retained = [entry for entry in entries if entry.source != source]
             if len(retained) != len(entries):
                 entries[:] = retained
-                changed = True
+                # read_credential_pool() may have supplied this row from the
+                # root auth.json fallback. Filter that borrowed row only in
+                # memory so runtime resolution falls through to the effective
+                # inherited dotenv value; never create or rewrite a child
+                # auth.json merely to persist an empty shadow. A genuinely
+                # local stale row is still removed from the child store.
+                if _active_store_owns_source(source):
+                    changed = True
             continue
         # Prefer ~/.hermes/.env over os.environ
         token = _get_env_prefer_dotenv(env_var)
@@ -3127,13 +3153,16 @@ def load_pool(provider: str) -> CredentialPool:
         ) != payload.get("auth_type", AUTH_TYPE_API_KEY)
         for payload in raw_entries
     )
-    if raw_needs_auth_normalization:
+    if raw_needs_sanitization or raw_needs_auth_normalization:
         # A profile may be reading this provider from the global-root fallback.
         # Keep that fallback read-only: only the store that owns these rows may
-        # rewrite them. Loading the default/root profile will heal global rows.
+        # sanitize or normalize them. Loading the default/root profile will
+        # heal global rows at their actual storage boundary.
         active_pool = _load_auth_store().get("credential_pool")
         active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
-        raw_needs_auth_normalization = bool(active_entries)
+        active_store_owns_rows = bool(active_entries)
+        raw_needs_sanitization &= active_store_owns_rows
+        raw_needs_auth_normalization &= active_store_owns_rows
 
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config

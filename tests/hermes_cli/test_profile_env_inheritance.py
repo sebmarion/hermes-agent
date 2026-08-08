@@ -290,6 +290,75 @@ def test_inherited_novita_runtime_does_not_materialize_child_pool(
     assert "novita" not in stored.get("credential_pool", {})
 
 
+@pytest.mark.parametrize("existing_child_store", [False, True])
+def test_inherited_novita_ignores_global_pool_without_writing_child_auth(
+    profile_tree, existing_child_store
+):
+    root, profile = profile_tree
+    _write_profile_configs(root, profile)
+    (root / ".env").write_text(
+        "NOVITA_API_KEY=root-novita\n"
+        "NOVITA_BASE_URL=https://root.novita.invalid/v1\n",
+        encoding="utf-8",
+    )
+    (profile / ".env").write_text("PROFILE_ONLY=worker\n", encoding="utf-8")
+    (root / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "novita": [
+                        {
+                            "id": "root-env-novita",
+                            "label": "NOVITA_API_KEY",
+                            "auth_type": "api_key",
+                            "priority": 0,
+                            "source": "env:NOVITA_API_KEY",
+                            "access_token": "stale-root-pool-novita",
+                            "base_url": "https://root.novita.invalid/v1",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    root_auth_before = (root / "auth.json").read_bytes()
+    auth_path = profile / "auth.json"
+    if existing_child_store:
+        auth_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "providers": {},
+                    "credential_pool": {"unrelated-provider": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+    before = auth_path.read_bytes() if auth_path.exists() else None
+    config_mod.invalidate_env_cache()
+
+    from agent.credential_pool import load_pool
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    assert load_pool("novita").entries() == []
+    runtime = resolve_runtime_provider(
+        requested="novita",
+        target_model="zai-org/glm-5.2",
+    )
+
+    assert runtime["provider"] == "novita"
+    assert runtime["api_key"] == "root-novita"
+    assert runtime["base_url"] == "https://root.novita.invalid/v1"
+    assert (root / "auth.json").read_bytes() == root_auth_before
+    if before is None:
+        assert not auth_path.exists()
+    else:
+        assert auth_path.read_bytes() == before
+
+
 def test_local_novita_override_remains_seedable_in_child_pool(profile_tree):
     root, profile = profile_tree
     _write_profile_configs(root, profile)
