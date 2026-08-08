@@ -270,14 +270,26 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 
 def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from its ``<home>/.env``.
+    """Build a profile's secret mapping from its effective dotenv layers.
 
     Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
     global vars are intentionally NOT copied in — ``get_secret`` reads those
     from ``os.environ`` directly, so the scope holds only profile secrets.
     """
     home = Path(hermes_home)
-    secrets = load_env_file(home / ".env")
+    from hermes_constants import PROFILE_INHERITED_ENV_KEYS
+    from hermes_cli.config import resolve_profile_env_layers
+
+    env_paths = resolve_profile_env_layers(home / ".env")
+    secrets: Dict[str, str] = {}
+    if len(env_paths) == 2:
+        root_secrets = load_env_file(env_paths[0])
+        secrets.update(
+            (key, root_secrets[key])
+            for key in PROFILE_INHERITED_ENV_KEYS
+            if key in root_secrets
+        )
+    secrets.update(load_env_file(env_paths[-1]))
 
     try:
         from hermes_cli.env_loader import get_secret_source_values

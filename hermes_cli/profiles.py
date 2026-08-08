@@ -33,6 +33,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_constants import PROFILE_INHERITED_ENV_KEYS
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -1240,11 +1241,9 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
     (PR #44792) have none, so once the Channels/Keys endpoints became
     profile-scoped those profiles stopped inheriting the root install's
     credentials and showed everything as unconfigured. To avoid breaking
-    anyone on update, copy the DEFAULT install's ``.env`` into each named
-    profile that lacks one — that preserves the effective credentials those
-    profiles were already running with (they previously read the root
-    ``.env`` via the process environment). Users can then diverge per
-    profile from there.
+    anyone on update, copy the DEFAULT install's local-only assignments into
+    each named profile that lacks one. Root-shared provider assignments are
+    omitted because named profiles inherit them at read time.
 
     Falls back to the placeholder header when the default install has no
     ``.env`` itself. Never overwrites an existing profile ``.env``.
@@ -1268,7 +1267,19 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
             continue
         try:
             if default_env.is_file():
-                shutil.copy2(default_env, env_path)
+                lines = default_env.read_text(
+                    encoding="utf-8-sig", errors="replace"
+                ).splitlines(keepends=True)
+                retained: list[str] = []
+                for raw_line in lines:
+                    line = raw_line.strip()
+                    if line.startswith("export "):
+                        line = line[7:].lstrip()
+                    key = line.partition("=")[0].strip() if "=" in line else ""
+                    if key in PROFILE_INHERITED_ENV_KEYS:
+                        continue
+                    retained.append(raw_line)
+                env_path.write_text("".join(retained), encoding="utf-8")
             else:
                 env_path.write_text(
                     "# Per-profile secrets for this Hermes profile.\n"

@@ -51,6 +51,12 @@ _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
 _APPLIED_HOMES: set[str] = set()
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
 
+# Values injected into process-global ``os.environ`` from a named profile's
+# root dotenv layer.  Tracking ownership lets hot reload remove a deleted
+# inherited value without clobbering a later shell/user assignment.
+_PROFILE_INHERITED_ENV_VALUES: dict[str, str] = {}
+_PROFILE_INHERITED_ENV_LOCK = threading.RLock()
+
 
 def _known_hermes_env_keys() -> set[str]:
     """Return the combined set of known Hermes env-var keys.
@@ -459,6 +465,23 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
+def _apply_profile_inherited_env(values: dict[str, str]) -> None:
+    """Install the current root-owned profile values and retire stale ones."""
+    from hermes_constants import PROFILE_INHERITED_ENV_KEYS
+
+    with _PROFILE_INHERITED_ENV_LOCK:
+        for key in PROFILE_INHERITED_ENV_KEYS:
+            if key in values:
+                value = values[key]
+                os.environ[key] = value
+                _PROFILE_INHERITED_ENV_VALUES[key] = value
+                continue
+
+            previous = _PROFILE_INHERITED_ENV_VALUES.pop(key, None)
+            if previous is not None and os.environ.get(key) == previous:
+                os.environ.pop(key, None)
+
+
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
@@ -478,11 +501,39 @@ def load_hermes_dotenv(
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
+    # Resolve the same lexical profile layers as config.load_env().  Import
+    # lazily because this loader is used during early config bootstrap.
+    from hermes_constants import PROFILE_INHERITED_ENV_KEYS
+    from hermes_cli.config import resolve_profile_env_layers
+
+    user_env_layers = resolve_profile_env_layers(user_env)
+
     # Normalize safe formatting and remove invalid NUL bytes before parsing.
-    if user_env.exists():
-        _sanitize_env_file_if_needed(user_env)
+    for env_layer in user_env_layers:
+        if env_layer.exists():
+            _sanitize_env_file_if_needed(env_layer)
     if project_env_path and project_env_path.exists():
         _sanitize_env_file_if_needed(project_env_path)
+
+    inherited_values: dict[str, str] = {}
+    if len(user_env_layers) == 2 and user_env_layers[0].exists():
+        # Parse the root file without loading every value into process-global
+        # os.environ. Only the provider keys explicitly allowed to inherit may
+        # cross the profile boundary.
+        from agent.secret_scope import load_env_file
+
+        root_values = load_env_file(user_env_layers[0])
+        inherited_values = {
+            key: root_values[key]
+            for key in PROFILE_INHERITED_ENV_KEYS
+            if key in root_values
+        }
+        loaded.append(user_env_layers[0])
+
+    # Run for every home, including standalone/default homes, so switching
+    # away from a named profile retires values previously owned by inheritance.
+    _apply_profile_inherited_env(inherited_values)
+    _sanitize_loaded_credentials()
 
     if user_env.exists():
         _load_dotenv_with_fallback(user_env, override=True)

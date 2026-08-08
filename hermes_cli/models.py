@@ -2084,11 +2084,15 @@ def _fetch_novita_pricing(
     matching the pattern used by ``fetch_ai_gateway_pricing`` — without this,
     every menu render or pricing lookup re-hits the network.
     """
-    api_key = os.getenv("NOVITA_API_KEY", "").strip()
+    from hermes_cli.config import get_env_value_prefer_dotenv
+
+    api_key = (get_env_value_prefer_dotenv("NOVITA_API_KEY") or "").strip()
     if not api_key:
         return {}
 
-    base_url = os.getenv("NOVITA_BASE_URL", "").strip() or "https://api.novita.ai/openai/v1"
+    base_url = (
+        get_env_value_prefer_dotenv("NOVITA_BASE_URL") or ""
+    ).strip() or "https://api.novita.ai/openai/v1"
     cache_key = base_url.rstrip("/")
     if not force_refresh and cache_key in _pricing_cache:
         return _pricing_cache[cache_key]

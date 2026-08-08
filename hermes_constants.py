@@ -26,6 +26,14 @@ _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
 INDICATOR_STYLES: tuple[str, ...] = ("ascii", "emoji", "kaomoji", "unicode")
 DEFAULT_INDICATOR_STYLE: str = "kaomoji"
 
+# Provider credentials intentionally shared by the default Hermes home with
+# canonical named profiles.  Keep this list narrow: messaging/listener tokens
+# and behavioral routing variables are profile-owned isolation boundaries.
+PROFILE_INHERITED_ENV_KEYS: frozenset[str] = frozenset({
+    "NOVITA_API_KEY",
+    "NOVITA_BASE_URL",
+})
+
 
 def set_hermes_home_override(path: str | Path | None) -> Token:
     """Set a context-local Hermes home override and return its reset token.

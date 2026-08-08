@@ -690,7 +690,11 @@ def get_container_exec_info() -> Optional[dict]:
 # =============================================================================
 
 # Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402
+from hermes_constants import (  # noqa: F811,E402
+    PROFILE_INHERITED_ENV_KEYS,
+    get_hermes_home,
+    get_process_hermes_home,
+)
 from utils import atomic_replace, fast_safe_load
 
 def get_config_path() -> Path:
@@ -749,6 +753,21 @@ def resolve_config_layers(config_path: Optional[Path] = None) -> ConfigLayerPath
         override_config_path=path,
         inherits_root=False,
     )
+
+
+def resolve_profile_env_layers(env_path: Optional[Path] = None) -> Tuple[Path, ...]:
+    """Return physical dotenv layers for one lexical Hermes profile home.
+
+    Only the canonical ``<root>/profiles/<valid-name>/.env`` shape inherits.
+    The profile metadata file is deliberately not consulted, matching config
+    inheritance for markerless legacy profiles.  Callers still decide which
+    root keys are eligible to inherit; this function only resolves ownership.
+    """
+    path = Path(env_path) if env_path is not None else get_env_path()
+    layers = resolve_config_layers(path.parent / "config.yaml")
+    if not layers.inherits_root:
+        return (path,)
+    return (layers.root_config_path.with_name(path.name), path)
 
 
 def config_write_lock_path(config_path: Optional[Path] = None) -> Path:
@@ -4247,11 +4266,84 @@ def _parse_env_value(raw_value: str) -> str:
     return value
 
 
+def _env_file_signature(path: Path) -> Tuple[str, Optional[int], Optional[int]]:
+    """Return a cache signature for one dotenv path without reading values."""
+    try:
+        stat_result = path.stat()
+        return (str(path), stat_result.st_mtime_ns, stat_result.st_size)
+    except FileNotFoundError:
+        return (str(path), None, None)
+    except Exception:
+        return (str(path), None, None)
+
+
+def _read_env_assignments(path: Path) -> Dict[str, str]:
+    """Parse one physical dotenv file using Hermes' canonical value rules."""
+    env_vars: Dict[str, str] = {}
+    if not path.exists():
+        return env_vars
+
+    # On Windows, open() defaults to the system locale (cp1252) which can
+    # fail on UTF-8 .env files. Always use explicit UTF-8; tolerate BOM via
+    # utf-8-sig since users may edit .env in Notepad which adds one.
+    open_kw = {"encoding": "utf-8-sig", "errors": "replace"}
+    with open(path, **open_kw) as f:
+        raw_lines = f.readlines()
+    # Normalize line endings without interpreting value contents as syntax.
+    lines = _sanitize_env_lines(raw_lines)
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        # Strip the bash-compatible ``export `` prefix so lines like
+        # ``export API_KEY=...`` parse as ``API_KEY`` rather than being
+        # stored under the wrong key ``"export API_KEY"`` (#6659).
+        if line.startswith('export '):
+            line = line[7:]
+        key, _, value = line.partition('=')
+        env_vars[key.strip()] = _parse_env_value(value)
+    return env_vars
+
+
+def _load_env_state() -> Tuple[Dict[str, str], frozenset[str]]:
+    """Load effective dotenv values plus keys inherited from the root file."""
+    global _env_cache
+    env_paths = resolve_profile_env_layers()
+    cache_key = tuple(_env_file_signature(path) for path in env_paths)
+
+    if _env_cache is not None:
+        cached_key, cached_vars, cached_inherited = _env_cache
+        if cached_key == cache_key:
+            return dict(cached_vars), frozenset(cached_inherited)
+
+    env_vars: Dict[str, str] = {}
+    inherited_keys: set[str] = set()
+
+    if len(env_paths) == 2:
+        root_vars = _read_env_assignments(env_paths[0])
+        for key in PROFILE_INHERITED_ENV_KEYS:
+            if key in root_vars:
+                env_vars[key] = root_vars[key]
+                inherited_keys.add(key)
+
+    local_vars = _read_env_assignments(env_paths[-1])
+    env_vars.update(local_vars)
+    inherited_keys.difference_update(local_vars)
+
+    _env_cache = (cache_key, dict(env_vars), frozenset(inherited_keys))
+    return env_vars, frozenset(inherited_keys)
+
+
 def load_env() -> Dict[str, str]:
-    """Load environment variables from ~/.hermes/.env.
+    """Load effective Hermes dotenv values for the active profile.
 
     Normalizes line endings before parsing while treating each assignment's
     value as opaque data for boundary discovery.
+
+    Canonical named profiles inherit only ``PROFILE_INHERITED_ENV_KEYS`` from
+    the default root file. Their local file then overrides every inherited
+    value, including with an explicit empty assignment. All other keys remain
+    local to preserve profile isolation.
 
     The parsed dict is memoised keyed on the .env file mtime, because
     ``get_env_value()`` is called dozens-to-hundreds of times per
@@ -4261,57 +4353,27 @@ def load_env() -> Dict[str, str]:
     menu paint on top of the OAuth-refresh slowness. The mtime check
     invalidates the cache when the user edits .env mid-process.
     """
-    global _env_cache
-    env_path = get_env_path()
-
-    try:
-        mtime = env_path.stat().st_mtime
-        size = env_path.stat().st_size
-        cache_key = (str(env_path), mtime, size)
-    except FileNotFoundError:
-        cache_key = (str(env_path), None, None)
-    except Exception:
-        cache_key = None
-
-    if cache_key is not None and _env_cache is not None:
-        cached_key, cached_vars = _env_cache
-        if cached_key == cache_key:
-            return dict(cached_vars)
-
-    env_vars: Dict[str, str] = {}
-
-    if env_path.exists():
-        # On Windows, open() defaults to the system locale (cp1252) which can
-        # fail on UTF-8 .env files. Always use explicit UTF-8; tolerate BOM
-        # via utf-8-sig since users may edit .env in Notepad which adds one.
-        open_kw = {"encoding": "utf-8-sig", "errors": "replace"}
-        with open(env_path, **open_kw) as f:
-            raw_lines = f.readlines()
-        # Normalize line endings without interpreting value contents as syntax.
-        lines = _sanitize_env_lines(raw_lines)
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                # Strip the bash-compatible ``export `` prefix so lines like
-                # ``export API_KEY=...`` parse as ``API_KEY`` rather than being
-                # stored under the wrong key ``"export API_KEY"`` (#6659).
-                if line.startswith('export '):
-                    line = line[7:]
-                key, _, value = line.partition('=')
-                env_vars[key.strip()] = _parse_env_value(value)
-
-    if cache_key is not None:
-        _env_cache = (cache_key, dict(env_vars))
-
+    env_vars, _ = _load_env_state()
     return env_vars
 
 
-# Module-level memo for load_env(), keyed on (path, mtime, size).
-# Editing .env bumps mtime → next load_env() rebuilds. invalidate_env_cache()
+def get_inherited_env_keys() -> frozenset[str]:
+    """Return effective dotenv keys owned by the default root layer."""
+    _, inherited_keys = _load_env_state()
+    return inherited_keys
+
+
+# Module-level memo for load_env(), keyed on every physical layer's
+# (path, mtime_ns, size). Editing either root or local .env rebuilds the
+# effective profile view. invalidate_env_cache()
 # is the explicit knob for writers that update .env via this module
 # (set_env_value, save_env, etc.) without relying on filesystem mtime
 # resolution.
-_env_cache: Optional[Tuple[Tuple[str, Optional[float], Optional[int]], Dict[str, str]]] = None
+_EnvLayerSignature = Tuple[str, Optional[int], Optional[int]]
+_EnvCacheKey = Tuple[_EnvLayerSignature, ...]
+_env_cache: Optional[
+    Tuple[_EnvCacheKey, Dict[str, str], frozenset[str]]
+] = None
 
 
 def invalidate_env_cache() -> None:
@@ -4764,9 +4826,11 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
     value — matching the credential-pool seeding path's behaviour.
     """
     env_vars = load_env()
-    val = env_vars.get(key)
-    if val:
-        return val
+    if key in env_vars:
+        # Membership, not truthiness, is the contract: ``KEY=`` is an
+        # explicit local mask and must not fall through to a stale process
+        # value or another profile's secret scope.
+        return env_vars[key]
     try:
         from agent.secret_scope import (
             UnscopedSecretError,

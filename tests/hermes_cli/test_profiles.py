@@ -217,13 +217,15 @@ class TestNoSkillsOptOut:
 
 class TestBackfillProfileEnvs:
     """Tests for backfill_profile_envs() — the `hermes update` pass that
-    gives pre-#44792 profiles (created before .env seeding) their own
-    .env, copied from the default install so credentials don't break."""
+    gives pre-#44792 profiles (created before .env seeding) a local override
+    file while omitting root-shared Novita assignments."""
 
-    def test_copies_default_env_into_envless_profiles(self, profile_env):
+    def test_excludes_inherited_keys_when_backfilling_envless_profiles(self, profile_env):
         import stat
         tmp_path = profile_env
-        (tmp_path / ".hermes" / ".env").write_text("OPENROUTER_API_KEY=root-key\n")
+        (tmp_path / ".hermes" / ".env").write_text(
+            "OPENROUTER_API_KEY=root-key\nNOVITA_API_KEY=shared-root-key\n"
+        )
         p1 = create_profile("old1", no_alias=True)
         p2 = create_profile("old2", no_alias=True)
         # Simulate pre-#44792 profiles: no .env
@@ -234,7 +236,9 @@ class TestBackfillProfileEnvs:
 
         assert sorted(backfilled) == ["old1", "old2"]
         for p in (p1, p2):
-            assert (p / ".env").read_text() == "OPENROUTER_API_KEY=root-key\n"
+            content = (p / ".env").read_text(encoding="utf-8")
+            assert content == "OPENROUTER_API_KEY=root-key\n"
+            assert "NOVITA_API_KEY" not in content
             assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
 
 
@@ -921,4 +925,3 @@ class TestProfilesToServe:
         assert set(serve) == {"default", "coder", "writer"}
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
-
