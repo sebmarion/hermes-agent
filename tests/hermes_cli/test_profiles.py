@@ -45,7 +45,7 @@ from hermes_cli.profiles import (
     backfill_profile_envs,
     profiles_to_serve,
 )
-from hermes_cli.config import DEFAULT_CONFIG
+from hermes_cli.config import DEFAULT_CONFIG, read_effective_user_config_for_path
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +146,11 @@ class TestCreateProfile:
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
         cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
-        assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
-        assert cloned_config["model"] == "test"
+        assert cloned_config["_profile"] == {"inherits": "default", "version": 1}
+        assert "model" not in cloned_config
+        assert read_effective_user_config_for_path(
+            profile_dir / "config.yaml"
+        )["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
@@ -891,7 +894,7 @@ class TestEdgeCases:
             "target", clone_from="source", clone_config=True, no_alias=True,
         )
         cloned_config = yaml.safe_load((target_dir / "config.yaml").read_text())
-        assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert cloned_config["_profile"] == {"inherits": "default", "version": 1}
         assert cloned_config["model"] == "cloned"
         assert (target_dir / ".env").read_text().strip() == "SECRET=yes"
 
@@ -918,6 +921,4 @@ class TestProfilesToServe:
         assert set(serve) == {"default", "coder", "writer"}
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
-
-
 

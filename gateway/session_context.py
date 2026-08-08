@@ -81,6 +81,10 @@ _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNS
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
+_SUPPRESS_PROCESS_SESSION_ID_MIRROR: ContextVar[bool] = ContextVar(
+    "_SUPPRESS_PROCESS_SESSION_ID_MIRROR",
+    default=False,
+)
 # In-process UI session/window id for multi-session desktop/TUI hosts. This is
 # intentionally separate from HERMES_SESSION_ID: the latter is the durable
 # conversation/session-db id, while the UI id is the live frontend tab/window
@@ -175,6 +179,12 @@ def set_current_session_id(session_id: str) -> None:
 
     _SESSION_ID.set(session_id)
 
+    # Multi-session hosts install this task-local boundary while an agent turn
+    # is active. Session rotation must still update that turn's ContextVar, but
+    # must not overwrite the process mirror observed by concurrent turns.
+    if _SUPPRESS_PROCESS_SESSION_ID_MIRROR.get():
+        return
+
     # Skip the process-global os.environ write for delegated children. The
     # child's own tools and subprocesses still resolve their id through the
     # ContextVar (task-local), while the parent's process-wide env keeps the
@@ -188,6 +198,22 @@ def set_current_session_id(session_id: str) -> None:
         pass
 
     os.environ["HERMES_SESSION_ID"] = session_id
+
+
+@contextmanager
+def suppress_process_session_id_mirroring() -> Iterator[None]:
+    """Keep session-id rotation task-local within this context.
+
+    The default remains the legacy CLI behavior where
+    :func:`set_current_session_id` also updates ``os.environ``. WebUI and other
+    concurrent hosts use this scope so one turn cannot clobber another turn's
+    process-global mirror.
+    """
+    token = _SUPPRESS_PROCESS_SESSION_ID_MIRROR.set(True)
+    try:
+        yield
+    finally:
+        _SUPPRESS_PROCESS_SESSION_ID_MIRROR.reset(token)
 
 
 @contextmanager

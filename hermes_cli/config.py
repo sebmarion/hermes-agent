@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+import errno
 import json
 import logging
 import os
@@ -27,9 +28,10 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Callable, Dict, Any, Iterator, Optional, List, Tuple, Set
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -240,16 +242,16 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # save_config() + migrate_config() write via atomic_yaml_write which
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
-# Cached tuple is (user_mtime_ns, user_size, managed_mtime_ns, managed_size,
-# merged_value, env_ref_snapshot) — the managed-file signature is folded in so
-# editing the managed-scope config.yaml invalidates the cache (see
-# managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
-# changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+# Cached tuple is (dependency_signature, merged_value, env_ref_snapshot). The
+# dependency signature contains every physical user layer plus managed config,
+# so root edits invalidate named-profile caches as well as direct child edits.
+# The env snapshot invalidates it when a referenced ${VAR} changes value (late
+# .env load, in-process rotation — #58514).
+_LOAD_CONFIG_CACHE: Dict[str, Any] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
-_RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+_RAW_CONFIG_CACHE: Dict[str, Any] = {}
 # Serializes all config read/write paths. libyaml's C extension is not
 # thread-safe for concurrent safe_load() on the same file, and multiple
 # tool threads (approval.py, browser_tool.py, setup flows) hit
@@ -694,6 +696,146 @@ from utils import atomic_replace, fast_safe_load
 def get_config_path() -> Path:
     """Get the main config file path."""
     return get_hermes_home() / "config.yaml"
+
+
+_PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_PROFILE_METADATA_KEY = "_profile"
+_PROFILE_METADATA_VERSION = 1
+_PROFILE_INHERITS_ROOT = "default"
+_PROFILE_WRITE_LOCK_NAME = ".config-write.lock"
+
+
+class ProfileConfigError(RuntimeError):
+    """A named-profile override contains invalid inheritance metadata."""
+
+
+@dataclass(frozen=True)
+class ConfigLayerPaths:
+    """Physical config files participating in one effective config read."""
+
+    root_config_path: Path
+    override_config_path: Path
+    inherits_root: bool
+    profile_name: Optional[str] = None
+
+
+def resolve_config_layers(config_path: Optional[Path] = None) -> ConfigLayerPaths:
+    """Resolve root/override paths without consulting or mutating process state.
+
+    Inheritance is automatic only for the canonical lexical shape
+    ``<root>/profiles/<valid-name>/config.yaml``.  Explicit config paths in
+    every other location are standalone, even if a parent directory happens
+    to be named ``profiles``.  Paths are deliberately not resolved through
+    symlinks: the on-disk namespace, not a referent's location, owns profile
+    identity.
+    """
+    path = Path(config_path) if config_path is not None else get_config_path()
+    profile_dir = path.parent
+    profiles_dir = profile_dir.parent
+    profile_name = profile_dir.name
+    if (
+        path.name == "config.yaml"
+        and profiles_dir.name == "profiles"
+        and _PROFILE_NAME_RE.fullmatch(profile_name) is not None
+    ):
+        return ConfigLayerPaths(
+            root_config_path=profiles_dir.parent / "config.yaml",
+            override_config_path=path,
+            inherits_root=True,
+            profile_name=profile_name,
+        )
+    return ConfigLayerPaths(
+        root_config_path=path,
+        override_config_path=path,
+        inherits_root=False,
+    )
+
+
+def config_write_lock_path(config_path: Optional[Path] = None) -> Path:
+    """Return the one machine-local lock shared by root and named profiles."""
+    layers = resolve_config_layers(config_path)
+    return layers.root_config_path.parent / _PROFILE_WRITE_LOCK_NAME
+
+
+def _lock_fd_nonblocking(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_fd(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def profile_config_write_lock(
+    config_path: Optional[Path] = None,
+    *,
+    timeout: float = 5.0,
+) -> Iterator[None]:
+    """Acquire the bounded process/thread lock for a config namespace.
+
+    The in-process ``RLock`` protects libyaml and cache state.  The file lock
+    closes the read/compare/atomic-replace race between the gateway, CLI and
+    WebUI when they write the root or any named override concurrently.
+    """
+    if timeout < 0:
+        raise ValueError("config write lock timeout must be non-negative")
+
+    lock_path = config_write_lock_path(config_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    with _CONFIG_LOCK:
+        fd = os.open(lock_path, flags, 0o600)
+        acquired = False
+        try:
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"0")
+                os.fsync(fd)
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    _lock_fd_nonblocking(fd)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                        errno.EDEADLK,
+                    }:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"Timed out after {timeout:.3f}s waiting for config write lock "
+                            f"{lock_path}"
+                        ) from exc
+                    time.sleep(min(0.05, remaining))
+            yield
+        finally:
+            if acquired:
+                _unlock_fd(fd)
+            os.close(fd)
 
 def get_env_path() -> Path:
     """Get the .env file path (for API keys)."""
@@ -2506,6 +2648,302 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+class _ConfigLayerReadError(RuntimeError):
+    """Attach a physical path to a config-layer read failure."""
+
+    def __init__(self, path: Path, cause: Exception):
+        super().__init__(f"Failed to read {path}: {cause}")
+        self.path = path
+        self.cause = cause
+
+
+def _config_file_signature(path: Path) -> Tuple[str, Optional[int], Optional[int]]:
+    try:
+        st = path.stat()
+        return (str(path), st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        return (str(path), None, None)
+    except OSError as exc:
+        # Preserve a stable error identity without treating an inaccessible
+        # file as absent. The subsequent read still raises/surfaces the error.
+        return (str(path), -1, exc.errno)
+
+
+def config_dependency_signature(
+    config_path: Optional[Path] = None,
+) -> Tuple[Tuple[str, Optional[int], Optional[int]], ...]:
+    """Return the complete physical dependency signature for one config.
+
+    A named profile depends on both root and override files, including their
+    absence.  This makes root edits/creation/deletion invalidate every child
+    cache without a broadcast invalidation registry.
+    """
+    layers = resolve_config_layers(config_path)
+    paths = [layers.root_config_path]
+    if layers.inherits_root:
+        paths.append(layers.override_config_path)
+    return tuple(_config_file_signature(path) for path in paths)
+
+
+def _validated_profile_override(
+    raw_override: Dict[str, Any],
+    *,
+    config_path: Path,
+) -> Tuple[Dict[str, Any], Tuple[Tuple[str, ...], ...]]:
+    """Return local values and validated structured masks for an override."""
+    local = copy.deepcopy(raw_override)
+    marker = local.pop(_PROFILE_METADATA_KEY, None)
+    if marker is None:
+        # Legacy full profile files become ordinary overrides automatically.
+        return local, ()
+    if not isinstance(marker, dict):
+        raise ProfileConfigError(
+            f"{config_path}: {_PROFILE_METADATA_KEY} must be a mapping"
+        )
+
+    unknown = set(marker) - {"inherits", "version", "masks"}
+    if unknown:
+        raise ProfileConfigError(
+            f"{config_path}: unknown {_PROFILE_METADATA_KEY} field(s): "
+            f"{', '.join(sorted(str(key) for key in unknown))}"
+        )
+    if marker.get("inherits") != _PROFILE_INHERITS_ROOT:
+        raise ProfileConfigError(
+            f"{config_path}: {_PROFILE_METADATA_KEY}.inherits must be "
+            f"{_PROFILE_INHERITS_ROOT!r}"
+        )
+    version = marker.get("version")
+    if isinstance(version, bool) or version != _PROFILE_METADATA_VERSION:
+        raise ProfileConfigError(
+            f"{config_path}: {_PROFILE_METADATA_KEY}.version must be "
+            f"{_PROFILE_METADATA_VERSION}"
+        )
+
+    raw_masks = marker.get("masks", [])
+    if not isinstance(raw_masks, list) or len(raw_masks) > 1024:
+        raise ProfileConfigError(
+            f"{config_path}: {_PROFILE_METADATA_KEY}.masks must be a list "
+            "with at most 1024 entries"
+        )
+    masks: Set[Tuple[str, ...]] = set()
+    for index, raw_path in enumerate(raw_masks):
+        if not isinstance(raw_path, list) or not 1 <= len(raw_path) <= 64:
+            raise ProfileConfigError(
+                f"{config_path}: {_PROFILE_METADATA_KEY}.masks[{index}] must "
+                "be a non-empty list with at most 64 segments"
+            )
+        if any(not isinstance(segment, str) or not segment for segment in raw_path):
+            raise ProfileConfigError(
+                f"{config_path}: {_PROFILE_METADATA_KEY}.masks[{index}] "
+                "segments must be non-empty strings"
+            )
+        if raw_path[0] == _PROFILE_METADATA_KEY:
+            raise ProfileConfigError(
+                f"{config_path}: {_PROFILE_METADATA_KEY}.masks[{index}] cannot "
+                "target profile metadata"
+            )
+        masks.add(tuple(raw_path))
+    return local, tuple(sorted(masks))
+
+
+def _remove_mapping_path(config: Dict[str, Any], path: Tuple[str, ...]) -> None:
+    parents: List[Tuple[Dict[str, Any], str]] = []
+    node: Any = config
+    for segment in path[:-1]:
+        if not isinstance(node, dict) or segment not in node:
+            return
+        parents.append((node, segment))
+        node = node[segment]
+    if not isinstance(node, dict) or path[-1] not in node:
+        return
+    del node[path[-1]]
+    for parent, segment in reversed(parents):
+        child = parent.get(segment)
+        if child != {}:
+            break
+        del parent[segment]
+
+
+def _read_config_layer(
+    path: Path,
+    loader: Callable[[Path], Dict[str, Any]],
+) -> Dict[str, Any]:
+    try:
+        data = loader(path)
+    except Exception as exc:
+        raise _ConfigLayerReadError(path, exc) from exc
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def read_effective_user_config_for_path(
+    config_path: Path,
+    *,
+    loader: Optional[Callable[[Path], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Compose physical user config layers for an explicit path.
+
+    This is the WebUI-safe/raw boundary: no schema defaults, environment
+    expansion, managed overlay, migration, cache, or ``HERMES_HOME`` mutation.
+    ``loader`` may be supplied by callers that already hold a snapshot or
+    storage abstraction; it must return one physical YAML mapping per path.
+    """
+    layers = resolve_config_layers(config_path)
+    physical_loader = loader or read_user_config_raw
+    if not layers.inherits_root:
+        return copy.deepcopy(
+            _read_config_layer(layers.override_config_path, physical_loader)
+        )
+
+    root = copy.deepcopy(
+        _read_config_layer(layers.root_config_path, physical_loader)
+    )
+    # Metadata is reserved for named overrides and never enters runtime data.
+    root.pop(_PROFILE_METADATA_KEY, None)
+    raw_override = _read_config_layer(layers.override_config_path, physical_loader)
+    local, masks = _validated_profile_override(
+        raw_override,
+        config_path=layers.override_config_path,
+    )
+    for mask in masks:
+        _remove_mapping_path(root, mask)
+    return _deep_merge(root, local)
+
+
+_PROFILE_DELTA_NONE = object()
+
+
+def _profile_delta_parts(
+    base: Any,
+    desired: Any,
+    defaults: Any,
+    *,
+    ignored_paths: Set[Tuple[str, ...]],
+    path: Tuple[str, ...] = (),
+) -> Tuple[Any, List[Tuple[str, ...]]]:
+    """Project desired data to mapping overrides plus inherited-leaf masks."""
+    if path in ignored_paths or desired == base:
+        return _PROFILE_DELTA_NONE, []
+    if base is _PROFILE_DELTA_NONE:
+        if defaults is not _PROFILE_DELTA_NONE and desired == defaults:
+            return _PROFILE_DELTA_NONE, []
+        return copy.deepcopy(desired), []
+
+    if isinstance(base, dict) and isinstance(desired, dict):
+        default_dict = defaults if isinstance(defaults, dict) else {}
+        override: Dict[str, Any] = {}
+        masks: List[Tuple[str, ...]] = []
+        ordered_keys = list(desired)
+        ordered_keys.extend(key for key in base if key not in desired)
+        for key in ordered_keys:
+            if not isinstance(key, str) or not key:
+                raise ProfileConfigError(
+                    "Profile inheritance supports only non-empty string mapping keys"
+                )
+            child_path = path + (key,)
+            if key not in desired:
+                child_default = default_dict.get(key, _PROFILE_DELTA_NONE)
+                if child_default is not _PROFILE_DELTA_NONE:
+                    _unused, child_masks = _profile_delta_parts(
+                        base[key],
+                        child_default,
+                        child_default,
+                        ignored_paths=ignored_paths,
+                        path=child_path,
+                    )
+                    masks.extend(child_masks)
+                elif child_path not in ignored_paths:
+                    masks.append(child_path)
+                continue
+            child_base = base.get(key, _PROFILE_DELTA_NONE)
+            child_default = default_dict.get(key, _PROFILE_DELTA_NONE)
+            child_override, child_masks = _profile_delta_parts(
+                child_base,
+                desired[key],
+                child_default,
+                ignored_paths=ignored_paths,
+                path=child_path,
+            )
+            if child_override is not _PROFILE_DELTA_NONE:
+                override[key] = child_override
+            masks.extend(child_masks)
+        return (override if override else _PROFILE_DELTA_NONE), masks
+
+    if desired is _PROFILE_DELTA_NONE:
+        return _PROFILE_DELTA_NONE, [path]
+    if defaults is not _PROFILE_DELTA_NONE and desired == defaults:
+        # An explicit value equal to the schema default cannot beat an
+        # inherited root value by ordinary merge; mask the root leaf so the
+        # subsequent DEFAULT_CONFIG merge supplies it.
+        return _PROFILE_DELTA_NONE, [path]
+    return copy.deepcopy(desired), []
+
+
+def _profile_document_from_delta(
+    base: Dict[str, Any],
+    desired: Dict[str, Any],
+    *,
+    defaults: Optional[Dict[str, Any]] = None,
+    ignored_paths: Set[Tuple[str, ...]] = frozenset(),
+) -> Dict[str, Any]:
+    override, masks = _profile_delta_parts(
+        base,
+        desired,
+        defaults if defaults is not None else {},
+        ignored_paths=set(ignored_paths),
+    )
+    marker: Dict[str, Any] = {
+        "inherits": _PROFILE_INHERITS_ROOT,
+        "version": _PROFILE_METADATA_VERSION,
+    }
+    unique_masks = sorted(set(masks))
+    if unique_masks:
+        marker["masks"] = [list(path) for path in unique_masks]
+    document: Dict[str, Any] = {_PROFILE_METADATA_KEY: marker}
+    if isinstance(override, dict):
+        document.update(override)
+    elif override is not _PROFILE_DELTA_NONE:
+        raise ProfileConfigError("The effective profile config must be a mapping")
+    return document
+
+
+def project_profile_override(
+    config_path: Path,
+    desired_effective_user: Dict[str, Any],
+    *,
+    existing_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Project effective raw user data into one physical profile document.
+
+    This companion to :func:`read_effective_user_config_for_path` is intended
+    for WebUI raw-config editors.  It performs no schema/default expansion;
+    omitted inherited root leaves become structured masks, changed leaves
+    become local overrides, and equal leaves are omitted.  Standalone paths
+    are returned unchanged.
+    """
+    if not isinstance(desired_effective_user, dict):
+        raise TypeError("desired_effective_user must be a mapping")
+    if _PROFILE_METADATA_KEY in desired_effective_user:
+        raise ProfileConfigError(
+            f"Effective config must not contain reserved {_PROFILE_METADATA_KEY} metadata"
+        )
+    layers = resolve_config_layers(config_path)
+    if not layers.inherits_root:
+        return copy.deepcopy(desired_effective_user)
+
+    root = read_user_config_raw(layers.root_config_path)
+    root = copy.deepcopy(root)
+    root.pop(_PROFILE_METADATA_KEY, None)
+    if existing_override is None:
+        existing_override = read_user_config_raw(layers.override_config_path)
+    _validated_profile_override(
+        existing_override,
+        config_path=layers.override_config_path,
+    )
+    return _profile_document_from_delta(root, desired_effective_user)
+
+
 def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     """Remove the given dotted leaf keys from a nested config dict.
 
@@ -2977,41 +3415,14 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 def read_raw_config() -> Dict[str, Any]:
-    """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
+    """Read effective user YAML without defaults, migration, env or managed data.
 
-    Returns the raw YAML dict, or ``{}`` if the file doesn't exist or can't
-    be parsed.  Use this for lightweight config reads where you just need a
-    single value and don't want the overhead of ``load_config()``'s deep-merge
-    + migration pipeline.
-
-    Cached on the config file's (mtime_ns, size) — same strategy as
-    ``load_config()``. Returns a deepcopy on every call since some callers
-    mutate the result before passing to ``save_config()``.
+    For a canonical named profile this is ``root + masks + local override``.
+    :func:`read_user_config_raw` remains the exact physical-file reader.
+    Returns a defensive deepcopy because existing callers mutate this result
+    before saving.
     """
-    with _CONFIG_LOCK:
-        try:
-            config_path = get_config_path()
-            st = config_path.stat()
-            cache_key = (st.st_mtime_ns, st.st_size)
-        except (FileNotFoundError, OSError):
-            return {}
-
-        path_key = str(config_path)
-        cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
-            return copy.deepcopy(cached[2])
-
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
-        except Exception as e:
-            _warn_config_parse_failure(config_path, e)
-            return {}
-
-        if not isinstance(data, dict):
-            data = {}
-        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
-        return data
+    return _read_effective_user_config_cached(want_deepcopy=True)
 
 
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
@@ -3075,37 +3486,32 @@ def read_raw_config_readonly() -> Dict[str, Any]:
     checks like the shared-metrics gate, which runs 2-3x per agent turn and
     was paying a full config deepcopy each time.
 
-    Same (mtime_ns, size) freshness key as ``read_raw_config()`` — an edited
-    config.yaml is picked up on the next call.
+    Its freshness signature contains both root and override files for named
+    profiles, so edits to either dependency are picked up on the next call.
     """
+    return _read_effective_user_config_cached(want_deepcopy=False)
+
+
+def _read_effective_user_config_cached(*, want_deepcopy: bool) -> Dict[str, Any]:
     with _CONFIG_LOCK:
-        try:
-            config_path = get_config_path()
-            st = config_path.stat()
-            cache_key = (st.st_mtime_ns, st.st_size)
-        except (FileNotFoundError, OSError):
-            return {}
-
+        config_path = get_config_path()
         path_key = str(config_path)
+        signature = config_dependency_signature(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
-            return cached[2]
+        if cached is not None and cached[0] == signature:
+            return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
 
         try:
-            with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
-        except Exception as e:
-            _warn_config_parse_failure(config_path, e)
+            data = read_effective_user_config_for_path(config_path)
+        except ProfileConfigError:
+            raise
+        except _ConfigLayerReadError as exc:
+            _warn_config_parse_failure(exc.path, exc.cause)
             return {}
 
-        if not isinstance(data, dict):
-            data = {}
-        # Store and return THE SAME object (identity invariant): the first
-        # caller must see the exact dict later cache hits return, so a test
-        # asserting ``ro1 is ro2`` holds from the very first call.
         cached_copy = copy.deepcopy(data)
-        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], cached_copy)
-        return cached_copy
+        _RAW_CONFIG_CACHE[path_key] = (signature, cached_copy)
+        return copy.deepcopy(cached_copy) if want_deepcopy else cached_copy
 
 
 def require_readable_config_before_write(config_path: Optional[Path] = None) -> None:
@@ -3466,11 +3872,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         config_path = get_config_path()
         path_key = str(config_path)
 
-        try:
-            st = config_path.stat()
-            user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
-        except FileNotFoundError:
-            user_sig = None
+        user_dependency_sig = config_dependency_signature(config_path)
+        has_user_layer = any(
+            mtime_ns is not None
+            for _path, mtime_ns, _size in user_dependency_sig
+        )
 
         # Managed scope: fold the managed config file's (mtime, size) into the
         # cache signature so editing /etc/hermes/config.yaml invalidates the
@@ -3485,37 +3891,29 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         except OSError:
             managed_sig = (0, 0)
 
-        # Combined cache signature: user file + managed file. None only when the
-        # user config is absent AND no managed file exists (nothing to cache on).
-        if user_sig is not None:
-            cache_sig: Optional[Tuple[int, int, int, int]] = (
-                user_sig[0],
-                user_sig[1],
-                managed_sig[0],
-                managed_sig[1],
-            )
-        elif managed_sig != (0, 0):
-            cache_sig = (0, 0, managed_sig[0], managed_sig[1])
-        else:
-            cache_sig = None
+        # None only when every user layer is absent and no managed file exists.
+        cache_sig = (
+            (user_dependency_sig, managed_sig)
+            if has_user_layer or managed_sig != (0, 0)
+            else None
+        )
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if cached is not None and cache_sig is not None and cached[0] == cache_sig:
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
             # pins unexpanded literals (e.g. auxiliary.<task>.api_key) for the
             # life of the process (#58514).
-            env_snapshot = cached[5] if len(cached) > 5 else {}
+            env_snapshot = cached[2] if len(cached) > 2 else {}
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
-                return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
+                return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
-        if user_sig is not None:
+        if has_user_layer:
             try:
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                user_config = read_effective_user_config_for_path(config_path)
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -3523,8 +3921,12 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         agent_user_config["max_turns"] = user_config["max_turns"]
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
-
                 config = _deep_merge(config, user_config)
+            except ProfileConfigError:
+                # Invalid inheritance metadata is a configuration-boundary
+                # violation, not a transient parse failure. Fail closed so a
+                # named profile cannot silently run on root/default policy.
+                raise
             except Exception as e:
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
@@ -3539,9 +3941,15 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 # Fresh processes with no last-known-good keep the existing
                 # DEFAULT_CONFIG fallback.
                 lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
+                failure_path = (
+                    e.path if isinstance(e, _ConfigLayerReadError) else config_path
+                )
+                failure_cause = (
+                    e.cause if isinstance(e, _ConfigLayerReadError) else e
+                )
                 _warn_config_parse_failure(
-                    config_path,
-                    e,
+                    failure_path,
+                    failure_cause,
                     fallback="last-known-good" if lkg is not None else "defaults",
                 )
                 if lkg is not None:
@@ -3560,9 +3968,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         # signature and triggers a normal reload.
                         _empty_env: Dict[str, Optional[str]] = {}
                         _LOAD_CONFIG_CACHE[path_key] = (
-                            cache_sig[0], cache_sig[1],
-                            cache_sig[2], cache_sig[3],
-                            lkg_copy, _empty_env,
+                            cache_sig,
+                            lkg_copy,
+                            _empty_env,
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
@@ -3582,16 +3990,14 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
             # (deepcopy=True) callers can mutate freely without affecting the
             # cached value, and ``load_config_readonly()`` (deepcopy=False)
-            # callers all see the same stable cached object. The cached tuple is
-            # (user_mtime, user_size, managed_mtime, managed_size, value,
-            # env_ref_snapshot). The snapshot records the environment values
-            # this expansion was made against so later loads can detect env
-            # drift (late .env load, in-process rotation) — see cache hit above.
+            # callers all see the same stable cached object. The snapshot
+            # records the environment values this expansion was made against
+            # so later loads can detect env drift — see cache hit above.
             cached_copy = copy.deepcopy(expanded)
             env_snapshot = _env_ref_snapshot(normalized)
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
+            _LOAD_CONFIG_CACHE[path_key] = (cache_sig, cached_copy, env_snapshot)
             # On the readonly path return the same cached object subsequent
             # calls will see — keeps "two readonly calls return the same
             # object" invariant that callers may rely on for identity checks.
@@ -3703,7 +4109,7 @@ def save_config(
     Full-document replacement callers (dashboard raw YAML editor, callers that
     already deep-merge) must leave this False so intentional deletions survive.
     """
-    with _CONFIG_LOCK:
+    with profile_config_write_lock(get_config_path()):
         if is_managed():
             managed_error("save configuration")
             return
@@ -3771,6 +4177,26 @@ def save_config(
                 normalized,  # type: ignore[arg-type]
                 DEFAULT_CONFIG,
                 preserve_keys=effective_preserve_keys,
+            )
+
+        layers = resolve_config_layers(config_path)
+        if layers.inherits_root:
+            # Persist only the named profile's delta. Compare against the
+            # physical root document (including env-ref templates), while
+            # schema-default values become masks when they intentionally
+            # override a different inherited root value.
+            root_config = read_user_config_raw(layers.root_config_path)
+            root_config = copy.deepcopy(root_config)
+            root_config.pop(_PROFILE_METADATA_KEY, None)
+            existing_override = read_user_config_raw(layers.override_config_path)
+            _validated_profile_override(
+                existing_override,
+                config_path=layers.override_config_path,
+            )
+            normalized = _profile_document_from_delta(
+                root_config,
+                normalized,
+                defaults=DEFAULT_CONFIG,
             )
 
         # Build optional commented-out sections for features that are off by

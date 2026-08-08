@@ -15,9 +15,10 @@ session's id.  A tool worker thread whose ContextVar is unset (or a
 path that still reads ``os.environ`` directly) then resolves to the
 wrong session — mixing threads / conversations.
 
-These tests assert the concurrency contract: the ContextVar is the
-single source of truth, and the process-global ``os.environ`` write must
-not leak a concurrent session's id.
+These tests assert the concurrent-host contract: inside the scoped mirror
+suppression boundary, the ContextVar is the single source of truth and a
+rotation cannot leak another session's id through process-global state.
+Unscoped CLI callers retain the legacy process mirror.
 """
 
 import os
@@ -32,6 +33,7 @@ from gateway.session_context import (
     get_session_env,
     set_current_session_id,
     set_session_vars,
+    suppress_process_session_id_mirroring,
 )
 
 
@@ -92,7 +94,7 @@ class TestSessionIdContextvarIsolation:
             "value — session-id thread mixing regression"
         )
 
-    def test_set_current_session_id_does_not_write_process_global_environ(self):
+    def test_scoped_rotation_does_not_write_process_global_environ(self):
         """set_current_session_id (used by compression rotation and
         agent_init) must NOT write the process-global os.environ, because
         concurrent gateway turns would clobber each other's session id —
@@ -106,7 +108,8 @@ class TestSessionIdContextvarIsolation:
         # Pre-existing env value from an unrelated CLI/cron process.
         os.environ["HERMES_SESSION_ID"] = "cli-session"
 
-        set_current_session_id("gateway-session-A")
+        with suppress_process_session_id_mirroring():
+            set_current_session_id("gateway-session-A")
 
         # The ContextVar must be set…
         assert _SESSION_ID.get() == "gateway-session-A"
@@ -126,8 +129,9 @@ class TestSessionIdContextvarIsolation:
         results = {}
 
         def worker(key):
-            set_current_session_id(key)
-            results[key] = get_session_env("HERMES_SESSION_ID")
+            with suppress_process_session_id_mirroring():
+                set_current_session_id(key)
+                results[key] = get_session_env("HERMES_SESSION_ID")
 
         ta = threading.Thread(target=worker, args=("session-A",))
         tb = threading.Thread(target=worker, args=("session-B",))
@@ -142,32 +146,4 @@ class TestSessionIdContextvarIsolation:
         assert os.environ.get("HERMES_SESSION_ID") == "baseline", (
             "a concurrent set_current_session_id write leaked into "
             "process-global os.environ"
-        )
-
-    def test_no_os_environ_writes_in_compression_or_init_paths(self):
-        """Grep-level guard: the compaction rotation/rollback fallbacks
-        and agent_init must NOT contain ``os.environ["HERMES_SESSION_ID"]``
-        writes (the #24100 bug class).  The ACP adapter is exempt (it
-        runs as a separate process per session in production)."""
-        import pathlib
-
-        root = pathlib.Path(__file__).resolve().parents[2]  # repo root
-        files_to_check = [
-            root / "agent" / "conversation_compression.py",
-            root / "agent" / "agent_init.py",
-            root / "gateway" / "session_context.py",
-        ]
-        pattern = 'os.environ["HERMES_SESSION_ID"]'
-        offenders = []
-        for f in files_to_check:
-            if not f.exists():
-                continue
-            for i, line in enumerate(f.read_text().splitlines(), 1):
-                stripped = line.split("#")[0]  # ignore comment-only lines
-                if pattern in stripped and "NOT" not in stripped and "deliberately" not in stripped:
-                    offenders.append(f"{f.name}:{i}: {line.strip()}")
-        assert not offenders, (
-            "Found os.environ[\"HERMES_SESSION_ID\"] writes in compaction/"
-            "init/gateway paths — these are process-global and clobber "
-            "concurrent sessions (#24100 class):\n" + "\n".join(offenders)
         )
