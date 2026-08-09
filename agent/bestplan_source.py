@@ -1328,46 +1328,42 @@ def _scan_nonignored_specials(repo: RepoIdentity, *, deadline: float) -> None:
         for directory, prefix in frontier:
             try:
                 with os.scandir(directory) as iterator:
-                    entries = []
                     for entry in iterator:
                         _remaining(deadline)
-                        entries.append(entry)
+                        name = os.fsencode(entry.name)
+                        if not prefix and name == b".git":
+                            continue
+                        relative = name if not prefix else prefix + b"/" + name
+                        seen_entries += 1
+                        seen_path_bytes += len(relative)
+                        if len(relative) > _MAX_PATH_BYTES or (
+                            seen_entries > _MAX_PROTECTED_PATHS
+                            or seen_path_bytes > _MAX_TOTAL_PATH_BYTES
+                        ):
+                            raise UnsupportedRepositoryError(
+                                "repository path metadata exceeds the trusted limit"
+                            )
+                        if prefix and name == b".git":
+                            raise UnsupportedRepositoryError(
+                                "nonignored nested Git repository boundary is unsupported: "
+                                f"{os.fsdecode(relative)}"
+                            )
+                        try:
+                            mode = entry.stat(follow_symlinks=False).st_mode
+                        except FileNotFoundError as exc:
+                            raise _CaptureChanged(
+                                f"repository entry changed: {os.fsdecode(relative)}"
+                            ) from exc
+                        if (
+                            stat.S_ISDIR(mode)
+                            and os.path.realpath(os.fsencode(entry.path)) in metadata_dirs
+                        ):
+                            continue
+                        candidates.append((entry, relative, mode))
             except OSError as exc:
                 raise SourceBoundaryError(
                     f"repository path cannot be enumerated: {os.fsdecode(directory)}: {exc}"
                 ) from exc
-            for entry in entries:
-                _remaining(deadline)
-                name = os.fsencode(entry.name)
-                if not prefix and name == b".git":
-                    continue
-                relative = name if not prefix else prefix + b"/" + name
-                seen_entries += 1
-                seen_path_bytes += len(relative)
-                if len(relative) > _MAX_PATH_BYTES or (
-                    seen_entries > _MAX_PROTECTED_PATHS
-                    or seen_path_bytes > _MAX_TOTAL_PATH_BYTES
-                ):
-                    raise UnsupportedRepositoryError(
-                        "repository path metadata exceeds the trusted limit"
-                    )
-                if prefix and name == b".git":
-                    raise UnsupportedRepositoryError(
-                        "nonignored nested Git repository boundary is unsupported: "
-                        f"{os.fsdecode(relative)}"
-                    )
-                try:
-                    mode = entry.stat(follow_symlinks=False).st_mode
-                except FileNotFoundError as exc:
-                    raise _CaptureChanged(
-                        f"repository entry changed: {os.fsdecode(relative)}"
-                    ) from exc
-                if (
-                    stat.S_ISDIR(mode)
-                    and os.path.realpath(os.fsencode(entry.path)) in metadata_dirs
-                ):
-                    continue
-                candidates.append((entry, relative, mode))
         ignored = _ignored_paths(
             repo, [relative for _entry, relative, _mode in candidates], deadline=deadline,
         )

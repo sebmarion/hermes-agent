@@ -217,6 +217,55 @@ def test_special_file_scan_batches_ignore_queries_by_depth(tmp_path, monkeypatch
     assert calls <= 4
 
 
+def test_special_file_scan_enforces_entry_limit_while_iterating(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    for index in range(8):
+        (repo / f"ambient-{index}.txt").write_bytes(b"ambient\n")
+    real_scandir = source.os.scandir
+    root_raw = os.fsencode(repo)
+    root_yields = 0
+
+    class GuardedScandir:
+        def __init__(self, path):
+            self._is_root = os.fsencode(path) == root_raw
+            self._context = real_scandir(path)
+
+        def __enter__(self):
+            self._iterator = iter(self._context.__enter__())
+            return self
+
+        def __exit__(self, *args):
+            return self._context.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal root_yields
+            entry = next(self._iterator)
+            if self._is_root:
+                root_yields += 1
+                if root_yields > 3:
+                    raise AssertionError(
+                        "directory was buffered past the trusted entry limit"
+                    )
+            return entry
+
+    monkeypatch.setattr(source, "_MAX_PROTECTED_PATHS", 1)
+    monkeypatch.setattr(source.os, "scandir", GuardedScandir)
+
+    with pytest.raises(source.UnsupportedRepositoryError, match="metadata|limit"):
+        source._scan_nonignored_specials(
+            source.resolve_repo_identity(str(repo)),
+            deadline=time.monotonic() + 2.0,
+        )
+
+    assert root_yields <= 3
+
+
 def test_snapshot_records_repo_head_ref_common_dir_and_full_oid(tmp_path):
     source = _source()
     repo = _init_repo(tmp_path / "repo")
