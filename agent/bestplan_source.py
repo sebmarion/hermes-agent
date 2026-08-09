@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pickle
+import signal
 import stat
 import subprocess
+import sys
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -109,6 +112,7 @@ class SourceSnapshot:
     head_oid: str
     tree_oid: str
     protected_manifest: ProtectedManifest
+    capture_implementation_sha256: str
     fingerprint: str
 
     @property
@@ -126,6 +130,18 @@ class _TreeEntry:
     mode: int
     object_type: bytes
     oid: str
+
+
+@dataclass(frozen=True)
+class _PreparedDestination:
+    path: bytes
+    leaf: bytes
+    root_fd: int
+    root_identity: tuple[int, int]
+    raw_parent: bytes
+    canonical_parent: bytes
+    parent_fds: tuple[int, ...]
+    parent_identities: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -240,6 +256,60 @@ def _sha256_bytes(value: bytes, *, deadline: float) -> str:
         digest.update(value[offset:offset + _BUFFER_SIZE])
     _remaining(deadline)
     return digest.hexdigest()
+
+
+def _loaded_file_sha256(path: bytes) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, _BUFFER_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    before_state = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_state = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_state != after_state:
+        raise RuntimeError("BestPlan capture implementation changed during import")
+    return digest.hexdigest()
+
+
+_CAPTURE_MODULE_PATH = os.path.realpath(os.fsencode(__file__))
+_CAPTURE_INTERPRETER_PATH = os.path.realpath(os.fsencode(sys.executable))
+_CAPTURE_MODULE_SHA256 = _loaded_file_sha256(_CAPTURE_MODULE_PATH)
+_capture_interpreter_stat = os.stat(_CAPTURE_INTERPRETER_PATH)
+_CAPTURE_IMPLEMENTATION_SHA256 = _hash_fields(
+    b"bestplan-capture-authority-v1",
+    (
+        _CAPTURE_MODULE_PATH,
+        _CAPTURE_MODULE_SHA256.encode("ascii"),
+        _CAPTURE_INTERPRETER_PATH,
+        str(_capture_interpreter_stat.st_dev).encode("ascii"),
+        str(_capture_interpreter_stat.st_ino).encode("ascii"),
+        sys.version.encode("utf-8"),
+        str(sys.implementation.cache_tag or "").encode("ascii"),
+    ),
+)
 
 
 def _canonical_raw(path: str | os.PathLike[str]) -> bytes:
@@ -1004,7 +1074,7 @@ def capture_protected_manifest(
     special_flag_paths = {
         entry.path
         for entry in index_flags
-        if entry.assume_unchanged or entry.skip_worktree or entry.fsmonitor_valid
+        if entry.assume_unchanged or entry.skip_worktree
     }
     protected_paths = tuple(sorted(
         set(_split_nul(staged_names_raw, deadline=absolute_deadline))
@@ -1108,6 +1178,7 @@ def _snapshot_fingerprint(
             repo.common_dir_raw,
             str(repo.common_dir_device).encode("ascii"),
             str(repo.common_dir_inode).encode("ascii"),
+            _CAPTURE_IMPLEMENTATION_SHA256.encode("ascii"),
             read.head_raw,
             b"" if read.head_ref is None else read.head_ref,
             read.head_oid.encode("ascii"),
@@ -1118,8 +1189,10 @@ def _snapshot_fingerprint(
     )
 
 
-def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapshot:
-    """Require two consecutive identical source/ambient reads before returning."""
+def _capture_source_snapshot_in_process(
+    repo: RepoIdentity, deadline: float,
+) -> SourceSnapshot:
+    """In-process primitive used only inside the trusted spawned helper/tests."""
 
     absolute_deadline = float(deadline)
     previous: _SourceRead | None = None
@@ -1139,6 +1212,7 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
                 head_oid=current.head_oid,
                 tree_oid=current.tree_oid,
                 protected_manifest=current.protected_manifest,
+                capture_implementation_sha256=_CAPTURE_IMPLEMENTATION_SHA256,
                 fingerprint=_snapshot_fingerprint(
                     repo, current, deadline=absolute_deadline,
                 ),
@@ -1147,6 +1221,420 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
     raise ProofStaleError(
         "proof_stale: source did not stabilize within the bounded read attempts"
     )
+
+
+_CAPTURE_HELPER_BOOTSTRAP = r"""
+import hashlib
+import importlib.util
+import os
+import pickle
+import stat
+import sys
+import types
+
+sys.dont_write_bytecode = True
+(
+    module_path,
+    expected_identity,
+    expected_module_sha256,
+    expected_interpreter_path,
+    expected_interpreter_dev,
+    expected_interpreter_ino,
+) = sys.argv[1:7]
+module_path_raw = os.fsencode(module_path)
+interpreter_path_raw = os.fsencode(expected_interpreter_path)
+interpreter_info = os.stat(interpreter_path_raw)
+if (
+    os.path.realpath(os.fsencode(sys.executable)) != interpreter_path_raw
+    or interpreter_info.st_dev != int(expected_interpreter_dev)
+    or interpreter_info.st_ino != int(expected_interpreter_ino)
+):
+    raise RuntimeError("trusted BestPlan capture interpreter identity mismatch")
+
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+flags |= getattr(os, "O_NOFOLLOW", 0)
+module_fd = os.open(module_path_raw, flags)
+try:
+    module_before = os.fstat(module_fd)
+    module_chunks = []
+    while True:
+        chunk = os.read(module_fd, 1024 * 1024)
+        if not chunk:
+            break
+        module_chunks.append(chunk)
+    module_after = os.fstat(module_fd)
+finally:
+    os.close(module_fd)
+module_state_before = (
+    module_before.st_dev,
+    module_before.st_ino,
+    module_before.st_mode,
+    module_before.st_size,
+    module_before.st_mtime_ns,
+    module_before.st_ctime_ns,
+)
+module_state_after = (
+    module_after.st_dev,
+    module_after.st_ino,
+    module_after.st_mode,
+    module_after.st_size,
+    module_after.st_mtime_ns,
+    module_after.st_ctime_ns,
+)
+module_bytes = b"".join(module_chunks)
+if (
+    not stat.S_ISREG(module_before.st_mode)
+    or module_state_before != module_state_after
+    or hashlib.sha256(module_bytes).hexdigest() != expected_module_sha256
+):
+    raise RuntimeError("trusted BestPlan capture module identity mismatch")
+
+agent_package = types.ModuleType("agent")
+agent_package.__path__ = []
+sys.modules["agent"] = agent_package
+module = types.ModuleType("agent.bestplan_source")
+module.__file__ = module_path
+module.__package__ = "agent"
+module.__spec__ = importlib.util.spec_from_loader(
+    "agent.bestplan_source", loader=None, origin=module_path,
+)
+sys.modules["agent.bestplan_source"] = module
+exec(compile(module_bytes, module_path, "exec"), module.__dict__)
+
+try:
+    request_identity, repo, remaining_budget = pickle.loads(sys.stdin.buffer.read())
+    if (
+        request_identity != expected_identity
+        or module._CAPTURE_IMPLEMENTATION_SHA256 != expected_identity
+        or not isinstance(repo, module.RepoIdentity)
+    ):
+        raise module.SourceBoundaryError(
+            "trusted capture helper implementation identity mismatch"
+        )
+    remaining_budget = float(remaining_budget)
+    if remaining_budget <= 0.0:
+        raise module.ProofStaleError(
+            "proof_stale: source capture deadline expired before helper startup"
+        )
+    child_deadline = module.time.monotonic() + remaining_budget
+    snapshot = module._capture_source_snapshot_in_process(repo, child_deadline)
+    payload = ("ok", expected_identity, snapshot)
+except module.SourceBoundaryError as exc:
+    payload = (
+        "error",
+        expected_identity,
+        type(exc).__name__,
+        exc.code,
+        str(exc),
+    )
+except BaseException as exc:
+    payload = (
+        "error",
+        expected_identity,
+        "SourceBoundaryError",
+        "source_unavailable",
+        f"trusted capture helper failed closed: {type(exc).__name__}: {exc}",
+    )
+sys.stdout.buffer.write(pickle.dumps(payload, protocol=5))
+sys.stdout.buffer.flush()
+"""
+
+
+def _capture_helper_argv() -> list[str]:
+    return [
+        os.fsdecode(_CAPTURE_INTERPRETER_PATH),
+        "-I",
+        "-S",
+        "-c",
+        _CAPTURE_HELPER_BOOTSTRAP,
+        os.fsdecode(_CAPTURE_MODULE_PATH),
+        _CAPTURE_IMPLEMENTATION_SHA256,
+        _CAPTURE_MODULE_SHA256,
+        os.fsdecode(_CAPTURE_INTERPRETER_PATH),
+        str(_capture_interpreter_stat.st_dev),
+        str(_capture_interpreter_stat.st_ino),
+    ]
+
+
+def _capture_helper_environment() -> dict[str, str]:
+    allowed = (
+        "HOME",
+        "LANG",
+        "PATH",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+    )
+    env = {key: os.environ[key] for key in allowed if key in os.environ}
+    env["LC_ALL"] = "C"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _attach_capture_helper_containment(
+    process: subprocess.Popen,
+) -> object | None:
+    """Attach a Windows kill-on-close job; POSIX uses the new session group."""
+
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("read_operations", ctypes.c_ulonglong),
+            ("write_operations", ctypes.c_ulonglong),
+            ("other_operations", ctypes.c_ulonglong),
+            ("read_bytes", ctypes.c_ulonglong),
+            ("write_bytes", ctypes.c_ulonglong),
+            ("other_bytes", ctypes.c_ulonglong),
+        ]
+
+    class _BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("per_process_time", ctypes.c_longlong),
+            ("per_job_time", ctypes.c_longlong),
+            ("limit_flags", wintypes.DWORD),
+            ("minimum_working_set", ctypes.c_size_t),
+            ("maximum_working_set", ctypes.c_size_t),
+            ("active_process_limit", wintypes.DWORD),
+            ("affinity", ctypes.c_size_t),
+            ("priority_class", wintypes.DWORD),
+            ("scheduling_class", wintypes.DWORD),
+        ]
+
+    class _ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("basic", _BasicLimitInformation),
+            ("io", _IoCounters),
+            ("process_memory_limit", ctypes.c_size_t),
+            ("job_memory_limit", ctypes.c_size_t),
+            ("peak_process_memory", ctypes.c_size_t),
+            ("peak_job_memory", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        limits = _ExtendedLimitInformation()
+        limits.basic.limit_flags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            job, 9, ctypes.byref(limits), ctypes.sizeof(limits),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.AssignProcessToJobObject(
+            job, wintypes.HANDLE(int(process._handle)),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except BaseException:
+        kernel32.CloseHandle(job)
+        raise
+    return job
+
+
+def _close_capture_helper_containment(handle: object | None) -> None:
+    if handle is None:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle(handle)
+
+
+def _signal_capture_helper(
+    process: subprocess.Popen, sig: int | None, *, force: bool = False,
+) -> bool:
+    if os.name == "posix" and sig is not None:
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return True
+    if process.poll() is not None:
+        return True
+    try:
+        if force:
+            process.kill()
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _terminate_capture_helper(process: subprocess.Popen) -> None:
+    _signal_capture_helper(process, getattr(signal, "SIGTERM", None))
+    leader_reaped = False
+    try:
+        process.communicate(timeout=0.2)
+        leader_reaped = True
+    except subprocess.TimeoutExpired:
+        pass
+    # The leader can exit on SIGTERM while a Git/FS descendant ignores it.
+    # Always kill the original POSIX process group before declaring cleanup.
+    group_killed = _signal_capture_helper(
+        process, getattr(signal, "SIGKILL", None), force=True,
+    )
+    if leader_reaped:
+        if not group_killed:
+            raise ProofStaleError(
+                "proof_stale: capture helper process group could not be killed"
+            )
+        return
+    try:
+        process.communicate(timeout=1.0)
+    except subprocess.TimeoutExpired as exc:
+        raise ProofStaleError(
+            "proof_stale: capture helper could not be reaped after kill"
+        ) from exc
+    if not group_killed:
+        raise ProofStaleError(
+            "proof_stale: capture helper process group could not be killed"
+        )
+
+
+def _raise_capture_helper_error(
+    class_name: str, code: str, message: str,
+) -> None:
+    if code == ProofStaleError.code or class_name == "ProofStaleError":
+        raise ProofStaleError(message, code=code)
+    if (
+        code == UnsupportedRepositoryError.code
+        or class_name == "UnsupportedRepositoryError"
+    ):
+        raise UnsupportedRepositoryError(message, code=code)
+    raise SourceBoundaryError(message, code=code)
+
+
+def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapshot:
+    """Capture in an isolated, deadline-killable trusted helper process."""
+
+    absolute_deadline = float(deadline)
+    remaining_budget = _remaining(absolute_deadline)
+    request = pickle.dumps(
+        (_CAPTURE_IMPLEMENTATION_SHA256, repo, remaining_budget), protocol=5,
+    )
+    _remaining(absolute_deadline)
+    try:
+        process = subprocess.Popen(
+            _capture_helper_argv(),
+            cwd=os.sep,
+            env=_capture_helper_environment(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=(os.name == "posix"),
+        )
+    except OSError as exc:
+        raise SourceBoundaryError(
+            f"trusted capture helper could not start: {type(exc).__name__}: {exc}"
+        ) from exc
+    containment: object | None = None
+    try:
+        containment = _attach_capture_helper_containment(process)
+    except OSError as exc:
+        _terminate_capture_helper(process)
+        raise SourceBoundaryError(
+            f"trusted capture helper containment unavailable: {exc}"
+        ) from exc
+    try:
+        try:
+            timeout = _remaining(absolute_deadline)
+        except SourceBoundaryError:
+            _close_capture_helper_containment(containment)
+            containment = None
+            _terminate_capture_helper(process)
+            raise
+        try:
+            output, stderr = process.communicate(input=request, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _close_capture_helper_containment(containment)
+            containment = None
+            _terminate_capture_helper(process)
+            raise ProofStaleError(
+                "proof_stale: trusted capture helper exceeded the source deadline"
+            ) from exc
+        # A coded helper result is not proof that a Git/FS descendant exited.
+        # Sweep the isolated POSIX process group before trusting any payload.
+        if not _signal_capture_helper(
+            process, getattr(signal, "SIGKILL", None), force=True,
+        ):
+            raise ProofStaleError(
+                "proof_stale: capture helper process group cleanup failed"
+            )
+        _close_capture_helper_containment(containment)
+        containment = None
+    except BaseException:
+        _close_capture_helper_containment(containment)
+        containment = None
+        if process.poll() is None:
+            _terminate_capture_helper(process)
+        raise
+    finally:
+        _close_capture_helper_containment(containment)
+
+    _remaining(absolute_deadline)
+    if process.returncode != 0:
+        detail = os.fsdecode(stderr[-4096:]).strip() or f"exit {process.returncode}"
+        raise SourceBoundaryError(
+            f"trusted capture helper failed: {detail}"
+        )
+    try:
+        payload = pickle.loads(output)
+    except (EOFError, pickle.PickleError, AttributeError, ValueError) as exc:
+        raise SourceBoundaryError(
+            "trusted capture helper returned an invalid response"
+        ) from exc
+    _remaining(absolute_deadline)
+    if not isinstance(payload, tuple) or len(payload) < 3:
+        raise SourceBoundaryError("trusted capture helper returned a malformed response")
+    status, identity, *fields = payload
+    if identity != _CAPTURE_IMPLEMENTATION_SHA256:
+        raise SourceBoundaryError(
+            "trusted capture helper response identity mismatch"
+        )
+    if status == "error" and len(fields) == 3:
+        class_name, code, message = fields
+        _raise_capture_helper_error(str(class_name), str(code), str(message))
+    if status != "ok" or len(fields) != 1:
+        raise SourceBoundaryError("trusted capture helper returned a malformed result")
+    snapshot = fields[0]
+    if (
+        not isinstance(snapshot, SourceSnapshot)
+        or snapshot.repo != repo
+        or snapshot.capture_implementation_sha256
+        != _CAPTURE_IMPLEMENTATION_SHA256
+    ):
+        raise SourceBoundaryError("trusted capture helper returned an unbound snapshot")
+    return snapshot
 
 
 def recapture_matches(
@@ -1198,19 +1686,122 @@ def _assert_tree_path_aliases(
             normalized_parent.append(normalized)
 
 
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    return flags | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _close_fds(fds: Iterable[int]) -> None:
+    for fd in reversed(tuple(fds)):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _open_canonical_parent_chain(
+    raw_parent: bytes, *, deadline: float,
+) -> tuple[bytes, tuple[int, ...], tuple[tuple[int, int], ...]]:
+    _remaining(deadline)
+    canonical_before = os.path.realpath(raw_parent)
+    _remaining(deadline)
+    if canonical_before != raw_parent:
+        raise SourceBoundaryError(
+            "exact-tree destination parent contains a symlink or alias"
+        )
+    if not os.path.isabs(raw_parent):
+        raise SourceBoundaryError("exact-tree destination parent is not absolute")
+
+    components = tuple(
+        component for component in raw_parent.split(os.sep.encode()) if component
+    )
+    fds: list[int] = []
+    identities: list[tuple[int, int]] = []
+    try:
+        root_fd = os.open(os.sep.encode(), _directory_open_flags())
+        root_info = os.fstat(root_fd)
+        fds.append(root_fd)
+        identities.append((root_info.st_dev, root_info.st_ino))
+        for component in components:
+            _remaining(deadline)
+            if component in {b"", b".", b".."}:
+                raise SourceBoundaryError(
+                    "exact-tree destination parent component is unsafe"
+                )
+            before = os.stat(
+                component, dir_fd=fds[-1], follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(before.st_mode):
+                raise SourceBoundaryError(
+                    "exact-tree destination parent contains a symlink or non-directory"
+                )
+            opened_fd = os.open(
+                component, _directory_open_flags(), dir_fd=fds[-1],
+            )
+            opened = os.fstat(opened_fd)
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                os.close(opened_fd)
+                raise SourceBoundaryError(
+                    "exact-tree destination parent changed while opening"
+                )
+            fds.append(opened_fd)
+            identities.append((opened.st_dev, opened.st_ino))
+        canonical_after = os.path.realpath(raw_parent)
+        _remaining(deadline)
+        if canonical_after != canonical_before:
+            raise SourceBoundaryError(
+                "exact-tree destination parent changed while opening"
+            )
+    except OSError as exc:
+        _close_fds(fds)
+        raise SourceBoundaryError(
+            f"exact-tree destination parent is unsafe: {exc}"
+        ) from exc
+    except BaseException:
+        _close_fds(fds)
+        raise
+    return canonical_before, tuple(fds), tuple(identities)
+
+
+def _verify_destination_parent(
+    prepared: _PreparedDestination, *, deadline: float,
+) -> None:
+    for fd, expected in zip(prepared.parent_fds, prepared.parent_identities):
+        _remaining(deadline)
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) != expected:
+            raise SourceBoundaryError(
+                "exact-tree destination parent descriptor changed"
+            )
+    canonical, verification_fds, identities = _open_canonical_parent_chain(
+        prepared.raw_parent, deadline=deadline,
+    )
+    try:
+        if (
+            canonical != prepared.canonical_parent
+            or identities != prepared.parent_identities
+        ):
+            raise SourceBoundaryError(
+                "exact-tree destination parent identity changed"
+            )
+    finally:
+        _close_fds(verification_fds)
+
+
 def _prepare_destination(
     repo: RepoIdentity,
     destination: str | os.PathLike[str],
     *,
     deadline: float,
-) -> tuple[bytes, int, tuple[int, int]]:
+) -> _PreparedDestination:
     _remaining(deadline)
     raw = os.path.abspath(os.path.expanduser(os.fsencode(destination)))
     leaf = os.path.basename(raw)
     if leaf in {b"", b".", b".."} or b"/" in leaf or b"\0" in leaf:
         raise SourceBoundaryError("exact-tree destination path is unsafe")
-    parent = os.path.realpath(os.path.dirname(raw))
-    canonical = os.path.join(parent, leaf)
+    raw_parent = os.path.dirname(raw)
+    canonical_parent = os.path.realpath(raw_parent)
+    canonical = os.path.join(canonical_parent, leaf)
     for source_root in (
         repo.worktree_raw,
         repo.git_dir_raw,
@@ -1221,14 +1812,11 @@ def _prepare_destination(
                 "exact-tree destination cannot be inside the source repository or Git state"
             )
 
-    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        parent_fd = os.open(parent, directory_flags)
-    except OSError as exc:
-        raise SourceBoundaryError(
-            f"exact-tree destination parent is unsafe: {exc}"
-        ) from exc
+    canonical_parent, parent_fds, parent_identities = _open_canonical_parent_chain(
+        raw_parent, deadline=deadline,
+    )
+    parent_fd = parent_fds[-1]
+    root_fd: int | None = None
     try:
         _remaining(deadline)
         try:
@@ -1242,7 +1830,7 @@ def _prepare_destination(
         try:
             os.mkdir(leaf, mode=0o700, dir_fd=parent_fd)
             created = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
-            root_fd = os.open(leaf, directory_flags, dir_fd=parent_fd)
+            root_fd = os.open(leaf, _directory_open_flags(), dir_fd=parent_fd)
         except OSError as exc:
             raise SourceBoundaryError(
                 f"exact-tree destination could not be created safely: {exc}"
@@ -1252,14 +1840,26 @@ def _prepare_destination(
             created.st_dev,
             created.st_ino,
         ) != (opened.st_dev, opened.st_ino):
-            os.close(root_fd)
             raise SourceBoundaryError(
                 "exact-tree destination changed while it was being opened"
             )
-    finally:
-        os.close(parent_fd)
-    _remaining(deadline)
-    return canonical, root_fd, (opened.st_dev, opened.st_ino)
+        prepared = _PreparedDestination(
+            path=canonical,
+            leaf=leaf,
+            root_fd=root_fd,
+            root_identity=(opened.st_dev, opened.st_ino),
+            raw_parent=raw_parent,
+            canonical_parent=canonical_parent,
+            parent_fds=parent_fds,
+            parent_identities=parent_identities,
+        )
+        _verify_destination_parent(prepared, deadline=deadline)
+        return prepared
+    except BaseException:
+        if root_fd is not None:
+            os.close(root_fd)
+        _close_fds(parent_fds)
+        raise
 
 
 def _batch_blobs(
@@ -1389,16 +1989,16 @@ def export_exact_tree(
         if entry.mode == 0o120000 and (not content or b"\0" in content):
             raise UnsupportedRepositoryError("Git tree contains an unsafe symlink target")
 
-    destination_raw, root_fd, root_identity = _prepare_destination(
+    prepared = _prepare_destination(
         snapshot.repo, destination, deadline=deadline,
     )
-    directories: dict[tuple[bytes, ...], int] = {(): root_fd}
+    directories: dict[tuple[bytes, ...], int] = {(): prepared.root_fd}
     try:
         for entry, content in zip(entries, blobs):
             _remaining(deadline)
             parts = tuple(entry.path.split(b"/"))
             parent_fd = _export_parent_fd(
-                root_fd, directories, parts[:-1], deadline=deadline,
+                prepared.root_fd, directories, parts[:-1], deadline=deadline,
             )
             if entry.mode == 0o120000:
                 try:
@@ -1416,17 +2016,20 @@ def export_exact_tree(
                     deadline=deadline,
                 )
         _remaining(deadline)
-        os.fchmod(root_fd, 0o755)
+        os.fchmod(prepared.root_fd, 0o755)
+        final = os.stat(
+            prepared.leaf,
+            dir_fd=prepared.parent_fds[-1],
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(final.st_mode) or (
+            final.st_dev,
+            final.st_ino,
+        ) != prepared.root_identity:
+            raise SourceBoundaryError(
+                "exact-tree destination was substituted during export"
+            )
+        _verify_destination_parent(prepared, deadline=deadline)
     finally:
-        for fd in reversed(tuple(directories.values())):
-            os.close(fd)
-    _remaining(deadline)
-    try:
-        final = os.lstat(destination_raw)
-    except OSError as exc:
-        raise SourceBoundaryError("exact-tree destination disappeared after export") from exc
-    if not stat.S_ISDIR(final.st_mode) or (
-        final.st_dev,
-        final.st_ino,
-    ) != root_identity:
-        raise SourceBoundaryError("exact-tree destination was substituted during export")
+        _close_fds(directories.values())
+        _close_fds(prepared.parent_fds)

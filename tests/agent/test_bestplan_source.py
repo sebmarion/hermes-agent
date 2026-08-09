@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import importlib
 import os
+import pickle
+import signal
 import sqlite3
 import stat
 import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -145,11 +148,12 @@ def test_ignored_runtime_trees_do_not_block_or_get_recursively_scanned(
         return real_scandir(path)
 
     monkeypatch.setattr(source.os, "scandir", guarded_scandir)
-    first = source.capture_source_snapshot(
+    assert hasattr(source, "_capture_source_snapshot_in_process")
+    first = source._capture_source_snapshot_in_process(
         source.resolve_repo_identity(str(repo)), time.monotonic() + 5.0,
     )
     (repo / ".bytecode-fingerprint").write_bytes(b"changed but ignored")
-    second = source.capture_source_snapshot(
+    second = source._capture_source_snapshot_in_process(
         source.resolve_repo_identity(str(repo)), time.monotonic() + 5.0,
     )
     assert second.fingerprint == first.fingerprint
@@ -194,6 +198,57 @@ def test_snapshot_records_repo_head_ref_common_dir_and_full_oid(tmp_path):
     assert snapshot.head_ref == b"refs/heads/" + _git(repo, "branch", "--show-current")
     assert snapshot.head_symbolic is True
     assert snapshot.head_raw == b"ref: " + snapshot.head_ref + b"\n"
+    assert snapshot.capture_implementation_sha256 == (
+        source._CAPTURE_IMPLEMENTATION_SHA256
+    )
+
+
+def test_capture_bootstrap_verifies_module_bytes_before_execution(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    marker = tmp_path / "replacement-executed"
+    replacement = tmp_path / "bestplan_source.py"
+    replacement.write_text(
+        "import sys\n"
+        f"open({str(marker)!r}, 'wb').close()\n"
+        "class SourceBoundaryError(ValueError):\n"
+        "    code = 'source_unavailable'\n"
+        "class RepoIdentity:\n"
+        "    pass\n"
+        "_CAPTURE_IMPLEMENTATION_SHA256 = sys.argv[2]\n"
+        "def _capture_source_snapshot_in_process(repo, deadline):\n"
+        "    raise SourceBoundaryError('replacement accepted')\n",
+        encoding="utf-8",
+    )
+    interpreter = os.fsdecode(source._CAPTURE_INTERPRETER_PATH)
+    interpreter_stat = os.stat(source._CAPTURE_INTERPRETER_PATH)
+    command = [
+        interpreter,
+        "-I",
+        "-S",
+        "-c",
+        source._CAPTURE_HELPER_BOOTSTRAP,
+        str(replacement),
+        source._CAPTURE_IMPLEMENTATION_SHA256,
+        source._CAPTURE_MODULE_SHA256,
+        interpreter,
+        str(interpreter_stat.st_dev),
+        str(interpreter_stat.st_ino),
+    ]
+    result = subprocess.run(
+        command,
+        input=pickle.dumps(
+            (source._CAPTURE_IMPLEMENTATION_SHA256, identity, 1.0),
+            protocol=5,
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=3.0,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert not marker.exists()
 
 
 def test_snapshot_fingerprint_binds_linked_worktree_and_identity_fields(tmp_path):
@@ -414,6 +469,20 @@ def test_protected_paths_only_block_dirty_untracked_and_special_index_state(tmp_
     assert raw_untracked in with_untracked.protected_paths
 
 
+def test_clean_fsmonitor_valid_entry_is_manifested_but_not_protected(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    _git(repo, "config", "core.fsmonitor", "true")
+    _git(repo, "update-index", "--fsmonitor-valid", "tracked.txt")
+
+    manifest = source.capture_protected_manifest(
+        source.resolve_repo_identity(str(repo))
+    )
+    flag = {entry.path: entry for entry in manifest.index_flags}[b"tracked.txt"]
+    assert flag.fsmonitor_valid is True
+    assert b"tracked.txt" not in manifest.protected_paths
+
+
 def test_manifest_pins_raw_staged_and_unstaged_diff_semantics(tmp_path, monkeypatch):
     source = _source()
     repo = _init_repo(tmp_path / "repo")
@@ -467,7 +536,9 @@ def test_capture_accepts_a_b_b_as_two_consecutive_identical_reads(
         return next(reads)
 
     monkeypatch.setattr(source, "_head_read", sequenced_read)
-    snapshot = source.capture_source_snapshot(identity, time.monotonic() + 1.0)
+    snapshot = source._capture_source_snapshot_in_process(
+        identity, time.monotonic() + 1.0,
+    )
     assert snapshot.protected_manifest.digest == "b" * 64
     assert calls == 3
 
@@ -492,7 +563,9 @@ def test_capture_churn_has_a_bounded_attempt_count_and_fails_proof_stale(
 
     monkeypatch.setattr(source, "_head_read", alternating_read)
     with pytest.raises(source.ProofStaleError) as raised:
-        source.capture_source_snapshot(identity, time.monotonic() + 1.0)
+        source._capture_source_snapshot_in_process(
+            identity, time.monotonic() + 1.0,
+        )
     assert raised.value.code == "proof_stale"
     assert 2 <= calls <= 16
 
@@ -519,11 +592,20 @@ def test_real_index_and_worktree_churn_is_proof_stale_and_persists_no_plan(
     monkeypatch.setattr(source, "_MAX_STABILIZATION_READS", 4)
     monkeypatch.setattr(source, "_head_read", alternating_real_read)
     with pytest.raises(source.ProofStaleError) as raised:
-        source.capture_source_snapshot(identity, time.monotonic() + 10.0)
+        source._capture_source_snapshot_in_process(
+            identity, time.monotonic() + 10.0,
+        )
     assert raised.value.code == "proof_stale"
 
     calls = 0
     store = BestplanStore(db_path=tmp_path / "state" / "state.db")
+    from agent import bestplan_state
+
+    monkeypatch.setattr(
+        bestplan_state,
+        "capture_source_snapshot",
+        source._capture_source_snapshot_in_process,
+    )
     with pytest.raises(BaselineFingerprintError, match="proof_stale"):
         store.create_plan(
             "churning",
@@ -883,3 +965,262 @@ def test_batch_blob_request_checks_deadline_before_spawning_git(tmp_path, monkey
     monkeypatch.setattr(source, "_run_git", unexpected_git)
     with pytest.raises(source.ProofStaleError, match="proof_stale"):
         source._batch_blobs(identity, entries, deadline=time.monotonic() + 1.0)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO support required")
+def test_public_capture_kills_and_reaps_blocked_spawn_helper(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    fifo = tmp_path / "blocking-filesystem-operation"
+    pid_file = tmp_path / "helper.pid"
+    os.mkfifo(fifo)
+
+    assert hasattr(source, "_capture_helper_argv"), (
+        "public capture must use a pinned spawned helper"
+    )
+    blocker = (
+        "import os,sys;"
+        "fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600);"
+        "os.write(fd,str(os.getpid()).encode());os.close(fd);"
+        "os.open(sys.argv[2],os.O_RDONLY)"
+    )
+    command = [
+        sys.executable,
+        "-I",
+        "-S",
+        "-c",
+        blocker,
+        str(pid_file),
+        str(fifo),
+    ]
+    processes = []
+    real_popen = source.subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(source, "_capture_helper_argv", lambda: command)
+    monkeypatch.setattr(source.subprocess, "Popen", recording_popen)
+    with pytest.raises(source.ProofStaleError) as raised:
+        source.capture_source_snapshot(identity, time.monotonic() + 0.5)
+    assert raised.value.code == "proof_stale"
+    assert len(processes) == 1
+    assert processes[0].poll() is not None
+    helper_pid = int(pid_file.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(helper_pid, 0)
+
+
+def test_public_capture_fails_closed_if_helper_containment_cannot_attach(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    assert hasattr(source, "_attach_capture_helper_containment")
+    command = [sys.executable, "-I", "-S", "-c", "import time;time.sleep(30)"]
+    processes = []
+    real_popen = source.subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def unavailable(_process):
+        raise OSError("synthetic containment unavailable")
+
+    monkeypatch.setattr(source, "_capture_helper_argv", lambda: command)
+    monkeypatch.setattr(source, "_attach_capture_helper_containment", unavailable)
+    monkeypatch.setattr(source.subprocess, "Popen", recording_popen)
+    with pytest.raises(source.SourceBoundaryError, match="containment"):
+        source.capture_source_snapshot(identity, time.monotonic() + 2.0)
+    assert len(processes) == 1
+    assert processes[0].poll() is not None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_public_capture_fails_closed_if_process_group_cleanup_is_denied(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+
+    def denied(_process_group, _signal):
+        raise PermissionError("synthetic killpg denial")
+
+    monkeypatch.setattr(source.os, "killpg", denied)
+    with pytest.raises(source.ProofStaleError, match="process group"):
+        source.capture_source_snapshot(identity, time.monotonic() + 5.0)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not hasattr(os, "fork"),
+    reason="POSIX process-group semantics required",
+)
+@pytest.mark.live_system_guard_bypass
+def test_public_capture_kills_descendant_after_helper_leader_exits(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    child_pid_file = tmp_path / "descendant.pid"
+    blocker = """
+import os
+import signal
+import sys
+
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(sys.argv[1], "w", encoding="ascii") as stream:
+        stream.write(str(os.getpid()))
+    os.close(0)
+    os.close(1)
+    os.close(2)
+    while True:
+        signal.pause()
+signal.pause()
+"""
+    command = [
+        sys.executable,
+        "-I",
+        "-S",
+        "-c",
+        blocker,
+        str(child_pid_file),
+    ]
+    monkeypatch.setattr(source, "_capture_helper_argv", lambda: command)
+
+    with pytest.raises(source.ProofStaleError, match="proof_stale"):
+        source.capture_source_snapshot(identity, time.monotonic() + 0.5)
+    child_pid = int(child_pid_file.read_text(encoding="ascii"))
+
+    def descendant_running() -> bool:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            return False
+        proc_stat = Path(f"/proc/{child_pid}/stat")
+        if proc_stat.exists():
+            fields = proc_stat.read_text(encoding="ascii").split()
+            return len(fields) < 3 or fields[2] != "Z"
+        return True
+
+    try:
+        check_until = time.monotonic() + 1.0
+        while descendant_running() and time.monotonic() < check_until:
+            time.sleep(0.01)
+        assert not descendant_running()
+    finally:
+        if descendant_running():
+            os.kill(child_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not hasattr(os, "fork"),
+    reason="POSIX process-group semantics required",
+)
+@pytest.mark.live_system_guard_bypass
+def test_public_capture_sweeps_descendant_after_valid_helper_error(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    child_pid_file = tmp_path / "error-descendant.pid"
+    blocker = """
+import os
+import pickle
+import signal
+import sys
+
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(sys.argv[1], "w", encoding="ascii") as stream:
+        stream.write(str(os.getpid()))
+    os.close(0)
+    os.close(1)
+    os.close(2)
+    while True:
+        signal.pause()
+payload = ("error", sys.argv[2], "ProofStaleError", "proof_stale", "synthetic")
+sys.stdout.buffer.write(pickle.dumps(payload, protocol=5))
+sys.stdout.buffer.flush()
+"""
+    command = [
+        sys.executable,
+        "-I",
+        "-S",
+        "-c",
+        blocker,
+        str(child_pid_file),
+        source._CAPTURE_IMPLEMENTATION_SHA256,
+    ]
+    monkeypatch.setattr(source, "_capture_helper_argv", lambda: command)
+
+    with pytest.raises(source.ProofStaleError, match="synthetic"):
+        source.capture_source_snapshot(identity, time.monotonic() + 2.0)
+    child_pid = int(child_pid_file.read_text(encoding="ascii"))
+
+    def descendant_running() -> bool:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            return False
+        proc_stat = Path(f"/proc/{child_pid}/stat")
+        if proc_stat.exists():
+            fields = proc_stat.read_text(encoding="ascii").split()
+            return len(fields) < 3 or fields[2] != "Z"
+        return True
+
+    try:
+        check_until = time.monotonic() + 1.0
+        while descendant_running() and time.monotonic() < check_until:
+            time.sleep(0.01)
+        assert not descendant_running()
+    finally:
+        if descendant_running():
+            os.kill(child_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+def test_export_rejects_intermediate_parent_symlink_substitution(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    stable = tmp_path / "stable"
+    race_component = stable / "race-component"
+    destination_parent = race_component / "destination-parent"
+    destination_parent.mkdir(parents=True)
+    backup = stable / "race-component-original"
+    attacker = tmp_path / "attacker"
+    (attacker / "destination-parent").mkdir(parents=True)
+    destination = destination_parent / "exported"
+    real_open = source.os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        raw = os.fsencode(path)
+        if not swapped and raw in {
+            os.fsencode(destination_parent),
+            b"race-component",
+        }:
+            race_component.rename(backup)
+            race_component.symlink_to(attacker, target_is_directory=True)
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(source.os, "open", racing_open)
+    with pytest.raises(source.SourceBoundaryError, match="parent|changed|unsafe"):
+        source.export_exact_tree(snapshot, destination)
+    assert swapped is True
+    assert not (attacker / "destination-parent" / "exported").exists()
