@@ -19,6 +19,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from agent.execution_plan import ExecutionPlan, PlanValidationError, compile_execution_plan
 from agent.bestplan_source import (
+    DEFAULT_SOURCE_OPERATION_SECONDS,
     SourceBoundaryError,
     capture_source_snapshot,
     resolve_repo_identity,
@@ -260,7 +261,9 @@ def compute_baseline_fingerprint(workspace: str) -> str:
 
     try:
         repo = resolve_repo_identity(_canonical_workspace(workspace))
-        snapshot = capture_source_snapshot(repo, time.monotonic() + 10.0)
+        snapshot = capture_source_snapshot(
+            repo, time.monotonic() + DEFAULT_SOURCE_OPERATION_SECONDS,
+        )
         return snapshot.fingerprint
     except SourceBoundaryError as exc:
         raise BaselineFingerprintError(
@@ -665,7 +668,9 @@ class BestplanStore:
             baseline_fingerprint = supplied_fingerprint
         else:
             try:
-                snapshot = capture_source_snapshot(repo, time.monotonic() + 10.0)
+                snapshot = capture_source_snapshot(
+                    repo, time.monotonic() + DEFAULT_SOURCE_OPERATION_SECONDS,
+                )
             except SourceBoundaryError as exc:
                 raise BaselineFingerprintError(
                     f"strong git baseline unavailable for {workspace}: {exc.code}: {exc}"

@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import errno
+import json
 import os
 import pickle
 import secrets
 import select
-import shutil
 import signal
 import stat
 import subprocess
@@ -26,7 +26,8 @@ from dataclasses import dataclass
 from typing import BinaryIO, Iterable
 
 
-_DEFAULT_DEADLINE_SECONDS = 10.0
+DEFAULT_SOURCE_OPERATION_SECONDS = 20.0
+_DEFAULT_DEADLINE_SECONDS = DEFAULT_SOURCE_OPERATION_SECONDS
 _BUFFER_SIZE = 1024 * 1024
 _MAX_STABILIZATION_READS = 16
 _CAPTURE_CLEANUP_SECONDS = 1.0
@@ -35,6 +36,7 @@ _MAX_GIT_METADATA_BYTES = 64 * 1024 * 1024
 _MAX_GIT_STDERR_BYTES = 1024 * 1024
 _MAX_GIT_INPUT_BYTES = 64 * 1024 * 1024
 _MAX_HELPER_RESPONSE_BYTES = 256 * 1024 * 1024
+_MAX_AUTHORITY_RESPONSE_BYTES = 64 * 1024
 _MAX_DIFF_BYTES = 256 * 1024 * 1024
 _MAX_PATH_BYTES = 4096
 _MAX_TOTAL_PATH_BYTES = 64 * 1024 * 1024
@@ -162,6 +164,8 @@ class _TreeEntry:
 class _CaptureAuthority:
     module_path: bytes
     module_sha256: str
+    module_device: int
+    module_inode: int
     interpreter_path: bytes
     interpreter_sha256: str
     interpreter_device: int
@@ -202,23 +206,12 @@ class _CaptureChanged(RuntimeError):
 
 
 def _git_environment() -> dict[str, str]:
-    env = dict(os.environ)
-    exact = {
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_CONFIG",
-    }
-    for key in list(env):
-        if key in exact or key.startswith("GIT_CONFIG_"):
-            env.pop(key, None)
+    allowed = ("HOME", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "XDG_CONFIG_HOME")
+    env = {key: os.environ[key] for key in allowed if key in os.environ}
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["LC_ALL"] = "C"
+    env["PATH"] = "/usr/bin:/bin"
     return env
 
 
@@ -305,14 +298,7 @@ def _run_git_output(
         if deadline is None
         else float(deadline)
     )
-    authority = _get_capture_authority()
-    _assert_trusted_file_identity(
-        authority.git_path,
-        authority.git_sha256,
-        authority.git_device,
-        authority.git_inode,
-        require_executable=True,
-    )
+    authority = _get_capture_authority(absolute_deadline)
     if input_data is not None and len(input_data) > _MAX_GIT_INPUT_BYTES:
         raise UnsupportedRepositoryError("Git input metadata exceeds the trusted limit")
     stdin_file: BinaryIO | None = None
@@ -361,13 +347,6 @@ def _run_git_output(
                 )
             time.sleep(min(0.005, remaining))
         _remaining(absolute_deadline)
-        _assert_trusted_file_identity(
-            authority.git_path,
-            authority.git_sha256,
-            authority.git_device,
-            authority.git_inode,
-            require_executable=True,
-        )
         if process.returncode not in ok_codes:
             detail_raw = _read_bounded_file(
                 stderr_file,
@@ -465,19 +444,30 @@ def _sha256_bytes(value: bytes, *, deadline: float) -> str:
 
 
 def _stable_file_identity(
-    path: bytes, *, require_executable: bool = False,
+    path: bytes,
+    *,
+    require_executable: bool = False,
+    deadline: float | None = None,
 ) -> tuple[str, int, int]:
+    if deadline is not None:
+        _remaining(deadline)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
     try:
+        if deadline is not None:
+            _remaining(deadline)
         before = os.fstat(fd)
         digest = hashlib.sha256()
         while True:
+            if deadline is not None:
+                _remaining(deadline)
             chunk = os.read(fd, _BUFFER_SIZE)
             if not chunk:
                 break
             digest.update(chunk)
+        if deadline is not None:
+            _remaining(deadline)
         after = os.fstat(fd)
     finally:
         os.close(fd)
@@ -515,26 +505,15 @@ def _loaded_file_sha256(path: bytes) -> str:
     return digest
 
 
-def _resolve_executable_path(name: str) -> bytes:
-    resolved = shutil.which(name)
-    if not resolved:
-        raise RuntimeError(f"trusted executable is unavailable: {name}")
-    canonical = os.path.realpath(os.fsencode(resolved))
-    if not os.path.isabs(canonical):
-        raise RuntimeError(f"trusted executable is not absolute: {name}")
-    return canonical
-
-
 def _helper_path_for(interpreter_path: bytes, git_path: bytes) -> str:
+    if os.name == "posix":
+        return "/usr/bin:/bin"
     entries = [
         os.fsdecode(os.path.dirname(git_path)),
         os.fsdecode(os.path.dirname(interpreter_path)),
     ]
-    if os.name == "posix":
-        entries.extend(("/usr/bin", "/bin"))
-    else:
-        system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
-        entries.extend((os.path.join(system_root, "System32"), system_root))
+    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    entries.extend((os.path.join(system_root, "System32"), system_root))
     return os.pathsep.join(dict.fromkeys(entries))
 
 
@@ -542,6 +521,8 @@ def _make_capture_authority(
     *,
     module_path: bytes,
     module_sha256: str,
+    module_device: int,
+    module_inode: int,
     interpreter_path: bytes,
     interpreter_sha256: str,
     interpreter_device: int,
@@ -552,10 +533,12 @@ def _make_capture_authority(
     git_inode: int,
 ) -> _CaptureAuthority:
     implementation_sha256 = _hash_fields(
-        b"bestplan-capture-authority-v3",
+        b"bestplan-capture-authority-v4",
         (
             module_path,
             module_sha256.encode("ascii"),
+            str(module_device).encode("ascii"),
+            str(module_inode).encode("ascii"),
             interpreter_path,
             interpreter_sha256.encode("ascii"),
             str(interpreter_device).encode("ascii"),
@@ -571,6 +554,8 @@ def _make_capture_authority(
     return _CaptureAuthority(
         module_path=module_path,
         module_sha256=module_sha256,
+        module_device=module_device,
+        module_inode=module_inode,
         interpreter_path=interpreter_path,
         interpreter_sha256=interpreter_sha256,
         interpreter_device=interpreter_device,
@@ -584,45 +569,393 @@ def _make_capture_authority(
     )
 
 
-def _build_capture_authority() -> _CaptureAuthority:
+_AUTHORITY_VERIFIER_BOOTSTRAP = r"""
+import hashlib
+import json
+import os
+import stat
+import sys
+
+TRUST_ROOT = b"/usr/bin/python3"
+
+def fail(message):
+    raise RuntimeError(message)
+
+def decode_path(value, label):
+    if not isinstance(value, str) or len(value) > 32768:
+        fail("invalid " + label)
     try:
-        module_path = os.path.realpath(os.fsencode(__file__))
-        interpreter_path = os.path.realpath(os.fsencode(sys.executable))
-        git_path = _resolve_executable_path("git")
-        module_sha256, _module_device, _module_inode = _stable_file_identity(
-            module_path,
-        )
-        (
-            interpreter_sha256,
-            interpreter_device,
-            interpreter_inode,
-        ) = _stable_file_identity(interpreter_path, require_executable=True)
-        git_sha256, git_device, git_inode = _stable_file_identity(
-            git_path, require_executable=True,
-        )
-    except (OSError, RuntimeError) as exc:
-        raise SourceBoundaryError(
-            f"trusted source capture authority is unavailable: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-    return _make_capture_authority(
-        module_path=module_path,
-        module_sha256=module_sha256,
-        interpreter_path=interpreter_path,
-        interpreter_sha256=interpreter_sha256,
-        interpreter_device=interpreter_device,
-        interpreter_inode=interpreter_inode,
-        git_path=git_path,
-        git_sha256=git_sha256,
-        git_device=git_device,
-        git_inode=git_inode,
+        raw = bytes.fromhex(value)
+    except ValueError:
+        fail("invalid " + label)
+    if not raw or b"\0" in raw:
+        fail("invalid " + label)
+    canonical = os.path.realpath(os.path.abspath(raw))
+    if not os.path.isabs(canonical):
+        fail("non-absolute " + label)
+    return canonical
+
+def stable_identity(path, executable, system_owned):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    path_before = os.stat(path, follow_symlinks=False)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    path_after = os.stat(path, follow_symlinks=False)
+    before_state = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
     )
+    after_state = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if (
+        before_state != after_state
+        or not stat.S_ISREG(before.st_mode)
+        or (path_before.st_dev, path_before.st_ino) != (before.st_dev, before.st_ino)
+        or (path_after.st_dev, path_after.st_ino) != (before.st_dev, before.st_ino)
+        or (executable and before.st_mode & 0o111 == 0)
+        or (system_owned and (before.st_uid != 0 or before.st_mode & 0o022))
+    ):
+        fail("trusted file changed during verification")
+    return {
+        "path": path.hex(),
+        "sha256": digest.hexdigest(),
+        "device": before.st_dev,
+        "inode": before.st_ino,
+    }
+
+root = os.stat(TRUST_ROOT, follow_symlinks=False)
+if (
+    not stat.S_ISREG(root.st_mode)
+    or root.st_uid != 0
+    or root.st_mode & 0o022
+    or root.st_mode & 0o111 == 0
+):
+    fail("fixed authority verifier trust root is unsafe")
+
+request_raw = sys.stdin.buffer.read(65537)
+if len(request_raw) > 65536:
+    fail("authority verifier request exceeds its limit")
+request = json.loads(request_raw.decode("ascii"))
+if not isinstance(request, dict) or set(request) != {
+    "module_path", "interpreter_path", "expected"
+}:
+    fail("invalid authority verifier request")
+expected = request["expected"]
+module_path = decode_path(request["module_path"], "module path")
+interpreter_path = decode_path(request["interpreter_path"], "interpreter path")
+if expected is None:
+    git_path = b"/usr/bin/git"
+elif isinstance(expected, dict):
+    if set(expected) != {"module", "interpreter", "git"}:
+        fail("invalid expected authority identity")
+    module_path = decode_path(expected["module"]["path"], "expected module path")
+    interpreter_path = decode_path(
+        expected["interpreter"]["path"], "expected interpreter path"
+    )
+    git_path = decode_path(expected["git"]["path"], "expected Git path")
+else:
+    fail("invalid expected authority identity")
+
+result = {
+    "module": stable_identity(module_path, False, False),
+    "interpreter": stable_identity(interpreter_path, True, False),
+    "git": stable_identity(git_path, True, True),
+}
+if expected is not None and result != expected:
+    fail("trusted capture authority identity changed")
+sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")))
+sys.stdout.flush()
+"""
+
+
+def _authority_verifier_argv() -> list[str]:
+    if os.name != "posix" or sys.platform != "darwin":
+        raise SourceBoundaryError(
+            "trusted source authority verification is unsupported on this host"
+        )
+    return [
+        "/usr/bin/python3",
+        "-I",
+        "-S",
+        "-c",
+        _AUTHORITY_VERIFIER_BOOTSTRAP,
+    ]
+
+
+def _authority_verifier_environment() -> dict[str, str]:
+    env = {
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    for key in ("SYSTEMROOT",):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    return env
+
+
+def _authority_identity_payload(authority: _CaptureAuthority) -> dict[str, object]:
+    def item(path: bytes, sha256: str, device: int, inode: int) -> dict[str, object]:
+        return {
+            "path": path.hex(),
+            "sha256": sha256,
+            "device": device,
+            "inode": inode,
+        }
+
+    return {
+        "module": item(
+            authority.module_path,
+            authority.module_sha256,
+            authority.module_device,
+            authority.module_inode,
+        ),
+        "interpreter": item(
+            authority.interpreter_path,
+            authority.interpreter_sha256,
+            authority.interpreter_device,
+            authority.interpreter_inode,
+        ),
+        "git": item(
+            authority.git_path,
+            authority.git_sha256,
+            authority.git_device,
+            authority.git_inode,
+        ),
+    }
+
+
+def _parse_authority_identity(value: object) -> _CaptureAuthority:
+    if not isinstance(value, dict) or set(value) != {"module", "interpreter", "git"}:
+        raise SourceBoundaryError("trusted authority verifier returned invalid metadata")
+
+    def item(label: str) -> tuple[bytes, str, int, int]:
+        raw = value[label]
+        if not isinstance(raw, dict) or set(raw) != {
+            "path", "sha256", "device", "inode"
+        }:
+            raise SourceBoundaryError(
+                "trusted authority verifier returned invalid metadata"
+            )
+        if (
+            not isinstance(raw["path"], str)
+            or not isinstance(raw["sha256"], str)
+            or type(raw["device"]) is not int
+            or type(raw["inode"]) is not int
+        ):
+            raise SourceBoundaryError(
+                "trusted authority verifier returned invalid metadata"
+            )
+        try:
+            path = bytes.fromhex(raw["path"])
+        except ValueError as exc:
+            raise SourceBoundaryError(
+                "trusted authority verifier returned invalid metadata"
+            ) from exc
+        digest = raw["sha256"]
+        device = raw["device"]
+        inode = raw["inode"]
+        if (
+            not path
+            or b"\0" in path
+            or not os.path.isabs(path)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or device < 0
+            or inode <= 0
+        ):
+            raise SourceBoundaryError(
+                "trusted authority verifier returned invalid identity"
+            )
+        return path, digest, device, inode
+
+    module = item("module")
+    interpreter = item("interpreter")
+    git = item("git")
+    return _make_capture_authority(
+        module_path=module[0],
+        module_sha256=module[1],
+        module_device=module[2],
+        module_inode=module[3],
+        interpreter_path=interpreter[0],
+        interpreter_sha256=interpreter[1],
+        interpreter_device=interpreter[2],
+        interpreter_inode=interpreter[3],
+        git_path=git[0],
+        git_sha256=git[1],
+        git_device=git[2],
+        git_inode=git[3],
+    )
+
+
+def _run_authority_verifier(
+    *, deadline: float, expected: _CaptureAuthority | None,
+) -> _CaptureAuthority:
+    absolute_deadline = float(deadline)
+    _remaining(absolute_deadline)
+    request = json.dumps(
+        {
+            "module_path": os.fsencode(__file__).hex(),
+            "interpreter_path": os.fsencode(sys.executable).hex(),
+            "expected": (
+                None if expected is None else _authority_identity_payload(expected)
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    try:
+        stdout_file = tempfile.TemporaryFile()
+        stderr_file = tempfile.TemporaryFile()
+    except OSError as exc:
+        raise SourceBoundaryError(
+            f"trusted authority verifier output could not be isolated: {exc}"
+        ) from exc
+    try:
+        try:
+            process = subprocess.Popen(
+                _authority_verifier_argv(),
+                cwd=os.sep,
+                env=_authority_verifier_environment(),
+                stdin=subprocess.PIPE,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                close_fds=True,
+                start_new_session=(os.name == "posix"),
+            )
+        except OSError as exc:
+            raise SourceBoundaryError(
+                f"trusted authority verifier could not start: {exc}"
+            ) from exc
+        try:
+            process_group = _capture_posix_process_group(process)
+        except SourceBoundaryError:
+            process.kill()
+            process.communicate(timeout=_CAPTURE_CLEANUP_SECONDS)
+            raise
+        containment: object | None = None
+        try:
+            try:
+                containment = _attach_capture_helper_containment(process)
+            except OSError as exc:
+                raise SourceBoundaryError(
+                    f"trusted authority verifier containment unavailable: {exc}"
+                ) from exc
+            try:
+                process.communicate(
+                    input=request, timeout=_remaining(absolute_deadline),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ProofStaleError(
+                    "proof_stale: trusted authority verifier exceeded the source deadline"
+                ) from exc
+            if os.name == "posix":
+                if process_group is None or not _signal_capture_helper(
+                    process,
+                    getattr(signal, "SIGKILL", None),
+                    force=True,
+                    process_group=process_group,
+                ):
+                    raise ProofStaleError(
+                        "proof_stale: authority verifier process group cleanup failed"
+                    )
+                _wait_for_posix_group_extinction(process_group)
+            elif containment is not None:
+                try:
+                    _terminate_windows_job_and_wait(containment)
+                finally:
+                    _close_capture_helper_containment(containment)
+                    containment = None
+            else:
+                raise ProofStaleError(
+                    "proof_stale: authority verifier containment is unavailable"
+                )
+        except BaseException:
+            owned_containment = containment
+            containment = None
+            _terminate_capture_helper(
+                process, owned_containment, process_group,
+            )
+            raise
+        finally:
+            _close_capture_helper_containment(containment)
+
+        _remaining(absolute_deadline)
+        output = _read_bounded_file(
+            stdout_file,
+            limit=_MAX_AUTHORITY_RESPONSE_BYTES,
+            label="trusted authority verifier response",
+            deadline=absolute_deadline,
+            digest_only=False,
+        )
+        stderr = _read_bounded_file(
+            stderr_file,
+            limit=_MAX_GIT_STDERR_BYTES,
+            label="trusted authority verifier stderr",
+            deadline=absolute_deadline,
+            digest_only=False,
+        )
+        assert isinstance(output, bytes) and isinstance(stderr, bytes)
+        if process.returncode != 0:
+            detail = os.fsdecode(stderr[-4096:]).strip() or f"exit {process.returncode}"
+            raise SourceBoundaryError(
+                f"trusted source capture authority is unavailable: {detail}"
+            )
+        try:
+            decoded = json.loads(output.decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise SourceBoundaryError(
+                "trusted authority verifier returned an invalid response"
+            ) from exc
+        authority = _parse_authority_identity(decoded)
+        if expected is not None and authority != expected:
+            raise SourceBoundaryError("trusted capture authority identity changed")
+        return authority
+    finally:
+        stdout_file.close()
+        stderr_file.close()
+
+
+def _verify_capture_authority(
+    authority: _CaptureAuthority, *, deadline: float,
+) -> None:
+    verified = _run_authority_verifier(deadline=deadline, expected=authority)
+    if verified != authority:
+        raise SourceBoundaryError("trusted capture authority identity changed")
+
+
+def _build_capture_authority(deadline: float) -> _CaptureAuthority:
+    return _run_authority_verifier(deadline=deadline, expected=None)
 
 
 _AUTHORITY_LOCK = threading.Lock()
 _CAPTURE_AUTHORITY: _CaptureAuthority | None = None
+_CAPTURE_AUTHORITY_PRESEEDED = False
 _CAPTURE_MODULE_PATH: bytes | None = None
 _CAPTURE_MODULE_SHA256: str | None = None
+_CAPTURE_MODULE_DEVICE: int | None = None
+_CAPTURE_MODULE_INODE: int | None = None
 _CAPTURE_INTERPRETER_PATH: bytes | None = None
 _CAPTURE_INTERPRETER_SHA256: str | None = None
 _CAPTURE_INTERPRETER_DEVICE: int | None = None
@@ -638,6 +971,8 @@ _CAPTURE_HELPER_PATH: str | None = None
 def _publish_capture_authority(authority: _CaptureAuthority) -> None:
     global _CAPTURE_MODULE_PATH
     global _CAPTURE_MODULE_SHA256
+    global _CAPTURE_MODULE_DEVICE
+    global _CAPTURE_MODULE_INODE
     global _CAPTURE_INTERPRETER_PATH
     global _CAPTURE_INTERPRETER_SHA256
     global _CAPTURE_INTERPRETER_DEVICE
@@ -650,6 +985,8 @@ def _publish_capture_authority(authority: _CaptureAuthority) -> None:
     global _CAPTURE_HELPER_PATH
     _CAPTURE_MODULE_PATH = authority.module_path
     _CAPTURE_MODULE_SHA256 = authority.module_sha256
+    _CAPTURE_MODULE_DEVICE = authority.module_device
+    _CAPTURE_MODULE_INODE = authority.module_inode
     _CAPTURE_INTERPRETER_PATH = authority.interpreter_path
     _CAPTURE_INTERPRETER_SHA256 = authority.interpreter_sha256
     _CAPTURE_INTERPRETER_DEVICE = authority.interpreter_device
@@ -664,29 +1001,62 @@ def _publish_capture_authority(authority: _CaptureAuthority) -> None:
 
 def _seed_capture_authority(authority: _CaptureAuthority) -> None:
     global _CAPTURE_AUTHORITY
+    global _CAPTURE_AUTHORITY_PRESEEDED
     with _AUTHORITY_LOCK:
         if _CAPTURE_AUTHORITY is not None and _CAPTURE_AUTHORITY != authority:
             raise SourceBoundaryError("trusted capture authority changed")
         _CAPTURE_AUTHORITY = authority
+        _CAPTURE_AUTHORITY_PRESEEDED = True
         _publish_capture_authority(authority)
 
 
-def _get_capture_authority() -> _CaptureAuthority:
+def _get_capture_authority(deadline: float | None = None) -> _CaptureAuthority:
     global _CAPTURE_AUTHORITY
+    absolute_deadline = (
+        time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+        if deadline is None
+        else float(deadline)
+    )
+    _remaining(absolute_deadline)
     authority = _CAPTURE_AUTHORITY
     if authority is not None:
         return authority
-    with _AUTHORITY_LOCK:
+    if not _AUTHORITY_LOCK.acquire(timeout=_remaining(absolute_deadline)):
+        raise ProofStaleError(
+            "proof_stale: capture authority lock exceeded the source deadline"
+        )
+    try:
+        _remaining(absolute_deadline)
         authority = _CAPTURE_AUTHORITY
         if authority is None:
-            authority = _build_capture_authority()
+            authority = _build_capture_authority(absolute_deadline)
+            _remaining(absolute_deadline)
             _CAPTURE_AUTHORITY = authority
             _publish_capture_authority(authority)
+    finally:
+        _AUTHORITY_LOCK.release()
     return authority
 
 
 def _capture_implementation_sha256() -> str:
     return _get_capture_authority().implementation_sha256
+
+
+def _verify_public_authority(*, deadline: float) -> _CaptureAuthority:
+    authority_was_missing = _CAPTURE_AUTHORITY is None
+    authority = _get_capture_authority(deadline)
+    if not authority_was_missing and not _CAPTURE_AUTHORITY_PRESEEDED:
+        _verify_capture_authority(authority, deadline=deadline)
+    return authority
+
+
+def _verify_public_authority_after(
+    authority: _CaptureAuthority, *, deadline: float,
+) -> None:
+    """Close the executable-identity bracket around one public operation."""
+
+    if not _CAPTURE_AUTHORITY_PRESEEDED:
+        _verify_capture_authority(authority, deadline=deadline)
 
 
 """Compatibility aliases above are populated only after a source operation.
@@ -704,11 +1074,19 @@ def _assert_trusted_file_identity(
     expected_inode: int,
     *,
     require_executable: bool,
+    deadline: float | None = None,
 ) -> None:
     try:
-        digest, device, inode = _stable_file_identity(
-            path, require_executable=require_executable,
-        )
+        if deadline is None:
+            digest, device, inode = _stable_file_identity(
+                path, require_executable=require_executable,
+            )
+        else:
+            digest, device, inode = _stable_file_identity(
+                path,
+                require_executable=require_executable,
+                deadline=deadline,
+            )
     except (OSError, RuntimeError) as exc:
         raise SourceBoundaryError(
             f"trusted capture executable is unavailable: {type(exc).__name__}: {exc}"
@@ -792,9 +1170,12 @@ def _resolve_repo_identity(workspace: str, deadline: float) -> RepoIdentity:
 def resolve_repo_identity(workspace: str) -> RepoIdentity:
     """Resolve one worktree and its shared repository identity losslessly."""
 
-    return _resolve_repo_identity(
-        workspace, time.monotonic() + _DEFAULT_DEADLINE_SECONDS,
-    )
+    deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+    authority = _verify_public_authority(deadline=deadline)
+    try:
+        return _resolve_repo_identity(workspace, deadline)
+    finally:
+        _verify_public_authority_after(authority, deadline=deadline)
 
 
 def _same_repository(expected: RepoIdentity, actual: RepoIdentity) -> bool:
@@ -901,8 +1282,8 @@ def _index_extension_records(
     *,
     object_format: str,
     deadline: float,
-) -> tuple[int, tuple[tuple[bytes, bytes], ...]]:
-    """Return the raw entry count and lossless extension payloads.
+) -> tuple[tuple[bytes, ...], tuple[tuple[bytes, bytes], ...]]:
+    """Return raw index paths in order and lossless extension payloads.
 
     This parser exists only to interpret persisted index flags that Git cannot
     safely report while repository-configured fsmonitor execution is disabled.
@@ -938,12 +1319,19 @@ def _index_extension_records(
 
     offset = 12
     previous_path = b""
+    paths: list[bytes] = []
     for _entry_index in range(entry_count):
         _remaining(deadline)
         entry_start = offset
+        mode_offset = entry_start + 24
         flags_offset = entry_start + 40 + hash_size
-        if flags_offset + 2 > checksum_offset:
+        if mode_offset + 4 > checksum_offset or flags_offset + 2 > checksum_offset:
             raise SourceBoundaryError("Git index entry metadata is truncated")
+        raw_mode = int.from_bytes(value[mode_offset : mode_offset + 4], "big")
+        if raw_mode & 0o170000 == 0o040000:
+            raise UnsupportedRepositoryError(
+                "persisted sparse Git index directory is unsupported"
+            )
         flags = int.from_bytes(value[flags_offset : flags_offset + 2], "big")
         name_length = flags & 0x0FFF
         name_offset = flags_offset + 2
@@ -994,6 +1382,7 @@ def _index_extension_records(
             raise UnsupportedRepositoryError(
                 "Git index path exceeds the trusted path limit"
             )
+        paths.append(path)
         previous_path = path
 
     extensions: list[tuple[bytes, bytes]] = []
@@ -1009,7 +1398,7 @@ def _index_extension_records(
             raise SourceBoundaryError("Git index extension size is malformed")
         extensions.append((signature, value[offset:extension_end]))
         offset = extension_end
-    return entry_count, tuple(extensions)
+    return tuple(paths), tuple(extensions)
 
 
 def _decode_ewah_set_bits(
@@ -1098,15 +1487,20 @@ def _parse_index_fsmonitor_valid_paths(
     object_format: str,
     deadline: float,
 ) -> set[bytes]:
-    entry_count, extensions = _index_extension_records(
+    raw_index_paths, extensions = _index_extension_records(
         value, object_format=object_format, deadline=deadline,
     )
     if any(signature == b"link" for signature, _payload in extensions):
         raise UnsupportedRepositoryError(
             "split Git indexes are unsupported for source proof capture"
         )
-    if entry_count != len(index_paths):
-        raise SourceBoundaryError("Git index entry count changed during capture")
+    if any(signature == b"sdir" for signature, _payload in extensions):
+        raise UnsupportedRepositoryError(
+            "persisted sparse Git indexes are unsupported for source proof capture"
+        )
+    if raw_index_paths != index_paths:
+        raise _CaptureChanged("Git index entries changed during capture")
+    entry_count = len(raw_index_paths)
     fsmonitor_payloads = [
         payload for signature, payload in extensions if signature == b"FSMN"
     ]
@@ -1456,29 +1850,27 @@ def _reject_nonempty_repository_file(
 def _reject_partial_clone_configuration(
     repo: RepoIdentity, *, deadline: float,
 ) -> None:
-    code, configured = _run_git(
+    code, _configured = _run_git(
         repo.worktree_raw,
         "config",
-        "--local",
         "--get",
         "extensions.partialClone",
         deadline=deadline,
         ok_codes=(0, 1),
     )
-    if code == 0 and configured:
+    if code == 0:
         raise UnsupportedRepositoryError(
             "Git partial/promisor clone configuration is unsupported"
         )
-    code, configured = _run_git(
+    code, _configured = _run_git(
         repo.worktree_raw,
         "config",
-        "--local",
         "--get-regexp",
         r"^remote\..*\.(promisor|partialclonefilter)$",
         deadline=deadline,
         ok_codes=(0, 1),
     )
-    if code == 0 and configured:
+    if code == 0:
         raise UnsupportedRepositoryError(
             "Git partial/promisor clone configuration is unsupported"
         )
@@ -1601,6 +1993,26 @@ def _assert_supported_repository(
         )
         if code == 0 and _without_delimiter(value).strip().lower() == b"true":
             raise UnsupportedRepositoryError("sparse checkout is unsupported")
+    _, index_path_raw = _run_git(
+        repo.worktree_raw,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "index",
+        deadline=absolute_deadline,
+    )
+    raw_index = _read_stable_small_file(
+        _without_delimiter(index_path_raw),
+        deadline=absolute_deadline,
+        limit=_MAX_GIT_METADATA_BYTES,
+    )
+    _raw_index_paths, index_extensions = _index_extension_records(
+        raw_index,
+        object_format=repo.object_format,
+        deadline=absolute_deadline,
+    )
+    if any(signature == b"sdir" for signature, _payload in index_extensions):
+        raise UnsupportedRepositoryError("persisted sparse Git index is unsupported")
     _, replacements = _run_git(
         repo.worktree_raw,
         "for-each-ref",
@@ -1657,11 +2069,13 @@ def _assert_supported_repository(
     _, index_raw = _run_git(
         repo.worktree_raw, "ls-files", "--stage", "-z", deadline=absolute_deadline,
     )
-    if any(
-        entry.mode == 0o160000
-        for entry in _parse_index_entries(index_raw, deadline=absolute_deadline)
-    ):
+    parsed_index_entries = _parse_index_entries(
+        index_raw, deadline=absolute_deadline,
+    )
+    if any(entry.mode == 0o160000 for entry in parsed_index_entries):
         raise UnsupportedRepositoryError("Git submodules are unsupported")
+    if any(entry.mode == 0o040000 for entry in parsed_index_entries):
+        raise UnsupportedRepositoryError("persisted sparse Git index is unsupported")
     if scan_specials:
         _scan_nonignored_specials(repo, deadline=absolute_deadline)
 
@@ -1676,9 +2090,13 @@ def assert_supported_repository(
         if deadline is None
         else float(deadline)
     )
-    _assert_supported_repository(
-        repo, deadline=absolute_deadline, scan_specials=True,
-    )
+    authority = _verify_public_authority(deadline=absolute_deadline)
+    try:
+        _assert_supported_repository(
+            repo, deadline=absolute_deadline, scan_specials=True,
+        )
+    finally:
+        _verify_public_authority_after(authority, deadline=absolute_deadline)
 
 
 def _manifest_digest(
@@ -1753,10 +2171,10 @@ def _tracked_entry_differs_from_index(
     return executable != (index.mode == 0o100755)
 
 
-def capture_protected_manifest(
+def _capture_protected_manifest(
     repo: RepoIdentity, *, deadline: float | None = None,
 ) -> ProtectedManifest:
-    """Capture index plus tracked/untracked nonignored ambient state."""
+    """Capture ambient state after the public trust boundary is established."""
 
     absolute_deadline = (
         time.monotonic() + _DEFAULT_DEADLINE_SECONDS
@@ -1945,6 +2363,23 @@ def capture_protected_manifest(
     )
 
 
+def capture_protected_manifest(
+    repo: RepoIdentity, *, deadline: float | None = None,
+) -> ProtectedManifest:
+    """Capture index plus tracked/untracked nonignored ambient state."""
+
+    absolute_deadline = (
+        time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+        if deadline is None
+        else float(deadline)
+    )
+    authority = _verify_public_authority(deadline=absolute_deadline)
+    try:
+        return _capture_protected_manifest(repo, deadline=absolute_deadline)
+    finally:
+        _verify_public_authority_after(authority, deadline=absolute_deadline)
+
+
 def _head_read(repo: RepoIdentity, *, deadline: float) -> _SourceRead:
     _assert_supported_repository(repo, deadline=deadline, scan_specials=False)
     current = _resolve_repo_identity(repo.workspace, deadline)
@@ -2081,6 +2516,8 @@ sys.dont_write_bytecode = True
     module_path,
     expected_identity,
     expected_module_sha256,
+    expected_module_dev,
+    expected_module_ino,
     expected_interpreter_path,
     expected_interpreter_dev,
     expected_interpreter_ino,
@@ -2089,7 +2526,7 @@ sys.dont_write_bytecode = True
     expected_git_dev,
     expected_git_ino,
     expected_git_sha256,
-) = sys.argv[1:12]
+) = sys.argv[1:14]
 
 def verified_bytes(path, expected_sha256, expected_dev, expected_ino, executable):
     path_raw = os.fsencode(path)
@@ -2163,8 +2600,8 @@ verified_bytes(
 module_bytes = verified_bytes(
     module_path,
     expected_module_sha256,
-    os.stat(os.fsencode(module_path), follow_symlinks=False).st_dev,
-    os.stat(os.fsencode(module_path), follow_symlinks=False).st_ino,
+    expected_module_dev,
+    expected_module_ino,
     False,
 )
 
@@ -2182,6 +2619,8 @@ exec(compile(module_bytes, module_path, "exec"), module.__dict__)
 child_authority = module._make_capture_authority(
     module_path=os.fsencode(module_path),
     module_sha256=expected_module_sha256,
+    module_device=int(expected_module_dev),
+    module_inode=int(expected_module_ino),
     interpreter_path=interpreter_path_raw,
     interpreter_sha256=expected_interpreter_sha256,
     interpreter_device=int(expected_interpreter_dev),
@@ -2234,8 +2673,7 @@ sys.stdout.buffer.flush()
 """
 
 
-def _capture_helper_argv() -> list[str]:
-    authority = _get_capture_authority()
+def _capture_helper_argv(authority: _CaptureAuthority) -> list[str]:
     return [
         os.fsdecode(authority.interpreter_path),
         "-I",
@@ -2245,6 +2683,8 @@ def _capture_helper_argv() -> list[str]:
         os.fsdecode(authority.module_path),
         authority.implementation_sha256,
         authority.module_sha256,
+        str(authority.module_device),
+        str(authority.module_inode),
         os.fsdecode(authority.interpreter_path),
         str(authority.interpreter_device),
         str(authority.interpreter_inode),
@@ -2256,8 +2696,7 @@ def _capture_helper_argv() -> list[str]:
     ]
 
 
-def _capture_helper_environment() -> dict[str, str]:
-    authority = _get_capture_authority()
+def _capture_helper_environment(authority: _CaptureAuthority) -> dict[str, str]:
     allowed = (
         "HOME",
         "LANG",
@@ -2562,22 +3001,8 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
     """Capture in an isolated, deadline-killable trusted helper process."""
 
     absolute_deadline = float(deadline)
+    authority = _verify_public_authority(deadline=absolute_deadline)
     remaining_budget = _remaining(absolute_deadline)
-    authority = _get_capture_authority()
-    _assert_trusted_file_identity(
-        authority.interpreter_path,
-        authority.interpreter_sha256,
-        authority.interpreter_device,
-        authority.interpreter_inode,
-        require_executable=True,
-    )
-    _assert_trusted_file_identity(
-        authority.git_path,
-        authority.git_sha256,
-        authority.git_device,
-        authority.git_inode,
-        require_executable=True,
-    )
     request = pickle.dumps(
         (authority.implementation_sha256, repo, remaining_budget), protocol=5,
     )
@@ -2593,9 +3018,9 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
     try:
         try:
             process = subprocess.Popen(
-                _capture_helper_argv(),
+                _capture_helper_argv(authority),
                 cwd=os.sep,
-                env=_capture_helper_environment(),
+                env=_capture_helper_environment(authority),
                 stdin=subprocess.PIPE,
                 stdout=stdout_file,
                 stderr=stderr_file,
@@ -2625,20 +3050,10 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
             try:
                 timeout = _remaining(absolute_deadline)
             except SourceBoundaryError:
-                owned_containment = containment
-                containment = None
-                _terminate_capture_helper(
-                    process, owned_containment, process_group,
-                )
                 raise
             try:
                 process.communicate(input=request, timeout=timeout)
             except subprocess.TimeoutExpired as exc:
-                owned_containment = containment
-                containment = None
-                _terminate_capture_helper(
-                    process, owned_containment, process_group,
-                )
                 raise ProofStaleError(
                     "proof_stale: trusted capture helper exceeded the source deadline"
                 ) from exc
@@ -2669,31 +3084,17 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
                     "proof_stale: capture helper containment is unavailable"
                 )
         except BaseException:
-            if containment is not None or process.poll() is None:
-                owned_containment = containment
-                containment = None
-                _terminate_capture_helper(
-                    process, owned_containment, process_group,
-                )
+            owned_containment = containment
+            containment = None
+            _terminate_capture_helper(
+                process, owned_containment, process_group,
+            )
             raise
         finally:
             _close_capture_helper_containment(containment)
 
         _remaining(absolute_deadline)
-        _assert_trusted_file_identity(
-            authority.interpreter_path,
-            authority.interpreter_sha256,
-            authority.interpreter_device,
-            authority.interpreter_inode,
-            require_executable=True,
-        )
-        _assert_trusted_file_identity(
-            authority.git_path,
-            authority.git_sha256,
-            authority.git_device,
-            authority.git_inode,
-            require_executable=True,
-        )
+        _verify_capture_authority(authority, deadline=absolute_deadline)
         output = _read_bounded_file(
             stdout_file,
             limit=_MAX_HELPER_RESPONSE_BYTES,
@@ -3185,14 +3586,7 @@ def _materialize_blobs(
     deadline: float,
 ) -> None:
     _remaining(deadline)
-    authority = _get_capture_authority()
-    _assert_trusted_file_identity(
-        authority.git_path,
-        authority.git_sha256,
-        authority.git_device,
-        authority.git_inode,
-        require_executable=True,
-    )
+    authority = _get_capture_authority(deadline)
     stderr_file = tempfile.TemporaryFile()
     try:
         try:
@@ -3296,13 +3690,6 @@ def _materialize_blobs(
                     "trusted git cat-file failed: "
                     + (os.fsdecode(detail.strip()) or f"exit {process.returncode}")
                 )
-            _assert_trusted_file_identity(
-                authority.git_path,
-                authority.git_sha256,
-                authority.git_device,
-                authority.git_inode,
-                require_executable=True,
-            )
         except BaseException:
             _stop_git_process(process)
             raise
@@ -3561,9 +3948,11 @@ def export_exact_tree(
     """Materialize only the captured committed tree, bypassing checkout filters."""
 
     backend = _assert_export_host_supported()
-    deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
-    if not recapture_matches(snapshot, deadline=deadline):
+    recapture_deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+    if not recapture_matches(snapshot, deadline=recapture_deadline):
         raise ProofStaleError("proof_stale: repository or protected state changed")
+    deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+    authority = _get_capture_authority(deadline)
     entries = _tree_entries(snapshot.repo, snapshot.tree_oid, deadline=deadline)
     if any(entry.object_type != b"blob" for entry in entries):
         raise UnsupportedRepositoryError("exact source tree contains a non-blob entry")
@@ -3574,6 +3963,7 @@ def export_exact_tree(
                 f"unsupported Git tree mode: {entry.mode:o}"
             )
     _assert_tree_path_aliases(entries, deadline=deadline)
+    _verify_public_authority_after(authority, deadline=deadline)
 
     prepared = _prepare_destination(
         snapshot.repo, destination, deadline=deadline,
@@ -3589,6 +3979,7 @@ def export_exact_tree(
             directories,
             deadline=deadline,
         )
+        _verify_public_authority_after(authority, deadline=deadline)
         _remaining(deadline)
         os.fchmod(prepared.root_fd, 0o755)
         staged = os.stat(

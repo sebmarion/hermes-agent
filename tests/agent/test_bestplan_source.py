@@ -150,6 +150,11 @@ def test_source_boundary_module_exposes_the_trusted_primitives():
     } <= set(dir(source))
 
 
+def test_default_source_operation_budget_has_real_checkout_headroom():
+    source = _source()
+    assert source.DEFAULT_SOURCE_OPERATION_SECONDS >= 20.0
+
+
 def test_ignored_runtime_trees_do_not_block_or_get_recursively_scanned(
     tmp_path, monkeypatch,
 ):
@@ -352,16 +357,56 @@ def test_git_environment_removes_all_config_injection_variables(monkeypatch):
         "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": "core.fsmonitor",
         "GIT_CONFIG_VALUE_0": "/tmp/hostile-hook",
+        "GIT_NAMESPACE": "hostile",
+        "GIT_SHALLOW_FILE": "/tmp/hostile-shallow",
+        "GIT_EXEC_PATH": "/tmp/hostile-exec-path",
+        "DEVELOPER_DIR": "/tmp/hostile-developer",
+        "DYLD_INSERT_LIBRARIES": "/tmp/hostile.dylib",
+        "LD_PRELOAD": "/tmp/hostile.so",
+        "PYTHONPATH": "/tmp/hostile-python",
     }
     for key, value in injected.items():
         monkeypatch.setenv(key, value)
 
     trusted = source._git_environment()
 
-    assert not {key for key in trusted if key.startswith("GIT_CONFIG")}
+    assert set(trusted) <= {
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OPTIONAL_LOCKS",
+        "HOME",
+        "LC_ALL",
+        "PATH",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+    }
+    assert not any(
+        key == "DEVELOPER_DIR"
+        or key.startswith(("DYLD_", "GIT_", "LD_", "PYTHON"))
+        and key not in {"GIT_NO_REPLACE_OBJECTS", "GIT_OPTIONAL_LOCKS"}
+        for key in trusted
+    )
 
 
-def test_bestplan_modules_import_without_git_and_capture_fails_coded(tmp_path):
+def test_fixed_system_verifier_and_git_ignore_hostile_developer_dir(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setenv("DEVELOPER_DIR", str(tmp_path / "missing-developer-dir"))
+
+    identity = source.resolve_repo_identity(str(repo))
+    snapshot = source.capture_source_snapshot(identity, time.monotonic() + 5.0)
+
+    assert snapshot.head_oid == _git(
+        repo, "rev-parse", "--verify", "HEAD^{commit}",
+    ).decode("ascii")
+    assert source._get_capture_authority().git_path == b"/usr/bin/git"
+
+
+def test_bestplan_modules_import_without_path_git_uses_fixed_system_git(tmp_path):
     empty_path = tmp_path / "empty-path"
     empty_path.mkdir()
     environment = dict(os.environ)
@@ -374,12 +419,8 @@ def test_bestplan_modules_import_without_git_and_capture_fails_coded(tmp_path):
                 "import agent.bestplan_state; "
                 "from agent import bestplan_source as source; "
                 "print('imported'); "
-                "\ntry:\n"
-                " source.resolve_repo_identity('.')\n"
-                "except source.SourceBoundaryError as exc:\n"
-                " print(exc.code)\n"
-                "else:\n"
-                " raise SystemExit('capture unexpectedly succeeded')\n"
+                "identity = source.resolve_repo_identity('.'); "
+                "print(source._get_capture_authority().git_path.decode())"
             ),
         ],
         cwd=Path(__file__).resolve().parents[2],
@@ -391,7 +432,257 @@ def test_bestplan_modules_import_without_git_and_capture_fails_coded(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["imported", "source_unavailable"]
+    assert result.stdout.splitlines() == ["imported", "/usr/bin/git"]
+
+
+def test_missing_fixed_authority_runtime_fails_as_coded_source_error(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    previous = source._CAPTURE_AUTHORITY
+    monkeypatch.setattr(source, "_CAPTURE_AUTHORITY", None)
+    monkeypatch.setattr(
+        source,
+        "_authority_verifier_argv",
+        lambda: ["/definitely/missing/bestplan-authority-verifier"],
+    )
+    try:
+        with pytest.raises(source.SourceBoundaryError) as raised:
+            source.resolve_repo_identity(str(repo))
+        assert raised.value.code == "source_unavailable"
+    finally:
+        source._CAPTURE_AUTHORITY = previous
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+@pytest.mark.live_system_guard_bypass
+def test_first_authority_verifier_obeys_capture_deadline_and_reaps_descendant(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    leader_pid_file = tmp_path / "authority-leader.pid"
+    child_pid_file = tmp_path / "authority-child.pid"
+    blocker = """
+import os
+import signal
+import sys
+
+with open(sys.argv[1], "w", encoding="ascii") as stream:
+    stream.write(str(os.getpid()))
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(sys.argv[2], "w", encoding="ascii") as stream:
+        stream.write(str(os.getpid()))
+    os.close(0)
+    os.close(1)
+    os.close(2)
+    while True:
+        signal.pause()
+while True:
+    signal.pause()
+"""
+    command = [
+        sys.executable,
+        "-I",
+        "-S",
+        "-c",
+        blocker,
+        str(leader_pid_file),
+        str(child_pid_file),
+    ]
+    previous = source._CAPTURE_AUTHORITY
+    monkeypatch.setattr(source, "_CAPTURE_AUTHORITY", None)
+    monkeypatch.setattr(
+        source, "_authority_verifier_argv", lambda: command, raising=False,
+    )
+
+    try:
+        with pytest.raises(source.ProofStaleError, match="proof_stale"):
+            source.capture_source_snapshot(identity, time.monotonic() + 0.5)
+        leader_pid = int(leader_pid_file.read_text(encoding="ascii"))
+        child_pid = int(child_pid_file.read_text(encoding="ascii"))
+        for pid in (leader_pid, child_pid):
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+    finally:
+        source._CAPTURE_AUTHORITY = previous
+        for path in (leader_pid_file, child_pid_file):
+            if not path.exists():
+                continue
+            pid = int(path.read_text(encoding="ascii"))
+            try:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except ProcessLookupError:
+                pass
+
+
+def test_resolve_repo_identity_bounds_first_authority_verification(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    blocker = [sys.executable, "-I", "-S", "-c", "import time;time.sleep(30)"]
+    previous = source._CAPTURE_AUTHORITY
+    monkeypatch.setattr(source, "_CAPTURE_AUTHORITY", None)
+    monkeypatch.setattr(source, "_DEFAULT_DEADLINE_SECONDS", 0.2)
+    monkeypatch.setattr(
+        source, "_authority_verifier_argv", lambda: blocker, raising=False,
+    )
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(source.ProofStaleError, match="proof_stale"):
+            source.resolve_repo_identity(str(repo))
+        assert time.monotonic() - started < 2.0
+    finally:
+        source._CAPTURE_AUTHORITY = previous
+
+
+def test_trusted_git_preexec_identity_check_never_blocks_in_parent(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    source.resolve_repo_identity(str(repo))
+
+    def parent_hash_is_forbidden(*_args, **_kwargs):
+        raise AssertionError("trusted executable was rehashed in the parent")
+
+    monkeypatch.setattr(source, "_stable_file_identity", parent_hash_is_forbidden)
+    identity = source.resolve_repo_identity(str(repo))
+    assert identity.worktree_raw == os.fsencode(repo.resolve())
+
+
+def test_capture_authority_lock_contention_obeys_deadline(monkeypatch):
+    source = _source()
+    previous = source._CAPTURE_AUTHORITY
+    monkeypatch.setattr(source, "_CAPTURE_AUTHORITY", None)
+    assert source._AUTHORITY_LOCK.acquire(timeout=1.0)
+    try:
+        with pytest.raises(source.ProofStaleError, match="proof_stale"):
+            source._get_capture_authority(time.monotonic() + 0.05)
+    finally:
+        source._AUTHORITY_LOCK.release()
+        source._CAPTURE_AUTHORITY = previous
+
+
+def test_capture_authority_binds_exact_module_interpreter_and_git_identity():
+    source = _source()
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+
+    for path, digest, device, inode in (
+        (
+            authority.module_path,
+            authority.module_sha256,
+            authority.module_device,
+            authority.module_inode,
+        ),
+        (
+            authority.interpreter_path,
+            authority.interpreter_sha256,
+            authority.interpreter_device,
+            authority.interpreter_inode,
+        ),
+        (
+            authority.git_path,
+            authority.git_sha256,
+            authority.git_device,
+            authority.git_inode,
+        ),
+    ):
+        assert path == os.path.realpath(path)
+        actual_digest, actual_device, actual_inode = source._stable_file_identity(path)
+        assert (actual_digest, actual_device, actual_inode) == (
+            digest,
+            device,
+            inode,
+        )
+
+    values = {
+        "module_path": authority.module_path,
+        "module_sha256": authority.module_sha256,
+        "module_device": authority.module_device,
+        "module_inode": authority.module_inode,
+        "interpreter_path": authority.interpreter_path,
+        "interpreter_sha256": authority.interpreter_sha256,
+        "interpreter_device": authority.interpreter_device,
+        "interpreter_inode": authority.interpreter_inode,
+        "git_path": authority.git_path,
+        "git_sha256": authority.git_sha256,
+        "git_device": authority.git_device,
+        "git_inode": authority.git_inode,
+    }
+    for field in values:
+        changed = dict(values)
+        original = changed[field]
+        if isinstance(original, bytes):
+            changed[field] = original + b"-changed"
+        elif isinstance(original, str):
+            changed[field] = ("0" if original[0] != "0" else "1") + original[1:]
+        else:
+            changed[field] = original + 1
+        assert source._make_capture_authority(**changed).implementation_sha256 != (
+            authority.implementation_sha256
+        )
+
+
+@pytest.mark.parametrize("bad_value", [True, "1", 1.5])
+def test_authority_response_identity_types_are_strict(bad_value):
+    source = _source()
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+    payload = source._authority_identity_payload(authority)
+    payload["git"]["device"] = bad_value
+
+    with pytest.raises(source.SourceBoundaryError, match="invalid metadata"):
+        source._parse_authority_identity(payload)
+
+
+@pytest.mark.parametrize("response", [b"{", b"x" * (64 * 1024 + 1)])
+def test_authority_verifier_rejects_malformed_and_oversize_response(
+    tmp_path, monkeypatch, response,
+):
+    source = _source()
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+    response_path = tmp_path / "authority-response"
+    response_path.write_bytes(response)
+    command = [
+        sys.executable,
+        "-I",
+        "-S",
+        "-c",
+        "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())",
+        str(response_path),
+    ]
+    monkeypatch.setattr(source, "_authority_verifier_argv", lambda: command)
+
+    with pytest.raises(source.SourceBoundaryError, match="invalid|limit|exceeds"):
+        source._run_authority_verifier(
+            deadline=time.monotonic() + 3.0,
+            expected=authority,
+        )
+
+
+def test_unsupported_authority_host_fails_before_spawn_but_preseed_is_usable(
+    monkeypatch,
+):
+    source = _source()
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+    monkeypatch.setattr(source.sys, "platform", "unsupported-test-host")
+    monkeypatch.setattr(source, "_CAPTURE_AUTHORITY", None)
+
+    def unexpected_spawn(*_args, **_kwargs):
+        raise AssertionError("unsupported authority host attempted to spawn")
+
+    monkeypatch.setattr(source.subprocess, "Popen", unexpected_spawn)
+    with pytest.raises(source.SourceBoundaryError, match="unsupported"):
+        source._get_capture_authority(time.monotonic() + 1.0)
+
+    source._CAPTURE_AUTHORITY = authority
+    assert source._get_capture_authority(time.monotonic() + 1.0) == authority
 
 
 def test_trusted_executable_identity_maps_unavailable_binary_to_boundary_error(
@@ -442,6 +733,8 @@ def test_capture_bootstrap_verifies_module_bytes_before_execution(tmp_path):
         str(replacement),
         source._CAPTURE_IMPLEMENTATION_SHA256,
         source._CAPTURE_MODULE_SHA256,
+        str(source._CAPTURE_MODULE_DEVICE),
+        str(source._CAPTURE_MODULE_INODE),
         interpreter,
         str(interpreter_stat.st_dev),
         str(interpreter_stat.st_ino),
@@ -497,6 +790,8 @@ def test_capture_bootstrap_rejects_executable_content_mismatch_before_module(
         str(replacement),
         source._CAPTURE_IMPLEMENTATION_SHA256,
         hashlib.sha256(replacement.read_bytes()).hexdigest(),
+        str(replacement.stat().st_dev),
+        str(replacement.stat().st_ino),
         interpreter,
         str(interpreter_stat.st_dev),
         str(interpreter_stat.st_ino),
@@ -1009,6 +1304,52 @@ def test_capture_churn_has_a_bounded_attempt_count_and_fails_proof_stale(
     assert 2 <= calls <= 16
 
 
+def test_same_count_index_path_churn_retries_to_proof_stale(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    real_read = source._read_stable_small_file
+    current = "tracked.txt"
+
+    def churn_after_raw_index_read(path, **kwargs):
+        nonlocal current
+        value = real_read(path, **kwargs)
+        replacement = "replacement.txt" if current == "tracked.txt" else "tracked.txt"
+        _git(repo, "mv", current, replacement)
+        current = replacement
+        return value
+
+    monkeypatch.setattr(source, "_MAX_STABILIZATION_READS", 4)
+    monkeypatch.setattr(source, "_read_stable_small_file", churn_after_raw_index_read)
+
+    with pytest.raises(source.ProofStaleError, match="proof_stale"):
+        source._capture_source_snapshot_in_process(
+            identity, time.monotonic() + 10.0,
+        )
+
+
+def test_index_count_churn_is_retryable_capture_change(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    real_read = source._read_stable_small_file
+    changed = False
+
+    def add_after_raw_index_read(path, **kwargs):
+        nonlocal changed
+        value = real_read(path, **kwargs)
+        if not changed:
+            (repo / "added.txt").write_bytes(b"added\n")
+            _git(repo, "add", "added.txt")
+            changed = True
+        return value
+
+    monkeypatch.setattr(source, "_read_stable_small_file", add_after_raw_index_read)
+
+    with pytest.raises(source._CaptureChanged, match="index"):
+        source.capture_protected_manifest(identity, deadline=time.monotonic() + 5.0)
+
+
 def test_real_index_and_worktree_churn_is_proof_stale_and_persists_no_plan(
     tmp_path, monkeypatch,
 ):
@@ -1228,6 +1569,69 @@ def test_grafts_alternates_partial_clones_and_nested_repositories_fail_closed(
         source.assert_supported_repository(source.resolve_repo_identity(str(nested)))
 
 
+def test_effective_worktree_and_global_partial_clone_config_fail_closed(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+
+    worktree_config = _init_repo(tmp_path / "worktree-config")
+    _git(worktree_config, "config", "extensions.worktreeConfig", "true")
+    _git(
+        worktree_config,
+        "config",
+        "--worktree",
+        "extensions.partialClone",
+        "origin",
+    )
+    with pytest.raises(source.UnsupportedRepositoryError, match="partial|promisor"):
+        source.assert_supported_repository(
+            source.resolve_repo_identity(str(worktree_config))
+        )
+
+    global_config = _init_repo(tmp_path / "global-config")
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    (isolated_home / ".gitconfig").write_text(
+        '[remote "origin"]\n\tpromisor = true\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(isolated_home))
+    with pytest.raises(source.UnsupportedRepositoryError, match="partial|promisor"):
+        source.assert_supported_repository(
+            source.resolve_repo_identity(str(global_config))
+        )
+
+
+def test_persisted_sparse_index_fails_closed_after_config_is_cleared(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "keep").mkdir()
+    (repo / "omit").mkdir()
+    (repo / "keep" / "kept.txt").write_bytes(b"kept\n")
+    (repo / "omit" / "omitted.txt").write_bytes(b"omitted\n")
+    _git(repo, "add", "keep/kept.txt", "omit/omitted.txt")
+    _git(repo, "commit", "-qm", "directories")
+    _git(repo, "sparse-checkout", "init", "--cone", "--sparse-index")
+    _git(repo, "sparse-checkout", "set", "keep")
+    for key in ("core.sparseCheckout", "core.sparseCheckoutCone", "index.sparse"):
+        _git(repo, "config", "--worktree", key, "false")
+        _git(repo, "config", "--local", key, "false")
+        assert _git(repo, "config", "--bool", "--get", key) == b"false"
+
+    index_path = Path(
+        _git(
+            repo,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ).decode("utf-8")
+    )
+    assert b"sdir" in index_path.read_bytes()
+    with pytest.raises(source.UnsupportedRepositoryError, match="sparse"):
+        source.assert_supported_repository(source.resolve_repo_identity(str(repo)))
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO support required")
 def test_nonignored_special_files_fail_closed_but_ignored_specials_do_not(tmp_path):
     source = _source()
@@ -1307,6 +1711,33 @@ def test_export_exact_tree_uses_committed_blobs_and_excludes_ambient_bytes(tmp_p
     assert (destination / "archive-template.txt").read_bytes() == b"$Format:%H$\n"
     assert not (destination / "untracked.txt").exists()
     assert not (destination / "cache").exists()
+
+
+def test_export_recapture_and_materialization_have_distinct_bounded_budgets(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+
+    class MaterializationReached(RuntimeError):
+        pass
+
+    def slow_recapture(_snapshot, *, deadline):
+        assert deadline > time.monotonic()
+        time.sleep(0.35)
+        return True
+
+    def require_fresh_materialization_budget(_repo, _tree_oid, *, deadline):
+        assert deadline - time.monotonic() > 0.2
+        raise MaterializationReached
+
+    monkeypatch.setattr(source, "_DEFAULT_DEADLINE_SECONDS", 0.3)
+    monkeypatch.setattr(source, "recapture_matches", slow_recapture)
+    monkeypatch.setattr(source, "_tree_entries", require_fresh_materialization_budget)
+
+    with pytest.raises(MaterializationReached):
+        source.export_exact_tree(snapshot, tmp_path / "exported")
 
 
 def test_export_failure_leaves_no_final_destination_and_retry_succeeds(
@@ -1555,13 +1986,14 @@ def test_public_capture_kills_and_reaps_blocked_spawn_helper(tmp_path, monkeypat
         processes.append(process)
         return process
 
-    monkeypatch.setattr(source, "_capture_helper_argv", lambda: command)
+    monkeypatch.setattr(source, "_capture_helper_argv", lambda _authority: command)
     monkeypatch.setattr(source.subprocess, "Popen", recording_popen)
     with pytest.raises(source.ProofStaleError) as raised:
         source.capture_source_snapshot(identity, time.monotonic() + 0.5)
     assert raised.value.code == "proof_stale"
-    assert len(processes) == 1
-    assert processes[0].poll() is not None
+    capture_processes = [process for process in processes if process.args == command]
+    assert len(capture_processes) == 1
+    assert capture_processes[0].poll() is not None
     helper_pid = int(pid_file.read_text(encoding="ascii"))
     with pytest.raises(ProcessLookupError):
         os.kill(helper_pid, 0)
@@ -1583,16 +2015,21 @@ def test_public_capture_fails_closed_if_helper_containment_cannot_attach(
         processes.append(process)
         return process
 
-    def unavailable(_process):
-        raise OSError("synthetic containment unavailable")
+    real_attach = source._attach_capture_helper_containment
 
-    monkeypatch.setattr(source, "_capture_helper_argv", lambda: command)
+    def unavailable(process):
+        if process.args == command:
+            raise OSError("synthetic containment unavailable")
+        return real_attach(process)
+
+    monkeypatch.setattr(source, "_capture_helper_argv", lambda _authority: command)
     monkeypatch.setattr(source, "_attach_capture_helper_containment", unavailable)
     monkeypatch.setattr(source.subprocess, "Popen", recording_popen)
     with pytest.raises(source.SourceBoundaryError, match="containment"):
         source.capture_source_snapshot(identity, time.monotonic() + 2.0)
-    assert len(processes) == 1
-    assert processes[0].poll() is not None
+    capture_processes = [process for process in processes if process.args == command]
+    assert len(capture_processes) == 1
+    assert capture_processes[0].poll() is not None
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
@@ -1680,7 +2117,7 @@ signal.pause()
         blocker,
         str(child_pid_file),
     ]
-    monkeypatch.setattr(source, "_capture_helper_argv", lambda: command)
+    monkeypatch.setattr(source, "_capture_helper_argv", lambda _authority: command)
 
     with pytest.raises(source.ProofStaleError, match="proof_stale"):
         source.capture_source_snapshot(identity, time.monotonic() + 0.5)
@@ -1745,7 +2182,7 @@ sys.stdout.buffer.flush()
         str(child_pid_file),
         source._CAPTURE_IMPLEMENTATION_SHA256,
     ]
-    monkeypatch.setattr(source, "_capture_helper_argv", lambda: command)
+    monkeypatch.setattr(source, "_capture_helper_argv", lambda _authority: command)
 
     with pytest.raises(source.ProofStaleError, match="synthetic"):
         source.capture_source_snapshot(identity, time.monotonic() + 2.0)
@@ -1819,7 +2256,7 @@ sys.stdout.buffer.flush()
         str(child_pid_file),
         str(response_file),
     ]
-    monkeypatch.setattr(source, "_capture_helper_argv", lambda: command)
+    monkeypatch.setattr(source, "_capture_helper_argv", lambda _authority: command)
 
     actual = source.capture_source_snapshot(identity, time.monotonic() + 2.0)
     child_pid = int(child_pid_file.read_text(encoding="ascii"))
