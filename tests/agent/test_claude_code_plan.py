@@ -104,6 +104,47 @@ def _assert_heartbeat_stopped(heartbeat: Path) -> None:
     assert heartbeat.stat().st_mtime_ns == before
 
 
+def _write_delayed_credential_helper_claude(
+    tmp_path: Path,
+    credential_state: Path,
+    process_group: Path,
+    *,
+    output: str,
+    returncode: int = 0,
+    detach_stdio: bool,
+) -> Path:
+    descendant_source = (
+        "import pathlib, time\n"
+        f"path = pathlib.Path({str(credential_state)!r})\n"
+        "path.write_text('started')\n"
+        "time.sleep(0.2)\n"
+        "path.write_text('complete')\n"
+    )
+    popen_stdio = (
+        ", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL"
+        if detach_stdio
+        else ""
+    )
+    return _write_fake_claude(
+        tmp_path,
+        "import os, pathlib, subprocess, sys, time\n"
+        f"pathlib.Path({str(process_group)!r}).write_text(str(os.getpid()))\n"
+        f"state = pathlib.Path({str(credential_state)!r})\n"
+        "subprocess.Popen(\n"
+        f"    [sys.executable, '-c', {descendant_source!r}]"
+        f"{popen_stdio},\n"
+        ")\n"
+        "deadline = time.monotonic() + 2\n"
+        "while not state.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.01)\n"
+        "if not state.exists():\n"
+        "    raise SystemExit(70)\n"
+        f"print({output!r}, flush=True)\n"
+        f"raise SystemExit({returncode})\n",
+    )
+
+
 def test_plan_auth_probe_uses_saved_first_party_login_without_api_overrides(
     tmp_path, monkeypatch
 ):
@@ -184,6 +225,39 @@ print(json.dumps({
     }
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_auth_probe_allows_post_exit_credential_helper_to_finish(tmp_path):
+    credential_state = tmp_path / "credential-state"
+    process_group = tmp_path / "auth-process-group"
+    status = json.dumps(
+        {
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "subscriptionType": "team",
+        }
+    )
+    executable = _write_delayed_credential_helper_claude(
+        tmp_path,
+        credential_state,
+        process_group,
+        output=status,
+        detach_stdio=False,
+    )
+
+    try:
+        observed = probe_claude_plan_auth(executable=str(executable), timeout=3.0)
+
+        assert observed["subscriptionType"] == "team"
+        assert credential_state.read_text() == "complete"
+    finally:
+        if process_group.exists():
+            try:
+                os.killpg(int(process_group.read_text()), signal.SIGKILL)
+            except OSError:
+                pass
+
+
 def test_plan_child_uses_print_mode_read_only_tools_and_stdin_prompt(
     tmp_path, monkeypatch
 ):
@@ -257,6 +331,45 @@ print(json.dumps({"argv": sys.argv[1:]}))
     payload = json.loads(child.run_conversation("repair")["final_response"])
 
     assert payload["argv"][payload["argv"].index("--tools") + 1] == ""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+@pytest.mark.parametrize("returncode", [0, 7])
+def test_plan_child_allows_natural_exit_credential_helper_to_finish(
+    tmp_path, returncode
+):
+    credential_state = tmp_path / f"turn-credential-state-{returncode}"
+    process_group = tmp_path / f"turn-process-group-{returncode}"
+    executable = _write_delayed_credential_helper_claude(
+        tmp_path,
+        credential_state,
+        process_group,
+        output="finished",
+        returncode=returncode,
+        detach_stdio=True,
+    )
+    child = ClaudeCodePlanChild(
+        executable=str(executable),
+        model="claude-opus-5",
+        reasoning_effort="xhigh",
+        workspace=tmp_path,
+    )
+
+    try:
+        if returncode:
+            with pytest.raises(ClaudeCodePlanUnavailable, match="turn failed"):
+                child.run_conversation("wait")
+        else:
+            assert child.run_conversation("wait") == {
+                "final_response": "finished"
+            }
+        assert credential_state.read_text() == "complete"
+    finally:
+        if process_group.exists():
+            try:
+                os.killpg(int(process_group.read_text()), signal.SIGKILL)
+            except OSError:
+                pass
 
 
 def test_stop_before_popen_assignment_terminates_new_process(tmp_path, monkeypatch):
@@ -455,12 +568,14 @@ def test_plan_child_tears_down_stdio_detached_descendant_after_cli_return(
         workspace=tmp_path,
     )
 
+    started = time.monotonic()
     try:
         if returncode:
             with pytest.raises(ClaudeCodePlanUnavailable, match="turn failed"):
                 child.run_conversation("wait")
         else:
             assert child.run_conversation("wait") == {"final_response": "finished"}
+        assert 1.5 <= time.monotonic() - started < 4
         _assert_heartbeat_stopped(heartbeat)
     finally:
         if process_group.exists():
@@ -581,7 +696,7 @@ def test_auth_probe_success_kills_cli_descendant_process_group(tmp_path):
     observed = probe_claude_plan_auth(executable=str(executable), timeout=3.0)
 
     assert observed["subscriptionType"] == "team"
-    assert time.monotonic() - started < 2
+    assert 1.5 <= time.monotonic() - started < 4
     _assert_heartbeat_stopped(heartbeat)
 
 
@@ -598,7 +713,7 @@ def test_auth_probe_invalid_status_kills_cli_descendant_process_group(tmp_path):
     with pytest.raises(ClaudeCodePlanUnavailable, match="Claude plan login"):
         probe_claude_plan_auth(executable=str(executable), timeout=3.0)
 
-    assert time.monotonic() - started < 2
+    assert 1.5 <= time.monotonic() - started < 4
     _assert_heartbeat_stopped(heartbeat)
 
 

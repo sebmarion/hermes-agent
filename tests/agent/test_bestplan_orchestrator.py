@@ -20,6 +20,7 @@ from agent.bestplan_orchestrator import (
     body_sha256, build_explorer_schedule, make_receipt, normalize_count, quorum_for,
     reconcile_bestplan_receipts, run_bestplan, validate_receipt, validate_runtime,
     _bestplan_task_with_context, _build_child_agent, _build_repair_agent,
+    _candidate_from_text,
     _resolve_lane_credentials, _run_child_with_timeout, _validated_plan_envelope,
 )
 
@@ -36,6 +37,56 @@ def _candidate_text(label="ok"):
             "verification": ["verify"],
         }
     )
+
+
+def _candidate_json(label="ok"):
+    return json.dumps(
+        {
+            "schema": "HERMES_BESTPLAN_CANDIDATE_V1",
+            "summary": label,
+            "steps": ["step"],
+            "risks": ["risk"],
+            "verification": ["verify"],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _candidate_json("raw"),
+        "```json\n" + _candidate_json("fenced") + "\n```",
+    ],
+)
+def test_candidate_parser_accepts_raw_json_with_schema_value(response):
+    assert _candidate_from_text(response)["schema"] == (
+        "HERMES_BESTPLAN_CANDIDATE_V1"
+    )
+
+
+def test_candidate_parser_preserves_explicit_prefix_format():
+    assert _candidate_from_text(_candidate_text("prefixed"))["summary"] == "prefixed"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "prose before\n" + _candidate_text(),
+        _candidate_text() + "\nprose after",
+        _candidate_json() + "\n" + _candidate_json("second"),
+    ],
+)
+def test_candidate_parser_rejects_prose_and_multiple_objects(response):
+    with pytest.raises((json.JSONDecodeError, ValueError)):
+        _candidate_from_text(response)
+
+
+def test_candidate_parser_rejects_invalid_schema():
+    invalid = json.loads(_candidate_json())
+    invalid["schema"] = "HERMES_BESTPLAN_CANDIDATE_V2"
+
+    with pytest.raises(ValueError, match="invalid BestPlan candidate schema"):
+        _candidate_from_text(json.dumps(invalid))
 
 
 def _synth_plan_envelope(*, workspace="/tmp/work", review=False):

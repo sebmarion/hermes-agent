@@ -956,7 +956,7 @@ class TestSessionRetirement:
         assert r.should_retire is False
         assert r.interrupted is False
 
-    def test_post_tool_watchdog_treats_in_scope_reasoning_as_activity(self):
+    def test_post_tool_watchdog_refreshes_on_reasoning_then_retires_after_silence(self):
         client = FakeClient()
         client.queue_notification(
             "item/completed",
@@ -976,29 +976,184 @@ class TestSessionRetirement:
             },
             threadId="t", turnId="tu1",
         )
+        session = make_session(client)
+        notes = list(client._notifications)
+        client._notifications.clear()
+        clock = {"now": 0.0}
+        schedule = iter(
+            [
+                (0.0, notes[0]),
+                (10.0, notes[1]),
+                (99.0, None),
+                (100.1, None),
+            ]
+        )
+
+        def take_notification(timeout=0.0):
+            del timeout
+            try:
+                clock["now"], note = next(schedule)
+            except StopIteration:
+                clock["now"] = 501.0
+                return None
+            return note
+
+        client.take_notification = take_notification
+
+        with patch.object(
+            session_mod.time,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            result = session.run_turn(
+                "tool then reason",
+                turn_timeout=500.0,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=90.0,
+            )
+
+        assert result.tool_iterations == 1
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "silent for 90s" in result.error
+        assert clock["now"] == 100.1
+
+    def test_post_tool_watchdog_repeated_reasoning_activity_keeps_turn_live(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        for index in (1, 2):
+            client.queue_notification(
+                "item/completed",
+                item={
+                    "type": "reasoning", "id": f"reasoning-{index}",
+                    "summary": ["Still working"], "content": [],
+                },
+                threadId="t", turnId="tu1",
+            )
         client.queue_notification(
             "turn/completed", threadId="t",
             turn={"id": "tu1", "status": "completed", "error": None},
         )
         session = make_session(client)
-        monotonic_values = iter([0.0, 0.0, 0.0, 0.0, 0.01, 0.2, 0.2])
+        notes = list(client._notifications)
+        client._notifications.clear()
+        clock = {"now": 0.0}
+        schedule = iter(
+            [
+                (0.0, notes[0]),
+                (60.0, notes[1]),
+                (120.0, None),
+                (180.0, notes[2]),
+                (250.0, None),
+                (260.0, notes[3]),
+            ]
+        )
+
+        def take_notification(timeout=0.0):
+            del timeout
+            clock["now"], note = next(schedule)
+            return note
+
+        client.take_notification = take_notification
 
         with patch.object(
             session_mod.time,
             "monotonic",
-            side_effect=lambda: next(monotonic_values),
+            side_effect=lambda: clock["now"],
         ):
             result = session.run_turn(
-                "tool then reason",
-                turn_timeout=5.0,
+                "tool then keep reasoning",
+                turn_timeout=500.0,
                 notification_poll_timeout=0.0,
-                post_tool_quiet_timeout=0.05,
+                post_tool_quiet_timeout=90.0,
             )
 
         assert result.tool_iterations == 1
         assert result.interrupted is False
         assert result.should_retire is False
         assert result.error is None
+
+    def test_post_tool_watchdog_refreshes_during_server_request_drain(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="echo hi",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "reasoning", "id": "reasoning-1",
+                "summary": ["Still working"], "content": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        session = make_session(
+            client,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+        notes = list(client._notifications)
+        client._notifications.clear()
+        clock = {"now": 0.0}
+        schedule = iter(
+            [
+                (0.0, notes[0]),
+                (10.0, notes[1]),
+                (10.0, None),
+                (99.0, None),
+                (100.1, None),
+            ]
+        )
+
+        def take_notification(timeout=0.0):
+            del timeout
+            try:
+                clock["now"], note = next(schedule)
+            except StopIteration:
+                clock["now"] = 501.0
+                return None
+            return note
+
+        client.take_notification = take_notification
+
+        with patch.object(
+            session_mod.time,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            result = session.run_turn(
+                "tool then approval then silence",
+                turn_timeout=500.0,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=90.0,
+            )
+
+        assert client.responses == [("approval-1", {"decision": "accept"})]
+        assert result.tool_iterations == 1
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "silent for 90s" in result.error
+        assert clock["now"] == 100.1
 
     @pytest.mark.parametrize(
         "activity_thread_id, activity_turn_id",

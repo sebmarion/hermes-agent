@@ -633,12 +633,22 @@ class ExplorerResult:
 
 def _candidate_from_text(text: str) -> dict[str, Any]:
     marker = "HERMES_BESTPLAN_CANDIDATE_V1"
-    if marker in text:
-        text = text.split(marker, 1)[1]
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("candidate JSON missing")
-    return validate_candidate(json.loads(text[start : end + 1]))
+    candidate = str(text or "").strip()
+    if candidate.startswith(marker):
+        remainder = candidate[len(marker) :]
+        if not remainder or not remainder[0].isspace():
+            raise ValueError("candidate JSON missing")
+        candidate = remainder.strip()
+    elif candidate.startswith("```"):
+        lines = candidate.splitlines()
+        if (
+            len(lines) < 3
+            or lines[0].strip().lower() not in {"```", "```json"}
+            or lines[-1].strip() != "```"
+        ):
+            raise ValueError("invalid candidate JSON fence")
+        candidate = "\n".join(lines[1:-1]).strip()
+    return validate_candidate(json.loads(candidate))
 
 
 def _truncate_middle(text: str, limit: int) -> str:

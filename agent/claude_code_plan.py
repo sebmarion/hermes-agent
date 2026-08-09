@@ -67,6 +67,8 @@ _FORBIDDEN_AUTH_ENV_PREFIXES = ("ANTHROPIC_",)
 _SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _READ_ONLY_TOOLS = "Read,Glob,Grep,WebFetch,WebSearch"
 _AUTH_PROBE_POLL_SECONDS = 0.05
+_NATURAL_EXIT_GRACE_SECONDS = 2.0
+_PROCESS_GROUP_POLL_SECONDS = 0.05
 _PROCESS_TERM_TIMEOUT_SECONDS = 1.0
 _PROCESS_KILL_TIMEOUT_SECONDS = 1.0
 
@@ -118,7 +120,10 @@ def probe_claude_plan_auth(
     """Require a logged-in first-party ``claude.ai`` subscription session."""
     binary = find_claude_executable(executable)
     process: subprocess.Popen[str] | None = None
+    cleanup_complete = False
     try:
+        timeout_seconds = float(timeout)
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
         if cancel_requested is not None and cancel_requested():
             raise _ClaudePlanAuthCancelled
         process = subprocess.Popen(
@@ -132,10 +137,18 @@ def probe_claude_plan_auth(
         )
         stdout, _stderr = _communicate_auth_probe(
             process,
-            timeout=timeout,
+            timeout=timeout_seconds,
+            deadline=deadline,
             cancel_requested=cancel_requested,
         )
         returncode = process.returncode
+        cleanup_complete = _cleanup_naturally_exited_process_group(
+            process,
+            interrupt_requested=cancel_requested,
+            deadline=deadline,
+        )
+        if not cleanup_complete:
+            raise _ClaudePlanAuthCancelled
     except _ClaudePlanAuthCancelled as exc:
         raise ClaudeCodePlanUnavailable("Claude plan login verification was cancelled") from exc
     except (OSError, subprocess.SubprocessError) as exc:
@@ -145,7 +158,8 @@ def probe_claude_plan_auth(
     finally:
         if process is not None:
             try:
-                _terminate_process_group(process)
+                if not cleanup_complete:
+                    _terminate_process_group(process)
             finally:
                 _close_process_pipes(process)
     try:
@@ -222,6 +236,46 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
         pass
 
 
+def _process_group_is_alive(process: subprocess.Popen[str]) -> bool:
+    if os.name != "posix":
+        return process.poll() is None
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _cleanup_naturally_exited_process_group(
+    process: subprocess.Popen[str],
+    *,
+    interrupt_requested: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+) -> bool:
+    """Give same-group exit helpers a bounded grace period before containment."""
+    if process.poll() is None:
+        _terminate_process_group(process)
+        return True
+    if os.name != "posix":
+        return True
+
+    grace_deadline = time.monotonic() + _NATURAL_EXIT_GRACE_SECONDS
+    if deadline is not None:
+        grace_deadline = min(grace_deadline, deadline)
+    while _process_group_is_alive(process):
+        if interrupt_requested is not None and interrupt_requested():
+            _terminate_process_group(process)
+            return False
+        remaining = grace_deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process_group(process)
+            return True
+        time.sleep(min(_PROCESS_GROUP_POLL_SECONDS, remaining))
+    return True
+
+
 def _close_process_pipes(process: subprocess.Popen[str]) -> None:
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None:
@@ -235,16 +289,23 @@ def _communicate_auth_probe(
     process: subprocess.Popen[str],
     *,
     timeout: float,
+    deadline: float,
     cancel_requested: Callable[[], bool] | None,
 ) -> tuple[str, str]:
     timeout_seconds = float(timeout)
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    natural_exit_deadline: float | None = None
     while True:
         if cancel_requested is not None and cancel_requested():
             raise _ClaudePlanAuthCancelled
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+        if natural_exit_deadline is not None:
+            natural_exit_remaining = natural_exit_deadline - time.monotonic()
+            if natural_exit_remaining <= 0:
+                _terminate_process_group(process)
+                return process.communicate(timeout=_PROCESS_KILL_TIMEOUT_SECONDS)
+            remaining = min(remaining, natural_exit_remaining)
         try:
             return process.communicate(
                 timeout=min(_AUTH_PROBE_POLL_SECONDS, remaining)
@@ -252,10 +313,11 @@ def _communicate_auth_probe(
         except subprocess.TimeoutExpired:
             if process.poll() is None:
                 continue
-            # The CLI leader has exited, but one of its descendants still owns
-            # an inherited pipe. Kill the isolated group, then drain the status.
-            _terminate_process_group(process)
-            return process.communicate(timeout=_PROCESS_KILL_TIMEOUT_SECONDS)
+            if natural_exit_deadline is None:
+                natural_exit_deadline = min(
+                    deadline,
+                    time.monotonic() + _NATURAL_EXIT_GRACE_SECONDS,
+                )
 
 
 class ClaudeCodePlanChild:
@@ -330,15 +392,23 @@ class ClaudeCodePlanChild:
             stop_requested = self._stop_requested.is_set()
         if stop_requested:
             _terminate_process_group(process)
+        cleanup_complete = False
         try:
             stdout, _stderr = process.communicate(str(prompt))
+            cleanup_complete = _cleanup_naturally_exited_process_group(
+                process,
+                interrupt_requested=self._stop_requested.is_set,
+            )
         finally:
             try:
-                _terminate_process_group(process)
+                if not cleanup_complete:
+                    _terminate_process_group(process)
             finally:
                 with self._process_lock:
                     if self._process is process:
                         self._process = None
+        if self._stop_requested.is_set():
+            raise ClaudeCodePlanUnavailable("Claude Code plan turn was cancelled")
         if process.returncode != 0:
             raise ClaudeCodePlanUnavailable("Claude Code plan turn failed")
         response = str(stdout or "").strip()

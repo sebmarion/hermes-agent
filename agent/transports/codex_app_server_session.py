@@ -738,6 +738,11 @@ class CodexAppServerSession:
                     if proj.is_tool_iteration:
                         result.tool_iterations += 1
                         last_tool_completion_at = time.monotonic()
+                    elif (
+                        pending.get("method", "").startswith("item/")
+                        and last_tool_completion_at is not None
+                    ):
+                        last_tool_completion_at = time.monotonic()
                     if proj.final_text is not None:
                         result.final_text = proj.final_text
                         if _has_turn_aborted_marker(proj.final_text):
@@ -748,9 +753,11 @@ class CodexAppServerSession:
                                 or "codex reported turn_aborted"
                             )
                 self._handle_server_request(sreq)
-                # Activity counts as live signal — reset the post-tool
-                # quiet timer so an approval round-trip doesn't trip it.
-                last_tool_completion_at = None
+                # Activity counts as a live signal. Once a tool has armed the
+                # watchdog, refresh it so a later approval-roundtrip silence
+                # still retires the turn. A pre-tool request must not arm it.
+                if last_tool_completion_at is not None:
+                    last_tool_completion_at = time.monotonic()
                 continue
 
             note = self._client.take_notification(
@@ -794,12 +801,15 @@ class CodexAppServerSession:
                 # Arm/refresh the post-tool quiet watchdog whenever a
                 # tool-shaped item completes.
                 last_tool_completion_at = time.monotonic()
-            elif method.startswith("item/"):
+            elif (
+                method.startswith("item/")
+                and last_tool_completion_at is not None
+            ):
                 # Accepted same-turn item activity proves Codex is live even
                 # when the projector intentionally emits no message (for
                 # example reasoning deltas/completions). Foreign/stale items
-                # were filtered above and cannot disarm this watchdog.
-                last_tool_completion_at = None
+                # were filtered above and cannot refresh this watchdog.
+                last_tool_completion_at = time.monotonic()
             if projection.final_text is not None:
                 # Codex can emit multiple agentMessage items in one turn
                 # (e.g. partial then final). Take the last one as canonical.
