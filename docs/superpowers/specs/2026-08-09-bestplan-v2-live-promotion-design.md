@@ -15,8 +15,10 @@ tests, or a reviewer verdict alone can never produce that state.
 
 Legacy BestPlan envelopes remain candidate-only. A newly captured plan may be
 upgraded to a host-attached V2 approval contract only when it matches a trusted
-promotion enrollment in the separate top-level `bestplan_promotion` block in
-`config.yaml`. The rendered plan must show the exact
+promotion enrollment held by the OS-protected promoter authority. The separate
+top-level `bestplan_promotion` block in `config.yaml` contains only the
+non-authoritative client endpoint and enrollment reference. The rendered plan
+must show the exact
 publication and live target before bare `go` approves its combined digest.
 Changing the enrollment requires operator action; routine promotions do not
 require repeated approval after the contract and gates are unchanged.
@@ -26,7 +28,8 @@ require repeated approval after the contract and gates are unchanged.
 The first production version supports:
 
 - one Git repository per plan;
-- one local target branch and one authorized remote ref;
+- one local target ref, fixed to `refs/heads/main` in V2.0, and one authorized
+  remote ref;
 - up to the existing V1 maximum of two independent implementation slices;
 - macOS `sandbox-exec` workers;
 - the current Hermes Agent Mac gateway as the first live adapter;
@@ -76,11 +79,30 @@ promoter records its own PID, process-start identity, controller artifact, and
 operation UUID before changing Git, remote, selector, or gateway state. A
 gateway restart cannot terminate or replace the authority completing its proof.
 
+The promoter executable, controller artifacts and selectors, enrollment,
+journal, job definition, and publication/live credentials reside in an
+OS-protected authority domain inaccessible to gateway, worker, check, reviewer,
+and candidate processes. On macOS V2.0 this is a root-owned LaunchDaemon and
+root-owned state directory installed during enrollment. Clients use narrow,
+peer-validated authenticated IPC and cannot signal or replace the promoter.
+Gateway-release and trusted-controller selectors are distinct: each operation
+pins controller `C(N-1)`, and the controller selector advances by compare-and-
+swap only after release N reaches `completed_verified`.
+
+Repository and worktree operations run under the enrolled repository owner
+UID/GID with a sanitized environment; the root authority never creates files in
+the user checkout as root. Publication authentication is supplied through a
+narrow authority-owned credential broker, never environment variables.
+Ownership mismatch blocks promotion.
+
 ## Host-attached approval contract
 
 The model continues to emit the existing strict V1 execution envelope. During
-capture, Hermes resolves the canonical Git repository and looks for exactly one
-trusted enrollment under `bestplan_promotion.repositories` in `config.yaml`.
+capture, Hermes first resolves only the canonical repository/common-directory
+identity, then asks the promoter authority for exactly one active enrollment
+matching the configured client reference and that identity, and only then
+captures source state using the enrollment deadline (or the bounded legacy
+default when no enrollment matches).
 If no enrollment matches, the plan remains contract version 1 and can stop only
 at `candidate_ready`.
 
@@ -105,10 +127,24 @@ and states that `go` authorizes automatic promotion only for that digest.
 Existing rows without a V2 contract can never inherit auto-promotion through a
 schema migration or configuration change.
 
-Check vectors, timeouts, review policy, remote identity, and live probes are
-host-owned enrollment inputs. Candidate code may add project tests, but it can
-never delete, replace, relax, or otherwise weaken an enrolled gate for its own
-promotion.
+Enrollment binds absolute checker executables and their digests, argv, cwd,
+environment, checker/config inputs, cache policy, timeouts, review policy,
+remote identity, and live probes. Before activation, code from `I` runs in a
+disposable N-1-created sandboxed overlay whose lower tree is immutable `I` and
+whose writable upper layer is limited to private scratch plus the frozen cache
+allowlist. It has no promoter/Git/remote/live credentials, uses restricted
+network, and receives process-tree reap. The promoter compares and discards the
+upper layer after checks; the canonical integration worktree remains untouched.
+Candidate changes cannot replace enrolled gate inputs; candidate-added tests
+run only in addition.
+
+Worker and pre-activation check processes use a default-deny Seatbelt profile.
+Reads are limited to the immutable export or integration tree, pinned N-1
+runtime and system dependencies, and private runtime/cache paths. Access to
+user homes, credential stores, Git metadata, authority state/control IPC,
+unrelated sockets or Mach services, and unrelated processes is denied. Network
+is denied except enrollment-pinned check endpoints and the worker's
+capability-bound model-broker channel.
 
 ## Source and ambient-state contract
 
@@ -116,7 +152,9 @@ The committed base tree is the sole worker and release input. Existing staged,
 unstaged, and untracked paths are protected ambient work; they are not copied
 into worker sandboxes or artifacts.
 
-Baseline capture records twice, until two consecutive reads agree:
+Baseline capture makes a bounded number of attempts within an enrolled deadline
+and succeeds only on two consecutive identical reads; otherwise it records
+`proof_stale` before persistence or dispatch. Each read records:
 
 - canonical root and common Git directory;
 - symbolic HEAD, full base object ID, target ref and target object ID;
@@ -143,7 +181,10 @@ committing the user's work.
 Each slice receives a unique attempt directory exported from the exact base
 commit. The model-visible directory contains no `.git` metadata. The worker:
 
-- receives an allowlisted environment plus only its model credential;
+- receives no provider credential; the N-1 authority model broker alone holds
+  provider credentials and accepts requests only for a registered
+  attempt/model/budget/expiry capability bound to the worker process identity;
+  the capability is revoked when the attempt process exits;
 - has no SSH agent, Git/GitHub/cloud/deployment credentials, inherited
   `PYTHONPATH`, or primary Hermes home;
 - cannot read repository Git metadata or enrolled promoter state;
@@ -180,8 +221,10 @@ At the head of the queue, the promoter:
 4. creates one immutable integration commit `I` whose first parent is the
    current target tip;
 5. verifies candidate ancestry and accepted leased-path/artifact digests;
-6. runs the required host-owned checks at exactly `I` and rejects any tracked or
-   non-ignored untracked test mutation (ignored runtime caches remain ambient);
+6. runs those approval-bound checks at exactly `I` and rejects tracked
+   mutations plus untracked mutations outside the frozen host cache allowlist;
+   ignore rules from `I` cannot expand exemptions, and test-created ignored
+   caches are byproducts, not test mutations or proof inputs;
 7. runs the mandatory independent adversarial review against exactly `I`;
 8. rechecks local/remote preconditions and protected ambient state;
 9. advances local `main` by compare-and-swap fast-forward;
@@ -190,20 +233,29 @@ At the head of the queue, the promoter:
 11. activates and verifies the live artifact;
 12. rereads local, remote, and live identity before terminal verification.
 
-The terminal reread fetches the authorized remote ref again and proves it still
-equals `I`, or is an explicitly permitted fast-forward descendant containing
-`I`; a historical push receipt is not treated as current remote state.
+The terminal reread fetches the authorized remote ref into a private ref and
+requires it to equal `I` exactly. Any other object ID, including a descendant
+containing `I`, is `remote_mismatch` and blocks `completed_verified`; a
+historical push receipt is not treated as current remote state.
 
-If current `main` moved before step 9, the integration proof is stale. The
-promoter rebuilds from the new tip and reruns checks and review. Merge conflicts
-block for a new candidate; the promoter does not ask a model to resolve them
-inside the trusted lane.
+If the target object ID changes after approval, the promoter records
+`proof_stale`; no rebuilt integration inherits that approval. A new capture
+must render and approve the changed source/target contract. Frozen candidate
+refs may be reused only when the new digest binds and revalidates them. Merge
+conflicts block for a new candidate; the promoter does not ask a model to
+resolve them inside the trusted lane.
 
 When the target branch is checked out in a dirty worktree, the promoter may
 fast-forward it only after proving that incoming paths are disjoint from the
 protected staged/unstaged/untracked set. It uses `--ff-only`, disables hooks and
 autostash, and verifies the complete protected manifest afterward. If the
 target branch is not checked out, it uses `update-ref <new> <expected-old>`.
+
+Before advancing a checked-out target, the promoter compares every incoming
+add, rename, delete, and type-change path and ancestor against the old index and
+filesystem. Any unexpected untracked entry, ignored or not, blocks with
+`dirty_overlap`. This targeted collision probe never enumerates or hashes
+ignored trees and does not make ignored caches test mutations.
 
 ## Mandatory adversarial review
 
@@ -249,18 +301,39 @@ After activation it requires:
 - a deterministic, model-free BestPlan capture/dispatch canary;
 - no new startup error in the bounded observation window.
 
-Activation failure atomically restores the previous selector and service
-definition, restarts, and verifies the old artifact and health. That terminal
-state is `rolled_back`, never completed. Complaint rollback uses the same
-verified last-good receipt. Source-history rollback is a new tested revert
-commit through the normal promotion lane; it never resets or force-pushes.
+Service-definition drift blocks before activation and is never overwritten by
+rollback. Activation failure compare-and-swap restores only the previous
+selector, restarts, and verifies the exact old artifact and health. Only a
+successful verified restore is `rolled_back`; selector conflict, restart
+failure, or an unhealthy old artifact becomes `rollback_failed` and then
+`quarantined`, never completed. Complaint rollback uses the same verified
+last-good receipt. Source-history rollback is a new tested revert commit through
+the normal promotion lane; it never resets or force-pushes.
 
 ## Durable state and recovery
 
+The root-owned authority journal is the sole authoritative proof store. It owns
+the append-only event chain, enrollment, candidate/integration identities, and
+terminal compare-and-swap. After every committed authority-journal event, the
+promoter enqueues an idempotent projection keyed by `(authority_epoch, plan_id,
+event_seq, event_hash)` and retries it until acknowledged. On startup it replays
+from each projection sink's durable cursor. Each projection carries those
+identifiers, phase, receipt digest, and a root-keyed local MAC; consumers
+validate that MAC through authority IPC and reject invalid, gapped, replayed, or
+regressive projections before reconciling from the authority. Projection
+failure never blocks, rolls back, or substitutes for authoritative state.
+`state.db`, `bestplan_plans`, and gateway-owned proof tables remain
+non-authoritative compatibility/UI projections. Authoritative status is read
+from the protected service.
+
 `bestplan_plans` retains compatibility fields for existing readers but gains
-contract version, promotion contract, source snapshot, integration, artifact,
-and verification timestamps. New normalized tables store immutable candidates
-and append-only proof events.
+a distinct nullable `promotion_contract_version`, promotion contract, source
+snapshot, integration, artifact, and verification timestamps. It does not
+repurpose the existing `version`. Rows predating source snapshots and candidate
+receipts remain legacy-terminal and cannot retry into V2; recapture is required.
+Legacy async callbacks are SQL-gated to legacy rows, while versioned plans
+ingest candidate proof events. No legacy setter may mutate V2 state. New
+normalized tables store immutable candidates and append-only proof events.
 
 Each proof event contains plan ID, sequence, phase, operation UUID, expected old
 identity, intended new identity, observed receipt, verifier/controller version,
@@ -295,7 +368,7 @@ v2_approved
 Failure/block states include `dirty_overlap`, `candidate_failed`,
 `integration_conflict`, `tests_failed`, `review_blocked`, `proof_stale`,
 `push_rejected`, `remote_mismatch`, `pushed_not_live`, `live_failed`,
-`rolled_back`, `unsupported_repository`, and `quarantined`.
+`rolled_back`, `rollback_failed`, `unsupported_repository`, and `quarantined`.
 
 There is no public unconditional verified setter. One validator performs a
 compare-and-swap to `completed_verified` only from a fresh `live_verified`
@@ -319,15 +392,24 @@ The minimal CLI is:
 
 Enrollment is also the bootstrap trust ceremony. It resolves and displays the
 exact repository, target ref, normalized credential-free push identity, live
-service, checks, and rollback target; snapshots the currently trusted
-controller into a content-addressed retained artifact; installs and verifies
-the independent promoter job plus stable gateway launcher; and only then writes
-an active `auto_live` enrollment. A partial bootstrap remains disabled and is
-safe to retry.
+service, checks, and rollback target. It creates C0 only from an exact committed
+artifact explicitly attested by the operator, installs and verifies the
+root-owned independent promoter authority plus stable gateway launcher,
+switches that launcher to C0, restarts the gateway, and verifies process-start,
+controller, artifact, and health identities before enabling `auto_live` inside
+the authority domain and writing a non-authoritative client reference in
+`config.yaml`. Dirty or unidentified runtime source cannot bootstrap authority.
+A partial bootstrap remains disabled and is safe to retry.
 
 Secrets never enter enrollment, plan rows, proof events, logs, or receipts.
 Commands and outputs are recorded as structured argument vectors, exit codes,
 bounded redacted summaries, and full-output digests.
+One authority-owned serialization/redaction boundary handles Git, checks,
+review, model-broker, health, canary, and process output. It computes the full
+digest in memory, persists only bounded redacted text plus that digest, and
+rejects payloads that cannot be safely serialized. Client projections and
+status responses pass through the same policy; raw secret-bearing output is
+never logged as a fallback.
 
 ## Acceptance
 
@@ -341,15 +423,21 @@ Implementation is complete only when all of the following are demonstrated:
   host-created candidate commits/refs;
 - worker environments contain no publication/deployment credentials and timeout
   cleanup leaves no writer process;
+- default-deny worker/check sandboxes reject secret reads, authority/control
+  IPC, arbitrary egress, and signaling unrelated processes while the exact
+  broker and enrolled check-endpoint allowlists remain functional;
 - legacy rows and V1 plans remain candidate-only;
 - V2 approval changes when any source, remote, check, review, target, or rollback
   field changes;
-- concurrent plans serialize only promotion and stale candidates are rebuilt or
-  blocked;
+- concurrent plans serialize only promotion and stale candidates require a
+  fresh approved contract or remain blocked;
 - checks and review are commit-bound and invalidated by any integration change;
 - dirty-overlap, conflict, test failure, review failure, push race/rejection,
   crash at every intent/receipt boundary, health failure, canary failure, and
   rollback failure are covered by deterministic tests;
+- a crash after authority-journal commit but before projection acknowledgement,
+  startup projection backfill, and stale, replayed, gapped, or bad-MAC
+  projections are covered without changing authoritative state;
 - local main and protected dirty files are preserved exactly;
 - the authorized remote ref is independently observed at the integration SHA;
 - the gateway runs the selected immutable artifact, reports the expected full
