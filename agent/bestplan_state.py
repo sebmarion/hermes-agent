@@ -158,6 +158,24 @@ def _canonical_workspace(workspace: str) -> str:
     return str(Path(workspace or os.getcwd()).expanduser().resolve())
 
 
+def _has_local_git_boundary(workspace: str) -> bool:
+    """Distinguish legacy non-Git fixtures from failed trusted repositories."""
+
+    candidate = Path(workspace)
+    for directory in (candidate, *candidate.parents):
+        try:
+            (directory / ".git").lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            return True
+        return True
+    try:
+        return (candidate / "HEAD").is_file() and (candidate / "objects").is_dir()
+    except OSError:
+        return True
+
+
 _RUNTIME_SECRET_CONTAINERS = {"auth", "cookies", "extra_headers", "headers"}
 _RUNTIME_SECRET_PARTS = {
     "api_key", "authorization", "bearer", "cookie", "credential",
@@ -630,15 +648,36 @@ class BestplanStore:
         provisional: bool = False,
     ) -> str:
         workspace = _canonical_workspace(workspace)
+        supplied_fingerprint = (
+            None if baseline_fingerprint is None else str(baseline_fingerprint)
+        )
         baseline_revision: str | None = None
-        if not baseline_fingerprint:
+        try:
+            repo = resolve_repo_identity(workspace)
+        except SourceBoundaryError as exc:
+            if not supplied_fingerprint or _has_local_git_boundary(workspace):
+                raise BaselineFingerprintError(
+                    f"strong git baseline unavailable for {workspace}: {exc.code}: {exc}"
+                ) from exc
+            # Compatibility only for historical tests/callers that inject a
+            # synthetic baseline for a nonexistent or non-Git workspace.
+            # Task 2 gates trusted V2 execution on baseline_revision != NULL.
+            baseline_fingerprint = supplied_fingerprint
+        else:
             try:
-                repo = resolve_repo_identity(workspace)
                 snapshot = capture_source_snapshot(repo, time.monotonic() + 10.0)
             except SourceBoundaryError as exc:
                 raise BaselineFingerprintError(
                     f"strong git baseline unavailable for {workspace}: {exc.code}: {exc}"
                 ) from exc
+            if (
+                supplied_fingerprint is not None
+                and supplied_fingerprint != snapshot.fingerprint
+            ):
+                raise BaselineFingerprintError(
+                    "supplied baseline fingerprint does not match the trusted "
+                    f"source snapshot for {workspace}"
+                )
             baseline_fingerprint = snapshot.fingerprint
             baseline_revision = snapshot.head_oid
         manifest = plan.to_manifest()

@@ -12,7 +12,8 @@ import os
 import stat
 import subprocess
 import time
-from dataclasses import dataclass, replace
+import unicodedata
+from dataclasses import dataclass
 from typing import Iterable
 
 
@@ -215,13 +216,29 @@ def _without_delimiter(value: bytes) -> bytes:
     return value[:-1] if value.endswith(b"\n") else value
 
 
-def _hash_fields(label: bytes, fields: Iterable[bytes]) -> str:
+def _hash_fields(
+    label: bytes,
+    fields: Iterable[bytes],
+    *,
+    deadline: float | None = None,
+) -> str:
     digest = hashlib.sha256()
     digest.update(len(label).to_bytes(8, "big"))
     digest.update(label)
     for field in fields:
+        if deadline is not None:
+            _remaining(deadline)
         digest.update(len(field).to_bytes(8, "big"))
         digest.update(field)
+    return digest.hexdigest()
+
+
+def _sha256_bytes(value: bytes, *, deadline: float) -> str:
+    digest = hashlib.sha256()
+    for offset in range(0, len(value), _BUFFER_SIZE):
+        _remaining(deadline)
+        digest.update(value[offset:offset + _BUFFER_SIZE])
+    _remaining(deadline)
     return digest.hexdigest()
 
 
@@ -273,6 +290,7 @@ def _resolve_repo_identity(workspace: str, deadline: float) -> RepoIdentity:
             str(common_stat.st_ino).encode("ascii"),
             object_format.encode("ascii"),
         ),
+        deadline=deadline,
     )
     return RepoIdentity(
         workspace=os.fsdecode(workspace_raw),
@@ -310,13 +328,28 @@ def _same_repository(expected: RepoIdentity, actual: RepoIdentity) -> bool:
     )
 
 
-def _split_nul(value: bytes) -> list[bytes]:
-    return [part for part in value.split(b"\0") if part]
+def _split_nul(value: bytes, *, deadline: float | None = None) -> list[bytes]:
+    parts: list[bytes] = []
+    offset = 0
+    while offset < len(value):
+        if deadline is not None:
+            _remaining(deadline)
+        end = value.find(b"\0", offset)
+        if end < 0:
+            end = len(value)
+        if end > offset:
+            parts.append(value[offset:end])
+        offset = end + 1
+    return parts
 
 
-def _parse_index_entries(value: bytes) -> tuple[IndexEntry, ...]:
+def _parse_index_entries(
+    value: bytes, *, deadline: float | None = None,
+) -> tuple[IndexEntry, ...]:
     entries: list[IndexEntry] = []
-    for record in _split_nul(value):
+    for record in _split_nul(value, deadline=deadline):
+        if deadline is not None:
+            _remaining(deadline)
         try:
             metadata, path = record.split(b"\t", 1)
             mode_raw, oid_raw, stage_raw = metadata.split(b" ", 2)
@@ -332,9 +365,13 @@ def _parse_index_entries(value: bytes) -> tuple[IndexEntry, ...]:
     return tuple(sorted(entries, key=lambda item: (item.path, item.stage)))
 
 
-def _parse_tags(value: bytes) -> dict[bytes, bytes]:
+def _parse_tags(
+    value: bytes, *, deadline: float | None = None,
+) -> dict[bytes, bytes]:
     tags: dict[bytes, bytes] = {}
-    for record in _split_nul(value):
+    for record in _split_nul(value, deadline=deadline):
+        if deadline is not None:
+            _remaining(deadline)
         if len(record) < 3 or record[1:2] != b" ":
             raise SourceBoundaryError("Git returned an invalid raw index flag record")
         tags[record[2:]] = record[:1]
@@ -427,7 +464,7 @@ def _capture_path(
             "symlink",
             mode,
             len(target_raw),
-            hashlib.sha256(target_raw).hexdigest(),
+            _sha256_bytes(target_raw, deadline=deadline),
             target_raw,
         )
     if stat.S_ISDIR(mode):
@@ -453,7 +490,7 @@ def _ignored_paths(
     )
     if code == 1:
         return set()
-    return set(_split_nul(output))
+    return set(_split_nul(output, deadline=deadline))
 
 
 def _scan_nonignored_specials(repo: RepoIdentity, *, deadline: float) -> None:
@@ -465,16 +502,25 @@ def _scan_nonignored_specials(repo: RepoIdentity, *, deadline: float) -> None:
         for directory, prefix in frontier:
             try:
                 with os.scandir(directory) as iterator:
-                    entries = list(iterator)
+                    entries = []
+                    for entry in iterator:
+                        _remaining(deadline)
+                        entries.append(entry)
             except OSError as exc:
                 raise SourceBoundaryError(
                     f"repository path cannot be enumerated: {os.fsdecode(directory)}: {exc}"
                 ) from exc
             for entry in entries:
+                _remaining(deadline)
                 name = os.fsencode(entry.name)
                 if not prefix and name == b".git":
                     continue
                 relative = name if not prefix else prefix + b"/" + name
+                if prefix and name == b".git":
+                    raise UnsupportedRepositoryError(
+                        "nonignored nested Git repository boundary is unsupported: "
+                        f"{os.fsdecode(relative)}"
+                    )
                 try:
                     mode = entry.stat(follow_symlinks=False).st_mode
                 except FileNotFoundError as exc:
@@ -503,6 +549,110 @@ def _scan_nonignored_specials(repo: RepoIdentity, *, deadline: float) -> None:
         frontier = next_frontier
 
 
+def _read_stable_small_file(
+    path: bytes,
+    *,
+    deadline: float,
+    limit: int = 64 * 1024,
+) -> bytes:
+    _remaining(deadline)
+    try:
+        before = os.lstat(path)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise _CaptureChanged("Git identity file changed during capture") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (before.st_dev, before.st_ino):
+            raise _CaptureChanged("Git identity file changed during capture")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            _remaining(deadline)
+            chunk = os.read(fd, min(_BUFFER_SIZE, limit + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > limit:
+                raise SourceBoundaryError("Git identity file exceeds the trusted limit")
+        after_open = os.fstat(fd)
+    finally:
+        os.close(fd)
+    try:
+        after_path = os.lstat(path)
+    except OSError as exc:
+        raise _CaptureChanged("Git identity file changed during capture") from exc
+    if (
+        _path_state(before) != _path_state(opened)
+        or _path_state(opened) != _path_state(after_open)
+        or _path_state(after_open) != _path_state(after_path)
+    ):
+        raise _CaptureChanged("Git identity file changed during capture")
+    _remaining(deadline)
+    return b"".join(chunks)
+
+
+def _reject_nonempty_repository_file(
+    repo: RepoIdentity,
+    relative: tuple[bytes, ...],
+    *,
+    label: str,
+    deadline: float,
+) -> None:
+    _remaining(deadline)
+    path = os.path.join(repo.common_dir_raw, *relative)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SourceBoundaryError(
+            f"repository {label} state cannot be inspected: {exc}"
+        ) from exc
+    _remaining(deadline)
+    if not stat.S_ISREG(info.st_mode) or info.st_size:
+        raise UnsupportedRepositoryError(
+            f"nonempty or non-regular Git {label} state is unsupported"
+        )
+
+
+def _reject_partial_clone_configuration(
+    repo: RepoIdentity, *, deadline: float,
+) -> None:
+    code, configured = _run_git(
+        repo.worktree_raw,
+        "config",
+        "--local",
+        "--get",
+        "extensions.partialClone",
+        deadline=deadline,
+        ok_codes=(0, 1),
+    )
+    if code == 0 and configured:
+        raise UnsupportedRepositoryError(
+            "Git partial/promisor clone configuration is unsupported"
+        )
+    code, configured = _run_git(
+        repo.worktree_raw,
+        "config",
+        "--local",
+        "--get-regexp",
+        r"^remote\..*\.(promisor|partialclonefilter)$",
+        deadline=deadline,
+        ok_codes=(0, 1),
+    )
+    if code == 0 and configured:
+        raise UnsupportedRepositoryError(
+            "Git partial/promisor clone configuration is unsupported"
+        )
+
+
 def _tree_entries(
     repo: RepoIdentity, treeish: str, *, deadline: float,
 ) -> tuple[_TreeEntry, ...]:
@@ -516,7 +666,8 @@ def _tree_entries(
         deadline=deadline,
     )
     entries: list[_TreeEntry] = []
-    for record in _split_nul(output):
+    for record in _split_nul(output, deadline=deadline):
+        _remaining(deadline)
         try:
             metadata, path = record.split(b"\t", 1)
             mode_raw, object_type, oid_raw = metadata.split(b" ", 2)
@@ -554,7 +705,7 @@ def _tree_filter_names(
         deadline=deadline,
         input_data=b"\0".join(paths) + b"\0",
     )
-    records = _split_nul(output)
+    records = _split_nul(output, deadline=deadline)
     if len(records) % 3:
         raise SourceBoundaryError("Git returned an invalid raw attribute record")
     names: set[bytes] = set()
@@ -574,6 +725,19 @@ def _assert_supported_repository(
     current = _resolve_repo_identity(repo.workspace, absolute_deadline)
     if not _same_repository(repo, current):
         raise ProofStaleError("proof_stale: repository identity changed")
+    _reject_nonempty_repository_file(
+        repo,
+        (b"info", b"grafts"),
+        label="grafts",
+        deadline=absolute_deadline,
+    )
+    _reject_nonempty_repository_file(
+        repo,
+        (b"objects", b"info", b"alternates"),
+        label="object alternates",
+        deadline=absolute_deadline,
+    )
+    _reject_partial_clone_configuration(repo, deadline=absolute_deadline)
     _, bare = _run_git(
         repo.worktree_raw, "rev-parse", "--is-bare-repository", deadline=absolute_deadline,
     )
@@ -652,7 +816,10 @@ def _assert_supported_repository(
     _, index_raw = _run_git(
         repo.worktree_raw, "ls-files", "--stage", "-z", deadline=absolute_deadline,
     )
-    if any(entry.mode == 0o160000 for entry in _parse_index_entries(index_raw)):
+    if any(
+        entry.mode == 0o160000
+        for entry in _parse_index_entries(index_raw, deadline=absolute_deadline)
+    ):
         raise UnsupportedRepositoryError("Git submodules are unsupported")
     if scan_specials:
         _scan_nonignored_specials(repo, deadline=absolute_deadline)
@@ -679,6 +846,8 @@ def _manifest_digest(
     worktree_entries: tuple[ProtectedPath, ...],
     staged_diff_sha256: str,
     unstaged_diff_sha256: str,
+    *,
+    deadline: float,
 ) -> str:
     fields: list[bytes] = [
         b"staged-diff",
@@ -687,6 +856,7 @@ def _manifest_digest(
         unstaged_diff_sha256.encode("ascii"),
     ]
     for entry in index_entries:
+        _remaining(deadline)
         fields.extend((
             b"index",
             entry.path,
@@ -695,6 +865,7 @@ def _manifest_digest(
             str(entry.stage).encode("ascii"),
         ))
     for entry in index_flags:
+        _remaining(deadline)
         fields.extend((
             b"flags",
             entry.path,
@@ -705,6 +876,7 @@ def _manifest_digest(
             b"1" if entry.fsmonitor_valid else b"0",
         ))
     for entry in worktree_entries:
+        _remaining(deadline)
         fields.extend((
             b"worktree",
             entry.path,
@@ -715,7 +887,9 @@ def _manifest_digest(
             b"" if entry.content_sha256 is None else entry.content_sha256.encode("ascii"),
             b"" if entry.symlink_target is None else entry.symlink_target,
         ))
-    return _hash_fields(b"bestplan-protected-manifest-v1", fields)
+    return _hash_fields(
+        b"bestplan-protected-manifest-v1", fields, deadline=deadline,
+    )
 
 
 def capture_protected_manifest(
@@ -731,15 +905,15 @@ def capture_protected_manifest(
     _, index_raw = _run_git(
         repo.worktree_raw, "ls-files", "--stage", "-z", deadline=absolute_deadline,
     )
-    index_entries = _parse_index_entries(index_raw)
+    index_entries = _parse_index_entries(index_raw, deadline=absolute_deadline)
     _, verbose_raw = _run_git(
         repo.worktree_raw, "ls-files", "-v", "-z", deadline=absolute_deadline,
     )
     _, fsmonitor_raw = _run_git(
         repo.worktree_raw, "ls-files", "-f", "-z", deadline=absolute_deadline,
     )
-    verbose_tags = _parse_tags(verbose_raw)
-    fsmonitor_tags = _parse_tags(fsmonitor_raw)
+    verbose_tags = _parse_tags(verbose_raw, deadline=absolute_deadline)
+    fsmonitor_tags = _parse_tags(fsmonitor_raw, deadline=absolute_deadline)
     all_flag_paths = sorted(set(verbose_tags) | set(fsmonitor_tags))
     index_flags = tuple(
         IndexFlags(
@@ -763,8 +937,8 @@ def capture_protected_manifest(
         "-z",
         deadline=absolute_deadline,
     )
-    tracked_paths = set(_split_nul(cached_raw))
-    untracked_paths = set(_split_nul(untracked_raw))
+    tracked_paths = set(_split_nul(cached_raw, deadline=absolute_deadline))
+    untracked_paths = set(_split_nul(untracked_raw, deadline=absolute_deadline))
     worktree_entries = tuple(
         _capture_path(
             repo,
@@ -779,7 +953,11 @@ def capture_protected_manifest(
         "diff",
         "--cached",
         "--binary",
+        "--full-index",
         "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-color",
         "HEAD",
         "--",
         deadline=absolute_deadline,
@@ -788,23 +966,61 @@ def capture_protected_manifest(
         repo.worktree_raw,
         "diff",
         "--binary",
+        "--full-index",
         "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-color",
+        "--",
+        deadline=absolute_deadline,
+    )
+    _, staged_names_raw = _run_git(
+        repo.worktree_raw,
+        "diff",
+        "--cached",
+        "--name-only",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-color",
+        "HEAD",
+        "--",
+        deadline=absolute_deadline,
+    )
+    _, unstaged_names_raw = _run_git(
+        repo.worktree_raw,
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-color",
         "--",
         deadline=absolute_deadline,
     )
     _scan_nonignored_specials(repo, deadline=absolute_deadline)
+    special_flag_paths = {
+        entry.path
+        for entry in index_flags
+        if entry.assume_unchanged or entry.skip_worktree or entry.fsmonitor_valid
+    }
     protected_paths = tuple(sorted(
-        {entry.path for entry in index_entries}
-        | {entry.path for entry in worktree_entries}
+        set(_split_nul(staged_names_raw, deadline=absolute_deadline))
+        | set(_split_nul(unstaged_names_raw, deadline=absolute_deadline))
+        | untracked_paths
+        | special_flag_paths
     ))
-    staged_diff_sha256 = hashlib.sha256(staged_diff).hexdigest()
-    unstaged_diff_sha256 = hashlib.sha256(unstaged_diff).hexdigest()
+    staged_diff_sha256 = _sha256_bytes(staged_diff, deadline=absolute_deadline)
+    unstaged_diff_sha256 = _sha256_bytes(unstaged_diff, deadline=absolute_deadline)
     digest = _manifest_digest(
         index_entries,
         index_flags,
         worktree_entries,
         staged_diff_sha256,
         unstaged_diff_sha256,
+        deadline=absolute_deadline,
     )
     return ProtectedManifest(
         index_entries=index_entries,
@@ -831,11 +1047,7 @@ def _head_read(repo: RepoIdentity, *, deadline: float) -> _SourceRead:
         deadline=deadline,
     )
     head_path = _without_delimiter(head_path_out)
-    try:
-        with open(head_path, "rb") as handle:
-            head_raw = handle.read()
-    except OSError as exc:
-        raise _CaptureChanged("Git HEAD changed during capture") from exc
+    head_raw = _read_stable_small_file(head_path, deadline=deadline)
     ref_code, ref_out = _run_git(
         repo.worktree_raw,
         "symbolic-ref",
@@ -881,17 +1093,28 @@ def _head_read(repo: RepoIdentity, *, deadline: float) -> _SourceRead:
     )
 
 
-def _snapshot_fingerprint(repo: RepoIdentity, read: _SourceRead) -> str:
+def _snapshot_fingerprint(
+    repo: RepoIdentity,
+    read: _SourceRead,
+    *,
+    deadline: float | None = None,
+) -> str:
     return _hash_fields(
         b"bestplan-source-snapshot-v1",
         (
             repo.repository_id.encode("ascii"),
+            repo.worktree_raw,
+            repo.git_dir_raw,
+            repo.common_dir_raw,
+            str(repo.common_dir_device).encode("ascii"),
+            str(repo.common_dir_inode).encode("ascii"),
             read.head_raw,
             b"" if read.head_ref is None else read.head_ref,
             read.head_oid.encode("ascii"),
             read.tree_oid.encode("ascii"),
             read.protected_manifest.digest.encode("ascii"),
         ),
+        deadline=deadline,
     )
 
 
@@ -916,7 +1139,9 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
                 head_oid=current.head_oid,
                 tree_oid=current.tree_oid,
                 protected_manifest=current.protected_manifest,
-                fingerprint=_snapshot_fingerprint(repo, current),
+                fingerprint=_snapshot_fingerprint(
+                    repo, current, deadline=absolute_deadline,
+                ),
             )
         previous = current
     raise ProofStaleError(
@@ -924,46 +1149,221 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
     )
 
 
-def recapture_matches(expected: SourceSnapshot) -> bool:
+def recapture_matches(
+    expected: SourceSnapshot, *, deadline: float | None = None,
+) -> bool:
     """Return whether the repository and protected state still match exactly."""
 
+    absolute_deadline = (
+        time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+        if deadline is None
+        else float(deadline)
+    )
     try:
-        actual_repo = resolve_repo_identity(expected.repo.workspace)
+        actual_repo = _resolve_repo_identity(expected.repo.workspace, absolute_deadline)
         if not _same_repository(expected.repo, actual_repo):
             return False
-        actual = capture_source_snapshot(
-            actual_repo, time.monotonic() + _DEFAULT_DEADLINE_SECONDS,
-        )
+        actual = capture_source_snapshot(actual_repo, absolute_deadline)
     except SourceBoundaryError:
         return False
     return actual == expected
 
 
-def _prepare_destination(destination: str | os.PathLike[str]) -> bytes:
-    raw = os.path.abspath(os.path.expanduser(os.fsencode(destination)))
+def _path_is_within(path: bytes, root: bytes) -> bool:
     try:
-        info = os.lstat(raw)
-    except FileNotFoundError:
-        os.makedirs(raw, mode=0o755)
-        return raw
-    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        raise SourceBoundaryError("exact-tree destination must be a real directory")
-    with os.scandir(raw) as iterator:
-        if next(iterator, None) is not None:
-            raise SourceBoundaryError("exact-tree destination must be empty")
-    return raw
+        return os.path.commonpath((path, root)) == root
+    except ValueError:
+        return False
 
 
-def _read_exact(stream, size: int) -> bytes:
-    chunks: list[bytes] = []
-    remaining = size
-    while remaining:
-        chunk = stream.read(remaining)
-        if not chunk:
-            raise SourceBoundaryError("git cat-file ended before the blob was complete")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+def _assert_tree_path_aliases(
+    entries: tuple[_TreeEntry, ...], *, deadline: float,
+) -> None:
+    siblings: dict[tuple[str, ...], dict[str, bytes]] = {}
+    for entry in entries:
+        _remaining(deadline)
+        normalized_parent: list[str] = []
+        for component in entry.path.split(b"/"):
+            _remaining(deadline)
+            normalized = unicodedata.normalize(
+                "NFC", os.fsdecode(component),
+            ).casefold()
+            parent_key = tuple(normalized_parent)
+            previous = siblings.setdefault(parent_key, {}).get(normalized)
+            if previous is not None and previous != component:
+                raise UnsupportedRepositoryError(
+                    "Git tree contains a case-fold or Unicode-normalization path alias"
+                )
+            siblings[parent_key][normalized] = component
+            normalized_parent.append(normalized)
+
+
+def _prepare_destination(
+    repo: RepoIdentity,
+    destination: str | os.PathLike[str],
+    *,
+    deadline: float,
+) -> tuple[bytes, int, tuple[int, int]]:
+    _remaining(deadline)
+    raw = os.path.abspath(os.path.expanduser(os.fsencode(destination)))
+    leaf = os.path.basename(raw)
+    if leaf in {b"", b".", b".."} or b"/" in leaf or b"\0" in leaf:
+        raise SourceBoundaryError("exact-tree destination path is unsafe")
+    parent = os.path.realpath(os.path.dirname(raw))
+    canonical = os.path.join(parent, leaf)
+    for source_root in (
+        repo.worktree_raw,
+        repo.git_dir_raw,
+        repo.common_dir_raw,
+    ):
+        if _path_is_within(canonical, source_root):
+            raise SourceBoundaryError(
+                "exact-tree destination cannot be inside the source repository or Git state"
+            )
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_fd = os.open(parent, directory_flags)
+    except OSError as exc:
+        raise SourceBoundaryError(
+            f"exact-tree destination parent is unsafe: {exc}"
+        ) from exc
+    try:
+        _remaining(deadline)
+        try:
+            os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SourceBoundaryError(
+                "exact-tree destination must not already exist"
+            )
+        try:
+            os.mkdir(leaf, mode=0o700, dir_fd=parent_fd)
+            created = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            root_fd = os.open(leaf, directory_flags, dir_fd=parent_fd)
+        except OSError as exc:
+            raise SourceBoundaryError(
+                f"exact-tree destination could not be created safely: {exc}"
+            ) from exc
+        opened = os.fstat(root_fd)
+        if not stat.S_ISDIR(created.st_mode) or (
+            created.st_dev,
+            created.st_ino,
+        ) != (opened.st_dev, opened.st_ino):
+            os.close(root_fd)
+            raise SourceBoundaryError(
+                "exact-tree destination changed while it was being opened"
+            )
+    finally:
+        os.close(parent_fd)
+    _remaining(deadline)
+    return canonical, root_fd, (opened.st_dev, opened.st_ino)
+
+
+def _batch_blobs(
+    repo: RepoIdentity,
+    entries: tuple[_TreeEntry, ...],
+    *,
+    deadline: float,
+) -> tuple[bytes, ...]:
+    request_parts: list[bytes] = []
+    for entry in entries:
+        _remaining(deadline)
+        request_parts.append(entry.oid.encode("ascii") + b"\n")
+    request = b"".join(request_parts)
+    _remaining(deadline)
+    _, output = _run_git(
+        repo.worktree_raw,
+        "cat-file",
+        "--batch",
+        deadline=deadline,
+        input_data=request,
+    )
+    blobs: list[bytes] = []
+    offset = 0
+    for entry in entries:
+        _remaining(deadline)
+        header_end = output.find(b"\n", offset)
+        if header_end < 0:
+            raise SourceBoundaryError("git cat-file returned an incomplete blob header")
+        header = output[offset:header_end]
+        try:
+            returned_oid, object_type, size_raw = header.split(b" ", 2)
+            size = int(size_raw)
+        except (ValueError, UnicodeError) as exc:
+            raise SourceBoundaryError(
+                "git cat-file returned an invalid blob header"
+            ) from exc
+        if returned_oid.decode("ascii") != entry.oid or object_type != b"blob":
+            raise SourceBoundaryError("git cat-file returned the wrong committed object")
+        content_start = header_end + 1
+        content_end = content_start + size
+        if size < 0 or content_end >= len(output) or output[content_end:content_end + 1] != b"\n":
+            raise SourceBoundaryError("git cat-file returned an incomplete blob")
+        blobs.append(output[content_start:content_end])
+        offset = content_end + 1
+    if offset != len(output):
+        raise SourceBoundaryError("git cat-file returned trailing batch data")
+    return tuple(blobs)
+
+
+def _export_parent_fd(
+    root_fd: int,
+    directories: dict[tuple[bytes, ...], int],
+    parts: tuple[bytes, ...],
+    *,
+    deadline: float,
+) -> int:
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    key: tuple[bytes, ...] = ()
+    for component in parts:
+        _remaining(deadline)
+        next_key = (*key, component)
+        if next_key not in directories:
+            try:
+                os.mkdir(component, mode=0o755, dir_fd=directories[key])
+                directories[next_key] = os.open(
+                    component, directory_flags, dir_fd=directories[key],
+                )
+            except OSError as exc:
+                raise SourceBoundaryError(
+                    f"exact-tree directory changed during export: {exc}"
+                ) from exc
+        key = next_key
+    return directories.get(key, root_fd)
+
+
+def _write_export_file(
+    parent_fd: int,
+    name: bytes,
+    content: bytes,
+    mode: int,
+    *,
+    deadline: float,
+) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, mode, dir_fd=parent_fd)
+    except OSError as exc:
+        raise SourceBoundaryError(
+            f"exact-tree file could not be created safely: {exc}"
+        ) from exc
+    try:
+        offset = 0
+        while offset < len(content):
+            _remaining(deadline)
+            written = os.write(fd, content[offset:offset + _BUFFER_SIZE])
+            if written <= 0:
+                raise SourceBoundaryError("exact-tree file write made no progress")
+            offset += written
+        _remaining(deadline)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
 
 
 def export_exact_tree(
@@ -971,63 +1371,62 @@ def export_exact_tree(
 ) -> None:
     """Materialize only the captured committed tree, bypassing checkout filters."""
 
-    if not recapture_matches(snapshot):
-        raise ProofStaleError("proof_stale: repository or protected state changed")
     deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+    if not recapture_matches(snapshot, deadline=deadline):
+        raise ProofStaleError("proof_stale: repository or protected state changed")
     entries = _tree_entries(snapshot.repo, snapshot.tree_oid, deadline=deadline)
     if any(entry.object_type != b"blob" for entry in entries):
         raise UnsupportedRepositoryError("exact source tree contains a non-blob entry")
-    destination_raw = _prepare_destination(destination)
-    process = subprocess.Popen(
-        ["git", "cat-file", "--batch"],
-        cwd=snapshot.repo.worktree_raw,
-        env=_git_environment(),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    for entry in entries:
+        _remaining(deadline)
+        if entry.mode not in {0o100644, 0o100755, 0o120000}:
+            raise UnsupportedRepositoryError(
+                f"unsupported Git tree mode: {entry.mode:o}"
+            )
+    _assert_tree_path_aliases(entries, deadline=deadline)
+    blobs = _batch_blobs(snapshot.repo, entries, deadline=deadline)
+    for entry, content in zip(entries, blobs):
+        if entry.mode == 0o120000 and (not content or b"\0" in content):
+            raise UnsupportedRepositoryError("Git tree contains an unsafe symlink target")
+
+    destination_raw, root_fd, root_identity = _prepare_destination(
+        snapshot.repo, destination, deadline=deadline,
     )
-    assert process.stdin is not None
-    assert process.stdout is not None
+    directories: dict[tuple[bytes, ...], int] = {(): root_fd}
     try:
-        for entry in entries:
-            process.stdin.write(entry.oid.encode("ascii") + b"\n")
-            process.stdin.flush()
-            header = process.stdout.readline()
-            try:
-                returned_oid, object_type, size_raw = header.rstrip(b"\n").split(b" ", 2)
-                size = int(size_raw)
-            except (ValueError, UnicodeError) as exc:
-                raise SourceBoundaryError("git cat-file returned an invalid blob header") from exc
-            if returned_oid.decode("ascii") != entry.oid or object_type != b"blob":
-                raise SourceBoundaryError("git cat-file returned the wrong committed object")
-            content = _read_exact(process.stdout, size)
-            if process.stdout.read(1) != b"\n":
-                raise SourceBoundaryError("git cat-file returned an invalid blob delimiter")
-            relative = entry.path.replace(b"/", os.sep.encode())
-            output_path = os.path.join(destination_raw, relative)
-            parent = os.path.dirname(output_path)
-            os.makedirs(parent, mode=0o755, exist_ok=True)
+        for entry, content in zip(entries, blobs):
+            _remaining(deadline)
+            parts = tuple(entry.path.split(b"/"))
+            parent_fd = _export_parent_fd(
+                root_fd, directories, parts[:-1], deadline=deadline,
+            )
             if entry.mode == 0o120000:
-                os.symlink(os.fsdecode(content), output_path)
-            elif entry.mode in {0o100644, 0o100755}:
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-                fd = os.open(output_path, flags, entry.mode & 0o777)
                 try:
-                    offset = 0
-                    while offset < len(content):
-                        offset += os.write(fd, content[offset:])
-                    os.fchmod(fd, entry.mode & 0o777)
-                finally:
-                    os.close(fd)
+                    os.symlink(content, parts[-1], dir_fd=parent_fd)
+                except OSError as exc:
+                    raise SourceBoundaryError(
+                        f"exact-tree symlink could not be created safely: {exc}"
+                    ) from exc
             else:
-                raise UnsupportedRepositoryError(
-                    f"unsupported Git tree mode: {entry.mode:o}"
+                _write_export_file(
+                    parent_fd,
+                    parts[-1],
+                    content,
+                    entry.mode & 0o777,
+                    deadline=deadline,
                 )
+        _remaining(deadline)
+        os.fchmod(root_fd, 0o755)
     finally:
-        process.stdin.close()
-        return_code = process.wait(timeout=_DEFAULT_DEADLINE_SECONDS)
-    if return_code != 0:
-        stderr = b"" if process.stderr is None else process.stderr.read()
-        raise SourceBoundaryError(
-            f"git cat-file failed while exporting exact tree: {os.fsdecode(stderr.strip())}"
-        )
+        for fd in reversed(tuple(directories.values())):
+            os.close(fd)
+    _remaining(deadline)
+    try:
+        final = os.lstat(destination_raw)
+    except OSError as exc:
+        raise SourceBoundaryError("exact-tree destination disappeared after export") from exc
+    if not stat.S_ISDIR(final.st_mode) or (
+        final.st_dev,
+        final.st_ino,
+    ) != root_identity:
+        raise SourceBoundaryError("exact-tree destination was substituted during export")

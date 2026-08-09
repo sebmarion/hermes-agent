@@ -139,10 +139,11 @@ def test_ignored_regular_file_is_not_candidate_input_or_protected_state(tmp_path
 def test_authoritative_approval_renders_artifacts_and_sandbox_identity(tmp_path):
     repo = _git_repo(tmp_path)
     store = BestplanStore(db_path=tmp_path / "state.db")
+    baseline = compute_baseline_fingerprint(str(repo))
     capture = capture_bestplan_response(
         _envelope(_manifest(str(repo))),
         session_id="s", profile="coder", workspace=str(repo),
-        baseline_fingerprint="baseline", store=store,
+        baseline_fingerprint=baseline, store=store,
     )
     assert capture.executable
     assert "expected artifacts: allowed/result.txt" in capture.response
