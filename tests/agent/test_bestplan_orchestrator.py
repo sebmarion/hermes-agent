@@ -13,12 +13,14 @@ from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from agent.bestplan_orchestrator import (
     BestPlanUnavailable, DEFAULT_RUNTIME, RECEIPT_BEGIN, RECEIPT_END, append_receipt,
     body_sha256, build_explorer_schedule, make_receipt, normalize_count, quorum_for,
     reconcile_bestplan_receipts, run_bestplan, validate_receipt, validate_runtime,
-    _bestplan_task_with_context, _resolve_lane_credentials, _run_child_with_timeout,
-    _validated_plan_envelope,
+    _bestplan_task_with_context, _build_child_agent, _build_repair_agent,
+    _resolve_lane_credentials, _run_child_with_timeout, _validated_plan_envelope,
 )
 
 _REQUIRED_LANE_KEYS = ("name", "provider", "model", "api_mode", "reasoning_effort")
@@ -94,6 +96,7 @@ def _identity(lane):
 
 
 def test_count_and_quorum():
+    assert normalize_count(None) == 4
     assert normalize_count(1) == 2
     assert normalize_count(9) == 5
     assert [quorum_for(n) for n in range(2, 6)] == [2, 2, 3, 4]
@@ -135,6 +138,52 @@ def test_validate_runtime_accepts_config_lanes_with_arbitrary_models():
     cfg = validate_runtime({"explorers": custom_lanes, "synthesizer": "sol"})
     assert cfg["explorers"][0]["model"] == "glm-5.3-fast"
     assert cfg["explorers"][1]["model"] == "gpt-6-sol"
+
+
+def test_validate_runtime_accepts_plan_backed_claude_lanes():
+    lanes = [
+        {"name": "opus", "provider": "anthropic", "model": "claude-opus-5",
+         "api_mode": "claude_code", "reasoning_effort": "xhigh"},
+        {"name": "fable", "provider": "anthropic", "model": "claude-fable-5",
+         "api_mode": "claude_code", "reasoning_effort": "xhigh"},
+    ]
+
+    cfg = validate_runtime({"explorers": lanes, "synthesizer": "opus"})
+
+    assert cfg["explorers"] == lanes
+
+
+def test_validate_runtime_rejects_direct_anthropic_messages_lane():
+    lane = {
+        "name": "opus",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "api_mode": "anthropic_messages",
+        "reasoning_effort": "xhigh",
+    }
+
+    with pytest.raises(BestPlanUnavailable, match="requires claude_code"):
+        validate_runtime({"explorers": [lane], "synthesizer": "opus"})
+
+
+@pytest.mark.parametrize(
+    "lane, message",
+    [
+        (
+            {"name": "wrong", "provider": "openrouter", "model": "claude-opus-5",
+             "api_mode": "claude_code", "reasoning_effort": "xhigh"},
+            "requires the Anthropic provider",
+        ),
+        (
+            {"name": "wrong", "provider": "anthropic", "model": "claude-opus-5",
+             "api_mode": "claude_code", "reasoning_effort": "minimal"},
+            "supports effort",
+        ),
+    ],
+)
+def test_validate_runtime_rejects_invalid_plan_backed_claude_lanes(lane, message):
+    with pytest.raises(BestPlanUnavailable, match=message):
+        validate_runtime({"explorers": [lane], "synthesizer": "wrong"})
 
 
 def test_validate_runtime_rejects_legacy_mapping_lanes():
@@ -192,14 +241,249 @@ def test_lane_credentials_forward_explicit_overrides(monkeypatch):
     assert captured["explicit_base_url"] == "https://lane.example/v1"
 
 
-def test_codex_does_not_use_foreign_parent_credentials(monkeypatch, tmp_path):
-    import hermes_cli.runtime_provider
+def test_claude_code_credentials_bypass_normal_runtime_provider(monkeypatch):
+    captured = {}
+
+    def forbidden_normal_resolver(**_kwargs):
+        raise AssertionError(
+            "claude_code must not call the normal runtime provider resolver"
+        )
+
+    def fake_claude_resolver(
+        *, model, auth_timeout=15.0, cancel_requested=None
+    ):
+        captured["model"] = model
+        captured["auth_timeout"] = auth_timeout
+        captured["cancel_requested"] = cancel_requested
+        return {
+            "provider": "anthropic",
+            "requested_provider": "anthropic",
+            "model": model,
+            "api_mode": "claude_code",
+            "base_url": None,
+            "api_key": None,
+            "executable": "/fake/claude",
+        }
+
     monkeypatch.setattr(
-        hermes_cli.runtime_provider,
-        "resolve_runtime_provider",
-        lambda **kwargs: {"provider": "openai-codex", "api_mode": "codex_responses", "api_key": ""},
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        forbidden_normal_resolver,
     )
-    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(
+        "agent.claude_code_plan.resolve_claude_code_plan_runtime",
+        fake_claude_resolver,
+    )
+    lane = {
+        "name": "opus",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "api_mode": "claude_code",
+        "reasoning_effort": "xhigh",
+    }
+
+    runtime = _resolve_lane_credentials(object(), lane)
+
+    assert captured == {
+        "model": "claude-opus-5",
+        "auth_timeout": 15.0,
+        "cancel_requested": None,
+    }
+    assert runtime["api_mode"] == "claude_code"
+    assert runtime["api_key"] is None
+
+
+def _write_codex_cli_auth(path: Path, *, expires_at: float) -> bytes:
+    import base64
+
+    def segment(value):
+        return base64.urlsafe_b64encode(
+            json.dumps(value, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
+
+    access_token = ".".join(
+        (segment({"alg": "none"}), segment({"exp": expires_at}), "signature")
+    )
+    payload = json.dumps(
+        {
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "read-only-test-refresh",
+            }
+        },
+        sort_keys=True,
+    ).encode()
+    path.mkdir(parents=True)
+    (path / "auth.json").write_bytes(payload)
+    return payload
+
+
+def test_codex_app_server_preflight_reads_cli_auth_without_runtime_resolution(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex-home"
+    before = _write_codex_cli_auth(
+        codex_home,
+        expires_at=time.time() + 3600,
+    )
+    normal_resolver_calls = []
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: normal_resolver_calls.append(kwargs),
+    )
+    lane = {
+        "name": "sol",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_app_server",
+        "reasoning_effort": "ultra",
+    }
+
+    runtime = _resolve_lane_credentials(object(), lane)
+
+    assert normal_resolver_calls == []
+    assert runtime == {
+        "provider": "openai-codex",
+        "requested_provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_app_server",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": None,
+    }
+    assert (codex_home / "auth.json").read_bytes() == before
+
+
+def test_codex_app_server_preflight_rejects_expiring_cli_auth_without_refresh(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex-home"
+    before = _write_codex_cli_auth(
+        codex_home,
+        expires_at=time.time() + 30,
+    )
+    normal_resolver_calls = []
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: normal_resolver_calls.append(kwargs),
+    )
+    lane = {
+        "name": "sol",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_app_server",
+        "reasoning_effort": "ultra",
+    }
+
+    with pytest.raises(BestPlanUnavailable, match="Codex credentials"):
+        _resolve_lane_credentials(object(), lane, auth_timeout=60)
+
+    assert normal_resolver_calls == []
+    assert (codex_home / "auth.json").read_bytes() == before
+
+
+def test_bestplan_sol_forces_read_only_app_server_policy(monkeypatch, tmp_path):
+    import agent.codex_runtime as codex_runtime
+    import agent.transports.codex_app_server_session as session_module
+
+    captured = {}
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.multi_agent_enabled = bool(kwargs.get("enable_multi_agent"))
+
+        def run_turn(self, **kwargs):
+            captured["turn"] = kwargs
+            return SimpleNamespace(
+                final_text="candidate",
+                projected_messages=[],
+                tool_iterations=0,
+                interrupted=False,
+                error=None,
+                should_retire=False,
+                thread_id="thread",
+                turn_id="turn",
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(session_module, "CodexAppServerSession", FakeSession)
+    monkeypatch.setattr(
+        codex_runtime,
+        "make_codex_app_server_event_bridge",
+        lambda _agent: lambda _note: None,
+    )
+    monkeypatch.setattr(
+        codex_runtime,
+        "_record_codex_app_server_compaction",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        codex_runtime,
+        "_record_codex_app_server_usage",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        "tools.terminal_tool._get_approval_callback",
+        lambda: lambda *_args, **_kwargs: "always",
+    )
+    monkeypatch.setattr(
+        "tools.approval.is_approval_bypass_active",
+        lambda: True,
+    )
+    agent = SimpleNamespace(
+        model="gpt-5.6-sol",
+        reasoning_config={"enabled": True, "effort": "ultra"},
+        session_cwd=str(tmp_path),
+        _bestplan_read_only=True,
+        _codex_session=None,
+        _interrupt_requested=False,
+        _interrupt_message=None,
+        _iters_since_skill=0,
+        _skill_nudge_interval=0,
+        valid_tool_names=set(),
+        _session_db=None,
+        tool_start_callback=None,
+        tool_complete_callback=None,
+        tool_progress_callback=None,
+        _sync_external_memory_for_turn=lambda **_kwargs: None,
+    )
+
+    result = codex_runtime.run_codex_app_server_turn(
+        agent,
+        user_message="inspect",
+        original_user_message="inspect",
+        messages=[],
+        effective_task_id="bestplan-sol",
+    )
+
+    assert result["completed"] is True
+    assert captured["cwd"] == str(tmp_path)
+    assert captured["enable_multi_agent"] is True
+    assert captured["permission_profile"] == "read-only"
+    assert captured["approval_callback"] is None
+    assert captured["request_routing"].auto_approve_exec is False
+    assert captured["request_routing"].auto_approve_apply_patch is False
+    assert captured["client_extra_args"] == [
+        "-c",
+        'sandbox_mode="read-only"',
+        "-c",
+        'approval_policy="never"',
+    ]
+    assert captured["turn"]["model"] == "gpt-5.6-sol"
+    assert captured["turn"]["effort"] == "ultra"
+
+
+def test_codex_does_not_use_foreign_parent_credentials(monkeypatch, tmp_path):
+    codex_home = tmp_path / "missing-codex-home"
+    normal_resolver_calls = []
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: normal_resolver_calls.append(kwargs),
+    )
     lane = {
         "name": "codex",
         "provider": "openai-codex",
@@ -214,6 +498,7 @@ def test_codex_does_not_use_foreign_parent_credentials(monkeypatch, tmp_path):
         assert "Codex credentials" in str(exc)
     else:
         raise AssertionError("foreign parent credentials activated Codex")
+    assert normal_resolver_calls == []
 
 
 def test_lane_resolution_non_bestplan_exception_isolated(monkeypatch):
@@ -340,6 +625,320 @@ def test_multiple_providers_keep_requested_fanout():
     assert [item["lane"]["model"] for item in schedule] == ["model-a", "model-b", "model-a", "model-b"]
 
 
+def test_heterogeneous_schedule_keeps_distinct_models_from_one_provider():
+    records = [
+        _record("glm", "novita", "glm-5.2", 0, 0),
+        _record("sol", "openai-codex", "gpt-5.6-sol", 1, 1),
+        _record("opus", "anthropic", "claude-opus-5", 2, 2),
+        _record("fable", "anthropic", "claude-fable-5", 3, 3),
+    ]
+
+    schedule, mode = build_explorer_schedule(records, count=4)
+
+    assert mode == "heterogeneous"
+    assert [item["lane"]["name"] for item in schedule] == [
+        "glm", "sol", "opus", "fable"
+    ]
+
+
+def test_run_bestplan_omitted_count_executes_all_four_configured_lanes(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    lanes = [
+        {
+            "name": "glm",
+            "provider": "novita",
+            "model": "glm-5.2",
+            "api_mode": "chat_completions",
+            "reasoning_effort": "high",
+        },
+        {
+            "name": "sol",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "api_mode": "codex_app_server",
+            "reasoning_effort": "max",
+        },
+        {
+            "name": "opus",
+            "provider": "anthropic",
+            "model": "claude-opus-5",
+            "api_mode": "claude_code",
+            "reasoning_effort": "xhigh",
+        },
+        {
+            "name": "fable",
+            "provider": "anthropic",
+            "model": "claude-fable-5",
+            "api_mode": "claude_code",
+            "reasoning_effort": "xhigh",
+        },
+    ]
+    explorer_models = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+
+        def run_conversation(self, prompt):
+            if "active BestPlan synthesizer" in prompt:
+                return {
+                    "final_response": _synth_plan_envelope(workspace=str(tmp_path))
+                }
+            explorer_models.append(self.model)
+            return {"final_response": _candidate_text(self.model)}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "agent.claude_code_plan.ClaudeCodePlanChild",
+        FakeAgent,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured, **_kwargs: _identity(configured),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    result = run_bestplan(
+        object(),
+        "plan this release",
+        config=_runtime_config(lanes, synthesizer="sol"),
+    )
+
+    assert result["status"] == "completed"
+    assert result["provider_mode"] == "heterogeneous"
+    assert [attempt["explorer"] for attempt in result["attempts"]] == [
+        "glm",
+        "sol",
+        "opus",
+        "fable",
+    ]
+    assert all(attempt["status"] == "success" for attempt in result["attempts"])
+    assert sorted(explorer_models) == sorted(lane["model"] for lane in lanes)
+    receipt = json.loads(result["final_response"].splitlines()[1])
+    assert receipt["requested_count"] == 4
+    assert receipt["effective_count"] == 4
+
+
+def test_claude_plan_children_use_request_workspace_and_repair_has_no_tools(
+    tmp_path, monkeypatch
+):
+    captures = []
+
+    class FakeClaudeChild:
+        def __init__(self, **kwargs):
+            captures.append(kwargs)
+
+    monkeypatch.setattr(
+        "agent.claude_code_plan.ClaudeCodePlanChild",
+        FakeClaudeChild,
+    )
+    monkeypatch.setattr(
+        "run_agent.AIAgent",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("claude_code must never construct AIAgent")
+        ),
+    )
+    lane = {
+        "name": "opus",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "api_mode": "claude_code",
+        "reasoning_effort": "xhigh",
+    }
+    runtime = {
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "api_mode": "claude_code",
+        "executable": "/fake/claude",
+        "_bestplan_workspace": str(tmp_path),
+    }
+
+    _build_child_agent(SimpleNamespace(), lane, runtime)
+    _build_repair_agent(SimpleNamespace(), lane, runtime)
+
+    assert captures[0]["workspace"] == str(tmp_path)
+    assert captures[0]["tools_enabled"] is True
+    assert captures[1]["workspace"] == str(tmp_path)
+    assert captures[1]["tools_enabled"] is False
+
+
+def test_non_host_workspace_fails_before_provider_resolution(tmp_path, monkeypatch):
+    import agent.bestplan_orchestrator as orchestrator
+
+    lane = {
+        "name": "opus",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "api_mode": "claude_code",
+        "reasoning_effort": "xhigh",
+    }
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "agent.runtime_cwd.session_cwd_uses_non_host_namespace",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provider resolution must not run for remote cwd")
+        ),
+    )
+
+    result = run_bestplan(
+        SimpleNamespace(),
+        "inspect it",
+        config=_runtime_config([lane]),
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "runtime_invalid"
+    assert result["attempts"][0]["reason_code"] == "runtime_invalid"
+
+
+def test_claude_auth_probe_obeys_overall_deadline_before_model_spawn(
+    tmp_path, monkeypatch
+):
+    import agent.bestplan_orchestrator as orchestrator
+
+    executable = tmp_path / "claude"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, time\n"
+        "time.sleep(5)\n"
+        "print(json.dumps({"
+        "'loggedIn': True, 'authMethod': 'claude.ai', "
+        "'apiProvider': 'firstParty'}))\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    constructed = []
+    monkeypatch.setenv("HERMES_CLAUDE_CLI_PATH", str(executable))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.setattr(
+        "agent.claude_code_plan.ClaudeCodePlanChild",
+        lambda **kwargs: constructed.append(kwargs),
+    )
+    lane = {
+        "name": "fable",
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "api_mode": "claude_code",
+        "reasoning_effort": "xhigh",
+    }
+
+    started = time.monotonic()
+    result = orchestrator.run_bestplan(
+        SimpleNamespace(),
+        "inspect it",
+        config=_runtime_config(
+            [lane],
+            explorer_timeout=1.0,
+            synthesizer_timeout=1.0,
+            overall_timeout=1.0,
+        ),
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.75
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "overall_timeout"
+    assert constructed == []
+
+
+def test_claude_children_use_request_local_workspace_end_to_end(
+    tmp_path, monkeypatch
+):
+    import agent.bestplan_orchestrator as orchestrator
+    from agent.runtime_cwd import bind_session_cwd
+
+    request_workspace = tmp_path / "request-workspace"
+    global_workspace = tmp_path / "global-workspace"
+    request_workspace.mkdir()
+    global_workspace.mkdir()
+    constructed = []
+    prompts = []
+
+    class FakeClaudeChild:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            constructed.append(kwargs)
+
+        def run_conversation(self, prompt):
+            prompts.append(prompt)
+            if "active BestPlan synthesizer" in prompt:
+                return {
+                    "final_response": _synth_plan_envelope(
+                        workspace=str(request_workspace.resolve())
+                    )
+                }
+            return {"final_response": _candidate_text(self.model)}
+
+        def hard_interrupt(self, *_args, **_kwargs):
+            pass
+
+        def clear_interrupt(self, **_kwargs):
+            return False
+
+        def close(self):
+            pass
+
+    lane = {
+        "name": "opus",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "api_mode": "claude_code",
+        "reasoning_effort": "xhigh",
+    }
+    monkeypatch.setattr(
+        "agent.claude_code_plan.ClaudeCodePlanChild",
+        FakeClaudeChild,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured, **_kwargs: {
+            "provider": "anthropic",
+            "requested_provider": "anthropic",
+            "model": configured["model"],
+            "api_mode": "claude_code",
+            "base_url": None,
+            "api_key": None,
+            "executable": "/fake/claude",
+        },
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(global_workspace))
+
+    with bind_session_cwd(str(request_workspace)):
+        result = run_bestplan(
+            SimpleNamespace(),
+            "inspect it",
+            config=_runtime_config([lane]),
+        )
+
+    canonical_request = str(request_workspace.resolve())
+    assert result["status"] == "completed"
+    assert constructed
+    assert {entry["workspace"] for entry in constructed} == {canonical_request}
+    assert prompts
+    assert all(canonical_request in prompt for prompt in prompts)
+    assert all(str(global_workspace) not in prompt for prompt in prompts)
+
+
 def test_context_walk_is_recent_first_bounded_and_redacted():
     class HugeHistory(Sequence):
         def __init__(self):
@@ -373,7 +972,9 @@ def test_context_walk_is_recent_first_bounded_and_redacted():
     assert len(planning_task) < 24_000
 
 
-def test_run_bestplan_binds_recent_context_without_granting_inspection(monkeypatch):
+def test_run_bestplan_binds_recent_context_without_granting_inspection(
+    monkeypatch, tmp_path
+):
     import agent.bestplan_orchestrator as orchestrator
     import run_agent
 
@@ -393,7 +994,9 @@ def test_run_bestplan_binds_recent_context_without_granting_inspection(monkeypat
         def run_conversation(self, prompt):
             prompts.append(prompt)
             if "active BestPlan synthesizer" in prompt:
-                return {"final_response": _synth_plan_envelope()}
+                return {
+                    "final_response": _synth_plan_envelope(workspace=str(tmp_path))
+                }
             return {"final_response": _candidate_text()}
 
         def interrupt(self, *_args, **_kwargs):
@@ -403,8 +1006,13 @@ def test_run_bestplan_binds_recent_context_without_granting_inspection(monkeypat
             pass
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
-    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda _agent, lane: _identity(lane))
-    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, lane, **_kwargs: _identity(lane),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
 
     secret = "sk-proj-abc123def456ghi789jkl012"
     result = run_bestplan(
@@ -460,7 +1068,9 @@ def test_minimum_change_contract_reaches_every_planning_stage(monkeypatch, tmp_p
         def run_conversation(self, prompt):
             prompts.append(prompt)
             if "BestPlan envelope repair" in prompt:
-                return {"final_response": _synth_plan_envelope()}
+                return {
+                    "final_response": _synth_plan_envelope(workspace=str(tmp_path))
+                }
             if "active BestPlan synthesizer" in prompt:
                 return {"final_response": "invalid synthesis"}
             return {"final_response": _candidate_text(self.model)}
@@ -478,7 +1088,7 @@ def test_minimum_change_contract_reaches_every_planning_stage(monkeypatch, tmp_p
         lambda _agent, configured: _identity(configured),
     )
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
 
     result = run_bestplan(
         SimpleNamespace(session_id="parent"),
@@ -626,7 +1236,11 @@ def test_synthesis_uses_only_named_lane_without_failover(monkeypatch, tmp_path):
             self.stop.set()
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
-    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda _agent, lane: _identity(lane))
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, lane, **_kwargs: _identity(lane),
+    )
     monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -696,7 +1310,11 @@ def test_codex_synthesizer_does_not_repair_on_an_alternate_lane(
             pass
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
-    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda _agent, lane: _identity(lane))
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, lane, **_kwargs: _identity(lane),
+    )
     monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "must not inject repair tools")
@@ -754,7 +1372,11 @@ def test_repair_stays_on_invalid_no_tools_lane_and_attempts_once(monkeypatch):
             pass
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
-    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda _agent, lane: _identity(lane))
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, lane, **_kwargs: _identity(lane),
+    )
     monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
 
     result = run_bestplan(
@@ -800,7 +1422,11 @@ def test_codex_invalid_fails_closed_when_no_resolved_no_tools_runtime(monkeypatc
             pass
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
-    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda _agent, lane: _identity(lane))
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, lane, **_kwargs: _identity(lane),
+    )
     monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
 
     result = run_bestplan(
@@ -850,7 +1476,11 @@ def test_repair_timeout_interrupts_closes_and_returns_within_hard_deadline(monke
             self.stop.set()
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
-    monkeypatch.setattr(orchestrator, "_resolve_lane_credentials", lambda _agent, lane: _identity(lane))
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, lane, **_kwargs: _identity(lane),
+    )
     monkeypatch.setattr(orchestrator, "_SYNTHESIS_REPAIR_TIMEOUT_SECONDS", 0.02)
     monkeypatch.setattr(orchestrator, "_CHILD_CLEANUP_GRACE_SECONDS", 0.02)
     monkeypatch.setattr(orchestrator, "_CHILD_CLEANUP_HARD_SECONDS", 0.08)
@@ -870,7 +1500,9 @@ def test_repair_timeout_interrupts_closes_and_returns_within_hard_deadline(monke
     assert repair_instances[0].closed is True
 
 
-def test_completed_synth_cleanup_does_not_poison_recycled_tool_thread(monkeypatch):
+def test_completed_synth_cleanup_does_not_poison_recycled_tool_thread(
+    monkeypatch, tmp_path
+):
     """Completion cleanup must not interrupt a worker after turn finalization.
 
     AIAgent clears its process-global tool interrupt bit before
@@ -901,7 +1533,11 @@ def test_completed_synth_cleanup_does_not_poison_recycled_tool_thread(monkeypatc
             set_interrupt(False, self._execution_thread_id)
             try:
                 if "active BestPlan synthesizer" in prompt:
-                    return {"final_response": _synth_plan_envelope()}
+                    return {
+                        "final_response": _synth_plan_envelope(
+                            workspace=str(tmp_path)
+                        )
+                    }
                 return {"final_response": _candidate_text()}
             finally:
                 # Mirrors AIAgent turn finalization.
@@ -919,7 +1555,8 @@ def test_completed_synth_cleanup_does_not_poison_recycled_tool_thread(monkeypatc
         "_resolve_lane_credentials",
         lambda _agent, configured: _identity(configured),
     )
-    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
 
     try:
         result = run_bestplan(
@@ -934,7 +1571,7 @@ def test_completed_synth_cleanup_does_not_poison_recycled_tool_thread(monkeypatc
             set_interrupt(False, tid)
 
 
-def test_synth_transport_close_runs_on_its_owner_thread(monkeypatch):
+def test_synth_transport_close_runs_on_its_owner_thread(monkeypatch, tmp_path):
     """A live SDK transport is closed only by the worker that used it."""
     import agent.bestplan_orchestrator as orchestrator
     import run_agent
@@ -959,7 +1596,9 @@ def test_synth_transport_close_runs_on_its_owner_thread(monkeypatch):
             self.is_synth = "active BestPlan synthesizer" in prompt
             if self.is_synth:
                 synth_instances.append(self)
-                return {"final_response": _synth_plan_envelope()}
+                return {
+                    "final_response": _synth_plan_envelope(workspace=str(tmp_path))
+                }
             return {"final_response": _candidate_text()}
 
         def interrupt(self, *_args, **_kwargs):
@@ -974,7 +1613,8 @@ def test_synth_transport_close_runs_on_its_owner_thread(monkeypatch):
         "_resolve_lane_credentials",
         lambda _agent, configured: _identity(configured),
     )
-    monkeypatch.setenv("TERMINAL_CWD", "/tmp/work")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
 
     result = run_bestplan(
         SimpleNamespace(session_id="parent"),
@@ -1040,6 +1680,359 @@ def test_run_bestplan_single_provider_uses_three_top_model_instances(monkeypatch
     assert outcome["reason_code"] == "quorum_unavailable"
     assert len(calls) == 4  # one synth preflight + three explorers
     assert {call["model"] for call in calls} == {"top"}
+
+
+def test_non_claude_children_are_bound_to_request_workspace_and_read_only_tools(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+    from agent.runtime_cwd import bind_session_cwd, get_session_cwd_override, resolve_agent_cwd
+    from tools.terminal_tool import get_session_cwd
+
+    request_workspace = tmp_path / "request"
+    global_workspace = tmp_path / "global"
+    request_workspace.mkdir()
+    global_workspace.mkdir()
+    captures = []
+    capture_lock = threading.Lock()
+    lanes = [
+        {
+            "name": "glm",
+            "provider": "novita",
+            "model": "glm",
+            "api_mode": "chat_completions",
+            "reasoning_effort": "high",
+        },
+        {
+            "name": "sol",
+            "provider": "openai-codex",
+            "model": "sol",
+            "api_mode": "codex_app_server",
+            "reasoning_effort": "ultra",
+        },
+    ]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self.tools = [
+                {"function": {"name": "read_file"}},
+                {"function": {"name": "web_search"}},
+                {"function": {"name": "patch"}},
+                {"function": {"name": "kanban_complete"}},
+            ]
+            self.valid_tool_names = {
+                "read_file", "web_search", "patch", "kanban_complete"
+            }
+            self._kanban_worker_guidance = "ambient dispatcher authority"
+
+        def run_conversation(self, prompt, task_id=None):
+            with capture_lock:
+                captures.append(
+                    {
+                        "model": self.model,
+                        "resolved_cwd": str(resolve_agent_cwd()),
+                        "context_cwd": get_session_cwd_override(),
+                        "session_cwd": getattr(self, "session_cwd", None),
+                        "task_id": task_id,
+                        "task_cwd": get_session_cwd(task_id),
+                        "tool_names": set(self.valid_tool_names),
+                        "schemas": {
+                            entry["function"]["name"] for entry in self.tools
+                        },
+                        "guidance": self._kanban_worker_guidance,
+                        "read_only": getattr(self, "_bestplan_read_only", False),
+                    }
+                )
+            if "active BestPlan synthesizer" in prompt:
+                return {
+                    "final_response": _synth_plan_envelope(
+                        workspace=str(request_workspace.resolve())
+                    )
+                }
+            return {"final_response": _candidate_text(self.model)}
+
+        def interrupt(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured, **_kwargs: _identity(configured),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(global_workspace))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "ambient-parent-task")
+
+    with bind_session_cwd(str(request_workspace)):
+        result = run_bestplan(
+            SimpleNamespace(session_id="parent"),
+            "inspect only",
+            count=2,
+            config=_runtime_config(lanes, synthesizer="sol"),
+        )
+
+    expected_workspace = str(request_workspace.resolve())
+    assert result["status"] == "completed"
+    assert captures
+    for capture in captures:
+        assert capture["resolved_cwd"] == expected_workspace
+        assert capture["context_cwd"] == expected_workspace
+        assert capture["session_cwd"] == expected_workspace
+        assert capture["task_id"]
+        assert capture["task_cwd"] == expected_workspace
+        assert capture["tool_names"] == {"read_file", "web_search"}
+        assert capture["schemas"] == {"read_file", "web_search"}
+        assert capture["guidance"] == ""
+        assert capture["read_only"] is True
+
+
+def test_parent_cancel_stops_explorers_and_returns_interrupted(monkeypatch, tmp_path):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    started = threading.Event()
+    parent = SimpleNamespace(
+        session_id="parent",
+        _interrupt_requested=False,
+        _hard_interrupt_requested=threading.Event(),
+    )
+    lane = {
+        "name": "local",
+        "provider": "provider-a",
+        "model": "local-model",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "high",
+    }
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            self.stop = threading.Event()
+            self.tools = []
+            self.valid_tool_names = set()
+            self._kanban_worker_guidance = ""
+
+        def run_conversation(self, prompt, **_kwargs):
+            if "active BestPlan synthesizer" in prompt:
+                return {"final_response": _synth_plan_envelope(workspace=str(tmp_path))}
+            started.set()
+            self.stop.wait(5)
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            self.stop.set()
+
+        def close(self):
+            self.stop.set()
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured, **_kwargs: _identity(configured),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    def cancel_parent():
+        assert started.wait(1)
+        parent._interrupt_requested = True
+        parent._hard_interrupt_requested.set()
+
+    cancel_thread = threading.Thread(target=cancel_parent, daemon=True)
+    cancel_thread.start()
+    began = time.monotonic()
+    result = run_bestplan(
+        parent,
+        "plan it",
+        config=_runtime_config(
+            [lane], explorer_timeout=5.0, synthesizer_timeout=5.0,
+            overall_timeout=10.0,
+        ),
+    )
+    cancel_thread.join(timeout=1)
+
+    assert time.monotonic() - began < 2.0
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "cancelled"
+    assert result["interrupted"] is True
+    assert validate_receipt(result["receipt"], "") is True
+
+
+def test_parent_cancel_stops_synthesizer_and_returns_interrupted(monkeypatch, tmp_path):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    synth_started = threading.Event()
+    parent = SimpleNamespace(
+        session_id="parent",
+        _interrupt_requested=False,
+        _hard_interrupt_requested=threading.Event(),
+    )
+    lane = {
+        "name": "local",
+        "provider": "provider-a",
+        "model": "local-model",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "high",
+    }
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            self.stop = threading.Event()
+            self.tools = []
+            self.valid_tool_names = set()
+            self._kanban_worker_guidance = ""
+
+        def run_conversation(self, prompt, **_kwargs):
+            if "active BestPlan synthesizer" in prompt:
+                synth_started.set()
+                self.stop.wait(5)
+                return {"final_response": _synth_plan_envelope(workspace=str(tmp_path))}
+            return {"final_response": _candidate_text()}
+
+        def interrupt(self, *_args, **_kwargs):
+            self.stop.set()
+
+        def close(self):
+            self.stop.set()
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured, **_kwargs: _identity(configured),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    def cancel_parent():
+        assert synth_started.wait(1)
+        parent._interrupt_requested = True
+        parent._hard_interrupt_requested.set()
+
+    cancel_thread = threading.Thread(target=cancel_parent, daemon=True)
+    cancel_thread.start()
+    began = time.monotonic()
+    result = run_bestplan(
+        parent,
+        "plan it",
+        config=_runtime_config(
+            [lane], explorer_timeout=5.0, synthesizer_timeout=5.0,
+            overall_timeout=10.0,
+        ),
+    )
+    cancel_thread.join(timeout=1)
+
+    assert time.monotonic() - began < 2.0
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "cancelled"
+    assert result["interrupted"] is True
+    assert validate_receipt(result["receipt"], "") is True
+
+
+def test_parent_cancel_during_claude_auth_probe_is_interrupted(monkeypatch, tmp_path):
+    import agent.bestplan_orchestrator as orchestrator
+
+    executable = tmp_path / "claude"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, time\n"
+        "time.sleep(5)\n"
+        "print(json.dumps({'loggedIn': True, 'authMethod': 'claude.ai', "
+        "'apiProvider': 'firstParty'}))\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    parent = SimpleNamespace(
+        session_id="parent",
+        _interrupt_requested=False,
+        _hard_interrupt_requested=threading.Event(),
+    )
+    lane = {
+        "name": "fable",
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "api_mode": "claude_code",
+        "reasoning_effort": "xhigh",
+    }
+    monkeypatch.setenv("HERMES_CLAUDE_CLI_PATH", str(executable))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    def cancel_parent():
+        time.sleep(0.15)
+        parent._interrupt_requested = True
+        parent._hard_interrupt_requested.set()
+
+    cancel_thread = threading.Thread(target=cancel_parent, daemon=True)
+    cancel_thread.start()
+    began = time.monotonic()
+    result = orchestrator.run_bestplan(
+        parent,
+        "plan it",
+        config=_runtime_config(
+            [lane], explorer_timeout=5.0, synthesizer_timeout=5.0,
+            overall_timeout=10.0,
+        ),
+    )
+    cancel_thread.join(timeout=1)
+
+    assert time.monotonic() - began < 2.0
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "cancelled"
+    assert result["interrupted"] is True
+    assert validate_receipt(result["receipt"], "") is True
+
+
+def test_conversation_loop_preserves_bestplan_interrupted_outcome(monkeypatch):
+    from agent import bestplan_orchestrator, conversation_loop
+    from agent.turn_context import TurnContext
+    from tests.agent.test_turn_finalizer_interrupt_alternation import _StubAgent
+
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "plan it"},
+    ]
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda *_args, **_kwargs: TurnContext(
+            user_message="plan it",
+            original_user_message="plan it",
+            messages=messages,
+            conversation_history=[],
+            active_system_prompt="system",
+            effective_task_id="task-1",
+            turn_id="turn-1",
+            current_turn_user_idx=1,
+        ),
+    )
+    monkeypatch.setattr(
+        bestplan_orchestrator,
+        "run_bestplan",
+        lambda *_args, **_kwargs: {
+            "status": "failed",
+            "reason_code": "cancelled",
+            "interrupted": True,
+            "run_id": "run-1",
+            "body": "",
+            "error": "BestPlan cancelled",
+        },
+    )
+    agent = _StubAgent()
+    result = conversation_loop._run_conversation(
+        agent, "plan it", bestplan_config={"count": 4}
+    )
+
+    assert result["completed"] is False
+    assert result["interrupted"] is True
+    assert result["failed"] is False
 
 
 def test_receipt_has_canonical_markers_and_hash():

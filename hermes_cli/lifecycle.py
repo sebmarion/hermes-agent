@@ -8,8 +8,20 @@ from typing import Any, List
 logger = logging.getLogger(__name__)
 
 
+def _bestplan_extensions_suppressed() -> bool:
+    """Return the task-local BestPlan extension-containment state."""
+    try:
+        from agent.delegation_context import is_bestplan_child_context
+
+        return is_bestplan_child_context()
+    except Exception:
+        return False
+
+
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Notify first-party observers, then invoke compatibility plugin hooks."""
+    if _bestplan_extensions_suppressed():
+        return []
     try:
         from hermes_cli.observability import observe_lifecycle
 
@@ -24,6 +36,8 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
 def has_hook(hook_name: str) -> bool:
     """Return whether a first-party observer or plugin consumes a hook."""
+    if _bestplan_extensions_suppressed():
+        return False
     try:
         from hermes_cli.observability import handles_hook
 
@@ -39,6 +53,8 @@ def has_hook(hook_name: str) -> bool:
 
 def finalize_session(**kwargs: Any) -> List[Any]:
     """Notify observers and hard-close one core-owned Relay conversation."""
+    if _bestplan_extensions_suppressed():
+        return []
     try:
         from hermes_cli.observability import observe_lifecycle
 

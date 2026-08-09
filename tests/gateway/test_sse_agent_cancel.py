@@ -355,6 +355,8 @@ class TestSSEAgentFailureFinishReason:
         reason, finish, sse = self._run(crash)
         assert reason == "error"
         assert "error" in finish
+        assert finish["hermes"]["completed"] is False
+        assert finish["hermes"]["failed"] is True
         assert "data: [DONE]" in sse
 
     def test_failed_result_dict_reports_error_not_stop(self):
@@ -368,6 +370,24 @@ class TestSSEAgentFailureFinishReason:
         reason, finish, _ = self._run(failed)
         assert reason == "error"
         assert finish.get("hermes", {}).get("failed") is True
+
+    def test_interrupted_result_dict_reports_error_not_stop(self):
+        async def interrupted():
+            return (
+                {
+                    "final_response": "BestPlan cancelled; partial receipt preserved.",
+                    "completed": False,
+                    "interrupted": True,
+                    "failed": False,
+                },
+                {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+            )
+
+        reason, finish, _ = self._run(interrupted)
+        assert reason == "error"
+        assert finish["hermes"]["completed"] is False
+        assert finish["hermes"]["interrupted"] is True
+        assert finish["hermes"]["failed"] is False
 
     def test_truncated_result_reports_length(self):
         async def trunc():

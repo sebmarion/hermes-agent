@@ -236,7 +236,11 @@ def finalize_turn(
         # We route through ``_record_task_failure(outcome="timed_out")``
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        if not is_dispatcher_owned_worker_context():
+            _kanban_task = None
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
@@ -280,6 +284,7 @@ def finalize_turn(
     completed = (
         final_response is not None
         and not failed
+        and not interrupted
         and not iteration_limit_fallback
         and (
             api_call_count < agent.max_iterations

@@ -756,12 +756,19 @@ def run_codex_app_server_turn(
         else:
             turn_effort = str(reasoning_config.get("effort") or "").strip() or None
     requires_multi_agent = str(turn_effort or "").strip().lower() == "ultra"
+    bestplan_read_only = getattr(agent, "_bestplan_read_only", False) is True
 
     existing_session = getattr(agent, "_codex_session", None)
     if (
         existing_session is not None
-        and requires_multi_agent
-        and not bool(getattr(existing_session, "multi_agent_enabled", False))
+        and (
+            (
+                requires_multi_agent
+                and not bool(getattr(existing_session, "multi_agent_enabled", False))
+            )
+            or (getattr(existing_session, "isolated_read_only", False) is True)
+            != bestplan_read_only
+        )
     ):
         # Upgrade a session created before Ultra was selected. Feature flags
         # are process-scoped, so the existing subprocess cannot be upgraded by
@@ -787,6 +794,8 @@ def run_codex_app_server_turn(
             approval_callback = _get_approval_callback()
         except Exception:
             approval_callback = None
+        if bestplan_read_only:
+            approval_callback = None
 
         # Gateway / cron contexts have no UI to surface codex's approval
         # requests through, so codex app-server exec / apply_patch requests
@@ -808,6 +817,8 @@ def run_codex_app_server_turn(
                 "keeping fail-closed default",
                 exc_info=True,
             )
+        if bestplan_read_only:
+            auto_approve_requests = False
 
         live_bridge = make_codex_app_server_event_bridge(agent)
 
@@ -848,7 +859,7 @@ def run_codex_app_server_turn(
                 except Exception:
                     logger.debug("codex tool-progress callback raised", exc_info=True)
 
-        agent._codex_session = CodexAppServerSession(
+        session_kwargs: dict[str, Any] = dict(
             cwd=cwd,
             enable_multi_agent=requires_multi_agent,
             approval_callback=approval_callback,
@@ -858,6 +869,20 @@ def run_codex_app_server_turn(
             ),
             on_event=_on_codex_event,
         )
+        if bestplan_read_only:
+            session_kwargs.update(
+                isolated_read_only=True,
+                permission_profile="read-only",
+                approval_callback=None,
+                request_routing=_ServerRequestRouting(),
+                client_extra_args=[
+                    "-c",
+                    'sandbox_mode="read-only"',
+                    "-c",
+                    'approval_policy="never"',
+                ],
+            )
+        agent._codex_session = CodexAppServerSession(**session_kwargs)
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early

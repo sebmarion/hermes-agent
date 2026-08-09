@@ -267,7 +267,7 @@ def test_cli_stack_binds_capability_profile_and_home(tmp_path):
         profile="coder", hermes_home=home,
     ):
         identity = get_delivery_context_identity()
-        assert identity["capability_version"] == 1
+        assert identity["capability_version"] == 2
         assert identity["profile"] == "coder"
         assert Path(identity["hermes_home"]) == home.resolve()
         assert get_hermes_home() == home

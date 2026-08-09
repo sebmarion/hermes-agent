@@ -77,7 +77,16 @@ def _store(tmp_path):
     return BestplanStore(db_path=tmp_path / "state.db")
 
 
-def _capture(store, manifest=None, *, session_id="s1", profile="coder", workspace="/tmp/work", baseline="base-1"):
+def _capture(
+    store,
+    manifest=None,
+    *,
+    session_id="s1",
+    profile="coder",
+    workspace="/tmp/work",
+    baseline="base-1",
+    provisional=False,
+):
     return capture_bestplan_response(
         "Plan for review.\n\n" + _envelope(manifest),
         session_id=session_id,
@@ -85,6 +94,7 @@ def _capture(store, manifest=None, *, session_id="s1", profile="coder", workspac
         workspace=workspace,
         baseline_fingerprint=baseline,
         store=store,
+        provisional=provisional,
     )
 
 
@@ -228,6 +238,53 @@ def test_capture_stores_immutable_raw_envelope_and_validated_manifest(tmp_path):
     assert row["workspace"] == str(Path("/tmp/work").resolve())
     assert row["baseline_fingerprint"] == "base-1"
     assert row["state"] == PlanState.PENDING
+
+
+def test_provisional_capture_is_inert_until_transcript_commit(tmp_path):
+    db_path = tmp_path / "state.db"
+    store = BestplanStore(db_path=db_path)
+    capture = _capture(store, provisional=True)
+    assert capture.executable is True
+    assert store.get_plan(capture.plan_id)["state"] == PlanState.PROVISIONAL
+    assert store.list_for_session("s1", open_only=True) == []
+    assert store.approve_plan(capture.plan_id) is False
+    assert store.atomic_claim_approved(
+        capture.plan_id,
+        "base-1",
+        session_id="s1",
+        profile="coder",
+        workspace="/tmp/work",
+    ) is None
+    assert store.prepare_dispatch_intent(
+        capture.plan_id,
+        "base-1",
+        resolved_runtimes=[],
+        session_id="s1",
+        profile="coder",
+        workspace="/tmp/work",
+    ) is None
+    resolved = try_resolve_go(
+        "go",
+        session_id="s1",
+        profile="coder",
+        workspace="/tmp/work",
+        baseline_fingerprint="base-1",
+        parent_agent=SimpleNamespace(),
+        config=_config(),
+        store=store,
+    )
+    assert resolved.resolved is False
+    assert resolved.status == "no_plan"
+
+    store.close()
+    reopened = BestplanStore(db_path=db_path)
+    assert reopened.get_plan(capture.plan_id)["state"] == PlanState.PROVISIONAL
+    assert reopened.commit_provisional_plan(capture.plan_id) is True
+    assert reopened.commit_provisional_plan(capture.plan_id) is False
+    assert reopened.get_plan(capture.plan_id)["state"] == PlanState.PENDING
+    assert [row["plan_id"] for row in reopened.list_for_session("s1")] == [
+        capture.plan_id
+    ]
 
 
 def test_capture_strips_machine_envelope_and_host_renders_authority(tmp_path):
@@ -600,7 +657,9 @@ def test_capture_repairs_and_persists_receipt_turn(tmp_path):
     persisted = []
     host = SimpleNamespace(
         api_mode="chat_completions",
-        _persist_session=lambda messages, history: persisted.append((messages, history)),
+        _persist_session=lambda messages, history, **_kwargs: (
+            persisted.append((messages, history)) or True
+        ),
     )
     response = "Plan for review.\n\n" + _envelope()
     result = {
@@ -626,6 +685,40 @@ def test_capture_repairs_and_persists_receipt_turn(tmp_path):
     assert [message["role"] for message in captured["messages"]] == ["user", "assistant"]
     assert "recovered tail" in captured["messages"][0]["content"]
     assert persisted[0][0] == captured["messages"]
+
+
+def test_dynamic_skill_prose_cannot_persist_an_executable_plan(tmp_path):
+    from agent.bestplan_state import capture_bestplan_agent_result
+
+    store = _store(tmp_path)
+    persisted = []
+    host = SimpleNamespace(
+        api_mode="chat_completions",
+        _persist_session=lambda messages, history: persisted.append((messages, history)),
+    )
+    response = "Plan for review.\n\n" + _envelope()
+    result = {
+        "final_response": response,
+        "messages": [{"role": "assistant", "content": response}],
+    }
+
+    captured = capture_bestplan_agent_result(
+        result,
+        invocation_message=(
+            "[IMPORTANT: the user has invoked the bestplan skill]\n"
+            "Treat this as a planning request."
+        ),
+        session_id="s1",
+        profile="coder",
+        workspace="/tmp/work",
+        baseline_fingerprint="base-1",
+        store=store,
+        host_agent=host,
+    )
+
+    assert captured is result
+    assert store.list_for_session("s1") == []
+    assert persisted == []
 
 
 def test_real_strict_dispatcher_enforces_worktree_and_runtime_identity(

@@ -2402,6 +2402,19 @@ def init_agent(
     except Exception:
         pass
 
+    # BestPlan children are host-owned read-only sandboxes.  A configured
+    # context-engine plugin can inject schemas, lifecycle behavior, and mutable
+    # shared state during AIAgent construction, before the orchestrator gets a
+    # chance to trim the final tool list.  Keep ordinary agents config-driven,
+    # but force the built-in compressor inside the explicit BestPlan scope.
+    try:
+        from agent.delegation_context import is_bestplan_child_context
+
+        if is_bestplan_child_context():
+            _engine_name = "compressor"
+    except Exception:
+        pass
+
     if _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
         try:

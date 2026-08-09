@@ -66,6 +66,10 @@ def _identity(explorer: dict[str, str]) -> dict[str, str]:
     }
 
 
+def _resolve_identity(_agent, explorer, **_kwargs):
+    return _identity(explorer)
+
+
 def _candidate(label: str) -> str:
     return "HERMES_BESTPLAN_CANDIDATE_V1\n" + json.dumps(
         {
@@ -332,7 +336,7 @@ def test_ordered_attempts_require_quorum_before_named_synthesis(
     monkeypatch.setattr(
         orchestrator,
         "_resolve_lane_credentials",
-        lambda _agent, explorer: _identity(explorer),
+        _resolve_identity,
     )
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
@@ -399,7 +403,7 @@ def test_only_named_synthesizer_runs_and_terminal_receipt_appends_once(
     monkeypatch.setattr(
         orchestrator,
         "_resolve_lane_credentials",
-        lambda _agent, explorer: _identity(explorer),
+        _resolve_identity,
     )
     monkeypatch.setattr(orchestrator, "append_receipt", record_append)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -459,7 +463,7 @@ def test_successful_body_survives_receipt_write_failure_with_sanitized_warning(
     monkeypatch.setattr(
         orchestrator,
         "_resolve_lane_credentials",
-        lambda _agent, explorer: _identity(explorer),
+        _resolve_identity,
     )
     monkeypatch.setattr(orchestrator, "append_receipt", fail_append)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -487,7 +491,7 @@ def test_synthesizer_preflight_failure_is_sanitized_and_terminalized_once(
     builds = 0
     append_calls = 0
 
-    def fail_resolution(_agent, _explorer):
+    def fail_resolution(_agent, _explorer, **_kwargs):
         raise BestPlanUnavailable(f"credential rejected: {sentinel}")
 
     def build_should_not_run(*_args):
@@ -530,7 +534,9 @@ def test_failed_receipt_write_reports_persistence_reason_without_secret(
     monkeypatch.setattr(
         orchestrator,
         "_resolve_lane_credentials",
-        lambda *_args: (_ for _ in ()).throw(BestPlanUnavailable(sentinel)),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            BestPlanUnavailable(sentinel)
+        ),
     )
     monkeypatch.setattr(
         orchestrator,
@@ -594,7 +600,7 @@ def test_parallel_child_construction_is_serial_and_restores_tool_global(
     monkeypatch.setattr(
         orchestrator,
         "_resolve_lane_credentials",
-        lambda _agent, explorer: _identity(explorer),
+        _resolve_identity,
     )
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))

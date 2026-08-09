@@ -46,6 +46,53 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _capture_cli_bestplan_result(
+    result: dict,
+    *,
+    invocation_message: str,
+    session_id: str,
+    profile: str,
+    workspace: str,
+    host_agent: Any,
+    baseline_fingerprint: Optional[str] = None,
+    store: Any = None,
+) -> dict:
+    """Make a CLI plan approvable only after its receipt is persisted."""
+    from agent.bestplan_state import BestplanStore, capture_bestplan_agent_result
+
+    owns_store = store is None
+    store = store or BestplanStore()
+    try:
+        captured = capture_bestplan_agent_result(
+            result,
+            invocation_message=invocation_message,
+            session_id=session_id,
+            profile=profile,
+            workspace=workspace,
+            baseline_fingerprint=baseline_fingerprint,
+            store=store,
+            host_agent=host_agent,
+            provisional=True,
+        )
+        capture = (
+            captured.get("bestplan_capture")
+            if isinstance(captured, dict)
+            else None
+        )
+        if isinstance(capture, dict) and capture.get("executable") is True:
+            plan_id = str(capture.get("plan_id") or "").strip()
+            if not callable(getattr(host_agent, "_persist_session", None)):
+                raise RuntimeError("CLI BestPlan receipt persistence unavailable")
+            if capture.get("receipt_persisted") is not True:
+                raise RuntimeError("CLI BestPlan receipt persistence failed")
+            if not plan_id or not store.commit_provisional_plan(plan_id):
+                raise RuntimeError("CLI BestPlan provisional capture could not be committed")
+        return captured
+    finally:
+        if owns_store:
+            store.close()
+
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
@@ -9895,16 +9942,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 rest = cmd_original[len(base_cmd):].strip()
                 # BestPlan is a host-owned command. Keep the existing command
                 # identity/alias, but bypass prompt-only dynamic skill loading
-                # and queue a one-shot runtime marker for the canonical turn.
+                # and queue trusted metadata separately from the user text.
                 if base_cmd in {"/bestplan", "/bp"}:
-                    import json
-                    from agent.bestplan_orchestrator import TURN_MARKER, normalize_count
+                    from agent.bestplan_orchestrator import (
+                        DEFAULT_EXPLORER_COUNT,
+                        normalize_count,
+                    )
                     parts = rest.split(maxsplit=1)
-                    requested = parts[0] if parts and parts[0].isdigit() else "3"
+                    requested = (
+                        parts[0]
+                        if parts and parts[0].isdigit()
+                        else str(DEFAULT_EXPLORER_COUNT)
+                    )
                     task = parts[1] if parts and parts[0].isdigit() else rest
-                    marker = TURN_MARKER + json.dumps({"count": normalize_count(requested)}) + "\x00" + task
                     if hasattr(self, '_pending_input'):
-                        self._pending_input.put(marker)
+                        self._pending_input.put((
+                            task,
+                            [],
+                            {
+                                "kind": "bestplan",
+                                "config": {"count": normalize_count(requested)},
+                            },
+                        ))
                     return True
                 # Stacked slash-skill invocations: `/skill-a /skill-b do XYZ`
                 # loads every leading skill (up to 5), not just the first.
@@ -13096,31 +13155,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         }.get(verdict, "deny")
 
     def _handle_bestplan_command(self, cmd_original: str) -> None:
-        """Handle /bestplan — run adversarial planning iterations or auto-review previous plan."""
-        # Extract args after /bestplan
+        """Queue one host-owned BestPlan turn with an explicit explorer count."""
+        from agent.bestplan_orchestrator import (
+            DEFAULT_EXPLORER_COUNT,
+            normalize_count,
+        )
+
         parts = cmd_original.split(None, 1)
         args = parts[1].strip() if len(parts) > 1 else ""
-
         if not args:
-            # No args: auto-review the previous plan in conversation history
-            self._auto_review_previous_plan()
-        else:
-            # Has args: run $bestplan with those args
-            # The $bestplan skill is invoked via the skill system, so we construct
-            # the user instruction and load the skill
-            from agent.skill_commands import build_skill_invocation_message
-
-            msg = build_skill_invocation_message(
-                "/bestplan",
-                args,
-                task_id=self.session_id
+            requested = DEFAULT_EXPLORER_COUNT
+            task = (
+                "adversarial review of the previous plan in this conversation"
             )
-            if msg:
-                if hasattr(self, '_pending_input'):
-                    self._pending_input.put(msg)
-                print(f"\n⚡ Loading skill: bestplan")
-            else:
-                _cprint("  Failed to load bestplan skill")
+        else:
+            tokens = args.split(maxsplit=1)
+            has_count = bool(tokens and tokens[0].isascii() and tokens[0].isdigit())
+            requested = tokens[0] if has_count else DEFAULT_EXPLORER_COUNT
+            task = tokens[1].strip() if has_count and len(tokens) > 1 else (
+                "" if has_count else args
+            )
+            if not task:
+                _cprint("  BestPlan unavailable: provide a task after the count.")
+                return
+        if hasattr(self, "_pending_input"):
+            self._pending_input.put((
+                task,
+                [],
+                {
+                    "kind": "bestplan",
+                    "config": {"count": normalize_count(requested)},
+                },
+            ))
 
     def _auto_review_previous_plan(self) -> None:
         """Auto-review the most recent plan in conversation history."""
@@ -13446,7 +13512,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None) -> Optional[str]:
+    @staticmethod
+    def _should_route_pending_input_controls(
+        _user_input: Any,
+        *,
+        bestplan_config: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Return whether queued text may enter ordinary CLI control routing."""
+        return bestplan_config is None
+
+    def chat(
+        self,
+        message,
+        images: list = None,
+        *,
+        bestplan_config: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -13461,6 +13542,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Args:
             message: The user's message (str or multimodal content list)
             images: Optional list of Path objects for attached images
+            bestplan_config: Trusted host-owned configuration supplied out of
+                band by the CLI command dispatcher.
             
         Returns:
             The agent's response, or None on error
@@ -13468,6 +13551,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
+        _bestplan_cfg = (
+            dict(bestplan_config) if bestplan_config is not None else None
+        )
 
         # Reset the per-turn interrupt flag. Any subsequent path that
         # discovers an interrupt (below, after run_conversation) will flip
@@ -13763,34 +13849,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 try:
                     from agent.bestplan_state import (
                         ResolvedGo,
-                        capture_bestplan_agent_result,
                         is_go_enabled,
                         try_resolve_go,
                     )
 
-                    try:
-                        _go_result = try_resolve_go(
-                            message,
-                            session_id=str(getattr(self, "session_id", "") or ""),
-                            profile=str(os.environ.get("HERMES_PROFILE") or ""),
-                            workspace=os.getcwd(),
-                            parent_agent=self.agent,
-                        )
-                    except Exception as _go_exc:
-                        if (
-                            isinstance(message, str)
-                            and message.strip().casefold() == "go"
-                            and is_go_enabled()
-                        ):
-                            _go_result = ResolvedGo(
-                                True,
-                                "resolver_error",
-                                reason="bestplan host resolver failed closed",
-                                error=str(_go_exc),
+                    if _bestplan_cfg is not None:
+                        _go_result = None
+                    else:
+                        try:
+                            _go_result = try_resolve_go(
+                                message,
+                                session_id=str(getattr(self, "session_id", "") or ""),
+                                profile=str(os.environ.get("HERMES_PROFILE") or ""),
+                                workspace=os.getcwd(),
+                                parent_agent=self.agent,
                             )
-                        else:
-                            _go_result = None
-                        logging.exception("bestplan go resolver error")
+                        except Exception as _go_exc:
+                            if (
+                                isinstance(message, str)
+                                and message.strip().casefold() == "go"
+                                and is_go_enabled()
+                            ):
+                                _go_result = ResolvedGo(
+                                    True,
+                                    "resolver_error",
+                                    reason="bestplan host resolver failed closed",
+                                    error=str(_go_exc),
+                                )
+                            else:
+                                _go_result = None
+                            logging.exception("bestplan go resolver error")
                     if _go_result is not None and _go_result.resolved:
                         result = _go_result.to_agent_result(
                             conversation_history=self.conversation_history[:-1],
@@ -13817,15 +13905,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             task_id=self.session_id,
                             persist_user_message=message if _voice_prefix else None,
                             moa_config=_moa_cfg,
+                            bestplan_config=_bestplan_cfg,
                         )
-                        result = capture_bestplan_agent_result(
-                            result,
-                            invocation_message=message,
-                            session_id=str(getattr(self, "session_id", "") or ""),
-                            profile=str(os.environ.get("HERMES_PROFILE") or ""),
-                            workspace=os.getcwd(),
-                            host_agent=self.agent,
-                        )
+                        if _bestplan_cfg is not None:
+                            result = _capture_cli_bestplan_result(
+                                result,
+                                invocation_message="/bestplan",
+                                session_id=str(getattr(self, "session_id", "") or ""),
+                                profile=str(os.environ.get("HERMES_PROFILE") or ""),
+                                workspace=os.getcwd(),
+                                host_agent=self.agent,
+                            )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -16955,6 +17045,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Unpack image payload or an internally guarded goal continuation.
                     submit_images = []
                     _internal_meta = None
+                    _bestplan_config = None
                     if isinstance(user_input, tuple):
                         if len(user_input) == 3:
                             user_input, submit_images, _internal_meta = user_input
@@ -16970,6 +17061,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             _rev = -1
                         if _gs is None or _gs.status != "active" or _gs.revision != _rev:
                             continue
+                    elif isinstance(_internal_meta, dict) and _internal_meta.get("kind") == "bestplan":
+                        _raw_bestplan_config = _internal_meta.get("config")
+                        _raw_bestplan_count = (
+                            _raw_bestplan_config.get("count")
+                            if isinstance(_raw_bestplan_config, dict)
+                            else None
+                        )
+                        if (
+                            not isinstance(_raw_bestplan_count, int)
+                            or isinstance(_raw_bestplan_count, bool)
+                            or set(_raw_bestplan_config) != {"count"}
+                        ):
+                            _cprint("  BestPlan unavailable: invalid internal turn metadata.")
+                            continue
+                        _bestplan_config = {"count": _raw_bestplan_count}
+
+                    _route_pending_input_controls = (
+                        self._should_route_pending_input_controls(
+                            user_input,
+                            bestplan_config=_bestplan_config,
+                        )
+                    )
 
                     if isinstance(user_input, str):
                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
@@ -16979,7 +17092,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     
                     # Check for commands — but detect dragged/pasted file paths first.
                     # See _detect_file_drop() for details.
-                    _file_drop = _detect_file_drop(user_input) if isinstance(user_input, str) else None
+                    _file_drop = (
+                        _detect_file_drop(user_input)
+                        if _route_pending_input_controls
+                        and isinstance(user_input, str)
+                        else None
+                    )
                     if _file_drop:
                         _drop_path = _file_drop["path"]
                         _remainder = _file_drop["remainder"]
@@ -16998,7 +17116,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # that session (see #34584). Checked before chat routing so
                     # the digit isn't sent to the agent as a message.
                     if (
-                        not _file_drop
+                        _route_pending_input_controls
+                        and not _file_drop
                         and self._pending_resume_sessions
                         and isinstance(user_input, str)
                         and self._consume_pending_resume_selection(user_input)
@@ -17010,13 +17129,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # path so nothing enters conversation history and no model
                     # turn is spent. See handle_bang_shell().
                     if (
-                        not _file_drop
+                        _route_pending_input_controls
+                        and not _file_drop
                         and isinstance(user_input, str)
                         and self.handle_bang_shell(user_input)
                     ):
                         continue
 
-                    if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
+                    if (
+                        _route_pending_input_controls
+                        and not _file_drop
+                        and isinstance(user_input, str)
+                        and _looks_like_slash_command(user_input)
+                    ):
                         _cprint(f"\n⚙️  {user_input}")
                         try:
                             if not self.process_command(user_input):
@@ -17065,7 +17190,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None)
+                        if _bestplan_config is None:
+                            self.chat(user_input, images=submit_images or None)
+                        else:
+                            self.chat(
+                                user_input,
+                                images=submit_images or None,
+                                bestplan_config=_bestplan_config,
+                            )
                     finally:
                         self._turn_summary_emit()
                         self._interactive_turn = False

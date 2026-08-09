@@ -206,6 +206,23 @@ def _sse_frame(data: Any, *, event: str = None, ensure_ascii: bool = True) -> by
     return f"{prefix}data: {json.dumps(data, ensure_ascii=ensure_ascii)}\n\n".encode()
 
 
+def _classify_agent_terminal_result(
+    result: Any,
+    *,
+    task_error: Any = None,
+) -> str:
+    """Classify terminal flags even when cancellation preserved usable text."""
+    if task_error is not None:
+        return "failed"
+    if not isinstance(result, dict):
+        return "completed"
+    if bool(result.get("failed")):
+        return "failed"
+    if bool(result.get("interrupted")) or result.get("completed") is False:
+        return "incomplete"
+    return "completed"
+
+
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
     """Parse a listen port without letting malformed env/config values crash startup."""
     try:
@@ -4247,9 +4264,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        terminal_status = _classify_agent_terminal_result(result)
         is_partial = bool(result.get("partial"))
-        is_failed = bool(result.get("failed"))
-        completed = bool(result.get("completed", True))
+        is_failed = terminal_status == "failed"
+        is_interrupted = bool(result.get("interrupted"))
+        completed = terminal_status == "completed"
         raw_err_msg = result.get("error")
         err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
 
@@ -4258,7 +4277,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # codes. See issue #22496.
         if is_partial and err_msg and "truncat" in err_msg.lower():
             finish_reason = "length"
-        elif is_failed or (not completed and err_msg):
+        elif terminal_status != "completed":
             finish_reason = "error"
         else:
             finish_reason = "stop"
@@ -4272,7 +4291,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Hard-fail path: no usable assistant text AND a real failure → 5xx
         # with OpenAI-style error envelope so SDK clients raise instead of
         # silently rendering the internal failure string as message.content.
-        if not final_response and (is_failed or is_partial):
+        if not final_response and (terminal_status != "completed" or is_partial):
             err_body = _openai_error(
                 err_msg or "Agent run did not produce a response.",
                 err_type="server_error",
@@ -4282,6 +4301,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "completed": completed,
                 "partial": is_partial,
                 "failed": is_failed,
+                "interrupted": is_interrupted,
             }
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
@@ -4311,11 +4331,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
-        if is_partial or is_failed or not completed:
+        if is_partial or terminal_status != "completed":
             response_data["hermes"] = {
                 "completed": completed,
                 "partial": is_partial,
                 "failed": is_failed,
+                "interrupted": is_interrupted,
                 "error": err_msg,
                 "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
             }
@@ -4439,9 +4460,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
             # Inspect the result dict for a flagged (non-exception) failure.
+            terminal_status = _classify_agent_terminal_result(
+                result,
+                task_error=agent_error,
+            )
             is_partial = bool(result.get("partial")) if isinstance(result, dict) else False
-            is_failed = bool(result.get("failed")) if isinstance(result, dict) else False
-            completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
+            is_failed = terminal_status == "failed"
+            is_interrupted = bool(result.get("interrupted")) if isinstance(result, dict) else False
+            completed = terminal_status == "completed"
             err_msg = result.get("error") if isinstance(result, dict) else None
             if agent_error is not None:
                 is_failed = True
@@ -4451,7 +4477,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # for truncation, "error" for failure, "stop" for normal completion.
             if is_partial and err_msg and "truncat" in err_msg.lower():
                 finish_reason = "length"
-            elif agent_error is not None or is_failed or (not completed and err_msg):
+            elif agent_error is not None or terminal_status != "completed":
                 finish_reason = "error"
             else:
                 finish_reason = "stop"
@@ -4478,6 +4504,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "completed": completed,
                     "partial": is_partial,
                     "failed": is_failed,
+                    "interrupted": is_interrupted,
                     "error": err_msg,
                     "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
                 }
@@ -4554,6 +4581,8 @@ class APIServerAdapter(BasePlatformAdapter):
         - ``response.completed`` — terminal event carrying the full
           response object with all output items + usage (same payload
           shape as the non-streaming path for parity)
+        - ``response.incomplete`` — terminal event when the agent reports an
+          interrupted or otherwise explicitly incomplete turn
         - ``response.failed`` — terminal event on agent error
 
         If the client disconnects mid-stream, ``agent.interrupt()`` is
@@ -4587,7 +4616,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # ``done`` event when the tool completes.  Order preserved.
         pending_tool_calls: List[Dict[str, Any]] = []
         # Output items we've emitted so far (used to build the terminal
-        # response.completed payload).  Kept in the order they appeared.
+        # response payload).  Kept in the order they appeared.
         emitted_items: List[Dict[str, Any]] = []
         # Monotonic counter for output_index (spec requires it).
         output_index = 0
@@ -4623,6 +4652,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         final_response_text = ""
         agent_error: Optional[str] = None
+        agent_terminal_status = "completed"
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
 
@@ -4925,6 +4955,7 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                agent_terminal_status = _classify_agent_terminal_result(result)
                 # If the agent produced a final_response but no text
                 # deltas were streamed (e.g. some providers only emit
                 # the full response at the end), emit a single fallback
@@ -4934,8 +4965,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     await _emit_text_delta(agent_final)
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
-                if isinstance(result, dict) and result.get("error") and not final_response_text:
+                if (
+                    isinstance(result, dict)
+                    and result.get("error")
+                    and not final_response_text
+                    and agent_terminal_status != "incomplete"
+                ):
                     agent_error = _redact_api_error_text(result["error"])
+                if agent_terminal_status == "failed" and not agent_error:
+                    raw_agent_error = result.get("error") if isinstance(result, dict) else None
+                    agent_error = _redact_api_error_text(raw_agent_error or "Agent run failed.")
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
@@ -4966,8 +5005,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "item": msg_done_item,
                 })
 
-            # Always append a final message item in the completed
-            # response envelope so clients that only parse the terminal
+            # Always append a final message item in the terminal response
+            # envelope so clients that only parse the terminal
             # payload still see the assistant text.  This mirrors the
             # shape produced by _extract_output_items in the batch path.
             final_items: List[Dict[str, Any]] = list(emitted_items)
@@ -5030,9 +5069,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "response": failed_env,
                 })
             else:
-                completed_env = _envelope("completed")
-                completed_env["output"] = final_items
-                completed_env["usage"] = {
+                terminal_env = _envelope(agent_terminal_status)
+                terminal_env["output"] = final_items
+                terminal_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
@@ -5049,14 +5088,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 # previous_response_id chaining resumes the child session.
                 _result_sid = result.get("session_id") if isinstance(result, dict) else None
                 _persist_response_snapshot(
-                    completed_env,
+                    terminal_env,
                     conversation_history_snapshot=full_history,
                     session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
                 )
                 terminal_snapshot_persisted = True
-                await _write_event("response.completed", {
-                    "type": "response.completed",
-                    "response": completed_env,
+                terminal_event = f"response.{agent_terminal_status}"
+                await _write_event(terminal_event, {
+                    "type": terminal_event,
+                    "response": terminal_env,
                 })
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -5452,7 +5492,7 @@ class APIServerAdapter(BasePlatformAdapter):
         response_data = {
             "id": response_id,
             "object": "response",
-            "status": "completed",
+            "status": _classify_agent_terminal_result(result),
             "created_at": created_at,
             "model": body.get("model", self._model_name),
             "output": output_items,

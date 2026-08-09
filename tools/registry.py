@@ -27,6 +27,16 @@ from typing import Callable, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 
+def _bestplan_builtin_only() -> bool:
+    """Return whether this task must resolve only checked-in tool entries."""
+    try:
+        from agent.delegation_context import is_bestplan_child_context
+
+        return is_bestplan_child_context()
+    except Exception:
+        return False
+
+
 def _is_registry_register_call(node: ast.AST) -> bool:
     """Return True when *node* is a ``registry.register(...)`` call expression."""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
@@ -375,6 +385,11 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: Dict[str, ToolEntry] = {}
+        # Immutable-authority view used only by host-owned BestPlan children.
+        # Active registrations remain mutable so explicitly authorized plugins
+        # can override ordinary agents, while the checked-in implementation is
+        # retained for a bounded planning sandbox.
+        self._builtin_tools: Dict[str, ToolEntry] = {}
         # Durable map: plugin module namespace (handler.__globals__["__name__"])
         # -> operator opt-in for built-in override. Populated at plugin load and
         # never cleared, so a plugin's override authorization is bound to the
@@ -397,7 +412,8 @@ class ToolRegistry:
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
         with self._lock:
-            return list(self._tools.values()), dict(self._toolset_checks)
+            entries = self._builtin_tools if _bestplan_builtin_only() else self._tools
+            return list(entries.values()), dict(self._toolset_checks)
 
     def _snapshot_entries(self) -> List[ToolEntry]:
         """Return a stable snapshot of registered tool entries."""
@@ -430,7 +446,8 @@ class ToolRegistry:
     def get_entry(self, name: str) -> Optional[ToolEntry]:
         """Return a registered tool entry by name, or None."""
         with self._lock:
-            return self._tools.get(name)
+            entries = self._builtin_tools if _bestplan_builtin_only() else self._tools
+            return entries.get(name)
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
@@ -541,6 +558,7 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        caller_module = self._caller_module()
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
@@ -579,7 +597,7 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
-            self._tools[name] = ToolEntry(
+            entry = ToolEntry(
                 name=name,
                 toolset=toolset,
                 schema=schema,
@@ -592,6 +610,17 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
             )
+            self._tools[name] = entry
+            if (
+                name not in self._builtin_tools
+                and caller_module.startswith("tools.")
+                and not toolset.startswith("mcp-")
+            ):
+                # Bind authority to the checked-in registration site, not the
+                # handler object's module. A plugin can legitimately reuse a
+                # built-in callable while replacing its schema/name binding;
+                # that must not replace BestPlan's retained original entry.
+                self._builtin_tools[name] = entry
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
             # get_toolset_requirements -> TOOLSET_REQUIREMENTS["check_fn"], which

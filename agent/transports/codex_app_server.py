@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -132,6 +133,7 @@ class CodexAppServerClient:
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        suppress_kanban_context: bool = False,
     ) -> None:
         self._codex_bin = codex_bin
         # codex app-server is a model-driving CLI executor: it runs a
@@ -148,6 +150,10 @@ class CodexAppServerClient:
         spawn_env = hermes_subprocess_env(inherit_credentials=True)
         if env:
             spawn_env.update(env)
+        if suppress_kanban_context:
+            for key in tuple(spawn_env):
+                if key.startswith("HERMES_KANBAN_"):
+                    spawn_env.pop(key, None)
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
 
@@ -190,15 +196,18 @@ class CodexAppServerClient:
         # (#56747). Hide-only — stdio pipes stay intact for the app-server wire.
         from hermes_cli._subprocess_compat import windows_hide_flags
 
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            env=spawn_env,
-            creationflags=windows_hide_flags(),
-        )
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "bufsize": 0,
+            "env": spawn_env,
+            "creationflags": windows_hide_flags(),
+        }
+        self._owns_process_group = os.name == "posix"
+        if self._owns_process_group:
+            popen_kwargs["start_new_session"] = True
+        self._proc = subprocess.Popen(cmd, **popen_kwargs)
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
@@ -242,7 +251,7 @@ class CodexAppServerClient:
         return result
 
     def close(self, timeout: float = 3.0) -> None:
-        """Close stdin and wait for the subprocess to exit, escalating to kill."""
+        """Close stdio and tear down the complete app-server process tree."""
         if self._closed:
             return
         self._closed = True
@@ -251,15 +260,41 @@ class CodexAppServerClient:
                 self._proc.stdin.close()
         except Exception:
             pass
+        if self._owns_process_group:
+            self._signal_process_group(signal.SIGTERM)
+        else:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
         try:
-            self._proc.terminate()
             self._proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            pass
+        finally:
+            # A cooperative leader can exit while an MCP/plugin/hook descendant
+            # remains alive and keeps inherited pipes open.  The app-server is
+            # always its own POSIX session, so a final group kill is bounded to
+            # this client and cannot reach the Hermes host process.
+            if self._owns_process_group:
+                self._signal_process_group(signal.SIGKILL)
+            elif self._proc.poll() is None:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
             try:
-                self._proc.kill()
                 self._proc.wait(timeout=1.0)
             except Exception:
                 pass
+
+    def _signal_process_group(self, sig: signal.Signals) -> None:
+        if not self._owns_process_group:
+            return
+        try:
+            os.killpg(self._proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
 
     def __enter__(self) -> "CodexAppServerClient":
         return self

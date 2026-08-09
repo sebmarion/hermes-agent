@@ -15426,7 +15426,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_subgoal_command(event)
 
         if canonical == "bestplan":
-            return await self._handle_bestplan_command(event)
+            bestplan_reply = await self._handle_bestplan_command(event)
+            if bestplan_reply:
+                return bestplan_reply
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
@@ -18717,7 +18719,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_bestplan_command(self, event: MessageEvent) -> str:
         """Handle /bestplan in the gateway.
 
-        If args provided: run $bestplan with those args (planning iterations).
+        If args provided: keep /bestplan with those args for skill expansion.
         If no args: auto-review the previous plan in the conversation.
         """
         args = (event.get_command_args() or "").strip()
@@ -18725,12 +18727,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not args:
             # No args - auto-review previous plan in conversation
             # We'll rewrite the event text to trigger a plan review
-            event.text = "/bestplan 3 adversarial review of the previous plan in this conversation"
+            from agent.bestplan_orchestrator import DEFAULT_EXPLORER_COUNT
+
+            event.text = (
+                f"/bestplan {DEFAULT_EXPLORER_COUNT} "
+                "adversarial review of the previous plan in this conversation"
+            )
             # Fall through to agent processing
             return ""
 
-        # Has args - rewrite to $bestplan format for the skill
-        event.text = f"$bestplan {args}"
+        # Keep the slash form so the shared skill dispatcher below recognizes
+        # and expands it before the planning-only gateway model turn.
+        event.text = f"/bestplan {args}"
         return ""
 
     # ────────────────────────────────────────────────────────────────

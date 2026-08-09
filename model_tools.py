@@ -51,6 +51,15 @@ def _is_delegated_child_context() -> bool:
         return False
 
 
+def _is_bestplan_child_context() -> bool:
+    try:
+        from agent.delegation_context import is_bestplan_child_context
+
+        return is_bestplan_child_context()
+    except Exception:
+        return False
+
+
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
 _WARNED_DISABLED_BUNDLES: set = set()
@@ -385,6 +394,7 @@ def get_tool_definitions(
                 bool(skip_tool_search_assembly),
                 platform,
                 _is_delegated_child_context(),
+                _is_bestplan_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
             )

@@ -8,6 +8,7 @@ tool, status, quorum, and receipt identity.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -20,7 +21,7 @@ import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, TimeoutError, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence, cast
+from typing import Any, Callable, Iterable, Sequence, cast
 
 from agent.execution_plan import compile_execution_plan
 from agent.redact import redact_sensitive_text
@@ -60,6 +61,7 @@ DEFAULT_RUNTIME = {
     "overall_timeout": 540,
 }
 SINGLE_PROVIDER_MOE_REPLICAS = 3
+DEFAULT_EXPLORER_COUNT = 4
 ALLOWED_TOOLS = frozenset({"read_only_files", "web"})
 TURN_MARKER = "\x00HERMES_BESTPLAN_CONFIG:"
 _CHILD_CLEANUP_GRACE_SECONDS = 5.0
@@ -83,6 +85,7 @@ _ALLOWED_API_MODES = frozenset(
         "anthropic_messages",
         "bedrock_converse",
         "codex_app_server",
+        "claude_code",
     }
 )
 _ALLOWED_REASONING_EFFORTS = frozenset(
@@ -108,6 +111,7 @@ _REASON_CODES = frozenset(
         "synthesizer_failed",
         "receipt_persistence_failed",
         "overall_timeout",
+        "cancelled",
     }
 )
 _V1_SYNTHESIS_CONTRACT = (
@@ -150,17 +154,85 @@ class BestPlanRuntimeInvalid(BestPlanUnavailable):
     """Raised when a resolved runtime violates its configured identity."""
 
 
+class _BestPlanCancelled(RuntimeError):
+    """Internal control flow for a parent-owned cancellation."""
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise BestPlanUnavailable(message)
 
 
-def normalize_count(value: Any, *, default: int = 3) -> int:
+def _bestplan_cancel_requested(agent: Any) -> bool:
+    if getattr(agent, "_interrupt_requested", False) is True:
+        return True
+    hard_interrupt = getattr(agent, "_hard_interrupt_requested", None)
+    is_set = getattr(hard_interrupt, "is_set", None)
+    return bool(callable(is_set) and is_set())
+
+
+def _future_result_until(
+    future: Future[Any],
+    *,
+    deadline: float,
+    cancel_requested: Callable[[], bool],
+) -> Any:
+    """Wait in bounded polls so parent cancellation cannot miss a child."""
+    while True:
+        if cancel_requested():
+            raise _BestPlanCancelled("BestPlan parent turn was cancelled")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("BestPlan child deadline reached")
+        try:
+            return future.result(timeout=min(0.1, remaining))
+        except TimeoutError:
+            # A completed provider future can raise TimeoutError as its own
+            # result; only an unfinished future means "poll again".
+            if future.done():
+                raise
+
+
+def normalize_count(value: Any, *, default: int = DEFAULT_EXPLORER_COUNT) -> int:
     try:
         count = int(value)
     except (TypeError, ValueError):
         count = default
     return max(2, min(5, count))
+
+
+def decode_bestplan_turn(
+    message: Any,
+) -> tuple[Any, dict[str, int] | None, str | None]:
+    """Decode the private CLI turn marker through one strict authority.
+
+    The producer emits exactly one integer ``count`` field followed by a NUL
+    delimiter and a non-empty task. Marker-like user text must never smuggle a
+    runtime config into :func:`run_bestplan`; malformed markers are returned as
+    an explicit fail-closed error for the conversation boundary.
+    """
+    if not isinstance(message, str) or not message.startswith(TURN_MARKER):
+        return message, None, None
+
+    marker_end = message.find("\x00", len(TURN_MARKER))
+    task = message[marker_end + 1 :].lstrip() if marker_end >= 0 else ""
+    if marker_end <= len(TURN_MARKER):
+        return task, None, "invalid_bestplan_turn_marker"
+    try:
+        marker_config = json.loads(message[len(TURN_MARKER) : marker_end])
+    except (json.JSONDecodeError, TypeError):
+        return task, None, "invalid_bestplan_turn_marker"
+    if not isinstance(marker_config, dict) or set(marker_config) != {"count"}:
+        return task, None, "invalid_bestplan_turn_marker"
+    count = marker_config.get("count")
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or not 2 <= count <= 5
+        or not task.strip()
+    ):
+        return task, None, "invalid_bestplan_turn_marker"
+    return task, {"count": count}, None
 
 
 def quorum_for(count: int) -> int:
@@ -202,6 +274,11 @@ def _normalize_explorer(entry: Any, index: int) -> dict[str, str]:
         normalized["reasoning_effort"] in _ALLOWED_REASONING_EFFORTS,
         f"BestPlan explorer #{index} reasoning_effort is invalid",
     )
+    if normalized["provider"].lower() == "anthropic":
+        _require(
+            normalized["api_mode"] == "claude_code",
+            "BestPlan Anthropic provider requires claude_code",
+        )
     if normalized["reasoning_effort"] == "ultra":
         _require(
             normalized["api_mode"] == "codex_app_server",
@@ -211,6 +288,15 @@ def _normalize_explorer(entry: Any, index: int) -> dict[str, str]:
         _require(
             normalized["provider"].lower() in {"openai", "openai-codex"},
             "BestPlan codex_app_server requires an OpenAI provider",
+        )
+    if normalized["api_mode"] == "claude_code":
+        _require(
+            normalized["provider"].lower() == "anthropic",
+            "BestPlan claude_code requires the Anthropic provider",
+        )
+        _require(
+            normalized["reasoning_effort"] in {"low", "medium", "high", "xhigh", "max"},
+            "BestPlan claude_code supports effort low through max",
         )
 
     # K3 is optional, but its canonical lane name or model is an identity
@@ -670,18 +756,83 @@ def _bestplan_task_with_context(
     )
 
 
-def _resolve_lane_credentials(agent: Any, lane: dict[str, Any]) -> dict[str, Any]:
+def _resolve_lane_credentials(
+    agent: Any,
+    lane: dict[str, Any],
+    *,
+    auth_timeout: float | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     """Resolve provider credentials for one explorer/synthesizer lane.
 
     Configured providers are resolved through the normal runtime provider path
     so config.yaml enablement and secrets are honoured. Codex app-server lanes
-    use provider-managed auth; api_key is None because the Codex adapter reads
-    credentials from the Hermes auth store / ~/.codex directory.
+    use a read-only snapshot of the official Codex CLI login instead of the
+    mutable Hermes credential resolver.
     """
     requested_provider = str(lane.get("provider") or "").strip()
     target_model = str(lane.get("model") or "").strip()
     if not requested_provider or not target_model:
         raise BestPlanUnavailable("BestPlan lane has no provider/model")
+    configured_api_mode = str(lane.get("api_mode") or "").strip().lower()
+    if configured_api_mode == "claude_code":
+        if requested_provider.lower() != "anthropic":
+            raise BestPlanRuntimeInvalid(
+                "BestPlan Claude Code runtime requires the Anthropic provider"
+            )
+        try:
+            from agent.claude_code_plan import resolve_claude_code_plan_runtime
+
+            return resolve_claude_code_plan_runtime(
+                model=target_model,
+                auth_timeout=(15.0 if auth_timeout is None else auth_timeout),
+                cancel_requested=cancel_requested,
+            )
+        except Exception as exc:
+            if cancel_requested is not None and cancel_requested():
+                raise _BestPlanCancelled(
+                    "BestPlan cancelled during Claude plan login verification"
+                ) from exc
+            raise BestPlanUnavailable("BestPlan Claude plan login unavailable") from exc
+    if configured_api_mode == "codex_app_server":
+        if requested_provider.lower() not in {"openai", "openai-codex"}:
+            raise BestPlanRuntimeInvalid(
+                "BestPlan Codex app-server runtime requires an OpenAI provider"
+            )
+        if cancel_requested is not None and cancel_requested():
+            raise _BestPlanCancelled(
+                "BestPlan cancelled during Codex login verification"
+            )
+        try:
+            from hermes_cli.auth import (
+                _codex_access_token_is_expiring,
+                _import_codex_cli_tokens,
+            )
+
+            tokens = _import_codex_cli_tokens()
+        except Exception as exc:
+            raise BestPlanUnavailable(
+                "BestPlan Codex credentials unavailable"
+            ) from exc
+        if cancel_requested is not None and cancel_requested():
+            raise _BestPlanCancelled(
+                "BestPlan cancelled during Codex login verification"
+            )
+        if not tokens:
+            raise BestPlanUnavailable("BestPlan Codex credentials unavailable")
+        if auth_timeout is not None and _codex_access_token_is_expiring(
+            tokens.get("access_token"), math.ceil(max(0.0, auth_timeout))
+        ):
+            raise BestPlanUnavailable("BestPlan Codex credentials unavailable")
+        return {
+            "provider": "openai-codex",
+            "requested_provider": requested_provider,
+            "model": target_model,
+            "api_mode": "codex_app_server",
+            "base_url": lane.get("base_url")
+            or "https://chatgpt.com/backend-api/codex",
+            "api_key": None,
+        }
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -693,40 +844,6 @@ def _resolve_lane_credentials(agent: Any, lane: dict[str, Any]) -> dict[str, Any
         )
     except Exception as exc:
         raise BestPlanUnavailable("BestPlan provider credentials unavailable") from exc
-
-    if requested_provider.lower() == "openai-codex":
-        parent_is_codex = (
-            str(getattr(agent, "provider", "") or "").lower()
-            == "openai-codex"
-        )
-        has_codex_auth = bool(
-            runtime.get("api_key")
-            or (Path.home() / ".codex").exists()
-            or (
-                parent_is_codex
-                and (
-                    getattr(agent, "api_key", None)
-                    or getattr(agent, "_credential_pool", None)
-                )
-            )
-        )
-        if not has_codex_auth:
-            raise BestPlanUnavailable("BestPlan Codex credentials unavailable")
-        runtime.update(
-            {
-                "provider": "openai-codex",
-                "model": target_model,
-                "api_mode": "codex_app_server",
-                "base_url": lane.get("base_url")
-                or runtime.get("base_url")
-                or "https://chatgpt.com/backend-api/codex",
-                # The app-server adapter owns Codex auth; do not pass an
-                # arbitrary parent key into an app-server child.
-                "api_key": None,
-                "requested_provider": requested_provider,
-            }
-        )
-        return runtime
 
     configured = {
         "name": str(lane.get("name") or "").strip().lower(),
@@ -823,13 +940,16 @@ def _best_lane_per_provider(active_records: list[dict[str, Any]]) -> list[dict[s
     return sorted(best_by_provider.values(), key=lambda item: item["index"])
 
 
-def build_explorer_schedule(active_records: list[dict[str, Any]], count: int = 3) -> tuple[list[dict[str, Any]], str]:
+def build_explorer_schedule(
+    active_records: list[dict[str, Any]],
+    count: int = DEFAULT_EXPLORER_COUNT,
+) -> tuple[list[dict[str, Any]], str]:
     """Build the explorer fan-out and identify its resilience mode.
 
     If only one unique provider is active, the highest-priority model is used
     for exactly three independent explorer instances. With multiple providers,
-    the highest-priority lane for each provider is round-robin scheduled for
-    the requested explorer count.
+    every configured lane identity is round-robin scheduled in list order so
+    distinct models sharing one provider remain distinct explorers.
     """
     if not active_records:
         return [], "no_active_provider"
@@ -839,7 +959,8 @@ def build_explorer_schedule(active_records: list[dict[str, Any]], count: int = 3
         return [provider_lanes[0]] * SINGLE_PROVIDER_MOE_REPLICAS, "single_provider_moe"
 
     effective = normalize_count(count)
-    return [provider_lanes[index % len(provider_lanes)] for index in range(effective)], "heterogeneous"
+    ordered_lanes = sorted(active_records, key=lambda item: item["index"])
+    return [ordered_lanes[index % len(ordered_lanes)] for index in range(effective)], "heterogeneous"
 
 
 def _configure_ephemeral_child(fork: Any) -> Any:
@@ -852,16 +973,84 @@ def _configure_ephemeral_child(fork: Any) -> Any:
     return fork
 
 
+def _lock_down_bestplan_child(
+    fork: Any,
+    *,
+    workspace: str,
+    tools_enabled: bool,
+) -> Any:
+    """Pin one child to its request and erase ambient mutable authority."""
+    canonical_workspace = str(Path(workspace).expanduser().resolve(strict=True))
+    fork.session_cwd = canonical_workspace
+    fork._bestplan_workspace = canonical_workspace
+    fork._bestplan_task_id = f"bestplan-{uuid.uuid4().hex}"
+    fork._bestplan_read_only = True
+    fork._kanban_worker_guidance = ""
+    if not tools_enabled:
+        fork.tools = []
+        fork.valid_tool_names = set()
+        return _configure_ephemeral_child(fork)
+
+    # Use only the checked-in static leaves of these two read-only bundles.
+    # Plugin/registry overlays are deliberately excluded: a local extension
+    # must not widen a host-owned planning child's authority.
+    from toolsets import resolve_toolset
+
+    allowed_names: set[str] = set()
+    for toolset in sorted(ALLOWED_TOOLS):
+        allowed_names.update(resolve_toolset(toolset, include_registry=False))
+    schemas = list(getattr(fork, "tools", None) or [])
+    fork.tools = [
+        schema
+        for schema in schemas
+        if isinstance(schema, dict)
+        and isinstance(schema.get("function"), dict)
+        and schema["function"].get("name") in allowed_names
+    ]
+    fork.valid_tool_names = {
+        schema["function"]["name"] for schema in fork.tools
+    }
+    fork.enabled_toolsets = ["read_only_files", "web"]
+    return _configure_ephemeral_child(fork)
+
+
 def _build_child_agent(
     parent: Any,
     lane: dict[str, Any],
     runtime: dict[str, Any],
 ) -> Any:
+    if str(runtime.get("api_mode") or "").strip().lower() == "claude_code":
+        from agent.claude_code_plan import ClaudeCodePlanChild
+
+        workspace = str(runtime.get("_bestplan_workspace") or "").strip()
+        if not workspace:
+            raise BestPlanRuntimeInvalid(
+                "BestPlan Claude Code runtime has no request workspace"
+            )
+        child = ClaudeCodePlanChild(
+            executable=str(runtime.get("executable") or ""),
+            model=str(runtime.get("model") or lane["model"]),
+            reasoning_effort=str(lane.get("reasoning_effort") or ""),
+            workspace=workspace,
+            tools_enabled=True,
+        )
+        return _lock_down_bestplan_child(
+            child,
+            workspace=workspace,
+            tools_enabled=True,
+        )
     from run_agent import AIAgent
     import model_tools
+    from agent.delegation_context import bestplan_child_context
 
     agent_class = cast(Any, AIAgent)
-    with model_tools.preserve_last_resolved_tool_names():
+    workspace = str(runtime.get("_bestplan_workspace") or "").strip()
+    if not workspace:
+        raise BestPlanRuntimeInvalid("BestPlan runtime has no request workspace")
+    with (
+        bestplan_child_context(),
+        model_tools.preserve_last_resolved_tool_names(),
+    ):
         fork: Any = agent_class(
             model=runtime.get("model") or lane["model"],
             provider=runtime["provider"],
@@ -876,7 +1065,11 @@ def _build_child_agent(
             skip_context_files=True,
             parent_session_id=getattr(parent, "session_id", None),
         )
-    return _configure_ephemeral_child(fork)
+    return _lock_down_bestplan_child(
+        fork,
+        workspace=workspace,
+        tools_enabled=True,
+    )
 
 
 def _build_repair_agent(
@@ -885,15 +1078,43 @@ def _build_repair_agent(
     runtime: dict[str, Any],
 ) -> Any:
     """Build the one representation-only repair child with no tools."""
+    if str(runtime.get("api_mode") or "").strip().lower() == "claude_code":
+        from agent.claude_code_plan import ClaudeCodePlanChild
+
+        workspace = str(runtime.get("_bestplan_workspace") or "").strip()
+        if not workspace:
+            raise BestPlanRuntimeInvalid(
+                "BestPlan Claude Code runtime has no request workspace"
+            )
+        child = ClaudeCodePlanChild(
+            executable=str(runtime.get("executable") or ""),
+            model=str(runtime.get("model") or lane["model"]),
+            reasoning_effort=str(lane.get("reasoning_effort") or ""),
+            workspace=workspace,
+            tools_enabled=False,
+        )
+        return _lock_down_bestplan_child(
+            child,
+            workspace=workspace,
+            tools_enabled=False,
+        )
+
     from run_agent import AIAgent
     import model_tools
+    from agent.delegation_context import bestplan_child_context
 
     agent_class = cast(Any, AIAgent)
     if str(runtime.get("api_mode") or "").strip() == "codex_app_server":
         raise BestPlanUnavailable(
             "BestPlan synthesis repair cannot disable Codex native tools"
         )
-    with model_tools.preserve_last_resolved_tool_names():
+    workspace = str(runtime.get("_bestplan_workspace") or "").strip()
+    if not workspace:
+        raise BestPlanRuntimeInvalid("BestPlan runtime has no request workspace")
+    with (
+        bestplan_child_context(),
+        model_tools.preserve_last_resolved_tool_names(),
+    ):
         fork: Any = agent_class(
             model=runtime.get("model") or lane["model"],
             provider=runtime["provider"],
@@ -908,18 +1129,28 @@ def _build_repair_agent(
             skip_context_files=True,
             parent_session_id=getattr(parent, "session_id", None),
         )
-    _configure_ephemeral_child(fork)
-    # Some worker contexts augment even an explicitly empty toolset. Repair is
-    # stricter: it may change representation only, so erase effective schemas
-    # and their prompt guidance after construction as well.
-    fork.tools = []
-    fork.valid_tool_names = set()
-    fork._kanban_worker_guidance = ""
-    return fork
+    return _lock_down_bestplan_child(
+        fork,
+        workspace=workspace,
+        tools_enabled=False,
+    )
 
 
 def _run_child_agent(fork: Any, prompt: str) -> str:
-    result = fork.run_conversation(prompt)
+    run_conversation = fork.run_conversation
+    task_id = str(getattr(fork, "_bestplan_task_id", "") or "")
+    try:
+        signature = inspect.signature(run_conversation)
+        accepts_task_id = "task_id" in signature.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    except (TypeError, ValueError):
+        accepts_task_id = False
+    if task_id and accepts_task_id:
+        result = run_conversation(prompt, task_id=task_id)
+    else:
+        result = run_conversation(prompt)
     return str(result.get("final_response") or "")
 
 
@@ -1021,7 +1252,33 @@ class _ManagedChildRun:
         try:
             if cancelled_before_start:
                 raise RuntimeError("BestPlan child cancelled before dispatch")
-            return _run_child_agent(self.child, prompt)
+            from agent.delegation_context import bestplan_child_context
+            from agent.runtime_cwd import bind_session_cwd
+            from tools.terminal_tool import (
+                clear_task_env_overrides,
+                register_task_env_overrides,
+            )
+
+            workspace = str(
+                getattr(self.child, "_bestplan_workspace", "") or ""
+            ).strip()
+            task_id = str(
+                getattr(self.child, "_bestplan_task_id", "") or ""
+            ).strip()
+            if not workspace or not task_id:
+                raise RuntimeError("BestPlan child execution scope is incomplete")
+            child_session_id = str(
+                getattr(self.child, "session_id", "") or ""
+            ).strip()
+            register_task_env_overrides(task_id, {"cwd": workspace})
+            try:
+                with (
+                    bind_session_cwd(workspace),
+                    bestplan_child_context(child_session_id or None),
+                ):
+                    return _run_child_agent(self.child, prompt)
+            finally:
+                clear_task_env_overrides(task_id)
         finally:
             # The lifecycle lock pairs with request_stop(). If an interrupt
             # won the race after turn finalization, clear it here before this
@@ -1215,7 +1472,7 @@ def run_bestplan(
     agent: Any,
     task: str,
     *,
-    count: int = 3,
+    count: int = DEFAULT_EXPLORER_COUNT,
     config: dict[str, Any] | None = None,
     conversation_history: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -1231,7 +1488,7 @@ def run_bestplan(
     try:
         requested_count = int(count)
     except (TypeError, ValueError):
-        requested_count = 3
+        requested_count = DEFAULT_EXPLORER_COUNT
     run_id = uuid.uuid4().hex
     started_at = time.monotonic()
     overall_deadline = started_at + float(resolved["overall_timeout"])
@@ -1266,7 +1523,6 @@ def run_bestplan(
     effective = len(schedule)
     quorum = quorum_for(effective)
     planning_task = _bestplan_task_with_context(task, conversation_history)
-    workspace_hint = str(os.environ.get("TERMINAL_CWD") or os.getcwd())
     attempts: list[dict[str, Any]] = []
     for index, record in enumerate(schedule):
         lane = record["lane"]
@@ -1448,10 +1704,92 @@ def run_bestplan(
             payload["warning_reason_code"] = "receipt_persistence_failed"
         return payload
 
+    def cancelled_result(
+        stage: str,
+        *,
+        synthesizer_status: str = "not_started",
+        cleanup_incomplete: bool = False,
+    ) -> dict[str, Any]:
+        return terminal(
+            status="failed",
+            error=f"BestPlan cancelled during {stage}",
+            reason_code="cancelled",
+            synthesizer_status=synthesizer_status,
+            synthesizer_reason_code="cancelled",
+            attempt_reason_code="cancelled",
+            cleanup_incomplete=cleanup_incomplete,
+            extra={"interrupted": True},
+        )
+
+    if _bestplan_cancel_requested(agent):
+        return cancelled_result("startup")
+
+    try:
+        from agent.runtime_cwd import (
+            get_session_cwd_override,
+            resolve_agent_cwd,
+            session_cwd_uses_non_host_namespace,
+        )
+
+        if session_cwd_uses_non_host_namespace():
+            raise BestPlanRuntimeInvalid(
+                "BestPlan requires a workspace in the host filesystem"
+            )
+        request_override = get_session_cwd_override()
+        if request_override is not None and not Path(request_override).expanduser().is_dir():
+            raise BestPlanRuntimeInvalid("BestPlan request workspace is unavailable")
+        workspace_path = resolve_agent_cwd().expanduser()
+        if not workspace_path.is_dir():
+            raise BestPlanRuntimeInvalid("BestPlan request workspace is unavailable")
+        workspace_hint = str(workspace_path.resolve(strict=True))
+    except Exception:
+        return terminal(
+            status="failed",
+            error="BestPlan request workspace invalid",
+            reason_code="runtime_invalid",
+        )
+
+    def resolve_lane_runtime(lane: dict[str, Any]) -> dict[str, Any]:
+        """Resolve one lane without letting preflight exceed the run deadline."""
+        if _bestplan_cancel_requested(agent):
+            raise _BestPlanCancelled("BestPlan cancelled during runtime preflight")
+        remaining = overall_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("BestPlan overall deadline reached during preflight")
+        lane_api_mode = str(lane.get("api_mode") or "").strip().lower()
+        if lane_api_mode in {"claude_code", "codex_app_server"}:
+            runtime = _resolve_lane_credentials(
+                agent,
+                lane,
+                auth_timeout=(
+                    min(15.0, max(0.001, remaining))
+                    if lane_api_mode == "claude_code"
+                    else max(0.001, remaining)
+                ),
+                cancel_requested=lambda: _bestplan_cancel_requested(agent),
+            )
+        else:
+            runtime = _resolve_lane_credentials(agent, lane)
+        if _bestplan_cancel_requested(agent):
+            raise _BestPlanCancelled("BestPlan cancelled during runtime preflight")
+        if time.monotonic() >= overall_deadline:
+            raise TimeoutError("BestPlan overall deadline reached during preflight")
+        resolved_runtime = dict(runtime)
+        resolved_runtime["_bestplan_workspace"] = workspace_hint
+        return resolved_runtime
+
     # Resolve and construct the named synthesizer first. Explorers do not run
     # when the only authorized synthesis runtime cannot be used.
     try:
-        synth_runtime = _resolve_lane_credentials(agent, synth_lane)
+        synth_runtime = resolve_lane_runtime(synth_lane)
+    except _BestPlanCancelled:
+        return cancelled_result("runtime preflight")
+    except TimeoutError:
+        return terminal(
+            status="failed",
+            error="BestPlan overall timeout during runtime preflight",
+            reason_code="overall_timeout",
+        )
     except BestPlanRuntimeInvalid:
         return terminal(
             status="failed",
@@ -1459,6 +1797,12 @@ def run_bestplan(
             reason_code="runtime_invalid",
         )
     except Exception:
+        if time.monotonic() >= overall_deadline:
+            return terminal(
+                status="failed",
+                error="BestPlan overall timeout during runtime preflight",
+                reason_code="overall_timeout",
+            )
         return terminal(
             status="failed",
             error="BestPlan synthesizer credentials unavailable",
@@ -1480,6 +1824,8 @@ def run_bestplan(
             reason_code="runtime_invalid",
             cleanup_incomplete=True,
         )
+    if _bestplan_cancel_requested(agent):
+        return cancelled_result("synthesizer preflight")
 
     runtimes: dict[str, dict[str, Any]] = {synth_name: synth_runtime}
     resolution_errors: dict[str, str] = {}
@@ -1489,10 +1835,24 @@ def run_bestplan(
             continue
         lane = next(entry for entry in explorers if entry["name"] == name)
         try:
-            runtimes[name] = _resolve_lane_credentials(agent, lane)
+            runtimes[name] = resolve_lane_runtime(lane)
+        except _BestPlanCancelled:
+            return cancelled_result("runtime preflight")
+        except TimeoutError:
+            return terminal(
+                status="failed",
+                error="BestPlan overall timeout during runtime preflight",
+                reason_code="overall_timeout",
+            )
         except BestPlanRuntimeInvalid:
             resolution_errors[name] = "runtime_invalid"
         except Exception:
+            if time.monotonic() >= overall_deadline:
+                return terminal(
+                    status="failed",
+                    error="BestPlan overall timeout during runtime preflight",
+                    reason_code="overall_timeout",
+                )
             resolution_errors[name] = "credential_unavailable"
 
     for attempt in attempts:
@@ -1592,18 +1952,22 @@ def run_bestplan(
     )
     overall_limited_explorers = explorer_deadline == overall_deadline
     explorer_cleanup_complete = True
+    explorer_cancelled = False
     try:
         while pending:
+            if _bestplan_cancel_requested(agent):
+                explorer_cancelled = True
+                break
             remaining = explorer_deadline - time.monotonic()
             if remaining <= 0:
                 break
             done, pending = wait(
                 pending,
-                timeout=remaining,
+                timeout=min(0.1, remaining),
                 return_when=FIRST_COMPLETED,
             )
             if not done:
-                break
+                continue
             for future in done:
                 _run, attempt_index = future_to_job[future]
                 attempt = attempts[attempt_index]
@@ -1626,8 +1990,12 @@ def run_bestplan(
                     attempt["status"] = "success"
         for future in pending:
             _run, attempt_index = future_to_job[future]
-            attempts[attempt_index]["status"] = "timeout"
-            attempts[attempt_index]["reason_code"] = "timeout"
+            attempts[attempt_index]["status"] = (
+                "failed" if explorer_cancelled else "timeout"
+            )
+            attempts[attempt_index]["reason_code"] = (
+                "cancelled" if explorer_cancelled else "timeout"
+            )
             future.cancel()
     finally:
         explorer_cleanup_complete = _stop_child_runs(
@@ -1642,6 +2010,8 @@ def run_bestplan(
             reason_code="provider_error",
             cleanup_incomplete=True,
         )
+    if explorer_cancelled or _bestplan_cancel_requested(agent):
+        return cancelled_result("explorers")
     if pending and overall_limited_explorers:
         return terminal(
             status="failed",
@@ -1665,6 +2035,8 @@ def run_bestplan(
             error="BestPlan overall timeout before synthesizer",
             reason_code="overall_timeout",
         )
+    if _bestplan_cancel_requested(agent):
+        return cancelled_result("before synthesizer")
 
     packet = json.dumps(successes, sort_keys=True)
     synth_prompt = (
@@ -1706,9 +2078,14 @@ def run_bestplan(
     candidate_body = ""
     synth_error: Exception | None = None
     try:
-        candidate_body = synth_future.result(
-            timeout=max(0.0, synth_deadline - time.monotonic())
+        candidate_body = _future_result_until(
+            synth_future,
+            deadline=synth_deadline,
+            cancel_requested=lambda: _bestplan_cancel_requested(agent),
         )
+    except _BestPlanCancelled as exc:
+        synth_error = exc
+        synth_future.cancel()
     except TimeoutError as exc:
         synth_error = exc
         synth_future.cancel()
@@ -1728,6 +2105,11 @@ def run_bestplan(
             cleanup_incomplete=True,
         )
     if synth_error is not None:
+        if isinstance(synth_error, _BestPlanCancelled):
+            return cancelled_result(
+                "synthesizer",
+                synthesizer_status="failed",
+            )
         if isinstance(synth_error, TimeoutError):
             timed_out_overall = synth_deadline == overall_deadline
             return terminal(
@@ -1751,6 +2133,11 @@ def run_bestplan(
             reason_code="synthesizer_failed",
             synthesizer_status="failed",
             synthesizer_reason_code="provider_error",
+        )
+    if _bestplan_cancel_requested(agent):
+        return cancelled_result(
+            "synthesizer completion",
+            synthesizer_status="failed",
         )
     if not candidate_body.strip():
         return terminal(
@@ -1804,9 +2191,14 @@ def run_bestplan(
                 repaired_body = ""
                 repair_error: Exception | None = None
                 try:
-                    repaired_body = repair_future.result(
-                        timeout=max(0.0, repair_deadline - time.monotonic())
+                    repaired_body = _future_result_until(
+                        repair_future,
+                        deadline=repair_deadline,
+                        cancel_requested=lambda: _bestplan_cancel_requested(agent),
                     )
+                except _BestPlanCancelled as exc:
+                    repair_error = exc
+                    repair_future.cancel()
                 except TimeoutError as exc:
                     repair_error = exc
                     repair_future.cancel()
@@ -1827,6 +2219,11 @@ def run_bestplan(
                 if repair_error is None:
                     body = _validated_plan_envelope(
                         repaired_body, workspace=workspace_hint
+                    )
+                elif isinstance(repair_error, _BestPlanCancelled):
+                    return cancelled_result(
+                        "synthesis repair",
+                        synthesizer_status="failed",
                     )
                 elif isinstance(repair_error, TimeoutError):
                     return terminal(
@@ -1853,6 +2250,11 @@ def run_bestplan(
                 synthesizer_reason_code="candidate_invalid",
             )
 
+    if _bestplan_cancel_requested(agent):
+        return cancelled_result(
+            "completion",
+            synthesizer_status="failed",
+        )
     return terminal(
         status="completed",
         reason_code=None,
@@ -1863,7 +2265,7 @@ def run_bestplan(
 
 __all__ = [
     "ALLOWED_TOOLS", "BestPlanRuntimeInvalid", "BestPlanUnavailable", "DEFAULT_RUNTIME", "ExplorerResult",
-    "RECEIPT_BEGIN", "RECEIPT_END", "TURN_MARKER", "append_receipt", "body_sha256", "make_receipt",
+    "DEFAULT_EXPLORER_COUNT", "RECEIPT_BEGIN", "RECEIPT_END", "TURN_MARKER", "append_receipt", "body_sha256", "decode_bestplan_turn", "make_receipt",
     "normalize_count", "quorum_for", "reconcile_bestplan_receipts", "run_bestplan",
     "build_explorer_schedule", "SINGLE_PROVIDER_MOE_REPLICAS",
     "validate_candidate", "validate_receipt", "validate_runtime",

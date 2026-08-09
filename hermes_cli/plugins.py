@@ -2870,6 +2870,8 @@ def authorize_required_tool_policies(
     execution. System-facing failure messages never include loaded-plugin
     error detail — those details stay out of the LLM prompt.
     """
+    if _bestplan_extensions_suppressed():
+        return None
     try:
         required_policies = _get_required_policies_for_module()
         required_policy_items = _normalize_required_policy_capture(
@@ -3099,12 +3101,22 @@ def discover_plugins(force: bool = False) -> None:
     get_plugin_manager().discover_and_load(force=force)
 
 
+def _bestplan_extensions_suppressed() -> bool:
+    """Return the task-local BestPlan extension-containment state."""
+    try:
+        from agent.delegation_context import is_bestplan_child_context
+
+        return is_bestplan_child_context()
+    except Exception:
+        return False
+
+
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Invoke a lifecycle hook on all loaded plugins.
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    if env_var_enabled("HERMES_SAFE_MODE"):
+    if _bestplan_extensions_suppressed() or env_var_enabled("HERMES_SAFE_MODE"):
         return []
     kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
     # Ordinary force-discovery transfers ownership from the recovered overlay
@@ -3152,11 +3164,15 @@ def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from middleware callbacks.
     """
+    if _bestplan_extensions_suppressed():
+        return []
     return get_plugin_manager().invoke_middleware(kind, **kwargs)
 
 
 def has_middleware(kind: str) -> bool:
     """Return True when middleware callbacks are registered for ``kind``."""
+    if _bestplan_extensions_suppressed():
+        return False
     manager = get_plugin_manager()
     method = getattr(manager, "has_middleware", None)
     if callable(method):
@@ -3166,7 +3182,7 @@ def has_middleware(kind: str) -> bool:
 
 def has_hook(hook_name: str) -> bool:
     """Return True when a hook has registered callbacks."""
-    if env_var_enabled("HERMES_SAFE_MODE"):
+    if _bestplan_extensions_suppressed() or env_var_enabled("HERMES_SAFE_MODE"):
         return False
     with _required_policy_recovery_lock:
         manager = get_plugin_manager()

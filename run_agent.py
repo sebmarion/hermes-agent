@@ -1943,7 +1943,13 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
-    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _persist_session(
+        self,
+        messages: List[Dict],
+        conversation_history: List[Dict] = None,
+        *,
+        rewrite: bool = False,
+    ) -> bool:
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
@@ -1972,7 +1978,63 @@ class AIAgent:
                     "session token-accounting flush failed during persist",
                     exc_info=True,
                 )
-        self._flush_messages_to_session_db(messages, conversation_history)
+        if rewrite:
+            return self._rewrite_messages_to_session_db(messages)
+        return self._flush_messages_to_session_db(messages, conversation_history) is True
+
+    def _rewrite_messages_to_session_db(self, messages: List[Dict]) -> bool:
+        """Atomically replace the active transcript and acknowledge durability.
+
+        Host-owned post-processing can legitimately replace content that the
+        normal turn flush has already stamped ``_db_persisted`` (for example,
+        replacing a model-produced BestPlan envelope with its executable host
+        receipt).  The append-only flush must honor that marker for ordinary
+        turns, so these rare rewrites use SessionDB's existing transactional
+        replacement path instead.  Archived rows remain untouched.
+
+        Returns ``True`` only after SQLite commits the exact active snapshot.
+        Callers that gate external authority on persistence must require that
+        explicit acknowledgement; every failure leaves the old transcript
+        intact and returns ``False``.
+        """
+        lock = getattr(self, "_session_persist_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._session_persist_lock = lock
+        with lock:
+            if getattr(self, "_persist_disabled", False) or not self._session_db:
+                return False
+            try:
+                if not self._session_db_created:
+                    self._ensure_db_session()
+                if not self._session_db_created:
+                    return False
+                durable_messages = [
+                    dict(message)
+                    for message in messages
+                    if isinstance(message, dict)
+                    and not _is_ephemeral_scaffolding(message)
+                ]
+                self._session_db.replace_messages(
+                    self.session_id,
+                    durable_messages,
+                    active_only=True,
+                )
+                for message in messages:
+                    if (
+                        isinstance(message, dict)
+                        and not _is_ephemeral_scaffolding(message)
+                    ):
+                        message[_DB_PERSISTED_MARKER] = True
+                self._flushed_db_message_ids = set()
+                self._flushed_db_message_session_id = self.session_id
+                self._last_flushed_db_idx = len(messages)
+                self._db_flush_scan_prefix = messages[:]
+                return True
+            except Exception as exc:
+                self._db_flush_scan_prefix = None
+                logger.warning("Session DB transcript rewrite failed: %s", exc)
+                return False
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -2309,6 +2371,7 @@ class AIAgent:
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
             logger.warning("Session DB append_message failed: %s", e)
+            return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -3714,7 +3777,12 @@ class AIAgent:
         self._last_activity_ts = time.time()
         self._last_activity_desc = bound_activity_description(desc)
         self._last_activity_provenance = normalize_activity_provenance(provenance)
-        if os.environ.get("HERMES_KANBAN_TASK"):
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and is_dispatcher_owned_worker_context()
+        ):
             try:
                 from tools.kanban_tools import (
                     heartbeat_current_worker_from_env,

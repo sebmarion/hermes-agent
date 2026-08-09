@@ -1115,19 +1115,6 @@ def _run_conversation(
     """
     _synchronize_context_engine_identity(agent)
 
-    if bestplan_config is None and isinstance(user_message, str):
-        from agent.bestplan_orchestrator import TURN_MARKER
-        if user_message.startswith(TURN_MARKER):
-            marker_end = user_message.find("\x00", len(TURN_MARKER))
-            if marker_end > len(TURN_MARKER):
-                try:
-                    bestplan_config = json.loads(user_message[len(TURN_MARKER):marker_end])
-                    user_message = user_message[marker_end + 1 :].lstrip()
-                    if persist_user_message is None:
-                        persist_user_message = user_message
-                except json.JSONDecodeError:
-                    bestplan_config = {"enabled": False}
-
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -1196,8 +1183,10 @@ def _run_conversation(
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Host-owned BestPlan is a one-shot branch after canonical turn setup and
-    # before ordinary app-server/MoA/model execution. The parent model and
-    # toolset are never mutated; only the synthesized response is finalized.
+    # before ordinary app-server/MoA/model execution. Only an explicit host
+    # argument may enter this branch; user text is never promoted into trusted
+    # configuration by marker-shaped syntax. The parent model and toolset are
+    # never mutated; only the synthesized response is finalized.
     if bestplan_config is not None:
         from agent.bestplan_orchestrator import run_bestplan
         bestplan_kwargs = dict(bestplan_config)
@@ -1211,13 +1200,16 @@ def _run_conversation(
             "run_id": outcome.get("run_id"),
             "body_sha256": outcome.get("body") and __import__("hashlib").sha256(outcome["body"].encode()).hexdigest(),
         }
+        bestplan_interrupted = outcome.get("interrupted") is True
         from agent.turn_finalizer import finalize_turn
         return finalize_turn(
             agent,
             final_response=response,
             api_call_count=0,
-            interrupted=False,
-            failed=outcome.get("status") != "completed",
+            interrupted=bestplan_interrupted,
+            failed=(
+                outcome.get("status") != "completed" and not bestplan_interrupted
+            ),
             messages=messages,
             conversation_history=conversation_history,
             effective_task_id=effective_task_id,

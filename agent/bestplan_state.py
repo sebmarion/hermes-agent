@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 BESTPLAN_ENVELOPE_START = "<<<HERMES_BESTPLAN_V1>>>"
 BESTPLAN_ENVELOPE_END = "<<<END_HERMES_BESTPLAN_V1>>>"
-BESTPLAN_HOST_CAPABILITY_VERSION = 1
+BESTPLAN_HOST_CAPABILITY_VERSION = 2
 _ENVELOPE_RE = re.compile(
     re.escape(BESTPLAN_ENVELOPE_START)
     + r"\s*(?P<payload>\{.*?\})\s*"
@@ -41,6 +41,7 @@ _ENVELOPE_BLOCK_RE = re.compile(
 
 
 class PlanState:
+    PROVISIONAL = "provisional"
     PENDING = "pending"
     APPROVED = "approved"
     RUNNING = "running"
@@ -698,6 +699,7 @@ class BestplanStore:
         profile: Optional[str] = None,
         baseline_fingerprint: Optional[str] = None,
         raw_envelope: Optional[str] = None,
+        provisional: bool = False,
     ) -> str:
         workspace = _canonical_workspace(workspace)
         manifest = plan.to_manifest()
@@ -728,7 +730,9 @@ class BestplanStore:
                     plan_id, time.time(), str(session_id),
                     str(_active_profile() if profile is None else profile), workspace,
                     baseline_fingerprint or compute_baseline_fingerprint(workspace),
-                    str(raw_request or ""), raw, manifest_json, PlanState.PENDING, digest,
+                    str(raw_request or ""), raw, manifest_json,
+                    PlanState.PROVISIONAL if provisional else PlanState.PENDING,
+                    digest,
                 ),
             )
 
@@ -775,8 +779,20 @@ class BestplanStore:
 
     def reject_plan(self, plan_id: str) -> bool:
         return bool(self._execute_write(lambda conn: conn.execute(
+            "UPDATE bestplan_plans SET state=? WHERE plan_id=? AND state IN (?, ?)",
+            (
+                PlanState.REJECTED,
+                plan_id,
+                PlanState.PENDING,
+                PlanState.PROVISIONAL,
+            ),
+        ).rowcount))
+
+    def commit_provisional_plan(self, plan_id: str) -> bool:
+        """Expose one captured plan only after its transcript is durable."""
+        return bool(self._execute_write(lambda conn: conn.execute(
             "UPDATE bestplan_plans SET state=? WHERE plan_id=? AND state=?",
-            (PlanState.REJECTED, plan_id, PlanState.PENDING),
+            (PlanState.PENDING, plan_id, PlanState.PROVISIONAL),
         ).rowcount))
 
     def list_approved_matching(
@@ -1033,6 +1049,7 @@ def capture_bestplan_response(
     profile: str = "",
     baseline_fingerprint: Optional[str] = None,
     store: Optional[BestplanStore] = None,
+    provisional: bool = False,
 ) -> PlanCapture:
     """Validate and persist the explicit envelope in a /bestplan response."""
     try:
@@ -1051,6 +1068,7 @@ def capture_bestplan_response(
         plan_id = store.create_plan(
             "", plan, session_id=session_id, profile=profile, workspace=workspace,
             baseline_fingerprint=baseline_fingerprint, raw_envelope=raw_envelope,
+            provisional=provisional,
         )
     except BaselineFingerprintError as exc:
         visible = _strip_bestplan_envelope(response)
@@ -1071,13 +1089,33 @@ def capture_bestplan_response(
     return PlanCapture(True, "\n\n".join(parts), plan_id=plan_id, digest=digest)
 
 
-def is_bestplan_invocation(message: Any) -> bool:
-    """Recognize the raw or dynamic-skill-expanded /bestplan planning turn."""
+def is_executable_bestplan_invocation(message: Any) -> bool:
+    """Recognize only host-owned forms allowed to mint executable plans."""
     if not isinstance(message, str):
         return False
+
+    # The canonical CLI queues BestPlan through the conversation loop with a
+    # NUL-delimited host marker.  Preserve that identity for result capture,
+    # but only for the exact marker shape the producer emits; malformed or
+    # user-spoofed marker-like text must not gain BestPlan semantics.
+    from agent.bestplan_orchestrator import TURN_MARKER, decode_bestplan_turn
+
+    if message.startswith(TURN_MARKER):
+        _task, marker_config, marker_error = decode_bestplan_turn(message)
+        return marker_config is not None and marker_error is None
+
     stripped = message.lstrip()
-    if re.match(r"^/bestplan(?:\s|$)", stripped, re.IGNORECASE):
+    return bool(re.match(r"^/bestplan(?:\s|$)", stripped, re.IGNORECASE))
+
+
+def is_bestplan_invocation(message: Any) -> bool:
+    """Recognize raw, host-marked, or legacy expanded BestPlan turns."""
+    if is_executable_bestplan_invocation(message):
         return True
+    if not isinstance(message, str):
+        return False
+
+    stripped = message.lstrip()
     prefix = stripped[:500].casefold()
     return (
         prefix.startswith("[important: the user has invoked the ")
@@ -1203,7 +1241,7 @@ def bind_bestplan_delivery_context(
         async_delivery=True,
         profile=profile,
         hermes_home=str(home),
-        capability_version=1,
+        capability_version=BESTPLAN_HOST_CAPABILITY_VERSION,
     )
     try:
         yield
@@ -1222,9 +1260,10 @@ def capture_bestplan_agent_result(
     baseline_fingerprint: Optional[str] = None,
     store: Optional[BestplanStore] = None,
     host_agent: Any = None,
+    provisional: bool = False,
 ) -> dict[str, Any]:
     """Attach the host-validated executable receipt to a planning result."""
-    if not is_bestplan_invocation(invocation_message) or not isinstance(result, dict):
+    if not is_executable_bestplan_invocation(invocation_message) or not isinstance(result, dict):
         return result
     capture = capture_bestplan_response(
         str(result.get("final_response") or ""),
@@ -1233,6 +1272,7 @@ def capture_bestplan_agent_result(
         workspace=workspace,
         baseline_fingerprint=baseline_fingerprint,
         store=store,
+        provisional=provisional,
     )
     updated = dict(result)
     updated["final_response"] = capture.response
@@ -1242,6 +1282,13 @@ def capture_bestplan_agent_result(
         if isinstance(item, dict) and item.get("role") == "assistant":
             replacement = dict(item)
             replacement["content"] = capture.response
+            if item.get("content") != capture.response:
+                # This is a host-owned replacement of a model response, not a
+                # new assistant turn.  Do not retain either the append-flush
+                # durability marker or a provider-wire sidecar whose bytes
+                # describe the superseded response.
+                replacement.pop("_db_persisted", None)
+                replacement.pop("api_content", None)
             messages[index] = replacement
             break
     updated["messages"] = messages
@@ -1256,7 +1303,12 @@ def capture_bestplan_agent_result(
 
         repair_message_sequence(host_agent, messages)
         if callable(getattr(host_agent, "_persist_session", None)):
-            host_agent._persist_session(messages, None)
+            persisted = host_agent._persist_session(
+                messages,
+                None,
+                rewrite=True,
+            )
+            updated["bestplan_capture"]["receipt_persisted"] = persisted is True
     return updated
 
 

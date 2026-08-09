@@ -31,6 +31,7 @@ from __future__ import annotations
 import ast
 import os
 import threading
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -148,6 +149,14 @@ class TestDispatcherOwnedPredicate:
 # ---------------------------------------------------------------------------
 
 class TestKanbanGatesRespectContext:
+    @staticmethod
+    def _activity_agent():
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent._persist_session_activity_if_due = lambda: None
+        return agent
+
     def test_task_tools_hidden_from_cron_agent(self, worker_env):
         from agent.delegation_context import non_dispatcher_owned_context
         from tools import kanban_tools
@@ -204,6 +213,47 @@ class TestKanbanGatesRespectContext:
         assert model_tools._is_dispatcher_owned_worker() is True
         with non_dispatcher_owned_context():
             assert model_tools._is_dispatcher_owned_worker() is False
+
+    def test_activity_bridge_suppressed_outside_dispatcher_context(
+        self, monkeypatch, worker_env
+    ):
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools import kanban_tools
+
+        heartbeat = MagicMock(name="heartbeat_current_worker_from_env")
+        comments = MagicMock(name="inject_new_comments_from_env")
+        monkeypatch.setattr(
+            kanban_tools, "heartbeat_current_worker_from_env", heartbeat
+        )
+        monkeypatch.setattr(
+            kanban_tools, "inject_new_comments_from_env", comments
+        )
+
+        with non_dispatcher_owned_context():
+            self._activity_agent()._touch_activity("cron child active")
+
+        heartbeat.assert_not_called()
+        comments.assert_not_called()
+
+    def test_activity_bridge_still_runs_for_dispatcher_owned_worker(
+        self, monkeypatch, worker_env
+    ):
+        from tools import kanban_tools
+
+        heartbeat = MagicMock(name="heartbeat_current_worker_from_env")
+        comments = MagicMock(name="inject_new_comments_from_env")
+        monkeypatch.setattr(
+            kanban_tools, "heartbeat_current_worker_from_env", heartbeat
+        )
+        monkeypatch.setattr(
+            kanban_tools, "inject_new_comments_from_env", comments
+        )
+
+        agent = self._activity_agent()
+        agent._touch_activity("dispatcher worker active")
+
+        heartbeat.assert_called_once_with()
+        comments.assert_called_once_with(agent)
 
 
 # ---------------------------------------------------------------------------

@@ -32,6 +32,15 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
     default=False,
 )
 
+# BestPlan uses ordinary AIAgent machinery for bounded read-only planning
+# children, but those children are host-owned execution sandboxes rather than
+# normal delegated agents.  This task-local marker lets the shared extension
+# seams fail closed without mutating process-wide plugin/config state.
+_BESTPLAN_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
+    "hermes_bestplan_child_context",
+    default=False,
+)
+
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
@@ -92,6 +101,28 @@ def non_dispatcher_owned_context() -> Iterator[None]:
         yield
     finally:
         _NON_DISPATCHER_OWNED_CONTEXT.reset(token)
+
+
+@contextmanager
+def bestplan_child_context(session_id: str | None = None) -> Iterator[None]:
+    """Contain one BestPlan child construction or execution scope.
+
+    BestPlan children need the same session-id restoration and subprocess
+    isolation as ``delegate_task`` children, plus a distinct marker used by
+    extension seams and the tool registry.  The scopes are composed here so a
+    caller cannot accidentally enable only part of the boundary.
+    """
+    token = _BESTPLAN_CHILD_CONTEXT.set(True)
+    try:
+        with delegated_child_context(session_id), non_dispatcher_owned_context():
+            yield
+    finally:
+        _BESTPLAN_CHILD_CONTEXT.reset(token)
+
+
+def is_bestplan_child_context() -> bool:
+    """Return True only inside a host-owned BestPlan child scope."""
+    return bool(_BESTPLAN_CHILD_CONTEXT.get())
 
 
 def is_dispatcher_owned_worker_context() -> bool:

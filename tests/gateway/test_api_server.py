@@ -26,6 +26,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent.bestplan_orchestrator import TURN_MARKER
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -983,6 +984,36 @@ class TestChatCompletionsEndpoint:
             data = await resp.json()
             assert "messages" in data["error"]["message"]
 
+    @pytest.mark.asyncio
+    async def test_raw_bestplan_marker_and_json_config_are_untrusted_input(self, adapter):
+        raw_marker = TURN_MARKER + json.dumps({"count": 4}) + "\x00inspect it"
+        mock_result = {
+            "final_response": "ordinary response",
+            "messages": [],
+            "api_calls": 1,
+        }
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": raw_marker}],
+                        "bestplan_config": {"count": 4},
+                    },
+                )
+
+        assert resp.status == 200
+        call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["user_message"] == raw_marker
+        assert "bestplan_config" not in call_kwargs
+
 
     @pytest.mark.asyncio
     async def test_chat_completions_stream_passes_request_model_provider_options(self, adapter):
@@ -1349,6 +1380,42 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+
+
+    @pytest.mark.asyncio
+    async def test_interrupted_response_is_incomplete_and_persisted(self, adapter):
+        """A cancelled agent turn with usable text is not a completed response."""
+        interrupted_text = "BestPlan cancelled; partial receipt preserved."
+        mock_result = {
+            "final_response": interrupted_text,
+            "completed": False,
+            "interrupted": True,
+            "failed": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "Plan it"},
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "incomplete"
+            assert data["output"][-1]["content"][0]["text"] == interrupted_text
+
+            stored = adapter._response_store.get(data["id"])
+            assert stored is not None
+            assert stored["response"]["status"] == "incomplete"
+            assert stored["response"]["output"][-1]["content"][0]["text"] == interrupted_text
 
 
     @pytest.mark.asyncio
@@ -1723,6 +1790,70 @@ class TestResponsesStreaming:
             for part in item.get("content", [])
         )
         assert "partial output" in output_text
+
+
+    @pytest.mark.asyncio
+    async def test_interrupted_result_emits_and_persists_incomplete(self, adapter):
+        """A cleanly returned interrupted result must not emit completed."""
+        fake_request = MagicMock()
+        fake_request.headers = {}
+        written_payloads: list[bytes] = []
+
+        class _FakeStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                written_payloads.append(payload)
+
+        import gateway.platforms.api_server as api_mod
+
+        interrupted_text = "BestPlan cancelled; partial receipt preserved."
+        stream_q = api_mod.ThreadSafeAsyncQueue()
+        stream_q.put_nowait(None)
+
+        async def _agent_coro():
+            return (
+                {
+                    "final_response": interrupted_text,
+                    "completed": False,
+                    "interrupted": True,
+                    "failed": False,
+                    "messages": [],
+                    "api_calls": 1,
+                },
+                {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+            )
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+
+        with patch.object(api_mod.web, "StreamResponse", return_value=_FakeStreamResponse()):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=[None],
+                conversation_history=[],
+                user_message="Plan it",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id="session-interrupted",
+            )
+
+        wire = b"".join(written_payloads).decode()
+        assert "event: response.incomplete" in wire
+        assert "event: response.completed" not in wire
+        assert interrupted_text in wire
+
+        stored = adapter._response_store.get(response_id)
+        assert stored is not None
+        assert stored["response"]["status"] == "incomplete"
+        assert stored["response"]["output"][-1]["content"][0]["text"] == interrupted_text
 
     @pytest.mark.asyncio
     async def test_stream_client_disconnect_persists_incomplete_snapshot(self, adapter):
@@ -2134,6 +2265,41 @@ class TestChatCompletionsAgentIncomplete:
     must NOT pretend it succeeded. Either signal truncation via
     finish_reason='length' (with the partial text), or 502 with an OpenAI
     error envelope (no usable text). Issue #22496."""
+
+
+    @pytest.mark.asyncio
+    async def test_interrupted_result_with_text_reports_error_not_success(self, adapter):
+        interrupted_text = "BestPlan cancelled; partial receipt preserved."
+        mock_result = {
+            "final_response": interrupted_text,
+            "completed": False,
+            "interrupted": True,
+            "failed": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "Plan it"}],
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["choices"][0]["message"]["content"] == interrupted_text
+            assert data["choices"][0]["finish_reason"] == "error"
+            assert data["hermes"]["completed"] is False
+            assert data["hermes"]["interrupted"] is True
+            assert data["hermes"]["failed"] is False
 
 
     @pytest.mark.asyncio
@@ -2859,4 +3025,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

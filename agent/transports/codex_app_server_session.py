@@ -26,9 +26,12 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
@@ -90,6 +93,19 @@ class TurnResult:
 # items when an interrupt or upstream error tears the turn down before the
 # normal completion path fires. Mirrors openclaw beta.8 fix.
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
+
+_ISOLATED_READ_ONLY_CONFIG = (
+    'sandbox_mode = "read-only"\n'
+    'approval_policy = "never"\n'
+    "\n[analytics]\n"
+    "enabled = false\n"
+)
+_READ_ONLY_CLIENT_ARGS = [
+    "-c",
+    'sandbox_mode="read-only"',
+    "-c",
+    'approval_policy="never"',
+]
 
 
 def _notification_scope_ids(
@@ -277,6 +293,9 @@ class CodexAppServerSession:
         cwd: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        enable_multi_agent: bool = False,
+        client_extra_args: Optional[list[str]] = None,
+        isolated_read_only: bool = False,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -285,7 +304,17 @@ class CodexAppServerSession:
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
+        self._source_codex_home = codex_home
         self._codex_home = codex_home
+        self.multi_agent_enabled = bool(enable_multi_agent)
+        self.isolated_read_only = bool(isolated_read_only)
+        self._isolated_home: Optional[tempfile.TemporaryDirectory[str]] = None
+        self._client_extra_args = list(client_extra_args or [])
+        if self.isolated_read_only:
+            self._client_extra_args = list(_READ_ONLY_CLIENT_ARGS)
+            permission_profile = "read-only"
+            approval_callback = None
+            request_routing = _ServerRequestRouting()
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -319,9 +348,21 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
-            )
+            if self.isolated_read_only:
+                self._codex_home = self._prepare_isolated_codex_home()
+            extra_args: list[str] = []
+            if self.multi_agent_enabled:
+                extra_args.extend(["--enable", "multi_agent"])
+            extra_args.extend(self._client_extra_args)
+            client_kwargs: dict[str, Any] = {
+                "codex_bin": self._codex_bin,
+                "codex_home": self._codex_home,
+            }
+            if extra_args:
+                client_kwargs["extra_args"] = extra_args
+            if self.isolated_read_only:
+                client_kwargs["suppress_kanban_context"] = True
+            self._client = self._client_factory(**client_kwargs)
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",
@@ -378,13 +419,44 @@ class CodexAppServerSession:
         self._closed = True
         with self._active_turn_lock:
             self._active_turn_id = None
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:  # pragma: no cover - best-effort cleanup
-                pass
-            self._client = None
-        self._thread_id = None
+        try:
+            if self._client is not None:
+                try:
+                    self._client.close()
+                except Exception:  # pragma: no cover - best-effort cleanup
+                    pass
+                self._client = None
+            self._thread_id = None
+        finally:
+            if self._isolated_home is not None:
+                self._isolated_home.cleanup()
+                self._isolated_home = None
+
+    def _prepare_isolated_codex_home(self) -> str:
+        """Build a minimal one-session CODEX_HOME with plan auth only."""
+        if self._isolated_home is not None:
+            return self._isolated_home.name
+
+        isolated_home = tempfile.TemporaryDirectory(
+            prefix="hermes-bestplan-codex-"
+        )
+        target = Path(isolated_home.name)
+        source_value = (
+            self._source_codex_home
+            or os.environ.get("CODEX_HOME")
+            or str(Path.home() / ".codex")
+        )
+        source = Path(source_value).expanduser()
+        source_auth = source / "auth.json"
+        if source_auth.is_file():
+            target_auth = target / "auth.json"
+            shutil.copyfile(source_auth, target_auth)
+            target_auth.chmod(0o600)
+        config_path = target / "config.toml"
+        config_path.write_text(_ISOLATED_READ_ONLY_CONFIG, encoding="utf-8")
+        config_path.chmod(0o600)
+        self._isolated_home = isolated_home
+        return isolated_home.name
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -471,6 +543,8 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
@@ -518,13 +592,20 @@ class CodexAppServerSession:
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
+        turn_params: dict[str, Any] = {
+            "threadId": self._thread_id,
+            "input": [{"type": "text", "text": user_input_text}],
+        }
+        normalized_model = str(model or "").strip()
+        normalized_effort = str(effort or "").strip()
+        if normalized_model:
+            turn_params["model"] = normalized_model
+        if normalized_effort:
+            turn_params["effort"] = normalized_effort
         try:
             ts = self._client.request(
                 "turn/start",
-                {
-                    "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
-                },
+                turn_params,
                 timeout=10,
             )
         except CodexAppServerError as exc:

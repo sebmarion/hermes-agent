@@ -713,6 +713,104 @@ class TestSpawnEnvIsolation:
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
 
+    def test_contained_spawn_removes_kanban_identity_and_widening(self, monkeypatch):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                captured["env"] = kwargs.get("env", {}).copy()
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "ambient-task")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/ambient/kanban.db")
+        monkeypatch.setenv("HERMES_KANBAN_ROOT", "/ambient")
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            suppress_kanban_context=True,
+        )
+        client._closed = True
+
+        assert not any(
+            key.startswith("HERMES_KANBAN_") for key in captured["env"]
+        )
+        command = captured["cmd"]
+        assert 'sandbox_mode="workspace-write"' not in command
+        assert not any("writable_roots" in part for part in command)
+
+    @pytest.mark.live_system_guard_bypass
+    def test_posix_close_terminates_app_server_descendants(self, tmp_path):
+        import os
+        import signal
+        import time
+        from agent.transports import codex_app_server as cas
+
+        if os.name != "posix":
+            pytest.skip("POSIX process groups are unavailable")
+
+        heartbeat = tmp_path / "heartbeat"
+        child_pid_file = tmp_path / "child.pid"
+        shim = tmp_path / "codex-with-child"
+        shim.write_text(
+            "#!/bin/sh\n"
+            "trap '' TERM\n"
+            "(\n"
+            "  trap '' TERM\n"
+            "  i=0\n"
+            "  while :; do\n"
+            "    i=$((i + 1))\n"
+            "    printf '%s' \"$i\" > \"$CODEX_HEARTBEAT\"\n"
+            "    sleep 0.05\n"
+            "  done\n"
+            ") &\n"
+            "printf '%s' \"$!\" > \"$CODEX_CHILD_PID\"\n"
+            "while :; do sleep 1; done\n"
+        )
+        shim.chmod(0o755)
+        client = cas.CodexAppServerClient(
+            codex_bin=str(shim),
+            env={
+                "CODEX_HEARTBEAT": str(heartbeat),
+                "CODEX_CHILD_PID": str(child_pid_file),
+            },
+        )
+
+        child_pid = None
+        try:
+            deadline = time.monotonic() + 3.0
+            while (
+                (not heartbeat.exists() or not child_pid_file.exists())
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            assert heartbeat.exists()
+            assert child_pid_file.exists()
+            child_pid = int(child_pid_file.read_text())
+
+            client.close(timeout=0.2)
+            stopped_value = heartbeat.read_text()
+            time.sleep(0.25)
+            assert heartbeat.read_text() == stopped_value
+        finally:
+            client.close(timeout=0.1)
+            if child_pid:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(

@@ -119,7 +119,14 @@ def _interrupted_tool_tail():
     ]
 
 
-def _finalize(agent, messages, *, interrupted, final_response=None):
+def _finalize(
+    agent,
+    messages,
+    *,
+    interrupted,
+    final_response=None,
+    turn_exit_reason="interrupted_by_user",
+):
     return finalize_turn(
         agent,
         final_response=final_response,
@@ -133,7 +140,7 @@ def _finalize(agent, messages, *, interrupted, final_response=None):
         user_message="edit the file",
         original_user_message="edit the file",
         _should_review_memory=False,
-        _turn_exit_reason="interrupted_by_user",
+        _turn_exit_reason=turn_exit_reason,
     )
 
 
@@ -180,3 +187,24 @@ def test_interrupt_without_tool_tail_adds_nothing():
     _finalize(agent, messages, interrupted=True, final_response="partial reply")
     assert len(messages) == before
     assert messages[-1]["role"] == "assistant"
+
+
+def test_bestplan_interrupt_with_response_is_not_completed():
+    agent = _StubAgent()
+    messages = [
+        {"role": "user", "content": "plan it"},
+        {"role": "assistant", "content": "BestPlan cancelled"},
+    ]
+
+    result = _finalize(
+        agent,
+        messages,
+        interrupted=True,
+        final_response="BestPlan cancelled",
+        turn_exit_reason="bestplan",
+    )
+
+    assert result["final_response"] == "BestPlan cancelled"
+    assert result["completed"] is False
+    assert result["failed"] is False
+    assert result["interrupted"] is True

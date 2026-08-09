@@ -8,6 +8,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from unittest.mock import patch
 from typing import Any, Optional
 
@@ -182,6 +183,103 @@ class TestLifecycle:
         s.close()
         assert client._closed is True
 
+    def test_multi_agent_and_read_only_args_reach_app_server_process(self):
+        client = FakeClient()
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            enable_multi_agent=True,
+            client_extra_args=[
+                "-c",
+                'sandbox_mode="read-only"',
+                "-c",
+                'approval_policy="never"',
+            ],
+            client_factory=factory,
+        )
+        session.ensure_started()
+
+        assert session.multi_agent_enabled is True
+        assert captured["extra_args"] == [
+            "--enable",
+            "multi_agent",
+            "-c",
+            'sandbox_mode="read-only"',
+            "-c",
+            'approval_policy="never"',
+        ]
+
+    def test_isolated_read_only_home_copies_only_auth_and_is_removed(
+        self, tmp_path
+    ):
+        source_home = tmp_path / "source-codex"
+        source_home.mkdir()
+        (source_home / "auth.json").write_text('{"tokens":"company-plan"}')
+        (source_home / "config.toml").write_text(
+            '[plugins."ambient"]\nenabled = true\n'
+            '[mcp_servers.ambient]\ncommand = "ambient"\n'
+            '[hooks.state]\n'
+        )
+        (source_home / "plugins").mkdir()
+        captured = {}
+        client = FakeClient()
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        ambient_approval = lambda *_args, **_kwargs: "always"
+        session = CodexAppServerSession(
+            cwd=str(tmp_path),
+            codex_home=str(source_home),
+            permission_profile="full-access",
+            approval_callback=ambient_approval,
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                auto_approve_apply_patch=True,
+            ),
+            client_extra_args=["--dangerously-bypass-approvals-and-sandbox"],
+            isolated_read_only=True,
+            client_factory=factory,
+        )
+        session.ensure_started()
+
+        isolated_home = Path(captured["codex_home"])
+        assert isolated_home != source_home
+        assert isolated_home.is_dir()
+        assert (isolated_home / "auth.json").read_text() == (
+            source_home / "auth.json"
+        ).read_text()
+        config = (isolated_home / "config.toml").read_text()
+        assert 'sandbox_mode = "read-only"' in config
+        assert 'approval_policy = "never"' in config
+        assert "plugins" not in config
+        assert "mcp_servers" not in config
+        assert "hooks" not in config
+        assert sorted(path.name for path in isolated_home.iterdir()) == [
+            "auth.json",
+            "config.toml",
+        ]
+        assert session._permission_profile == "read-only"
+        assert session._approval_callback is None
+        assert session._routing.auto_approve_exec is False
+        assert session._routing.auto_approve_apply_patch is False
+        assert captured["extra_args"] == [
+            "-c",
+            'sandbox_mode="read-only"',
+            "-c",
+            'approval_policy="never"',
+        ]
+        assert captured["suppress_kanban_context"] is True
+
+        session.close()
+        assert not isolated_home.exists()
+
 
 # ---- turn loop ----
 
@@ -208,6 +306,41 @@ class TestRunTurn:
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
+
+    def test_turn_start_includes_optional_model_and_effort_controls(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+
+        session.run_turn(
+            "use real ultra",
+            model="gpt-5.6-sol",
+            effort="ultra",
+            turn_timeout=2.0,
+        )
+
+        _, params = next(r for r in client.requests if r[0] == "turn/start")
+        assert params["model"] == "gpt-5.6-sol"
+        assert params["effort"] == "ultra"
+
+    def test_turn_start_omits_empty_model_and_effort_controls(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+
+        session.run_turn("ordinary turn", turn_timeout=2.0)
+
+        _, params = next(r for r in client.requests if r[0] == "turn/start")
+        assert "model" not in params
+        assert "effort" not in params
 
 
 
@@ -895,4 +1028,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

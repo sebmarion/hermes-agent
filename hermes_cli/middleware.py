@@ -30,6 +30,17 @@ from hermes_cli.tool_policy import (
 
 logger = logging.getLogger(__name__)
 
+
+def _bestplan_extensions_suppressed() -> bool:
+    """Return the task-local BestPlan extension-containment state."""
+    try:
+        from agent.delegation_context import is_bestplan_child_context
+
+        return is_bestplan_child_context()
+    except Exception:
+        return False
+
+
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
 MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v1"
 
@@ -578,6 +589,13 @@ def apply_tool_request_middleware(
     Middleware may return ``{"args": {...}}`` to replace the effective tool
     arguments before hooks, guardrails, approvals, and execution see them.
     """
+    if _bestplan_extensions_suppressed():
+        return RequestMiddlewareResult(
+            payload=args,
+            original_payload=args,
+            changed=False,
+            trace=[],
+        )
     original_args = _safe_copy(args)
     current_args = _safe_copy(original_args)
     trace: List[Dict[str, Any]] = []
@@ -722,6 +740,8 @@ def _has_middleware(kind: str) -> bool:
 
 
 def _get_middleware_callbacks(kind: str) -> List[Callable]:
+    if _bestplan_extensions_suppressed():
+        return []
     from hermes_cli.plugins import get_plugin_manager
 
     return list(get_plugin_manager()._middleware.get(kind, []))
