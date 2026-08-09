@@ -227,7 +227,9 @@ print(json.dumps({
     assert "--no-session-persistence" in argv
     assert "--disable-slash-commands" in argv
     assert "--strict-mcp-config" in argv
-    assert argv[argv.index("--mcp-config") + 1] == "{}"
+    assert json.loads(argv[argv.index("--mcp-config") + 1]) == {
+        "mcpServers": {},
+    }
     assert argv[argv.index("--model") + 1] == "claude-opus-5"
     assert argv[argv.index("--effort") + 1] == "xhigh"
     assert argv[argv.index("--permission-mode") + 1] == "plan"

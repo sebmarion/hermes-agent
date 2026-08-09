@@ -296,7 +296,7 @@ class ClaudeCodePlanChild:
             "--disable-slash-commands",
             "--strict-mcp-config",
             "--mcp-config",
-            "{}",
+            '{"mcpServers":{}}',
             "--permission-mode",
             "plan",
             "--tools",
