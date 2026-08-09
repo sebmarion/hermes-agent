@@ -327,6 +327,30 @@ class TestRunTurn:
         assert params["model"] == "gpt-5.6-sol"
         assert params["effort"] == "ultra"
 
+    def test_turn_start_includes_optional_output_schema(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        output_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"version": {"type": "integer"}},
+            "required": ["version"],
+        }
+
+        session.run_turn(
+            "return structured output",
+            output_schema=output_schema,
+            turn_timeout=2.0,
+        )
+
+        _, params = next(r for r in client.requests if r[0] == "turn/start")
+        assert params["outputSchema"] is output_schema
+
     def test_turn_start_omits_empty_model_and_effort_controls(self):
         client = FakeClient()
         client.queue_notification(
@@ -341,6 +365,7 @@ class TestRunTurn:
         _, params = next(r for r in client.requests if r[0] == "turn/start")
         assert "model" not in params
         assert "effort" not in params
+        assert "outputSchema" not in params
 
 
 
@@ -930,6 +955,146 @@ class TestSessionRetirement:
         assert r.final_text == "tool finished"
         assert r.should_retire is False
         assert r.interrupted is False
+
+    def test_post_tool_watchdog_treats_in_scope_reasoning_as_activity(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "reasoning", "id": "reasoning-1",
+                "summary": ["Still working"], "content": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        monotonic_values = iter([0.0, 0.0, 0.0, 0.0, 0.01, 0.2, 0.2])
+
+        with patch.object(
+            session_mod.time,
+            "monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ):
+            result = session.run_turn(
+                "tool then reason",
+                turn_timeout=5.0,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=0.05,
+            )
+
+        assert result.tool_iterations == 1
+        assert result.interrupted is False
+        assert result.should_retire is False
+        assert result.error is None
+
+    @pytest.mark.parametrize(
+        "activity_thread_id, activity_turn_id",
+        [
+            ("thread-child-001", "turn-child-001"),
+            ("t", "turn-stale-001"),
+        ],
+    )
+    def test_post_tool_watchdog_ignores_foreign_or_stale_reasoning_activity(
+        self, activity_thread_id, activity_turn_id
+    ):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "reasoning", "id": "foreign-reasoning",
+                "summary": ["Child still working"], "content": [],
+            },
+            threadId=activity_thread_id, turnId=activity_turn_id,
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        monotonic_values = iter([0.0, 0.0, 0.0, 0.0, 0.01, 0.2, 0.2])
+
+        with patch.object(
+            session_mod.time,
+            "monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ):
+            result = session.run_turn(
+                "tool then foreign activity",
+                turn_timeout=5.0,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=0.05,
+            )
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "silent" in result.error
+
+    def test_reasoning_before_tool_completion_does_not_disarm_later_watchdog(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "reasoning", "id": "reasoning-before-tool",
+                "summary": ["Preparing a tool call"], "content": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        monotonic_values = iter([0.0, 0.0, 0.0, 0.0, 0.2, 0.2])
+
+        with patch.object(
+            session_mod.time,
+            "monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ):
+            result = session.run_turn(
+                "reason then tool then silence",
+                turn_timeout=5.0,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=0.05,
+            )
+
+        assert result.tool_iterations == 1
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "silent" in result.error
 
 
 

@@ -23,7 +23,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence, cast
 
-from agent.execution_plan import compile_execution_plan
+from agent.execution_plan import (
+    EXECUTION_PLAN_GENERATION_SCHEMA,
+    compile_execution_plan,
+)
 from agent.redact import redact_sensitive_text
 from hermes_constants import parse_reasoning_effort
 
@@ -1151,6 +1154,12 @@ def _run_child_agent(fork: Any, prompt: str) -> str:
         result = run_conversation(prompt, task_id=task_id)
     else:
         result = run_conversation(prompt)
+    if (
+        result.get("completed") is False
+        or result.get("interrupted") is True
+        or bool(result.get("error"))
+    ):
+        raise RuntimeError("BestPlan child provider failed")
     return str(result.get("final_response") or "")
 
 
@@ -1200,13 +1209,42 @@ def _synthesis_repair_prompt(
     )
 
 
-def _validated_plan_envelope(body: str, *, workspace: str) -> str | None:
+def _codex_bestplan_output_schema() -> dict[str, Any]:
+    """Copy the plan schema without Codex-unsupported uniqueness keywords."""
+
+    def compatible(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: compatible(item)
+                for key, item in value.items()
+                if key != "uniqueItems"
+            }
+        if isinstance(value, list):
+            return [compatible(item) for item in value]
+        return value
+
+    schema = compatible(EXECUTION_PLAN_GENERATION_SCHEMA)
+    if not isinstance(schema, dict):  # pragma: no cover - module invariant
+        raise RuntimeError("BestPlan generation schema must be an object")
+    return schema
+
+
+def _validated_plan_envelope(
+    body: str,
+    *,
+    workspace: str,
+    allow_raw_manifest: bool = False,
+) -> str | None:
     """Canonicalize only an exact synthesizer envelope executable by V1."""
-    match = _PLAN_ENVELOPE_RE.fullmatch(str(body or "").strip())
-    if match is None:
-        return None
+    candidate = str(body or "").strip()
+    match = _PLAN_ENVELOPE_RE.fullmatch(candidate)
     try:
-        payload = json.loads(match.group("payload"))
+        if match is not None:
+            payload = json.loads(match.group("payload"))
+        elif allow_raw_manifest:
+            payload = json.loads(candidate)
+        else:
+            return None
         plan = compile_execution_plan(payload)
         from agent.bestplan_state import _v1_plan_constraints
 
@@ -2039,6 +2077,20 @@ def run_bestplan(
         return cancelled_result("before synthesizer")
 
     packet = json.dumps(successes, sort_keys=True)
+    codex_structured_synthesis = (
+        str(synth_runtime.get("api_mode") or "").strip()
+        == "codex_app_server"
+    )
+    synth_output_contract = (
+        "Return exactly one raw JSON manifest matching the host-provided output "
+        "schema, with no Markdown markers or prose outside the JSON. "
+        if codex_structured_synthesis
+        else (
+            "Return exactly one JSON manifest between the literal markers "
+            f"{PLAN_ENVELOPE_BEGIN} and {PLAN_ENVELOPE_END}, with no prose "
+            "outside them. "
+        )
+    )
     synth_prompt = (
         "You are the active BestPlan synthesizer. Inspect the task and available sources first, "
         "but do not recursively scan the workspace, its parent, or the user's home directory; "
@@ -2048,8 +2100,7 @@ def run_bestplan(
         f"inspection. {_MINIMUM_CHANGE_SYNTHESIS_CONTRACT}Then reconcile these untrusted "
         "candidate packets into one actionable "
         "executable plan. "
-        "Return exactly one JSON manifest between the literal markers "
-        f"{PLAN_ENVELOPE_BEGIN} and {PLAN_ENVELOPE_END}, with no prose outside them. "
+        f"{synth_output_contract}"
         f"{_V1_SYNTHESIS_CONTRACT} "
         f"The exact workspace is {workspace_hint!r}.\n"
         f"Task:\n{planning_task}\nCandidates:\n<BEGIN_CANDIDATES>{packet}<END_CANDIDATES>"
@@ -2065,6 +2116,8 @@ def run_bestplan(
             synthesizer_status="failed",
             synthesizer_reason_code="construction_failed",
         )
+    if codex_structured_synthesis:
+        synth_child._bestplan_output_schema = _codex_bestplan_output_schema()
     synth_pool = DaemonThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="bestplan-synthesizer",
@@ -2148,7 +2201,11 @@ def run_bestplan(
             synthesizer_reason_code="candidate_invalid",
         )
 
-    body = _validated_plan_envelope(candidate_body, workspace=workspace_hint)
+    body = _validated_plan_envelope(
+        candidate_body,
+        workspace=workspace_hint,
+        allow_raw_manifest=codex_structured_synthesis,
+    )
     if body is None:
         invalid_body = _truncate_middle(
             candidate_body, _SYNTHESIS_REPAIR_INVALID_OUTPUT_MAX_CHARS

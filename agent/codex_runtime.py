@@ -888,12 +888,17 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    turn_kwargs: dict[str, Any] = {
+        "user_input": user_message,
+        "model": str(getattr(agent, "model", "") or "").strip() or None,
+        "effort": turn_effort,
+    }
+    bestplan_output_schema = getattr(agent, "_bestplan_output_schema", None)
+    if bestplan_read_only and bestplan_output_schema is not None:
+        turn_kwargs["output_schema"] = bestplan_output_schema
+
     try:
-        turn = agent._codex_session.run_turn(
-            user_input=user_message,
-            model=str(getattr(agent, "model", "") or "").strip() or None,
-            effort=turn_effort,
-        )
+        turn = agent._codex_session.run_turn(**turn_kwargs)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

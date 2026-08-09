@@ -545,6 +545,7 @@ class CodexAppServerSession:
         *,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        output_schema: Optional[dict[str, Any]] = None,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
@@ -602,6 +603,8 @@ class CodexAppServerSession:
             turn_params["model"] = normalized_model
         if normalized_effort:
             turn_params["effort"] = normalized_effort
+        if output_schema is not None:
+            turn_params["outputSchema"] = output_schema
         try:
             ts = self._client.request(
                 "turn/start",
@@ -791,12 +794,12 @@ class CodexAppServerSession:
                 # Arm/refresh the post-tool quiet watchdog whenever a
                 # tool-shaped item completes.
                 last_tool_completion_at = time.monotonic()
-            else:
-                # Any non-tool projected activity (assistant message,
-                # status update, etc.) means codex is still producing
-                # output — clear the quiet timer so we don't fast-fail.
-                if projection.messages or projection.final_text is not None:
-                    last_tool_completion_at = None
+            elif method.startswith("item/"):
+                # Accepted same-turn item activity proves Codex is live even
+                # when the projector intentionally emits no message (for
+                # example reasoning deltas/completions). Foreign/stale items
+                # were filtered above and cannot disarm this watchdog.
+                last_tool_completion_at = None
             if projection.final_text is not None:
                 # Codex can emit multiple agentMessage items in one turn
                 # (e.g. partial then final). Take the last one as canonical.

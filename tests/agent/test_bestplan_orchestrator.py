@@ -474,6 +474,7 @@ def test_bestplan_sol_forces_read_only_app_server_policy(monkeypatch, tmp_path):
     ]
     assert captured["turn"]["model"] == "gpt-5.6-sol"
     assert captured["turn"]["effort"] == "ultra"
+    assert "output_schema" not in captured["turn"]
 
 
 def test_codex_does_not_use_foreign_parent_credentials(monkeypatch, tmp_path):
@@ -729,6 +730,85 @@ def test_run_bestplan_omitted_count_executes_all_four_configured_lanes(
     receipt = json.loads(result["final_response"].splitlines()[1])
     assert receipt["requested_count"] == 4
     assert receipt["effective_count"] == 4
+
+
+@pytest.mark.parametrize(
+    "failed_result",
+    [
+        {"final_response": "", "completed": False},
+        {"final_response": "", "interrupted": True},
+        {"final_response": "", "error": "codex transport failed"},
+    ],
+)
+def test_run_child_agent_propagates_explicit_failure(failed_result):
+    import agent.bestplan_orchestrator as orchestrator
+
+    child = SimpleNamespace(
+        run_conversation=lambda _prompt: failed_result,
+    )
+
+    with pytest.raises(RuntimeError, match="BestPlan child provider failed"):
+        orchestrator._run_child_agent(child, "plan")
+
+
+def test_failed_child_result_is_recorded_as_provider_error(monkeypatch, tmp_path):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    lane = {
+        "name": "local",
+        "provider": "provider-a",
+        "model": "local-model",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "high",
+    }
+
+    class FailedChildAgent:
+        def __init__(self, **_kwargs):
+            self.tools = []
+            self.valid_tool_names = set()
+
+        def run_conversation(self, _prompt, **_kwargs):
+            return {
+                "final_response": "",
+                "completed": False,
+                "partial": True,
+                "error": "codex went silent after a tool result",
+            }
+
+        def clear_interrupt(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FailedChildAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured, **_kwargs: _identity(configured),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    result = run_bestplan(
+        object(),
+        "plan this release",
+        config=_runtime_config([lane]),
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "quorum_unavailable"
+    assert all(
+        attempt["status"] == "failed"
+        and attempt["reason_code"] == "provider_error"
+        for attempt in result["attempts"]
+    )
+    receipt = json.loads(result["receipt"].splitlines()[1])
+    assert all(
+        attempt["reason_code"] == "provider_error"
+        for attempt in receipt["attempts"]
+    )
 
 
 def test_claude_plan_children_use_request_workspace_and_repair_has_no_tools(
@@ -1188,6 +1268,127 @@ def test_strict_v1_envelope_accepts_only_executable_implementation_or_review():
         + "\n<<<END_HERMES_BESTPLAN_V1>>>"
     )
     assert _validated_plan_envelope(mixed_body, workspace="/tmp/work") is None
+
+
+def test_codex_schema_copy_strips_unique_items_without_mutating_host_schema():
+    import agent.bestplan_orchestrator as orchestrator
+    from agent.execution_plan import EXECUTION_PLAN_GENERATION_SCHEMA
+
+    def contains_unique_items(value):
+        if isinstance(value, dict):
+            return "uniqueItems" in value or any(
+                contains_unique_items(item) for item in value.values()
+            )
+        if isinstance(value, list):
+            return any(contains_unique_items(item) for item in value)
+        return False
+
+    assert contains_unique_items(EXECUTION_PLAN_GENERATION_SCHEMA) is True
+    compatible = orchestrator._codex_bestplan_output_schema()
+
+    assert compatible is not EXECUTION_PLAN_GENERATION_SCHEMA
+    assert contains_unique_items(compatible) is False
+    assert contains_unique_items(EXECUTION_PLAN_GENERATION_SCHEMA) is True
+
+
+def test_codex_raw_manifest_is_host_canonicalized_and_v1_validated():
+    manifest = json.loads(_synth_plan_envelope().splitlines()[1])
+    raw = json.dumps(manifest)
+
+    assert _validated_plan_envelope(raw, workspace="/tmp/work") is None
+    canonical = _validated_plan_envelope(
+        raw,
+        workspace="/tmp/work",
+        allow_raw_manifest=True,
+    )
+
+    assert canonical is not None
+    assert canonical.startswith("<<<HERMES_BESTPLAN_V1>>>\n")
+    assert canonical.endswith("\n<<<END_HERMES_BESTPLAN_V1>>>")
+    authority = json.loads(canonical.splitlines()[1])
+    assert authority == {"version": 1, "manifest": manifest}
+
+    duplicate_paths = json.loads(raw)
+    duplicate_paths["slices"][0]["allowed_paths"] = ["src/", "src/"]
+    assert _validated_plan_envelope(
+        json.dumps(duplicate_paths),
+        workspace="/tmp/work",
+        allow_raw_manifest=True,
+    ) is None
+
+    wrong_workspace = json.loads(raw)
+    wrong_workspace["slices"][0]["workspace"] = "/tmp/other"
+    assert _validated_plan_envelope(
+        json.dumps(wrong_workspace),
+        workspace="/tmp/work",
+        allow_raw_manifest=True,
+    ) is None
+
+
+def test_codex_synthesizer_alone_gets_schema_and_raw_manifest_contract(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    lane = {
+        "name": "sol",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_app_server",
+        "reasoning_effort": "ultra",
+    }
+    explorer_schemas = []
+    synth_schemas = []
+    synth_prompts = []
+    raw_manifest = _synth_plan_envelope(
+        workspace=str(tmp_path)
+    ).splitlines()[1]
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            self.tools = []
+            self.valid_tool_names = set()
+
+        def run_conversation(self, prompt, **_kwargs):
+            schema = getattr(self, "_bestplan_output_schema", None)
+            if "active BestPlan synthesizer" in prompt:
+                synth_schemas.append(schema)
+                synth_prompts.append(prompt)
+                return {"final_response": raw_manifest}
+            explorer_schemas.append(schema)
+            return {"final_response": _candidate_text()}
+
+        def clear_interrupt(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured, **_kwargs: _identity(configured),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan this release",
+        config=_runtime_config([lane]),
+    )
+
+    assert result["status"] == "completed"
+    assert explorer_schemas == [None, None, None]
+    assert len(synth_schemas) == 1
+    assert isinstance(synth_schemas[0], dict)
+    assert len(synth_prompts) == 1
+    assert "raw JSON manifest" in synth_prompts[0]
+    assert "literal markers" not in synth_prompts[0]
+    assert result["body"].startswith("<<<HERMES_BESTPLAN_V1>>>\n")
+    assert result["body"].endswith("\n<<<END_HERMES_BESTPLAN_V1>>>")
 
 
 def test_synthesis_uses_only_named_lane_without_failover(monkeypatch, tmp_path):

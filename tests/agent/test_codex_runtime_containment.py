@@ -49,11 +49,13 @@ def test_bestplan_read_only_runtime_enables_isolated_containment(monkeypatch, tm
         lambda: lambda *_args, **_kwargs: "always",
     )
     monkeypatch.setattr("tools.approval.is_approval_bypass_active", lambda: True)
+    output_schema = {"type": "object", "additionalProperties": False}
     agent = SimpleNamespace(
         model="gpt-5.6-sol",
         reasoning_config={"enabled": True, "effort": "ultra"},
         session_cwd=str(tmp_path),
         _bestplan_read_only=True,
+        _bestplan_output_schema=output_schema,
         _codex_session=None,
         _interrupt_requested=False,
         _interrupt_message=None,
@@ -87,6 +89,7 @@ def test_bestplan_read_only_runtime_enables_isolated_containment(monkeypatch, tm
         "-c",
         'approval_policy="never"',
     ]
+    assert captured["turn"]["output_schema"] is output_schema
 
 
 def test_ordinary_runtime_does_not_enable_isolated_containment(monkeypatch, tmp_path):
@@ -101,7 +104,8 @@ def test_ordinary_runtime_does_not_enable_isolated_containment(monkeypatch, tmp_
             captured.update(kwargs)
             self.multi_agent_enabled = bool(kwargs.get("enable_multi_agent"))
 
-        def run_turn(self, **_kwargs):
+        def run_turn(self, **kwargs):
+            captured["turn"] = kwargs
             return SimpleNamespace(
                 final_text="ordinary",
                 projected_messages=[],
@@ -166,3 +170,4 @@ def test_ordinary_runtime_does_not_enable_isolated_containment(monkeypatch, tmp_
     assert captured.get("isolated_read_only", False) is False
     assert captured["approval_callback"] is approval_callback
     assert "client_extra_args" not in captured
+    assert "output_schema" not in captured["turn"]
