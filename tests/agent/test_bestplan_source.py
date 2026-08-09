@@ -46,6 +46,41 @@ def _snapshot(repo: Path):
     return source.capture_source_snapshot(identity, time.monotonic() + 5.0)
 
 
+def _fsmonitor_index_bytes(repo: Path) -> bytes:
+    index_path = Path(
+        _git(
+            repo,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ).decode("utf-8")
+    )
+    value = index_path.read_bytes()
+    assert b"FSMN" in value
+    return value
+
+
+def _fsmn_payload(value: bytes) -> tuple[int, int]:
+    signature = value.index(b"FSMN")
+    size = int.from_bytes(value[signature + 4 : signature + 8], "big")
+    start = signature + 8
+    return start, start + size
+
+
+def _fsmn_ewah_offset(value: bytes) -> int:
+    start, end = _fsmn_payload(value)
+    version = int.from_bytes(value[start : start + 4], "big")
+    assert version == 2
+    token_end = value.index(b"\0", start + 4, end)
+    return token_end + 1 + 4
+
+
+def _rewrite_sha1_index_checksum(value: bytearray) -> bytes:
+    value[-20:] = hashlib.sha1(value[:-20]).digest()
+    return bytes(value)
+
+
 def _set_head_to_flat_tree(repo: Path, files: list[tuple[bytes, bytes]]) -> None:
     records: list[bytes] = []
     repo_raw = os.fsencode(repo)
@@ -236,6 +271,78 @@ def test_trusted_git_invocation_ignores_path_substitution(tmp_path, monkeypatch)
     source.export_exact_tree(snapshot, destination)
     assert (destination / "tracked.txt").read_bytes() == b"committed\n"
     assert not marker.exists()
+
+
+def test_trusted_git_invocation_disables_configured_fsmonitor_hook(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    marker = tmp_path / "fsmonitor-executed"
+    hook = tmp_path / "fsmonitor-hook"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"printf invoked > {str(marker)!r}\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    _git(repo, "config", "core.fsmonitor", str(hook))
+
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "exported"
+    source.export_exact_tree(snapshot, destination)
+
+    assert snapshot.head_oid
+    assert (destination / "tracked.txt").read_bytes() == b"committed\n"
+    assert not marker.exists()
+
+
+def test_git_environment_removes_all_config_injection_variables(monkeypatch):
+    source = _source()
+    injected = {
+        "GIT_CONFIG": "/tmp/hostile-config",
+        "GIT_CONFIG_PARAMETERS": "'core.fsmonitor=/tmp/hostile-hook'",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "/tmp/hostile-hook",
+    }
+    for key, value in injected.items():
+        monkeypatch.setenv(key, value)
+
+    trusted = source._git_environment()
+
+    assert not {key for key in trusted if key.startswith("GIT_CONFIG")}
+
+
+def test_bestplan_modules_import_without_git_and_capture_fails_coded(tmp_path):
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    environment = dict(os.environ)
+    environment["PATH"] = str(empty_path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import agent.bestplan_state; "
+                "from agent import bestplan_source as source; "
+                "print('imported'); "
+                "\ntry:\n"
+                " source.resolve_repo_identity('.')\n"
+                "except source.SourceBoundaryError as exc:\n"
+                " print(exc.code)\n"
+                "else:\n"
+                " raise SystemExit('capture unexpectedly succeeded')\n"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["imported", "source_unavailable"]
 
 
 def test_trusted_executable_identity_maps_unavailable_binary_to_boundary_error(
@@ -525,6 +632,94 @@ def test_protected_manifest_separates_staged_and_unstaged_binary_state(tmp_path)
     assert second.digest != first.digest
 
 
+def test_manifest_streams_exact_binary_diff_hashes(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    binary = repo / "binary.dat"
+    binary.write_bytes(b"committed\x00bytes")
+    _git(repo, "add", "binary.dat")
+    _git(repo, "commit", "-qm", "binary base")
+    binary.write_bytes(b"staged\x00bytes")
+    _git(repo, "add", "binary.dat")
+    binary.write_bytes(b"unstaged\x00bytes")
+    expected_staged = subprocess.run(
+        [
+            "git", "diff", "--cached", "--binary", "--full-index",
+            "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color",
+            "HEAD", "--",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    ).stdout
+    expected_unstaged = subprocess.run(
+        [
+            "git", "diff", "--binary", "--full-index", "--no-ext-diff",
+            "--no-textconv", "--no-renames", "--no-color", "--",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    ).stdout
+    real_run_git = source._run_git
+
+    def reject_buffered_diff(cwd, *args, **kwargs):
+        if args and args[0] == "diff" and "--binary" in args:
+            raise AssertionError("whole diff was sent through the buffering runner")
+        return real_run_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(source, "_run_git", reject_buffered_diff)
+    manifest = source.capture_protected_manifest(
+        source.resolve_repo_identity(str(repo))
+    )
+
+    assert manifest.staged_diff_sha256 == hashlib.sha256(expected_staged).hexdigest()
+    assert manifest.unstaged_diff_sha256 == hashlib.sha256(
+        expected_unstaged
+    ).hexdigest()
+
+
+def test_manifest_fails_closed_when_diff_exceeds_bound(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_bytes(b"a substantially larger dirty payload\n")
+    monkeypatch.setattr(source, "_MAX_DIFF_BYTES", 8, raising=False)
+
+    with pytest.raises(source.UnsupportedRepositoryError, match="diff|limit") as raised:
+        source.capture_protected_manifest(source.resolve_repo_identity(str(repo)))
+
+    assert raised.value.code == "unsupported_repository"
+
+
+def test_manifest_fails_closed_when_raw_path_exceeds_bound(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "long-untracked-name.txt").write_bytes(b"ambient\n")
+    monkeypatch.setattr(source, "_MAX_PATH_BYTES", 8, raising=False)
+
+    with pytest.raises(source.UnsupportedRepositoryError, match="path|metadata|limit"):
+        source.capture_protected_manifest(source.resolve_repo_identity(str(repo)))
+
+
+def test_same_size_same_mtime_tracked_mutation_is_never_missed(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    _git(repo, "config", "core.trustctime", "false")
+    _git(repo, "update-index", "--refresh")
+    identity = source.resolve_repo_identity(str(repo))
+    before = source.capture_protected_manifest(identity)
+    tracked = repo / "tracked.txt"
+    original = tracked.stat()
+    assert len(b"committed\n") == len(b"tampered!\n")
+    tracked.write_bytes(b"tampered!\n")
+    os.utime(tracked, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    after = source.capture_protected_manifest(identity)
+
+    assert after.digest != before.digest
+    assert b"tracked.txt" in after.protected_paths
+
+
 def test_protected_paths_only_block_dirty_untracked_and_special_index_state(tmp_path):
     source = _source()
     repo = _init_repo(tmp_path / "repo")
@@ -597,19 +792,100 @@ def test_clean_fsmonitor_valid_entry_is_manifested_but_not_protected(tmp_path):
     assert b"tracked.txt" not in manifest.protected_paths
 
 
+def test_fsmonitor_valid_decoder_supports_index_v4(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked-two.txt").write_bytes(b"two\n")
+    _git(repo, "add", "tracked-two.txt")
+    _git(repo, "commit", "-qm", "second path")
+    _git(repo, "update-index", "--index-version=4")
+    _git(repo, "config", "core.fsmonitor", "true")
+    _git(repo, "update-index", "--fsmonitor-valid", "tracked-two.txt")
+
+    manifest = source.capture_protected_manifest(
+        source.resolve_repo_identity(str(repo))
+    )
+
+    flags = {entry.path: entry for entry in manifest.index_flags}
+    assert flags[b"tracked-two.txt"].fsmonitor_valid is True
+
+
+def test_fsmonitor_decoder_rejects_unsupported_extension_version(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    _git(repo, "config", "core.fsmonitor", "true")
+    _git(repo, "update-index", "--fsmonitor-valid", "tracked.txt")
+    value = bytearray(_fsmonitor_index_bytes(repo))
+    start, _end = _fsmn_payload(value)
+    value[start : start + 4] = (3).to_bytes(4, "big")
+
+    with pytest.raises(source.SourceBoundaryError, match="fsmonitor.*version"):
+        source._parse_index_fsmonitor_valid_paths(
+            _rewrite_sha1_index_checksum(value),
+            index_paths=(b"tracked.txt",),
+            object_format="sha1",
+            deadline=time.monotonic() + 2.0,
+        )
+
+
+def test_fsmonitor_decoder_rejects_malformed_bitmap_size(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    _git(repo, "config", "core.fsmonitor", "true")
+    _git(repo, "update-index", "--fsmonitor-valid", "tracked.txt")
+    value = bytearray(_fsmonitor_index_bytes(repo))
+    ewah_offset = _fsmn_ewah_offset(value)
+    size_offset = ewah_offset - 4
+    declared = int.from_bytes(value[size_offset:ewah_offset], "big")
+    value[size_offset:ewah_offset] = (declared + 1).to_bytes(4, "big")
+
+    with pytest.raises(source.SourceBoundaryError, match="fsmonitor.*size"):
+        source._parse_index_fsmonitor_valid_paths(
+            _rewrite_sha1_index_checksum(value),
+            index_paths=(b"tracked.txt",),
+            object_format="sha1",
+            deadline=time.monotonic() + 2.0,
+        )
+
+
+def test_fsmonitor_decoder_rejects_bitmap_larger_than_index(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    _git(repo, "config", "core.fsmonitor", "true")
+    _git(repo, "update-index", "--fsmonitor-valid", "tracked.txt")
+    value = bytearray(_fsmonitor_index_bytes(repo))
+    ewah_offset = _fsmn_ewah_offset(value)
+    value[ewah_offset : ewah_offset + 4] = (2).to_bytes(4, "big")
+
+    with pytest.raises(source.SourceBoundaryError, match="fsmonitor.*entries"):
+        source._parse_index_fsmonitor_valid_paths(
+            _rewrite_sha1_index_checksum(value),
+            index_paths=(b"tracked.txt",),
+            object_format="sha1",
+            deadline=time.monotonic() + 2.0,
+        )
+
+
 def test_manifest_pins_raw_staged_and_unstaged_diff_semantics(tmp_path, monkeypatch):
     source = _source()
     repo = _init_repo(tmp_path / "repo")
     (repo / "tracked.txt").write_bytes(b"changed\n")
     calls: list[tuple[str, ...]] = []
     real_run_git = source._run_git
+    real_run_git_digest = source._run_git_digest
 
     def recording_run_git(cwd, *args, **kwargs):
         if args and args[0] == "diff":
             calls.append(args)
         return real_run_git(cwd, *args, **kwargs)
 
+    def recording_run_git_digest(cwd, *args, **kwargs):
+        if args and args[0] == "diff":
+            calls.append(args)
+        return real_run_git_digest(cwd, *args, **kwargs)
+
     monkeypatch.setattr(source, "_run_git", recording_run_git)
+    monkeypatch.setattr(source, "_run_git_digest", recording_run_git_digest)
     source.capture_protected_manifest(source.resolve_repo_identity(str(repo)))
 
     assert len(calls) >= 4
@@ -984,6 +1260,122 @@ def test_export_exact_tree_uses_committed_blobs_and_excludes_ambient_bytes(tmp_p
     assert not (destination / "cache").exists()
 
 
+def test_export_failure_leaves_no_final_destination_and_retry_succeeds(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "second.txt").write_bytes(b"second committed file\n")
+    _git(repo, "add", "second.txt")
+    _git(repo, "commit", "-qm", "second file")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "exported"
+    real_write = source._write_export_file
+    writes = 0
+
+    def fail_second_write(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise source.SourceBoundaryError("synthetic second-file failure")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(source, "_write_export_file", fail_second_write)
+    with pytest.raises(source.SourceBoundaryError, match="second-file"):
+        source.export_exact_tree(snapshot, destination)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".exported.bestplan-staging-*"))
+
+    monkeypatch.setattr(source, "_write_export_file", real_write)
+    source.export_exact_tree(snapshot, destination)
+    assert (destination / "tracked.txt").read_bytes() == b"committed\n"
+    assert (destination / "second.txt").read_bytes() == b"second committed file\n"
+
+
+def test_export_atomic_publish_preserves_raced_destination(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "raced-export"
+    real_publish = source._publish_staging_no_replace
+
+    def race_destination(prepared, *, backend, deadline):
+        os.mkdir(prepared.final_leaf, dir_fd=prepared.parent_fds[-1])
+        final_fd = os.open(
+            prepared.final_leaf,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=prepared.parent_fds[-1],
+        )
+        try:
+            sentinel = os.open(
+                b"attacker-sentinel",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=final_fd,
+            )
+            os.close(sentinel)
+        finally:
+            os.close(final_fd)
+        return real_publish(prepared, backend=backend, deadline=deadline)
+
+    monkeypatch.setattr(source, "_publish_staging_no_replace", race_destination)
+    with pytest.raises(source.SourceBoundaryError, match="destination|publication"):
+        source.export_exact_tree(snapshot, destination)
+
+    assert (destination / "attacker-sentinel").is_file()
+    assert not (destination / "tracked.txt").exists()
+    assert not list(tmp_path.glob(".raced-export.bestplan-staging-*"))
+
+
+def test_export_fails_closed_when_tree_entry_limit_is_exceeded(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "second.txt").write_bytes(b"second\n")
+    _git(repo, "add", "second.txt")
+    _git(repo, "commit", "-qm", "second file")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "entry-limited-export"
+    monkeypatch.setattr(source, "_MAX_TREE_ENTRIES", 1, raising=False)
+
+    with pytest.raises(source.UnsupportedRepositoryError, match="tree|metadata|limit"):
+        source.export_exact_tree(snapshot, destination)
+
+    assert not destination.exists()
+
+
+def test_export_streams_blobs_and_fails_closed_at_blob_limit(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "blob-limited-export"
+    monkeypatch.setattr(source, "_MAX_BLOB_BYTES", 4, raising=False)
+
+    with pytest.raises(source.UnsupportedRepositoryError, match="blob|limit"):
+        source.export_exact_tree(snapshot, destination)
+
+    assert not destination.exists()
+
+
+def test_export_fails_closed_before_capture_on_non_posix_host(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "unsupported-host-export"
+    monkeypatch.setattr(
+        source,
+        "recapture_matches",
+        lambda *_args, **_kwargs: pytest.fail("unsupported host recaptured source"),
+    )
+
+    with monkeypatch.context() as context:
+        context.setattr(source.os, "name", "nt")
+        with pytest.raises(source.UnsupportedRepositoryError, match="POSIX|host"):
+            source.export_exact_tree(snapshot, destination)
+
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize(
     "aliased_paths",
     [
@@ -1036,14 +1428,12 @@ def test_export_cat_file_timeout_is_coded_proof_stale(tmp_path, monkeypatch):
     source = _source()
     repo = _init_repo(tmp_path / "repo")
     snapshot = _snapshot(repo)
-    real_run = source.subprocess.run
+    def timeout_cat_file(_reader):
+        raise source.ProofStaleError(
+            "proof_stale: synthetic cat-file read timeout"
+        )
 
-    def timeout_cat_file(command, *args, **kwargs):
-        if command[1:3] == ["cat-file", "--batch"]:
-            raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
-        return real_run(command, *args, **kwargs)
-
-    monkeypatch.setattr(source.subprocess, "run", timeout_cat_file)
+    monkeypatch.setattr(source._DeadlinePipeReader, "_fill", timeout_cat_file)
     with pytest.raises(source.ProofStaleError) as raised:
         source.export_exact_tree(snapshot, tmp_path / "timed-out-export")
     assert raised.value.code == "proof_stale"
@@ -1063,22 +1453,22 @@ def test_batch_blob_request_checks_deadline_before_spawning_git(tmp_path, monkey
         )
         for index in range(2)
     )
-    checks = 0
-
     def expiring_remaining(_deadline):
-        nonlocal checks
-        checks += 1
-        if checks == 2:
-            raise source.ProofStaleError("proof_stale: synthetic deadline")
-        return 1.0
+        raise source.ProofStaleError("proof_stale: synthetic deadline")
 
     def unexpected_git(*_args, **_kwargs):
         raise AssertionError("cat-file spawned after the absolute deadline")
 
     monkeypatch.setattr(source, "_remaining", expiring_remaining)
-    monkeypatch.setattr(source, "_run_git", unexpected_git)
+    monkeypatch.setattr(source.subprocess, "Popen", unexpected_git)
     with pytest.raises(source.ProofStaleError, match="proof_stale"):
-        source._batch_blobs(identity, entries, deadline=time.monotonic() + 1.0)
+        source._materialize_blobs(
+            identity,
+            entries,
+            -1,
+            {},
+            deadline=time.monotonic() + 1.0,
+        )
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO support required")
