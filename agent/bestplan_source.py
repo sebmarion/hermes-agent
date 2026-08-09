@@ -1305,6 +1305,7 @@ def _run_legacy_v1_git_output(
     deadline: float,
     max_output_bytes: int,
     digest_only: bool = False,
+    owns_process_tree: bool = False,
 ) -> bytes | str:
     """Run fixed-path Git inside the already isolated legacy helper process."""
 
@@ -1329,6 +1330,7 @@ def _run_legacy_v1_git_output(
         cwd=cwd,
         label="legacy V1 Git command",
         response_limit=max_output_bytes,
+        owns_process_tree=owns_process_tree,
     )
     if digest_only:
         return _sha256_bytes(output, deadline=deadline)
@@ -1371,32 +1373,45 @@ def _capture_legacy_v1_in_process(
         or any(character not in b"0123456789abcdef" for character in head)
     ):
         raise SourceBoundaryError("legacy V1 Git HEAD is malformed")
-    diff_flags = (
-        "--binary",
-        "--full-index",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        "--no-color",
-    )
-    staged = _run_legacy_v1_git_output(
+    object_format_output = _run_legacy_v1_git_output(
         root_raw,
-        "diff",
+        "rev-parse",
+        "--show-object-format",
+        deadline=deadline,
+        max_output_bytes=16,
+    )
+    assert isinstance(object_format_output, bytes)
+    object_format_raw = _without_delimiter(object_format_output)
+    if object_format_raw not in {b"sha1", b"sha256"}:
+        raise UnsupportedRepositoryError(
+            "legacy V1 Git object format is unsupported"
+        )
+    object_format = object_format_raw.decode("ascii")
+    if len(head) != {"sha1": 40, "sha256": 64}[object_format]:
+        raise SourceBoundaryError("legacy V1 Git HEAD format is inconsistent")
+    index_output = _run_legacy_v1_git_output(
+        root_raw,
+        "ls-files",
+        "--stage",
+        "-z",
+        deadline=deadline,
+        max_output_bytes=_MAX_GIT_METADATA_BYTES,
+    )
+    flags_output = _run_legacy_v1_git_output(
+        root_raw,
+        "ls-files",
+        "-v",
+        "-z",
+        deadline=deadline,
+        max_output_bytes=_MAX_GIT_METADATA_BYTES,
+    )
+    tracked_output = _run_legacy_v1_git_output(
+        root_raw,
+        "ls-files",
         "--cached",
-        *diff_flags,
-        "--",
+        "-z",
         deadline=deadline,
-        max_output_bytes=_MAX_DIFF_BYTES,
-        digest_only=True,
-    )
-    unstaged = _run_legacy_v1_git_output(
-        root_raw,
-        "diff",
-        *diff_flags,
-        "--",
-        deadline=deadline,
-        max_output_bytes=_MAX_DIFF_BYTES,
-        digest_only=True,
+        max_output_bytes=_MAX_GIT_METADATA_BYTES,
     )
     untracked_output = _run_legacy_v1_git_output(
         root_raw,
@@ -1407,18 +1422,33 @@ def _capture_legacy_v1_in_process(
         deadline=deadline,
         max_output_bytes=_MAX_GIT_METADATA_BYTES,
     )
-    assert isinstance(staged, str) and isinstance(unstaged, str)
+    assert isinstance(index_output, bytes)
+    assert isinstance(flags_output, bytes)
+    assert isinstance(tracked_output, bytes)
     assert isinstance(untracked_output, bytes)
-    if untracked_output and not untracked_output.endswith(b"\0"):
-        raise SourceBoundaryError("legacy V1 untracked path output is malformed")
-    paths = () if not untracked_output else tuple(untracked_output[:-1].split(b"\0"))
-    if (
-        len(paths) > _MAX_PROTECTED_PATHS
-        or sum(len(path) for path in paths) > _MAX_TOTAL_PATH_BYTES
+    for label, output in (
+        ("index", index_output),
+        ("flags", flags_output),
+        ("tracked", tracked_output),
+        ("untracked", untracked_output),
     ):
-        raise UnsupportedRepositoryError(
-            "legacy V1 path metadata exceeds the trusted limit"
-        )
+        if output and not output.endswith(b"\0"):
+            raise SourceBoundaryError(
+                f"legacy V1 {label} path output is malformed"
+            )
+    index_entries = _parse_index_entries(index_output, deadline=deadline)
+    index_flags = _parse_tags(flags_output, deadline=deadline)
+    tracked_paths = set(_split_nul(tracked_output, deadline=deadline))
+    untracked_paths = set(_split_nul(untracked_output, deadline=deadline))
+    if tracked_paths & untracked_paths:
+        raise SourceBoundaryError("legacy V1 Git path sets overlap")
+    paths = sorted(tracked_paths | untracked_paths)
+    _assert_path_scale(
+        paths,
+        label="legacy V1",
+        max_count=_MAX_PROTECTED_PATHS,
+        deadline=deadline,
+    )
     legacy_repo = RepoIdentity(
         workspace=os.fsdecode(root_raw),
         workspace_raw=root_raw,
@@ -1430,28 +1460,36 @@ def _capture_legacy_v1_in_process(
         common_dir_raw=b"",
         common_dir_device=0,
         common_dir_inode=0,
-        object_format="sha1",
+        object_format=object_format,
         repository_id="legacy-v1",
     )
     digest = hashlib.sha256()
-    for value in (
-        b"bestplan-legacy-v1",
-        root_raw,
-        head,
-        staged.encode("ascii"),
-        unstaged.encode("ascii"),
-    ):
+
+    def add(value: bytes) -> None:
+        _remaining(deadline)
         digest.update(len(value).to_bytes(8, "big"))
         digest.update(value)
+
+    for value in (b"bestplan-legacy-v1-raw", root_raw, head):
+        add(value)
+    for entry in index_entries:
+        add(b"index")
+        add(entry.path)
+        add(oct(entry.mode).encode("ascii"))
+        add(entry.oid.encode("ascii"))
+        add(str(entry.stage).encode("ascii"))
+    for path in sorted(index_flags):
+        add(b"flags")
+        add(path)
+        add(index_flags[path])
     total_size = 0
-    for path in sorted(paths):
+    for path in paths:
         _remaining(deadline)
-        if len(path) > _MAX_PATH_BYTES:
-            raise UnsupportedRepositoryError(
-                "legacy V1 path exceeds the trusted limit"
-            )
         captured = _capture_path(
-            legacy_repo, path, tracked=False, deadline=deadline,
+            legacy_repo,
+            path,
+            tracked=path in tracked_paths,
+            deadline=deadline,
         )
         total_size += captured.size or 0
         if total_size > _MAX_EXPORT_BYTES:
@@ -1459,14 +1497,17 @@ def _capture_legacy_v1_in_process(
                 "legacy V1 content exceeds the trusted limit"
             )
         for value in (
+            b"worktree",
             captured.path,
+            b"1" if captured.tracked else b"0",
             captured.kind.encode("ascii"),
             str(captured.mode or 0).encode("ascii"),
+            str(captured.size or 0).encode("ascii"),
             (captured.content_sha256 or "").encode("ascii"),
             captured.symlink_target or b"",
+            (captured.git_oid or "").encode("ascii"),
         ):
-            digest.update(len(value).to_bytes(8, "big"))
-            digest.update(value)
+            add(value)
     return {
         "workspace": os.fsdecode(root_raw),
         "fingerprint": "legacy-v1:" + digest.hexdigest(),
@@ -3404,6 +3445,7 @@ def _run_bounded_helper_process(
     cwd: str | bytes | None,
     label: str,
     response_limit: int,
+    owns_process_tree: bool = True,
 ) -> bytes:
     """Run one isolated helper with bounded I/O and proven descendant cleanup."""
 
@@ -3434,26 +3476,30 @@ def _run_bounded_helper_process(
                 stdout=stdout_file,
                 stderr=stderr_file,
                 close_fds=True,
-                start_new_session=(os.name == "posix"),
+                start_new_session=(owns_process_tree and os.name == "posix"),
             )
         except OSError as exc:
             raise SourceBoundaryError(
                 f"{label} could not start: {type(exc).__name__}: {exc}"
             ) from exc
-        try:
-            process_group = _capture_posix_process_group(process)
-        except SourceBoundaryError:
-            process.kill()
-            process.communicate(timeout=_CAPTURE_CLEANUP_SECONDS)
-            raise
+        if owns_process_tree:
+            try:
+                process_group = _capture_posix_process_group(process)
+            except SourceBoundaryError:
+                process.kill()
+                process.communicate(timeout=_CAPTURE_CLEANUP_SECONDS)
+                raise
+        else:
+            process_group = None
         containment: object | None = None
-        try:
-            containment = _attach_capture_helper_containment(process)
-        except OSError as exc:
-            _terminate_capture_helper(process, process_group=process_group)
-            raise SourceBoundaryError(
-                f"{label} containment unavailable: {exc}"
-            ) from exc
+        if owns_process_tree:
+            try:
+                containment = _attach_capture_helper_containment(process)
+            except OSError as exc:
+                _terminate_capture_helper(process, process_group=process_group)
+                raise SourceBoundaryError(
+                    f"{label} containment unavailable: {exc}"
+                ) from exc
         try:
             while process.poll() is None:
                 remaining = _remaining(absolute_deadline)
@@ -3470,7 +3516,9 @@ def _run_bounded_helper_process(
                     )
                 time.sleep(min(0.005, remaining))
             # A coded result is not proof that a Git/FS descendant exited.
-            if os.name == "posix":
+            if not owns_process_tree:
+                pass
+            elif os.name == "posix":
                 if not _signal_capture_helper(
                     process,
                     getattr(signal, "SIGKILL", None),
@@ -3496,11 +3544,14 @@ def _run_bounded_helper_process(
                     f"proof_stale: {label} containment is unavailable"
                 )
         except BaseException:
-            owned_containment = containment
-            containment = None
-            _terminate_capture_helper(
-                process, owned_containment, process_group,
-            )
+            if owns_process_tree:
+                owned_containment = containment
+                containment = None
+                _terminate_capture_helper(
+                    process, owned_containment, process_group,
+                )
+            else:
+                _stop_git_process(process)
             raise
         finally:
             _close_capture_helper_containment(containment)

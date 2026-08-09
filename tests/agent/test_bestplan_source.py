@@ -452,6 +452,154 @@ def test_non_darwin_strong_capture_fails_but_legacy_plan_is_candidate_only(
     assert not marker.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX FIFO/process proof required")
+@pytest.mark.live_system_guard_bypass
+def test_public_legacy_timeout_reaps_git_blocked_on_fifo_index(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    index_path = Path(
+        _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index")
+        .decode("utf-8")
+    )
+    index_path.rename(index_path.with_suffix(".saved"))
+    os.mkfifo(index_path)
+    script = """
+import sys
+import time
+from agent import bestplan_source as source
+
+try:
+    source.capture_legacy_v1_fingerprint(sys.argv[1], time.monotonic() + 0.8)
+except source.ProofStaleError as exc:
+    print(exc.code)
+else:
+    raise AssertionError("FIFO-backed index did not expire")
+"""
+    client = subprocess.Popen(
+        [sys.executable, "-c", script, str(repo)],
+        cwd=Path(__file__).resolve().parents[2],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    git_pid: int | None = None
+
+    def process_snapshot() -> dict[int, tuple[int, str]]:
+        output = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        snapshot: dict[int, tuple[int, str]] = {}
+        for line in output.splitlines():
+            fields = line.strip().split(None, 2)
+            if len(fields) == 3:
+                snapshot[int(fields[0])] = (int(fields[1]), fields[2])
+        return snapshot
+
+    try:
+        observation_deadline = time.monotonic() + 3.0
+        while client.poll() is None and time.monotonic() < observation_deadline:
+            snapshot = process_snapshot()
+            descendants = {client.pid}
+            changed = True
+            while changed:
+                changed = False
+                for pid, (parent_pid, _command) in snapshot.items():
+                    if parent_pid in descendants and pid not in descendants:
+                        descendants.add(pid)
+                        changed = True
+            for pid in descendants:
+                command = snapshot.get(pid, (0, ""))[1]
+                if "/usr/bin/git --no-pager -c core.fsmonitor=false" in command:
+                    git_pid = pid
+                    break
+            if git_pid is not None:
+                break
+            time.sleep(0.01)
+        stdout, stderr = client.communicate(timeout=5.0)
+        assert client.returncode == 0, stderr
+        assert stdout.strip() == "proof_stale"
+        assert git_pid is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(git_pid, 0)
+    finally:
+        if client.poll() is None:
+            client.kill()
+            client.communicate(timeout=2.0)
+        if git_pid is not None:
+            try:
+                os.kill(git_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except ProcessLookupError:
+                pass
+
+
+def _write_filter_marker_script(path: Path, marker: Path, *, passthrough: bool) -> None:
+    tail = "cat\n" if passthrough else "exit 1\n"
+    path.write_text(
+        f"#!/bin/sh\n: > {marker}\n" + tail,
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def test_public_legacy_fingerprint_never_executes_clean_filter(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    marker = tmp_path / "clean-filter-ran"
+    filter_script = tmp_path / "clean-filter"
+    _write_filter_marker_script(filter_script, marker, passthrough=True)
+    (repo / ".gitattributes").write_text("*.txt filter=evil\n", encoding="utf-8")
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-qm", "add filter attributes")
+    _git(repo, "config", "filter.evil.clean", str(filter_script))
+    (repo / "tracked.txt").write_bytes(b"modified worktree bytes\n")
+
+    _workspace, fingerprint = source.capture_legacy_v1_fingerprint(
+        str(repo), time.monotonic() + 5.0,
+    )
+
+    assert fingerprint.startswith("legacy-v1:")
+    assert not marker.exists()
+
+
+def test_public_legacy_fingerprint_ignores_all_conversion_drivers(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    markers = {
+        name: tmp_path / f"{name}-ran"
+        for name in ("clean", "smudge", "process", "textconv")
+    }
+    scripts = {name: tmp_path / name for name in markers}
+    for name, script in scripts.items():
+        _write_filter_marker_script(
+            script, markers[name], passthrough=name != "process",
+        )
+    (repo / ".gitattributes").write_text(
+        "*.txt filter=evil diff=evil\n", encoding="utf-8",
+    )
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-qm", "add conversion attributes")
+    for name in ("clean", "smudge", "process"):
+        _git(repo, "config", f"filter.evil.{name}", str(scripts[name]))
+    _git(repo, "config", "diff.evil.textconv", str(scripts["textconv"]))
+    (repo / "tracked.txt").write_bytes(b"modified worktree bytes\n")
+
+    error = None
+    try:
+        _workspace, fingerprint = source.capture_legacy_v1_fingerprint(
+            str(repo), time.monotonic() + 5.0,
+        )
+    except source.SourceBoundaryError as exc:
+        error = exc
+        fingerprint = ""
+
+    assert error is None
+    assert fingerprint.startswith("legacy-v1:")
+    assert not {name for name, marker in markers.items() if marker.exists()}
+
+
 def test_git_environment_uses_the_verified_platform_helper_path():
     source = _source()
     authority = replace(
@@ -509,6 +657,7 @@ def test_legacy_git_output_caps_stop_a_blocked_producer(
             stream_name,
             deadline=time.monotonic() + 1.5,
             max_output_bytes=1024,
+            owns_process_tree=True,
         )
     elapsed = time.monotonic() - started
 
@@ -551,6 +700,7 @@ def test_legacy_git_timeout_reaps_a_signal_ignoring_descendant(
                 str(child_pid_file),
                 deadline=time.monotonic() + 0.6,
                 max_output_bytes=1024,
+                owns_process_tree=True,
             )
         for pid_file in (leader_pid_file, child_pid_file):
             pid = int(pid_file.read_text(encoding="ascii"))
