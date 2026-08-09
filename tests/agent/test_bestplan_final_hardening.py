@@ -126,14 +126,14 @@ def test_shared_production_ingress_calls_model_only_for_unblocked_turns(tmp_path
     assert calls == ["ordinary", "plan"]
 
 
-def test_ignored_regular_file_fails_closed_and_never_silently_changes_baseline(tmp_path):
+def test_ignored_regular_file_is_not_candidate_input_or_protected_state(tmp_path):
     repo = _git_repo(tmp_path)
     (repo / ".gitignore").write_text("ignored.cfg\n", encoding="utf-8")
     subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-qm", "ignore config"], cwd=repo, check=True)
+    clean = compute_baseline_fingerprint(str(repo))
     (repo / "ignored.cfg").write_text("approved input", encoding="utf-8")
-    with pytest.raises(BaselineFingerprintError, match="ignored regular file"):
-        compute_baseline_fingerprint(str(repo))
+    assert compute_baseline_fingerprint(str(repo)) == clean
 
 
 def test_authoritative_approval_renders_artifacts_and_sandbox_identity(tmp_path):

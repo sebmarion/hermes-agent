@@ -8,8 +8,6 @@ import logging
 import os
 import re
 import sqlite3
-import stat
-import subprocess
 import threading
 import time
 import uuid
@@ -20,6 +18,11 @@ from typing import Any, Callable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.execution_plan import ExecutionPlan, PlanValidationError, compile_execution_plan
+from agent.bestplan_source import (
+    SourceBoundaryError,
+    capture_source_snapshot,
+    resolve_repo_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -235,92 +238,16 @@ def _strip_bestplan_envelope(value: Any) -> str:
 
 
 def compute_baseline_fingerprint(workspace: str) -> str:
-    workspace = _canonical_workspace(workspace)
+    """Compatibility wrapper for the stable Git source/protected-state proof."""
+
     try:
-        root = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"], cwd=workspace,
-            capture_output=True, text=True, timeout=10, check=True,
-        ).stdout.strip()
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=root,
-            capture_output=True, text=True, timeout=10, check=True,
-        ).stdout.strip()
-        tracked_diff = subprocess.run(
-            ["git", "diff", "--binary", "--no-ext-diff", "HEAD", "--"],
-            cwd=root, capture_output=True, timeout=10, check=True,
-        ).stdout
-        untracked_raw = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-            cwd=root, capture_output=True, timeout=10, check=True,
-        ).stdout
-        ignored_raw = subprocess.run(
-            ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
-            cwd=root, capture_output=True, timeout=10, check=True,
-        ).stdout
-        for relative_raw in sorted(part for part in ignored_raw.split(b"\0") if part):
-            ignored = Path(root) / os.fsdecode(relative_raw)
-            try:
-                mode = ignored.lstat().st_mode
-            except FileNotFoundError:
-                continue
-            if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-                raise BaselineFingerprintError(
-                    f"workspace contains ignored regular file omitted by detached worktrees: "
-                    f"{ignored.relative_to(root)}"
-                )
-        # Git intentionally omits sockets/FIFOs/devices from its untracked
-        # listing. Walk only to reject those unsafe baseline inputs; ignored
-        # regular files and symlinks were rejected explicitly above.
-        scanned = 0
-        deadline = time.monotonic() + 10
-        for current, dirnames, filenames in os.walk(
-            workspace,
-            topdown=True,
-            followlinks=False,
-            onerror=lambda exc: (_ for _ in ()).throw(exc),
-        ):
-            if time.monotonic() > deadline:
-                raise BaselineFingerprintError("workspace special-file scan timed out")
-            if Path(current).resolve() == Path(root).resolve():
-                dirnames[:] = [name for name in dirnames if name != ".git"]
-            for name in [*dirnames, *filenames]:
-                scanned += 1
-                if scanned > 100_000:
-                    raise BaselineFingerprintError("workspace special-file scan exceeded 100000 entries")
-                candidate = Path(current) / name
-                mode = candidate.lstat().st_mode
-                if not (
-                    stat.S_ISREG(mode)
-                    or stat.S_ISDIR(mode)
-                    or stat.S_ISLNK(mode)
-                ):
-                    raise BaselineFingerprintError(
-                        f"workspace contains special file: {candidate.relative_to(workspace)}"
-                    )
-        digest = hashlib.sha256()
-        digest.update(f"git:{root}\n{head}\n".encode())
-        digest.update(tracked_diff)
-        for relative_raw in sorted(part for part in untracked_raw.split(b"\0") if part):
-            relative = os.fsdecode(relative_raw)
-            path = Path(root) / relative
-            digest.update(b"\0untracked\0")
-            digest.update(relative_raw)
-            digest.update(b"\0")
-            if path.is_symlink():
-                digest.update(os.fsencode(os.readlink(path)))
-            else:
-                mode = path.lstat().st_mode
-                if not stat.S_ISREG(mode):
-                    raise BaselineFingerprintError(
-                        f"untracked special file cannot be fingerprinted: {relative}"
-                    )
-                digest.update(path.read_bytes())
-        return digest.hexdigest()
-    except BaselineFingerprintError:
-        raise
-    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        repo = resolve_repo_identity(_canonical_workspace(workspace))
+        snapshot = capture_source_snapshot(repo, time.monotonic() + 10.0)
+        return snapshot.fingerprint
+    except SourceBoundaryError as exc:
         raise BaselineFingerprintError(
-            f"strong git baseline unavailable for {workspace}: {type(exc).__name__}: {exc}"
+            f"strong git baseline unavailable for {_canonical_workspace(workspace)}: "
+            f"{exc.code}: {exc}"
         ) from exc
 
 
@@ -564,6 +491,7 @@ class BestplanStore:
 
     def _ensure_schema(self) -> None:
         columns = {
+            "baseline_revision": "TEXT",
             "dispatch_id": "TEXT",
             "dispatch_state": "TEXT",
             "resolved_runtime_json": "TEXT",
@@ -702,6 +630,17 @@ class BestplanStore:
         provisional: bool = False,
     ) -> str:
         workspace = _canonical_workspace(workspace)
+        baseline_revision: str | None = None
+        if not baseline_fingerprint:
+            try:
+                repo = resolve_repo_identity(workspace)
+                snapshot = capture_source_snapshot(repo, time.monotonic() + 10.0)
+            except SourceBoundaryError as exc:
+                raise BaselineFingerprintError(
+                    f"strong git baseline unavailable for {workspace}: {exc.code}: {exc}"
+                ) from exc
+            baseline_fingerprint = snapshot.fingerprint
+            baseline_revision = snapshot.head_oid
         manifest = plan.to_manifest()
         manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
         if raw_envelope is None:
@@ -723,13 +662,13 @@ class BestplanStore:
             conn.execute(
                 """INSERT INTO bestplan_plans (
                     plan_id, version, created_at, session_id, profile, workspace,
-                    baseline_fingerprint, raw_request, raw_plan_json,
+                    baseline_revision, baseline_fingerprint, raw_request, raw_plan_json,
                     validated_manifest_json, state, approval_digest
-                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     plan_id, time.time(), str(session_id),
                     str(_active_profile() if profile is None else profile), workspace,
-                    baseline_fingerprint or compute_baseline_fingerprint(workspace),
+                    baseline_revision, baseline_fingerprint,
                     str(raw_request or ""), raw, manifest_json,
                     PlanState.PROVISIONAL if provisional else PlanState.PENDING,
                     digest,
