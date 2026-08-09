@@ -409,12 +409,26 @@ def validate_runtime(config: dict[str, Any] | None = None, *, credentials_availa
 
 
 def validate_candidate(candidate: Any) -> dict[str, Any]:
-    if not isinstance(candidate, dict) or candidate.get("schema") != "HERMES_BESTPLAN_CANDIDATE_V1":
+    if not isinstance(candidate, dict):
         raise ValueError("invalid BestPlan candidate schema")
-    required = ("summary", "steps", "risks", "verification")
-    if any(not candidate.get(key) for key in required):
+    fields = ("schema", "summary", "steps", "risks", "verification")
+    if set(candidate) != set(fields):
+        raise ValueError("invalid BestPlan candidate fields")
+    if candidate["schema"] != "HERMES_BESTPLAN_CANDIDATE_V1":
+        raise ValueError("invalid BestPlan candidate schema")
+    required = fields[1:]
+    summary = candidate.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
         raise ValueError("incomplete BestPlan candidate")
-    return {key: candidate[key] for key in ("schema", *required)}
+    for key in required[1:]:
+        values = candidate.get(key)
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(not isinstance(value, str) or not value.strip() for value in values)
+        ):
+            raise ValueError("incomplete BestPlan candidate")
+    return {key: candidate[key] for key in fields}
 
 
 def body_sha256(body: str) -> str:
@@ -1239,6 +1253,30 @@ def _codex_bestplan_output_schema() -> dict[str, Any]:
     return schema
 
 
+def _bestplan_candidate_output_schema() -> dict[str, Any]:
+    """Return the host-owned schema shared by structured explorer transports."""
+    string_value = {"type": "string"}
+    string_list = {
+        "type": "array",
+        "items": string_value,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "schema": {
+                "type": "string",
+                "enum": ["HERMES_BESTPLAN_CANDIDATE_V1"],
+            },
+            "summary": string_value,
+            "steps": string_list,
+            "risks": string_list,
+            "verification": string_list,
+        },
+        "required": ["schema", "summary", "steps", "risks", "verification"],
+        "additionalProperties": False,
+    }
+
+
 def _validated_plan_envelope(
     body: str,
     *,
@@ -1934,11 +1972,23 @@ def run_bestplan(
         "inspection. "
         f"{_MINIMUM_CHANGE_CONTRACT}"
         f"The exact workspace is {workspace_hint!r}. "
-        "Return exactly one JSON object prefixed HERMES_BESTPLAN_CANDIDATE_V1 with keys "
-        "schema,summary,steps,risks,verification. Task:\n"
-        + planning_task
-        + "\nStrategy: "
     )
+    structured_candidate_contract = (
+        "Return exactly one raw JSON object matching the provided schema. "
+        "Do not add a marker, Markdown fence, or prose outside the JSON object. "
+    )
+    unstructured_candidate_contract = (
+        "Return exactly one JSON object prefixed HERMES_BESTPLAN_CANDIDATE_V1. "
+    )
+    candidate_fields_contract = (
+        "The JSON object must contain exactly the five fields schema, summary, "
+        "steps, risks, and verification, and no others. "
+        'The JSON field "schema" must equal the literal '
+        '"HERMES_BESTPLAN_CANDIDATE_V1"; '
+        "summary must be a nonblank string; steps, risks, and verification "
+        "must be nonempty arrays of nonblank strings. "
+    )
+    task_and_strategy = "Task:\n" + planning_task + "\nStrategy: "
     explorer_jobs: list[tuple[_ManagedChildRun, str, int]] = []
     for attempt in attempts:
         if attempt["status"] != "pending":
@@ -1964,10 +2014,43 @@ def run_bestplan(
             attempt["status"] = "failed"
             attempt["reason_code"] = "construction_failed"
             continue
+        structured_candidate_output = False
+        if (
+            str(attempt["_runtime"].get("api_mode") or "").strip().lower()
+            == "claude_code"
+        ):
+            child._bestplan_output_schema = _bestplan_candidate_output_schema()
+            structured_candidate_output = True
+        runtime = attempt["_runtime"]
+        if (
+            str(runtime.get("provider") or "").strip().lower() == "novita"
+            and str(runtime.get("model") or "").strip().lower()
+            == "zai-org/glm-5.2"
+            and str(runtime.get("api_mode") or "").strip().lower()
+            == "chat_completions"
+        ):
+            request_overrides = dict(
+                getattr(child, "request_overrides", {}) or {}
+            )
+            request_overrides["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "hermes_bestplan_candidate_v1",
+                    "strict": True,
+                    "schema": _bestplan_candidate_output_schema(),
+                },
+            }
+            child.request_overrides = request_overrides
+            structured_candidate_output = True
+        candidate_contract = (
+            structured_candidate_contract
+            if structured_candidate_output
+            else unstructured_candidate_contract
+        ) + candidate_fields_contract
         explorer_jobs.append(
             (
                 _ManagedChildRun(child),
-                base + attempt["strategy"],
+                base + candidate_contract + task_and_strategy + attempt["strategy"],
                 attempt["index"],
             )
         )

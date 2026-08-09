@@ -349,7 +349,12 @@ class ClaudeCodePlanChild:
         self._stop_requested = threading.Event()
 
     def _command(self) -> list[str]:
-        return [
+        output_schema = getattr(self, "_bestplan_output_schema", None)
+        if output_schema is not None and not isinstance(output_schema, dict):
+            raise ClaudeCodePlanUnavailable(
+                "Claude Code plan output schema must be a JSON object"
+            )
+        command = [
             self.executable,
             "--print",
             "--safe-mode",
@@ -364,12 +369,29 @@ class ClaudeCodePlanChild:
             "--tools",
             _READ_ONLY_TOOLS if self.tools_enabled else "",
             "--output-format",
-            "text",
-            "--model",
-            self.model,
-            "--effort",
-            self.reasoning_effort,
+            "json" if output_schema is not None else "text",
         ]
+        if output_schema is not None:
+            command.extend(
+                [
+                    "--json-schema",
+                    json.dumps(
+                        output_schema,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ]
+            )
+        command.extend(
+            [
+                "--model",
+                self.model,
+                "--effort",
+                self.reasoning_effort,
+            ]
+        )
+        return command
 
     def run_conversation(self, prompt: str) -> dict[str, str]:
         if self._stop_requested.is_set():
@@ -414,6 +436,33 @@ class ClaudeCodePlanChild:
         response = str(stdout or "").strip()
         if not response:
             raise ClaudeCodePlanUnavailable("Claude Code plan turn returned no output")
+        if getattr(self, "_bestplan_output_schema", None) is not None:
+            try:
+                envelope = json.loads(response)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ClaudeCodePlanUnavailable(
+                    "Claude Code plan turn returned invalid structured output"
+                ) from exc
+            structured_output = (
+                envelope.get("structured_output")
+                if isinstance(envelope, dict)
+                else None
+            )
+            if not (
+                isinstance(envelope, dict)
+                and envelope.get("type") == "result"
+                and envelope.get("subtype") == "success"
+                and isinstance(structured_output, dict)
+            ):
+                raise ClaudeCodePlanUnavailable(
+                    "Claude Code plan turn returned invalid structured output"
+                )
+            response = json.dumps(
+                structured_output,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         return {"final_response": response}
 
     def hard_interrupt(self, _message: str | None = None) -> None:

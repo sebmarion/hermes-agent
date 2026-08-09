@@ -89,6 +89,67 @@ def test_candidate_parser_rejects_invalid_schema():
         _candidate_from_text(json.dumps(invalid))
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("summary", ""),
+        ("summary", "   "),
+        ("summary", []),
+        ("summary", 1),
+        ("steps", []),
+        ("steps", "step"),
+        ("steps", [""]),
+        ("steps", ["   "]),
+        ("steps", [1]),
+        ("risks", []),
+        ("risks", "risk"),
+        ("risks", [""]),
+        ("risks", ["   "]),
+        ("risks", [1]),
+        ("verification", []),
+        ("verification", "verify"),
+        ("verification", [""]),
+        ("verification", ["   "]),
+        ("verification", [1]),
+    ],
+)
+def test_candidate_parser_rejects_empty_required_fields(field, value):
+    invalid = json.loads(_candidate_json())
+    invalid[field] = value
+
+    with pytest.raises(ValueError, match="incomplete BestPlan candidate"):
+        _candidate_from_text(json.dumps(invalid))
+
+
+def test_candidate_parser_preserves_validated_return_contract():
+    assert _candidate_from_text(_candidate_json()) == {
+        "schema": "HERMES_BESTPLAN_CANDIDATE_V1",
+        "summary": "ok",
+        "steps": ["step"],
+        "risks": ["risk"],
+        "verification": ["verify"],
+    }
+
+
+@pytest.mark.parametrize(
+    "field", ["schema", "summary", "steps", "risks", "verification"]
+)
+def test_candidate_parser_rejects_missing_fields(field):
+    invalid = json.loads(_candidate_json())
+    del invalid[field]
+
+    with pytest.raises(ValueError):
+        _candidate_from_text(json.dumps(invalid))
+
+
+def test_candidate_parser_rejects_extra_fields():
+    invalid = json.loads(_candidate_json())
+    invalid["extra"] = "not in the wire schema"
+
+    with pytest.raises(ValueError):
+        _candidate_from_text(json.dumps(invalid))
+
+
 def _synth_plan_envelope(*, workspace="/tmp/work", review=False):
     manifest = {
         "version": 1,
@@ -1390,6 +1451,7 @@ def test_codex_synthesizer_alone_gets_schema_and_raw_manifest_contract(
         "reasoning_effort": "ultra",
     }
     explorer_schemas = []
+    explorer_prompts = []
     synth_schemas = []
     synth_prompts = []
     raw_manifest = _synth_plan_envelope(
@@ -1408,6 +1470,7 @@ def test_codex_synthesizer_alone_gets_schema_and_raw_manifest_contract(
                 synth_prompts.append(prompt)
                 return {"final_response": raw_manifest}
             explorer_schemas.append(schema)
+            explorer_prompts.append(prompt)
             return {"final_response": _candidate_text()}
 
         def clear_interrupt(self):
@@ -1433,6 +1496,31 @@ def test_codex_synthesizer_alone_gets_schema_and_raw_manifest_contract(
 
     assert result["status"] == "completed"
     assert explorer_schemas == [None, None, None]
+    assert len(explorer_prompts) == 3
+    assert all(
+        "Return exactly one JSON object prefixed "
+        "HERMES_BESTPLAN_CANDIDATE_V1" in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "raw JSON object matching the provided schema" not in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "summary must be a nonblank string; steps, risks, and verification "
+        "must be nonempty arrays of nonblank strings" in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        'The JSON field "schema" must equal the literal '
+        '"HERMES_BESTPLAN_CANDIDATE_V1"' in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "The JSON object must contain exactly the five fields schema, summary, "
+        "steps, risks, and verification, and no others" in prompt
+        for prompt in explorer_prompts
+    )
     assert len(synth_schemas) == 1
     assert isinstance(synth_schemas[0], dict)
     assert len(synth_prompts) == 1
@@ -1440,6 +1528,237 @@ def test_codex_synthesizer_alone_gets_schema_and_raw_manifest_contract(
     assert "literal markers" not in synth_prompts[0]
     assert result["body"].startswith("<<<HERMES_BESTPLAN_V1>>>\n")
     assert result["body"].endswith("\n<<<END_HERMES_BESTPLAN_V1>>>")
+
+
+def test_claude_explorers_alone_get_candidate_schema(monkeypatch, tmp_path):
+    import agent.bestplan_orchestrator as orchestrator
+
+    lane = {
+        "name": "opus",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "api_mode": "claude_code",
+        "reasoning_effort": "xhigh",
+    }
+    explorer_schemas = []
+    explorer_prompts = []
+    synth_schemas = []
+
+    class FakeClaudeChild:
+        def __init__(self, **_kwargs):
+            self.tools = []
+
+        def run_conversation(self, prompt):
+            schema = getattr(self, "_bestplan_output_schema", None)
+            if "active BestPlan synthesizer" in prompt:
+                synth_schemas.append(schema)
+                return {
+                    "final_response": _synth_plan_envelope(workspace=str(tmp_path))
+                }
+            explorer_schemas.append(schema)
+            explorer_prompts.append(prompt)
+            return {"final_response": _candidate_json()}
+
+        def clear_interrupt(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "agent.claude_code_plan.ClaudeCodePlanChild",
+        FakeClaudeChild,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured, **_kwargs: _identity(configured),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan this release",
+        config=_runtime_config([lane]),
+    )
+
+    assert result["status"] == "completed"
+    assert len(explorer_schemas) == 3
+    assert all(isinstance(schema, dict) for schema in explorer_schemas)
+    assert all(
+        schema["properties"]["schema"]
+        == {
+            "type": "string",
+            "enum": ["HERMES_BESTPLAN_CANDIDATE_V1"],
+        }
+        for schema in explorer_schemas
+    )
+    assert all(
+        schema["required"]
+        == ["schema", "summary", "steps", "risks", "verification"]
+        for schema in explorer_schemas
+    )
+    assert len(explorer_prompts) == 3
+    assert all(
+        "Return exactly one raw JSON object matching the provided schema" in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "Do not add a marker, Markdown fence, or prose outside the JSON object"
+        in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "prefixed HERMES_BESTPLAN_CANDIDATE_V1" not in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "summary must be a nonblank string; steps, risks, and verification "
+        "must be nonempty arrays of nonblank strings" in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        'The JSON field "schema" must equal the literal '
+        '"HERMES_BESTPLAN_CANDIDATE_V1"' in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "The JSON object must contain exactly the five fields schema, summary, "
+        "steps, risks, and verification, and no others" in prompt
+        for prompt in explorer_prompts
+    )
+    assert synth_schemas == [None]
+
+
+def test_novita_glm_explorers_alone_get_strict_candidate_response_format(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    lane = {
+        "name": "glm",
+        "provider": "novita",
+        "model": "zai-org/glm-5.2",
+        "api_mode": "chat_completions",
+        "reasoning_effort": "high",
+    }
+    constructor_overrides = []
+    explorer_formats = []
+    explorer_prompts = []
+    synth_formats = []
+    repair_formats = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.tools = []
+            self.valid_tool_names = set()
+            self.request_overrides = dict(kwargs.get("request_overrides") or {})
+            constructor_overrides.append(dict(self.request_overrides))
+
+        def run_conversation(self, prompt, **_kwargs):
+            response_format = self.request_overrides.get("response_format")
+            if "performing one BestPlan envelope repair" in prompt:
+                repair_formats.append(response_format)
+                return {
+                    "final_response": _synth_plan_envelope(workspace=str(tmp_path))
+                }
+            if "active BestPlan synthesizer" in prompt:
+                synth_formats.append(response_format)
+                return {"final_response": "invalid synthesis"}
+            explorer_formats.append(response_format)
+            explorer_prompts.append(prompt)
+            return {"final_response": _candidate_json()}
+
+        def clear_interrupt(self, **_kwargs):
+            return False
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured, **_kwargs: {
+            "provider": configured["provider"],
+            "requested_provider": configured["provider"],
+            "model": configured["model"],
+            "api_mode": configured["api_mode"],
+            "base_url": "https://novita.invalid/v1",
+            "api_key": "test-key",
+        },
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    result = run_bestplan(
+        SimpleNamespace(session_id="parent"),
+        "plan this release",
+        config=_runtime_config([lane]),
+    )
+
+    expected_schema = {
+        "type": "object",
+        "properties": {
+            "schema": {
+                "type": "string",
+                "enum": ["HERMES_BESTPLAN_CANDIDATE_V1"],
+            },
+            "summary": {"type": "string"},
+            "steps": {"type": "array", "items": {"type": "string"}},
+            "risks": {"type": "array", "items": {"type": "string"}},
+            "verification": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["schema", "summary", "steps", "risks", "verification"],
+        "additionalProperties": False,
+    }
+    expected_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "hermes_bestplan_candidate_v1",
+            "strict": True,
+            "schema": expected_schema,
+        },
+    }
+    assert result["status"] == "completed"
+    assert constructor_overrides and all(not value for value in constructor_overrides)
+    assert explorer_formats == [expected_format, expected_format, expected_format]
+    assert len(explorer_prompts) == 3
+    assert all(
+        "Return exactly one raw JSON object matching the provided schema" in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "Do not add a marker, Markdown fence, or prose outside the JSON object"
+        in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "prefixed HERMES_BESTPLAN_CANDIDATE_V1" not in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "summary must be a nonblank string; steps, risks, and verification "
+        "must be nonempty arrays of nonblank strings" in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        'The JSON field "schema" must equal the literal '
+        '"HERMES_BESTPLAN_CANDIDATE_V1"' in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "The JSON object must contain exactly the five fields schema, summary, "
+        "steps, risks, and verification, and no others" in prompt
+        for prompt in explorer_prompts
+    )
+    assert synth_formats == [None]
+    assert repair_formats == [None]
 
 
 def test_synthesis_uses_only_named_lane_without_failover(monkeypatch, tmp_path):

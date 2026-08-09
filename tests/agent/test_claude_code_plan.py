@@ -311,6 +311,94 @@ print(json.dumps({
     assert argv[argv.index("--output-format") + 1] == "text"
 
 
+def test_plan_child_uses_json_schema_and_extracts_structured_output(tmp_path):
+    argv_path = tmp_path / "argv.json"
+    candidate = {
+        "schema": "HERMES_BESTPLAN_CANDIDATE_V1",
+        "summary": "inspect the release",
+        "steps": ["read the named files"],
+        "risks": ["configuration drift"],
+        "verification": ["run the focused tests"],
+    }
+    output_schema = {
+        "type": "object",
+        "required": ["schema", "summary", "steps", "risks", "verification"],
+        "properties": {
+            "schema": {"const": "HERMES_BESTPLAN_CANDIDATE_V1"},
+            "summary": {"type": "string", "minLength": 1},
+            "steps": {"type": "array", "minItems": 1},
+            "risks": {"type": "array", "minItems": 1},
+            "verification": {"type": "array", "minItems": 1},
+        },
+        "additionalProperties": False,
+    }
+    executable = _write_fake_claude(
+        tmp_path,
+        "import json, pathlib, sys\n"
+        "sys.stdin.read()\n"
+        f"pathlib.Path({str(argv_path)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+        "print(json.dumps({\n"
+        "    'type': 'result',\n"
+        "    'subtype': 'success',\n"
+        f"    'structured_output': {candidate!r},\n"
+        "}))\n",
+    )
+    child = ClaudeCodePlanChild(
+        executable=str(executable),
+        model="claude-opus-5",
+        reasoning_effort="xhigh",
+        workspace=tmp_path,
+    )
+    child._bestplan_output_schema = output_schema
+
+    result = child.run_conversation("return the candidate")
+    argv = json.loads(argv_path.read_text())
+
+    assert json.loads(result["final_response"]) == candidate
+    assert argv[argv.index("--output-format") + 1] == "json"
+    assert json.loads(argv[argv.index("--json-schema") + 1]) == output_schema
+    assert argv[argv.index("--permission-mode") + 1] == "plan"
+    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,WebFetch,WebSearch"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "not-json",
+        json.dumps({"type": "result", "subtype": "success"}),
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "structured_output": [],
+            }
+        ),
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_max_structured_output_retries",
+                "structured_output": {"schema": "HERMES_BESTPLAN_CANDIDATE_V1"},
+            }
+        ),
+    ],
+)
+def test_plan_child_rejects_invalid_structured_output_envelope(tmp_path, stdout):
+    executable = _write_fake_claude(tmp_path, f"print({stdout!r})\n")
+    child = ClaudeCodePlanChild(
+        executable=str(executable),
+        model="claude-fable-5",
+        reasoning_effort="xhigh",
+        workspace=tmp_path,
+    )
+    child._bestplan_output_schema = {"type": "object"}
+
+    with pytest.raises(
+        ClaudeCodePlanUnavailable,
+        match="turn returned invalid structured output",
+    ):
+        child.run_conversation("return the candidate")
+
+
 def test_plan_repair_child_disables_every_tool(tmp_path):
     executable = _write_fake_claude(
         tmp_path,
@@ -575,7 +663,10 @@ def test_plan_child_tears_down_stdio_detached_descendant_after_cli_return(
                 child.run_conversation("wait")
         else:
             assert child.run_conversation("wait") == {"final_response": "finished"}
-        assert 1.5 <= time.monotonic() - started < 4
+        # Cleanup is bounded by a 2s grace plus two 1s signal waits. Leave a
+        # full scheduler-jitter margin so the parallel test runner does not
+        # turn that four-second implementation bound into a flaky assertion.
+        assert 1.5 <= time.monotonic() - started < 6
         _assert_heartbeat_stopped(heartbeat)
     finally:
         if process_group.exists():
