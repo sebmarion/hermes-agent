@@ -2017,15 +2017,15 @@ def run_bestplan(
         structured_candidate_output = False
         if (
             str(attempt["_runtime"].get("api_mode") or "").strip().lower()
-            == "claude_code"
+            in {"claude_code", "codex_app_server"}
         ):
             child._bestplan_output_schema = _bestplan_candidate_output_schema()
             structured_candidate_output = True
         runtime = attempt["_runtime"]
+        novita_model = str(runtime.get("model") or "").strip().lower()
         if (
             str(runtime.get("provider") or "").strip().lower() == "novita"
-            and str(runtime.get("model") or "").strip().lower()
-            in {
+            and novita_model in {
                 "deepseek/deepseek-v4-flash-0731",
                 "zai-org/glm-5.2",
             }
@@ -2035,14 +2035,17 @@ def run_bestplan(
             request_overrides = dict(
                 getattr(child, "request_overrides", {}) or {}
             )
-            request_overrides["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "hermes_bestplan_candidate_v1",
-                    "strict": True,
-                    "schema": _bestplan_candidate_output_schema(),
-                },
-            }
+            if novita_model == "deepseek/deepseek-v4-flash-0731":
+                request_overrides["response_format"] = {"type": "json_object"}
+            else:
+                request_overrides["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "hermes_bestplan_candidate_v1",
+                        "strict": True,
+                        "schema": _bestplan_candidate_output_schema(),
+                    },
+                }
             child.request_overrides = request_overrides
             structured_candidate_output = True
         candidate_contract = (

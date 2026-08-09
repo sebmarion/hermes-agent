@@ -1437,7 +1437,7 @@ def test_codex_raw_manifest_is_host_canonicalized_and_v1_validated():
     ) is None
 
 
-def test_codex_synthesizer_alone_gets_schema_and_raw_manifest_contract(
+def test_codex_explorers_and_synthesizer_get_their_own_output_schemas(
     monkeypatch, tmp_path
 ):
     import agent.bestplan_orchestrator as orchestrator
@@ -1495,15 +1495,33 @@ def test_codex_synthesizer_alone_gets_schema_and_raw_manifest_contract(
     )
 
     assert result["status"] == "completed"
-    assert explorer_schemas == [None, None, None]
+    assert len(explorer_schemas) == 3
+    assert all(isinstance(schema, dict) for schema in explorer_schemas)
+    assert all(
+        schema["properties"]["schema"]
+        == {
+            "type": "string",
+            "enum": ["HERMES_BESTPLAN_CANDIDATE_V1"],
+        }
+        for schema in explorer_schemas
+    )
+    assert all(
+        schema["required"]
+        == ["schema", "summary", "steps", "risks", "verification"]
+        for schema in explorer_schemas
+    )
     assert len(explorer_prompts) == 3
     assert all(
-        "Return exactly one JSON object prefixed "
-        "HERMES_BESTPLAN_CANDIDATE_V1" in prompt
+        "Return exactly one raw JSON object matching the provided schema" in prompt
         for prompt in explorer_prompts
     )
     assert all(
-        "raw JSON object matching the provided schema" not in prompt
+        "Do not add a marker, Markdown fence, or prose outside the JSON object"
+        in prompt
+        for prompt in explorer_prompts
+    )
+    assert all(
+        "prefixed HERMES_BESTPLAN_CANDIDATE_V1" not in prompt
         for prompt in explorer_prompts
     )
     assert all(
@@ -1632,11 +1650,27 @@ def test_claude_explorers_alone_get_candidate_schema(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "model",
-    ["zai-org/glm-5.2", "deepseek/deepseek-v4-flash-0731"],
+    ("model", "expected_response_format"),
+    [
+        (
+            "zai-org/glm-5.2",
+            {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "hermes_bestplan_candidate_v1",
+                    "strict": True,
+                    "schema": "candidate_schema",
+                },
+            },
+        ),
+        (
+            "deepseek/deepseek-v4-flash-0731",
+            {"type": "json_object"},
+        ),
+    ],
 )
-def test_novita_chat_completion_explorers_alone_get_strict_candidate_response_format(
-    monkeypatch, tmp_path, model
+def test_novita_chat_completion_explorers_use_model_supported_candidate_response_format(
+    monkeypatch, tmp_path, model, expected_response_format
 ):
     import agent.bestplan_orchestrator as orchestrator
     import run_agent
@@ -1721,14 +1755,10 @@ def test_novita_chat_completion_explorers_alone_get_strict_candidate_response_fo
         "required": ["schema", "summary", "steps", "risks", "verification"],
         "additionalProperties": False,
     }
-    expected_format = {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "hermes_bestplan_candidate_v1",
-            "strict": True,
-            "schema": expected_schema,
-        },
-    }
+    expected_format = dict(expected_response_format)
+    if "json_schema" in expected_format:
+        expected_format["json_schema"] = dict(expected_format["json_schema"])
+        expected_format["json_schema"]["schema"] = expected_schema
     assert result["status"] == "completed"
     assert constructor_overrides and all(not value for value in constructor_overrides)
     assert explorer_formats == [expected_format, expected_format, expected_format]
