@@ -37,6 +37,7 @@ _MAX_GIT_STDERR_BYTES = 1024 * 1024
 _MAX_GIT_INPUT_BYTES = 64 * 1024 * 1024
 _MAX_HELPER_RESPONSE_BYTES = 256 * 1024 * 1024
 _MAX_AUTHORITY_RESPONSE_BYTES = 64 * 1024
+_MAX_LEGACY_V1_RESPONSE_BYTES = 64 * 1024
 _MAX_DIFF_BYTES = 256 * 1024 * 1024
 _MAX_PATH_BYTES = 4096
 _MAX_TOTAL_PATH_BYTES = 64 * 1024 * 1024
@@ -205,13 +206,64 @@ class _CaptureChanged(RuntimeError):
     pass
 
 
-def _git_environment() -> dict[str, str]:
+def strong_source_capture_supported(
+    *, os_name: str | None = None, platform: str | None = None,
+) -> bool:
+    """Return whether the N-1 strong source verifier exists on this host."""
+
+    return (
+        (os.name if os_name is None else os_name) == "posix"
+        and (sys.platform if platform is None else platform) == "darwin"
+    )
+
+
+def _legacy_v1_git_path(
+    *, os_name: str | None = None, platform: str | None = None,
+) -> str:
+    """Return the fixed Git path used only by candidate-only legacy V1 proofs."""
+
+    host_os = os.name if os_name is None else os_name
+    host_platform = sys.platform if platform is None else platform
+    if host_os == "posix" and (
+        host_platform == "darwin" or host_platform.startswith("linux")
+    ):
+        return "/usr/bin/git"
+    if host_os == "nt" and host_platform.startswith("win"):
+        return r"C:\Program Files\Git\cmd\git.exe"
+    raise SourceBoundaryError(
+        "legacy V1 source fingerprinting is unsupported on this host"
+    )
+
+
+def _legacy_v1_helper_environment() -> dict[str, str]:
+    environment = {
+        key: os.environ[key]
+        for key in ("TEMP", "TMP", "TMPDIR")
+        if key in os.environ
+    }
+    if os.name == "posix":
+        environment["PATH"] = "/usr/bin:/bin"
+    else:
+        environment["PATH"] = os.pathsep.join((
+            r"C:\Program Files\Git\cmd",
+            r"C:\Program Files\Git\bin",
+            r"C:\Windows\System32",
+        ))
+        environment["SYSTEMROOT"] = r"C:\Windows"
+    environment.update({"LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"})
+    return environment
+
+
+def _git_environment(
+    authority: _CaptureAuthority | None = None,
+) -> dict[str, str]:
+    authority = _get_capture_authority() if authority is None else authority
     allowed = ("HOME", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "XDG_CONFIG_HOME")
     env = {key: os.environ[key] for key in allowed if key in os.environ}
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["LC_ALL"] = "C"
-    env["PATH"] = "/usr/bin:/bin"
+    env["PATH"] = authority.helper_path
     return env
 
 
@@ -317,7 +369,7 @@ def _run_git_output(
         process = subprocess.Popen(
             _trusted_git_argv(authority, tuple(args)),
             cwd=cwd,
-            env=_git_environment(),
+            env=_git_environment(authority),
             stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
             stdout=stdout_file,
             stderr=stderr_file,
@@ -676,7 +728,6 @@ elif isinstance(expected, dict):
     git_path = decode_path(expected["git"]["path"], "expected Git path")
 else:
     fail("invalid expected authority identity")
-
 result = {
     "module": stable_identity(module_path, False, False),
     "interpreter": stable_identity(interpreter_path, True, False),
@@ -685,6 +736,46 @@ result = {
 if expected is not None and result != expected:
     fail("trusted capture authority identity changed")
 sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")))
+sys.stdout.flush()
+"""
+
+
+_LEGACY_V1_HELPER_BOOTSTRAP = r"""
+import importlib.util
+import json
+import sys
+import time
+
+request = json.loads(sys.stdin.buffer.read(65537).decode("utf-8"))
+spec = importlib.util.spec_from_file_location("agent.bestplan_source", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+try:
+    deadline = time.monotonic() + float(request["budget"])
+    if request["operation"] == "fingerprint":
+        result = module._capture_legacy_v1_in_process(
+            request["workspace"], deadline,
+        )
+    elif request["operation"] == "inspect":
+        result = module._inspect_workspace_boundary_in_process(
+            request["workspace"], deadline,
+        )
+    else:
+        raise module.SourceBoundaryError("unsupported legacy V1 operation")
+    payload = {"ok": True, "result": result}
+except module.SourceBoundaryError as exc:
+    payload = {"ok": False, "code": exc.code, "message": str(exc)}
+except BaseException as exc:
+    payload = {
+        "ok": False,
+        "code": "source_unavailable",
+        "message": "legacy V1 helper failed closed: "
+        + type(exc).__name__
+        + ": "
+        + str(exc),
+    }
+sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 sys.stdout.flush()
 """
 
@@ -1167,15 +1258,299 @@ def _resolve_repo_identity(workspace: str, deadline: float) -> RepoIdentity:
     )
 
 
+def _inspect_workspace_boundary_in_process(
+    workspace: str, deadline: float,
+) -> tuple[str, bool]:
+    """Canonicalize a legacy hint and conservatively detect a Git boundary."""
+
+    workspace_raw = _canonical_raw(workspace or os.getcwd())
+    _remaining(deadline)
+    directory = workspace_raw
+    while True:
+        _remaining(deadline)
+        try:
+            os.lstat(os.path.join(directory, b".git"))
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError:
+            return os.fsdecode(workspace_raw), True
+        else:
+            _remaining(deadline)
+            return os.fsdecode(workspace_raw), True
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+
+    try:
+        _remaining(deadline)
+        head = os.stat(os.path.join(workspace_raw, b"HEAD"))
+        _remaining(deadline)
+        objects = os.stat(os.path.join(workspace_raw, b"objects"))
+        _remaining(deadline)
+    except (FileNotFoundError, NotADirectoryError):
+        has_bare_boundary = False
+    except OSError:
+        has_bare_boundary = True
+    else:
+        has_bare_boundary = stat.S_ISREG(head.st_mode) and stat.S_ISDIR(
+            objects.st_mode,
+        )
+    return os.fsdecode(workspace_raw), has_bare_boundary
+
+
+def _run_legacy_v1_git_output(
+    cwd: bytes,
+    *args: str,
+    deadline: float,
+    max_output_bytes: int,
+    digest_only: bool = False,
+) -> bytes | str:
+    """Run fixed-path Git inside the already isolated legacy helper process."""
+
+    environment = _legacy_v1_helper_environment()
+    environment.update({
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+    })
+    output = _run_bounded_helper_process(
+        [
+            _legacy_v1_git_path(),
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            *args,
+        ],
+        environment,
+        b"",
+        deadline,
+        cwd=cwd,
+        label="legacy V1 Git command",
+        response_limit=max_output_bytes,
+    )
+    if digest_only:
+        return _sha256_bytes(output, deadline=deadline)
+    return output
+
+
+def _capture_legacy_v1_in_process(
+    workspace: str, deadline: float,
+) -> dict[str, str]:
+    """Capture a bounded candidate-only fingerprint without scanning ignored trees."""
+
+    workspace_raw = _canonical_raw(workspace or os.getcwd())
+    if not os.path.isdir(workspace_raw):
+        raise SourceBoundaryError("legacy V1 workspace is not a directory")
+    root_output = _run_legacy_v1_git_output(
+        workspace_raw,
+        "rev-parse",
+        "--path-format=absolute",
+        "--show-toplevel",
+        deadline=deadline,
+        max_output_bytes=_MAX_PATH_BYTES + 2,
+    )
+    assert isinstance(root_output, bytes)
+    root_value = _without_delimiter(root_output)
+    if not root_value or b"\0" in root_value or b"\n" in root_value:
+        raise SourceBoundaryError("legacy V1 Git root is malformed")
+    root_raw = os.path.realpath(root_value)
+    head_output = _run_legacy_v1_git_output(
+        root_raw,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        deadline=deadline,
+        max_output_bytes=128,
+    )
+    assert isinstance(head_output, bytes)
+    head = _without_delimiter(head_output)
+    if (
+        len(head) not in {40, 64}
+        or any(character not in b"0123456789abcdef" for character in head)
+    ):
+        raise SourceBoundaryError("legacy V1 Git HEAD is malformed")
+    diff_flags = (
+        "--binary",
+        "--full-index",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-color",
+    )
+    staged = _run_legacy_v1_git_output(
+        root_raw,
+        "diff",
+        "--cached",
+        *diff_flags,
+        "--",
+        deadline=deadline,
+        max_output_bytes=_MAX_DIFF_BYTES,
+        digest_only=True,
+    )
+    unstaged = _run_legacy_v1_git_output(
+        root_raw,
+        "diff",
+        *diff_flags,
+        "--",
+        deadline=deadline,
+        max_output_bytes=_MAX_DIFF_BYTES,
+        digest_only=True,
+    )
+    untracked_output = _run_legacy_v1_git_output(
+        root_raw,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        deadline=deadline,
+        max_output_bytes=_MAX_GIT_METADATA_BYTES,
+    )
+    assert isinstance(staged, str) and isinstance(unstaged, str)
+    assert isinstance(untracked_output, bytes)
+    if untracked_output and not untracked_output.endswith(b"\0"):
+        raise SourceBoundaryError("legacy V1 untracked path output is malformed")
+    paths = () if not untracked_output else tuple(untracked_output[:-1].split(b"\0"))
+    if (
+        len(paths) > _MAX_PROTECTED_PATHS
+        or sum(len(path) for path in paths) > _MAX_TOTAL_PATH_BYTES
+    ):
+        raise UnsupportedRepositoryError(
+            "legacy V1 path metadata exceeds the trusted limit"
+        )
+    legacy_repo = RepoIdentity(
+        workspace=os.fsdecode(root_raw),
+        workspace_raw=root_raw,
+        worktree=os.fsdecode(root_raw),
+        worktree_raw=root_raw,
+        git_dir="",
+        git_dir_raw=b"",
+        common_dir="",
+        common_dir_raw=b"",
+        common_dir_device=0,
+        common_dir_inode=0,
+        object_format="sha1",
+        repository_id="legacy-v1",
+    )
+    digest = hashlib.sha256()
+    for value in (
+        b"bestplan-legacy-v1",
+        root_raw,
+        head,
+        staged.encode("ascii"),
+        unstaged.encode("ascii"),
+    ):
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    total_size = 0
+    for path in sorted(paths):
+        _remaining(deadline)
+        if len(path) > _MAX_PATH_BYTES:
+            raise UnsupportedRepositoryError(
+                "legacy V1 path exceeds the trusted limit"
+            )
+        captured = _capture_path(
+            legacy_repo, path, tracked=False, deadline=deadline,
+        )
+        total_size += captured.size or 0
+        if total_size > _MAX_EXPORT_BYTES:
+            raise UnsupportedRepositoryError(
+                "legacy V1 content exceeds the trusted limit"
+            )
+        for value in (
+            captured.path,
+            captured.kind.encode("ascii"),
+            str(captured.mode or 0).encode("ascii"),
+            (captured.content_sha256 or "").encode("ascii"),
+            captured.symlink_target or b"",
+        ):
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+    return {
+        "workspace": os.fsdecode(root_raw),
+        "fingerprint": "legacy-v1:" + digest.hexdigest(),
+    }
+
+
 def resolve_repo_identity(workspace: str) -> RepoIdentity:
     """Resolve one worktree and its shared repository identity losslessly."""
 
     deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
     authority = _verify_public_authority(deadline=deadline)
     try:
-        return _resolve_repo_identity(workspace, deadline)
+        resolved = _run_source_helper(
+            authority, "resolve", str(workspace), deadline,
+        )
     finally:
         _verify_public_authority_after(authority, deadline=deadline)
+    if not isinstance(resolved, RepoIdentity):
+        raise SourceBoundaryError(
+            "trusted capture helper returned an invalid repository identity"
+        )
+    return resolved
+
+
+def inspect_workspace_boundary(
+    workspace: str, deadline: float,
+) -> tuple[str, bool]:
+    """Resolve a legacy workspace and inspect Git markers in the bounded helper."""
+
+    absolute_deadline = float(deadline)
+    authority = _verify_public_authority(deadline=absolute_deadline)
+    try:
+        result = _run_source_helper(
+            authority, "inspect_boundary", str(workspace), absolute_deadline,
+        )
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], str)
+            or not isinstance(result[1], bool)
+        ):
+            raise SourceBoundaryError(
+                "trusted capture helper returned an invalid workspace inspection"
+            )
+        return result
+    finally:
+        _verify_public_authority_after(authority, deadline=absolute_deadline)
+
+
+def capture_legacy_v1_fingerprint(
+    workspace: str, deadline: float,
+) -> tuple[str, str]:
+    """Return an explicitly untrusted, candidate-only legacy V1 proof."""
+
+    result = _run_legacy_v1_helper("fingerprint", workspace, float(deadline))
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"workspace", "fingerprint"}
+        or not isinstance(result["workspace"], str)
+        or not isinstance(result["fingerprint"], str)
+        or not result["fingerprint"].startswith("legacy-v1:")
+    ):
+        raise SourceBoundaryError(
+            "legacy V1 helper returned an invalid fingerprint"
+        )
+    return result["workspace"], result["fingerprint"]
+
+
+def inspect_legacy_v1_workspace(
+    workspace: str, deadline: float,
+) -> tuple[str, bool]:
+    """Inspect a legacy workspace without claiming a trusted source proof."""
+
+    result = _run_legacy_v1_helper("inspect", workspace, float(deadline))
+    if (
+        not isinstance(result, list)
+        or len(result) != 2
+        or not isinstance(result[0], str)
+        or not isinstance(result[1], bool)
+    ):
+        raise SourceBoundaryError(
+            "legacy V1 helper returned an invalid workspace inspection"
+        )
+    return result[0], result[1]
 
 
 def _same_repository(expected: RepoIdentity, actual: RepoIdentity) -> bool:
@@ -2635,11 +3010,19 @@ if child_authority.implementation_sha256 != expected_identity:
     raise RuntimeError("trusted BestPlan capture executable binding mismatch")
 
 try:
-    request_identity, repo, remaining_budget = pickle.loads(sys.stdin.buffer.read())
+    request = pickle.loads(sys.stdin.buffer.read())
+    if isinstance(request, tuple) and len(request) == 3:
+        request_identity, request_value, remaining_budget = request
+        operation = "capture"
+    elif isinstance(request, tuple) and len(request) == 4:
+        request_identity, operation, request_value, remaining_budget = request
+    else:
+        raise module.SourceBoundaryError(
+            "trusted capture helper request is malformed"
+        )
     if (
         request_identity != expected_identity
         or child_authority.implementation_sha256 != expected_identity
-        or not isinstance(repo, module.RepoIdentity)
     ):
         raise module.SourceBoundaryError(
             "trusted capture helper implementation identity mismatch"
@@ -2650,8 +3033,21 @@ try:
             "proof_stale: source capture deadline expired before helper startup"
         )
     child_deadline = module.time.monotonic() + remaining_budget
-    snapshot = module._capture_source_snapshot_in_process(repo, child_deadline)
-    payload = ("ok", expected_identity, snapshot)
+    if operation == "capture" and isinstance(request_value, module.RepoIdentity):
+        result = module._capture_source_snapshot_in_process(
+            request_value, child_deadline,
+        )
+    elif operation == "resolve" and isinstance(request_value, str):
+        result = module._resolve_repo_identity(request_value, child_deadline)
+    elif operation == "inspect_boundary" and isinstance(request_value, str):
+        result = module._inspect_workspace_boundary_in_process(
+            request_value, child_deadline,
+        )
+    else:
+        raise module.SourceBoundaryError(
+            "trusted capture helper operation is unsupported"
+        )
+    payload = ("ok", expected_identity, result)
 except module.SourceBoundaryError as exc:
     payload = (
         "error",
@@ -2997,31 +3393,44 @@ def _raise_capture_helper_error(
     raise SourceBoundaryError(message, code=code)
 
 
-def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapshot:
-    """Capture in an isolated, deadline-killable trusted helper process."""
+
+
+def _run_bounded_helper_process(
+    argv: list[str],
+    environment: dict[str, str],
+    request: bytes,
+    deadline: float,
+    *,
+    cwd: str | bytes | None,
+    label: str,
+    response_limit: int,
+) -> bytes:
+    """Run one isolated helper with bounded I/O and proven descendant cleanup."""
 
     absolute_deadline = float(deadline)
-    authority = _verify_public_authority(deadline=absolute_deadline)
-    remaining_budget = _remaining(absolute_deadline)
-    request = pickle.dumps(
-        (authority.implementation_sha256, repo, remaining_budget), protocol=5,
-    )
     _remaining(absolute_deadline)
+    if len(request) > _MAX_GIT_INPUT_BYTES:
+        raise UnsupportedRepositoryError(f"{label} request exceeds the trusted limit")
     try:
+        stdin_file = tempfile.TemporaryFile()
         stdout_file = tempfile.TemporaryFile()
         stderr_file = tempfile.TemporaryFile()
     except OSError as exc:
         raise SourceBoundaryError(
-            f"trusted capture helper output could not be isolated: "
+            f"{label} output could not be isolated: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
     try:
+        for offset in range(0, len(request), _BUFFER_SIZE):
+            _remaining(absolute_deadline)
+            stdin_file.write(request[offset:offset + _BUFFER_SIZE])
+        stdin_file.seek(0)
         try:
             process = subprocess.Popen(
-                _capture_helper_argv(authority),
-                cwd=os.sep,
-                env=_capture_helper_environment(authority),
-                stdin=subprocess.PIPE,
+                argv,
+                cwd=cwd,
+                env=environment,
+                stdin=stdin_file,
                 stdout=stdout_file,
                 stderr=stderr_file,
                 close_fds=True,
@@ -3029,8 +3438,7 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
             )
         except OSError as exc:
             raise SourceBoundaryError(
-                f"trusted capture helper could not start: "
-                f"{type(exc).__name__}: {exc}"
+                f"{label} could not start: {type(exc).__name__}: {exc}"
             ) from exc
         try:
             process_group = _capture_posix_process_group(process)
@@ -3044,19 +3452,23 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
         except OSError as exc:
             _terminate_capture_helper(process, process_group=process_group)
             raise SourceBoundaryError(
-                f"trusted capture helper containment unavailable: {exc}"
+                f"{label} containment unavailable: {exc}"
             ) from exc
         try:
-            try:
-                timeout = _remaining(absolute_deadline)
-            except SourceBoundaryError:
-                raise
-            try:
-                process.communicate(input=request, timeout=timeout)
-            except subprocess.TimeoutExpired as exc:
-                raise ProofStaleError(
-                    "proof_stale: trusted capture helper exceeded the source deadline"
-                ) from exc
+            while process.poll() is None:
+                remaining = _remaining(absolute_deadline)
+                if os.fstat(stdout_file.fileno()).st_size > response_limit:
+                    raise UnsupportedRepositoryError(
+                        f"{label} response exceeds the trusted limit"
+                    )
+                if (
+                    os.fstat(stderr_file.fileno()).st_size
+                    > _MAX_GIT_STDERR_BYTES
+                ):
+                    raise UnsupportedRepositoryError(
+                        f"{label} stderr exceeds the trusted limit"
+                    )
+                time.sleep(min(0.005, remaining))
             # A coded result is not proof that a Git/FS descendant exited.
             if os.name == "posix":
                 if not _signal_capture_helper(
@@ -3066,11 +3478,11 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
                     process_group=process_group,
                 ):
                     raise ProofStaleError(
-                        "proof_stale: capture helper process group cleanup failed"
+                        f"proof_stale: {label} process group cleanup failed"
                     )
                 if process_group is None:
                     raise ProofStaleError(
-                        "proof_stale: capture helper process group ownership was lost"
+                        f"proof_stale: {label} process group ownership was lost"
                     )
                 _wait_for_posix_group_extinction(process_group)
             elif containment is not None:
@@ -3081,7 +3493,7 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
                     containment = None
             else:
                 raise ProofStaleError(
-                    "proof_stale: capture helper containment is unavailable"
+                    f"proof_stale: {label} containment is unavailable"
                 )
         except BaseException:
             owned_containment = containment
@@ -3094,49 +3506,148 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
             _close_capture_helper_containment(containment)
 
         _remaining(absolute_deadline)
-        _verify_capture_authority(authority, deadline=absolute_deadline)
         output = _read_bounded_file(
             stdout_file,
-            limit=_MAX_HELPER_RESPONSE_BYTES,
-            label="trusted capture helper response",
+            limit=response_limit,
+            label=f"{label} response",
             deadline=absolute_deadline,
             digest_only=False,
         )
         stderr = _read_bounded_file(
             stderr_file,
             limit=_MAX_GIT_STDERR_BYTES,
-            label="trusted capture helper stderr",
+            label=f"{label} stderr",
             deadline=absolute_deadline,
             digest_only=False,
         )
         assert isinstance(output, bytes) and isinstance(stderr, bytes)
         if process.returncode != 0:
             detail = os.fsdecode(stderr[-4096:]).strip() or f"exit {process.returncode}"
-            raise SourceBoundaryError(f"trusted capture helper failed: {detail}")
-        try:
-            payload = pickle.loads(output)
-        except (EOFError, pickle.PickleError, AttributeError, ValueError) as exc:
-            raise SourceBoundaryError(
-                "trusted capture helper returned an invalid response"
-            ) from exc
-        _remaining(absolute_deadline)
-        if not isinstance(payload, tuple) or len(payload) < 3:
-            raise SourceBoundaryError(
-                "trusted capture helper returned a malformed response"
+            raise SourceBoundaryError(f"{label} failed: {detail}")
+        return output
+    finally:
+        stdin_file.close()
+        stdout_file.close()
+        stderr_file.close()
+
+
+def _run_source_helper(
+    authority: _CaptureAuthority,
+    operation: str,
+    request_value: object,
+    deadline: float,
+) -> object:
+    """Run one source operation in the isolated, deadline-owned helper."""
+
+    absolute_deadline = float(deadline)
+    request = pickle.dumps(
+        (
+            authority.implementation_sha256,
+            operation,
+            request_value,
+            _remaining(absolute_deadline),
+        ),
+        protocol=5,
+    )
+    output = _run_bounded_helper_process(
+        _capture_helper_argv(authority),
+        _capture_helper_environment(authority),
+        request,
+        absolute_deadline,
+        # Relative workspace hints are resolved inside the bounded helper
+        # against the kernel-inherited cwd.
+        cwd=None if operation in {"resolve", "inspect_boundary"} else os.sep,
+        label="trusted capture helper",
+        response_limit=_MAX_HELPER_RESPONSE_BYTES,
+    )
+    _verify_capture_authority(authority, deadline=absolute_deadline)
+    try:
+        payload = pickle.loads(output)
+    except (EOFError, pickle.PickleError, AttributeError, ValueError) as exc:
+        raise SourceBoundaryError(
+            "trusted capture helper returned an invalid response"
+        ) from exc
+    _remaining(absolute_deadline)
+    if not isinstance(payload, tuple) or len(payload) < 3:
+        raise SourceBoundaryError(
+            "trusted capture helper returned a malformed response"
+        )
+    status, identity, *fields = payload
+    if identity != authority.implementation_sha256:
+        raise SourceBoundaryError(
+            "trusted capture helper response identity mismatch"
+        )
+    if status == "error" and len(fields) == 3:
+        class_name, code, message = fields
+        _raise_capture_helper_error(str(class_name), str(code), str(message))
+    if status != "ok" or len(fields) != 1:
+        raise SourceBoundaryError(
+            "trusted capture helper returned a malformed result"
+        )
+    return fields[0]
+
+
+def _run_legacy_v1_helper(
+    operation: str, workspace: str, deadline: float,
+) -> object:
+    """Run the candidate-only legacy proof in the shared bounded container."""
+
+    absolute_deadline = float(deadline)
+    request = json.dumps(
+        {
+            "operation": operation,
+            "workspace": str(workspace),
+            "budget": _remaining(absolute_deadline),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    output = _run_bounded_helper_process(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _LEGACY_V1_HELPER_BOOTSTRAP,
+            __file__,
+        ],
+        _legacy_v1_helper_environment(),
+        request,
+        absolute_deadline,
+        cwd=None,
+        label="legacy V1 source helper",
+        response_limit=_MAX_LEGACY_V1_RESPONSE_BYTES,
+    )
+    try:
+        payload = json.loads(output.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceBoundaryError(
+            "legacy V1 helper returned an invalid response"
+        ) from exc
+    if not isinstance(payload, dict) or set(payload) != {"ok", "result"}:
+        if isinstance(payload, dict) and set(payload) == {"ok", "code", "message"}:
+            _raise_capture_helper_error(
+                "", str(payload["code"]), str(payload["message"]),
             )
-        status, identity, *fields = payload
-        if identity != authority.implementation_sha256:
-            raise SourceBoundaryError(
-                "trusted capture helper response identity mismatch"
-            )
-        if status == "error" and len(fields) == 3:
-            class_name, code, message = fields
-            _raise_capture_helper_error(str(class_name), str(code), str(message))
-        if status != "ok" or len(fields) != 1:
-            raise SourceBoundaryError(
-                "trusted capture helper returned a malformed result"
-            )
-        snapshot = fields[0]
+        raise SourceBoundaryError(
+            "legacy V1 helper returned a malformed response"
+        )
+    if payload["ok"] is not True:
+        raise SourceBoundaryError(
+            "legacy V1 helper returned a malformed result"
+        )
+    return payload["result"]
+
+
+def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapshot:
+    """Capture in an isolated, deadline-killable trusted helper process."""
+
+    absolute_deadline = float(deadline)
+    authority = _verify_public_authority(deadline=absolute_deadline)
+    try:
+        snapshot = _run_source_helper(
+            authority, "capture", repo, absolute_deadline,
+        )
         if (
             not isinstance(snapshot, SourceSnapshot)
             or snapshot.repo != repo
@@ -3148,8 +3659,7 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
             )
         return snapshot
     finally:
-        stdout_file.close()
-        stderr_file.close()
+        _verify_public_authority_after(authority, deadline=absolute_deadline)
 
 
 def recapture_matches(
@@ -3163,13 +3673,33 @@ def recapture_matches(
         else float(deadline)
     )
     try:
-        actual_repo = _resolve_repo_identity(expected.repo.workspace, absolute_deadline)
-        if not _same_repository(expected.repo, actual_repo):
-            return False
-        actual = capture_source_snapshot(actual_repo, absolute_deadline)
+        authority = _verify_public_authority(deadline=absolute_deadline)
     except SourceBoundaryError:
         return False
-    return actual == expected
+    matches = False
+    try:
+        try:
+            actual_repo = _run_source_helper(
+                authority,
+                "resolve",
+                expected.repo.workspace,
+                absolute_deadline,
+            )
+            if not isinstance(actual_repo, RepoIdentity):
+                raise SourceBoundaryError(
+                    "trusted capture helper returned an invalid repository identity"
+                )
+            if _same_repository(expected.repo, actual_repo):
+                actual = capture_source_snapshot(actual_repo, absolute_deadline)
+                matches = actual == expected
+        except SourceBoundaryError:
+            matches = False
+    finally:
+        try:
+            _verify_public_authority_after(authority, deadline=absolute_deadline)
+        except SourceBoundaryError:
+            matches = False
+    return matches
 
 
 def _path_is_within(path: bytes, root: bytes) -> bool:
@@ -3581,7 +4111,6 @@ def _materialize_blobs(
     repo: RepoIdentity,
     entries: tuple[_TreeEntry, ...],
     root_fd: int,
-    directories: dict[tuple[bytes, ...], int],
     *,
     deadline: float,
 ) -> None:
@@ -3593,7 +4122,7 @@ def _materialize_blobs(
             process = subprocess.Popen(
                 _trusted_git_argv(authority, ("cat-file", "--batch")),
                 cwd=repo.worktree_raw,
-                env=_git_environment(),
+                env=_git_environment(authority),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,
@@ -3643,33 +4172,37 @@ def _materialize_blobs(
                     )
                 parts = tuple(entry.path.split(b"/"))
                 parent_fd = _export_parent_fd(
-                    root_fd, directories, parts[:-1], deadline=deadline,
+                    root_fd, parts[:-1], deadline=deadline,
                 )
-                if entry.mode == 0o120000:
-                    if size > _MAX_SYMLINK_TARGET_BYTES:
-                        raise UnsupportedRepositoryError(
-                            "Git symlink target exceeds the trusted blob limit"
+                try:
+                    if entry.mode == 0o120000:
+                        if size > _MAX_SYMLINK_TARGET_BYTES:
+                            raise UnsupportedRepositoryError(
+                                "Git symlink target exceeds the trusted blob limit"
+                            )
+                        target = reader.read_exact_bytes(size)
+                        if not target or b"\0" in target:
+                            raise UnsupportedRepositoryError(
+                                "Git tree contains an unsafe symlink target"
+                            )
+                        try:
+                            os.symlink(target, parts[-1], dir_fd=parent_fd)
+                        except OSError as exc:
+                            raise SourceBoundaryError(
+                                "exact-tree symlink could not be created safely: "
+                                f"{exc}"
+                            ) from exc
+                    else:
+                        _write_export_file(
+                            parent_fd,
+                            parts[-1],
+                            reader,
+                            size,
+                            entry.mode & 0o777,
+                            deadline=deadline,
                         )
-                    target = reader.read_exact_bytes(size)
-                    if not target or b"\0" in target:
-                        raise UnsupportedRepositoryError(
-                            "Git tree contains an unsafe symlink target"
-                        )
-                    try:
-                        os.symlink(target, parts[-1], dir_fd=parent_fd)
-                    except OSError as exc:
-                        raise SourceBoundaryError(
-                            f"exact-tree symlink could not be created safely: {exc}"
-                        ) from exc
-                else:
-                    _write_export_file(
-                        parent_fd,
-                        parts[-1],
-                        reader,
-                        size,
-                        entry.mode & 0o777,
-                        deadline=deadline,
-                    )
+                finally:
+                    os.close(parent_fd)
                 if reader.read_exact_bytes(1) != b"\n":
                     raise SourceBoundaryError(
                         "git cat-file returned an incomplete blob delimiter"
@@ -3704,82 +4237,201 @@ def _materialize_blobs(
 
 def _export_parent_fd(
     root_fd: int,
-    directories: dict[tuple[bytes, ...], int],
     parts: tuple[bytes, ...],
     *,
     deadline: float,
 ) -> int:
+    """Open one destination parent without retaining a descriptor per directory."""
+
     directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    key: tuple[bytes, ...] = ()
-    for component in parts:
-        _remaining(deadline)
-        next_key = (*key, component)
-        if next_key not in directories:
+    current_fd = os.dup(root_fd)
+    try:
+        for component in parts:
+            _remaining(deadline)
             try:
-                os.mkdir(component, mode=0o755, dir_fd=directories[key])
-                directories[next_key] = os.open(
-                    component, directory_flags, dir_fd=directories[key],
+                os.mkdir(component, mode=0o755, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise SourceBoundaryError(
+                    f"exact-tree directory changed during export: {exc}"
+                ) from exc
+            try:
+                next_fd = os.open(
+                    component, directory_flags, dir_fd=current_fd,
                 )
             except OSError as exc:
                 raise SourceBoundaryError(
                     f"exact-tree directory changed during export: {exc}"
                 ) from exc
-        key = next_key
-    return directories.get(key, root_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _open_owned_relative_directory(
+    root_fd: int,
+    parts: tuple[bytes, ...],
+    expected_identity: tuple[int, int],
+    *,
+    deadline: float,
+) -> int:
+    """Reopen one owned directory with a constant number of live descriptors."""
+
+    _remaining(deadline)
+    current_fd = os.dup(root_fd)
+    try:
+        for component in parts:
+            _remaining(deadline)
+            next_fd = os.open(
+                component, _directory_open_flags(), dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        opened = os.fstat(current_fd)
+        if not stat.S_ISDIR(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != expected_identity:
+            raise SourceBoundaryError(
+                "owned exact-tree staging directory was substituted"
+            )
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
 
 
 def _remove_owned_tree_contents(directory_fd: int, *, deadline: float) -> None:
-    _remaining(deadline)
-    try:
-        with os.scandir(directory_fd) as iterator:
-            names = []
-            for entry in iterator:
-                _remaining(deadline)
-                names.append(os.fsencode(entry.name))
-                if len(names) > _MAX_TREE_ENTRIES:
-                    raise UnsupportedRepositoryError(
-                        "owned staging metadata exceeds the trusted limit"
-                    )
-    except OSError as exc:
-        raise SourceBoundaryError(
-            f"owned exact-tree staging directory could not be enumerated: {exc}"
-        ) from exc
-    for name in names:
+    """Remove an owned tree iteratively without retaining one FD per depth."""
+
+    root = os.fstat(directory_fd)
+    root_identity = (root.st_dev, root.st_ino)
+    stack: list[
+        tuple[
+            tuple[bytes, ...],
+            tuple[int, int],
+            tuple[int, int] | None,
+            bool,
+        ]
+    ] = [((), root_identity, None, False)]
+    entry_count = 0
+    total_path_bytes = 0
+    while stack:
         _remaining(deadline)
-        try:
-            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if stat.S_ISDIR(info.st_mode):
+        parts, identity, parent_identity, expanded = stack.pop()
+        if expanded:
+            if not parts:
+                continue
+            assert parent_identity is not None
+            parent_fd = _open_owned_relative_directory(
+                directory_fd,
+                parts[:-1],
+                parent_identity,
+                deadline=deadline,
+            )
+            try:
+                current = os.stat(
+                    parts[-1], dir_fd=parent_fd, follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(current.st_mode) or (
+                    current.st_dev,
+                    current.st_ino,
+                ) != identity:
+                    raise SourceBoundaryError(
+                        "owned exact-tree staging directory was substituted"
+                    )
                 child_fd = os.open(
-                    name, _directory_open_flags(), dir_fd=directory_fd,
+                    parts[-1], _directory_open_flags(), dir_fd=parent_fd,
                 )
                 try:
                     opened = os.fstat(child_fd)
-                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    if (opened.st_dev, opened.st_ino) != identity:
                         raise SourceBoundaryError(
                             "owned exact-tree staging directory was substituted"
                         )
-                    _remove_owned_tree_contents(child_fd, deadline=deadline)
                 finally:
                     os.close(child_fd)
-                os.rmdir(name, dir_fd=directory_fd)
-            elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                os.unlink(name, dir_fd=directory_fd)
-            else:
+                os.rmdir(parts[-1], dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+            continue
+
+        current_fd = _open_owned_relative_directory(
+            directory_fd, parts, identity, deadline=deadline,
+        )
+        child_directories: list[
+            tuple[tuple[bytes, ...], tuple[int, int], tuple[int, int], bool]
+        ] = []
+        try:
+            try:
+                with os.scandir(current_fd) as iterator:
+                    names: list[bytes] = []
+                    for entry in iterator:
+                        _remaining(deadline)
+                        name = os.fsencode(entry.name)
+                        entry_count += 1
+                        total_path_bytes += sum(len(part) + 1 for part in parts) + len(name)
+                        if (
+                            entry_count > _MAX_TREE_ENTRIES
+                            or len(name) > _MAX_PATH_BYTES
+                            or total_path_bytes > _MAX_TOTAL_PATH_BYTES
+                        ):
+                            raise UnsupportedRepositoryError(
+                                "owned staging metadata exceeds the trusted limit"
+                            )
+                        names.append(name)
+            except OSError as exc:
                 raise SourceBoundaryError(
-                    "owned exact-tree staging contains an unexpected file type"
-                )
+                    "owned exact-tree staging directory could not be enumerated: "
+                    f"{exc}"
+                ) from exc
+            for name in names:
+                _remaining(deadline)
+                info = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    child_fd = os.open(
+                        name, _directory_open_flags(), dir_fd=current_fd,
+                    )
+                    try:
+                        opened = os.fstat(child_fd)
+                        child_identity = (opened.st_dev, opened.st_ino)
+                        if child_identity != (info.st_dev, info.st_ino):
+                            raise SourceBoundaryError(
+                                "owned exact-tree staging directory was substituted"
+                            )
+                    finally:
+                        os.close(child_fd)
+                    child_directories.append(
+                        ((*parts, name), child_identity, identity, False)
+                    )
+                elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    os.unlink(name, dir_fd=current_fd)
+                else:
+                    raise SourceBoundaryError(
+                        "owned exact-tree staging contains an unexpected file type"
+                    )
         except OSError as exc:
             raise SourceBoundaryError(
                 f"owned exact-tree staging cleanup failed: {exc}"
             ) from exc
+        finally:
+            os.close(current_fd)
+        stack.append((parts, identity, parent_identity, True))
+        stack.extend(child_directories)
 
 
-def _cleanup_owned_staging(prepared: _PreparedDestination) -> None:
+def _cleanup_owned_tree(
+    prepared: _PreparedDestination, leaf: bytes, *, label: str,
+) -> None:
     cleanup_deadline = time.monotonic() + _EXPORT_CLEANUP_SECONDS
     opened = os.fstat(prepared.root_fd)
     current = os.stat(
-        prepared.staging_leaf,
+        leaf,
         dir_fd=prepared.parent_fds[-1],
         follow_symlinks=False,
     )
@@ -3790,20 +4442,88 @@ def _cleanup_owned_staging(prepared: _PreparedDestination) -> None:
         or (current.st_dev, current.st_ino) != prepared.root_identity
     ):
         raise SourceBoundaryError(
-            "owned exact-tree staging identity changed; cleanup quarantined"
+            f"owned exact-tree {label} identity changed; cleanup quarantined"
         )
     _remove_owned_tree_contents(prepared.root_fd, deadline=cleanup_deadline)
     _remaining(cleanup_deadline)
     current = os.stat(
-        prepared.staging_leaf,
+        leaf,
         dir_fd=prepared.parent_fds[-1],
         follow_symlinks=False,
     )
     if (current.st_dev, current.st_ino) != prepared.root_identity:
         raise SourceBoundaryError(
-            "owned exact-tree staging identity changed; cleanup quarantined"
+            f"owned exact-tree {label} identity changed; cleanup quarantined"
         )
-    os.rmdir(prepared.staging_leaf, dir_fd=prepared.parent_fds[-1])
+    os.rmdir(leaf, dir_fd=prepared.parent_fds[-1])
+
+
+def _cleanup_owned_staging(prepared: _PreparedDestination) -> None:
+    _cleanup_owned_tree(prepared, prepared.staging_leaf, label="staging")
+
+
+def _rename_leaf_no_replace(
+    parent_fd: int,
+    source_leaf: bytes,
+    destination_leaf: bytes,
+    *,
+    backend: str,
+) -> None:
+    """Atomically rename one sibling without replacing an existing name."""
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if backend == "darwin":
+        rename = libc.renameatx_np
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            parent_fd,
+            source_leaf,
+            parent_fd,
+            destination_leaf,
+            0x00000004,  # RENAME_EXCL
+        )
+    elif backend == "linux":
+        rename = libc.renameat2
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            parent_fd,
+            source_leaf,
+            parent_fd,
+            destination_leaf,
+            1,  # RENAME_NOREPLACE
+        )
+    else:
+        raise UnsupportedRepositoryError(
+            "exact-tree export host lacks atomic no-replace publication"
+        )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number))
+    if error_number in {errno.ENOSYS, errno.ENOTSUP, errno.EINVAL}:
+        raise UnsupportedRepositoryError(
+            "exact-tree export host rejected atomic no-replace publication"
+        )
+    raise SourceBoundaryError(
+        f"exact-tree atomic rename failed: {os.strerror(error_number)}"
+    )
 
 
 def _publish_staging_no_replace(
@@ -3826,62 +4546,18 @@ def _publish_staging_no_replace(
     opened = os.fstat(prepared.root_fd)
     if (opened.st_dev, opened.st_ino) != prepared.root_identity:
         raise SourceBoundaryError("exact-tree staging root identity changed")
-
-    import ctypes
-
-    libc = ctypes.CDLL(None, use_errno=True)
     parent_fd = prepared.parent_fds[-1]
-    if backend == "darwin":
-        rename = libc.renameatx_np
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename.restype = ctypes.c_int
-        result = rename(
+    try:
+        _rename_leaf_no_replace(
             parent_fd,
             prepared.staging_leaf,
-            parent_fd,
             prepared.final_leaf,
-            0x00000004,  # RENAME_EXCL
+            backend=backend,
         )
-    elif backend == "linux":
-        rename = libc.renameat2
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename.restype = ctypes.c_int
-        result = rename(
-            parent_fd,
-            prepared.staging_leaf,
-            parent_fd,
-            prepared.final_leaf,
-            1,  # RENAME_NOREPLACE
-        )
-    else:
-        raise UnsupportedRepositoryError(
-            "exact-tree export host lacks atomic no-replace publication"
-        )
-    if result != 0:
-        error_number = ctypes.get_errno()
-        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-            raise SourceBoundaryError(
-                "exact-tree destination collided during atomic publication"
-            )
-        if error_number in {errno.ENOSYS, errno.ENOTSUP, errno.EINVAL}:
-            raise UnsupportedRepositoryError(
-                "exact-tree export host rejected atomic no-replace publication"
-            )
+    except FileExistsError as exc:
         raise SourceBoundaryError(
-            f"exact-tree atomic publication failed: {os.strerror(error_number)}"
-        )
+            "exact-tree destination collided during atomic publication"
+        ) from exc
 
 
 def _verify_published_destination(
@@ -3901,6 +4577,227 @@ def _verify_published_destination(
             "exact-tree destination was substituted during publication"
         )
     _verify_destination_parent(prepared, deadline=deadline)
+
+
+def _quarantined_tree_matches_export(
+    prepared: _PreparedDestination,
+    entries: tuple[_TreeEntry, ...],
+    *,
+    deadline: float,
+) -> bool:
+    """Classify a quarantined tree without deleting any of its contents."""
+
+    expected_files = {entry.path: entry for entry in entries}
+    expected_directories: set[bytes] = set()
+    for entry in entries:
+        parts = entry.path.split(b"/")
+        for length in range(1, len(parts)):
+            expected_directories.add(b"/".join(parts[:length]))
+    seen_files: set[bytes] = set()
+    seen_directories: set[bytes] = set()
+    stack: list[tuple[tuple[bytes, ...], tuple[int, int]]] = [
+        ((), prepared.root_identity),
+    ]
+    entry_count = 0
+    total_path_bytes = 0
+    total_content_bytes = 0
+    try:
+        while stack:
+            _remaining(deadline)
+            parts, identity = stack.pop()
+            directory_fd = _open_owned_relative_directory(
+                prepared.root_fd, parts, identity, deadline=deadline,
+            )
+            try:
+                with os.scandir(directory_fd) as iterator:
+                    names: list[bytes] = []
+                    for item in iterator:
+                        _remaining(deadline)
+                        name = os.fsencode(item.name)
+                        path_size = sum(len(part) + 1 for part in parts) + len(name)
+                        entry_count += 1
+                        total_path_bytes += path_size
+                        if (
+                            entry_count > _MAX_TREE_ENTRIES
+                            or len(name) > _MAX_PATH_BYTES
+                            or total_path_bytes > _MAX_TOTAL_PATH_BYTES
+                        ):
+                            return False
+                        names.append(name)
+                for name in names:
+                    _remaining(deadline)
+                    path_parts = (*parts, name)
+                    path = b"/".join(path_parts)
+                    info = os.stat(
+                        name, dir_fd=directory_fd, follow_symlinks=False,
+                    )
+                    if stat.S_ISDIR(info.st_mode):
+                        if path not in expected_directories:
+                            return False
+                        child_fd = os.open(
+                            name, _directory_open_flags(), dir_fd=directory_fd,
+                        )
+                        try:
+                            opened = os.fstat(child_fd)
+                            child_identity = (opened.st_dev, opened.st_ino)
+                            if child_identity != (info.st_dev, info.st_ino):
+                                return False
+                        finally:
+                            os.close(child_fd)
+                        seen_directories.add(path)
+                        stack.append((path_parts, child_identity))
+                        continue
+
+                    expected = expected_files.get(path)
+                    if expected is None:
+                        return False
+                    if stat.S_ISREG(info.st_mode):
+                        if expected.mode not in {0o100644, 0o100755}:
+                            return False
+                        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                        flags |= getattr(os, "O_NOFOLLOW", 0)
+                        flags |= getattr(os, "O_NONBLOCK", 0)
+                        fd = os.open(name, flags, dir_fd=directory_fd)
+                        try:
+                            opened = os.fstat(fd)
+                            if (
+                                not stat.S_ISREG(opened.st_mode)
+                                or (opened.st_dev, opened.st_ino)
+                                != (info.st_dev, info.st_ino)
+                                or (opened.st_mode & 0o777)
+                                != (expected.mode & 0o777)
+                                or opened.st_size > _MAX_BLOB_BYTES
+                            ):
+                                return False
+                            digest = (
+                                hashlib.sha256()
+                                if len(expected.oid) == 64
+                                else hashlib.sha1()
+                            )
+                            digest.update(f"blob {opened.st_size}\0".encode("ascii"))
+                            size = 0
+                            while True:
+                                _remaining(deadline)
+                                chunk = os.read(fd, _BUFFER_SIZE)
+                                if not chunk:
+                                    break
+                                digest.update(chunk)
+                                size += len(chunk)
+                            after = os.fstat(fd)
+                        finally:
+                            os.close(fd)
+                        after_path = os.stat(
+                            name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                        total_content_bytes += size
+                        if (
+                            _path_state(opened) != _path_state(after)
+                            or _path_state(after) != _path_state(after_path)
+                            or not stat.S_ISREG(after_path.st_mode)
+                            or size != opened.st_size
+                            or digest.hexdigest() != expected.oid
+                        ):
+                            return False
+                    elif stat.S_ISLNK(info.st_mode):
+                        if expected.mode != 0o120000:
+                            return False
+                        target = os.readlink(name, dir_fd=directory_fd)
+                        target_raw = os.fsencode(target)
+                        if len(target_raw) > _MAX_SYMLINK_TARGET_BYTES:
+                            return False
+                        digest = hashlib.sha256() if len(expected.oid) == 64 else hashlib.sha1()
+                        digest.update(f"blob {len(target_raw)}\0".encode("ascii"))
+                        digest.update(target_raw)
+                        after = os.stat(
+                            name, dir_fd=directory_fd, follow_symlinks=False,
+                        )
+                        total_content_bytes += len(target_raw)
+                        if (
+                            _path_state(info) != _path_state(after)
+                            or digest.hexdigest() != expected.oid
+                        ):
+                            return False
+                    else:
+                        return False
+                    if total_content_bytes > _MAX_EXPORT_BYTES:
+                        return False
+                    seen_files.add(path)
+            finally:
+                os.close(directory_fd)
+    except (OSError, SourceBoundaryError):
+        return False
+    return (
+        seen_files == set(expected_files)
+        and seen_directories == expected_directories
+    )
+
+
+def _quarantine_owned_published(
+    prepared: _PreparedDestination,
+    entries: tuple[_TreeEntry, ...],
+    *,
+    backend: str,
+) -> tuple[str, bool]:
+    """Move a failed published tree aside without deleting concurrent bytes."""
+
+    deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+    _verify_destination_parent(prepared, deadline=deadline)
+    opened = os.fstat(prepared.root_fd)
+    current = os.stat(
+        prepared.final_leaf,
+        dir_fd=prepared.parent_fds[-1],
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or (opened.st_dev, opened.st_ino) != prepared.root_identity
+        or (current.st_dev, current.st_ino) != prepared.root_identity
+    ):
+        raise SourceBoundaryError(
+            "owned exact-tree destination identity changed; cleanup quarantined"
+        )
+    for _attempt in range(16):
+        quarantine_leaf = (
+            b"."
+            + prepared.final_leaf[:64]
+            + b".bestplan-quarantine-"
+            + secrets.token_hex(16).encode("ascii")
+        )
+        try:
+            _rename_leaf_no_replace(
+                prepared.parent_fds[-1],
+                prepared.final_leaf,
+                quarantine_leaf,
+                backend=backend,
+            )
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise SourceBoundaryError(
+            "owned exact-tree quarantine name could not be reserved"
+        )
+    _remaining(deadline)
+    quarantined = os.stat(
+        quarantine_leaf,
+        dir_fd=prepared.parent_fds[-1],
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISDIR(quarantined.st_mode)
+        or (quarantined.st_dev, quarantined.st_ino) != prepared.root_identity
+    ):
+        raise SourceBoundaryError(
+            "owned exact-tree quarantine identity changed"
+        )
+    quarantine_path = os.path.join(prepared.canonical_parent, quarantine_leaf)
+    unchanged = _quarantined_tree_matches_export(
+        prepared, entries, deadline=deadline,
+    )
+    return os.fsdecode(quarantine_path), unchanged
 
 
 def _write_export_file(
@@ -3948,79 +4845,98 @@ def export_exact_tree(
     """Materialize only the captured committed tree, bypassing checkout filters."""
 
     backend = _assert_export_host_supported()
-    recapture_deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
-    if not recapture_matches(snapshot, deadline=recapture_deadline):
-        raise ProofStaleError("proof_stale: repository or protected state changed")
-    deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
-    authority = _get_capture_authority(deadline)
-    entries = _tree_entries(snapshot.repo, snapshot.tree_oid, deadline=deadline)
-    if any(entry.object_type != b"blob" for entry in entries):
-        raise UnsupportedRepositoryError("exact source tree contains a non-blob entry")
-    for entry in entries:
-        _remaining(deadline)
-        if entry.mode not in {0o100644, 0o100755, 0o120000}:
-            raise UnsupportedRepositoryError(
-                f"unsupported Git tree mode: {entry.mode:o}"
-            )
-    _assert_tree_path_aliases(entries, deadline=deadline)
-    _verify_public_authority_after(authority, deadline=deadline)
-
-    prepared = _prepare_destination(
-        snapshot.repo, destination, deadline=deadline,
-    )
-    directories: dict[tuple[bytes, ...], int] = {(): prepared.root_fd}
-    descendants_closed = False
+    authority_deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+    authority = _verify_public_authority(deadline=authority_deadline)
+    prepared: _PreparedDestination | None = None
+    entries: tuple[_TreeEntry, ...] = ()
     published = False
     try:
-        _materialize_blobs(
-            snapshot.repo,
-            entries,
-            prepared.root_fd,
-            directories,
-            deadline=deadline,
-        )
-        _verify_public_authority_after(authority, deadline=deadline)
-        _remaining(deadline)
-        os.fchmod(prepared.root_fd, 0o755)
-        staged = os.stat(
-            prepared.staging_leaf,
-            dir_fd=prepared.parent_fds[-1],
-            follow_symlinks=False,
-        )
-        if not stat.S_ISDIR(staged.st_mode) or (
-            staged.st_dev,
-            staged.st_ino,
-        ) != prepared.root_identity:
-            raise SourceBoundaryError(
-                "exact-tree staging directory was substituted during export"
+        try:
+            recapture_deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+            if not recapture_matches(snapshot, deadline=recapture_deadline):
+                raise ProofStaleError(
+                    "proof_stale: repository or protected state changed"
+                )
+            deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+            entries = _tree_entries(
+                snapshot.repo, snapshot.tree_oid, deadline=deadline,
             )
-        _verify_destination_parent(prepared, deadline=deadline)
-        _close_fds(
-            fd for key, fd in directories.items() if key
-        )
-        descendants_closed = True
-        _publish_staging_no_replace(
-            prepared, backend=backend, deadline=deadline,
-        )
-        published = True
-        _verify_published_destination(prepared, deadline=deadline)
-    except BaseException:
-        if not descendants_closed:
-            _close_fds(fd for key, fd in directories.items() if key)
-            descendants_closed = True
-        if not published:
+            if any(entry.object_type != b"blob" for entry in entries):
+                raise UnsupportedRepositoryError(
+                    "exact source tree contains a non-blob entry"
+                )
+            for entry in entries:
+                _remaining(deadline)
+                if entry.mode not in {0o100644, 0o100755, 0o120000}:
+                    raise UnsupportedRepositoryError(
+                        f"unsupported Git tree mode: {entry.mode:o}"
+                    )
+            _assert_tree_path_aliases(entries, deadline=deadline)
+            _verify_public_authority_after(authority, deadline=deadline)
+
+            prepared = _prepare_destination(
+                snapshot.repo, destination, deadline=deadline,
+            )
+            _materialize_blobs(
+                snapshot.repo,
+                entries,
+                prepared.root_fd,
+                deadline=deadline,
+            )
+            _verify_public_authority_after(authority, deadline=deadline)
+            _remaining(deadline)
+            os.fchmod(prepared.root_fd, 0o755)
+            staged = os.stat(
+                prepared.staging_leaf,
+                dir_fd=prepared.parent_fds[-1],
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(staged.st_mode) or (
+                staged.st_dev,
+                staged.st_ino,
+            ) != prepared.root_identity:
+                raise SourceBoundaryError(
+                    "exact-tree staging directory was substituted during export"
+                )
+            _verify_destination_parent(prepared, deadline=deadline)
+            _publish_staging_no_replace(
+                prepared, backend=backend, deadline=deadline,
+            )
+            published = True
+            _verify_published_destination(prepared, deadline=deadline)
+        finally:
+            _verify_public_authority_after(
+                authority,
+                deadline=time.monotonic() + _DEFAULT_DEADLINE_SECONDS,
+            )
+    except BaseException as export_error:
+        if prepared is not None:
+            if published:
+                try:
+                    quarantine_path, unchanged = _quarantine_owned_published(
+                        prepared, entries, backend=backend,
+                    )
+                except BaseException as cleanup_error:
+                    raise SourceBoundaryError(
+                        "exact-tree export failed and published output could "
+                        "not be quarantined"
+                    ) from cleanup_error
+                state = "unchanged" if unchanged else "contains concurrent changes"
+                raise SourceBoundaryError(
+                    f"{export_error}; published output quarantined at "
+                    f"{quarantine_path} ({state})"
+                ) from export_error
             try:
                 _cleanup_owned_staging(prepared)
             except BaseException as cleanup_error:
                 raise SourceBoundaryError(
-                    "exact-tree export failed and owned staging was quarantined"
+                    "exact-tree export failed and owned output was quarantined"
                 ) from cleanup_error
         raise
     finally:
-        if not descendants_closed:
-            _close_fds(fd for key, fd in directories.items() if key)
-        try:
-            os.close(prepared.root_fd)
-        except OSError:
-            pass
-        _close_fds(prepared.parent_fds)
+        if prepared is not None:
+            try:
+                os.close(prepared.root_fd)
+            except OSError:
+                pass
+            _close_fds(prepared.parent_fds)

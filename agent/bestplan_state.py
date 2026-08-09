@@ -21,8 +21,12 @@ from agent.execution_plan import ExecutionPlan, PlanValidationError, compile_exe
 from agent.bestplan_source import (
     DEFAULT_SOURCE_OPERATION_SECONDS,
     SourceBoundaryError,
+    capture_legacy_v1_fingerprint,
     capture_source_snapshot,
+    inspect_legacy_v1_workspace,
+    inspect_workspace_boundary,
     resolve_repo_identity,
+    strong_source_capture_supported,
 )
 
 logger = logging.getLogger(__name__)
@@ -159,22 +163,10 @@ def _canonical_workspace(workspace: str) -> str:
     return str(Path(workspace or os.getcwd()).expanduser().resolve())
 
 
-def _has_local_git_boundary(workspace: str) -> bool:
-    """Distinguish legacy non-Git fixtures from failed trusted repositories."""
+def _workspace_hint(workspace: str) -> str:
+    """Preserve the hint; trusted helper resolves filesystem identity and relativity."""
 
-    candidate = Path(workspace)
-    for directory in (candidate, *candidate.parents):
-        try:
-            (directory / ".git").lstat()
-        except (FileNotFoundError, NotADirectoryError):
-            continue
-        except OSError:
-            return True
-        return True
-    try:
-        return (candidate / "HEAD").is_file() and (candidate / "objects").is_dir()
-    except OSError:
-        return True
+    return str(workspace or ".")
 
 
 _RUNTIME_SECRET_CONTAINERS = {"auth", "cookies", "extra_headers", "headers"}
@@ -259,15 +251,28 @@ def _strip_bestplan_envelope(value: Any) -> str:
 def compute_baseline_fingerprint(workspace: str) -> str:
     """Compatibility wrapper for the stable Git source/protected-state proof."""
 
+    workspace_hint = _workspace_hint(workspace)
+    if not strong_source_capture_supported():
+        try:
+            _, fingerprint = capture_legacy_v1_fingerprint(
+                workspace_hint,
+                time.monotonic() + DEFAULT_SOURCE_OPERATION_SECONDS,
+            )
+            return fingerprint
+        except SourceBoundaryError as exc:
+            raise BaselineFingerprintError(
+                "candidate-only legacy git baseline unavailable for "
+                f"{workspace_hint}: {exc.code}: {exc}"
+            ) from exc
     try:
-        repo = resolve_repo_identity(_canonical_workspace(workspace))
+        repo = resolve_repo_identity(workspace_hint)
         snapshot = capture_source_snapshot(
             repo, time.monotonic() + DEFAULT_SOURCE_OPERATION_SECONDS,
         )
         return snapshot.fingerprint
     except SourceBoundaryError as exc:
         raise BaselineFingerprintError(
-            f"strong git baseline unavailable for {_canonical_workspace(workspace)}: "
+            f"strong git baseline unavailable for {workspace_hint}: "
             f"{exc.code}: {exc}"
         ) from exc
 
@@ -650,41 +655,98 @@ class BestplanStore:
         raw_envelope: Optional[str] = None,
         provisional: bool = False,
     ) -> str:
-        workspace = _canonical_workspace(workspace)
+        workspace = _workspace_hint(workspace)
         supplied_fingerprint = (
             None if baseline_fingerprint is None else str(baseline_fingerprint)
         )
         baseline_revision: str | None = None
-        try:
-            repo = resolve_repo_identity(workspace)
-        except SourceBoundaryError as exc:
-            if not supplied_fingerprint or _has_local_git_boundary(workspace):
-                raise BaselineFingerprintError(
-                    f"strong git baseline unavailable for {workspace}: {exc.code}: {exc}"
-                ) from exc
-            # Compatibility only for historical tests/callers that inject a
-            # synthetic baseline for a nonexistent or non-Git workspace.
-            # Task 2 gates trusted V2 execution on baseline_revision != NULL.
-            baseline_fingerprint = supplied_fingerprint
-        else:
+        if not strong_source_capture_supported():
             try:
-                snapshot = capture_source_snapshot(
-                    repo, time.monotonic() + DEFAULT_SOURCE_OPERATION_SECONDS,
+                workspace, captured_fingerprint = capture_legacy_v1_fingerprint(
+                    workspace,
+                    time.monotonic() + DEFAULT_SOURCE_OPERATION_SECONDS,
                 )
             except SourceBoundaryError as exc:
-                raise BaselineFingerprintError(
-                    f"strong git baseline unavailable for {workspace}: {exc.code}: {exc}"
-                ) from exc
-            if (
-                supplied_fingerprint is not None
-                and supplied_fingerprint != snapshot.fingerprint
-            ):
-                raise BaselineFingerprintError(
-                    "supplied baseline fingerprint does not match the trusted "
-                    f"source snapshot for {workspace}"
-                )
-            baseline_fingerprint = snapshot.fingerprint
-            baseline_revision = snapshot.head_oid
+                if not supplied_fingerprint:
+                    raise BaselineFingerprintError(
+                        "candidate-only legacy git baseline unavailable for "
+                        f"{workspace}: {exc.code}: {exc}"
+                    ) from exc
+                try:
+                    workspace, has_git_boundary = inspect_legacy_v1_workspace(
+                        workspace,
+                        time.monotonic() + DEFAULT_SOURCE_OPERATION_SECONDS,
+                    )
+                except SourceBoundaryError as inspection_exc:
+                    raise BaselineFingerprintError(
+                        "candidate-only legacy git baseline unavailable for "
+                        f"{workspace}: {inspection_exc.code}: {inspection_exc}"
+                    ) from inspection_exc
+                if has_git_boundary:
+                    raise BaselineFingerprintError(
+                        "candidate-only legacy git baseline unavailable for "
+                        f"{workspace}: {exc.code}: {exc}"
+                    ) from exc
+                baseline_fingerprint = supplied_fingerprint
+            else:
+                if (
+                    supplied_fingerprint is not None
+                    and supplied_fingerprint != captured_fingerprint
+                ):
+                    raise BaselineFingerprintError(
+                        "supplied baseline fingerprint does not match the "
+                        f"candidate-only legacy source proof for {workspace}"
+                    )
+                # Legacy rows deliberately have no revision. Task 2 keeps
+                # baseline_revision=NULL plans candidate-only/non-executable.
+                baseline_fingerprint = captured_fingerprint
+        else:
+            try:
+                repo = resolve_repo_identity(workspace)
+            except SourceBoundaryError as exc:
+                if not supplied_fingerprint:
+                    raise BaselineFingerprintError(
+                        f"strong git baseline unavailable for {workspace}: {exc.code}: {exc}"
+                    ) from exc
+                try:
+                    workspace, has_git_boundary = inspect_workspace_boundary(
+                        workspace,
+                        time.monotonic() + DEFAULT_SOURCE_OPERATION_SECONDS,
+                    )
+                except SourceBoundaryError as inspection_exc:
+                    raise BaselineFingerprintError(
+                        "strong git baseline unavailable for "
+                        f"{workspace}: {inspection_exc.code}: {inspection_exc}"
+                    ) from inspection_exc
+                if has_git_boundary:
+                    raise BaselineFingerprintError(
+                        f"strong git baseline unavailable for {workspace}: "
+                        f"{exc.code}: {exc}"
+                    ) from exc
+                # Compatibility only for historical tests/callers that inject a
+                # synthetic baseline for a nonexistent or non-Git workspace.
+                # Task 2 gates trusted V2 execution on baseline_revision != NULL.
+                baseline_fingerprint = supplied_fingerprint
+            else:
+                workspace = repo.worktree
+                try:
+                    snapshot = capture_source_snapshot(
+                        repo, time.monotonic() + DEFAULT_SOURCE_OPERATION_SECONDS,
+                    )
+                except SourceBoundaryError as exc:
+                    raise BaselineFingerprintError(
+                        f"strong git baseline unavailable for {workspace}: {exc.code}: {exc}"
+                    ) from exc
+                if (
+                    supplied_fingerprint is not None
+                    and supplied_fingerprint != snapshot.fingerprint
+                ):
+                    raise BaselineFingerprintError(
+                        "supplied baseline fingerprint does not match the trusted "
+                        f"source snapshot for {workspace}"
+                    )
+                baseline_fingerprint = snapshot.fingerprint
+                baseline_revision = snapshot.head_oid
         manifest = plan.to_manifest()
         manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
         if raw_envelope is None:

@@ -406,6 +406,167 @@ def test_fixed_system_verifier_and_git_ignore_hostile_developer_dir(
     assert source._get_capture_authority().git_path == b"/usr/bin/git"
 
 
+def test_non_darwin_strong_capture_fails_but_legacy_plan_is_candidate_only(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    from agent.bestplan_state import BestplanStore, compute_baseline_fingerprint
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text("ignored-runtime/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore runtime")
+    ignored = repo / "ignored-runtime"
+    ignored.mkdir()
+    (ignored / "cache.bin").write_bytes(b"ambient ignored bytes\n")
+    attacker_bin = tmp_path / "attacker-bin"
+    attacker_bin.mkdir()
+    marker = tmp_path / "attacker-git-ran"
+    attacker_git = attacker_bin / "git"
+    attacker_git.write_text(
+        f"#!/bin/sh\n: > {marker}\nexit 99\n", encoding="utf-8",
+    )
+    attacker_git.chmod(0o755)
+    monkeypatch.setattr(source, "_CAPTURE_AUTHORITY", None)
+    monkeypatch.setattr(source, "_CAPTURE_AUTHORITY_PRESEEDED", False)
+    monkeypatch.setattr(source.sys, "platform", "linux")
+    monkeypatch.setenv("PATH", str(attacker_bin))
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Users\attacker\root")
+    monkeypatch.setenv("PROGRAMFILES", r"C:\Users\attacker\programs")
+
+    with pytest.raises(source.SourceBoundaryError, match="unsupported"):
+        source.resolve_repo_identity(str(repo))
+    fingerprint = compute_baseline_fingerprint(str(repo))
+    store = BestplanStore(db_path=tmp_path / "state" / "state.db")
+    plan_id = store.create_plan(
+        "portable legacy plan",
+        _plan(str(repo)),
+        session_id="portable",
+        workspace=str(repo),
+    )
+
+    record = store.get_plan(plan_id)
+    assert fingerprint.startswith("legacy-v1:")
+    assert record["baseline_fingerprint"] == fingerprint
+    assert record["baseline_revision"] is None
+    assert not marker.exists()
+
+
+def test_git_environment_uses_the_verified_platform_helper_path():
+    source = _source()
+    authority = replace(
+        source._get_capture_authority(time.monotonic() + 3.0),
+        helper_path="trusted-platform-path",
+    )
+
+    assert source._git_environment(authority)["PATH"] == "trusted-platform-path"
+
+
+def test_legacy_git_roots_are_fixed_and_strong_capture_is_darwin_only():
+    source = _source()
+
+    assert source.strong_source_capture_supported(
+        os_name="posix", platform="darwin",
+    ) is True
+    assert source.strong_source_capture_supported(
+        os_name="posix", platform="linux",
+    ) is False
+    assert source.strong_source_capture_supported(
+        os_name="nt", platform="win32",
+    ) is False
+    assert source._legacy_v1_git_path(
+        os_name="posix", platform="linux",
+    ) == "/usr/bin/git"
+    assert source._legacy_v1_git_path(
+        os_name="nt", platform="win32",
+    ) == r"C:\Program Files\Git\cmd\git.exe"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="executable fixture is POSIX-only")
+@pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
+def test_legacy_git_output_caps_stop_a_blocked_producer(
+    tmp_path, monkeypatch, stream_name,
+):
+    source = _source()
+    producer = tmp_path / "legacy-git-producer"
+    producer.write_text(
+        "#!/usr/bin/python3\n"
+        "import sys, time\n"
+        "stream = getattr(sys, sys.argv[-1]).buffer\n"
+        "size = 4096 if sys.argv[-1] == 'stdout' else 2 * 1024 * 1024\n"
+        "stream.write(b'x' * size)\n"
+        "stream.flush()\n"
+        "time.sleep(5)\n",
+        encoding="utf-8",
+    )
+    producer.chmod(0o755)
+    monkeypatch.setattr(source, "_legacy_v1_git_path", lambda: str(producer))
+
+    started = time.monotonic()
+    with pytest.raises(source.UnsupportedRepositoryError, match="exceeds"):
+        source._run_legacy_v1_git_output(
+            os.fsencode(tmp_path),
+            stream_name,
+            deadline=time.monotonic() + 1.5,
+            max_output_bytes=1024,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.8
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+@pytest.mark.live_system_guard_bypass
+def test_legacy_git_timeout_reaps_a_signal_ignoring_descendant(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    producer = tmp_path / "legacy-git-descendant"
+    leader_pid_file = tmp_path / "leader.pid"
+    child_pid_file = tmp_path / "child.pid"
+    producer.write_text(
+        "#!/usr/bin/python3\n"
+        "import os, signal, sys\n"
+        "leader_path, child_path = sys.argv[-2:]\n"
+        "with open(leader_path, 'w', encoding='ascii') as stream:\n"
+        "    stream.write(str(os.getpid()))\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    with open(child_path, 'w', encoding='ascii') as stream:\n"
+        "        stream.write(str(os.getpid()))\n"
+        "    os.close(0); os.close(1); os.close(2)\n"
+        "    while True: signal.pause()\n"
+        "while True: signal.pause()\n",
+        encoding="utf-8",
+    )
+    producer.chmod(0o755)
+    monkeypatch.setattr(source, "_legacy_v1_git_path", lambda: str(producer))
+
+    try:
+        with pytest.raises(source.ProofStaleError, match="proof_stale"):
+            source._run_legacy_v1_git_output(
+                os.fsencode(tmp_path),
+                str(leader_pid_file),
+                str(child_pid_file),
+                deadline=time.monotonic() + 0.6,
+                max_output_bytes=1024,
+            )
+        for pid_file in (leader_pid_file, child_pid_file):
+            pid = int(pid_file.read_text(encoding="ascii"))
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+    finally:
+        for pid_file in (leader_pid_file, child_pid_file):
+            if not pid_file.exists():
+                continue
+            pid = int(pid_file.read_text(encoding="ascii"))
+            try:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except ProcessLookupError:
+                pass
+
+
 def test_bestplan_modules_import_without_path_git_uses_fixed_system_git(tmp_path):
     empty_path = tmp_path / "empty-path"
     empty_path.mkdir()
@@ -540,6 +701,56 @@ def test_resolve_repo_identity_bounds_first_authority_verification(
         assert time.monotonic() - started < 2.0
     finally:
         source._CAPTURE_AUTHORITY = previous
+
+
+def test_resolve_repo_identity_does_not_run_blocking_realpath_in_parent(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    source._get_capture_authority(time.monotonic() + 3.0)
+    repo_raw = os.fsencode(repo)
+
+    def blocked_parent_realpath(path, *args, **kwargs):
+        if os.fsencode(path) == repo_raw:
+            time.sleep(0.6)
+        return path
+
+    monkeypatch.setattr(source.os.path, "realpath", blocked_parent_realpath)
+    monkeypatch.setattr(source, "_DEFAULT_DEADLINE_SECONDS", 0.2)
+    started = time.monotonic()
+    with pytest.raises(source.ProofStaleError, match="proof_stale"):
+        source.resolve_repo_identity(str(repo))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+
+
+def test_relative_repo_resolution_does_not_read_parent_cwd(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    source._get_capture_authority(time.monotonic() + 3.0)
+    monkeypatch.chdir(repo)
+    real_getcwd = source.os.getcwd
+    calls = 0
+
+    def blocked_parent_getcwd():
+        nonlocal calls
+        calls += 1
+        time.sleep(1.2)
+        return real_getcwd()
+
+    monkeypatch.setattr(source.os, "getcwd", blocked_parent_getcwd)
+    monkeypatch.setattr(source, "_DEFAULT_DEADLINE_SECONDS", 2.0)
+    started = time.monotonic()
+    identity = source.resolve_repo_identity(".")
+    elapsed = time.monotonic() - started
+
+    assert calls == 0
+    assert elapsed < 1.0
+    assert identity.worktree_raw == os.fsencode(repo)
 
 
 def test_trusted_git_preexec_identity_check_never_blocks_in_parent(
@@ -865,6 +1076,106 @@ def test_create_plan_persists_the_exact_captured_head_oid(tmp_path):
     ).decode("ascii")
 
 
+def test_create_plan_does_not_resolve_workspace_in_the_parent(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    from agent import bestplan_state
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = bestplan_state.BestplanStore(
+        db_path=tmp_path / "state" / "state.db",
+    )
+    captured_repo = type(
+        "CapturedRepo", (), {"worktree": str(repo), "workspace": str(repo)},
+    )()
+    captured_snapshot = type(
+        "CapturedSnapshot", (), {
+            "fingerprint": "f" * 64,
+            "head_oid": "1" * 40,
+        },
+    )()
+    real_resolve = bestplan_state.Path.resolve
+
+    def blocked_parent_resolve(path, *args, **kwargs):
+        time.sleep(0.6)
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(bestplan_state.Path, "resolve", blocked_parent_resolve)
+    monkeypatch.setattr(
+        bestplan_state, "resolve_repo_identity", lambda _workspace: captured_repo,
+    )
+    monkeypatch.setattr(
+        bestplan_state,
+        "capture_source_snapshot",
+        lambda _repo, _deadline: captured_snapshot,
+    )
+
+    started = time.monotonic()
+    plan_id = store.create_plan(
+        "bounded",
+        _plan(str(repo)),
+        session_id="bounded",
+        workspace=str(repo),
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert store.get_plan(plan_id)["baseline_revision"] == "1" * 40
+
+
+def test_create_plan_relative_workspace_does_not_read_parent_cwd(
+    tmp_path, monkeypatch,
+):
+    from agent import bestplan_state
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = bestplan_state.BestplanStore(
+        db_path=tmp_path / "state" / "state.db",
+    )
+    captured_repo = type(
+        "CapturedRepo", (), {"worktree": str(repo), "workspace": str(repo)},
+    )()
+    captured_snapshot = type(
+        "CapturedSnapshot", (), {
+            "fingerprint": "f" * 64,
+            "head_oid": "1" * 40,
+        },
+    )()
+    calls = 0
+
+    def blocked_parent_getcwd():
+        nonlocal calls
+        calls += 1
+        time.sleep(1.2)
+        return str(repo)
+
+    monkeypatch.setattr(bestplan_state.os, "getcwd", blocked_parent_getcwd)
+    monkeypatch.setattr(
+        bestplan_state, "resolve_repo_identity", lambda _workspace: captured_repo,
+    )
+    monkeypatch.setattr(
+        bestplan_state,
+        "capture_source_snapshot",
+        lambda _repo, _deadline: captured_snapshot,
+    )
+
+    started = time.monotonic()
+    plan_id = store.create_plan(
+        "bounded relative",
+        _plan(str(repo)),
+        session_id="bounded-relative",
+        workspace=".",
+    )
+    elapsed = time.monotonic() - started
+
+    assert calls == 0
+    assert elapsed < 0.5
+    assert store.get_plan(plan_id)["workspace"] == str(repo)
+
+
 def test_create_plan_distinguishes_trusted_capture_from_legacy_injection(tmp_path):
     source = _source()
     from agent.bestplan_state import BaselineFingerprintError, BestplanStore
@@ -907,6 +1218,44 @@ def test_create_plan_distinguishes_trusted_capture_from_legacy_injection(tmp_pat
     assert store._connection().execute(
         "SELECT COUNT(*) FROM bestplan_plans WHERE session_id = 'mismatch'"
     ).fetchone()[0] == 0
+
+
+def test_legacy_create_plan_canonicalizes_only_in_the_bounded_helper(
+    tmp_path, monkeypatch,
+):
+    from agent import bestplan_state
+
+    workspace = "/tmp/hermes-bestplan-legacy-canonical-fixture"
+    expected = os.path.realpath(workspace)
+    store = bestplan_state.BestplanStore(
+        db_path=tmp_path / "state" / "state.db",
+    )
+
+    def forbidden_parent_resolve(*_args, **_kwargs):
+        raise AssertionError("legacy workspace resolved in the parent process")
+
+    def forbidden_parent_boundary(*_args, **_kwargs):
+        raise AssertionError("legacy Git boundary inspected in the parent process")
+
+    monkeypatch.setattr(bestplan_state.Path, "resolve", forbidden_parent_resolve)
+    monkeypatch.setattr(
+        bestplan_state,
+        "_has_local_git_boundary",
+        forbidden_parent_boundary,
+        raising=False,
+    )
+
+    plan_id = store.create_plan(
+        "legacy bounded",
+        _plan(workspace),
+        session_id="legacy-bounded",
+        workspace=workspace,
+        baseline_fingerprint="synthetic-test-baseline",
+    )
+
+    record = store.get_plan(plan_id)
+    assert record["workspace"] == expected
+    assert record["baseline_revision"] is None
 
 
 def test_protected_manifest_is_deterministic_and_binds_dirty_index_and_worktree(
@@ -1664,6 +2013,82 @@ def test_recapture_detects_protected_changes_but_ignores_ignored_state(tmp_path)
     assert source.recapture_matches(expected) is False
 
 
+def test_recapture_brackets_identity_resolution_with_authority_verification(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    snapshot = _snapshot(_init_repo(tmp_path / "repo"))
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+    events: list[str] = []
+
+    def verify_before(*, deadline):
+        assert deadline > time.monotonic()
+        events.append("verify-before")
+        return authority
+
+    def resolve_in_helper(_authority, operation, request_value, deadline):
+        assert operation == "resolve"
+        assert request_value == snapshot.repo.workspace
+        assert deadline > time.monotonic()
+        events.append("resolve-helper")
+        return snapshot.repo
+
+    def forbidden_parent_resolve(*_args, **_kwargs):
+        raise AssertionError("recapture resolved repository identity in the parent")
+
+    def capture(_repo, _deadline):
+        events.append("capture")
+        return snapshot
+
+    def verify_after(_authority, *, deadline):
+        assert deadline > time.monotonic()
+        events.append("verify-after")
+
+    monkeypatch.setattr(source, "_verify_public_authority", verify_before)
+    monkeypatch.setattr(source, "_run_source_helper", resolve_in_helper)
+    monkeypatch.setattr(source, "_resolve_repo_identity", forbidden_parent_resolve)
+    monkeypatch.setattr(source, "capture_source_snapshot", capture)
+    monkeypatch.setattr(source, "_verify_public_authority_after", verify_after)
+
+    assert source.recapture_matches(snapshot) is True
+    assert events == [
+        "verify-before", "resolve-helper", "capture", "verify-after",
+    ]
+
+
+def test_public_capture_verifies_authority_after_result_validation(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    snapshot = _snapshot(_init_repo(tmp_path / "repo"))
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+    events: list[str] = []
+
+    def verify_before(*, deadline):
+        events.append("verify-before")
+        return authority
+
+    def run_helper(_authority, operation, request_value, deadline):
+        assert operation == "capture"
+        assert request_value == snapshot.repo
+        assert deadline > time.monotonic()
+        events.append("helper")
+        return snapshot
+
+    def verify_after(_authority, *, deadline):
+        assert deadline > time.monotonic()
+        events.append("verify-after")
+
+    monkeypatch.setattr(source, "_verify_public_authority", verify_before)
+    monkeypatch.setattr(source, "_run_source_helper", run_helper)
+    monkeypatch.setattr(source, "_verify_public_authority_after", verify_after)
+
+    assert source.capture_source_snapshot(
+        snapshot.repo, time.monotonic() + 3.0,
+    ) == snapshot
+    assert events == ["verify-before", "helper", "verify-after"]
+
+
 def test_export_exact_tree_uses_committed_blobs_and_excludes_ambient_bytes(tmp_path):
     source = _source()
     repo = _init_repo(tmp_path / "repo")
@@ -1771,6 +2196,266 @@ def test_export_failure_leaves_no_final_destination_and_retry_succeeds(
     source.export_exact_tree(snapshot, destination)
     assert (destination / "tracked.txt").read_bytes() == b"committed\n"
     assert (destination / "second.txt").read_bytes() == b"second committed file\n"
+
+
+def test_export_post_publish_authority_failure_removes_owned_destination(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "exported"
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+
+    monkeypatch.setattr(source, "recapture_matches", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        source,
+        "_verify_public_authority",
+        lambda *, deadline: authority,
+    )
+
+    def fail_only_after_publish(_authority, *, deadline):
+        assert deadline > time.monotonic()
+        if destination.exists():
+            raise source.SourceBoundaryError(
+                "trusted authority changed after atomic publication"
+            )
+
+    monkeypatch.setattr(
+        source, "_verify_public_authority_after", fail_only_after_publish,
+    )
+    with pytest.raises(
+        source.SourceBoundaryError, match="after atomic publication",
+    ) as raised:
+        source.export_exact_tree(snapshot, destination)
+
+    quarantines = list(tmp_path.glob(".exported.bestplan-quarantine-*"))
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".exported.bestplan-staging-*"))
+    assert len(quarantines) == 1
+    assert "(unchanged)" in str(raised.value)
+    assert (quarantines[0] / "tracked.txt").read_bytes() == b"committed\n"
+
+
+def test_export_post_publish_failure_preserves_concurrent_foreign_addition(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "exported"
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+
+    monkeypatch.setattr(source, "recapture_matches", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        source,
+        "_verify_public_authority",
+        lambda *, deadline: authority,
+    )
+
+    def add_foreign_file_then_fail(_authority, *, deadline):
+        assert deadline > time.monotonic()
+        if destination.exists():
+            (destination / "foreign-sentinel").write_bytes(b"foreign bytes\n")
+            raise source.SourceBoundaryError("synthetic post-publish failure")
+
+    monkeypatch.setattr(
+        source, "_verify_public_authority_after", add_foreign_file_then_fail,
+    )
+    with pytest.raises(source.SourceBoundaryError, match="quarantined") as raised:
+        source.export_exact_tree(snapshot, destination)
+
+    quarantines = list(tmp_path.glob(".exported.bestplan-quarantine-*"))
+    assert not destination.exists()
+    assert len(quarantines) == 1
+    assert str(quarantines[0]) in str(raised.value)
+    assert "concurrent changes" in str(raised.value)
+    assert (quarantines[0] / "foreign-sentinel").read_bytes() == b"foreign bytes\n"
+
+
+def test_quarantine_classifier_rechecks_regular_path_after_hashing(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "exported"
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+    exported_identity: tuple[int, int] | None = None
+    target_fstats = 0
+    real_fstat = source.os.fstat
+
+    monkeypatch.setattr(source, "recapture_matches", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        source,
+        "_verify_public_authority",
+        lambda *, deadline: authority,
+    )
+
+    def capture_identity_then_fail(_authority, *, deadline):
+        nonlocal exported_identity
+        assert deadline > time.monotonic()
+        if destination.exists():
+            info = os.lstat(destination / "tracked.txt")
+            exported_identity = (info.st_dev, info.st_ino)
+            raise source.SourceBoundaryError("synthetic post-publish failure")
+
+    def replace_name_after_final_fd_check(fd):
+        nonlocal target_fstats
+        result = real_fstat(fd)
+        if exported_identity == (result.st_dev, result.st_ino):
+            target_fstats += 1
+            if target_fstats == 2:
+                quarantines = list(
+                    tmp_path.glob(".exported.bestplan-quarantine-*")
+                )
+                assert len(quarantines) == 1
+                target = quarantines[0] / "tracked.txt"
+                target.unlink()
+                target.write_bytes(b"foreign replacement\n")
+        return result
+
+    monkeypatch.setattr(
+        source, "_verify_public_authority_after", capture_identity_then_fail,
+    )
+    monkeypatch.setattr(source.os, "fstat", replace_name_after_final_fd_check)
+    with pytest.raises(source.SourceBoundaryError, match="concurrent changes"):
+        source.export_exact_tree(snapshot, destination)
+
+    quarantines = list(tmp_path.glob(".exported.bestplan-quarantine-*"))
+    assert target_fstats == 2
+    assert not destination.exists()
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "tracked.txt").read_bytes() == b"foreign replacement\n"
+
+
+def test_export_brackets_a_failure_before_destination_preparation(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    snapshot = _snapshot(_init_repo(tmp_path / "repo"))
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+    events: list[str] = []
+
+    monkeypatch.setattr(source, "_assert_export_host_supported", lambda: "darwin")
+
+    def verify_before(*, deadline):
+        assert deadline > time.monotonic()
+        events.append("verify-before")
+        return authority
+
+    def stale_recapture(_snapshot, *, deadline):
+        assert deadline > time.monotonic()
+        events.append("recapture")
+        return False
+
+    def verify_after(_authority, *, deadline):
+        assert deadline > time.monotonic()
+        events.append("verify-after")
+
+    monkeypatch.setattr(source, "_verify_public_authority", verify_before)
+    monkeypatch.setattr(source, "recapture_matches", stale_recapture)
+    monkeypatch.setattr(source, "_verify_public_authority_after", verify_after)
+
+    with pytest.raises(source.ProofStaleError, match="proof_stale"):
+        source.export_exact_tree(snapshot, tmp_path / "exported")
+
+    assert events == ["verify-before", "recapture", "verify-after"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="RLIMIT_NOFILE is POSIX-only")
+def test_exact_tree_export_keeps_directory_fds_below_low_process_limit(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    for index in range(320):
+        directory = repo / f"directory-{index:04d}"
+        directory.mkdir()
+        (directory / "payload.txt").write_bytes(f"payload-{index}\n".encode())
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "wide committed tree")
+    destination = tmp_path / "exported-low-fd"
+    script = """
+import os
+import resource
+import sys
+import time
+from agent import bestplan_source as source
+
+repo_path, destination = sys.argv[1:3]
+identity = source.resolve_repo_identity(repo_path)
+snapshot = source.capture_source_snapshot(identity, time.monotonic() + 20.0)
+_soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (96, hard))
+source.export_exact_tree(snapshot, destination)
+assert os.path.isfile(os.path.join(destination, "directory-0319", "payload.txt"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(repo), str(destination)],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=90.0,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (destination / "directory-0000" / "payload.txt").is_file()
+    assert (destination / "directory-0319" / "payload.txt").is_file()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="RLIMIT_NOFILE is POSIX-only")
+def test_failed_deep_export_cleanup_stays_below_low_process_limit(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    directory = repo
+    for index in range(130):
+        directory /= f"d{index:03d}"
+        directory.mkdir()
+    (directory / "payload.txt").write_bytes(b"deep payload\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "deep committed tree")
+    destination = tmp_path / "exported-deep-low-fd"
+    script = """
+import os
+import resource
+import sys
+import time
+from agent import bestplan_source as source
+
+repo_path, destination = sys.argv[1:3]
+identity = source.resolve_repo_identity(repo_path)
+snapshot = source.capture_source_snapshot(identity, time.monotonic() + 20.0)
+_soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (96, hard))
+
+def fail_after_publish(_authority, *, deadline):
+    if os.path.lexists(destination):
+        raise source.SourceBoundaryError("synthetic post-publish failure")
+
+source._verify_public_authority_after = fail_after_publish
+try:
+    source.export_exact_tree(snapshot, destination)
+except source.SourceBoundaryError:
+    pass
+else:
+    raise AssertionError("synthetic verifier failure was not raised")
+assert not os.path.lexists(destination)
+parent = os.path.dirname(destination)
+leaf = os.path.basename(destination)
+assert not any(
+    name.startswith("." + leaf + ".bestplan-staging-")
+    for name in os.listdir(parent)
+)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(repo), str(destination)],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=90.0,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not destination.exists()
 
 
 def test_export_atomic_publish_preserves_raced_destination(tmp_path, monkeypatch):
@@ -1946,7 +2631,6 @@ def test_batch_blob_request_checks_deadline_before_spawning_git(tmp_path, monkey
             identity,
             entries,
             -1,
-            {},
             deadline=time.monotonic() + 1.0,
         )
 
