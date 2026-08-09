@@ -1631,8 +1631,12 @@ def test_claude_explorers_alone_get_candidate_schema(monkeypatch, tmp_path):
     assert synth_schemas == [None]
 
 
-def test_novita_glm_explorers_alone_get_strict_candidate_response_format(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    "model",
+    ["zai-org/glm-5.2", "deepseek/deepseek-v4-flash-0731"],
+)
+def test_novita_chat_completion_explorers_alone_get_strict_candidate_response_format(
+    monkeypatch, tmp_path, model
 ):
     import agent.bestplan_orchestrator as orchestrator
     import run_agent
@@ -1640,7 +1644,7 @@ def test_novita_glm_explorers_alone_get_strict_candidate_response_format(
     lane = {
         "name": "glm",
         "provider": "novita",
-        "model": "zai-org/glm-5.2",
+        "model": model,
         "api_mode": "chat_completions",
         "reasoning_effort": "high",
     }

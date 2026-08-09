@@ -2025,7 +2025,10 @@ def run_bestplan(
         if (
             str(runtime.get("provider") or "").strip().lower() == "novita"
             and str(runtime.get("model") or "").strip().lower()
-            == "zai-org/glm-5.2"
+            in {
+                "deepseek/deepseek-v4-flash-0731",
+                "zai-org/glm-5.2",
+            }
             and str(runtime.get("api_mode") or "").strip().lower()
             == "chat_completions"
         ):
