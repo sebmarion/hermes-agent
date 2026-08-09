@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import os
 import pickle
+import shutil
 import signal
 import sqlite3
 import stat
@@ -203,6 +204,59 @@ def test_snapshot_records_repo_head_ref_common_dir_and_full_oid(tmp_path):
     )
 
 
+def test_trusted_git_invocation_ignores_path_substitution(tmp_path, monkeypatch):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "fake-git-executed"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        f"printf redirected > {str(marker)!r}\n"
+        "printf 'forged\\n'\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    _code, output = source._run_git(
+        os.fsencode(repo),
+        "rev-parse",
+        "--is-inside-work-tree",
+        deadline=time.monotonic() + 2.0,
+    )
+    assert output == b"true\n"
+    assert not marker.exists()
+    identity = source.resolve_repo_identity(str(repo))
+    snapshot = source.capture_source_snapshot(
+        identity, time.monotonic() + 8.0,
+    )
+    destination = tmp_path / "exported"
+    source.export_exact_tree(snapshot, destination)
+    assert (destination / "tracked.txt").read_bytes() == b"committed\n"
+    assert not marker.exists()
+
+
+def test_trusted_executable_identity_maps_unavailable_binary_to_boundary_error(
+    monkeypatch,
+):
+    source = _source()
+
+    def unavailable(_path, *, require_executable):
+        raise OSError("synthetic executable disappearance")
+
+    monkeypatch.setattr(source, "_stable_file_identity", unavailable)
+    with pytest.raises(source.SourceBoundaryError, match="executable"):
+        source._assert_trusted_file_identity(
+            source._CAPTURE_GIT_PATH,
+            source._CAPTURE_GIT_SHA256,
+            source._CAPTURE_GIT_DEVICE,
+            source._CAPTURE_GIT_INODE,
+            require_executable=True,
+        )
+
+
 def test_capture_bootstrap_verifies_module_bytes_before_execution(tmp_path):
     source = _source()
     repo = _init_repo(tmp_path / "repo")
@@ -235,6 +289,66 @@ def test_capture_bootstrap_verifies_module_bytes_before_execution(tmp_path):
         interpreter,
         str(interpreter_stat.st_dev),
         str(interpreter_stat.st_ino),
+        source._CAPTURE_INTERPRETER_SHA256,
+        os.fsdecode(source._CAPTURE_GIT_PATH),
+        str(source._CAPTURE_GIT_DEVICE),
+        str(source._CAPTURE_GIT_INODE),
+        source._CAPTURE_GIT_SHA256,
+    ]
+    result = subprocess.run(
+        command,
+        input=pickle.dumps(
+            (source._CAPTURE_IMPLEMENTATION_SHA256, identity, 1.0),
+            protocol=5,
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=3.0,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+def test_capture_bootstrap_rejects_executable_content_mismatch_before_module(
+    tmp_path,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    marker = tmp_path / "mismatched-executable-module-ran"
+    replacement = tmp_path / "bestplan_source.py"
+    replacement.write_text(
+        "import sys\n"
+        f"open({str(marker)!r}, 'wb').close()\n"
+        "class SourceBoundaryError(ValueError):\n"
+        "    code = 'source_unavailable'\n"
+        "class RepoIdentity:\n"
+        "    pass\n"
+        "_CAPTURE_IMPLEMENTATION_SHA256 = sys.argv[2]\n",
+        encoding="utf-8",
+    )
+    interpreter = os.fsdecode(source._CAPTURE_INTERPRETER_PATH)
+    interpreter_stat = os.stat(source._CAPTURE_INTERPRETER_PATH)
+    git_path = Path(shutil.which("git") or "").resolve()
+    git_stat = git_path.stat()
+    command = [
+        interpreter,
+        "-I",
+        "-S",
+        "-c",
+        source._CAPTURE_HELPER_BOOTSTRAP,
+        str(replacement),
+        source._CAPTURE_IMPLEMENTATION_SHA256,
+        hashlib.sha256(replacement.read_bytes()).hexdigest(),
+        interpreter,
+        str(interpreter_stat.st_dev),
+        str(interpreter_stat.st_ino),
+        "0" * 64,
+        str(git_path),
+        str(git_stat.st_dev),
+        str(git_stat.st_ino),
+        hashlib.sha256(git_path.read_bytes()).hexdigest(),
     ]
     result = subprocess.run(
         command,
@@ -925,7 +1039,7 @@ def test_export_cat_file_timeout_is_coded_proof_stale(tmp_path, monkeypatch):
     real_run = source.subprocess.run
 
     def timeout_cat_file(command, *args, **kwargs):
-        if command[:3] == ["git", "cat-file", "--batch"]:
+        if command[1:3] == ["cat-file", "--batch"]:
             raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
         return real_run(command, *args, **kwargs)
 
@@ -1058,6 +1172,38 @@ def test_public_capture_fails_closed_if_process_group_cleanup_is_denied(
         source.capture_source_snapshot(identity, time.monotonic() + 5.0)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_capture_rejects_a_helper_outside_its_owned_session_group(monkeypatch):
+    source = _source()
+
+    class Process:
+        pid = 12345
+
+    monkeypatch.setattr(source.os, "getpgid", lambda _pid: Process.pid + 1)
+    with pytest.raises(source.SourceBoundaryError, match="process group"):
+        source._capture_posix_process_group(Process())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_public_capture_fails_closed_if_group_extinction_cannot_be_proven(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    real_killpg = source.os.killpg
+
+    def persistent_group(process_group, sig):
+        if sig == 0:
+            return None
+        return real_killpg(process_group, sig)
+
+    monkeypatch.setattr(source, "_CAPTURE_CLEANUP_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(source.os, "killpg", persistent_group)
+    with pytest.raises(source.ProofStaleError, match="extinction|process group"):
+        source.capture_source_snapshot(identity, time.monotonic() + 5.0)
+
+
 @pytest.mark.skipif(
     os.name != "posix" or not hasattr(os, "fork"),
     reason="POSIX process-group semantics required",
@@ -1113,9 +1259,6 @@ signal.pause()
         return True
 
     try:
-        check_until = time.monotonic() + 1.0
-        while descendant_running() and time.monotonic() < check_until:
-            time.sleep(0.01)
         assert not descendant_running()
     finally:
         if descendant_running():
@@ -1181,9 +1324,76 @@ sys.stdout.buffer.flush()
         return True
 
     try:
-        check_until = time.monotonic() + 1.0
-        while descendant_running() and time.monotonic() < check_until:
-            time.sleep(0.01)
+        assert not descendant_running()
+    finally:
+        if descendant_running():
+            os.kill(child_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not hasattr(os, "fork"),
+    reason="POSIX process-group semantics required",
+)
+@pytest.mark.live_system_guard_bypass
+def test_public_capture_sweeps_descendant_before_success_return(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    identity = source.resolve_repo_identity(str(repo))
+    expected = source.capture_source_snapshot(
+        identity, time.monotonic() + 5.0,
+    )
+    response_file = tmp_path / "success-response.pickle"
+    response_file.write_bytes(
+        pickle.dumps(
+            ("ok", source._CAPTURE_IMPLEMENTATION_SHA256, expected),
+            protocol=5,
+        )
+    )
+    child_pid_file = tmp_path / "success-descendant.pid"
+    blocker = """
+import os
+import signal
+import sys
+
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(sys.argv[1], "w", encoding="ascii") as stream:
+        stream.write(str(os.getpid()))
+    os.close(0)
+    os.close(1)
+    os.close(2)
+    while True:
+        signal.pause()
+with open(sys.argv[2], "rb") as stream:
+    sys.stdout.buffer.write(stream.read())
+sys.stdout.buffer.flush()
+"""
+    command = [
+        sys.executable,
+        "-I",
+        "-S",
+        "-c",
+        blocker,
+        str(child_pid_file),
+        str(response_file),
+    ]
+    monkeypatch.setattr(source, "_capture_helper_argv", lambda: command)
+
+    actual = source.capture_source_snapshot(identity, time.monotonic() + 2.0)
+    child_pid = int(child_pid_file.read_text(encoding="ascii"))
+
+    def descendant_running() -> bool:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    try:
+        assert actual == expected
         assert not descendant_running()
     finally:
         if descendant_running():

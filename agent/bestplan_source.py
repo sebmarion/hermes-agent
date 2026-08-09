@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import pickle
+import shutil
 import signal
 import stat
 import subprocess
@@ -23,6 +24,7 @@ from typing import Iterable
 _DEFAULT_DEADLINE_SECONDS = 10.0
 _BUFFER_SIZE = 1024 * 1024
 _MAX_STABILIZATION_READS = 16
+_CAPTURE_CLEANUP_SECONDS = 1.0
 
 
 class SourceBoundaryError(ValueError):
@@ -201,9 +203,16 @@ def _run_git(
         if deadline is None
         else float(deadline)
     )
+    _assert_trusted_file_identity(
+        _CAPTURE_GIT_PATH,
+        _CAPTURE_GIT_SHA256,
+        _CAPTURE_GIT_DEVICE,
+        _CAPTURE_GIT_INODE,
+        require_executable=True,
+    )
     try:
         result = subprocess.run(
-            ["git", *args],
+            [os.fsdecode(_CAPTURE_GIT_PATH), *args],
             cwd=cwd,
             env=_git_environment(),
             input=input_data,
@@ -220,6 +229,13 @@ def _run_git(
         raise SourceBoundaryError(
             f"trusted Git command unavailable: {type(exc).__name__}: {exc}"
         ) from exc
+    _assert_trusted_file_identity(
+        _CAPTURE_GIT_PATH,
+        _CAPTURE_GIT_SHA256,
+        _CAPTURE_GIT_DEVICE,
+        _CAPTURE_GIT_INODE,
+        require_executable=True,
+    )
     if result.returncode not in ok_codes:
         detail = os.fsdecode(result.stderr.strip()) or f"exit {result.returncode}"
         raise SourceBoundaryError(
@@ -258,7 +274,9 @@ def _sha256_bytes(value: bytes, *, deadline: float) -> str:
     return digest.hexdigest()
 
 
-def _loaded_file_sha256(path: bytes) -> str:
+def _stable_file_identity(
+    path: bytes, *, require_executable: bool = False,
+) -> tuple[str, int, int]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
@@ -289,27 +307,107 @@ def _loaded_file_sha256(path: bytes) -> str:
         after.st_mtime_ns,
         after.st_ctime_ns,
     )
-    if before_state != after_state:
+    if (
+        before_state != after_state
+        or not stat.S_ISREG(before.st_mode)
+        or (
+            require_executable
+            and os.name == "posix"
+            and before.st_mode & 0o111 == 0
+        )
+    ):
         raise RuntimeError("BestPlan capture implementation changed during import")
-    return digest.hexdigest()
+    return digest.hexdigest(), before.st_dev, before.st_ino
+
+
+def _loaded_file_sha256(path: bytes) -> str:
+    digest, _device, _inode = _stable_file_identity(path)
+    return digest
+
+
+def _resolve_executable_path(name: str) -> bytes:
+    resolved = shutil.which(name)
+    if not resolved:
+        raise RuntimeError(f"trusted executable is unavailable: {name}")
+    canonical = os.path.realpath(os.fsencode(resolved))
+    if not os.path.isabs(canonical):
+        raise RuntimeError(f"trusted executable is not absolute: {name}")
+    return canonical
 
 
 _CAPTURE_MODULE_PATH = os.path.realpath(os.fsencode(__file__))
 _CAPTURE_INTERPRETER_PATH = os.path.realpath(os.fsencode(sys.executable))
-_CAPTURE_MODULE_SHA256 = _loaded_file_sha256(_CAPTURE_MODULE_PATH)
-_capture_interpreter_stat = os.stat(_CAPTURE_INTERPRETER_PATH)
+_CAPTURE_GIT_PATH = _resolve_executable_path("git")
+(
+    _CAPTURE_MODULE_SHA256,
+    _CAPTURE_MODULE_DEVICE,
+    _CAPTURE_MODULE_INODE,
+) = _stable_file_identity(_CAPTURE_MODULE_PATH)
+(
+    _CAPTURE_INTERPRETER_SHA256,
+    _CAPTURE_INTERPRETER_DEVICE,
+    _CAPTURE_INTERPRETER_INODE,
+) = _stable_file_identity(_CAPTURE_INTERPRETER_PATH, require_executable=True)
+(
+    _CAPTURE_GIT_SHA256,
+    _CAPTURE_GIT_DEVICE,
+    _CAPTURE_GIT_INODE,
+) = _stable_file_identity(_CAPTURE_GIT_PATH, require_executable=True)
 _CAPTURE_IMPLEMENTATION_SHA256 = _hash_fields(
-    b"bestplan-capture-authority-v1",
+    b"bestplan-capture-authority-v2",
     (
         _CAPTURE_MODULE_PATH,
         _CAPTURE_MODULE_SHA256.encode("ascii"),
         _CAPTURE_INTERPRETER_PATH,
-        str(_capture_interpreter_stat.st_dev).encode("ascii"),
-        str(_capture_interpreter_stat.st_ino).encode("ascii"),
+        _CAPTURE_INTERPRETER_SHA256.encode("ascii"),
+        str(_CAPTURE_INTERPRETER_DEVICE).encode("ascii"),
+        str(_CAPTURE_INTERPRETER_INODE).encode("ascii"),
+        _CAPTURE_GIT_PATH,
+        _CAPTURE_GIT_SHA256.encode("ascii"),
+        str(_CAPTURE_GIT_DEVICE).encode("ascii"),
+        str(_CAPTURE_GIT_INODE).encode("ascii"),
         sys.version.encode("utf-8"),
         str(sys.implementation.cache_tag or "").encode("ascii"),
     ),
 )
+_helper_path_entries = [
+    os.fsdecode(os.path.dirname(_CAPTURE_GIT_PATH)),
+    os.fsdecode(os.path.dirname(_CAPTURE_INTERPRETER_PATH)),
+]
+if os.name == "posix":
+    _helper_path_entries.extend(("/usr/bin", "/bin"))
+else:
+    _system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    _helper_path_entries.extend(
+        (os.path.join(_system_root, "System32"), _system_root)
+    )
+_CAPTURE_HELPER_PATH = os.pathsep.join(dict.fromkeys(_helper_path_entries))
+
+
+def _assert_trusted_file_identity(
+    path: bytes,
+    expected_sha256: str,
+    expected_device: int,
+    expected_inode: int,
+    *,
+    require_executable: bool,
+) -> None:
+    try:
+        digest, device, inode = _stable_file_identity(
+            path, require_executable=require_executable,
+        )
+    except (OSError, RuntimeError) as exc:
+        raise SourceBoundaryError(
+            f"trusted capture executable is unavailable: {type(exc).__name__}: {exc}"
+        ) from exc
+    if (
+        digest != expected_sha256
+        or device != expected_device
+        or inode != expected_inode
+    ):
+        raise SourceBoundaryError(
+            "trusted capture executable identity changed"
+        )
 
 
 def _canonical_raw(path: str | os.PathLike[str]) -> bytes:
@@ -1240,54 +1338,89 @@ sys.dont_write_bytecode = True
     expected_interpreter_path,
     expected_interpreter_dev,
     expected_interpreter_ino,
-) = sys.argv[1:7]
-module_path_raw = os.fsencode(module_path)
-interpreter_path_raw = os.fsencode(expected_interpreter_path)
-interpreter_info = os.stat(interpreter_path_raw)
-if (
-    os.path.realpath(os.fsencode(sys.executable)) != interpreter_path_raw
-    or interpreter_info.st_dev != int(expected_interpreter_dev)
-    or interpreter_info.st_ino != int(expected_interpreter_ino)
-):
-    raise RuntimeError("trusted BestPlan capture interpreter identity mismatch")
+    expected_interpreter_sha256,
+    expected_git_path,
+    expected_git_dev,
+    expected_git_ino,
+    expected_git_sha256,
+) = sys.argv[1:12]
 
-flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-flags |= getattr(os, "O_NOFOLLOW", 0)
-module_fd = os.open(module_path_raw, flags)
-try:
-    module_before = os.fstat(module_fd)
-    module_chunks = []
-    while True:
-        chunk = os.read(module_fd, 1024 * 1024)
-        if not chunk:
-            break
-        module_chunks.append(chunk)
-    module_after = os.fstat(module_fd)
-finally:
-    os.close(module_fd)
-module_state_before = (
-    module_before.st_dev,
-    module_before.st_ino,
-    module_before.st_mode,
-    module_before.st_size,
-    module_before.st_mtime_ns,
-    module_before.st_ctime_ns,
-)
-module_state_after = (
-    module_after.st_dev,
-    module_after.st_ino,
-    module_after.st_mode,
-    module_after.st_size,
-    module_after.st_mtime_ns,
-    module_after.st_ctime_ns,
-)
-module_bytes = b"".join(module_chunks)
-if (
-    not stat.S_ISREG(module_before.st_mode)
-    or module_state_before != module_state_after
-    or hashlib.sha256(module_bytes).hexdigest() != expected_module_sha256
+def verified_bytes(path, expected_sha256, expected_dev, expected_ino, executable):
+    path_raw = os.fsencode(path)
+    if os.path.normcase(os.path.realpath(path_raw)) != os.path.normcase(path_raw):
+        raise RuntimeError("trusted BestPlan executable path is not canonical")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    path_before = os.stat(path_raw, follow_symlinks=False)
+    fd = os.open(path_raw, flags)
+    try:
+        opened_before = os.fstat(fd)
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        opened_after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    path_after = os.stat(path_raw, follow_symlinks=False)
+    before_state = (
+        opened_before.st_dev,
+        opened_before.st_ino,
+        opened_before.st_mode,
+        opened_before.st_size,
+        opened_before.st_mtime_ns,
+        opened_before.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(opened_before.st_mode)
+        or before_state != (
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_mode,
+            opened_after.st_size,
+            opened_after.st_mtime_ns,
+            opened_after.st_ctime_ns,
+        )
+        or (path_before.st_dev, path_before.st_ino)
+        != (opened_before.st_dev, opened_before.st_ino)
+        or (path_after.st_dev, path_after.st_ino)
+        != (opened_before.st_dev, opened_before.st_ino)
+        or opened_before.st_dev != int(expected_dev)
+        or opened_before.st_ino != int(expected_ino)
+        or hashlib.sha256(b"".join(chunks)).hexdigest() != expected_sha256
+        or (executable and os.name == "posix" and opened_before.st_mode & 0o111 == 0)
+    ):
+        raise RuntimeError("trusted BestPlan executable identity mismatch")
+    return b"".join(chunks)
+
+interpreter_path_raw = os.fsencode(expected_interpreter_path)
+if os.path.normcase(os.path.realpath(os.fsencode(sys.executable))) != os.path.normcase(
+    interpreter_path_raw
 ):
-    raise RuntimeError("trusted BestPlan capture module identity mismatch")
+    raise RuntimeError("trusted BestPlan capture interpreter path mismatch")
+verified_bytes(
+    expected_interpreter_path,
+    expected_interpreter_sha256,
+    expected_interpreter_dev,
+    expected_interpreter_ino,
+    True,
+)
+verified_bytes(
+    expected_git_path,
+    expected_git_sha256,
+    expected_git_dev,
+    expected_git_ino,
+    True,
+)
+module_bytes = verified_bytes(
+    module_path,
+    expected_module_sha256,
+    os.stat(os.fsencode(module_path), follow_symlinks=False).st_dev,
+    os.stat(os.fsencode(module_path), follow_symlinks=False).st_ino,
+    False,
+)
 
 agent_package = types.ModuleType("agent")
 agent_package.__path__ = []
@@ -1300,6 +1433,13 @@ module.__spec__ = importlib.util.spec_from_loader(
 )
 sys.modules["agent.bestplan_source"] = module
 exec(compile(module_bytes, module_path, "exec"), module.__dict__)
+if (
+    module._CAPTURE_INTERPRETER_PATH != interpreter_path_raw
+    or module._CAPTURE_INTERPRETER_SHA256 != expected_interpreter_sha256
+    or module._CAPTURE_GIT_PATH != os.fsencode(expected_git_path)
+    or module._CAPTURE_GIT_SHA256 != expected_git_sha256
+):
+    raise RuntimeError("trusted BestPlan capture executable binding mismatch")
 
 try:
     request_identity, repo, remaining_budget = pickle.loads(sys.stdin.buffer.read())
@@ -1351,8 +1491,13 @@ def _capture_helper_argv() -> list[str]:
         _CAPTURE_IMPLEMENTATION_SHA256,
         _CAPTURE_MODULE_SHA256,
         os.fsdecode(_CAPTURE_INTERPRETER_PATH),
-        str(_capture_interpreter_stat.st_dev),
-        str(_capture_interpreter_stat.st_ino),
+        str(_CAPTURE_INTERPRETER_DEVICE),
+        str(_CAPTURE_INTERPRETER_INODE),
+        _CAPTURE_INTERPRETER_SHA256,
+        os.fsdecode(_CAPTURE_GIT_PATH),
+        str(_CAPTURE_GIT_DEVICE),
+        str(_CAPTURE_GIT_INODE),
+        _CAPTURE_GIT_SHA256,
     ]
 
 
@@ -1360,7 +1505,6 @@ def _capture_helper_environment() -> dict[str, str]:
     allowed = (
         "HOME",
         "LANG",
-        "PATH",
         "SYSTEMROOT",
         "TEMP",
         "TMP",
@@ -1368,6 +1512,7 @@ def _capture_helper_environment() -> dict[str, str]:
         "XDG_CONFIG_HOME",
     )
     env = {key: os.environ[key] for key in allowed if key in os.environ}
+    env["PATH"] = _CAPTURE_HELPER_PATH
     env["LC_ALL"] = "C"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
@@ -1464,12 +1609,32 @@ def _close_capture_helper_containment(handle: object | None) -> None:
     kernel32.CloseHandle(handle)
 
 
+def _capture_posix_process_group(process: subprocess.Popen) -> int | None:
+    if os.name != "posix":
+        return None
+    try:
+        process_group = os.getpgid(process.pid)
+    except OSError as exc:
+        raise SourceBoundaryError(
+            "trusted capture helper process group could not be identified"
+        ) from exc
+    if process_group != process.pid:
+        raise SourceBoundaryError(
+            "trusted capture helper does not own its isolated process group"
+        )
+    return process_group
+
+
 def _signal_capture_helper(
-    process: subprocess.Popen, sig: int | None, *, force: bool = False,
+    process: subprocess.Popen,
+    sig: int | None,
+    *,
+    force: bool = False,
+    process_group: int | None = None,
 ) -> bool:
     if os.name == "posix" and sig is not None:
         try:
-            os.killpg(process.pid, sig)
+            os.killpg(process.pid if process_group is None else process_group, sig)
         except ProcessLookupError:
             return True
         except OSError:
@@ -1489,8 +1654,96 @@ def _signal_capture_helper(
     return True
 
 
-def _terminate_capture_helper(process: subprocess.Popen) -> None:
-    _signal_capture_helper(process, getattr(signal, "SIGTERM", None))
+def _wait_for_posix_group_extinction(process_group: int) -> None:
+    cleanup_deadline = time.monotonic() + _CAPTURE_CLEANUP_SECONDS
+    while True:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return
+        except OSError as exc:
+            raise ProofStaleError(
+                "proof_stale: capture helper process group extinction query failed"
+            ) from exc
+        remaining = cleanup_deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProofStaleError(
+                "proof_stale: capture helper process group extinction was not proven"
+            )
+        time.sleep(min(0.01, remaining))
+
+
+def _terminate_windows_job_and_wait(handle: object) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class _BasicAccountingInformation(ctypes.Structure):
+        _fields_ = [
+            ("total_user_time", ctypes.c_longlong),
+            ("total_kernel_time", ctypes.c_longlong),
+            ("period_user_time", ctypes.c_longlong),
+            ("period_kernel_time", ctypes.c_longlong),
+            ("total_page_faults", wintypes.DWORD),
+            ("total_processes", wintypes.DWORD),
+            ("active_processes", wintypes.DWORD),
+            ("terminated_processes", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    if not kernel32.TerminateJobObject(handle, 1):
+        raise ProofStaleError(
+            "proof_stale: capture helper Windows Job termination failed"
+        )
+    cleanup_deadline = time.monotonic() + _CAPTURE_CLEANUP_SECONDS
+    while True:
+        accounting = _BasicAccountingInformation()
+        if not kernel32.QueryInformationJobObject(
+            handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None,
+        ):
+            raise ProofStaleError(
+                "proof_stale: capture helper Windows Job extinction query failed"
+            )
+        if accounting.active_processes == 0:
+            return
+        remaining = cleanup_deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProofStaleError(
+                "proof_stale: capture helper Windows Job extinction was not proven"
+            )
+        time.sleep(min(0.01, remaining))
+
+
+def _terminate_capture_helper(
+    process: subprocess.Popen,
+    containment: object | None = None,
+    process_group: int | None = None,
+) -> None:
+    if os.name == "nt" and containment is not None:
+        try:
+            _terminate_windows_job_and_wait(containment)
+        finally:
+            _close_capture_helper_containment(containment)
+        try:
+            process.communicate(timeout=_CAPTURE_CLEANUP_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise ProofStaleError(
+                "proof_stale: capture helper could not be reaped after Job termination"
+            ) from exc
+        return
+
+    _signal_capture_helper(
+        process, getattr(signal, "SIGTERM", None), process_group=process_group,
+    )
     leader_reaped = False
     try:
         process.communicate(timeout=0.2)
@@ -1500,12 +1753,19 @@ def _terminate_capture_helper(process: subprocess.Popen) -> None:
     # The leader can exit on SIGTERM while a Git/FS descendant ignores it.
     # Always kill the original POSIX process group before declaring cleanup.
     group_killed = _signal_capture_helper(
-        process, getattr(signal, "SIGKILL", None), force=True,
+        process,
+        getattr(signal, "SIGKILL", None),
+        force=True,
+        process_group=process_group,
     )
     if leader_reaped:
         if not group_killed:
             raise ProofStaleError(
                 "proof_stale: capture helper process group could not be killed"
+            )
+        if os.name == "posix":
+            _wait_for_posix_group_extinction(
+                process.pid if process_group is None else process_group
             )
         return
     try:
@@ -1517,6 +1777,10 @@ def _terminate_capture_helper(process: subprocess.Popen) -> None:
     if not group_killed:
         raise ProofStaleError(
             "proof_stale: capture helper process group could not be killed"
+        )
+    if os.name == "posix":
+        _wait_for_posix_group_extinction(
+            process.pid if process_group is None else process_group
         )
 
 
@@ -1538,6 +1802,20 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
 
     absolute_deadline = float(deadline)
     remaining_budget = _remaining(absolute_deadline)
+    _assert_trusted_file_identity(
+        _CAPTURE_INTERPRETER_PATH,
+        _CAPTURE_INTERPRETER_SHA256,
+        _CAPTURE_INTERPRETER_DEVICE,
+        _CAPTURE_INTERPRETER_INODE,
+        require_executable=True,
+    )
+    _assert_trusted_file_identity(
+        _CAPTURE_GIT_PATH,
+        _CAPTURE_GIT_SHA256,
+        _CAPTURE_GIT_DEVICE,
+        _CAPTURE_GIT_INODE,
+        require_executable=True,
+    )
     request = pickle.dumps(
         (_CAPTURE_IMPLEMENTATION_SHA256, repo, remaining_budget), protocol=5,
     )
@@ -1557,11 +1835,17 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
         raise SourceBoundaryError(
             f"trusted capture helper could not start: {type(exc).__name__}: {exc}"
         ) from exc
+    try:
+        process_group = _capture_posix_process_group(process)
+    except SourceBoundaryError:
+        process.kill()
+        process.communicate(timeout=_CAPTURE_CLEANUP_SECONDS)
+        raise
     containment: object | None = None
     try:
         containment = _attach_capture_helper_containment(process)
     except OSError as exc:
-        _terminate_capture_helper(process)
+        _terminate_capture_helper(process, process_group=process_group)
         raise SourceBoundaryError(
             f"trusted capture helper containment unavailable: {exc}"
         ) from exc
@@ -1569,39 +1853,76 @@ def capture_source_snapshot(repo: RepoIdentity, deadline: float) -> SourceSnapsh
         try:
             timeout = _remaining(absolute_deadline)
         except SourceBoundaryError:
-            _close_capture_helper_containment(containment)
+            owned_containment = containment
             containment = None
-            _terminate_capture_helper(process)
+            _terminate_capture_helper(
+                process, owned_containment, process_group,
+            )
             raise
         try:
             output, stderr = process.communicate(input=request, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            _close_capture_helper_containment(containment)
+            owned_containment = containment
             containment = None
-            _terminate_capture_helper(process)
+            _terminate_capture_helper(
+                process, owned_containment, process_group,
+            )
             raise ProofStaleError(
                 "proof_stale: trusted capture helper exceeded the source deadline"
             ) from exc
         # A coded helper result is not proof that a Git/FS descendant exited.
         # Sweep the isolated POSIX process group before trusting any payload.
-        if not _signal_capture_helper(
-            process, getattr(signal, "SIGKILL", None), force=True,
-        ):
+        if os.name == "posix":
+            if not _signal_capture_helper(
+                process,
+                getattr(signal, "SIGKILL", None),
+                force=True,
+                process_group=process_group,
+            ):
+                raise ProofStaleError(
+                    "proof_stale: capture helper process group cleanup failed"
+                )
+            if process_group is None:
+                raise ProofStaleError(
+                    "proof_stale: capture helper process group ownership was lost"
+                )
+            _wait_for_posix_group_extinction(process_group)
+        elif containment is not None:
+            try:
+                _terminate_windows_job_and_wait(containment)
+            finally:
+                _close_capture_helper_containment(containment)
+                containment = None
+        else:
             raise ProofStaleError(
-                "proof_stale: capture helper process group cleanup failed"
+                "proof_stale: capture helper containment is unavailable"
             )
-        _close_capture_helper_containment(containment)
-        containment = None
     except BaseException:
-        _close_capture_helper_containment(containment)
-        containment = None
-        if process.poll() is None:
-            _terminate_capture_helper(process)
+        if containment is not None or process.poll() is None:
+            owned_containment = containment
+            containment = None
+            _terminate_capture_helper(
+                process, owned_containment, process_group,
+            )
         raise
     finally:
         _close_capture_helper_containment(containment)
 
     _remaining(absolute_deadline)
+    _assert_trusted_file_identity(
+        _CAPTURE_INTERPRETER_PATH,
+        _CAPTURE_INTERPRETER_SHA256,
+        _CAPTURE_INTERPRETER_DEVICE,
+        _CAPTURE_INTERPRETER_INODE,
+        require_executable=True,
+    )
+    _assert_trusted_file_identity(
+        _CAPTURE_GIT_PATH,
+        _CAPTURE_GIT_SHA256,
+        _CAPTURE_GIT_DEVICE,
+        _CAPTURE_GIT_INODE,
+        require_executable=True,
+    )
     if process.returncode != 0:
         detail = os.fsdecode(stderr[-4096:]).strip() or f"exit {process.returncode}"
         raise SourceBoundaryError(
