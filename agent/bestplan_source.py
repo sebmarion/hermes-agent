@@ -108,6 +108,18 @@ class IndexFlags:
     assume_unchanged: bool
     skip_worktree: bool
     fsmonitor_valid: bool
+    intent_to_add: bool
+
+
+@dataclass(frozen=True)
+class _RawIndexEntry:
+    path: bytes
+    mode: int
+    oid: str
+    stage: int
+    assume_unchanged: bool
+    skip_worktree: bool
+    intent_to_add: bool
 
 
 @dataclass(frozen=True)
@@ -454,23 +466,6 @@ def _run_git(
     )
     assert isinstance(output, bytes)
     return code, output
-
-
-def _run_git_digest(
-    cwd: bytes | str,
-    *args: str,
-    deadline: float,
-    max_output_bytes: int,
-) -> str:
-    _code, output = _run_git_output(
-        cwd,
-        *args,
-        deadline=deadline,
-        max_output_bytes=max_output_bytes,
-        digest_only=True,
-    )
-    assert isinstance(output, str)
-    return output
 
 
 def _without_delimiter(value: bytes) -> bytes:
@@ -1706,8 +1701,8 @@ def _index_extension_records(
     *,
     object_format: str,
     deadline: float,
-) -> tuple[tuple[bytes, ...], tuple[tuple[bytes, bytes], ...]]:
-    """Return raw index paths in order and lossless extension payloads.
+) -> tuple[tuple[_RawIndexEntry, ...], tuple[tuple[bytes, bytes], ...]]:
+    """Return raw semantic index entries and lossless extension payloads.
 
     This parser exists only to interpret persisted index flags that Git cannot
     safely report while repository-configured fsmonitor execution is disabled.
@@ -1743,7 +1738,7 @@ def _index_extension_records(
 
     offset = 12
     previous_path = b""
-    paths: list[bytes] = []
+    entries: list[_RawIndexEntry] = []
     for _entry_index in range(entry_count):
         _remaining(deadline)
         entry_start = offset
@@ -1752,13 +1747,16 @@ def _index_extension_records(
         if mode_offset + 4 > checksum_offset or flags_offset + 2 > checksum_offset:
             raise SourceBoundaryError("Git index entry metadata is truncated")
         raw_mode = int.from_bytes(value[mode_offset : mode_offset + 4], "big")
+        raw_oid = value[entry_start + 40 : entry_start + 40 + hash_size].hex()
         if raw_mode & 0o170000 == 0o040000:
             raise UnsupportedRepositoryError(
                 "persisted sparse Git index directory is unsupported"
             )
         flags = int.from_bytes(value[flags_offset : flags_offset + 2], "big")
+        stage = (flags >> 12) & 0x3
         name_length = flags & 0x0FFF
         name_offset = flags_offset + 2
+        extended = 0
         if flags & 0x4000:
             if version < 3 or name_offset + 2 > checksum_offset:
                 raise SourceBoundaryError("Git index extended flags are malformed")
@@ -1806,7 +1804,15 @@ def _index_extension_records(
             raise UnsupportedRepositoryError(
                 "Git index path exceeds the trusted path limit"
             )
-        paths.append(path)
+        entries.append(_RawIndexEntry(
+            path=path,
+            mode=raw_mode,
+            oid=raw_oid,
+            stage=stage,
+            assume_unchanged=bool(flags & 0x8000),
+            skip_worktree=bool(extended & 0x4000),
+            intent_to_add=bool(extended & 0x2000),
+        ))
         previous_path = path
 
     extensions: list[tuple[bytes, bytes]] = []
@@ -1822,7 +1828,7 @@ def _index_extension_records(
             raise SourceBoundaryError("Git index extension size is malformed")
         extensions.append((signature, value[offset:extension_end]))
         offset = extension_end
-    return tuple(paths), tuple(extensions)
+    return tuple(entries), tuple(extensions)
 
 
 def _decode_ewah_set_bits(
@@ -1911,7 +1917,7 @@ def _parse_index_fsmonitor_valid_paths(
     object_format: str,
     deadline: float,
 ) -> set[bytes]:
-    raw_index_paths, extensions = _index_extension_records(
+    raw_index_entries, extensions = _index_extension_records(
         value, object_format=object_format, deadline=deadline,
     )
     if any(signature == b"link" for signature, _payload in extensions):
@@ -1922,6 +1928,7 @@ def _parse_index_fsmonitor_valid_paths(
         raise UnsupportedRepositoryError(
             "persisted sparse Git indexes are unsupported for source proof capture"
         )
+    raw_index_paths = tuple(entry.path for entry in raw_index_entries)
     if raw_index_paths != index_paths:
         raise _CaptureChanged("Git index entries changed during capture")
     entry_count = len(raw_index_paths)
@@ -2377,7 +2384,7 @@ def _tree_filter_names(
 
 def _assert_supported_repository(
     repo: RepoIdentity, *, deadline: float, scan_specials: bool,
-) -> None:
+) -> tuple[str, str, tuple[_TreeEntry, ...]]:
     absolute_deadline = float(deadline)
     current = _resolve_repo_identity(repo.workspace, absolute_deadline)
     if not _same_repository(repo, current):
@@ -2430,7 +2437,7 @@ def _assert_supported_repository(
         deadline=absolute_deadline,
         limit=_MAX_GIT_METADATA_BYTES,
     )
-    _raw_index_paths, index_extensions = _index_extension_records(
+    _raw_index_entries, index_extensions = _index_extension_records(
         raw_index,
         object_format=repo.object_format,
         deadline=absolute_deadline,
@@ -2502,6 +2509,7 @@ def _assert_supported_repository(
         raise UnsupportedRepositoryError("persisted sparse Git index is unsupported")
     if scan_specials:
         _scan_nonignored_specials(repo, deadline=absolute_deadline)
+    return head_oid, tree_oid, tree_entries
 
 
 def assert_supported_repository(
@@ -2533,7 +2541,7 @@ def _manifest_digest(
     deadline: float,
 ) -> str:
     digest = hashlib.sha256()
-    label = b"bestplan-protected-manifest-v1"
+    label = b"bestplan-protected-manifest-v2"
     digest.update(len(label).to_bytes(8, "big"))
     digest.update(label)
 
@@ -2560,6 +2568,7 @@ def _manifest_digest(
         add(b"1" if entry.assume_unchanged else b"0")
         add(b"1" if entry.skip_worktree else b"0")
         add(b"1" if entry.fsmonitor_valid else b"0")
+        add(b"1" if entry.intent_to_add else b"0")
     for entry in worktree_entries:
         add(b"worktree")
         add(entry.path)
@@ -2595,8 +2604,278 @@ def _tracked_entry_differs_from_index(
     return executable != (index.mode == 0o100755)
 
 
+def _index_mode_kind(mode: int) -> bytes:
+    kind = mode & 0o170000
+    if kind == 0o100000:
+        return b"regular"
+    if kind == 0o120000:
+        return b"symlink"
+    if kind == 0o160000:
+        return b"gitlink"
+    if kind == 0o040000:
+        return b"directory"
+    return b"unsupported"
+
+
+def _group_index_entries(
+    entries: tuple[IndexEntry, ...], *, deadline: float,
+) -> dict[bytes, tuple[IndexEntry, ...]]:
+    grouped: dict[bytes, list[IndexEntry]] = {}
+    for entry in entries:
+        _remaining(deadline)
+        if entry.stage not in {0, 1, 2, 3}:
+            raise SourceBoundaryError("Git index contains an invalid stage")
+        grouped.setdefault(entry.path, []).append(entry)
+    result: dict[bytes, tuple[IndexEntry, ...]] = {}
+    for path, values in grouped.items():
+        _remaining(deadline)
+        ordered = tuple(sorted(values, key=lambda item: item.stage))
+        stages = {entry.stage for entry in ordered}
+        if len(stages) != len(ordered) or (0 in stages and len(stages) != 1):
+            raise SourceBoundaryError(
+                "Git index contains inconsistent conflict stages"
+            )
+        result[path] = ordered
+    return result
+
+
+def _index_flags_by_path(
+    entries: tuple[IndexFlags, ...], *, deadline: float,
+) -> dict[bytes, IndexFlags]:
+    result: dict[bytes, IndexFlags] = {}
+    for entry in entries:
+        _remaining(deadline)
+        if entry.path in result:
+            raise SourceBoundaryError("Git index contains duplicate path flags")
+        result[entry.path] = entry
+    return result
+
+
+def _bounded_delta_digest(
+    label: bytes,
+    records: Iterable[tuple[bytes, ...]],
+    *,
+    deadline: float,
+) -> str:
+    digest = hashlib.sha256()
+    total = 0
+
+    def add(field: bytes) -> None:
+        nonlocal total
+        _remaining(deadline)
+        total += 8 + len(field)
+        if total > _MAX_DIFF_BYTES:
+            raise UnsupportedRepositoryError(
+                "canonical source delta exceeds the trusted diff limit"
+            )
+        digest.update(len(field).to_bytes(8, "big"))
+        digest.update(field)
+
+    add(label)
+    for record in records:
+        add(b"record")
+        for field in record:
+            add(field)
+    _remaining(deadline)
+    return digest.hexdigest()
+
+
+def _index_record_fields(
+    entries: tuple[IndexEntry, ...], *, intent_to_add: bool,
+) -> tuple[bytes, ...]:
+    fields: list[bytes] = [
+        b"index",
+        b"present" if entries else b"absent",
+        str(len(entries)).encode("ascii"),
+        b"intent-to-add",
+        b"1" if intent_to_add else b"0",
+    ]
+    for entry in entries:
+        fields.extend((
+            b"entry",
+            str(entry.stage).encode("ascii"),
+            oct(entry.mode).encode("ascii"),
+            _index_mode_kind(entry.mode),
+            entry.oid.encode("ascii"),
+        ))
+    return tuple(fields)
+
+
+def _head_record_fields(entry: _TreeEntry | None) -> tuple[bytes, ...]:
+    if entry is None:
+        return (b"head", b"absent")
+    return (
+        b"head",
+        b"present",
+        oct(entry.mode).encode("ascii"),
+        entry.object_type,
+        entry.oid.encode("ascii"),
+    )
+
+
+def _worktree_record_fields(entry: ProtectedPath) -> tuple[bytes, ...]:
+    return (
+        b"worktree",
+        b"present",
+        entry.kind.encode("ascii"),
+        b"" if entry.mode is None else oct(entry.mode).encode("ascii"),
+        b"" if entry.size is None else str(entry.size).encode("ascii"),
+        b"" if entry.content_sha256 is None else entry.content_sha256.encode("ascii"),
+        b"" if entry.symlink_target is None else entry.symlink_target,
+        b"" if entry.git_oid is None else entry.git_oid.encode("ascii"),
+    )
+
+
+def _empty_blob_oid(object_format: str) -> str:
+    try:
+        digest = hashlib.new(object_format, usedforsecurity=False)
+    except TypeError:  # pragma: no cover - compatibility with older Python
+        digest = hashlib.new(object_format)
+    digest.update(b"blob 0\0")
+    return digest.hexdigest()
+
+
+def _staged_delta(
+    head_entries: tuple[_TreeEntry, ...],
+    index_entries: tuple[IndexEntry, ...],
+    index_flags: tuple[IndexFlags, ...],
+    *,
+    object_format: str,
+    deadline: float,
+) -> tuple[set[bytes], str]:
+    head_by_path: dict[bytes, _TreeEntry] = {}
+    for entry in head_entries:
+        _remaining(deadline)
+        if entry.path in head_by_path:
+            raise SourceBoundaryError("Git HEAD tree contains duplicate paths")
+        head_by_path[entry.path] = entry
+    index_by_path = _group_index_entries(index_entries, deadline=deadline)
+    flags_by_path = _index_flags_by_path(index_flags, deadline=deadline)
+    empty_oid = _empty_blob_oid(object_format)
+    changed: set[bytes] = set()
+    for path in sorted(set(head_by_path) | set(index_by_path)):
+        _remaining(deadline)
+        head = head_by_path.get(path)
+        indexed = index_by_path.get(path, ())
+        flag = flags_by_path.get(path)
+        intent_to_add = bool(flag and flag.intent_to_add)
+        if intent_to_add:
+            if (
+                head is not None
+                or len(indexed) != 1
+                or indexed[0].stage != 0
+                or indexed[0].mode not in {0o100644, 0o100755}
+                or indexed[0].oid != empty_oid
+            ):
+                raise SourceBoundaryError(
+                    "Git intent-to-add index state is malformed"
+                )
+            effective_index: tuple[IndexEntry, ...] = ()
+        else:
+            effective_index = indexed
+        clean = (
+            head is not None
+            and head.object_type == b"blob"
+            and len(effective_index) == 1
+            and effective_index[0].stage == 0
+            and effective_index[0].mode == head.mode
+            and effective_index[0].oid == head.oid
+        ) or (head is None and not effective_index)
+        if not clean:
+            changed.add(path)
+    for path, flag in flags_by_path.items():
+        _remaining(deadline)
+        if flag.intent_to_add and path not in index_by_path:
+            raise SourceBoundaryError("Git intent-to-add flag has no index entry")
+    _assert_path_scale(
+        changed,
+        label="canonical staged delta",
+        max_count=_MAX_PROTECTED_PATHS,
+        deadline=deadline,
+    )
+
+    def records() -> Iterable[tuple[bytes, ...]]:
+        for path in sorted(changed):
+            _remaining(deadline)
+            head = head_by_path.get(path)
+            indexed = index_by_path.get(path, ())
+            flag = flags_by_path.get(path)
+            yield (
+                b"path",
+                path,
+                *_head_record_fields(head),
+                *_index_record_fields(
+                    indexed,
+                    intent_to_add=bool(flag and flag.intent_to_add),
+                ),
+            )
+
+    return changed, _bounded_delta_digest(
+        b"bestplan-staged-delta-v2", records(), deadline=deadline,
+    )
+
+
+def _unstaged_delta(
+    index_entries: tuple[IndexEntry, ...],
+    index_flags: tuple[IndexFlags, ...],
+    worktree_entries: tuple[ProtectedPath, ...],
+    *,
+    deadline: float,
+) -> tuple[set[bytes], str]:
+    index_by_path = _group_index_entries(index_entries, deadline=deadline)
+    flags_by_path = _index_flags_by_path(index_flags, deadline=deadline)
+    worktree_by_path: dict[bytes, ProtectedPath] = {}
+    for entry in worktree_entries:
+        _remaining(deadline)
+        if not entry.tracked:
+            continue
+        if entry.path in worktree_by_path:
+            raise SourceBoundaryError("protected manifest contains duplicate paths")
+        worktree_by_path[entry.path] = entry
+    if set(worktree_by_path) != set(index_by_path):
+        raise _CaptureChanged("Git index paths changed during worktree capture")
+    changed: set[bytes] = set()
+    for path in sorted(index_by_path):
+        _remaining(deadline)
+        indexed = index_by_path[path]
+        flag = flags_by_path.get(path)
+        stage_zero = indexed[0] if len(indexed) == 1 and indexed[0].stage == 0 else None
+        if (
+            bool(flag and flag.intent_to_add)
+            or _tracked_entry_differs_from_index(worktree_by_path[path], stage_zero)
+        ):
+            changed.add(path)
+    _assert_path_scale(
+        changed,
+        label="canonical unstaged delta",
+        max_count=_MAX_PROTECTED_PATHS,
+        deadline=deadline,
+    )
+
+    def records() -> Iterable[tuple[bytes, ...]]:
+        for path in sorted(changed):
+            _remaining(deadline)
+            flag = flags_by_path.get(path)
+            yield (
+                b"path",
+                path,
+                *_index_record_fields(
+                    index_by_path[path],
+                    intent_to_add=bool(flag and flag.intent_to_add),
+                ),
+                *_worktree_record_fields(worktree_by_path[path]),
+            )
+
+    return changed, _bounded_delta_digest(
+        b"bestplan-unstaged-delta-v2", records(), deadline=deadline,
+    )
+
+
 def _capture_protected_manifest(
-    repo: RepoIdentity, *, deadline: float | None = None,
+    repo: RepoIdentity,
+    *,
+    deadline: float | None = None,
+    head_tree_entries: tuple[_TreeEntry, ...] | None = None,
 ) -> ProtectedManifest:
     """Capture ambient state after the public trust boundary is established."""
 
@@ -2618,10 +2897,33 @@ def _capture_protected_manifest(
         deadline=absolute_deadline,
         limit=_MAX_GIT_METADATA_BYTES,
     )
+    raw_index_entries, _index_extensions = _index_extension_records(
+        index_state,
+        object_format=repo.object_format,
+        deadline=absolute_deadline,
+    )
     _, index_raw = _run_git(
         repo.worktree_raw, "ls-files", "--stage", "-z", deadline=absolute_deadline,
     )
     index_entries = _parse_index_entries(index_raw, deadline=absolute_deadline)
+    raw_semantic_entries = tuple(
+        IndexEntry(entry.path, entry.mode, entry.oid, entry.stage)
+        for entry in raw_index_entries
+    )
+    if raw_semantic_entries != index_entries:
+        raise _CaptureChanged("Git index entries changed during capture")
+    if any(
+        entry.stage != 0
+        and (
+            entry.assume_unchanged
+            or entry.skip_worktree
+            or entry.intent_to_add
+        )
+        for entry in raw_index_entries
+    ):
+        raise UnsupportedRepositoryError(
+            "nonzero conflict-stage index flags are unsupported"
+        )
     _, verbose_raw = _run_git(
         repo.worktree_raw, "ls-files", "-v", "-z", deadline=absolute_deadline,
     )
@@ -2632,22 +2934,33 @@ def _capture_protected_manifest(
         object_format=repo.object_format,
         deadline=absolute_deadline,
     )
+    raw_flags_by_path: dict[bytes, list[_RawIndexEntry]] = {}
+    for entry in raw_index_entries:
+        _remaining(absolute_deadline)
+        raw_flags_by_path.setdefault(entry.path, []).append(entry)
+    if set(verbose_tags) != set(raw_flags_by_path):
+        raise _CaptureChanged("Git index flags changed during capture")
     all_flag_paths = sorted(
-        set(verbose_tags) | {entry.path for entry in index_entries}
+        raw_flags_by_path
     )
     index_flags = tuple(
         IndexFlags(
             path=path,
             tag=verbose_tags.get(path, b""),
             fsmonitor_tag=b"f" if path in fsmonitor_valid_paths else b"F",
-            assume_unchanged=verbose_tags.get(path, b"").islower(),
-            skip_worktree=verbose_tags.get(path, b"").upper() == b"S",
+            assume_unchanged=any(
+                entry.assume_unchanged
+                for entry in raw_flags_by_path.get(path, ())
+            ),
+            skip_worktree=any(
+                entry.skip_worktree for entry in raw_flags_by_path.get(path, ())
+            ),
             fsmonitor_valid=path in fsmonitor_valid_paths,
+            intent_to_add=any(
+                entry.intent_to_add for entry in raw_flags_by_path.get(path, ())
+            ),
         )
         for path in all_flag_paths
-    )
-    _, cached_raw = _run_git(
-        repo.worktree_raw, "ls-files", "--cached", "-z", deadline=absolute_deadline,
     )
     _, untracked_raw = _run_git(
         repo.worktree_raw,
@@ -2657,8 +2970,10 @@ def _capture_protected_manifest(
         "-z",
         deadline=absolute_deadline,
     )
-    tracked_paths = set(_split_nul(cached_raw, deadline=absolute_deadline))
+    tracked_paths = {entry.path for entry in index_entries}
     untracked_paths = set(_split_nul(untracked_raw, deadline=absolute_deadline))
+    if tracked_paths & untracked_paths:
+        raise _CaptureChanged("Git tracked and untracked paths overlap")
     all_worktree_paths = sorted(tracked_paths | untracked_paths)
     _assert_path_scale(
         all_worktree_paths,
@@ -2678,63 +2993,37 @@ def _capture_protected_manifest(
             )
         )
     worktree_entries = tuple(worktree_entries_list)
-    staged_diff_sha256 = _run_git_digest(
-        repo.worktree_raw,
-        "diff",
-        "--cached",
-        "--binary",
-        "--full-index",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        "--no-color",
-        "HEAD",
-        "--",
-        deadline=absolute_deadline,
-        max_output_bytes=_MAX_DIFF_BYTES,
-    )
-    unstaged_diff_sha256 = _run_git_digest(
-        repo.worktree_raw,
-        "diff",
-        "--binary",
-        "--full-index",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        "--no-color",
-        "--",
-        deadline=absolute_deadline,
-        max_output_bytes=_MAX_DIFF_BYTES,
-    )
-    _, staged_names_raw = _run_git(
-        repo.worktree_raw,
-        "diff",
-        "--cached",
-        "--name-only",
-        "-z",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        "--no-color",
-        "HEAD",
-        "--",
+    if head_tree_entries is None:
+        _, tree_oid_raw = _run_git(
+            repo.worktree_raw,
+            "rev-parse",
+            "--verify",
+            "HEAD^{tree}",
+            deadline=absolute_deadline,
+        )
+        try:
+            head_tree_oid = _without_delimiter(tree_oid_raw).decode("ascii")
+        except UnicodeError as exc:
+            raise SourceBoundaryError(
+                "Git returned a non-canonical HEAD tree id"
+            ) from exc
+        head_tree_entries = _tree_entries(
+            repo, head_tree_oid, deadline=absolute_deadline,
+        )
+    staged_names, staged_diff_sha256 = _staged_delta(
+        head_tree_entries,
+        index_entries,
+        index_flags,
+        object_format=repo.object_format,
         deadline=absolute_deadline,
     )
-    _, unstaged_names_raw = _run_git(
-        repo.worktree_raw,
-        "diff",
-        "--name-only",
-        "-z",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        "--no-color",
-        "--",
+    unstaged_names, unstaged_diff_sha256 = _unstaged_delta(
+        index_entries,
+        index_flags,
+        worktree_entries,
         deadline=absolute_deadline,
     )
     _scan_nonignored_specials(repo, deadline=absolute_deadline)
-    staged_names = set(_split_nul(staged_names_raw, deadline=absolute_deadline))
-    unstaged_names = set(_split_nul(unstaged_names_raw, deadline=absolute_deadline))
     _assert_path_scale(
         staged_names | unstaged_names,
         label="dirty Git",
@@ -2744,23 +3033,13 @@ def _capture_protected_manifest(
     special_flag_paths = {
         entry.path
         for entry in index_flags
-        if entry.assume_unchanged or entry.skip_worktree
-    }
-    index_by_path = {
-        entry.path: entry for entry in index_entries if entry.stage == 0
-    }
-    independently_dirty_paths = {
-        entry.path
-        for entry in worktree_entries
-        if entry.tracked
-        and _tracked_entry_differs_from_index(entry, index_by_path.get(entry.path))
+        if entry.assume_unchanged or entry.skip_worktree or entry.intent_to_add
     }
     protected_paths = tuple(sorted(
         staged_names
         | unstaged_names
         | untracked_paths
         | special_flag_paths
-        | independently_dirty_paths
     ))
     _assert_path_scale(
         protected_paths,
@@ -2805,7 +3084,9 @@ def capture_protected_manifest(
 
 
 def _head_read(repo: RepoIdentity, *, deadline: float) -> _SourceRead:
-    _assert_supported_repository(repo, deadline=deadline, scan_specials=False)
+    supported_head_oid, supported_tree_oid, head_tree_entries = (
+        _assert_supported_repository(repo, deadline=deadline, scan_specials=False)
+    )
     current = _resolve_repo_identity(repo.workspace, deadline)
     if not _same_repository(repo, current):
         raise _CaptureChanged("repository identity changed during capture")
@@ -2851,9 +3132,15 @@ def _head_read(repo: RepoIdentity, *, deadline: float) -> _SourceRead:
         for value in (head_oid, tree_oid)
     ):
         raise SourceBoundaryError("Git returned a non-canonical full object id")
+    if (head_oid, tree_oid) != (supported_head_oid, supported_tree_oid):
+        raise _CaptureChanged("Git HEAD tree changed during capture")
     if head_ref is not None and head_raw != b"ref: " + head_ref + b"\n":
         raise _CaptureChanged("symbolic Git HEAD changed during capture")
-    manifest = capture_protected_manifest(repo, deadline=deadline)
+    manifest = _capture_protected_manifest(
+        repo,
+        deadline=deadline,
+        head_tree_entries=head_tree_entries,
+    )
     return _SourceRead(
         head_symbolic=head_ref is not None,
         head_ref=head_ref,
@@ -2872,7 +3159,7 @@ def _snapshot_fingerprint(
 ) -> str:
     implementation_sha256 = _capture_implementation_sha256()
     return _hash_fields(
-        b"bestplan-source-snapshot-v1",
+        b"bestplan-source-snapshot-v2",
         (
             repo.repository_id.encode("ascii"),
             repo.worktree_raw,
