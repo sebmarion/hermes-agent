@@ -920,6 +920,16 @@ def test_tampered_v2_contract_or_source_rejects_approve_claim_and_dispatch(
     row = store.get_plan(plan_id)
     changed = json.loads(row[tampered_column])
     changed["schema"] += "-tampered"
+    with pytest.raises(sqlite3.IntegrityError):
+        store._connection().execute(
+            f"UPDATE bestplan_plans SET {tampered_column}=? WHERE plan_id=?",
+            (json.dumps(changed, sort_keys=True), plan_id),
+        )
+    store._connection().rollback()
+    assert store.get_plan(plan_id)[tampered_column] == row[tampered_column]
+    store._connection().execute(
+        "DROP TRIGGER bestplan_plans_v2_immutable_inputs_v1"
+    )
     store._connection().execute(
         f"UPDATE bestplan_plans SET {tampered_column}=? WHERE plan_id=?",
         (json.dumps(changed, sort_keys=True), plan_id),
@@ -1018,6 +1028,16 @@ def test_tampered_v2_is_rejected_by_go_and_provisional_commit(tmp_path, monkeypa
         )
 
     provisional = create("provisional", provisional=True)
+    with pytest.raises(sqlite3.IntegrityError):
+        store._connection().execute(
+            "UPDATE bestplan_plans SET promotion_contract_digest=? WHERE plan_id=?",
+            ("0" * 64, provisional),
+        )
+    store._connection().rollback()
+    assert store.get_plan(provisional)["promotion_contract_digest"] != "0" * 64
+    store._connection().execute(
+        "DROP TRIGGER bestplan_plans_v2_immutable_inputs_v1"
+    )
     store._connection().execute(
         "UPDATE bestplan_plans SET promotion_contract_digest=? WHERE plan_id=?",
         ("0" * 64, provisional),
@@ -1025,7 +1045,19 @@ def test_tampered_v2_is_rejected_by_go_and_provisional_commit(tmp_path, monkeypa
     store._connection().commit()
     assert store.commit_provisional_plan(provisional) is False
 
+    store = BestplanStore(db_path=tmp_path / "pending.db")
     pending = create("pending")
+    original_source_digest = store.get_plan(pending)["source_snapshot_digest"]
+    with pytest.raises(sqlite3.IntegrityError):
+        store._connection().execute(
+            "UPDATE bestplan_plans SET source_snapshot_digest=? WHERE plan_id=?",
+            ("0" * 64, pending),
+        )
+    store._connection().rollback()
+    assert store.get_plan(pending)["source_snapshot_digest"] == original_source_digest
+    store._connection().execute(
+        "DROP TRIGGER bestplan_plans_v2_immutable_inputs_v1"
+    )
     store._connection().execute(
         "UPDATE bestplan_plans SET source_snapshot_digest=? WHERE plan_id=?",
         ("0" * 64, pending),

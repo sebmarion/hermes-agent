@@ -195,6 +195,41 @@ _RUNTIME_SECRET_VALUE_RE = re.compile(
     r"(?i)(?:\b(?:bearer|basic)\s+\S+|"
     r"(?:api[-_]?key|authorization|password|secret|token)\s*[=:]\s*[^\s&]+)"
 )
+_V2_RUNTIME_IDENTITY_STRING_FIELDS = frozenset(
+    {
+        "api_mode",
+        "model",
+        "provider",
+        "route",
+        "runtime_fingerprint",
+        "sandbox_backend",
+        "sandbox_policy_digest",
+    }
+)
+_V2_RUNTIME_IDENTITY_LIST_FIELDS = frozenset({"bestplan_toolsets"})
+_V2_RUNTIME_EXECUTION_FIELDS = frozenset(
+    {
+        "api_key",
+        "api_mode",
+        "args",
+        "base_url",
+        "bestplan_toolsets",
+        "command",
+        "max_output_tokens",
+        "model",
+        "provider",
+        "request_overrides",
+        "route",
+        "runtime_fingerprint",
+        "runtime_identity",
+        "sandbox_backend",
+        "sandbox_policy_digest",
+        "toolsets",
+    }
+)
+_V2_RUNTIME_MAX_ITEMS = 64
+_V2_RUNTIME_MAX_STRING_BYTES = 1024
+_V2_RUNTIME_MAX_JSON_BYTES = 32768
 
 
 def _normalized_runtime_key(key: Any) -> str:
@@ -237,8 +272,96 @@ def _sanitize_runtime_string(value: str, *, key: Any = "") -> str:
     return value
 
 
-def sanitize_runtime_metadata(value: Any, *, _key: Any = "") -> Any:
+def _bounded_v2_runtime_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise BestplanError("protocol-2 runtime identity has an invalid field type")
+    if value == "":
+        return None
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise BestplanError("protocol-2 runtime identity has invalid text") from None
+    if (
+        len(encoded) > _V2_RUNTIME_MAX_STRING_BYTES
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise BestplanError("protocol-2 runtime identity text is out of bounds")
+    return value
+
+
+def _sanitize_v2_runtime_identity(value: Any) -> list[dict[str, Any]]:
+    """Project untrusted resolver output onto the retry identity contract."""
+
+    if type(value) is not list or len(value) > _V2_RUNTIME_MAX_ITEMS:
+        raise BestplanError("protocol-2 runtime identity must be a bounded list")
+    projected: list[dict[str, Any]] = []
+    for item in value:
+        if type(item) is not dict:
+            raise BestplanError("protocol-2 runtime identity item must be a mapping")
+        if any(type(key) is not str for key in item):
+            raise BestplanError("protocol-2 runtime identity keys must be strings")
+        safe: dict[str, Any] = {}
+        for key in sorted(_V2_RUNTIME_IDENTITY_STRING_FIELDS):
+            if key not in item:
+                continue
+            normalized = _bounded_v2_runtime_string(item[key])
+            if normalized is not None:
+                safe[key] = normalized
+        for key in _V2_RUNTIME_IDENTITY_LIST_FIELDS:
+            if key not in item or item[key] is None:
+                continue
+            raw_items = item[key]
+            if type(raw_items) is not list or len(raw_items) > _V2_RUNTIME_MAX_ITEMS:
+                raise BestplanError(
+                    "protocol-2 runtime identity list field is invalid"
+                )
+            normalized_items = []
+            for raw_item in raw_items:
+                normalized = _bounded_v2_runtime_string(raw_item)
+                if normalized is None:
+                    raise BestplanError(
+                        "protocol-2 runtime identity list item is invalid"
+                    )
+                normalized_items.append(normalized)
+            safe[key] = sorted(dict.fromkeys(normalized_items))
+        projected.append(safe)
+    encoded = json.dumps(
+        projected,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("ascii")) > _V2_RUNTIME_MAX_JSON_BYTES:
+        raise BestplanError("protocol-2 runtime identity projection is oversized")
+    return projected
+
+
+def _filter_v2_runtime_execution(value: Any) -> list[dict[str, Any]]:
+    """Drop unsupported resolver fields before crossing the dispatch boundary."""
+
+    _sanitize_v2_runtime_identity(value)
+    return [
+        {
+            key: item[key]
+            for key in sorted(_V2_RUNTIME_EXECUTION_FIELDS)
+            if key in item
+        }
+        for item in value
+    ]
+
+
+def sanitize_runtime_metadata(
+    value: Any,
+    *,
+    _key: Any = "",
+    execution_protocol: int = 1,
+) -> Any:
     """Return JSON-safe runtime identity data with credential surfaces removed."""
+    if execution_protocol == 2:
+        return _sanitize_v2_runtime_identity(value)
     if isinstance(value, dict):
         return {
             str(key): sanitize_runtime_metadata(item, _key=key)
@@ -503,11 +626,13 @@ CREATE TABLE IF NOT EXISTS bestplan_plans (
     promotion_contract_version INTEGER,
     promotion_contract_json TEXT,
     promotion_contract_digest TEXT,
+    promotion_mode TEXT,
     source_snapshot_json TEXT,
     source_snapshot_digest TEXT,
     current_phase TEXT,
     integration_oid TEXT,
     artifact_digest TEXT,
+    candidate_set_digest TEXT,
     proof_authority_epoch TEXT,
     proof_event_seq INTEGER,
     proof_event_hash TEXT,
@@ -590,6 +715,7 @@ def _validate_stored_plan_row(
                 "promotion_contract_version",
                 "promotion_contract_json",
                 "promotion_contract_digest",
+                "promotion_mode",
             )
         ):
             raise BestplanError("protocol-1 row contains a promotion contract")
@@ -619,6 +745,8 @@ def _validate_stored_plan_row(
             raise BestplanError(f"stored promotion contract is invalid: {exc}") from exc
         if contract_digest(contract) != stored_contract_digest:
             raise BestplanError("stored promotion contract digest differs")
+        if values.get("promotion_mode") != contract["promotion_mode"]:
+            raise BestplanError("stored promotion mode differs from contract")
         source = contract["source"]
         if source["snapshot_digest"] != source_digest_raw:
             raise BestplanError("contract/source snapshot digest differs")
@@ -725,11 +853,13 @@ class BestplanStore:
             "promotion_contract_version": "INTEGER",
             "promotion_contract_json": "TEXT",
             "promotion_contract_digest": "TEXT",
+            "promotion_mode": "TEXT",
             "source_snapshot_json": "TEXT",
             "source_snapshot_digest": "TEXT",
             "current_phase": "TEXT",
             "integration_oid": "TEXT",
             "artifact_digest": "TEXT",
+            "candidate_set_digest": "TEXT",
             "proof_authority_epoch": "TEXT",
             "proof_event_seq": "INTEGER",
             "proof_event_hash": "TEXT",
@@ -767,6 +897,33 @@ class BestplanStore:
                         if name not in refreshed:
                             raise
 
+            # Task-2 protocol rows predate the relational promotion-mode
+            # projection.  Backfill only from their already-persisted,
+            # canonical contract; incomplete legacy rows remain non-authoritative.
+            rows = conn.execute(
+                "SELECT plan_id, promotion_contract_json FROM bestplan_plans "
+                "WHERE execution_protocol=2 AND promotion_mode IS NULL"
+            ).fetchall()
+            for row in rows:
+                raw_contract = row["promotion_contract_json"]
+                if not isinstance(raw_contract, str):
+                    continue
+                try:
+                    migrated_contract = validate_execution_contract(
+                        json.loads(raw_contract)
+                    )
+                except Exception:
+                    continue
+                conn.execute(
+                    "UPDATE bestplan_plans SET promotion_mode=? "
+                    "WHERE plan_id=? AND promotion_mode IS NULL",
+                    (migrated_contract["promotion_mode"], row["plan_id"]),
+                )
+
+            from agent.bestplan_proof import install_proof_schema
+
+            install_proof_schema(conn)
+
         self._execute_write(migrate)
 
     def _read_lock(self):
@@ -788,7 +945,8 @@ class BestplanStore:
         def reconcile(conn):
             changed = 0
             rows = conn.execute(
-                "SELECT plan_id, state, dispatch_id FROM bestplan_plans "
+                "SELECT plan_id, state, dispatch_id, execution_protocol "
+                "FROM bestplan_plans "
                 "WHERE state IN (?, ?)",
                 (PlanState.RUNNING, PlanState.WAITING),
             ).fetchall()
@@ -800,6 +958,86 @@ class BestplanStore:
                 record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
                 phase = str(entry.get("status") or record.get("status") or "")
                 event = entry.get("event") if isinstance(entry.get("event"), dict) else None
+                if int(row["execution_protocol"] or 1) == 2:
+                    from agent.bestplan_proof import ProofLedger
+                    from agent.bestplan_redaction import RedactionError
+
+                    advisory_kind: str | None = None
+                    compatibility_error: str | None = None
+                    advisory_output: Any = entry
+                    dispatch_state: str | None = None
+                    clear_owner = False
+                    if phase in {"scheduled", "running"}:
+                        try:
+                            owner_pid = int(record.get("owner_pid"))
+                            if owner_pid <= 0:
+                                raise ValueError("invalid owner pid")
+                            os.kill(owner_pid, 0)
+                            owner_live = True
+                        except (ProcessLookupError, TypeError, ValueError):
+                            owner_live = False
+                        except PermissionError:
+                            owner_live = True
+                        if owner_live:
+                            advisory_kind = "async_tracker_running_advisory"
+                            dispatch_state = "scheduled"
+                        elif phase == "scheduled":
+                            advisory_kind = "async_tracker_recovered_advisory"
+                            compatibility_error = "recovered_pre_run_schedule"
+                            dispatch_state = "intent"
+                            clear_owner = True
+                        else:
+                            advisory_kind = "async_tracker_lost_advisory"
+                            compatibility_error = "recapture_required"
+                            dispatch_state = "terminal"
+                            advisory_output = {
+                                "delegation_id": delegation_id,
+                                "status": "lost",
+                                "error": "async delegation owner exited during running phase",
+                            }
+                    elif phase in {
+                        "completed",
+                        "error",
+                        "failed",
+                        "lost",
+                        "interrupted",
+                    } or event:
+                        advisory_kind = "async_tracker_terminal_advisory"
+                        compatibility_error = "recapture_required"
+                        dispatch_state = "terminal"
+                        advisory_output = event or {
+                            "delegation_id": delegation_id,
+                            "status": phase or "terminal",
+                            "result": entry.get("result"),
+                        }
+                    if advisory_kind is not None and dispatch_state is not None:
+                        try:
+                            ProofLedger(self).append_advisory_in_transaction(
+                                conn,
+                                plan_id=row["plan_id"],
+                                kind=advisory_kind,
+                                raw_output=advisory_output,
+                                output_source="async",
+                                compatibility_error=compatibility_error,
+                                compatibility_dispatch_state=dispatch_state,
+                                compatibility_clear_dispatch_owner=clear_owner,
+                            )
+                        except RedactionError:
+                            ProofLedger(self).append_advisory_in_transaction(
+                                conn,
+                                plan_id=row["plan_id"],
+                                kind=advisory_kind,
+                                raw_output={
+                                    "code": "tracker_payload_rejected",
+                                    "status": "recapture_required",
+                                },
+                                output_source="async",
+                                compatibility_error=compatibility_error,
+                                compatibility_dispatch_state=dispatch_state,
+                                compatibility_clear_dispatch_owner=clear_owner,
+                            )
+                        changed += 1
+                    continue
                 if phase in {"scheduled", "running"}:
                     try:
                         owner_pid = int(record.get("owner_pid"))
@@ -1037,9 +1275,9 @@ class BestplanStore:
                     baseline_revision, baseline_fingerprint, raw_request, raw_plan_json,
                     validated_manifest_json, state, approval_digest, execution_protocol,
                     promotion_contract_version, promotion_contract_json,
-                    promotion_contract_digest, source_snapshot_json,
+                    promotion_contract_digest, promotion_mode, source_snapshot_json,
                     source_snapshot_digest, current_phase
-                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     plan_id, time.time(), str(session_id),
                     str(_active_profile() if profile is None else profile), workspace,
@@ -1049,6 +1287,7 @@ class BestplanStore:
                     digest, execution_protocol,
                     2 if execution_protocol == 2 else None,
                     contract_json_value, contract_digest_value,
+                    contract_value["promotion_mode"] if contract_value is not None else None,
                     source_json_value, source_digest_value,
                     "captured" if execution_protocol == 2 else None,
                 ),
@@ -1173,6 +1412,8 @@ class BestplanStore:
             ).fetchone()
             if row is None or row["state"] not in (PlanState.PENDING, PlanState.APPROVED):
                 return None
+            if int(row["execution_protocol"] or 1) != 1:
+                return None
             if session_id is not None and row["session_id"] != str(session_id):
                 return None
             if profile is not None and row["profile"] != str(profile):
@@ -1215,7 +1456,6 @@ class BestplanStore:
     ) -> Optional[dict[str, Any]]:
         """Atomically approve and persist the deterministic dispatch outbox."""
         dispatch_id = f"bestplan-{plan_id}"
-        safe_runtimes = sanitize_runtime_metadata(resolved_runtimes)
 
         def prepare(conn):
             row = conn.execute(
@@ -1226,6 +1466,21 @@ class BestplanStore:
             try:
                 validated = _validate_stored_plan_row(row)
             except BestplanError:
+                return None
+            protocol = int(row["execution_protocol"] or 1)
+            try:
+                safe_runtimes = sanitize_runtime_metadata(
+                    resolved_runtimes,
+                    execution_protocol=protocol,
+                )
+                runtime_json = json.dumps(
+                    safe_runtimes,
+                    ensure_ascii=True,
+                    allow_nan=protocol != 2,
+                    sort_keys=True,
+                    separators=(",", ":") if protocol == 2 else None,
+                )
+            except (BestplanError, TypeError, ValueError):
                 return None
             if row["state"] == PlanState.RUNNING and row["dispatch_state"] in {
                 "intent", "unknown", "dispatching",
@@ -1254,7 +1509,7 @@ class BestplanStore:
                    WHERE plan_id=? AND state IN (?, ?)""",
                 (
                     PlanState.RUNNING, now, now, dispatch_id,
-                    json.dumps(safe_runtimes, sort_keys=True),
+                    runtime_json,
                     json.dumps([dispatch_id]), now, plan_id,
                     PlanState.PENDING, PlanState.APPROVED,
                 ),
@@ -1291,17 +1546,39 @@ class BestplanStore:
         return bool(self._execute_write(begin))
 
     def record_dispatch_unknown(self, plan_id: str, error: str) -> bool:
-        return bool(self._execute_write(lambda conn: conn.execute(
-            """UPDATE bestplan_plans SET dispatch_state='unknown', error=?,
-               dispatch_updated_at=? WHERE plan_id=? AND state=?
-               AND dispatch_state='dispatching'""",
-            (str(error), time.time(), plan_id, PlanState.RUNNING),
-        ).rowcount))
+        def record(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=? AND state IN (?, ?)",
+                (plan_id, PlanState.RUNNING, PlanState.WAITING),
+            ).fetchone()
+            if row is None:
+                return 0
+            if int(row["execution_protocol"] or 1) == 2:
+                from agent.bestplan_proof import ProofLedger
+
+                ProofLedger(self).append_advisory_in_transaction(
+                    conn,
+                    plan_id=plan_id,
+                    kind="dispatch_unknown_advisory",
+                    raw_output={"status": "dispatch_unknown", "detail": error},
+                    output_source="model-broker",
+                    compatibility_error="dispatch_unknown",
+                    compatibility_dispatch_state="unknown",
+                )
+                return 1
+            return conn.execute(
+                """UPDATE bestplan_plans SET dispatch_state='unknown', error=?,
+                   dispatch_updated_at=? WHERE plan_id=? AND state=?
+                   AND dispatch_state='dispatching'""",
+                (str(error), time.time(), plan_id, PlanState.RUNNING),
+            ).rowcount
+
+        return bool(self._execute_write(record))
 
     def recover_dead_dispatch_owners(self) -> int:
         def recover(conn):
             rows = conn.execute(
-                "SELECT plan_id, dispatch_owner FROM bestplan_plans "
+                "SELECT plan_id, dispatch_owner, execution_protocol FROM bestplan_plans "
                 "WHERE state=? AND dispatch_state='dispatching'",
                 (PlanState.RUNNING,),
             ).fetchall()
@@ -1319,6 +1596,24 @@ class BestplanStore:
                 except (PermissionError, ValueError):
                     live = True
                 if live:
+                    continue
+                if int(row["execution_protocol"] or 1) == 2:
+                    from agent.bestplan_proof import ProofLedger
+
+                    ProofLedger(self).append_advisory_in_transaction(
+                        conn,
+                        plan_id=row["plan_id"],
+                        kind="dispatch_owner_recovered_advisory",
+                        raw_output={
+                            "status": "recovered_dead_dispatch_owner",
+                            "dispatch_owner": owner,
+                        },
+                        output_source="process",
+                        compatibility_error="recovered_dead_dispatch_owner",
+                        compatibility_dispatch_state="unknown",
+                        compatibility_clear_dispatch_owner=True,
+                    )
+                    changed += 1
                     continue
                 changed += conn.execute(
                     """UPDATE bestplan_plans SET dispatch_state='unknown',
@@ -1340,13 +1635,33 @@ class BestplanStore:
     ) -> bool:
         def record(conn):
             row = conn.execute(
-                "SELECT state, dispatch_state FROM bestplan_plans WHERE plan_id=?",
+                "SELECT * FROM bestplan_plans WHERE plan_id=?",
                 (plan_id,),
             ).fetchone()
             if row is None or row["state"] not in {
                 PlanState.RUNNING, PlanState.COMPLETED_UNVERIFIED,
             }:
                 return 0
+            if int(row["execution_protocol"] or 1) == 2:
+                from agent.bestplan_proof import ProofLedger
+
+                safe_dispatch_id = str(
+                    row["dispatch_id"] or f"bestplan-{plan_id}"
+                )
+                ProofLedger(self).append_advisory_in_transaction(
+                    conn,
+                    plan_id=plan_id,
+                    kind="dispatch_scheduled_advisory",
+                    raw_output={
+                        "delegation_ids": delegation_ids,
+                        "sandbox_workspace": str(sandbox_workspace or ""),
+                    },
+                    output_source="model-broker",
+                    compatibility_dispatch_state="scheduled",
+                    compatibility_delegation_ids_json=json.dumps([safe_dispatch_id]),
+                    compatibility_sandbox_workspace="",
+                )
+                return 1
             terminal = row["state"] == PlanState.COMPLETED_UNVERIFIED
             return conn.execute(
                 """UPDATE bestplan_plans SET state=?, delegation_ids_json=?,
@@ -1362,29 +1677,107 @@ class BestplanStore:
         return bool(self._execute_write(record))
 
     def record_dispatch_failure(self, plan_id: str, error: str) -> bool:
-        return bool(self._execute_write(lambda conn: conn.execute(
-            "UPDATE bestplan_plans SET state=?, error=?, completed_at=? "
-            "WHERE plan_id=? AND state=?",
-            (PlanState.FAILED, str(error), time.time(), plan_id, PlanState.RUNNING),
-        ).rowcount))
+        def record(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=? AND state IN (?, ?)",
+                (plan_id, PlanState.RUNNING, PlanState.WAITING),
+            ).fetchone()
+            if row is None:
+                return 0
+            if int(row["execution_protocol"] or 1) == 2:
+                from agent.bestplan_proof import ProofLedger
+
+                ProofLedger(self).append_advisory_in_transaction(
+                    conn,
+                    plan_id=plan_id,
+                    kind="dispatch_failed_advisory",
+                    raw_output={"status": "dispatch_failed", "detail": error},
+                    output_source="model-broker",
+                    compatibility_error="dispatch_failed",
+                    compatibility_dispatch_state="terminal",
+                )
+                return 1
+            return conn.execute(
+                "UPDATE bestplan_plans SET state=?, error=?, completed_at=? "
+                "WHERE plan_id=? AND state=?",
+                (
+                    PlanState.FAILED,
+                    str(error),
+                    time.time(),
+                    plan_id,
+                    PlanState.RUNNING,
+                ),
+            ).rowcount
+
+        return bool(self._execute_write(record))
 
     def record_dispatch_deferred(self, plan_id: str, error: str) -> bool:
-        return bool(self._execute_write(lambda conn: conn.execute(
-            """UPDATE bestplan_plans SET dispatch_state='intent', error=?,
-               dispatch_updated_at=? WHERE plan_id=? AND state=?
-               AND dispatch_state='dispatching'""",
-            (str(error), time.time(), plan_id, PlanState.RUNNING),
-        ).rowcount))
+        def record(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=? AND state IN (?, ?)",
+                (plan_id, PlanState.RUNNING, PlanState.WAITING),
+            ).fetchone()
+            if row is None:
+                return 0
+            if int(row["execution_protocol"] or 1) == 2:
+                from agent.bestplan_proof import ProofLedger
+
+                ProofLedger(self).append_advisory_in_transaction(
+                    conn,
+                    plan_id=plan_id,
+                    kind="dispatch_deferred_advisory",
+                    raw_output={"status": "dispatch_deferred", "detail": error},
+                    output_source="model-broker",
+                    compatibility_error="dispatch_deferred",
+                    compatibility_dispatch_state="intent",
+                )
+                return 1
+            return conn.execute(
+                """UPDATE bestplan_plans SET dispatch_state='intent', error=?,
+                   dispatch_updated_at=? WHERE plan_id=? AND state=?
+                   AND dispatch_state='dispatching'""",
+                (str(error), time.time(), plan_id, PlanState.RUNNING),
+            ).rowcount
+
+        return bool(self._execute_write(record))
 
     def mark_completed_unverified(self, plan_id: str, evidence: dict[str, Any]) -> bool:
-        return bool(self._execute_write(lambda conn: conn.execute(
-            "UPDATE bestplan_plans SET state=?, dispatch_state='terminal', "
-            "evidence_json=?, completed_at=? WHERE plan_id=? AND state IN (?, ?)",
-            (
-                PlanState.COMPLETED_UNVERIFIED, json.dumps(evidence, sort_keys=True),
-                time.time(), plan_id, PlanState.RUNNING, PlanState.WAITING,
-            ),
-        ).rowcount))
+        def complete(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=?", (plan_id,)
+            ).fetchone()
+            if row is None or row["state"] not in {
+                PlanState.RUNNING,
+                PlanState.WAITING,
+            }:
+                return 0
+            if int(row["execution_protocol"] or 1) == 2:
+                from agent.bestplan_proof import ProofLedger
+
+                ProofLedger(self).append_advisory_in_transaction(
+                    conn,
+                    plan_id=plan_id,
+                    kind="async_terminal_advisory",
+                    raw_output=evidence,
+                    output_source="async",
+                    compatibility_error="recapture_required",
+                    compatibility_dispatch_state="terminal",
+                )
+                return 1
+            return conn.execute(
+                "UPDATE bestplan_plans SET state=?, dispatch_state='terminal', "
+                "evidence_json=?, completed_at=? WHERE plan_id=? AND state IN (?, ?)",
+                (
+                    PlanState.COMPLETED_UNVERIFIED,
+                    json.dumps(evidence, sort_keys=True),
+                    time.time(),
+                    plan_id,
+                    PlanState.RUNNING,
+                    PlanState.WAITING,
+                ),
+            ).rowcount
+
+        return bool(self._execute_write(complete))
 
     def mark_completed_verified(self, plan_id: str) -> bool:
         def complete(conn):
@@ -1802,11 +2195,13 @@ def try_resolve_go(
 
     candidate = exact[0]
     plan_id = candidate["plan_id"]
+    protocol2 = int(candidate.get("execution_protocol") or 1) == 2
     try:
         validated = _validate_stored_plan_row(candidate)
     except Exception as exc:
+        error = "invalid_plan" if protocol2 else str(exc)
         return ResolvedGo(
-            True, "invalid_plan", plan_id=plan_id, reason=str(exc), error=str(exc),
+            True, "invalid_plan", plan_id=plan_id, reason=error, error=error,
         )
     if candidate["state"] == PlanState.WAITING:
         return ResolvedGo(True, "already_claimed", plan_id=plan_id, reason="plan was already dispatched")
@@ -1816,7 +2211,10 @@ def try_resolve_go(
             validated.plan, workspace=expected_workspace,
         )
     except Exception as exc:
-        return ResolvedGo(True, "invalid_plan", plan_id=plan_id, reason=str(exc), error=str(exc))
+        error = "invalid_plan" if protocol2 else str(exc)
+        return ResolvedGo(
+            True, "invalid_plan", plan_id=plan_id, reason=error, error=error,
+        )
 
     if parent_agent is None:
         return ResolvedGo(True, "dispatch_unavailable", plan_id=plan_id, reason="live parent agent is required")
@@ -1840,21 +2238,42 @@ def try_resolve_go(
             stored_runtimes = json.loads(candidate.get("resolved_runtime_json") or "[]")
         except Exception:
             stored_runtimes = []
-        if runtime_resolver is None:
-            try:
+        try:
+            if runtime_resolver is None:
                 from tools.delegate_tool import resolve_bestplan_runtime_specs
                 resolved_runtimes = resolve_bestplan_runtime_specs(
                     tasks, parent_agent, expected=stored_runtimes,
                 )
-            except Exception as exc:
-                return ResolvedGo(True, "lane_unavailable", plan_id=plan_id, reason=str(exc))
-        else:
-            resolved_runtimes = runtime_resolver(tasks, parent_agent)
+            else:
+                resolved_runtimes = runtime_resolver(tasks, parent_agent)
+        except Exception as exc:
+            error = "lane_unavailable" if protocol2 else str(exc)
+            return ResolvedGo(
+                True, "lane_unavailable", plan_id=plan_id,
+                reason=error, error=error if protocol2 else None,
+            )
+        if protocol2:
+            try:
+                resolved_runtimes = _filter_v2_runtime_execution(
+                    resolved_runtimes
+                )
+            except BestplanError:
+                return ResolvedGo(
+                    True,
+                    "lane_unavailable",
+                    plan_id=plan_id,
+                    reason="lane_unavailable",
+                    error="lane_unavailable",
+                )
     else:
         if runtime_resolver is None and delegate is not None:
             lane_error = _configured_lane_error(tasks, cfg)
             if lane_error:
-                return ResolvedGo(True, "lane_unavailable", plan_id=plan_id, reason=lane_error)
+                error = "lane_unavailable" if protocol2 else lane_error
+                return ResolvedGo(
+                    True, "lane_unavailable", plan_id=plan_id,
+                    reason=error, error=error if protocol2 else None,
+                )
             lanes = ((cfg.get("delegation") or {}).get("lanes") or {})
             resolved_runtimes = [
                 {
@@ -1872,9 +2291,31 @@ def try_resolve_go(
                 else:
                     resolved_runtimes = runtime_resolver(tasks, parent_agent)
             except Exception as exc:
-                return ResolvedGo(True, "lane_unavailable", plan_id=plan_id, reason=str(exc))
+                error = "lane_unavailable" if protocol2 else str(exc)
+                return ResolvedGo(
+                    True, "lane_unavailable", plan_id=plan_id,
+                    reason=error, error=error if protocol2 else None,
+                )
+        resolved_runtimes_for_storage = resolved_runtimes
+        if protocol2:
+            try:
+                resolved_runtimes = _filter_v2_runtime_execution(
+                    resolved_runtimes
+                )
+                resolved_runtimes_for_storage = sanitize_runtime_metadata(
+                    resolved_runtimes,
+                    execution_protocol=2,
+                )
+            except BestplanError:
+                return ResolvedGo(
+                    True,
+                    "lane_unavailable",
+                    plan_id=plan_id,
+                    reason="lane_unavailable",
+                    error="lane_unavailable",
+                )
         claimed = store.prepare_dispatch_intent(
-            plan_id, baseline, resolved_runtimes=resolved_runtimes,
+            plan_id, baseline, resolved_runtimes=resolved_runtimes_for_storage,
             session_id=session_id, profile=expected_profile, workspace=expected_workspace,
         )
         if claimed is None:
@@ -1910,14 +2351,22 @@ def try_resolve_go(
         )
         result = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
         if not isinstance(result, dict) or result.get("status") != "dispatched":
-            error = str((result or {}).get("error") if isinstance(result, dict) else result)
+            raw_error = (
+                (result or {}).get("error") if isinstance(result, dict) else result
+            )
+            error = "dispatch_failed" if protocol2 else str(raw_error)
             if isinstance(result, dict) and result.get("status") == "rejected":
-                store.record_dispatch_deferred(plan_id, error)
+                store.record_dispatch_deferred(
+                    plan_id, raw_error if protocol2 else error
+                )
                 return ResolvedGo(
                     True, "dispatch_deferred", plan_id=plan_id,
-                    delegation_id=dispatch_id, reason=error,
+                    delegation_id=dispatch_id,
+                    reason="dispatch_deferred" if protocol2 else error,
                 )
-            store.record_dispatch_failure(plan_id, error)
+            store.record_dispatch_failure(
+                plan_id, raw_error if protocol2 else error
+            )
             return ResolvedGo(
                 True, "dispatch_failed", plan_id=plan_id,
                 delegation_id=dispatch_id, reason=error, error=error,
@@ -1926,10 +2375,11 @@ def try_resolve_go(
         if not delegation_ids:
             raise BestplanError("delegate_task returned no delegation id")
     except Exception as exc:
-        store.record_dispatch_unknown(plan_id, str(exc))
+        error = "dispatch_unknown" if protocol2 else str(exc)
+        store.record_dispatch_unknown(plan_id, error)
         return ResolvedGo(
             True, "possibly_dispatched", plan_id=plan_id,
-            delegation_id=dispatch_id, reason=str(exc), error=str(exc),
+            delegation_id=dispatch_id, reason=error, error=error,
         )
 
     if not store.record_dispatch(
@@ -1938,4 +2388,9 @@ def try_resolve_go(
         sandbox_workspace=str(result.get("sandbox_workspace") or ""),
     ):
         return ResolvedGo(True, "dispatch_state_error", plan_id=plan_id, reason="delegation id was not persisted")
-    return ResolvedGo(True, "waiting", plan_id=plan_id, delegation_id=delegation_ids[0])
+    return ResolvedGo(
+        True,
+        "waiting",
+        plan_id=plan_id,
+        delegation_id=dispatch_id if protocol2 else delegation_ids[0],
+    )
