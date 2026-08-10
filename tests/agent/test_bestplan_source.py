@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -2286,6 +2287,158 @@ def test_export_exact_tree_uses_committed_blobs_and_excludes_ambient_bytes(tmp_p
     assert (destination / "archive-template.txt").read_bytes() == b"$Format:%H$\n"
     assert not (destination / "untracked.txt").exists()
     assert not (destination / "cache").exists()
+
+
+def test_export_quarantines_staging_content_changed_while_later_blob_streams(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "a.txt").write_bytes(b"committed a\n")
+    (repo / "z.bin").write_bytes(b"z" * (source._BUFFER_SIZE * 2 + 1))
+    _git(repo, "add", "a.txt", "z.bin")
+    _git(repo, "commit", "-qm", "streamed tree")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "exported"
+    real_write = source._write_export_file
+    z_streaming = threading.Event()
+    mutation_finished = threading.Event()
+    mutation_errors: list[BaseException] = []
+
+    class PausingReader:
+        def __init__(self, reader):
+            self.reader = reader
+
+        def iter_exact(self, size):
+            first = True
+            for chunk in self.reader.iter_exact(size):
+                yield chunk
+                if first:
+                    first = False
+                    z_streaming.set()
+                    if not mutation_finished.wait(timeout=5.0):
+                        raise AssertionError("staging mutator did not finish")
+
+    def pause_later_blob(parent_fd, name, reader, size, mode, *, deadline):
+        if name == b"z.bin":
+            reader = PausingReader(reader)
+        return real_write(
+            parent_fd, name, reader, size, mode, deadline=deadline,
+        )
+
+    def overwrite_materialized_file():
+        try:
+            if not z_streaming.wait(timeout=5.0):
+                raise AssertionError("later blob did not start streaming")
+            staging = list(tmp_path.glob(".exported.bestplan-staging-*"))
+            if len(staging) != 1:
+                raise AssertionError(f"unexpected staging paths: {staging!r}")
+            (staging[0] / "a.txt").write_bytes(b"foreign aa!\n")
+        except BaseException as exc:
+            mutation_errors.append(exc)
+        finally:
+            mutation_finished.set()
+
+    monkeypatch.setattr(source, "_write_export_file", pause_later_blob)
+    mutator = threading.Thread(target=overwrite_materialized_file, daemon=True)
+    mutator.start()
+    try:
+        with pytest.raises(source.SourceBoundaryError, match="quarantined") as raised:
+            source.export_exact_tree(snapshot, destination)
+    finally:
+        mutation_finished.set()
+        mutator.join(timeout=5.0)
+
+    quarantines = list(tmp_path.glob(".exported.bestplan-quarantine-*"))
+    assert not mutator.is_alive()
+    assert mutation_errors == []
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".exported.bestplan-staging-*"))
+    assert len(quarantines) == 1
+    assert str(quarantines[0]) in str(raised.value)
+    assert "concurrent changes" in str(raised.value)
+    assert (quarantines[0] / "a.txt").read_bytes() == b"foreign aa!\n"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "extra_path",
+        "missing_path",
+        "regular_mode",
+        "directory_mode",
+        "root_mode",
+        "regular_type",
+        "symlink_target",
+    ],
+)
+def test_export_final_verifier_checks_exact_tree_shape(
+    tmp_path, monkeypatch, mutation,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    nested = repo / "nested"
+    nested.mkdir()
+    (nested / "payload.txt").write_bytes(b"nested committed\n")
+    (repo / "committed-link").symlink_to("tracked.txt")
+    _git(repo, "add", "nested/payload.txt", "committed-link")
+    _git(repo, "commit", "-qm", "tree verification shapes")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "exported"
+    real_root_verifier = source._verify_published_destination
+    mutated = False
+
+    def mutate_after_root_identity(prepared, *, deadline):
+        nonlocal mutated
+        real_root_verifier(prepared, deadline=deadline)
+        if mutated:
+            return
+        mutated = True
+        if mutation == "extra_path":
+            (destination / "foreign-extra").write_bytes(b"foreign bytes\n")
+        elif mutation == "missing_path":
+            (destination / "nested" / "payload.txt").unlink()
+        elif mutation == "regular_mode":
+            (destination / "tracked.txt").chmod(0o755)
+        elif mutation == "directory_mode":
+            (destination / "nested").chmod(0o700)
+        elif mutation == "root_mode":
+            destination.chmod(0o700)
+        elif mutation == "regular_type":
+            (destination / "tracked.txt").unlink()
+            (destination / "tracked.txt").mkdir()
+        elif mutation == "symlink_target":
+            (destination / "committed-link").unlink()
+            (destination / "committed-link").symlink_to("foreign-target")
+        else:
+            raise AssertionError(f"unknown mutation: {mutation}")
+
+    monkeypatch.setattr(
+        source, "_verify_published_destination", mutate_after_root_identity,
+    )
+    with pytest.raises(source.SourceBoundaryError, match="quarantined") as raised:
+        source.export_exact_tree(snapshot, destination)
+
+    quarantines = list(tmp_path.glob(".exported.bestplan-quarantine-*"))
+    assert mutated is True
+    assert not destination.exists()
+    assert len(quarantines) == 1
+    assert "concurrent changes" in str(raised.value)
+    quarantined = quarantines[0]
+    if mutation == "extra_path":
+        assert (quarantined / "foreign-extra").read_bytes() == b"foreign bytes\n"
+    elif mutation == "missing_path":
+        assert not (quarantined / "nested" / "payload.txt").exists()
+    elif mutation == "regular_mode":
+        assert stat.S_IMODE((quarantined / "tracked.txt").stat().st_mode) == 0o755
+    elif mutation == "directory_mode":
+        assert stat.S_IMODE((quarantined / "nested").stat().st_mode) == 0o700
+    elif mutation == "root_mode":
+        assert stat.S_IMODE(quarantined.stat().st_mode) == 0o700
+    elif mutation == "regular_type":
+        assert (quarantined / "tracked.txt").is_dir()
+    elif mutation == "symlink_target":
+        assert os.readlink(quarantined / "committed-link") == "foreign-target"
 
 
 def test_export_recapture_and_materialization_have_distinct_bounded_budgets(

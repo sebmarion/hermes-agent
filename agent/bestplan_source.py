@@ -162,6 +162,13 @@ class _TreeEntry:
 
 
 @dataclass(frozen=True)
+class _ExportWitness:
+    path: bytes
+    size: int
+    content_sha256: str
+
+
+@dataclass(frozen=True)
 class _CaptureAuthority:
     module_path: bytes
     module_sha256: str
@@ -4164,10 +4171,11 @@ def _materialize_blobs(
     root_fd: int,
     *,
     deadline: float,
-) -> None:
+) -> tuple[_ExportWitness, ...]:
     _remaining(deadline)
     authority = _get_capture_authority(deadline)
     stderr_file = tempfile.TemporaryFile()
+    witnesses: list[_ExportWitness] = []
     try:
         try:
             process = subprocess.Popen(
@@ -4243,14 +4251,28 @@ def _materialize_blobs(
                                 "exact-tree symlink could not be created safely: "
                                 f"{exc}"
                             ) from exc
+                        witnesses.append(
+                            _ExportWitness(
+                                path=entry.path,
+                                size=len(target),
+                                content_sha256=hashlib.sha256(target).hexdigest(),
+                            )
+                        )
                     else:
-                        _write_export_file(
+                        written_size, content_sha256 = _write_export_file(
                             parent_fd,
                             parts[-1],
                             reader,
                             size,
                             entry.mode & 0o777,
                             deadline=deadline,
+                        )
+                        witnesses.append(
+                            _ExportWitness(
+                                path=entry.path,
+                                size=written_size,
+                                content_sha256=content_sha256,
+                            )
                         )
                 finally:
                     os.close(parent_fd)
@@ -4284,6 +4306,7 @@ def _materialize_blobs(
                 process.stdout.close()
     finally:
         stderr_file.close()
+    return tuple(witnesses)
 
 
 def _export_parent_fd(
@@ -4300,8 +4323,10 @@ def _export_parent_fd(
     try:
         for component in parts:
             _remaining(deadline)
+            created = False
             try:
                 os.mkdir(component, mode=0o755, dir_fd=current_fd)
+                created = True
             except FileExistsError:
                 pass
             except OSError as exc:
@@ -4316,6 +4341,20 @@ def _export_parent_fd(
                 raise SourceBoundaryError(
                     f"exact-tree directory changed during export: {exc}"
                 ) from exc
+            try:
+                if created:
+                    os.fchmod(next_fd, 0o755)
+                opened = os.fstat(next_fd)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or stat.S_IMODE(opened.st_mode) != 0o755
+                ):
+                    raise SourceBoundaryError(
+                        "exact-tree directory mode changed during export"
+                    )
+            except BaseException:
+                os.close(next_fd)
+                raise
             os.close(current_fd)
             current_fd = next_fd
         return current_fd
@@ -4630,20 +4669,73 @@ def _verify_published_destination(
     _verify_destination_parent(prepared, deadline=deadline)
 
 
-def _quarantined_tree_matches_export(
+def _verify_exported_tree(
     prepared: _PreparedDestination,
     entries: tuple[_TreeEntry, ...],
+    witnesses: tuple[_ExportWitness, ...],
     *,
+    object_format: str,
     deadline: float,
-) -> bool:
-    """Classify a quarantined tree without deleting any of its contents."""
+) -> None:
+    """Verify every published byte through the retained no-follow root FD."""
 
-    expected_files = {entry.path: entry for entry in entries}
+    oid_length = {"sha1": 40, "sha256": 64}.get(object_format)
+    if oid_length is None:
+        raise UnsupportedRepositoryError(
+            "exact-tree verifier received an unsupported Git object format"
+        )
+    expected_files: dict[bytes, _TreeEntry] = {}
+    for entry in entries:
+        _remaining(deadline)
+        if (
+            entry.path in expected_files
+            or entry.object_type != b"blob"
+            or entry.mode not in {0o100644, 0o100755, 0o120000}
+            or len(entry.oid) != oid_length
+            or any(character not in "0123456789abcdef" for character in entry.oid)
+        ):
+            raise SourceBoundaryError(
+                "exact-tree verifier received inconsistent tree metadata"
+            )
+        expected_files[entry.path] = entry
+    expected_witnesses: dict[bytes, _ExportWitness] = {}
+    for witness in witnesses:
+        _remaining(deadline)
+        if (
+            witness.path in expected_witnesses
+            or witness.size < 0
+            or witness.size > _MAX_BLOB_BYTES
+            or len(witness.content_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in witness.content_sha256
+            )
+        ):
+            raise SourceBoundaryError(
+                "exact-tree verifier received inconsistent content witnesses"
+            )
+        expected_witnesses[witness.path] = witness
+    if set(expected_witnesses) != set(expected_files):
+        raise SourceBoundaryError(
+            "exact-tree verifier content witnesses are incomplete"
+        )
     expected_directories: set[bytes] = set()
     for entry in entries:
+        _remaining(deadline)
         parts = entry.path.split(b"/")
         for length in range(1, len(parts)):
+            _remaining(deadline)
             expected_directories.add(b"/".join(parts[:length]))
+
+    root_before = os.fstat(prepared.root_fd)
+    if (
+        not stat.S_ISDIR(root_before.st_mode)
+        or (root_before.st_dev, root_before.st_ino) != prepared.root_identity
+        or stat.S_IMODE(root_before.st_mode) != 0o755
+    ):
+        raise SourceBoundaryError(
+            "exact-tree published root does not match the exported tree"
+        )
     seen_files: set[bytes] = set()
     seen_directories: set[bytes] = set()
     stack: list[tuple[tuple[bytes, ...], tuple[int, int]]] = [
@@ -4652,144 +4744,268 @@ def _quarantined_tree_matches_export(
     entry_count = 0
     total_path_bytes = 0
     total_content_bytes = 0
-    try:
-        while stack:
-            _remaining(deadline)
-            parts, identity = stack.pop()
-            directory_fd = _open_owned_relative_directory(
-                prepared.root_fd, parts, identity, deadline=deadline,
-            )
-            try:
-                with os.scandir(directory_fd) as iterator:
-                    names: list[bytes] = []
-                    for item in iterator:
-                        _remaining(deadline)
-                        name = os.fsencode(item.name)
-                        path_size = sum(len(part) + 1 for part in parts) + len(name)
-                        entry_count += 1
-                        total_path_bytes += path_size
-                        if (
-                            entry_count > _MAX_TREE_ENTRIES
-                            or len(name) > _MAX_PATH_BYTES
-                            or total_path_bytes > _MAX_TOTAL_PATH_BYTES
-                        ):
-                            return False
-                        names.append(name)
-                for name in names:
+    while stack:
+        _remaining(deadline)
+        parts, identity = stack.pop()
+        directory_fd = _open_owned_relative_directory(
+            prepared.root_fd, parts, identity, deadline=deadline,
+        )
+        directory_after: os.stat_result | None = None
+        try:
+            directory_before = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(directory_before.st_mode)
+                or (directory_before.st_dev, directory_before.st_ino) != identity
+                or stat.S_IMODE(directory_before.st_mode) != 0o755
+            ):
+                raise SourceBoundaryError(
+                    "exact-tree published directory metadata changed"
+                )
+            prefix_size = sum(len(part) + 1 for part in parts)
+            with os.scandir(directory_fd) as iterator:
+                names: list[bytes] = []
+                for item in iterator:
                     _remaining(deadline)
-                    path_parts = (*parts, name)
-                    path = b"/".join(path_parts)
-                    info = os.stat(
+                    name = os.fsencode(item.name)
+                    entry_count += 1
+                    total_path_bytes += prefix_size + len(name)
+                    if (
+                        entry_count > _MAX_TREE_ENTRIES
+                        or len(name) > _MAX_PATH_BYTES
+                        or total_path_bytes > _MAX_TOTAL_PATH_BYTES
+                    ):
+                        raise UnsupportedRepositoryError(
+                            "exact-tree verification metadata exceeds the trusted limit"
+                        )
+                    names.append(name)
+            for name in names:
+                _remaining(deadline)
+                path_parts = (*parts, name)
+                path = b"/".join(path_parts)
+                info = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False,
+                )
+                if stat.S_ISDIR(info.st_mode):
+                    if (
+                        path not in expected_directories
+                        or stat.S_IMODE(info.st_mode) != 0o755
+                    ):
+                        raise SourceBoundaryError(
+                            "exact-tree published directory set or mode changed"
+                        )
+                    child_fd = os.open(
+                        name, _directory_open_flags(), dir_fd=directory_fd,
+                    )
+                    try:
+                        opened = os.fstat(child_fd)
+                        child_identity = (opened.st_dev, opened.st_ino)
+                        if (
+                            child_identity != (info.st_dev, info.st_ino)
+                            or stat.S_IMODE(opened.st_mode) != 0o755
+                        ):
+                            raise SourceBoundaryError(
+                                "exact-tree published directory was substituted"
+                            )
+                    finally:
+                        os.close(child_fd)
+                    seen_directories.add(path)
+                    stack.append((path_parts, child_identity))
+                    continue
+
+                expected = expected_files.get(path)
+                witness = expected_witnesses.get(path)
+                if expected is None or witness is None:
+                    raise SourceBoundaryError(
+                        "exact-tree published path set contains an extra entry"
+                    )
+                if stat.S_ISREG(info.st_mode):
+                    expected_mode = expected.mode & 0o777
+                    if (
+                        expected.mode not in {0o100644, 0o100755}
+                        or stat.S_IMODE(info.st_mode) != expected_mode
+                        or info.st_size != witness.size
+                    ):
+                        raise SourceBoundaryError(
+                            "exact-tree published regular file metadata changed"
+                        )
+                    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    flags |= getattr(os, "O_NOFOLLOW", 0)
+                    flags |= getattr(os, "O_NONBLOCK", 0)
+                    fd = os.open(name, flags, dir_fd=directory_fd)
+                    try:
+                        opened = os.fstat(fd)
+                        if (
+                            not stat.S_ISREG(opened.st_mode)
+                            or (opened.st_dev, opened.st_ino)
+                            != (info.st_dev, info.st_ino)
+                            or stat.S_IMODE(opened.st_mode) != expected_mode
+                            or opened.st_size != witness.size
+                            or opened.st_size > _MAX_BLOB_BYTES
+                        ):
+                            raise SourceBoundaryError(
+                                "exact-tree published regular file was substituted"
+                            )
+                        content_digest = hashlib.sha256()
+                        git_digest = hashlib.new(object_format)
+                        git_digest.update(
+                            f"blob {witness.size}\0".encode("ascii")
+                        )
+                        size = 0
+                        while True:
+                            _remaining(deadline)
+                            chunk = os.read(fd, _BUFFER_SIZE)
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            total_content_bytes += len(chunk)
+                            if total_content_bytes > _MAX_EXPORT_BYTES:
+                                raise UnsupportedRepositoryError(
+                                    "exact-tree verification content exceeds "
+                                    "the trusted limit"
+                                )
+                            content_digest.update(chunk)
+                            git_digest.update(chunk)
+                        after = os.fstat(fd)
+                    finally:
+                        os.close(fd)
+                    after_path = os.stat(
+                        name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        _path_state(opened) != _path_state(after)
+                        or _path_state(after) != _path_state(after_path)
+                        or not stat.S_ISREG(after_path.st_mode)
+                        or size != witness.size
+                        or content_digest.hexdigest() != witness.content_sha256
+                        or git_digest.hexdigest() != expected.oid
+                    ):
+                        raise SourceBoundaryError(
+                            "exact-tree published regular file content changed"
+                        )
+                elif stat.S_ISLNK(info.st_mode):
+                    if expected.mode != 0o120000:
+                        raise SourceBoundaryError(
+                            "exact-tree published path type changed"
+                        )
+                    target = os.readlink(name, dir_fd=directory_fd)
+                    target_raw = os.fsencode(target)
+                    if (
+                        len(target_raw) != witness.size
+                        or len(target_raw) > _MAX_SYMLINK_TARGET_BYTES
+                    ):
+                        raise SourceBoundaryError(
+                            "exact-tree published symlink length changed"
+                        )
+                    content_digest = hashlib.sha256(target_raw)
+                    git_digest = hashlib.new(object_format)
+                    git_digest.update(
+                        f"blob {len(target_raw)}\0".encode("ascii")
+                    )
+                    git_digest.update(target_raw)
+                    after = os.stat(
                         name, dir_fd=directory_fd, follow_symlinks=False,
                     )
-                    if stat.S_ISDIR(info.st_mode):
-                        if path not in expected_directories:
-                            return False
-                        child_fd = os.open(
-                            name, _directory_open_flags(), dir_fd=directory_fd,
+                    total_content_bytes += len(target_raw)
+                    if (
+                        total_content_bytes > _MAX_EXPORT_BYTES
+                        or _path_state(info) != _path_state(after)
+                        or content_digest.hexdigest() != witness.content_sha256
+                        or git_digest.hexdigest() != expected.oid
+                    ):
+                        raise SourceBoundaryError(
+                            "exact-tree published symlink target changed"
                         )
-                        try:
-                            opened = os.fstat(child_fd)
-                            child_identity = (opened.st_dev, opened.st_ino)
-                            if child_identity != (info.st_dev, info.st_ino):
-                                return False
-                        finally:
-                            os.close(child_fd)
-                        seen_directories.add(path)
-                        stack.append((path_parts, child_identity))
-                        continue
+                else:
+                    raise SourceBoundaryError(
+                        "exact-tree published path type is unsupported"
+                    )
+                seen_files.add(path)
+            directory_after = os.fstat(directory_fd)
+            if _path_state(directory_before) != _path_state(directory_after):
+                raise SourceBoundaryError(
+                    "exact-tree published directory changed during verification"
+                )
+        finally:
+            os.close(directory_fd)
+        assert directory_after is not None
+        rebound_fd = _open_owned_relative_directory(
+            prepared.root_fd, parts, identity, deadline=deadline,
+        )
+        try:
+            rebound = os.fstat(rebound_fd)
+            if _path_state(directory_after) != _path_state(rebound):
+                raise SourceBoundaryError(
+                    "exact-tree published directory pathname was rebound"
+                )
+        finally:
+            os.close(rebound_fd)
+    if (
+        seen_files != set(expected_files)
+        or seen_directories != expected_directories
+    ):
+        raise SourceBoundaryError(
+            "exact-tree published raw path set does not match the committed tree"
+        )
+    root_after = os.fstat(prepared.root_fd)
+    if _path_state(root_before) != _path_state(root_after):
+        raise SourceBoundaryError(
+            "exact-tree published root changed during verification"
+        )
 
-                    expected = expected_files.get(path)
-                    if expected is None:
-                        return False
-                    if stat.S_ISREG(info.st_mode):
-                        if expected.mode not in {0o100644, 0o100755}:
-                            return False
-                        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-                        flags |= getattr(os, "O_NOFOLLOW", 0)
-                        flags |= getattr(os, "O_NONBLOCK", 0)
-                        fd = os.open(name, flags, dir_fd=directory_fd)
-                        try:
-                            opened = os.fstat(fd)
-                            if (
-                                not stat.S_ISREG(opened.st_mode)
-                                or (opened.st_dev, opened.st_ino)
-                                != (info.st_dev, info.st_ino)
-                                or (opened.st_mode & 0o777)
-                                != (expected.mode & 0o777)
-                                or opened.st_size > _MAX_BLOB_BYTES
-                            ):
-                                return False
-                            digest = (
-                                hashlib.sha256()
-                                if len(expected.oid) == 64
-                                else hashlib.sha1()
-                            )
-                            digest.update(f"blob {opened.st_size}\0".encode("ascii"))
-                            size = 0
-                            while True:
-                                _remaining(deadline)
-                                chunk = os.read(fd, _BUFFER_SIZE)
-                                if not chunk:
-                                    break
-                                digest.update(chunk)
-                                size += len(chunk)
-                            after = os.fstat(fd)
-                        finally:
-                            os.close(fd)
-                        after_path = os.stat(
-                            name,
-                            dir_fd=directory_fd,
-                            follow_symlinks=False,
-                        )
-                        total_content_bytes += size
-                        if (
-                            _path_state(opened) != _path_state(after)
-                            or _path_state(after) != _path_state(after_path)
-                            or not stat.S_ISREG(after_path.st_mode)
-                            or size != opened.st_size
-                            or digest.hexdigest() != expected.oid
-                        ):
-                            return False
-                    elif stat.S_ISLNK(info.st_mode):
-                        if expected.mode != 0o120000:
-                            return False
-                        target = os.readlink(name, dir_fd=directory_fd)
-                        target_raw = os.fsencode(target)
-                        if len(target_raw) > _MAX_SYMLINK_TARGET_BYTES:
-                            return False
-                        digest = hashlib.sha256() if len(expected.oid) == 64 else hashlib.sha1()
-                        digest.update(f"blob {len(target_raw)}\0".encode("ascii"))
-                        digest.update(target_raw)
-                        after = os.stat(
-                            name, dir_fd=directory_fd, follow_symlinks=False,
-                        )
-                        total_content_bytes += len(target_raw)
-                        if (
-                            _path_state(info) != _path_state(after)
-                            or digest.hexdigest() != expected.oid
-                        ):
-                            return False
-                    else:
-                        return False
-                    if total_content_bytes > _MAX_EXPORT_BYTES:
-                        return False
-                    seen_files.add(path)
-            finally:
-                os.close(directory_fd)
+
+def _verify_published_exact_tree(
+    prepared: _PreparedDestination,
+    entries: tuple[_TreeEntry, ...],
+    witnesses: tuple[_ExportWitness, ...],
+    *,
+    object_format: str,
+    deadline: float,
+) -> None:
+    """Bind the public destination name around the exact content walk."""
+
+    _verify_published_destination(prepared, deadline=deadline)
+    _verify_exported_tree(
+        prepared,
+        entries,
+        witnesses,
+        object_format=object_format,
+        deadline=deadline,
+    )
+    _verify_published_destination(prepared, deadline=deadline)
+
+
+def _quarantined_tree_matches_export(
+    prepared: _PreparedDestination,
+    entries: tuple[_TreeEntry, ...],
+    witnesses: tuple[_ExportWitness, ...],
+    *,
+    object_format: str,
+    deadline: float,
+) -> bool:
+    """Classify a quarantine without deleting or trusting any of its contents."""
+
+    try:
+        _verify_exported_tree(
+            prepared,
+            entries,
+            witnesses,
+            object_format=object_format,
+            deadline=deadline,
+        )
     except (OSError, SourceBoundaryError):
         return False
-    return (
-        seen_files == set(expected_files)
-        and seen_directories == expected_directories
-    )
+    return True
 
 
 def _quarantine_owned_published(
     prepared: _PreparedDestination,
     entries: tuple[_TreeEntry, ...],
+    witnesses: tuple[_ExportWitness, ...],
     *,
     backend: str,
+    object_format: str,
 ) -> tuple[str, bool]:
     """Move a failed published tree aside without deleting concurrent bytes."""
 
@@ -4846,7 +5062,11 @@ def _quarantine_owned_published(
         )
     quarantine_path = os.path.join(prepared.canonical_parent, quarantine_leaf)
     unchanged = _quarantined_tree_matches_export(
-        prepared, entries, deadline=deadline,
+        prepared,
+        entries,
+        witnesses,
+        object_format=object_format,
+        deadline=deadline,
     )
     return os.fsdecode(quarantine_path), unchanged
 
@@ -4859,7 +5079,7 @@ def _write_export_file(
     mode: int,
     *,
     deadline: float,
-) -> None:
+) -> tuple[int, str]:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -4870,8 +5090,10 @@ def _write_export_file(
         ) from exc
     try:
         total = 0
+        digest = hashlib.sha256()
         for chunk in reader.iter_exact(size):
             _remaining(deadline)
+            digest.update(chunk)
             offset = 0
             while offset < len(chunk):
                 _remaining(deadline)
@@ -4888,18 +5110,25 @@ def _write_export_file(
         os.fchmod(fd, mode)
     finally:
         os.close(fd)
+    return total, digest.hexdigest()
 
 
 def export_exact_tree(
     snapshot: SourceSnapshot, destination: str | os.PathLike[str],
 ) -> None:
-    """Materialize only the captured committed tree, bypassing checkout filters."""
+    """Materialize and verify the captured committed tree without filters.
+
+    The final bounded content walk establishes exactness immediately before this
+    call returns. Mutation after return belongs to the later consumer/root
+    authority boundary and is intentionally outside this Task 1 API.
+    """
 
     backend = _assert_export_host_supported()
     authority_deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
     authority = _verify_public_authority(deadline=authority_deadline)
     prepared: _PreparedDestination | None = None
     entries: tuple[_TreeEntry, ...] = ()
+    witnesses: tuple[_ExportWitness, ...] = ()
     published = False
     try:
         try:
@@ -4928,7 +5157,7 @@ def export_exact_tree(
             prepared = _prepare_destination(
                 snapshot.repo, destination, deadline=deadline,
             )
-            _materialize_blobs(
+            witnesses = _materialize_blobs(
                 snapshot.repo,
                 entries,
                 prepared.root_fd,
@@ -4954,7 +5183,20 @@ def export_exact_tree(
                 prepared, backend=backend, deadline=deadline,
             )
             published = True
-            _verify_published_destination(prepared, deadline=deadline)
+            _verify_public_authority_after(
+                authority,
+                deadline=time.monotonic() + _DEFAULT_DEADLINE_SECONDS,
+            )
+            verification_deadline = (
+                time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+            )
+            _verify_published_exact_tree(
+                prepared,
+                entries,
+                witnesses,
+                object_format=snapshot.repo.object_format,
+                deadline=verification_deadline,
+            )
         finally:
             _verify_public_authority_after(
                 authority,
@@ -4965,7 +5207,11 @@ def export_exact_tree(
             if published:
                 try:
                     quarantine_path, unchanged = _quarantine_owned_published(
-                        prepared, entries, backend=backend,
+                        prepared,
+                        entries,
+                        witnesses,
+                        backend=backend,
+                        object_format=snapshot.repo.object_format,
                     )
                 except BaseException as cleanup_error:
                     raise SourceBoundaryError(
