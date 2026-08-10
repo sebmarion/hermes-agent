@@ -1967,7 +1967,9 @@ class ProofLedger:
             raise ProofValidationError("event contract digest differs from plan")
         timestamp_policy = "clock" if created_at_ns is None else "explicit"
         effective_created_at_ns = (
-            time.time_ns() if created_at_ns is None else created_at_ns
+            int(existing_row["created_at_ns"])
+            if existing_row is not None and created_at_ns is None
+            else time.time_ns() if created_at_ns is None else created_at_ns
         )
         fingerprint_values = {
             "plan_id": plan_id,

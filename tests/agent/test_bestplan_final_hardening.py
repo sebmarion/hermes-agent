@@ -421,4 +421,4 @@ def test_old_host_context_keeps_new_hermes_strict_bestplan_disabled(monkeypatch)
         workspace="/tmp/work", resolved_runtimes=[],
     )
     assert result["status"] == "rejected"
-    assert "capability/version" in result["error"]
+    assert result["error"] == "source_snapshot_required"

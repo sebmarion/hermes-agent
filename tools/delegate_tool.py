@@ -23,6 +23,9 @@ import hashlib
 import json
 import logging
 import math
+import re
+import unicodedata
+import uuid
 
 logger = logging.getLogger(__name__)
 import os
@@ -32,10 +35,14 @@ import sys
 import threading
 import time
 from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
+    wait,
 )
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
@@ -5187,6 +5194,358 @@ def _load_config() -> dict:
 # Strict BestPlan runtime identity and sandbox dispatch
 # ---------------------------------------------------------------------------
 
+_BESTPLAN_HOST_RUNTIME_SCHEMA = "hermes.bestplan.host-runtime.v1"
+_BESTPLAN_HOST_RUNTIME_DIGEST_DOMAIN = b"hermes.bestplan.host-runtime.v1\0"
+_BESTPLAN_CHANGED_PATHS_DIGEST_DOMAIN = b"hermes.bestplan.changed-paths.v1\0"
+_BESTPLAN_MAX_CAPABILITY_TTL_SECONDS = 86_400.0
+_BESTPLAN_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+class BestplanCandidateBatchError(RuntimeError):
+    """One or more isolated candidates failed or were cancelled."""
+
+
+class _BestplanPreflightError(ValueError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class BestplanHostRuntime:
+    """Non-secret, immutable coordinates for Task 4 candidate execution."""
+
+    controller: object
+    controller_source: Path
+    controller_python: Path
+    runtime_read_paths: tuple[Path, ...]
+    attempts_root: Path
+    policy_version: int
+    request_budget: int
+    token_budget: int
+    max_iterations: int
+    max_output_tokens: int
+    timeout_seconds: float
+    capability_ttl_seconds: float
+
+    def __post_init__(self) -> None:
+        from agent.bestplan_contract import ControllerIdentity
+
+        if not isinstance(self.controller, ControllerIdentity):
+            raise ValueError("candidate controller identity is invalid")
+        for value, name, maximum in (
+            (self.policy_version, "policy version", 1_000_000),
+            (self.request_budget, "request budget", 10_000),
+            (self.token_budget, "token budget", 100_000_000),
+            (self.max_iterations, "iteration budget", 500),
+            (self.max_output_tokens, "output token budget", 32_768),
+        ):
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ValueError(f"candidate {name} is invalid")
+        for value, name, maximum in (
+            (self.timeout_seconds, "timeout", 86_400.0),
+            (
+                self.capability_ttl_seconds,
+                "capability ttl",
+                _BESTPLAN_MAX_CAPABILITY_TTL_SECONDS,
+            ),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0 < float(value) <= maximum
+            ):
+                raise ValueError(f"candidate {name} is invalid")
+        controller_source = Path(self.controller_source).expanduser().resolve()
+        controller_python = Path(
+            os.path.abspath(os.fspath(Path(self.controller_python).expanduser()))
+        )
+        attempts_root = Path(self.attempts_root).expanduser().resolve()
+        runtime_paths = tuple(
+            Path(path).expanduser().resolve() for path in self.runtime_read_paths
+        )
+        if len(set(runtime_paths)) != len(runtime_paths):
+            raise ValueError("candidate runtime read path is duplicated")
+        object.__setattr__(self, "controller_source", controller_source)
+        object.__setattr__(self, "controller_python", controller_python)
+        object.__setattr__(self, "attempts_root", attempts_root)
+        object.__setattr__(self, "runtime_read_paths", runtime_paths)
+        object.__setattr__(self, "timeout_seconds", float(self.timeout_seconds))
+        object.__setattr__(
+            self, "capability_ttl_seconds", float(self.capability_ttl_seconds),
+        )
+
+
+def _bestplan_host_runtime_body(runtime: BestplanHostRuntime) -> dict[str, Any]:
+    if not isinstance(runtime, BestplanHostRuntime):
+        raise ValueError("candidate host runtime is invalid")
+    controller = runtime.controller
+    return {
+        "schema": _BESTPLAN_HOST_RUNTIME_SCHEMA,
+        "controller": {
+            "repository_id": controller.repository_id,
+            "controller_id": controller.controller_id,
+            "release_oid": controller.release_oid,
+            "artifact_sha256": controller.artifact_sha256,
+        },
+        "controller_source": str(runtime.controller_source),
+        "controller_python": str(runtime.controller_python),
+        "controller_python_resolved": str(runtime.controller_python.resolve()),
+        "runtime_read_paths": [str(path) for path in runtime.runtime_read_paths],
+        "attempts_root": str(runtime.attempts_root),
+        "policy": {
+            "version": runtime.policy_version,
+            "request_budget": runtime.request_budget,
+            "token_budget": runtime.token_budget,
+            "max_iterations": runtime.max_iterations,
+            "max_output_tokens": runtime.max_output_tokens,
+            "timeout_seconds": runtime.timeout_seconds,
+            "capability_ttl_seconds": runtime.capability_ttl_seconds,
+        },
+    }
+
+
+def _bestplan_host_runtime_digest(runtime: BestplanHostRuntime) -> str:
+    payload = json.dumps(
+        _bestplan_host_runtime_body(runtime),
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(_BESTPLAN_HOST_RUNTIME_DIGEST_DOMAIN + payload).hexdigest()
+
+
+def _bestplan_host_runtime_projection(
+    runtime: BestplanHostRuntime,
+) -> dict[str, Any]:
+    return {
+        "candidate_policy_version": runtime.policy_version,
+        "candidate_request_budget": runtime.request_budget,
+        "candidate_token_budget": runtime.token_budget,
+        "candidate_max_iterations": runtime.max_iterations,
+        "candidate_max_output_tokens": runtime.max_output_tokens,
+        "candidate_timeout_seconds": runtime.timeout_seconds,
+        "candidate_capability_ttl_seconds": runtime.capability_ttl_seconds,
+        "candidate_host_runtime_digest": _bestplan_host_runtime_digest(runtime),
+    }
+
+
+def _bestplan_paths_overlap(first: Path, second: Path) -> bool:
+    try:
+        first.relative_to(second)
+        return True
+    except ValueError:
+        pass
+    try:
+        second.relative_to(first)
+        return True
+    except ValueError:
+        return False
+
+
+def _validate_bestplan_host_runtime(
+    runtime: BestplanHostRuntime,
+    *,
+    source_snapshot: object,
+    promotion_contract: Mapping[str, Any] | None,
+) -> None:
+    from agent.bestplan_sandbox import (
+        candidate_controller_artifact_sha256,
+        pinned_candidate_runtime_paths,
+    )
+    from agent.bestplan_source import SourceSnapshot
+
+    if not isinstance(runtime, BestplanHostRuntime):
+        raise _BestplanPreflightError("candidate_runtime_unavailable")
+    if not isinstance(source_snapshot, SourceSnapshot):
+        raise _BestplanPreflightError("source_snapshot_required")
+    controller = runtime.controller
+    if controller.repository_id != source_snapshot.repo.repository_id:
+        raise _BestplanPreflightError("candidate_runtime_unavailable")
+    if promotion_contract is not None:
+        expected = promotion_contract.get("controller")
+        actual = {
+            "repository_id": controller.repository_id,
+            "controller_id": controller.controller_id,
+            "release_oid": controller.release_oid,
+            "artifact_sha256": controller.artifact_sha256,
+        }
+        if not isinstance(expected, Mapping) or dict(expected) != actual:
+            raise _BestplanPreflightError("candidate_runtime_unavailable")
+    if not runtime.controller_source.is_dir():
+        raise _BestplanPreflightError("candidate_runtime_unavailable")
+    if not runtime.controller_python.is_file():
+        raise _BestplanPreflightError("candidate_runtime_unavailable")
+    try:
+        expected_runtime_paths = pinned_candidate_runtime_paths(
+            runtime.controller_python
+        )
+    except Exception:
+        raise _BestplanPreflightError("candidate_runtime_unavailable") from None
+    if runtime.runtime_read_paths != expected_runtime_paths:
+        raise _BestplanPreflightError("candidate_runtime_unavailable")
+    try:
+        artifact = candidate_controller_artifact_sha256(runtime.controller_source)
+    except Exception:
+        raise _BestplanPreflightError("candidate_runtime_unavailable") from None
+    if artifact != controller.artifact_sha256:
+        raise _BestplanPreflightError("candidate_runtime_unavailable")
+    repo_paths = tuple(
+        Path(os.fsdecode(raw)).resolve()
+        for raw in (
+            source_snapshot.repo.worktree_raw,
+            source_snapshot.repo.git_dir_raw,
+            source_snapshot.repo.common_dir_raw,
+        )
+    )
+    if any(
+        _bestplan_paths_overlap(runtime.controller_source, path)
+        for path in repo_paths
+    ):
+        raise _BestplanPreflightError("candidate_runtime_unavailable")
+    if any(
+        _bestplan_paths_overlap(runtime.attempts_root, path)
+        for path in (*repo_paths, runtime.controller_source)
+    ):
+        raise _BestplanPreflightError("candidate_runtime_unavailable")
+
+
+def _bestplan_path_key(path: str) -> tuple[str, ...]:
+    if path == ".":
+        return ()
+    return tuple(
+        unicodedata.normalize("NFC", part).casefold()
+        for part in path.split("/")
+    )
+
+
+def _bestplan_key_overlaps(
+    first: tuple[str, ...], second: tuple[str, ...],
+) -> bool:
+    length = min(len(first), len(second))
+    return first[:length] == second[:length]
+
+
+def _bestplan_safe_identifier(prefix: str, *values: object) -> str:
+    payload = json.dumps(
+        [str(value) for value in values],
+        ensure_ascii=True,
+        sort_keys=False,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return f"{prefix}-{hashlib.sha256(payload).hexdigest()[:24]}"
+
+
+def _bestplan_rebased_path(source_snapshot: object, raw_path: object) -> str:
+    # CandidateSpec owns the final lexical relative-path contract.  Keep this
+    # step limited to moving a workspace-relative path under the repo root.
+    if not isinstance(raw_path, str) or not raw_path:
+        raise _BestplanPreflightError("candidate_spec_invalid")
+    raw_path = raw_path.replace("\\", "/")
+    if raw_path.startswith("/") or "\x00" in raw_path:
+        raise _BestplanPreflightError("candidate_spec_invalid")
+    worktree = Path(os.fsdecode(source_snapshot.repo.worktree_raw)).resolve()
+    workspace = Path(source_snapshot.repo.workspace).resolve()
+    try:
+        prefix = workspace.relative_to(worktree).as_posix()
+    except ValueError:
+        raise _BestplanPreflightError("candidate_spec_invalid") from None
+    if prefix == ".":
+        rebased = raw_path
+    elif raw_path == ".":
+        rebased = prefix
+    else:
+        rebased = f"{prefix}/{raw_path}"
+    return rebased
+
+
+def _bestplan_mandatory_protected_paths(source_snapshot: object) -> set[bytes]:
+    manifest = source_snapshot.protected_manifest
+    mandatory = {
+        item.path for item in manifest.worktree_entries if not item.tracked
+    }
+    mandatory.update(
+        item.path
+        for item in manifest.index_flags
+        if (
+            item.assume_unchanged
+            or item.skip_worktree
+            or item.intent_to_add
+        )
+    )
+    return mandatory
+
+
+def _bestplan_candidate_goal(
+    task: Mapping[str, Any],
+    *,
+    leases: tuple[str, ...],
+    artifacts: tuple[str, ...],
+) -> str:
+    """Build the bounded worker instruction only from approved task fields."""
+
+    goal = task.get("goal")
+    raw_acceptance = task.get("_bestplan_acceptance")
+    if (
+        not isinstance(goal, str)
+        or not goal.strip()
+        or "\x00" in goal
+        or not isinstance(raw_acceptance, (list, tuple))
+        or not raw_acceptance
+    ):
+        raise _BestplanPreflightError("candidate_spec_invalid")
+    acceptance: list[str] = []
+    for item in raw_acceptance:
+        if (
+            not isinstance(item, str)
+            or not item.strip()
+            or "\x00" in item
+            or len(item.encode("utf-8")) > 16_384
+        ):
+            raise _BestplanPreflightError("candidate_spec_invalid")
+        acceptance.append(item)
+    contract = json.dumps(
+        {
+            "acceptance": acceptance,
+            "allowed_paths": list(leases),
+            "expected_artifacts": list(artifacts),
+            "schema": "hermes.bestplan.candidate-instruction.v1",
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"Approved candidate contract:\n{contract}\n\nGoal:\n{goal}"
+
+
+def _bestplan_changed_paths_digest(paths: Iterable[bytes]) -> str:
+    normalized = tuple(sorted(bytes(path) for path in paths))
+    if len(set(normalized)) != len(normalized):
+        raise BestplanCandidateBatchError("candidate batch failed")
+    payload = json.dumps(
+        [path.hex() for path in normalized],
+        ensure_ascii=True,
+        sort_keys=False,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(
+        _BESTPLAN_CHANGED_PATHS_DIGEST_DOMAIN + payload
+    ).hexdigest()
+
+
+def _bestplan_plain_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _bestplan_plain_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return [_bestplan_plain_json(item) for item in value]
+    return value
+
 def _normalize_bestplan_toolsets(value: Any) -> list[str] | None:
     if value is None:
         return None
@@ -5245,7 +5604,40 @@ def _nonsecret_runtime_value(value: Any) -> Any:
         return value
 
 
-def _bestplan_runtime_identity(task: Dict[str, Any], runtime: Dict[str, Any]) -> Dict[str, Any]:
+def _bestplan_runtime_identity(
+    task: Dict[str, Any],
+    runtime: Dict[str, Any],
+    *,
+    execution_protocol: int = 1,
+) -> Dict[str, Any]:
+    if execution_protocol == 2:
+        toolsets = (
+            ["read_only_files"]
+            if bool(task.get("_bestplan_read_only"))
+            else ["file"]
+        )
+        identity = {
+            "execution_protocol": 2,
+            "route": str(runtime.get("route") or task.get("route") or ""),
+            "provider": str(runtime.get("provider") or ""),
+            "model": str(runtime.get("model") or ""),
+            "toolsets": toolsets,
+        }
+        fingerprint = hashlib.sha256(
+            b"hermes.bestplan.runtime-identity.v2\0"
+            + json.dumps(
+                identity, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "runtime_identity": identity,
+            "runtime_fingerprint": fingerprint,
+            "sandbox_backend": "bestplan-candidate",
+            "sandbox_policy_digest": "",
+            "bestplan_toolsets": toolsets,
+        }
+    if execution_protocol != 1:
+        raise ValueError("BestPlan execution protocol is unsupported")
     from agent.bestplan_sandbox import sandbox_backend_identity
 
     workspace = str(task.get("_bestplan_workspace") or task.get("workspace") or "")
@@ -5365,6 +5757,7 @@ def resolve_bestplan_runtime_specs(
     parent_agent: Any,
     *,
     expected: Optional[List[Dict[str, Any]]] = None,
+    execution_protocol: int = 1,
 ) -> List[Dict[str, Any]]:
     """Resolve each approved BestPlan lane and bind its runtime identity."""
     cfg = _load_config()
@@ -5388,13 +5781,347 @@ def resolve_bestplan_runtime_specs(
             raise ValueError(f"delegation lane {route} resolved without a provider")
         if not str(runtime.get("model") or "").strip():
             raise ValueError(f"delegation lane {route} resolved without a model")
-        runtime.update(_bestplan_runtime_identity(task, runtime))
+        identity = _bestplan_runtime_identity(
+            task, runtime, execution_protocol=execution_protocol,
+        )
+        runtime.update(identity)
+        if execution_protocol == 2:
+            runtime["toolsets"] = list(identity["bestplan_toolsets"])
         if expected and index < len(expected):
             wanted = str((expected[index] or {}).get("runtime_fingerprint") or "")
             if not wanted or runtime["runtime_fingerprint"] != wanted:
                 raise ValueError(f"delegation lane {route} changed since approval")
         resolved.append(runtime)
     return resolved
+
+
+def _preflight_bestplan_candidates(
+    *,
+    tasks: Iterable[Mapping[str, Any]],
+    resolved_runtimes: Iterable[Mapping[str, Any]],
+    plan_id: str,
+    workspace: str,
+    source_snapshot: object,
+    candidate_host_runtime: BestplanHostRuntime,
+    promotion_contract: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    from agent.bestplan_candidates import CandidateSpec
+
+    task_list = list(tasks)
+    runtime_list = list(resolved_runtimes)
+    if not task_list or len(task_list) != len(runtime_list):
+        raise _BestplanPreflightError("candidate_task_runtime_mismatch")
+    _validate_bestplan_host_runtime(
+        candidate_host_runtime,
+        source_snapshot=source_snapshot,
+        promotion_contract=promotion_contract,
+    )
+    try:
+        requested_workspace = Path(workspace).expanduser().resolve()
+        captured_workspace = Path(source_snapshot.repo.workspace).resolve()
+    except Exception:
+        raise _BestplanPreflightError("candidate_spec_invalid") from None
+    if requested_workspace != captured_workspace:
+        raise _BestplanPreflightError("candidate_spec_invalid")
+
+    manifest = source_snapshot.protected_manifest
+    declared_protected = set(manifest.protected_paths)
+    if not _bestplan_mandatory_protected_paths(source_snapshot).issubset(
+        declared_protected
+    ):
+        raise _BestplanPreflightError("protected_manifest_inconsistent")
+    protected_keys: list[tuple[str, ...]] = []
+    try:
+        for raw in declared_protected:
+            decoded = os.fsdecode(raw)
+            if os.fsencode(decoded) != raw:
+                raise UnicodeError
+            protected_keys.append(_bestplan_path_key(decoded))
+    except (TypeError, UnicodeError, ValueError):
+        raise _BestplanPreflightError("protected_manifest_inconsistent") from None
+
+    raw_plan_id = str(plan_id or "")
+    candidate_plan_id = (
+        raw_plan_id
+        if _BESTPLAN_IDENTIFIER_RE.fullmatch(raw_plan_id)
+        else _bestplan_safe_identifier("plan", raw_plan_id)
+    )
+    prepared: list[dict[str, Any]] = []
+    lease_keys: list[tuple[str, ...]] = []
+    seen_manifest_indices: set[int] = set()
+    for position, (task, runtime) in enumerate(zip(task_list, runtime_list)):
+        if not isinstance(task, Mapping) or not isinstance(runtime, Mapping):
+            raise _BestplanPreflightError("candidate_spec_invalid")
+        manifest_index = task.get("_bestplan_manifest_index", position)
+        if type(manifest_index) is not int or manifest_index != position:
+            raise _BestplanPreflightError("candidate_spec_invalid")
+        if manifest_index in seen_manifest_indices:
+            raise _BestplanPreflightError("candidate_spec_invalid")
+        seen_manifest_indices.add(manifest_index)
+        dependencies = task.get("_bestplan_depends_on") or ()
+        if not isinstance(dependencies, (list, tuple)) or dependencies:
+            raise _BestplanPreflightError("candidate_dependencies_unsupported")
+        task_workspace = task.get("_bestplan_workspace")
+        try:
+            if Path(str(task_workspace)).expanduser().resolve() != captured_workspace:
+                raise _BestplanPreflightError("candidate_spec_invalid")
+        except (OSError, RuntimeError, ValueError):
+            raise _BestplanPreflightError("candidate_spec_invalid") from None
+        original_slice_id = task.get("_bestplan_slice_id")
+        if not isinstance(original_slice_id, str) or not original_slice_id:
+            raise _BestplanPreflightError("candidate_spec_invalid")
+        safe_slice_id = _bestplan_safe_identifier(
+            "slice", raw_plan_id, manifest_index, original_slice_id,
+        )
+        candidate_id = _bestplan_safe_identifier(
+            "candidate", raw_plan_id, manifest_index, original_slice_id,
+        )
+        attempt_id = _bestplan_safe_identifier(
+            "attempt", raw_plan_id, manifest_index, original_slice_id,
+        )
+        raw_leases = task.get("_bestplan_leases") or ()
+        raw_artifacts = task.get("_bestplan_expected_artifacts") or ()
+        if not isinstance(raw_leases, (list, tuple)) or not isinstance(
+            raw_artifacts, (list, tuple)
+        ):
+            raise _BestplanPreflightError("candidate_spec_invalid")
+        leases = tuple(
+            _bestplan_rebased_path(source_snapshot, item) for item in raw_leases
+        )
+        artifacts = tuple(
+            _bestplan_rebased_path(source_snapshot, item)
+            for item in raw_artifacts
+        )
+        for lease in leases:
+            key = _bestplan_path_key(lease)
+            if any(_bestplan_key_overlaps(key, protected) for protected in protected_keys):
+                raise _BestplanPreflightError("protected_path_overlap")
+            if any(_bestplan_key_overlaps(key, existing) for existing in lease_keys):
+                raise _BestplanPreflightError("lease_alias")
+            lease_keys.append(key)
+        read_only = task.get("_bestplan_read_only")
+        if type(read_only) is not bool:
+            raise _BestplanPreflightError("candidate_spec_invalid")
+        model = runtime.get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise _BestplanPreflightError("candidate_spec_invalid")
+        candidate_goal = _bestplan_candidate_goal(
+            task,
+            leases=leases,
+            artifacts=artifacts,
+        )
+        try:
+            preflight_spec = CandidateSpec(
+                plan_id=candidate_plan_id,
+                candidate_id=candidate_id,
+                slice_id=safe_slice_id,
+                goal=candidate_goal,
+                allowed_paths=leases,
+                read_only=read_only,
+                expected_artifacts=artifacts,
+                model=model,
+                request_budget=candidate_host_runtime.request_budget,
+                token_budget=candidate_host_runtime.token_budget,
+                expires_at=math.ceil(
+                    time.time()
+                    + candidate_host_runtime.capability_ttl_seconds
+                ),
+                max_iterations=candidate_host_runtime.max_iterations,
+                max_output_tokens=candidate_host_runtime.max_output_tokens,
+                toolsets=("read_only_files",) if read_only else ("file",),
+            )
+        except Exception:
+            raise _BestplanPreflightError("candidate_spec_invalid") from None
+        prepared.append({
+            "position": position,
+            "manifest_slice_id": original_slice_id,
+            "attempt_id": attempt_id,
+            "spec": preflight_spec,
+        })
+    return prepared
+
+
+def _validate_bestplan_frozen_candidate(
+    frozen: object,
+    *,
+    spec: object,
+    attempt_id: str,
+    runtime: BestplanHostRuntime,
+) -> None:
+    from agent.bestplan_candidates import FrozenCandidate
+
+    if not isinstance(frozen, FrozenCandidate):
+        raise BestplanCandidateBatchError("candidate batch failed")
+    if (
+        frozen.candidate_id != spec.candidate_id
+        or frozen.slice_id != spec.slice_id
+        or frozen.attempt_id != attempt_id
+        or frozen.controller_id != runtime.controller.controller_id
+        or frozen.controller_repository_id != runtime.controller.repository_id
+        or frozen.controller_release_oid != runtime.controller.release_oid
+        or frozen.controller_artifact_sha256 != runtime.controller.artifact_sha256
+        or (spec.read_only and frozen.changed_paths)
+    ):
+        raise BestplanCandidateBatchError("candidate batch failed")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(frozen.policy_digest or "")):
+        raise BestplanCandidateBatchError("candidate batch failed")
+    try:
+        worker_receipt = _bestplan_plain_json(frozen.raw_receipt)
+        encoded = json.dumps(
+            worker_receipt,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        raise BestplanCandidateBatchError("candidate batch failed") from None
+    if hashlib.sha256(encoded).hexdigest() != frozen.raw_receipt_sha256:
+        raise BestplanCandidateBatchError("candidate batch failed")
+
+
+def _bestplan_host_candidate_receipt(
+    *,
+    frozen: object,
+    manifest_slice_id: str,
+    spec: object,
+    promotion_contract_digest: str,
+) -> dict[str, Any]:
+    changed_paths = tuple(sorted(bytes(path) for path in frozen.changed_paths))
+    return {
+        "schema": "hermes.bestplan.host-candidate-receipt.v1",
+        "manifest_slice_id": manifest_slice_id,
+        "candidate_id": frozen.candidate_id,
+        "slice_id": frozen.slice_id,
+        "attempt_id": frozen.attempt_id,
+        "candidate_ref": frozen.ref_name,
+        "commit_oid": frozen.commit_oid,
+        "tree_oid": frozen.tree_oid,
+        "policy_digest": frozen.policy_digest,
+        "candidate_expires_at": spec.expires_at,
+        "promotion_contract_digest": promotion_contract_digest,
+        "changed_paths": {
+            "count": len(changed_paths),
+            "sha256": _bestplan_changed_paths_digest(changed_paths),
+        },
+        "controller": {
+            "id": frozen.controller_id,
+            "repository_id": frozen.controller_repository_id,
+            "release_oid": frozen.controller_release_oid,
+            "artifact_sha256": frozen.controller_artifact_sha256,
+        },
+        "admitted": {
+            "requests": frozen.admitted_requests,
+            "input_tokens": frozen.admitted_input_tokens,
+            "output_tokens": frozen.admitted_output_tokens,
+        },
+        "worker_receipt": _bestplan_plain_json(frozen.raw_receipt),
+        "worker_receipt_sha256": frozen.raw_receipt_sha256,
+    }
+
+
+def _bestplan_candidate_projection(
+    *, frozen: object, manifest_slice_id: str, spec: object,
+) -> dict[str, Any]:
+    return {
+        "status": "frozen",
+        "manifest_slice_id": manifest_slice_id,
+        "slice_id": frozen.slice_id,
+        "candidate_id": frozen.candidate_id,
+        "attempt_id": frozen.attempt_id,
+        "commit_oid": frozen.commit_oid,
+        "tree_oid": frozen.tree_oid,
+        "candidate_ref": frozen.ref_name,
+        "policy_digest": frozen.policy_digest,
+        "candidate_expires_at": spec.expires_at,
+        "changed_path_count": len(frozen.changed_paths),
+        "changed_paths_sha256": _bestplan_changed_paths_digest(
+            frozen.changed_paths
+        ),
+        "summary": (
+            f"Host froze candidate {frozen.candidate_id} at "
+            f"{frozen.commit_oid}."
+        ),
+    }
+
+
+def _bestplan_candidate_ready_operation_id(
+    plan_id: str, promotion_contract_digest: str,
+) -> str:
+    raw = hashlib.sha256(
+        b"hermes.bestplan.candidate-ready-operation.v1\0"
+        + plan_id.encode("utf-8")
+        + b"\0"
+        + promotion_contract_digest.encode("ascii")
+    ).digest()[:16]
+    return str(uuid.UUID(bytes=raw, version=4))
+
+
+def _persist_bestplan_candidates_ready(
+    *,
+    state_db_path: Path,
+    plan_id: str,
+    promotion_contract: Mapping[str, Any],
+    promotion_contract_digest: str,
+    completed: list[tuple[object, object, str]],
+    projected_results: list[dict[str, Any]],
+) -> None:
+    from agent.bestplan_proof import ProofLedger
+    from agent.bestplan_state import BestplanStore, PlanState
+
+    store = BestplanStore(db_path=state_db_path)
+    try:
+        ledger = ProofLedger(store)
+        for frozen, spec, manifest_slice_id in completed:
+            receipt = _bestplan_host_candidate_receipt(
+                frozen=frozen,
+                manifest_slice_id=manifest_slice_id,
+                spec=spec,
+                promotion_contract_digest=promotion_contract_digest,
+            )
+            ledger.record_candidate(
+                plan_id=plan_id,
+                candidate_id=frozen.candidate_id,
+                slice_id=frozen.slice_id,
+                attempt_id=frozen.attempt_id,
+                commit_oid=frozen.commit_oid,
+                tree_oid=frozen.tree_oid,
+                raw_receipt=receipt,
+            )
+        enrollment = promotion_contract.get("enrollment")
+        authority_epoch = (
+            enrollment.get("epoch") if isinstance(enrollment, Mapping) else None
+        )
+        if not isinstance(authority_epoch, str) or not authority_epoch:
+            raise BestplanCandidateBatchError("candidate batch failed")
+        ledger.append_event(
+            plan_id=plan_id,
+            authority_epoch=authority_epoch,
+            operation_id=_bestplan_candidate_ready_operation_id(
+                plan_id, promotion_contract_digest,
+            ),
+            expected_epoch=None,
+            expected_seq=0,
+            expected_hash=None,
+            kind="candidate_ready",
+            phase="candidate_ready",
+            projected_state=PlanState.RUNNING,
+            integration_oid=None,
+            artifact_digest=None,
+            origin="promoter",
+            raw_output={
+                "status": "candidate_ready",
+                "candidates": projected_results,
+            },
+            output_source="promoter",
+            contract_digest=promotion_contract_digest,
+        )
+    except BestplanCandidateBatchError:
+        raise
+    except BaseException:
+        raise BestplanCandidateBatchError("candidate batch failed") from None
+    finally:
+        store.close()
 
 
 def dispatch_bestplan_tasks_async(
@@ -5405,10 +6132,49 @@ def dispatch_bestplan_tasks_async(
     plan_id: str,
     workspace: str,
     resolved_runtimes: List[Dict[str, Any]],
+    execution_protocol: int = 1,
+    source_snapshot: object | None = None,
+    approval_digest: str = "",
+    promotion_contract: Mapping[str, Any] | None = None,
+    promotion_contract_digest: str = "",
+    promotion_mode: str | None = None,
+    candidate_host_runtime: BestplanHostRuntime | None = None,
+    authority_client: object | None = None,
+    state_db_path: str | Path | None = None,
 ) -> Dict[str, Any]:
-    """Admit strict BestPlan workers only on a versioned delivery host."""
-    from agent.bestplan_sandbox import create_bestplan_sandbox_launch
+    """Admit one bounded async batch of independent Task 4 candidates."""
+    from agent.bestplan_candidates import run_and_freeze_candidate
     from tools.async_delegation import dispatch_async_delegation_batch
+
+    if source_snapshot is None:
+        return {"status": "rejected", "error": "source_snapshot_required"}
+    if candidate_host_runtime is None or authority_client is None or state_db_path is None:
+        return {"status": "rejected", "error": "candidate_runtime_unavailable"}
+    if type(execution_protocol) is not int or execution_protocol not in {1, 2}:
+        return {"status": "rejected", "error": "candidate_protocol_invalid"}
+    if execution_protocol == 2:
+        if not isinstance(promotion_contract, Mapping):
+            return {"status": "rejected", "error": "candidate_contract_invalid"}
+        if not re.fullmatch(r"[0-9a-f]{64}", promotion_contract_digest or ""):
+            return {"status": "rejected", "error": "candidate_contract_invalid"}
+        if promotion_mode not in {"candidate_only", "auto_live"}:
+            return {"status": "rejected", "error": "candidate_contract_invalid"}
+    try:
+        prepared = _preflight_bestplan_candidates(
+            tasks=tasks,
+            resolved_runtimes=resolved_runtimes,
+            plan_id=plan_id,
+            workspace=workspace,
+            source_snapshot=source_snapshot,
+            candidate_host_runtime=candidate_host_runtime,
+            promotion_contract=promotion_contract,
+        )
+        durable_state_path = Path(state_db_path).expanduser().resolve()
+    except _BestplanPreflightError as exc:
+        return {"status": "rejected", "error": exc.code}
+    except Exception:
+        logger.warning("strict BestPlan preflight failed", exc_info=True)
+        return {"status": "rejected", "error": "candidate_preflight_failed"}
     try:
         from gateway.session_context import get_delivery_context_identity
 
@@ -5422,86 +6188,142 @@ def dispatch_bestplan_tasks_async(
         }
     if len(tasks) != len(resolved_runtimes):
         return {"status": "rejected", "error": "BestPlan task/runtime count mismatch"}
-    try:
-        sandbox = _bestplan_sandbox_workspace(workspace, plan_id)
-        launches = []
-        for index, (task, runtime) in enumerate(zip(tasks, resolved_runtimes)):
-            expected_identity = _bestplan_runtime_identity(task, runtime)
-            if runtime.get("runtime_fingerprint") != expected_identity["runtime_fingerprint"]:
-                raise ValueError(f"BestPlan runtime fingerprint mismatch for slice {index}")
-            runtime_dir = sandbox / ".bestplan-runtime" / f"slice-{index}"
-            launch = create_bestplan_sandbox_launch(
-                workspace=sandbox,
-                allowed_paths=task.get("_bestplan_leases") or [],
-                read_only=bool(task.get("_bestplan_read_only")),
-                runtime_dir=runtime_dir,
+
+    cancellation = threading.Event()
+    async_runtime_metadata: list[dict[str, Any]] = []
+    for item, runtime_value in zip(prepared, resolved_runtimes):
+        projected_runtime = _nonsecret_runtime_value(runtime_value)
+        if not isinstance(projected_runtime, dict):
+            return {"status": "rejected", "error": "candidate_runtime_unavailable"}
+        if execution_protocol == 2:
+            candidate_toolsets = list(item["spec"].toolsets)
+            projected_runtime.pop("runtime_identity", None)
+            projected_runtime["toolsets"] = candidate_toolsets
+            projected_runtime["bestplan_toolsets"] = list(candidate_toolsets)
+        async_runtime_metadata.append(projected_runtime)
+
+    def runner() -> Dict[str, Any]:
+        count = len(prepared)
+        maximum = min(count, max(1, int(_get_max_concurrent_children())))
+        slots: list[tuple[object, object, str] | None] = [None] * count
+        first_failure: BaseException | None = None
+
+        def run_one(item: dict[str, Any]) -> tuple[object, object, str]:
+            if cancellation.is_set():
+                raise BestplanCandidateBatchError("candidate batch failed")
+            expires_at = math.ceil(
+                time.time() + candidate_host_runtime.capability_ttl_seconds
             )
-            if launch.policy_digest != runtime.get("sandbox_policy_digest"):
-                launch.close()
-                raise ValueError(f"BestPlan sandbox policy changed for slice {index}")
-            launches.append(launch)
+            spec = replace(item["spec"], expires_at=expires_at)
+            frozen = run_and_freeze_candidate(
+                snapshot=source_snapshot,
+                spec=spec,
+                attempts_root=candidate_host_runtime.attempts_root,
+                controller_source=candidate_host_runtime.controller_source,
+                controller_python=candidate_host_runtime.controller_python,
+                runtime_read_paths=candidate_host_runtime.runtime_read_paths,
+                expected_controller=candidate_host_runtime.controller,
+                authority_client=authority_client,
+                timeout_seconds=candidate_host_runtime.timeout_seconds,
+                attempt_id=item["attempt_id"],
+                cancel_event=cancellation,
+            )
+            _validate_bestplan_frozen_candidate(
+                frozen,
+                spec=spec,
+                attempt_id=item["attempt_id"],
+                runtime=candidate_host_runtime,
+            )
+            return frozen, spec, item["manifest_slice_id"]
 
-        def runner() -> Dict[str, Any]:
-            results = []
-            try:
-                for index, (launch, task, runtime) in enumerate(
-                    zip(launches, tasks, resolved_runtimes)
-                ):
-                    runtime_dir = sandbox / ".bestplan-runtime" / f"slice-{index}"
-                    payload = {
-                        "goal": str(task.get("goal") or ""),
-                        "workspace": str(sandbox),
-                        "runtime_home": str(runtime_dir),
-                        "runtime": dict(runtime),
-                        "task_id": f"{dispatch_id}-{index}",
-                    }
-                    env = dict(os.environ)
-                    env["PYTHONPATH"] = os.pathsep.join(
-                        part for part in (str(Path(__file__).resolve().parent.parent), env.get("PYTHONPATH", "")) if part
-                    )
-                    process = launch.popen(
-                        [sys.executable, "-m", "agent.bestplan_worker"],
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        env=env,
-                        start_new_session=True,
-                    )
-                    stdout, stderr = process.communicate(json.dumps(payload), timeout=_get_child_timeout() or None)
-                    marker = "HERMES_BESTPLAN_RESULT="
-                    line = next((item for item in reversed(stdout.splitlines()) if item.startswith(marker)), "")
-                    if line:
-                        results.append(json.loads(line[len(marker):]))
-                    else:
-                        results.append({"status": "error", "summary": "", "error": stderr[-1000:]})
-            finally:
-                for launch in launches:
-                    launch.close()
-            return {"results": results}
+        if cancellation.is_set():
+            raise BestplanCandidateBatchError("candidate batch failed")
+        executor = ThreadPoolExecutor(
+            max_workers=maximum,
+            thread_name_prefix="bestplan-candidate",
+        )
+        futures: dict[object, int] = {}
+        next_position = 0
+        try:
+            while next_position < maximum:
+                future = executor.submit(run_one, prepared[next_position])
+                futures[future] = next_position
+                next_position += 1
+            while futures:
+                done, _pending = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                successes: list[tuple[int, tuple[object, object, str]]] = []
+                for future in done:
+                    position = futures.pop(future)
+                    try:
+                        successes.append((position, future.result()))
+                    except BaseException as exc:
+                        if first_failure is None:
+                            first_failure = exc
+                if first_failure is not None or cancellation.is_set():
+                    cancellation.set()
+                    for future in futures:
+                        future.cancel()
+                    continue
+                for position, completed in successes:
+                    slots[position] = completed
+                while next_position < count and len(futures) < maximum:
+                    future = executor.submit(run_one, prepared[next_position])
+                    futures[future] = next_position
+                    next_position += 1
+        finally:
+            if first_failure is not None or cancellation.is_set():
+                cancellation.set()
+                for future in futures:
+                    future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+        if first_failure is not None or cancellation.is_set() or any(
+            item is None for item in slots
+        ):
+            raise BestplanCandidateBatchError("candidate batch failed") from None
+        completed = [item for item in slots if item is not None]
+        projected = [
+            _bestplan_candidate_projection(
+                frozen=frozen,
+                spec=spec,
+                manifest_slice_id=manifest_slice_id,
+            )
+            for frozen, spec, manifest_slice_id in completed
+        ]
+        if execution_protocol == 2:
+            _persist_bestplan_candidates_ready(
+                state_db_path=durable_state_path,
+                plan_id=plan_id,
+                promotion_contract=promotion_contract,
+                promotion_contract_digest=promotion_contract_digest,
+                completed=completed,
+                projected_results=projected,
+            )
+        return {"results": projected}
 
+    try:
         result = dispatch_async_delegation_batch(
             goals=[str(task.get("goal") or "") for task in tasks],
-            context="OS-sandboxed BestPlan execution",
+            context="Isolated BestPlan candidate execution",
             toolsets=None,
             role="leaf",
             model=str(resolved_runtimes[0].get("model") or "") if resolved_runtimes else "",
             session_key=str(identity.get("session_key") or ""),
             parent_session_id=str(identity.get("session_id") or ""),
             origin_ui_session_id=str(identity.get("ui_session_id") or ""),
+            interrupt_fn=cancellation.set,
             runner=runner,
             max_async_children=_get_max_async_children(),
             delegation_id=dispatch_id,
             origin_profile=str(identity.get("profile") or ""),
             origin_tracker_path=str(identity.get("tracker_path") or ""),
             bestplan_plan_id=plan_id,
-            resolved_runtimes=[_nonsecret_runtime_value(runtime) for runtime in resolved_runtimes],
+            bestplan_state_db_path=str(durable_state_path),
+            resolved_runtimes=async_runtime_metadata,
         )
-        result["sandbox_workspace"] = str(sandbox)
         return result
     except Exception as exc:
         logger.warning("strict BestPlan dispatch rejected before acceptance", exc_info=True)
-        return {"status": "rejected", "error": f"{type(exc).__name__}: {exc}"}
+        return {"status": "rejected", "error": "candidate_dispatch_unavailable"}
 
 
 # ---------------------------------------------------------------------------

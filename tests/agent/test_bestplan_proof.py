@@ -278,6 +278,60 @@ def _insert_v1_plan(
     )
 
 
+def _task5_go_context(tmp_path: Path, monkeypatch) -> dict[str, object]:
+    """Supply the retained host bindings that protocol 2 now requires."""
+    from tools import delegate_tool
+
+    runtime = delegate_tool.BestplanHostRuntime(
+        controller=_enrollment().controller,
+        controller_source=tmp_path / "retained-controller",
+        controller_python=tmp_path / "retained-python" / "bin" / "python3.11",
+        runtime_read_paths=(),
+        attempts_root=tmp_path / "attempts",
+        policy_version=1,
+        request_budget=4,
+        token_budget=8192,
+        max_iterations=8,
+        max_output_tokens=1024,
+        timeout_seconds=10,
+        capability_ttl_seconds=60,
+    )
+    # These tests characterize proof/status/redaction behavior.  The real retained
+    # artifact and interpreter relationship is exercised by the Task 5 host-ingress
+    # tests, so keep this fixture focused on the mandatory handoff shape.
+    monkeypatch.setattr(
+        delegate_tool,
+        "_validate_bestplan_host_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    return {
+        "candidate_host_runtime": runtime,
+        "authority_client": object(),
+    }
+
+
+def _v2_runtime() -> dict[str, object]:
+    return {
+        "route": "code_worker",
+        "provider": "test",
+        "model": "coder",
+        "runtime_fingerprint": "f" * 64,
+    }
+
+
+def _task5_stored_runtime(go_context: dict[str, object]) -> dict[str, object]:
+    from tools import delegate_tool
+
+    return {
+        **_v2_runtime(),
+        "toolsets": ["file"],
+        "bestplan_toolsets": ["file"],
+        **delegate_tool._bestplan_host_runtime_projection(
+            go_context["candidate_host_runtime"]
+        ),
+    }
+
+
 def _operation(number: int) -> str:
     return str(uuid.UUID(int=number))
 
@@ -422,6 +476,29 @@ def test_operation_retry_is_idempotent_before_head_check_and_conflicts_on_reuse(
     assert _append(ledger) == first
     with pytest.raises(proof.ProofOperationConflict):
         _append(ledger, raw_output={"status": "different"})
+    assert len(ledger.read_events("bp_proof")) == 1
+
+
+def test_candidate_ready_clock_timestamp_retry_reuses_stored_event_time(
+    tmp_path, monkeypatch,
+):
+    proof = _proof()
+    store = _store(tmp_path / "state.db")
+    _insert_v2_plan(store)
+    ledger = proof.ProofLedger(store)
+
+    first = _append(ledger, created_at_ns=None)
+    monkeypatch.setattr(
+        proof.time,
+        "time_ns",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("an exact authority retry must reuse its stored timestamp")
+        ),
+    )
+
+    assert _append(ledger, created_at_ns=None) == first
+    with pytest.raises(proof.ProofOperationConflict):
+        _append(ledger, created_at_ns=first.created_at_ns + 1)
     assert len(ledger.read_events("bp_proof")) == 1
 
 
@@ -1066,6 +1143,7 @@ def test_v2_go_success_returns_only_host_owned_dispatch_identity(
     store = _store(tmp_path / "go-success.db")
     row = _insert_v2_plan(store, state=PlanState.PENDING)
     secret = "opaque-broker-delegation-identity"
+    go_context = _task5_go_context(tmp_path, monkeypatch)
     monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
 
     result = try_resolve_go(
@@ -1077,12 +1155,13 @@ def test_v2_go_success_returns_only_host_owned_dispatch_identity(
         parent_agent=object(),
         config={"autonomy": {"go_enabled": True}},
         store=store,
-        runtime_resolver=lambda *_: [],
+        runtime_resolver=lambda *_: [_v2_runtime()],
         strict_dispatcher=lambda **_: {
             "status": "dispatched",
             "delegation_id": secret,
             "sandbox_workspace": f"/tmp/{secret}",
         },
+        **go_context,
     )
 
     assert result.status == "waiting"
@@ -1107,6 +1186,7 @@ def test_v2_go_persists_only_allowlisted_runtime_identity(
     row = _insert_v2_plan(store, state=PlanState.PENDING)
     secret = "unrecognized-runtime-secret-sentinel"
     dispatch_inputs = []
+    go_context = _task5_go_context(tmp_path, monkeypatch)
     monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
 
     def dispatch(**kwargs):
@@ -1137,16 +1217,24 @@ def test_v2_go_persists_only_allowlisted_runtime_identity(
             }
         ],
         strict_dispatcher=dispatch,
+        **go_context,
     )
 
     assert result.status == "waiting"
     persisted = json.loads(store.get_plan("bp_proof")["resolved_runtime_json"])
+    from tools import delegate_tool
+
     assert persisted == [
         {
             "model": "coder",
             "provider": "test",
             "route": "code_worker",
             "runtime_fingerprint": "f" * 64,
+            "toolsets": ["file"],
+            "bestplan_toolsets": ["file"],
+            **delegate_tool._bestplan_host_runtime_projection(
+                go_context["candidate_host_runtime"]
+            ),
         }
     ]
     sinks = (
@@ -1176,6 +1264,7 @@ def test_v2_go_rejects_unsupported_allowlisted_runtime_identity(
 ):
     store = _store(tmp_path / "go-invalid-runtime.db")
     row = _insert_v2_plan(store, state=PlanState.PENDING)
+    go_context = _task5_go_context(tmp_path, monkeypatch)
     monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
 
     result = try_resolve_go(
@@ -1188,6 +1277,7 @@ def test_v2_go_rejects_unsupported_allowlisted_runtime_identity(
         config={"autonomy": {"go_enabled": True}},
         store=store,
         runtime_resolver=lambda *_: [invalid_runtime],
+        **go_context,
     )
 
     assert result.status == "lane_unavailable"
@@ -1245,6 +1335,7 @@ def test_v2_go_returns_only_constant_codes_for_raw_broker_failures(
     proof = _proof()
     store = _store(tmp_path / f"{expected_status}.db")
     row = _insert_v2_plan(store, state=PlanState.PENDING)
+    go_context = _task5_go_context(tmp_path, monkeypatch)
     monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
 
     def dispatch(**_kwargs):
@@ -1261,8 +1352,9 @@ def test_v2_go_returns_only_constant_codes_for_raw_broker_failures(
         parent_agent=object(),
         config={"autonomy": {"go_enabled": True}},
         store=store,
-        runtime_resolver=lambda *_: [],
+        runtime_resolver=lambda *_: [_v2_runtime()],
         strict_dispatcher=dispatch,
+        **go_context,
     )
     assert result.status == expected_status
     assert result.reason == expected_code
@@ -1300,6 +1392,7 @@ def test_v2_go_internal_failures_return_only_stable_codes(
     store = _store(tmp_path / f"{failure_stage}.db")
     row = _insert_v2_plan(store, state=PlanState.PENDING)
     sentinel = f"opaque-{failure_stage}-internal-value"
+    go_context = _task5_go_context(tmp_path, monkeypatch)
 
     def fail(*_args, **_kwargs):
         raise RuntimeError(sentinel)
@@ -1312,7 +1405,7 @@ def test_v2_go_internal_failures_return_only_stable_codes(
         claimed = store.prepare_dispatch_intent(
             "bp_proof",
             row["baseline_fingerprint"],
-            resolved_runtimes=[],
+            resolved_runtimes=[_task5_stored_runtime(go_context)],
             session_id="session",
             profile="coder",
             workspace=row["workspace"],
@@ -1330,6 +1423,7 @@ def test_v2_go_internal_failures_return_only_stable_codes(
         config={"autonomy": {"go_enabled": True}},
         store=store,
         runtime_resolver=fail,
+        **go_context,
     )
 
     assert result.status == expected_status
@@ -1367,6 +1461,9 @@ def test_v1_go_runtime_failure_retains_legacy_error_text(tmp_path, monkeypatch):
         config={"autonomy": {"go_enabled": True}},
         store=store,
         runtime_resolver=fail,
+        strict_dispatcher=lambda **_kwargs: pytest.fail(
+            "runtime failure must happen before dispatch"
+        ),
     )
 
     assert result.status == "lane_unavailable"

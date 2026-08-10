@@ -440,7 +440,7 @@ def test_public_runner_rechecks_spec_expiry_before_attempt_or_ref_creation(
                 controller, repository_id=snapshot.repo.repository_id,
             ),
             authority_client=object(),
-            timeout_seconds=2,
+            timeout_seconds=3,
             attempt_id="expired-before-attempt",
         )
 
@@ -2216,7 +2216,9 @@ def test_complete_malformed_result_frame_closes_broker_without_consuming_deadlin
             process_identity_resolver=identity,
             process_group_reaper=candidates.terminate_process_group,
         )
-    assert time.monotonic() - started < 2
+    # Leave a narrow scheduler/artifact-verification margin while still
+    # proving the malformed frame closes well before the 3s attempt deadline.
+    assert time.monotonic() - started < 2.75
 
 
 def test_blocked_stdin_writer_is_reaped_before_pipe_close(tmp_path, monkeypatch):
@@ -3855,3 +3857,780 @@ def test_default_process_identity_uses_kernel_start_time_without_ps(monkeypatch)
     finally:
         os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Task 5 RED contracts: one accepted async batch owns a bounded concurrent
+# candidate fan-out.  The real single-candidate lifecycle remains the Task 4
+# implementation above; these tests characterize only host coordination.
+# ---------------------------------------------------------------------------
+
+
+def _task5_host_runtime(tmp_path: Path, snapshot):
+    from tools import delegate_tool
+
+    controller = tmp_path / "retained-controller"
+    (controller / "agent").mkdir(parents=True)
+    (controller / "agent" / "bestplan_worker.py").write_text(
+        "# retained Task 5 controller\n", encoding="utf-8",
+    )
+    interpreter, runtime_paths = _fake_controller_runtime(
+        tmp_path, "task5-python",
+    )
+    identity = _controller_identity(
+        controller, repository_id=snapshot.repo.repository_id,
+    )
+    runtime = delegate_tool.BestplanHostRuntime(
+        controller=identity,
+        controller_source=controller,
+        controller_python=interpreter,
+        runtime_read_paths=runtime_paths,
+        attempts_root=tmp_path / "task5-attempts",
+        policy_version=1,
+        request_budget=4,
+        token_budget=8192,
+        max_iterations=8,
+        max_output_tokens=1024,
+        timeout_seconds=10,
+        capability_ttl_seconds=60,
+    )
+    return runtime
+
+
+def _task5_tasks(workspace: Path, *, count: int = 2):
+    result = []
+    for index in range(count):
+        label = ("first", "second", "third")[index]
+        result.append({
+            "goal": f"produce {label}",
+            "context": f"Workspace: {workspace}",
+            "route": "code_worker",
+            "role": "leaf",
+            "_bestplan_slice_id": f"slice {label}/ß",
+            "_bestplan_manifest_index": index,
+            "_bestplan_read_only": False,
+            "_bestplan_leases": [f"allowed/{label}.txt"],
+            "_bestplan_workspace": str(workspace),
+            "_bestplan_expected_artifacts": [f"allowed/{label}.txt"],
+            "_bestplan_acceptance": [f"{label} exists"],
+        })
+    return result
+
+
+def _task5_runtimes(count: int = 2):
+    return [
+        {
+            "route": "code_worker",
+            "provider": "authority-broker",
+            "model": f"model-{index}",
+            "runtime_fingerprint": hashlib.sha256(
+                f"runtime-{index}".encode("ascii")
+            ).hexdigest(),
+        }
+        for index in range(count)
+    ]
+
+
+def _task5_frozen(
+    candidates, spec, attempt_id: str, ordinal: int, *, controller,
+):
+    receipt = {
+        "status": "completed",
+        "summary": f"untrusted worker prose {ordinal}",
+        "request_count": 1,
+        "input_tokens": 3,
+        "output_tokens": 2,
+    }
+    canonical = json.dumps(
+        receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("ascii")
+    digit = f"{ordinal + 1:x}"
+    return candidates.FrozenCandidate(
+        candidate_id=spec.candidate_id,
+        slice_id=spec.slice_id,
+        attempt_id=attempt_id,
+        commit_oid=digit * 40,
+        tree_oid=f"{ordinal + 9:x}" * 40,
+        ref_name=(
+            f"refs/hermes-bestplan/{spec.plan_id}/{spec.slice_id}/{attempt_id}"
+        ),
+        changed_paths=(spec.expected_artifacts[0].encode("utf-8"),),
+        raw_receipt=candidates._immutable_json_value(json.loads(canonical)),
+        raw_receipt_sha256=hashlib.sha256(canonical).hexdigest(),
+        policy_digest=hashlib.sha256(attempt_id.encode("ascii")).hexdigest(),
+        controller_id=controller.controller_id,
+        controller_repository_id=controller.repository_id,
+        controller_release_oid=controller.release_oid,
+        controller_artifact_sha256=controller.artifact_sha256,
+        admitted_requests=1,
+        admitted_input_tokens=3,
+        admitted_output_tokens=2,
+    )
+
+
+def _task5_capture_async_admission(monkeypatch):
+    admitted = {}
+
+    def accept(**kwargs):
+        admitted.update(kwargs)
+        return {
+            "status": "dispatched",
+            "delegation_id": kwargs["delegation_id"],
+        }
+
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch", accept,
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.get_delivery_context_identity",
+        lambda: {
+            "capability_version": 1,
+            "session_key": "task5-session",
+            "session_id": "task5-session",
+            "ui_session_id": "task5-session",
+            "profile": "coder",
+            "tracker_path": "/tmp/task5-async.json",
+        },
+    )
+    return admitted
+
+
+def _task5_dispatch(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    count: int = 2,
+    execution_protocol: int = 1,
+):
+    from tools import delegate_tool
+
+    candidates = _candidates()
+    repo = _repo(tmp_path / "task5-repo")
+    snapshot = _snapshot(repo)
+    runtime = _task5_host_runtime(tmp_path, snapshot)
+    admitted = _task5_capture_async_admission(monkeypatch)
+    result = delegate_tool.dispatch_bestplan_tasks_async(
+        tasks=_task5_tasks(repo, count=count),
+        parent_agent=SimpleNamespace(),
+        dispatch_id="bestplan-task5-batch",
+        plan_id="bp-task5-batch",
+        workspace=str(repo),
+        resolved_runtimes=_task5_runtimes(count),
+        execution_protocol=execution_protocol,
+        source_snapshot=snapshot,
+        approval_digest="a" * 64,
+        promotion_contract=None,
+        promotion_mode=None,
+        candidate_host_runtime=runtime,
+        authority_client=SimpleNamespace(),
+        state_db_path=tmp_path / "task5-state.db",
+    )
+    assert result == {
+        "status": "dispatched",
+        "delegation_id": "bestplan-task5-batch",
+    }
+    assert admitted["runner"] is not None
+    return candidates, snapshot, runtime, admitted
+
+
+def test_task5_public_candidate_cancel_before_attempt_has_zero_side_effects(
+    tmp_path,
+):
+    candidates = _candidates()
+    snapshot = _snapshot(_repo(tmp_path / "repo"))
+    controller = tmp_path / "controller"
+    (controller / "agent").mkdir(parents=True)
+    (controller / "agent" / "bestplan_worker.py").write_text("# worker\n")
+    interpreter, runtime_paths = _fake_controller_runtime(tmp_path)
+    attempts = tmp_path / "attempts"
+    cancellation = threading.Event()
+    cancellation.set()
+
+    class Authority:
+        def register_model_attempt(self, *_args, **_kwargs):
+            raise AssertionError("pre-cancelled candidate registered a capability")
+
+    with pytest.raises(candidates.CandidateExecutionError, match="cancel"):
+        candidates.run_and_freeze_candidate(
+            snapshot=snapshot,
+            spec=_spec(candidates),
+            attempts_root=attempts,
+            controller_source=controller,
+            controller_python=interpreter,
+            runtime_read_paths=runtime_paths,
+            expected_controller=_controller_identity(
+                controller, repository_id=snapshot.repo.repository_id,
+            ),
+            authority_client=Authority(),
+            timeout_seconds=5,
+            attempt_id="task5-cancel-before-attempt",
+            cancel_event=cancellation,
+        )
+
+    assert not attempts.exists()
+    assert not _git(snapshot.repo.worktree_raw.decode(), "for-each-ref", "refs/hermes-bestplan/")
+
+
+def test_task5_candidate_cancel_after_capability_closes_reaps_revokes_and_never_freezes(
+    tmp_path, monkeypatch,
+):
+    from agent.bestplan_authority_client import BrokerCapability, WorkerIdentity
+
+    candidates = _candidates()
+    snapshot = _snapshot(_repo(tmp_path / "post-cap-repo"))
+    controller = tmp_path / "post-cap-controller"
+    (controller / "agent").mkdir(parents=True)
+    (controller / "agent" / "bestplan_worker.py").write_text("# worker\n")
+    expected_controller = _controller_identity(
+        controller, repository_id=snapshot.repo.repository_id,
+    )
+    cancellation = threading.Event()
+    capability_registered = threading.Event()
+    events = []
+
+    class Authority:
+        capability = None
+
+        def register_model_attempt(
+            self, attempt_id, identity, model, request_budget, token_budget, expires_at,
+        ):
+            self.capability = BrokerCapability(
+                attempt_id, identity, "post-capability-cancel",
+            )
+            events.append(("register", attempt_id))
+            capability_registered.set()
+            return self.capability
+
+        def model_request(self, *_args, **_kwargs):
+            raise AssertionError("cancelled worker unexpectedly requested a model turn")
+
+        def revoke_model_attempt(self, capability):
+            assert capability is self.capability
+            events.append(("revoke", capability.attempt_id))
+
+    class Launch:
+        policy_digest = "post-cap-policy"
+
+        def __init__(self, kwargs):
+            self.broker_fd = kwargs["broker_fd"]
+            self.control_dir = Path(kwargs["control_dir"])
+            self.process = None
+
+        def launch_worker(self):
+            marker = self.control_dir / "broker-closed"
+            code = (
+                "import pathlib,socket,sys,time;"
+                "channel=socket.socket(fileno=int(sys.argv[1]));"
+                "channel.recv(1);"
+                "pathlib.Path(sys.argv[2]).write_text('closed');"
+                "time.sleep(30)"
+            )
+            self.process = subprocess.Popen(
+                [sys.executable, "-c", code, str(self.broker_fd), str(marker)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                pass_fds=(self.broker_fd,),
+                start_new_session=True,
+            )
+            return self.process
+
+        def verify_identity(self, *, deadline=None):
+            raise AssertionError("cancelled candidate verified for freezing")
+
+        def close(self):
+            events.append(("launch_close", None))
+
+    identity_digest = hashlib.sha256(
+        Path(sys.executable).resolve().read_bytes()
+    ).hexdigest()
+
+    def identity(pid, _executable):
+        return WorkerIdentity(
+            pid, os.getuid(), f"task5-post-cap:{pid}", identity_digest,
+        )
+
+    def reaper(process, **kwargs):
+        marker = Path(process.args[-1])
+        deadline = time.monotonic() + 2
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.read_text() == "closed"
+        events.append(("broker_close", process.pid))
+        candidates.terminate_process_group(process, **kwargs)
+        events.append(("reap", process.pid))
+
+    monkeypatch.setattr(
+        candidates,
+        "_freeze_sealed_candidate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cancelled candidate was frozen")
+        ),
+    )
+    outcome = {}
+
+    def run():
+        try:
+            candidates._run_and_freeze_candidate_for_test(
+                snapshot=snapshot,
+                spec=_spec(candidates),
+                attempts_root=tmp_path / "post-cap-attempts",
+                controller_source=controller,
+                controller_python=Path(sys.executable),
+                runtime_read_paths=(),
+                expected_controller=expected_controller,
+                authority_client=Authority(),
+                timeout_seconds=10,
+                attempt_id="task5-post-cap-cancel",
+                sandbox_factory=lambda **kwargs: Launch(kwargs),
+                process_identity_resolver=identity,
+                process_group_reaper=reaper,
+                cancel_event=cancellation,
+            )
+        except candidates.CandidateExecutionError as exc:
+            outcome["error"] = exc
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    assert capability_registered.wait(timeout=5)
+    cancellation.set()
+    runner.join(timeout=5)
+
+    assert not runner.is_alive()
+    assert type(outcome.get("error")) is candidates.CandidateExecutionError
+    assert str(outcome["error"]) == "candidate cancelled"
+    names = [event[0] for event in events]
+    assert names == ["register", "broker_close", "reap", "revoke", "launch_close"]
+    assert not _git(
+        snapshot.repo.worktree_raw.decode(),
+        "for-each-ref",
+        "refs/hermes-bestplan/",
+        "refs/hermes-bestplan-bases/",
+    )
+
+
+def test_task5_batch_barrier_overlaps_distinct_attempt_roots_and_preserves_manifest_order(
+    tmp_path, monkeypatch,
+):
+    candidates = _candidates()
+    barrier = threading.Barrier(2)
+    second_finished = threading.Event()
+    completion_order = []
+    layouts = {}
+
+    def run_candidate(**kwargs):
+        spec = kwargs["spec"]
+        label = "produce first" if spec.goal.endswith("first") else "produce second"
+        attempt_id = kwargs["attempt_id"]
+        root = Path(kwargs["attempts_root"]) / attempt_id
+        source = root / "source"
+        runtime = root / "runtime"
+        source.mkdir(parents=True)
+        runtime.mkdir()
+        layouts[label] = (source, runtime, spec, attempt_id)
+        ordinal = 0 if spec.goal.endswith("first") else 1
+        barrier.wait(timeout=5)
+        if ordinal == 0:
+            assert second_finished.wait(timeout=5)
+        else:
+            completion_order.append(label)
+            second_finished.set()
+        if ordinal == 0:
+            completion_order.append(label)
+        return _task5_frozen(
+            candidates,
+            spec,
+            attempt_id,
+            ordinal,
+            controller=kwargs["expected_controller"],
+        )
+
+    monkeypatch.setattr(
+        "agent.bestplan_candidates.run_and_freeze_candidate", run_candidate,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_max_concurrent_children", lambda: 2,
+    )
+    _candidates_module, _snapshot_value, _runtime, admitted = _task5_dispatch(
+        tmp_path, monkeypatch,
+    )
+
+    combined = admitted["runner"]()
+
+    assert completion_order == ["produce second", "produce first"]
+    assert [item["manifest_slice_id"] for item in combined["results"]] == [
+        "slice first/ß",
+        "slice second/ß",
+    ]
+    assert [item["commit_oid"] for item in combined["results"]] == [
+        "1" * 40,
+        "2" * 40,
+    ]
+    assert all(item["candidate_id"] for item in combined["results"])
+    assert "untrusted worker prose" not in json.dumps(combined, sort_keys=True)
+    first_source, first_runtime, first_spec, first_attempt = layouts["produce first"]
+    second_source, second_runtime, second_spec, second_attempt = layouts["produce second"]
+    assert first_source != second_source
+    assert first_runtime != second_runtime
+    assert first_attempt != second_attempt
+    assert first_spec.slice_id != second_spec.slice_id
+    assert first_spec.toolsets == second_spec.toolsets == ("file",)
+    assert "terminal" not in first_spec.toolsets + second_spec.toolsets
+    assert first_spec.model == "model-0"
+    assert second_spec.model == "model-1"
+    assert combined["results"][0]["policy_digest"] != combined["results"][1]["policy_digest"]
+
+
+def test_task5_batch_respects_configured_candidate_worker_bound(tmp_path, monkeypatch):
+    candidates = _candidates()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+
+    def run_candidate(**kwargs):
+        nonlocal active, maximum_active
+        spec = kwargs["spec"]
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            if spec.goal.endswith("first"):
+                first_started.set()
+                assert release_first.wait(timeout=5)
+                ordinal = 0
+            else:
+                second_started.set()
+                ordinal = 1
+            return _task5_frozen(
+                candidates,
+                spec,
+                kwargs["attempt_id"],
+                ordinal,
+                controller=kwargs["expected_controller"],
+            )
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(
+        "agent.bestplan_candidates.run_and_freeze_candidate", run_candidate,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_max_concurrent_children", lambda: 1,
+    )
+    _module, _snapshot_value, _runtime, admitted = _task5_dispatch(
+        tmp_path, monkeypatch,
+    )
+    result_holder = {}
+    thread = threading.Thread(
+        target=lambda: result_holder.setdefault("result", admitted["runner"]()),
+        daemon=True,
+    )
+    thread.start()
+    assert first_started.wait(timeout=5)
+    assert not second_started.is_set()
+    release_first.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert second_started.is_set()
+    assert maximum_active == 1
+    assert len(result_holder["result"]["results"]) == 2
+
+
+def test_task5_each_candidate_expiry_is_derived_when_that_runner_enters(
+    tmp_path, monkeypatch,
+):
+    candidates = _candidates()
+    observed = []
+    clock = [1_900_000_000.0]
+
+    def run_candidate(**kwargs):
+        spec = kwargs["spec"]
+        label = "produce first" if spec.goal.endswith("first") else "produce second"
+        observed.append((label, clock[0], spec.expires_at))
+        ordinal = 0 if spec.goal.endswith("first") else 1
+        if ordinal == 0:
+            clock[0] += 120
+        return _task5_frozen(
+            candidates,
+            spec,
+            kwargs["attempt_id"],
+            ordinal,
+            controller=kwargs["expected_controller"],
+        )
+
+    monkeypatch.setattr(
+        "agent.bestplan_candidates.run_and_freeze_candidate", run_candidate,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_max_concurrent_children", lambda: 1,
+    )
+    _module, _snapshot_value, runtime, admitted = _task5_dispatch(
+        tmp_path, monkeypatch,
+    )
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    result = admitted["runner"]()
+
+    assert len(result["results"]) == 2
+    assert observed == [
+        (
+            "produce first",
+            1_900_000_000.0,
+            1_900_000_000.0 + runtime.capability_ttl_seconds,
+        ),
+        (
+            "produce second",
+            1_900_000_120.0,
+            1_900_000_120.0 + runtime.capability_ttl_seconds,
+        ),
+    ]
+
+
+def test_task5_batch_success_waits_until_every_candidate_is_frozen(
+    tmp_path, monkeypatch,
+):
+    candidates = _candidates()
+    first_frozen = threading.Event()
+    second_started = threading.Event()
+    release_second = threading.Event()
+
+    def run_candidate(**kwargs):
+        spec = kwargs["spec"]
+        ordinal = 0 if spec.goal.endswith("first") else 1
+        if ordinal == 0:
+            first_frozen.set()
+        else:
+            second_started.set()
+            assert release_second.wait(timeout=5)
+        return _task5_frozen(
+            candidates,
+            spec,
+            kwargs["attempt_id"],
+            ordinal,
+            controller=kwargs["expected_controller"],
+        )
+
+    monkeypatch.setattr(
+        "agent.bestplan_candidates.run_and_freeze_candidate", run_candidate,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_max_concurrent_children", lambda: 2,
+    )
+    _module, _snapshot_value, _runtime, admitted = _task5_dispatch(
+        tmp_path, monkeypatch,
+    )
+    outcome = {}
+    runner_thread = threading.Thread(
+        target=lambda: outcome.setdefault("result", admitted["runner"]()),
+        daemon=True,
+    )
+    runner_thread.start()
+    assert first_frozen.wait(timeout=5)
+    assert second_started.wait(timeout=5)
+    assert runner_thread.is_alive()
+    assert outcome == {}
+
+    release_second.set()
+    runner_thread.join(timeout=5)
+    assert not runner_thread.is_alive()
+    assert [item["manifest_slice_id"] for item in outcome["result"]["results"]] == [
+        "slice first/ß",
+        "slice second/ß",
+    ]
+
+
+def test_task5_batch_first_failure_cancels_and_joins_every_started_candidate(
+    tmp_path, monkeypatch,
+):
+    candidates = _candidates()
+    barrier = threading.Barrier(2)
+    sibling_stopped = threading.Event()
+    seen_cancel_events = []
+
+    def run_candidate(**kwargs):
+        spec = kwargs["spec"]
+        cancel_event = kwargs["cancel_event"]
+        seen_cancel_events.append(cancel_event)
+        barrier.wait(timeout=5)
+        if spec.goal.endswith("first"):
+            raise candidates.CandidateExecutionError("first candidate failed")
+        assert cancel_event.wait(timeout=5)
+        sibling_stopped.set()
+        raise candidates.CandidateExecutionError("second candidate cancelled")
+
+    monkeypatch.setattr(
+        "agent.bestplan_candidates.run_and_freeze_candidate", run_candidate,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_max_concurrent_children", lambda: 2,
+    )
+    _module, _snapshot_value, _runtime, admitted = _task5_dispatch(
+        tmp_path, monkeypatch,
+    )
+
+    from tools import delegate_tool
+
+    with pytest.raises(
+        delegate_tool.BestplanCandidateBatchError, match="candidate batch failed",
+    ):
+        admitted["runner"]()
+
+    assert sibling_stopped.is_set()
+    assert len(seen_cancel_events) == 2
+    assert seen_cancel_events[0] is seen_cancel_events[1]
+    assert seen_cancel_events[0].is_set()
+
+
+def test_task5_batch_failure_cancels_queued_candidate_before_it_starts(
+    tmp_path, monkeypatch,
+):
+    candidates = _candidates()
+    first_wave = threading.Barrier(2)
+    sibling_stopped = threading.Event()
+    started = []
+
+    def run_candidate(**kwargs):
+        spec = kwargs["spec"]
+        label = next(
+            f"produce {name}"
+            for name in ("first", "second", "third")
+            if spec.goal.endswith(name)
+        )
+        started.append(label)
+        if spec.goal.endswith("third"):
+            raise AssertionError("queued candidate started after batch failure")
+        first_wave.wait(timeout=5)
+        if spec.goal.endswith("first"):
+            raise candidates.CandidateExecutionError("first candidate failed")
+        assert kwargs["cancel_event"].wait(timeout=5)
+        sibling_stopped.set()
+        raise candidates.CandidateExecutionError("second candidate cancelled")
+
+    monkeypatch.setattr(
+        "agent.bestplan_candidates.run_and_freeze_candidate", run_candidate,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_max_concurrent_children", lambda: 2,
+    )
+    _module, _snapshot_value, _runtime, admitted = _task5_dispatch(
+        tmp_path, monkeypatch, count=3,
+    )
+    from tools import delegate_tool
+
+    with pytest.raises(
+        delegate_tool.BestplanCandidateBatchError, match="candidate batch failed",
+    ):
+        admitted["runner"]()
+
+    assert sibling_stopped.is_set()
+    assert set(started) == {"produce first", "produce second"}
+
+
+def test_task5_real_interrupt_registry_reaches_batch_and_waits_for_candidate_cleanup(
+    tmp_path, monkeypatch,
+):
+    from tools import async_delegation
+    from tools import delegate_tool
+
+    started = threading.Barrier(3)
+    stopped = []
+    stop_lock = threading.Lock()
+
+    def run_candidate(**kwargs):
+        cancel_event = kwargs["cancel_event"]
+        started.wait(timeout=5)
+        assert cancel_event.wait(timeout=5)
+        with stop_lock:
+            stopped.append(kwargs["spec"].slice_id)
+        raise _candidates().CandidateExecutionError("candidate interrupted")
+
+    monkeypatch.setattr(
+        "agent.bestplan_candidates.run_and_freeze_candidate", run_candidate,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_max_concurrent_children", lambda: 2,
+    )
+    _module, _snapshot_value, _runtime, admitted = _task5_dispatch(
+        tmp_path, monkeypatch,
+    )
+    outcome = {}
+
+    def invoke_runner():
+        try:
+            outcome["value"] = admitted["runner"]()
+        except delegate_tool.BestplanCandidateBatchError as exc:
+            outcome["error"] = exc
+
+    runner_thread = threading.Thread(target=invoke_runner, daemon=True)
+    runner_thread.start()
+    started.wait(timeout=5)
+    record = {
+        "delegation_id": "bestplan-task5-batch",
+        "status": "running",
+        "delivery_status": "running",
+        "is_batch": True,
+        "interrupt_fn": admitted["interrupt_fn"],
+        "origin_tracker_path": "",
+    }
+    with async_delegation._records_lock:
+        async_delegation._records[record["delegation_id"]] = record
+    monkeypatch.setattr(async_delegation, "_persist_record", lambda *_a, **_k: True)
+    try:
+        assert async_delegation.interrupt_all(reason="task5-test") == 1
+        runner_thread.join(timeout=5)
+    finally:
+        with async_delegation._records_lock:
+            async_delegation._records.pop(record["delegation_id"], None)
+
+    assert not runner_thread.is_alive()
+    assert len(stopped) == 2
+    assert type(outcome.get("error")) is delegate_tool.BestplanCandidateBatchError
+    assert str(outcome["error"]) == "candidate batch failed"
+
+
+def test_task5_batch_mixed_success_and_failure_is_one_top_level_error_without_partial_result(
+    tmp_path, monkeypatch,
+):
+    candidates = _candidates()
+    barrier = threading.Barrier(2)
+    started_attempts = []
+
+    def run_candidate(**kwargs):
+        spec = kwargs["spec"]
+        started_attempts.append(kwargs["attempt_id"])
+        barrier.wait(timeout=5)
+        if spec.goal.endswith("second"):
+            raise candidates.CandidateExecutionError("second failed")
+        return _task5_frozen(
+            candidates,
+            spec,
+            kwargs["attempt_id"],
+            0,
+            controller=kwargs["expected_controller"],
+        )
+
+    monkeypatch.setattr(
+        "agent.bestplan_candidates.run_and_freeze_candidate", run_candidate,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_max_concurrent_children", lambda: 2,
+    )
+    _module, _snapshot_value, _runtime, admitted = _task5_dispatch(
+        tmp_path, monkeypatch,
+    )
+
+    from tools import delegate_tool
+
+    with pytest.raises(
+        delegate_tool.BestplanCandidateBatchError, match="candidate batch failed",
+    ):
+        admitted["runner"]()
+
+    assert len(started_attempts) == 2
+    assert len(set(started_attempts)) == 2

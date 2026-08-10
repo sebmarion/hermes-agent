@@ -1736,6 +1736,7 @@ def _serialise_record(record: Dict[str, Any], now: float) -> Dict[str, Any]:
             "heartbeat_stop",
             "progress_fn",
             "_terminal_callback",
+            "bestplan_state_db_path",
         }
         and not k.startswith("_")
     }
@@ -2145,6 +2146,35 @@ def _persist_and_queue_terminal(
     return True
 
 
+def _canonical_bestplan_state_db_path(value: object) -> str:
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, (str, os.PathLike)):
+        raise ValueError("BestPlan state database locator must be path-like")
+    raw = os.fspath(value)
+    if not isinstance(raw, str):
+        raise ValueError("BestPlan state database locator must be text")
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("BestPlan state database locator has invalid text") from None
+    if (
+        not encoded
+        or len(encoded) > 4096
+        or "\x00" in raw
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw)
+    ):
+        raise ValueError("BestPlan state database locator is out of bounds")
+    path = Path(raw)
+    try:
+        canonical = path.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("BestPlan state database locator is invalid") from None
+    if not path.is_absolute() or str(canonical) != raw:
+        raise ValueError("BestPlan state database locator is not canonical")
+    return raw
+
+
 def dispatch_async_delegation_batch(
     *,
     goals: List[str],
@@ -2164,12 +2194,22 @@ def dispatch_async_delegation_batch(
     origin_profile: str = "",
     origin_tracker_path: str = "",
     bestplan_plan_id: str = "",
+    bestplan_state_db_path: str = "",
     resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
     terminal_callback: Optional[
         Callable[[Dict[str, Any], str], None]
     ] = None,
 ) -> Dict[str, Any]:
     """Atomically admit one deterministic-ID batch dispatch."""
+    try:
+        canonical_state_db_path = _canonical_bestplan_state_db_path(
+            bestplan_state_db_path
+        )
+    except ValueError:
+        return {
+            "status": "rejected",
+            "error": "bestplan_state_locator_invalid",
+        }
     resolved_id = str(delegation_id or _new_delegation_id())
     admission_lock = _DISPATCH_ADMISSION_LOCKS[
         hash(resolved_id) % len(_DISPATCH_ADMISSION_LOCKS)
@@ -2193,6 +2233,7 @@ def dispatch_async_delegation_batch(
             origin_profile=origin_profile,
             origin_tracker_path=origin_tracker_path,
             bestplan_plan_id=bestplan_plan_id,
+            bestplan_state_db_path=canonical_state_db_path,
             resolved_runtimes=resolved_runtimes,
             terminal_callback=terminal_callback,
         )
@@ -2217,6 +2258,7 @@ def _dispatch_async_delegation_batch_admitted(
     origin_profile: str = "",
     origin_tracker_path: str = "",
     bestplan_plan_id: str = "",
+    bestplan_state_db_path: str = "",
     resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
     terminal_callback: Optional[
         Callable[[Dict[str, Any], str], None]
@@ -2301,7 +2343,10 @@ def _dispatch_async_delegation_batch_admitted(
     )
     from agent.bestplan_state import sanitize_runtime_metadata
 
-    safe_resolved_runtimes = sanitize_runtime_metadata(resolved_runtimes or [])
+    safe_resolved_runtimes = sanitize_runtime_metadata(
+        resolved_runtimes or [],
+        execution_protocol=2 if bestplan_plan_id else 1,
+    )
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "goal": combined_goal,
@@ -2321,6 +2366,7 @@ def _dispatch_async_delegation_batch_admitted(
         "origin_tracker_path": origin_tracker_path,
         "parent_session_id": parent_session_id,
         "bestplan_plan_id": bestplan_plan_id,
+        "bestplan_state_db_path": bestplan_state_db_path,
         "resolved_runtimes": safe_resolved_runtimes,
         "status": "intent",
         "dispatched_at": dispatched_at,
@@ -2450,9 +2496,18 @@ def _dispatch_async_delegation_batch_admitted(
         status = "error"
         try:
             combined = runner() or {}
-            # Batch status: completed unless every child errored/was interrupted.
             child_results = combined.get("results") or []
-            if child_results and all(
+            if bestplan_plan_id:
+                # Only the host-owned BestPlan coordinator may use the frozen
+                # result phase; ordinary delegated workers retain the legacy
+                # completed/success contract.
+                status = (
+                    "completed"
+                    if child_results
+                    and all(r.get("status") == "frozen" for r in child_results)
+                    else "error"
+                )
+            elif child_results and all(
                 (r.get("status") not in ("completed", "success"))
                 for r in child_results
             ):
@@ -2463,7 +2518,11 @@ def _dispatch_async_delegation_batch_admitted(
             logger.exception("Async delegation batch %s crashed", delegation_id)
             combined = {
                 "results": [],
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": (
+                    "candidate_batch_failed"
+                    if bestplan_plan_id
+                    else f"{type(exc).__name__}: {exc}"
+                ),
                 "total_duration_seconds": round(time.time() - dispatched_at, 2),
             }
             status = "error"
@@ -2634,11 +2693,17 @@ def _finalize_batch(
             evt[key] = combined[key]
     plan_id = str(event_record.get("bestplan_plan_id") or "")
     tracker_path = str(event_record.get("origin_tracker_path") or "")
-    if plan_id and tracker_path:
+    handed_off_path = str(event_record.get("bestplan_state_db_path") or "")
+    if plan_id and (handed_off_path or tracker_path):
         try:
             from agent.bestplan_state import BestplanStore
 
-            plan_store = BestplanStore(db_path=Path(tracker_path).parent / "state.db")
+            state_db_path = (
+                Path(_canonical_bestplan_state_db_path(handed_off_path))
+                if handed_off_path
+                else Path(tracker_path).parent / "state.db"
+            )
+            plan_store = BestplanStore(db_path=state_db_path)
             try:
                 plan_store.mark_completed_unverified(plan_id, evt)
             finally:

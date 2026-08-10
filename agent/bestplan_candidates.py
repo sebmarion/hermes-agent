@@ -1917,10 +1917,13 @@ def _wait_for_worker_identity(
     expected_executable: Path,
     resolver: Callable[[int, Path], WorkerIdentity],
     deadline: float,
+    cancel_event: object | None = None,
 ) -> WorkerIdentity:
     expected_digest = hashlib.sha256(expected_executable.read_bytes()).hexdigest()
     start_id: str | None = None
     while time.monotonic() < deadline:
+        if cancel_event is not None and bool(cancel_event.is_set()):
+            raise CandidateExecutionError("candidate cancelled")
         if getattr(process, "poll")() is not None:
             raise CandidateExecutionError("candidate worker exited before admission")
         try:
@@ -1938,6 +1941,12 @@ def _wait_for_worker_identity(
             return identity
         time.sleep(0.01)
     raise CandidateExecutionError("candidate worker did not reach its pinned executable")
+
+
+def _validated_cancel_event(cancel_event: object | None) -> threading.Event | None:
+    if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+        raise CandidateValidationError("candidate cancellation signal is invalid")
+    return cancel_event
 
 
 class _BoundedProcessCapture:
@@ -2086,12 +2095,16 @@ def _run_and_freeze_candidate(
     authority_client: object,
     timeout_seconds: float,
     attempt_id: str | None = None,
+    cancel_event: object | None = None,
     sandbox_factory: Callable[..., object] | None = None,
     process_identity_resolver: Callable[[int, Path], WorkerIdentity] | None = None,
     process_group_reaper: Callable[..., None] = terminate_process_group,
 ) -> FrozenCandidate:
     from agent.bestplan_sandbox import create_bestplan_candidate_sandbox_launch
 
+    cancel_event = _validated_cancel_event(cancel_event)
+    if cancel_event is not None and bool(cancel_event.is_set()):
+        raise CandidateExecutionError("candidate cancelled")
     if (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, (int, float))
@@ -2120,6 +2133,8 @@ def _run_and_freeze_candidate(
             "candidate broker channel allocation failed"
         ) from None
     try:
+        if cancel_event is not None and bool(cancel_event.is_set()):
+            raise CandidateExecutionError("candidate cancelled")
         attempt = create_candidate_attempt(
             snapshot,
             plan_id=spec.plan_id,
@@ -2143,6 +2158,8 @@ def _run_and_freeze_candidate(
     factory = sandbox_factory or create_bestplan_candidate_sandbox_launch
     resolver = process_identity_resolver or _default_process_identity
     try:
+        if cancel_event is not None and bool(cancel_event.is_set()):
+            raise CandidateExecutionError("candidate cancelled")
         environment = build_candidate_environment(
             attempt,
             controller_source=controller_source_path,
@@ -2163,11 +2180,21 @@ def _run_and_freeze_candidate(
             worker_environment=environment,
             broker_fd=child_channel.fileno(),
         )
+        if cancel_event is not None and bool(cancel_event.is_set()):
+            raise CandidateExecutionError("candidate cancelled")
         process = launch.launch_worker()
         group_extinct = False
         child_channel.close()
         expected_executable = Path(controller_python).resolve(strict=True)
-        identity = _wait_for_worker_identity(process, expected_executable, resolver, deadline)
+        identity = _wait_for_worker_identity(
+            process,
+            expected_executable,
+            resolver,
+            deadline,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and bool(cancel_event.is_set()):
+            raise CandidateExecutionError("candidate cancelled")
         capability = authority_client.register_model_attempt(
             attempt.attempt_id,
             identity,
@@ -2210,6 +2237,11 @@ def _run_and_freeze_candidate(
             capture = _BoundedProcessCapture(process, payload_json)
             capture.start()
             while True:
+                if cancel_event is not None and bool(cancel_event.is_set()):
+                    execution_error = CandidateExecutionError(
+                        "candidate cancelled"
+                    )
+                    break
                 if capture.overflow.is_set():
                     execution_error = CandidateExecutionError(
                         "candidate worker output limit exceeded"
@@ -2292,12 +2324,18 @@ def _run_and_freeze_candidate(
         if not has_pipes and getattr(process, "returncode", None) != 0:
             raise CandidateExecutionError("candidate worker exited with a fixed failure")
         result = parse_bounded_worker_output(stdout, stderr)
+        if cancel_event is not None and bool(cancel_event.is_set()):
+            raise CandidateExecutionError("candidate cancelled")
         if time.monotonic() >= deadline:
             raise CandidateExecutionError("candidate worker timeout")
         launch.verify_identity(deadline=deadline)
+        if cancel_event is not None and bool(cancel_event.is_set()):
+            raise CandidateExecutionError("candidate cancelled")
         if time.monotonic() >= deadline:
             raise CandidateExecutionError("candidate worker timeout")
         sealed = seal_candidate_attempt(attempt, deadline=deadline)
+        if cancel_event is not None and bool(cancel_event.is_set()):
+            raise CandidateExecutionError("candidate cancelled")
         artifact = _freeze_sealed_candidate(
             snapshot,
             sealed,
@@ -2395,6 +2433,7 @@ def run_and_freeze_candidate(
     authority_client: object,
     timeout_seconds: float,
     attempt_id: str | None = None,
+    cancel_event: object | None = None,
 ) -> FrozenCandidate:
     """Run one candidate using only the production sandbox/identity/reaper."""
 
@@ -2411,6 +2450,7 @@ def run_and_freeze_candidate(
         authority_client=authority_client,
         timeout_seconds=timeout_seconds,
         attempt_id=attempt_id,
+        cancel_event=cancel_event,
         sandbox_factory=create_bestplan_candidate_sandbox_launch,
         process_identity_resolver=_default_process_identity,
         process_group_reaper=terminate_process_group,

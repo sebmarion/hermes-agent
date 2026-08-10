@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -14,7 +15,8 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.bestplan_authority_client import BestplanAuthorityClient
@@ -204,9 +206,23 @@ _V2_RUNTIME_IDENTITY_STRING_FIELDS = frozenset(
         "runtime_fingerprint",
         "sandbox_backend",
         "sandbox_policy_digest",
+        "candidate_host_runtime_digest",
     }
 )
-_V2_RUNTIME_IDENTITY_LIST_FIELDS = frozenset({"bestplan_toolsets"})
+_V2_RUNTIME_IDENTITY_LIST_FIELDS = frozenset(
+    {"bestplan_toolsets", "toolsets"}
+)
+_V2_RUNTIME_IDENTITY_INT_FIELDS = {
+    "candidate_policy_version": 1_000_000,
+    "candidate_request_budget": 10_000,
+    "candidate_token_budget": 100_000_000,
+    "candidate_max_iterations": 500,
+    "candidate_max_output_tokens": 32_768,
+}
+_V2_RUNTIME_IDENTITY_NUMBER_FIELDS = {
+    "candidate_timeout_seconds": 86_400.0,
+    "candidate_capability_ttl_seconds": 86_400.0,
+}
 _V2_RUNTIME_EXECUTION_FIELDS = frozenset(
     {
         "api_key",
@@ -221,7 +237,6 @@ _V2_RUNTIME_EXECUTION_FIELDS = frozenset(
         "request_overrides",
         "route",
         "runtime_fingerprint",
-        "runtime_identity",
         "sandbox_backend",
         "sandbox_policy_digest",
         "toolsets",
@@ -326,6 +341,29 @@ def _sanitize_v2_runtime_identity(value: Any) -> list[dict[str, Any]]:
                     )
                 normalized_items.append(normalized)
             safe[key] = sorted(dict.fromkeys(normalized_items))
+        for key, maximum in _V2_RUNTIME_IDENTITY_INT_FIELDS.items():
+            if key not in item:
+                continue
+            raw_number = item[key]
+            if type(raw_number) is not int or not 1 <= raw_number <= maximum:
+                raise BestplanError(
+                    "protocol-2 runtime candidate policy is invalid"
+                )
+            safe[key] = raw_number
+        for key, maximum in _V2_RUNTIME_IDENTITY_NUMBER_FIELDS.items():
+            if key not in item:
+                continue
+            raw_number = item[key]
+            if (
+                isinstance(raw_number, bool)
+                or not isinstance(raw_number, (int, float))
+                or not math.isfinite(float(raw_number))
+                or not 0 < float(raw_number) <= maximum
+            ):
+                raise BestplanError(
+                    "protocol-2 runtime candidate policy is invalid"
+                )
+            safe[key] = float(raw_number)
         projected.append(safe)
     encoded = json.dumps(
         projected,
@@ -351,6 +389,28 @@ def _filter_v2_runtime_execution(value: Any) -> list[dict[str, Any]]:
         }
         for item in value
     ]
+
+
+def _bind_v2_candidate_toolsets(
+    value: Any, tasks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Replace resolver-selected tools with the approved process-free set."""
+
+    if type(value) is not list or len(value) != len(tasks):
+        raise BestplanError("protocol-2 runtime count is invalid")
+    bound: list[dict[str, Any]] = []
+    for runtime, task in zip(value, tasks):
+        if type(runtime) is not dict or not isinstance(task, dict):
+            raise BestplanError("protocol-2 runtime item is invalid")
+        item = dict(runtime)
+        item.pop("runtime_identity", None)
+        candidate_toolsets = [
+            "read_only_files" if bool(task.get("_bestplan_read_only")) else "file"
+        ]
+        item["toolsets"] = candidate_toolsets
+        item["bestplan_toolsets"] = list(candidate_toolsets)
+        bound.append(item)
+    return bound
 
 
 def sanitize_runtime_metadata(
@@ -511,7 +571,7 @@ def _plan_to_delegate_tasks(
 ) -> list[dict[str, Any]]:
     _v1_plan_constraints(plan, workspace=workspace)
     tasks = []
-    for item in plan.slices:
+    for index, item in enumerate(plan.slices):
         tasks.append({
             "goal": item.goal,
             "context": "\n".join([
@@ -523,10 +583,14 @@ def _plan_to_delegate_tasks(
             ]),
             "route": _LANE_FOR_SLICE[(item.kind, item.capability)],
             "role": "leaf",
+            "_bestplan_slice_id": item.id,
+            "_bestplan_manifest_index": index,
+            "_bestplan_depends_on": list(item.depends_on),
             "_bestplan_read_only": item.read_only,
             "_bestplan_leases": list(item.allowed_paths),
             "_bestplan_workspace": _canonical_workspace(workspace or item.workspace),
             "_bestplan_expected_artifacts": list(item.expected_artifacts),
+            "_bestplan_acceptance": list(item.acceptance),
         })
     return tasks
 
@@ -816,6 +880,15 @@ class BestplanStore:
                 self._owned_connection.close()
                 self._owned_connection = None
 
+    @property
+    def state_db_path(self) -> Path | None:
+        """Return the durable locator without exposing the open connection."""
+
+        if self._db_path is not None:
+            return self._db_path
+        session_path = getattr(self._session_db, "db_path", None)
+        return Path(session_path) if session_path is not None else None
+
     def _connection(self) -> sqlite3.Connection:
         if self._session_db is not None:
             return self._session_db._conn
@@ -945,7 +1018,8 @@ class BestplanStore:
         def reconcile(conn):
             changed = 0
             rows = conn.execute(
-                "SELECT plan_id, state, dispatch_id, execution_protocol "
+                "SELECT plan_id, state, dispatch_id, execution_protocol, "
+                "current_phase, dispatch_state "
                 "FROM bestplan_plans "
                 "WHERE state IN (?, ?)",
                 (PlanState.RUNNING, PlanState.WAITING),
@@ -967,6 +1041,13 @@ class BestplanStore:
                     advisory_output: Any = entry
                     dispatch_state: str | None = None
                     clear_owner = False
+                    tracker_is_terminal = bool(event) or phase in {
+                        "completed",
+                        "error",
+                        "failed",
+                        "lost",
+                        "interrupted",
+                    }
                     if phase in {"scheduled", "running"}:
                         try:
                             owner_pid = int(record.get("owner_pid"))
@@ -995,13 +1076,7 @@ class BestplanStore:
                                 "status": "lost",
                                 "error": "async delegation owner exited during running phase",
                             }
-                    elif phase in {
-                        "completed",
-                        "error",
-                        "failed",
-                        "lost",
-                        "interrupted",
-                    } or event:
+                    elif tracker_is_terminal:
                         advisory_kind = "async_tracker_terminal_advisory"
                         compatibility_error = "recapture_required"
                         dispatch_state = "terminal"
@@ -1010,7 +1085,24 @@ class BestplanStore:
                             "status": phase or "terminal",
                             "result": entry.get("result"),
                         }
-                    if advisory_kind is not None and dispatch_state is not None:
+                    authority_phase = str(row["current_phase"] or "captured")
+                    captured_is_terminal = (
+                        authority_phase == "captured"
+                        and str(row["dispatch_state"] or "") == "terminal"
+                    )
+                    if captured_is_terminal:
+                        compatibility_error = None
+                        dispatch_state = None
+                        clear_owner = False
+                    elif authority_phase != "captured":
+                        compatibility_error = None
+                        clear_owner = False
+                        if authority_phase == "candidate_ready" and tracker_is_terminal:
+                            dispatch_state = "terminal"
+                            clear_owner = True
+                        else:
+                            dispatch_state = None
+                    if advisory_kind is not None:
                         try:
                             ProofLedger(self).append_advisory_in_transaction(
                                 conn,
@@ -1648,6 +1740,22 @@ class BestplanStore:
                 safe_dispatch_id = str(
                     row["dispatch_id"] or f"bestplan-{plan_id}"
                 )
+                compatibility = (
+                    {
+                        "compatibility_dispatch_state": "scheduled",
+                        "compatibility_delegation_ids_json": json.dumps(
+                            [safe_dispatch_id]
+                        ),
+                        "compatibility_sandbox_workspace": "",
+                    }
+                    if (
+                        row["current_phase"] == "captured"
+                        and row["dispatch_state"] == "dispatching"
+                        and isinstance(row["dispatch_owner"], str)
+                        and bool(row["dispatch_owner"])
+                    )
+                    else {}
+                )
                 ProofLedger(self).append_advisory_in_transaction(
                     conn,
                     plan_id=plan_id,
@@ -1657,9 +1765,7 @@ class BestplanStore:
                         "sandbox_workspace": str(sandbox_workspace or ""),
                     },
                     output_source="model-broker",
-                    compatibility_dispatch_state="scheduled",
-                    compatibility_delegation_ids_json=json.dumps([safe_dispatch_id]),
-                    compatibility_sandbox_workspace="",
+                    **compatibility,
                 )
                 return 1
             terminal = row["state"] == PlanState.COMPLETED_UNVERIFIED
@@ -1722,14 +1828,26 @@ class BestplanStore:
             if int(row["execution_protocol"] or 1) == 2:
                 from agent.bestplan_proof import ProofLedger
 
+                compatibility = (
+                    {
+                        "compatibility_error": "dispatch_deferred",
+                        "compatibility_dispatch_state": "intent",
+                    }
+                    if (
+                        row["current_phase"] == "captured"
+                        and row["dispatch_state"] == "dispatching"
+                        and isinstance(row["dispatch_owner"], str)
+                        and bool(row["dispatch_owner"])
+                    )
+                    else {}
+                )
                 ProofLedger(self).append_advisory_in_transaction(
                     conn,
                     plan_id=plan_id,
                     kind="dispatch_deferred_advisory",
                     raw_output={"status": "dispatch_deferred", "detail": error},
                     output_source="model-broker",
-                    compatibility_error="dispatch_deferred",
-                    compatibility_dispatch_state="intent",
+                    **compatibility,
                 )
                 return 1
             return conn.execute(
@@ -1754,14 +1872,26 @@ class BestplanStore:
             if int(row["execution_protocol"] or 1) == 2:
                 from agent.bestplan_proof import ProofLedger
 
+                if row["current_phase"] == "captured":
+                    compatibility = {
+                        "compatibility_error": "recapture_required",
+                        "compatibility_dispatch_state": "terminal",
+                        "compatibility_clear_dispatch_owner": True,
+                    }
+                elif row["current_phase"] == "candidate_ready":
+                    compatibility = {
+                        "compatibility_dispatch_state": "terminal",
+                        "compatibility_clear_dispatch_owner": True,
+                    }
+                else:
+                    compatibility = {}
                 ProofLedger(self).append_advisory_in_transaction(
                     conn,
                     plan_id=plan_id,
                     kind="async_terminal_advisory",
                     raw_output=evidence,
                     output_source="async",
-                    compatibility_error="recapture_required",
-                    compatibility_dispatch_state="terminal",
+                    **compatibility,
                 )
                 return 1
             return conn.execute(
@@ -2150,6 +2280,30 @@ def _delegation_ids(payload: Any) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+class _FrozenHandoffSequence(tuple):
+    """Tuple semantics with relationship-compatible sequence equality."""
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (list, tuple)):
+            return tuple(self) == tuple(other)
+        return False
+
+    __hash__ = tuple.__hash__
+
+
+def _immutable_bestplan_handoff(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            str(key): _immutable_bestplan_handoff(item)
+            for key, item in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return _FrozenHandoffSequence(
+            _immutable_bestplan_handoff(item) for item in value
+        )
+    return value
+
+
 def try_resolve_go(
     message: str,
     *,
@@ -2163,6 +2317,8 @@ def try_resolve_go(
     delegate: Optional[Callable[..., Any]] = None,
     runtime_resolver: Optional[Callable[[list[dict[str, Any]], Any], list[dict[str, Any]]]] = None,
     strict_dispatcher: Optional[Callable[..., Any]] = None,
+    candidate_host_runtime: Any = None,
+    authority_client: Any = None,
 ) -> ResolvedGo:
     """Resolve bare ``go`` before the model loop, failing closed around a plan."""
     cfg = config if config is not None else _load_config()
@@ -2196,12 +2352,25 @@ def try_resolve_go(
     candidate = exact[0]
     plan_id = candidate["plan_id"]
     protocol2 = int(candidate.get("execution_protocol") or 1) == 2
+    legacy_injected_p1 = not protocol2 and (
+        delegate is not None or strict_dispatcher is not None
+    )
     try:
         validated = _validate_stored_plan_row(candidate)
     except Exception as exc:
         error = "invalid_plan" if protocol2 else str(exc)
         return ResolvedGo(
             True, "invalid_plan", plan_id=plan_id, reason=error, error=error,
+        )
+    if protocol2 and str(candidate.get("current_phase") or "captured") != "captured":
+        return ResolvedGo(
+            True,
+            "already_advanced",
+            plan_id=plan_id,
+            delegation_id=str(
+                candidate.get("dispatch_id") or f"bestplan-{plan_id}"
+            ),
+            reason="protocol-2 plan already advanced beyond candidate dispatch",
         )
     if candidate["state"] == PlanState.WAITING:
         return ResolvedGo(True, "already_claimed", plan_id=plan_id, reason="plan was already dispatched")
@@ -2218,6 +2387,50 @@ def try_resolve_go(
 
     if parent_agent is None:
         return ResolvedGo(True, "dispatch_unavailable", plan_id=plan_id, reason="live parent agent is required")
+    effective_host_runtime = (
+        candidate_host_runtime
+        if candidate_host_runtime is not None
+        else getattr(parent_agent, "candidate_host_runtime", None)
+    )
+    effective_authority_client = (
+        authority_client
+        if authority_client is not None
+        else getattr(parent_agent, "bestplan_authority_client", None)
+    )
+    state_db_path = store.state_db_path
+    host_runtime_projection: dict[str, Any] = {}
+    if not legacy_injected_p1:
+        try:
+            from tools.delegate_tool import (
+                BestplanHostRuntime,
+                _BestplanPreflightError,
+                _bestplan_host_runtime_projection,
+                _validate_bestplan_host_runtime,
+            )
+
+            if (
+                not isinstance(effective_host_runtime, BestplanHostRuntime)
+                or effective_authority_client is None
+                or state_db_path is None
+                or validated.source_snapshot is None
+            ):
+                raise _BestplanPreflightError("candidate_runtime_unavailable")
+            _validate_bestplan_host_runtime(
+                effective_host_runtime,
+                source_snapshot=validated.source_snapshot,
+                promotion_contract=validated.contract if protocol2 else None,
+            )
+            host_runtime_projection = _bestplan_host_runtime_projection(
+                effective_host_runtime
+            )
+        except Exception:
+            return ResolvedGo(
+                True,
+                "candidate_runtime_unavailable",
+                plan_id=plan_id,
+                reason="candidate_runtime_unavailable",
+                error="candidate_runtime_unavailable" if protocol2 else None,
+            )
     try:
         from gateway.session_context import async_delivery_supported
         if not async_delivery_supported():
@@ -2238,11 +2451,33 @@ def try_resolve_go(
             stored_runtimes = json.loads(candidate.get("resolved_runtime_json") or "[]")
         except Exception:
             stored_runtimes = []
+        if not legacy_injected_p1 and (
+            not isinstance(stored_runtimes, list)
+            or len(stored_runtimes) != len(tasks)
+            or any(
+                not isinstance(item, dict)
+                or any(
+                    item.get(key) != value
+                    for key, value in host_runtime_projection.items()
+                )
+                for item in stored_runtimes
+            )
+        ):
+            return ResolvedGo(
+                True,
+                "candidate_runtime_unavailable",
+                plan_id=plan_id,
+                reason="candidate_runtime_unavailable",
+                error="candidate_runtime_unavailable" if protocol2 else None,
+            )
         try:
             if runtime_resolver is None:
                 from tools.delegate_tool import resolve_bestplan_runtime_specs
                 resolved_runtimes = resolve_bestplan_runtime_specs(
-                    tasks, parent_agent, expected=stored_runtimes,
+                    tasks,
+                    parent_agent,
+                    expected=stored_runtimes,
+                    execution_protocol=validated.execution_protocol,
                 )
             else:
                 resolved_runtimes = runtime_resolver(tasks, parent_agent)
@@ -2254,6 +2489,9 @@ def try_resolve_go(
             )
         if protocol2:
             try:
+                resolved_runtimes = _bind_v2_candidate_toolsets(
+                    resolved_runtimes, tasks,
+                )
                 resolved_runtimes = _filter_v2_runtime_execution(
                     resolved_runtimes
                 )
@@ -2287,7 +2525,11 @@ def try_resolve_go(
             try:
                 if runtime_resolver is None:
                     from tools.delegate_tool import resolve_bestplan_runtime_specs
-                    resolved_runtimes = resolve_bestplan_runtime_specs(tasks, parent_agent)
+                    resolved_runtimes = resolve_bestplan_runtime_specs(
+                        tasks,
+                        parent_agent,
+                        execution_protocol=validated.execution_protocol,
+                    )
                 else:
                     resolved_runtimes = runtime_resolver(tasks, parent_agent)
             except Exception as exc:
@@ -2299,6 +2541,9 @@ def try_resolve_go(
         resolved_runtimes_for_storage = resolved_runtimes
         if protocol2:
             try:
+                resolved_runtimes = _bind_v2_candidate_toolsets(
+                    resolved_runtimes, tasks,
+                )
                 resolved_runtimes = _filter_v2_runtime_execution(
                     resolved_runtimes
                 )
@@ -2314,6 +2559,10 @@ def try_resolve_go(
                     reason="lane_unavailable",
                     error="lane_unavailable",
                 )
+        resolved_runtimes_for_storage = [
+            {**dict(item), **host_runtime_projection}
+            for item in resolved_runtimes_for_storage
+        ]
         claimed = store.prepare_dispatch_intent(
             plan_id, baseline, resolved_runtimes=resolved_runtimes_for_storage,
             session_id=session_id, profile=expected_profile, workspace=expected_workspace,
@@ -2341,14 +2590,47 @@ def try_resolve_go(
             from tools.delegate_tool import dispatch_bestplan_tasks_async
             strict_dispatcher = dispatch_bestplan_tasks_async
     try:
-        raw_result = strict_dispatcher(
-            tasks=tasks,
-            parent_agent=parent_agent,
-            dispatch_id=dispatch_id,
-            plan_id=plan_id,
-            workspace=expected_workspace,
-            resolved_runtimes=resolved_runtimes,
-        )
+        if legacy_injected_p1:
+            raw_result = strict_dispatcher(
+                tasks=tasks,
+                parent_agent=parent_agent,
+                dispatch_id=dispatch_id,
+                plan_id=plan_id,
+                workspace=expected_workspace,
+                resolved_runtimes=resolved_runtimes,
+            )
+        else:
+            handoff_tasks = _immutable_bestplan_handoff(tasks)
+            handoff_contract = (
+                _immutable_bestplan_handoff(validated.contract)
+                if protocol2
+                else None
+            )
+            raw_result = strict_dispatcher(
+                tasks=handoff_tasks,
+                parent_agent=parent_agent,
+                dispatch_id=dispatch_id,
+                plan_id=plan_id,
+                workspace=expected_workspace,
+                resolved_runtimes=resolved_runtimes,
+                execution_protocol=validated.execution_protocol,
+                source_snapshot=validated.source_snapshot,
+                approval_digest=validated.approval_digest,
+                promotion_contract=handoff_contract,
+                promotion_contract_digest=(
+                    str(candidate.get("promotion_contract_digest") or "")
+                    if protocol2
+                    else ""
+                ),
+                promotion_mode=(
+                    str(validated.contract.get("promotion_mode") or "")
+                    if protocol2 and validated.contract is not None
+                    else None
+                ),
+                candidate_host_runtime=effective_host_runtime,
+                authority_client=effective_authority_client,
+                state_db_path=state_db_path,
+            )
         result = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
         if not isinstance(result, dict) or result.get("status") != "dispatched":
             raw_error = (
