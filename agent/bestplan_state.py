@@ -17,7 +17,21 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
-from agent.execution_plan import ExecutionPlan, PlanValidationError, compile_execution_plan
+from agent.bestplan_authority_client import BestplanAuthorityClient
+from agent.bestplan_contract import (
+    ContractValidationError,
+    approval_digest as _approval_digest,
+    build_execution_contract,
+    contract_digest,
+    contract_json,
+    render_execution_contract,
+    resolve_matching_enrollment,
+    source_snapshot_digest,
+    source_snapshot_from_json,
+    source_snapshot_json,
+    source_snapshot_to_dict,
+    validate_execution_contract,
+)
 from agent.bestplan_source import (
     DEFAULT_SOURCE_OPERATION_SECONDS,
     SourceBoundaryError,
@@ -28,6 +42,7 @@ from agent.bestplan_source import (
     resolve_repo_identity,
     strong_source_capture_supported,
 )
+from agent.execution_plan import ExecutionPlan, PlanValidationError, compile_execution_plan
 
 logger = logging.getLogger(__name__)
 
@@ -394,14 +409,22 @@ def _plan_to_delegate_tasks(
 
 
 def _render_authoritative_manifest(
-    plan: ExecutionPlan, *, workspace: str, digest: str,
+    plan: ExecutionPlan,
+    *,
+    workspace: str,
+    digest: str,
+    contract: dict[str, Any] | None = None,
 ) -> str:
+    def escaped(value: Any) -> str:
+        encoded = json.dumps(str(value), ensure_ascii=True)
+        return encoded[1:-1]
+
     lines = [
         "Authoritative executable manifest (host-rendered):",
         f"- digest={digest}",
-        f"- mode: {plan.mode}",
-        f"- risk: {plan.risk}",
-        f"- workspace: {_canonical_workspace(workspace)}",
+        f"- mode: {escaped(plan.mode)}",
+        f"- risk: {escaped(plan.risk)}",
+        f"- workspace: {escaped(_canonical_workspace(workspace))}",
     ]
     for item in plan.slices:
         from agent.bestplan_sandbox import sandbox_backend_identity
@@ -412,25 +435,42 @@ def _render_authoritative_manifest(
             allowed_paths=item.allowed_paths,
             read_only=item.read_only,
         )
-        leases = ", ".join(item.allowed_paths) if item.allowed_paths else "none (read-only)"
-        artifacts = ", ".join(item.expected_artifacts) if item.expected_artifacts else "none"
-        acceptance = "; ".join(item.acceptance)
+        leases = (
+            ", ".join(escaped(value) for value in item.allowed_paths)
+            if item.allowed_paths
+            else "none (read-only)"
+        )
+        artifacts = (
+            ", ".join(escaped(value) for value in item.expected_artifacts)
+            if item.expected_artifacts
+            else "none"
+        )
+        acceptance = "; ".join(escaped(value) for value in item.acceptance)
         lines.extend([
-            f"- slice {item.id}:",
-            f"  - route: {route}",
-            f"  - goal: {item.goal}",
-            f"  - kind/capability: {item.kind}/{item.capability}",
+            f"- slice {escaped(item.id)}:",
+            f"  - route: {escaped(route)}",
+            f"  - goal: {escaped(item.goal)}",
+            f"  - kind/capability: {escaped(item.kind)}/{escaped(item.capability)}",
             f"  - read_only: {str(item.read_only).lower()}",
             f"  - write leases: {leases}",
             f"  - expected artifacts: {artifacts}",
-            f"  - sandbox backend: {sandbox['backend']}",
-            f"  - sandbox policy digest: {sandbox['policy_digest']}",
+            f"  - sandbox backend: {escaped(sandbox['backend'])}",
+            f"  - sandbox policy digest: {escaped(sandbox['policy_digest'])}",
             f"  - acceptance: {acceptance}",
         ])
+    contract_lines = render_execution_contract(
+        plan, contract, digest, _canonical_workspace(workspace),
+    ).splitlines()
+    protocol_index = next(
+        index
+        for index, line in enumerate(contract_lines)
+        if line.startswith("- execution protocol:")
+    )
+    lines.extend(contract_lines[protocol_index:])
     return "\n".join(lines)
 
 
-_TABLE_SQL = """
+_CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS bestplan_plans (
     plan_id TEXT PRIMARY KEY,
     version INTEGER NOT NULL DEFAULT 1,
@@ -458,11 +498,152 @@ CREATE TABLE IF NOT EXISTS bestplan_plans (
     dispatch_owner TEXT,
     dispatch_started_at REAL,
     dispatch_updated_at REAL,
-    sandbox_workspace TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_bestplan_plans_session_state
-    ON bestplan_plans(session_id, state);
+    sandbox_workspace TEXT,
+    execution_protocol INTEGER NOT NULL DEFAULT 1,
+    promotion_contract_version INTEGER,
+    promotion_contract_json TEXT,
+    promotion_contract_digest TEXT,
+    source_snapshot_json TEXT,
+    source_snapshot_digest TEXT,
+    current_phase TEXT,
+    integration_oid TEXT,
+    artifact_digest TEXT,
+    proof_authority_epoch TEXT,
+    proof_event_seq INTEGER,
+    proof_event_hash TEXT,
+    verification_receipt_json TEXT,
+    verification_receipt_digest TEXT,
+    tests_verified_at REAL,
+    review_verified_at REAL,
+    remote_verified_at REAL,
+    live_verified_at REAL,
+    verified_at REAL
+)
 """
+_CREATE_INDEX_SQL = """CREATE INDEX IF NOT EXISTS idx_bestplan_plans_session_state
+    ON bestplan_plans(session_id, state)"""
+
+
+@dataclass(frozen=True)
+class _ValidatedStoredPlan:
+    execution_protocol: int
+    plan: ExecutionPlan
+    manifest: dict[str, Any]
+    approval_digest: str
+    contract: dict[str, Any] | None
+    source_snapshot: Any | None
+
+
+def _validate_stored_plan_row(
+    row: sqlite3.Row | dict[str, Any],
+    *,
+    allow_v1_null_approval: bool = False,
+) -> _ValidatedStoredPlan:
+    """Revalidate every immutable approval input from one stored row.
+
+    The contract and source are never reconstructed from current config.  This
+    pure validator is called while each state-transition transaction owns its
+    write lock and is also used by the pre-dispatch host path.
+    """
+
+    values = dict(row)
+    if values.get("version") != 1 or isinstance(values.get("version"), bool):
+        raise BestplanError("stored model envelope version must remain integer 1")
+    try:
+        _raw_envelope, plan, raw_manifest = _extract_envelope(values["raw_plan_json"])
+        stored_manifest = compile_execution_plan(
+            json.loads(values["validated_manifest_json"])
+        ).to_manifest()
+    except Exception as exc:
+        raise BestplanError(f"stored plan envelope/manifest is invalid: {exc}") from exc
+    if raw_manifest != stored_manifest:
+        raise BestplanError("raw envelope and validated manifest differ")
+
+    protocol = values.get("execution_protocol", 1)
+    if protocol not in (1, 2) or isinstance(protocol, bool):
+        raise BestplanError("stored execution_protocol must be integer 1 or 2")
+
+    source_raw = values.get("source_snapshot_json")
+    source_digest_raw = values.get("source_snapshot_digest")
+    if (source_raw is None) != (source_digest_raw is None):
+        raise BestplanError("stored source snapshot is partial")
+    snapshot = None
+    if source_raw is not None:
+        try:
+            snapshot = source_snapshot_from_json(source_raw)
+        except Exception as exc:
+            raise BestplanError(f"stored source snapshot is invalid: {exc}") from exc
+        if source_snapshot_digest(snapshot) != source_digest_raw:
+            raise BestplanError("stored source snapshot digest differs")
+        if values.get("baseline_fingerprint") != snapshot.fingerprint:
+            raise BestplanError("stored source fingerprint differs from baseline")
+        if values.get("baseline_revision") != snapshot.head_oid:
+            raise BestplanError("stored source revision differs from baseline")
+        if values.get("workspace") != snapshot.repo.workspace:
+            raise BestplanError("stored source workspace identity differs")
+
+    contract: dict[str, Any] | None = None
+    if protocol == 1:
+        if any(
+            values.get(name) is not None
+            for name in (
+                "promotion_contract_version",
+                "promotion_contract_json",
+                "promotion_contract_digest",
+            )
+        ):
+            raise BestplanError("protocol-1 row contains a promotion contract")
+        expected_digest = _manifest_digest(stored_manifest)
+        stored_approval = values.get("approval_digest")
+        if stored_approval is None and allow_v1_null_approval:
+            pass
+        elif stored_approval != expected_digest:
+            raise BestplanError("approval digest does not match protocol-1 manifest")
+    else:
+        if values.get("promotion_contract_version") != 2 or isinstance(
+            values.get("promotion_contract_version"), bool
+        ):
+            raise BestplanError("protocol-2 row has no contract version 2")
+        if snapshot is None:
+            raise BestplanError("protocol-2 row has no source snapshot")
+        raw_contract = values.get("promotion_contract_json")
+        stored_contract_digest = values.get("promotion_contract_digest")
+        if not isinstance(raw_contract, str) or not isinstance(stored_contract_digest, str):
+            raise BestplanError("protocol-2 row has incomplete contract storage")
+        try:
+            decoded_contract = json.loads(raw_contract)
+            contract = validate_execution_contract(decoded_contract)
+            if contract_json(contract) != raw_contract:
+                raise ContractValidationError("contract JSON is not canonical")
+        except Exception as exc:
+            raise BestplanError(f"stored promotion contract is invalid: {exc}") from exc
+        if contract_digest(contract) != stored_contract_digest:
+            raise BestplanError("stored promotion contract digest differs")
+        source = contract["source"]
+        if source["snapshot_digest"] != source_digest_raw:
+            raise BestplanError("contract/source snapshot digest differs")
+        if source["source_digest"] != snapshot.fingerprint:
+            raise BestplanError("contract/source fingerprint differs")
+        if source["protected_digest"] != snapshot.protected_manifest.digest:
+            raise BestplanError("contract/protected manifest digest differs")
+        if source["base_oid"] != snapshot.head_oid or source["local_main_oid"] != snapshot.head_oid:
+            raise BestplanError("contract/source base object differs")
+        if source["tree_oid"] != snapshot.tree_oid:
+            raise BestplanError("contract/source tree object differs")
+        if contract["repository"] != source_snapshot_to_dict(snapshot)["repository"]:
+            raise BestplanError("contract/source repository identity differs")
+        expected_digest = _approval_digest(stored_manifest, contract)
+        if values.get("approval_digest") != expected_digest:
+            raise BestplanError("approval digest does not match manifest and contract")
+
+    return _ValidatedStoredPlan(
+        execution_protocol=protocol,
+        plan=plan,
+        manifest=stored_manifest,
+        approval_digest=expected_digest,
+        contract=contract,
+        source_snapshot=snapshot,
+    )
 
 
 class BestplanStore:
@@ -479,9 +660,24 @@ class BestplanStore:
                 str(self._db_path), check_same_thread=False, timeout=30,
             )
             self._owned_connection.row_factory = sqlite3.Row
-            self._owned_connection.execute("PRAGMA journal_mode=WAL")
+            journal_deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    journal_mode = self._owned_connection.execute(
+                        "PRAGMA journal_mode=WAL"
+                    ).fetchone()[0]
+                    if str(journal_mode).casefold() != "wal":
+                        raise sqlite3.OperationalError(
+                            f"could not enable WAL journal mode: {journal_mode}"
+                        )
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).casefold() or time.monotonic() >= journal_deadline:
+                        raise
+                    time.sleep(0.01)
             self._owned_connection.execute("PRAGMA synchronous=FULL")
-            self._owned_connection.executescript(_TABLE_SQL)
+            self._owned_connection.execute(_CREATE_TABLE_SQL)
+            self._owned_connection.execute(_CREATE_INDEX_SQL)
             self._owned_connection.commit()
         self._ensure_schema()
         self.reconcile_async_tracker()
@@ -525,16 +721,51 @@ class BestplanStore:
             "dispatch_started_at": "REAL",
             "dispatch_updated_at": "REAL",
             "sandbox_workspace": "TEXT",
+            "execution_protocol": "INTEGER NOT NULL DEFAULT 1",
+            "promotion_contract_version": "INTEGER",
+            "promotion_contract_json": "TEXT",
+            "promotion_contract_digest": "TEXT",
+            "source_snapshot_json": "TEXT",
+            "source_snapshot_digest": "TEXT",
+            "current_phase": "TEXT",
+            "integration_oid": "TEXT",
+            "artifact_digest": "TEXT",
+            "proof_authority_epoch": "TEXT",
+            "proof_event_seq": "INTEGER",
+            "proof_event_hash": "TEXT",
+            "verification_receipt_json": "TEXT",
+            "verification_receipt_digest": "TEXT",
+            "tests_verified_at": "REAL",
+            "review_verified_at": "REAL",
+            "remote_verified_at": "REAL",
+            "live_verified_at": "REAL",
+            "verified_at": "REAL",
         }
 
         def migrate(conn):
-            conn.executescript(_TABLE_SQL)
+            # executescript() commits implicitly.  Keep schema creation and
+            # every additive ALTER inside the caller's BEGIN IMMEDIATE.
+            conn.execute(_CREATE_TABLE_SQL)
+            conn.execute(_CREATE_INDEX_SQL)
             existing = {
                 str(row[1]) for row in conn.execute("PRAGMA table_info(bestplan_plans)")
             }
             for name, sql_type in columns.items():
                 if name not in existing:
-                    conn.execute(f"ALTER TABLE bestplan_plans ADD COLUMN {name} {sql_type}")
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE bestplan_plans ADD COLUMN {name} {sql_type}"
+                        )
+                    except sqlite3.OperationalError:
+                        # Concurrent openers serialize on BEGIN IMMEDIATE.  If
+                        # another connection nevertheless completed this same
+                        # additive column first, accept only that exact state.
+                        refreshed = {
+                            str(row[1])
+                            for row in conn.execute("PRAGMA table_info(bestplan_plans)")
+                        }
+                        if name not in refreshed:
+                            raise
 
         self._execute_write(migrate)
 
@@ -654,12 +885,20 @@ class BestplanStore:
         baseline_fingerprint: Optional[str] = None,
         raw_envelope: Optional[str] = None,
         provisional: bool = False,
+        config: Optional[dict[str, Any]] = None,
+        authority_client: BestplanAuthorityClient | None = None,
     ) -> str:
         workspace = _workspace_hint(workspace)
         supplied_fingerprint = (
             None if baseline_fingerprint is None else str(baseline_fingerprint)
         )
         baseline_revision: str | None = None
+        execution_protocol = 1
+        source_json_value: str | None = None
+        source_digest_value: str | None = None
+        contract_value: dict[str, Any] | None = None
+        contract_json_value: str | None = None
+        contract_digest_value: str | None = None
         if not strong_source_capture_supported():
             try:
                 workspace, captured_fingerprint = capture_legacy_v1_fingerprint(
@@ -728,10 +967,23 @@ class BestplanStore:
                 # Task 2 gates trusted V2 execution on baseline_revision != NULL.
                 baseline_fingerprint = supplied_fingerprint
             else:
-                workspace = repo.worktree
+                workspace = repo.workspace
+                try:
+                    enrollment = resolve_matching_enrollment(
+                        config or {}, repo, authority_client,
+                    )
+                except Exception as exc:
+                    raise BestplanError(
+                        f"matching promotion enrollment is invalid: {exc}"
+                    ) from exc
+                capture_seconds = (
+                    enrollment.capture_budget_seconds
+                    if enrollment is not None
+                    else DEFAULT_SOURCE_OPERATION_SECONDS
+                )
                 try:
                     snapshot = capture_source_snapshot(
-                        repo, time.monotonic() + DEFAULT_SOURCE_OPERATION_SECONDS,
+                        repo, time.monotonic() + capture_seconds,
                     )
                 except SourceBoundaryError as exc:
                     raise BaselineFingerprintError(
@@ -747,6 +999,20 @@ class BestplanStore:
                     )
                 baseline_fingerprint = snapshot.fingerprint
                 baseline_revision = snapshot.head_oid
+                source_json_value = source_snapshot_json(snapshot)
+                source_digest_value = source_snapshot_digest(snapshot)
+                if enrollment is not None:
+                    try:
+                        contract_value = build_execution_contract(
+                            plan, snapshot, enrollment, enrollment.controller,
+                        )
+                        contract_json_value = contract_json(contract_value)
+                        contract_digest_value = contract_digest(contract_value)
+                    except ContractValidationError as exc:
+                        raise BestplanError(
+                            f"matching promotion enrollment cannot issue a contract: {exc}"
+                        ) from exc
+                    execution_protocol = 2
         manifest = plan.to_manifest()
         manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
         if raw_envelope is None:
@@ -762,22 +1028,29 @@ class BestplanStore:
         else:
             raw = str(raw_envelope)
         plan_id = f"bp_{uuid.uuid4().hex}"
-        digest = _manifest_digest(manifest)
+        digest = _approval_digest(manifest, contract_value)
 
         def insert(conn):
             conn.execute(
                 """INSERT INTO bestplan_plans (
                     plan_id, version, created_at, session_id, profile, workspace,
                     baseline_revision, baseline_fingerprint, raw_request, raw_plan_json,
-                    validated_manifest_json, state, approval_digest
-                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    validated_manifest_json, state, approval_digest, execution_protocol,
+                    promotion_contract_version, promotion_contract_json,
+                    promotion_contract_digest, source_snapshot_json,
+                    source_snapshot_digest, current_phase
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     plan_id, time.time(), str(session_id),
                     str(_active_profile() if profile is None else profile), workspace,
                     baseline_revision, baseline_fingerprint,
                     str(raw_request or ""), raw, manifest_json,
                     PlanState.PROVISIONAL if provisional else PlanState.PENDING,
-                    digest,
+                    digest, execution_protocol,
+                    2 if execution_protocol == 2 else None,
+                    contract_json_value, contract_digest_value,
+                    source_json_value, source_digest_value,
+                    "captured" if execution_protocol == 2 else None,
                 ),
             )
 
@@ -805,20 +1078,28 @@ class BestplanStore:
     def approve_plan(self, plan_id: str, approver: str = "user") -> bool:
         def approve(conn):
             row = conn.execute(
-                "SELECT validated_manifest_json, approval_digest FROM bestplan_plans "
-                "WHERE plan_id = ? AND state = ?",
+                "SELECT * FROM bestplan_plans WHERE plan_id = ? AND state = ?",
                 (plan_id, PlanState.PENDING),
             ).fetchone()
             if row is None:
                 return 0
-            manifest = json.loads(row["validated_manifest_json"])
-            digest = _manifest_digest(manifest)
-            if row["approval_digest"] and row["approval_digest"] != digest:
+            try:
+                validated = _validate_stored_plan_row(
+                    row, allow_v1_null_approval=True,
+                )
+            except BestplanError:
                 return 0
             return conn.execute(
                 "UPDATE bestplan_plans SET state=?, approved_at=?, approved_by=?, "
                 "approval_digest=? WHERE plan_id=? AND state=?",
-                (PlanState.APPROVED, time.time(), approver, digest, plan_id, PlanState.PENDING),
+                (
+                    PlanState.APPROVED,
+                    time.time(),
+                    approver,
+                    validated.approval_digest,
+                    plan_id,
+                    PlanState.PENDING,
+                ),
             ).rowcount
         return bool(self._execute_write(approve))
 
@@ -835,10 +1116,23 @@ class BestplanStore:
 
     def commit_provisional_plan(self, plan_id: str) -> bool:
         """Expose one captured plan only after its transcript is durable."""
-        return bool(self._execute_write(lambda conn: conn.execute(
-            "UPDATE bestplan_plans SET state=? WHERE plan_id=? AND state=?",
-            (PlanState.PENDING, plan_id, PlanState.PROVISIONAL),
-        ).rowcount))
+        def commit(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=? AND state=?",
+                (plan_id, PlanState.PROVISIONAL),
+            ).fetchone()
+            if row is None:
+                return 0
+            try:
+                _validate_stored_plan_row(row)
+            except BestplanError:
+                return 0
+            return conn.execute(
+                "UPDATE bestplan_plans SET state=? WHERE plan_id=? AND state=?",
+                (PlanState.PENDING, plan_id, PlanState.PROVISIONAL),
+            ).rowcount
+
+        return bool(self._execute_write(commit))
 
     def list_approved_matching(
         self, *, session_id: str, workspace: str,
@@ -847,13 +1141,21 @@ class BestplanStore:
         expected_profile = _active_profile() if profile is None else str(profile)
         expected_workspace = _canonical_workspace(workspace)
         expected_baseline = baseline_fingerprint or compute_baseline_fingerprint(workspace)
-        return [
-            row for row in self.list_for_session(session_id)
-            if row["state"] == PlanState.APPROVED
-            and row["profile"] == expected_profile
-            and row["workspace"] == expected_workspace
-            and row["baseline_fingerprint"] == expected_baseline
-        ]
+        result = []
+        for row in self.list_for_session(session_id):
+            if not (
+                row["state"] == PlanState.APPROVED
+                and row["profile"] == expected_profile
+                and row["workspace"] == expected_workspace
+                and row["baseline_fingerprint"] == expected_baseline
+            ):
+                continue
+            try:
+                _validate_stored_plan_row(row)
+            except BestplanError:
+                continue
+            result.append(row)
+        return result
 
     def atomic_claim_approved(
         self,
@@ -880,16 +1182,8 @@ class BestplanStore:
             if row["baseline_fingerprint"] != baseline_fingerprint:
                 return None
             try:
-                raw_envelope, _raw_plan, raw_manifest = _extract_envelope(row["raw_plan_json"])
-                del raw_envelope, _raw_plan
-                stored_manifest = json.loads(row["validated_manifest_json"])
-                compiled_manifest = compile_execution_plan(stored_manifest).to_manifest()
-            except Exception:
-                return None
-            if raw_manifest != compiled_manifest:
-                return None
-            digest = _manifest_digest(compiled_manifest)
-            if row["approval_digest"] != digest:
+                validated = _validate_stored_plan_row(row)
+            except BestplanError:
                 return None
             now = time.time()
             changed = conn.execute(
@@ -898,7 +1192,8 @@ class BestplanStore:
                    WHERE plan_id=? AND state IN (?, ?) AND approval_digest=?""",
                 (
                     PlanState.RUNNING, now, now, plan_id,
-                    PlanState.PENDING, PlanState.APPROVED, digest,
+                    PlanState.PENDING, PlanState.APPROVED,
+                    validated.approval_digest,
                 ),
             ).rowcount
             if changed != 1:
@@ -928,6 +1223,10 @@ class BestplanStore:
             ).fetchone()
             if row is None:
                 return None
+            try:
+                validated = _validate_stored_plan_row(row)
+            except BestplanError:
+                return None
             if row["state"] == PlanState.RUNNING and row["dispatch_state"] in {
                 "intent", "unknown", "dispatching",
             }:
@@ -942,15 +1241,9 @@ class BestplanStore:
             ):
                 return None
             try:
-                _raw, plan, raw_manifest = _extract_envelope(row["raw_plan_json"])
+                plan = validated.plan
                 _v1_plan_constraints(plan, workspace=workspace)
-                stored_manifest = compile_execution_plan(
-                    json.loads(row["validated_manifest_json"])
-                ).to_manifest()
             except Exception:
-                return None
-            digest = _manifest_digest(stored_manifest)
-            if raw_manifest != stored_manifest or row["approval_digest"] != digest:
                 return None
             now = time.time()
             changed = conn.execute(
@@ -976,12 +1269,26 @@ class BestplanStore:
 
     def begin_dispatch_attempt(self, plan_id: str) -> bool:
         now = time.time()
-        return bool(self._execute_write(lambda conn: conn.execute(
-            """UPDATE bestplan_plans SET dispatch_state='dispatching',
-               dispatch_owner=?, dispatch_started_at=?, dispatch_updated_at=?
-               WHERE plan_id=? AND state=? AND dispatch_state IN ('intent', 'unknown')""",
-            (f"pid:{os.getpid()}", now, now, plan_id, PlanState.RUNNING),
-        ).rowcount))
+        def begin(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=? AND state=?",
+                (plan_id, PlanState.RUNNING),
+            ).fetchone()
+            if row is None:
+                return 0
+            try:
+                _validate_stored_plan_row(row)
+            except BestplanError:
+                return 0
+            return conn.execute(
+                """UPDATE bestplan_plans SET dispatch_state='dispatching',
+                   dispatch_owner=?, dispatch_started_at=?, dispatch_updated_at=?
+                   WHERE plan_id=? AND state=?
+                   AND dispatch_state IN ('intent', 'unknown')""",
+                (f"pid:{os.getpid()}", now, now, plan_id, PlanState.RUNNING),
+            ).rowcount
+
+        return bool(self._execute_write(begin))
 
     def record_dispatch_unknown(self, plan_id: str, error: str) -> bool:
         return bool(self._execute_write(lambda conn: conn.execute(
@@ -1080,10 +1387,34 @@ class BestplanStore:
         ).rowcount))
 
     def mark_completed_verified(self, plan_id: str) -> bool:
-        return bool(self._execute_write(lambda conn: conn.execute(
-            "UPDATE bestplan_plans SET state=?, completed_at=? WHERE plan_id=? AND state=?",
-            (PlanState.COMPLETED_VERIFIED, time.time(), plan_id, PlanState.COMPLETED_UNVERIFIED),
-        ).rowcount))
+        def complete(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=? AND state=?",
+                (plan_id, PlanState.COMPLETED_UNVERIFIED),
+            ).fetchone()
+            if row is None:
+                return 0
+            try:
+                validated = _validate_stored_plan_row(row)
+            except BestplanError:
+                return 0
+            # Task 3 introduces the authority receipt/final-event gate.  Until
+            # then V2 cannot use the legacy verified setter at all.
+            if validated.execution_protocol == 2:
+                return 0
+            return conn.execute(
+                "UPDATE bestplan_plans SET state=?, completed_at=?, verified_at=? "
+                "WHERE plan_id=? AND state=? AND execution_protocol=1",
+                (
+                    PlanState.COMPLETED_VERIFIED,
+                    time.time(),
+                    time.time(),
+                    plan_id,
+                    PlanState.COMPLETED_UNVERIFIED,
+                ),
+            ).rowcount
+
+        return bool(self._execute_write(complete))
 
 
 def capture_bestplan_response(
@@ -1095,6 +1426,8 @@ def capture_bestplan_response(
     baseline_fingerprint: Optional[str] = None,
     store: Optional[BestplanStore] = None,
     provisional: bool = False,
+    config: Optional[dict[str, Any]] = None,
+    authority_client: BestplanAuthorityClient | None = None,
 ) -> PlanCapture:
     """Validate and persist the explicit envelope in a /bestplan response."""
     try:
@@ -1107,21 +1440,30 @@ def capture_bestplan_response(
         )
         visible = _strip_bestplan_envelope(response)
         return PlanCapture(False, visible + suffix, error=str(exc))
-    digest = _manifest_digest(manifest)
     try:
         store = store or BestplanStore()
         plan_id = store.create_plan(
             "", plan, session_id=session_id, profile=profile, workspace=workspace,
             baseline_fingerprint=baseline_fingerprint, raw_envelope=raw_envelope,
             provisional=provisional,
+            config=config,
+            authority_client=authority_client,
         )
-    except BaselineFingerprintError as exc:
+        row = store.get_plan(plan_id)
+        if row is None:
+            raise BestplanError("persisted plan could not be read back")
+        validated = _validate_stored_plan_row(row)
+    except (BaselineFingerprintError, BestplanError) as exc:
         visible = _strip_bestplan_envelope(response)
         suffix = f"\n\n[Bestplan status: non-executable — {exc}.]"
         return PlanCapture(False, visible + suffix, error=str(exc))
+    digest = validated.approval_digest
     advisory = _strip_bestplan_envelope(response)
     authority = _render_authoritative_manifest(
-        plan, workspace=workspace, digest=digest,
+        validated.plan,
+        workspace=row["workspace"],
+        digest=digest,
+        contract=validated.contract,
     )
     parts = []
     if advisory:
@@ -1306,10 +1648,15 @@ def capture_bestplan_agent_result(
     store: Optional[BestplanStore] = None,
     host_agent: Any = None,
     provisional: bool = False,
+    config: Optional[dict[str, Any]] = None,
+    authority_client: BestplanAuthorityClient | None = None,
 ) -> dict[str, Any]:
     """Attach the host-validated executable receipt to a planning result."""
     if not is_executable_bestplan_invocation(invocation_message) or not isinstance(result, dict):
         return result
+    injected_client = authority_client
+    if injected_client is None and host_agent is not None:
+        injected_client = getattr(host_agent, "bestplan_authority_client", None)
     capture = capture_bestplan_response(
         str(result.get("final_response") or ""),
         session_id=session_id,
@@ -1318,6 +1665,8 @@ def capture_bestplan_agent_result(
         baseline_fingerprint=baseline_fingerprint,
         store=store,
         provisional=provisional,
+        config=config if config is not None else _load_config(),
+        authority_client=injected_client,
     )
     updated = dict(result)
     updated["final_response"] = capture.response
@@ -1453,19 +1802,19 @@ def try_resolve_go(
 
     candidate = exact[0]
     plan_id = candidate["plan_id"]
+    try:
+        validated = _validate_stored_plan_row(candidate)
+    except Exception as exc:
+        return ResolvedGo(
+            True, "invalid_plan", plan_id=plan_id, reason=str(exc), error=str(exc),
+        )
     if candidate["state"] == PlanState.WAITING:
         return ResolvedGo(True, "already_claimed", plan_id=plan_id, reason="plan was already dispatched")
 
     try:
-        _raw, plan, raw_manifest = _extract_envelope(candidate["raw_plan_json"])
-        stored_manifest = compile_execution_plan(
-            json.loads(candidate["validated_manifest_json"])
-        ).to_manifest()
-        if raw_manifest != stored_manifest:
-            raise BestplanError("raw envelope and validated manifest differ")
-        if candidate["approval_digest"] != _manifest_digest(stored_manifest):
-            raise BestplanError("approval digest does not match manifest")
-        tasks = _plan_to_delegate_tasks(plan, workspace=expected_workspace)
+        tasks = _plan_to_delegate_tasks(
+            validated.plan, workspace=expected_workspace,
+        )
     except Exception as exc:
         return ResolvedGo(True, "invalid_plan", plan_id=plan_id, reason=str(exc), error=str(exc))
 

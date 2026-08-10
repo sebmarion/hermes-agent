@@ -10,6 +10,14 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Non-authoritative pointer used only to ask an injected BestPlan
+    # promotion authority for an exact repository enrollment.  The endpoint
+    # is transport configuration, never a trust root; enrollment owns every
+    # publication/check/live target and contains no credential.
+    "bestplan_promotion": {
+        "authority_endpoint": "",
+        "enrollment_ref": "",
+    },
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
     # not crash-safe (for example macOS virtiofs, NFS, or SMB).
