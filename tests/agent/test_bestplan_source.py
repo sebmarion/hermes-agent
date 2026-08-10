@@ -44,7 +44,36 @@ def _init_repo(path: Path) -> Path:
 def _snapshot(repo: Path):
     source = _source()
     identity = source.resolve_repo_identity(str(repo))
-    return source.capture_source_snapshot(identity, time.monotonic() + 5.0)
+    return source.capture_source_snapshot(
+        identity,
+        time.monotonic() + source.DEFAULT_SOURCE_OPERATION_SECONDS,
+    )
+
+
+def test_snapshot_fixture_uses_production_operation_budget(tmp_path, monkeypatch):
+    source = _source()
+    repo = tmp_path / "repo"
+    identity = object()
+    observed: dict[str, float] = {}
+
+    monkeypatch.setattr(source, "resolve_repo_identity", lambda _workspace: identity)
+
+    def capture(repo_identity, deadline):
+        assert repo_identity is identity
+        observed["deadline"] = deadline
+        return object()
+
+    monkeypatch.setattr(source, "capture_source_snapshot", capture)
+
+    before = time.monotonic()
+    _snapshot(repo)
+    after = time.monotonic()
+
+    assert (
+        before + source.DEFAULT_SOURCE_OPERATION_SECONDS
+        <= observed["deadline"]
+        <= after + source.DEFAULT_SOURCE_OPERATION_SECONDS
+    )
 
 
 def _fsmonitor_index_bytes(repo: Path) -> bytes:
@@ -279,7 +308,10 @@ def test_snapshot_records_repo_head_ref_common_dir_and_full_oid(tmp_path):
     nested.mkdir()
 
     identity = source.resolve_repo_identity(str(nested))
-    snapshot = source.capture_source_snapshot(identity, time.monotonic() + 5.0)
+    snapshot = source.capture_source_snapshot(
+        identity,
+        time.monotonic() + source.DEFAULT_SOURCE_OPERATION_SECONDS,
+    )
     expected = _git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode("ascii")
 
     assert identity.worktree_raw == os.fsencode(repo.resolve())
@@ -320,7 +352,8 @@ def test_trusted_git_invocation_ignores_path_substitution(tmp_path, monkeypatch)
     assert not marker.exists()
     identity = source.resolve_repo_identity(str(repo))
     snapshot = source.capture_source_snapshot(
-        identity, time.monotonic() + 8.0,
+        identity,
+        time.monotonic() + source.DEFAULT_SOURCE_OPERATION_SECONDS,
     )
     destination = tmp_path / "exported"
     source.export_exact_tree(snapshot, destination)
@@ -402,7 +435,10 @@ def test_fixed_system_verifier_and_git_ignore_hostile_developer_dir(
     monkeypatch.setenv("DEVELOPER_DIR", str(tmp_path / "missing-developer-dir"))
 
     identity = source.resolve_repo_identity(str(repo))
-    snapshot = source.capture_source_snapshot(identity, time.monotonic() + 5.0)
+    snapshot = source.capture_source_snapshot(
+        identity,
+        time.monotonic() + source.DEFAULT_SOURCE_OPERATION_SECONDS,
+    )
 
     assert snapshot.head_oid == expected_head
     assert source._get_capture_authority().git_path == b"/usr/bin/git"
@@ -2410,7 +2446,8 @@ def test_public_capture_sweeps_descendant_before_success_return(
     repo = _init_repo(tmp_path / "repo")
     identity = source.resolve_repo_identity(str(repo))
     expected = source.capture_source_snapshot(
-        identity, time.monotonic() + 5.0,
+        identity,
+        time.monotonic() + source.DEFAULT_SOURCE_OPERATION_SECONDS,
     )
     response_file = tmp_path / "success-response.pickle"
     response_file.write_bytes(
