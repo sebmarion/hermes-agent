@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_MAX_BROKER_TURN_JSON_BYTES = 2 * 1024 * 1024
+_MAX_TOKEN_COUNT = 100_000_000
 
 
 class AuthorityClientError(RuntimeError):
@@ -40,10 +43,30 @@ def _nonempty(value: Any, name: str) -> str:
     return value
 
 
-def _integer(value: Any, name: str, *, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(f"{name} must be an integer >= {minimum}")
+def _integer(
+    value: Any,
+    name: str,
+    *,
+    minimum: int = 0,
+    maximum: int = (1 << 63) - 1,
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > maximum
+    ):
+        raise ValueError(
+            f"{name} must be an integer between {minimum} and {maximum}"
+        )
     return value
+
+
+def _request_id(value: Any) -> str:
+    text = _nonempty(value, "request_id")
+    if not text.isascii() or not _REQUEST_ID_RE.fullmatch(text):
+        raise ValueError("request_id must be short control-free ASCII")
+    return text
 
 
 def _sha256(value: Any, name: str) -> str:
@@ -51,6 +74,42 @@ def _sha256(value: Any, name: str) -> str:
     if not _SHA256_RE.fullmatch(text):
         raise ValueError(f"{name} must be a lowercase sha256 digest")
     return text
+
+
+def _canonical_json_object(value: Any, name: str) -> str:
+    """Validate one bounded provider-neutral JSON object on the broker wire."""
+
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a JSON string")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{name} must be valid UTF-8") from exc
+    if len(encoded) > _MAX_BROKER_TURN_JSON_BYTES:
+        raise ValueError(f"{name} exceeds the bounded broker turn limit")
+
+    def reject_nonfinite(constant: str) -> None:
+        raise ValueError(f"{name} contains a non-finite number: {constant}")
+
+    try:
+        decoded = json.loads(value, parse_constant=reject_nonfinite)
+    except (TypeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"{name} must be valid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError(f"{name} must encode a JSON object")
+    try:
+        canonical = json.dumps(
+            decoded,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError(f"{name} contains unsupported JSON data") from exc
+    if value != canonical:
+        raise ValueError(f"{name} must be canonical JSON")
+    return value
 
 
 @dataclass(frozen=True)
@@ -63,8 +122,8 @@ class WorkerIdentity:
     executable_sha256: str
 
     def __post_init__(self) -> None:
-        _integer(self.pid, "pid", minimum=1)
-        _integer(self.uid, "uid")
+        _integer(self.pid, "pid", minimum=1, maximum=(1 << 31) - 1)
+        _integer(self.uid, "uid", maximum=(1 << 32) - 1)
         _nonempty(self.process_start_id, "process_start_id")
         _sha256(self.executable_sha256, "executable_sha256")
 
@@ -108,8 +167,13 @@ class ModelRequest:
     max_output_tokens: int
 
     def __post_init__(self) -> None:
-        _nonempty(self.request_id, "request_id")
-        _integer(self.max_output_tokens, "max_output_tokens", minimum=1)
+        _request_id(self.request_id)
+        _integer(
+            self.max_output_tokens,
+            "max_output_tokens",
+            minimum=1,
+            maximum=1_000_000,
+        )
         if not isinstance(self.messages_json, str):
             raise ValueError("messages_json must be a JSON string")
         try:
@@ -135,8 +199,49 @@ class ModelResponse:
         if not isinstance(self.content, str):
             raise ValueError("content must be a string")
         _nonempty(self.finish_reason, "finish_reason")
-        _integer(self.input_tokens, "input_tokens")
-        _integer(self.output_tokens, "output_tokens")
+        _integer(self.input_tokens, "input_tokens", maximum=_MAX_TOKEN_COUNT)
+        _integer(self.output_tokens, "output_tokens", maximum=_MAX_TOKEN_COUNT)
+
+
+@dataclass(frozen=True)
+class BrokerTurnRequest:
+    """Full credential-free chat-completions turn sent through the broker."""
+
+    request_id: str
+    request_json: str
+    max_output_tokens: int
+
+    def __post_init__(self) -> None:
+        _request_id(self.request_id)
+        _canonical_json_object(self.request_json, "request_json")
+        _integer(
+            self.max_output_tokens,
+            "max_output_tokens",
+            minimum=1,
+            maximum=1_000_000,
+        )
+
+
+@dataclass(frozen=True)
+class BrokerTurnResponse:
+    """Full tool-call-capable response paired to one broker request."""
+
+    request_id: str
+    response_json: str
+    input_tokens: int
+    output_tokens: int
+
+    def __post_init__(self) -> None:
+        _request_id(self.request_id)
+        _canonical_json_object(self.response_json, "response_json")
+        _integer(self.input_tokens, "input_tokens", maximum=_MAX_TOKEN_COUNT)
+        _integer(self.output_tokens, "output_tokens", maximum=_MAX_TOKEN_COUNT)
+
+    def validate_for_request(self, request_id: str) -> "BrokerTurnResponse":
+        expected = _request_id(request_id)
+        if self.request_id != expected:
+            raise ValueError("broker response request_id does not match the request")
+        return self
 
 
 @dataclass(frozen=True)
@@ -186,8 +291,10 @@ class BestplanAuthorityClient(Protocol):
     ) -> BrokerCapability: ...
 
     def model_request(
-        self, capability: BrokerCapability, request: ModelRequest
-    ) -> ModelResponse: ...
+        self,
+        capability: BrokerCapability,
+        request: ModelRequest | BrokerTurnRequest,
+    ) -> ModelResponse | BrokerTurnResponse: ...
 
     def revoke_model_attempt(self, capability: BrokerCapability) -> None: ...
 
@@ -217,8 +324,10 @@ class NullAuthorityClient:
         self._unavailable()
 
     def model_request(
-        self, capability: BrokerCapability, request: ModelRequest
-    ) -> ModelResponse:
+        self,
+        capability: BrokerCapability,
+        request: ModelRequest | BrokerTurnRequest,
+    ) -> ModelResponse | BrokerTurnResponse:
         del capability, request
         self._unavailable()
 

@@ -1517,10 +1517,16 @@ def _capture_legacy_v1_in_process(
     }
 
 
-def resolve_repo_identity(workspace: str) -> RepoIdentity:
+def resolve_repo_identity(
+    workspace: str, deadline: float | None = None,
+) -> RepoIdentity:
     """Resolve one worktree and its shared repository identity losslessly."""
 
-    deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+    deadline = (
+        time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+        if deadline is None
+        else float(deadline)
+    )
     authority = _verify_public_authority(deadline=deadline)
     try:
         resolved = _run_source_helper(
@@ -5423,10 +5429,204 @@ def _write_export_file(
     return total, digest.hexdigest()
 
 
-def export_exact_tree(
-    snapshot: SourceSnapshot, destination: str | os.PathLike[str],
+def _validate_captured_snapshot(
+    snapshot: SourceSnapshot,
+    authority: _CaptureAuthority,
+    *,
+    deadline: float,
+) -> tuple[_TreeEntry, ...]:
+    """Revalidate immutable capture facts without consulting ambient HEAD state."""
+
+    if not isinstance(snapshot, SourceSnapshot):
+        raise SourceBoundaryError("captured source snapshot has an invalid type")
+    if snapshot.capture_implementation_sha256 != authority.implementation_sha256:
+        raise SourceBoundaryError(
+            "captured source snapshot implementation identity changed"
+        )
+    manifest = snapshot.protected_manifest
+    if not isinstance(manifest, ProtectedManifest):
+        raise SourceBoundaryError("captured source snapshot manifest is invalid")
+    expected_manifest_digest = _manifest_digest(
+        manifest.index_entries,
+        manifest.index_flags,
+        manifest.worktree_entries,
+        manifest.staged_diff_sha256,
+        manifest.unstaged_diff_sha256,
+        deadline=deadline,
+    )
+    if manifest.digest != expected_manifest_digest:
+        raise SourceBoundaryError(
+            "captured source snapshot manifest digest is inconsistent"
+        )
+    if snapshot.head_symbolic != (snapshot.head_ref is not None):
+        raise SourceBoundaryError("captured source snapshot HEAD identity is invalid")
+    if snapshot.head_ref is not None:
+        if snapshot.head_raw != b"ref: " + snapshot.head_ref + b"\n":
+            raise SourceBoundaryError(
+                "captured source snapshot symbolic HEAD is inconsistent"
+            )
+    expected_fingerprint = _snapshot_fingerprint(
+        snapshot.repo,
+        _SourceRead(
+            head_symbolic=snapshot.head_symbolic,
+            head_ref=snapshot.head_ref,
+            head_raw=snapshot.head_raw,
+            head_oid=snapshot.head_oid,
+            tree_oid=snapshot.tree_oid,
+            protected_manifest=manifest,
+        ),
+        deadline=deadline,
+    )
+    if snapshot.fingerprint != expected_fingerprint:
+        raise SourceBoundaryError(
+            "captured source snapshot fingerprint is inconsistent"
+        )
+
+    actual_repo = _run_source_helper(
+        authority, "resolve", snapshot.repo.workspace, deadline,
+    )
+    if not isinstance(actual_repo, RepoIdentity) or not _same_repository(
+        snapshot.repo, actual_repo,
+    ):
+        raise ProofStaleError("proof_stale: repository identity changed")
+
+    _reject_nonempty_repository_file(
+        snapshot.repo, (b"info", b"grafts"), label="grafts", deadline=deadline,
+    )
+    _reject_nonempty_repository_file(
+        snapshot.repo,
+        (b"objects", b"info", b"alternates"),
+        label="object alternates",
+        deadline=deadline,
+    )
+    _reject_partial_clone_configuration(snapshot.repo, deadline=deadline)
+    _, bare = _run_git(
+        snapshot.repo.worktree_raw,
+        "rev-parse",
+        "--is-bare-repository",
+        deadline=deadline,
+    )
+    if _without_delimiter(bare) != b"false":
+        raise UnsupportedRepositoryError("bare repositories are unsupported")
+    _, shallow = _run_git(
+        snapshot.repo.worktree_raw,
+        "rev-parse",
+        "--is-shallow-repository",
+        deadline=deadline,
+    )
+    if _without_delimiter(shallow) == b"true":
+        raise UnsupportedRepositoryError("shallow repositories are unsupported")
+    for key in ("core.sparseCheckout", "core.sparseCheckoutCone"):
+        code, value = _run_git(
+            snapshot.repo.worktree_raw,
+            "config",
+            "--bool",
+            "--get",
+            key,
+            deadline=deadline,
+            ok_codes=(0, 1),
+        )
+        if code == 0 and _without_delimiter(value).strip().lower() == b"true":
+            raise UnsupportedRepositoryError("sparse checkout is unsupported")
+    _, index_path_raw = _run_git(
+        snapshot.repo.worktree_raw,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "index",
+        deadline=deadline,
+    )
+    raw_index = _read_stable_small_file(
+        _without_delimiter(index_path_raw),
+        deadline=deadline,
+        limit=_MAX_GIT_METADATA_BYTES,
+    )
+    _raw_index_entries, index_extensions = _index_extension_records(
+        raw_index,
+        object_format=snapshot.repo.object_format,
+        deadline=deadline,
+    )
+    if any(signature == b"sdir" for signature, _payload in index_extensions):
+        raise UnsupportedRepositoryError("persisted sparse Git index is unsupported")
+    _, replacements = _run_git(
+        snapshot.repo.worktree_raw,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/replace",
+        deadline=deadline,
+    )
+    if replacements:
+        raise UnsupportedRepositoryError("Git replace refs are unsupported")
+
+    _, commit_out = _run_git(
+        snapshot.repo.worktree_raw,
+        "rev-parse",
+        "--verify",
+        f"{snapshot.head_oid}^{{commit}}",
+        deadline=deadline,
+    )
+    if _without_delimiter(commit_out).decode("ascii") != snapshot.head_oid:
+        raise SourceBoundaryError("captured source commit identity is inconsistent")
+    _, tree_out = _run_git(
+        snapshot.repo.worktree_raw,
+        "rev-parse",
+        "--verify",
+        f"{snapshot.head_oid}^{{tree}}",
+        deadline=deadline,
+    )
+    if _without_delimiter(tree_out).decode("ascii") != snapshot.tree_oid:
+        raise SourceBoundaryError("captured source commit tree is inconsistent")
+
+    entries = _tree_entries(snapshot.repo, snapshot.tree_oid, deadline=deadline)
+    if any(
+        entry.mode == 0o160000 or entry.object_type == b"commit"
+        for entry in entries
+    ):
+        raise UnsupportedRepositoryError("Git submodules are unsupported")
+    if any(entry.object_type != b"blob" for entry in entries):
+        raise UnsupportedRepositoryError(
+            "exact source tree contains a non-blob entry"
+        )
+    for entry in entries:
+        _remaining(deadline)
+        if entry.mode not in {0o100644, 0o100755, 0o120000}:
+            raise UnsupportedRepositoryError(
+                f"unsupported Git tree mode: {entry.mode:o}"
+            )
+    for filter_name in _tree_filter_names(
+        snapshot.repo, snapshot.head_oid, entries, deadline=deadline,
+    ):
+        try:
+            decoded_name = filter_name.decode("utf-8")
+        except UnicodeError as exc:
+            raise UnsupportedRepositoryError(
+                "non-UTF-8 Git filter names are unsupported"
+            ) from exc
+        for suffix in ("clean", "smudge", "process"):
+            code, configured = _run_git(
+                snapshot.repo.worktree_raw,
+                "config",
+                "--get",
+                f"filter.{decoded_name}.{suffix}",
+                deadline=deadline,
+                ok_codes=(0, 1),
+            )
+            if code == 0 and configured:
+                raise UnsupportedRepositoryError(
+                    "configured Git LFS/custom clean, smudge, or process "
+                    "filters are unsupported"
+                )
+    _assert_tree_path_aliases(entries, deadline=deadline)
+    return entries
+
+
+def _export_captured_tree(
+    snapshot: SourceSnapshot,
+    destination: str | os.PathLike[str],
+    *,
+    require_current_capture: bool,
 ) -> None:
-    """Materialize and verify the captured committed tree without filters.
+    """Materialize one validated captured tree through the shared exporter.
 
     The final bounded content walk establishes exactness immediately before this
     call returns. Mutation after return belongs to the later consumer/root
@@ -5442,26 +5642,37 @@ def export_exact_tree(
     published = False
     try:
         try:
-            recapture_deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
-            if not recapture_matches(snapshot, deadline=recapture_deadline):
-                raise ProofStaleError(
-                    "proof_stale: repository or protected state changed"
+            if require_current_capture:
+                validation_deadline = (
+                    time.monotonic() + _DEFAULT_DEADLINE_SECONDS
                 )
-            deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
-            entries = _tree_entries(
-                snapshot.repo, snapshot.tree_oid, deadline=deadline,
-            )
-            if any(entry.object_type != b"blob" for entry in entries):
-                raise UnsupportedRepositoryError(
-                    "exact source tree contains a non-blob entry"
-                )
-            for entry in entries:
-                _remaining(deadline)
-                if entry.mode not in {0o100644, 0o100755, 0o120000}:
-                    raise UnsupportedRepositoryError(
-                        f"unsupported Git tree mode: {entry.mode:o}"
+                if not recapture_matches(snapshot, deadline=validation_deadline):
+                    raise ProofStaleError(
+                        "proof_stale: repository or protected state changed"
                     )
-            _assert_tree_path_aliases(entries, deadline=deadline)
+                deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+                entries = _tree_entries(
+                    snapshot.repo, snapshot.tree_oid, deadline=deadline,
+                )
+                if any(entry.object_type != b"blob" for entry in entries):
+                    raise UnsupportedRepositoryError(
+                        "exact source tree contains a non-blob entry"
+                    )
+                for entry in entries:
+                    _remaining(deadline)
+                    if entry.mode not in {0o100644, 0o100755, 0o120000}:
+                        raise UnsupportedRepositoryError(
+                            f"unsupported Git tree mode: {entry.mode:o}"
+                        )
+                _assert_tree_path_aliases(entries, deadline=deadline)
+            else:
+                validation_deadline = (
+                    time.monotonic() + _DEFAULT_DEADLINE_SECONDS
+                )
+                entries = _validate_captured_snapshot(
+                    snapshot, authority, deadline=validation_deadline,
+                )
+                deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
             _verify_public_authority_after(authority, deadline=deadline)
 
             prepared = _prepare_destination(
@@ -5547,3 +5758,27 @@ def export_exact_tree(
             except OSError:
                 pass
             _close_fds(prepared.parent_fds)
+
+
+def export_exact_tree(
+    snapshot: SourceSnapshot, destination: str | os.PathLike[str],
+) -> None:
+    """Export only while the full repository and protected state still match."""
+
+    _export_captured_tree(
+        snapshot, destination, require_current_capture=True,
+    )
+
+
+def export_captured_commit_tree(
+    snapshot: SourceSnapshot, destination: str | os.PathLike[str],
+) -> None:
+    """Export an internally consistent captured commit after ambient HEAD moves.
+
+    This deliberately ignores later HEAD/index/worktree content while preserving
+    the immutable repository, capture-authority, object, mode, and filter checks.
+    """
+
+    _export_captured_tree(
+        snapshot, destination, require_current_capture=False,
+    )

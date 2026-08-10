@@ -361,6 +361,72 @@ def test_trusted_git_invocation_ignores_path_substitution(tmp_path, monkeypatch)
     assert not marker.exists()
 
 
+def test_captured_commit_export_survives_ambient_head_move_without_weakening_strong_export(
+    tmp_path,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+
+    (repo / "tracked.txt").write_bytes(b"later head\n")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-qm", "advance ambient head")
+
+    with pytest.raises(source.ProofStaleError, match="proof_stale"):
+        source.export_exact_tree(snapshot, tmp_path / "strong-export")
+
+    destination = tmp_path / "captured-export"
+    source.export_captured_commit_tree(snapshot, destination)
+    assert (destination / "tracked.txt").read_bytes() == b"committed\n"
+    assert not (destination / ".git").exists()
+
+
+def test_captured_commit_export_rejects_forged_snapshot_fields(tmp_path):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    forged_manifest = replace(
+        snapshot.protected_manifest,
+        digest="0" * 64,
+    )
+    forged = replace(snapshot, protected_manifest=forged_manifest)
+
+    with pytest.raises(source.SourceBoundaryError, match="snapshot"):
+        source.export_captured_commit_tree(forged, tmp_path / "forged-export")
+
+
+def test_captured_commit_validation_and_materialization_have_distinct_budgets(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+
+    class MaterializationReached(RuntimeError):
+        pass
+
+    observed: dict[str, float] = {}
+
+    def slow_validation(_snapshot, _authority, *, deadline):
+        assert deadline > time.monotonic()
+        observed["validation_deadline"] = deadline
+        time.sleep(0.35)
+        return ()
+
+    def require_fresh_materialization_budget(_repo, _destination, *, deadline):
+        assert deadline > observed["validation_deadline"]
+        raise MaterializationReached
+
+    monkeypatch.setattr(source, "_DEFAULT_DEADLINE_SECONDS", 0.3)
+    monkeypatch.setattr(source, "_validate_captured_snapshot", slow_validation)
+    monkeypatch.setattr(
+        source, "_prepare_destination", require_fresh_materialization_budget,
+    )
+
+    with pytest.raises(MaterializationReached):
+        source.export_captured_commit_tree(snapshot, tmp_path / "exported")
+
+
 def test_trusted_git_invocation_disables_configured_fsmonitor_hook(tmp_path):
     source = _source()
     repo = _init_repo(tmp_path / "repo")
@@ -1270,20 +1336,12 @@ def test_create_plan_does_not_resolve_workspace_in_the_parent(
     source = _source()
     from agent import bestplan_state
 
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _init_repo(tmp_path / "repo")
     store = bestplan_state.BestplanStore(
         db_path=tmp_path / "state" / "state.db",
     )
-    captured_repo = type(
-        "CapturedRepo", (), {"worktree": str(repo), "workspace": str(repo)},
-    )()
-    captured_snapshot = type(
-        "CapturedSnapshot", (), {
-            "fingerprint": "f" * 64,
-            "head_oid": "1" * 40,
-        },
-    )()
+    captured_snapshot = _snapshot(repo)
+    captured_repo = captured_snapshot.repo
     real_resolve = bestplan_state.Path.resolve
 
     def blocked_parent_resolve(path, *args, **kwargs):
@@ -1310,28 +1368,21 @@ def test_create_plan_does_not_resolve_workspace_in_the_parent(
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.5
-    assert store.get_plan(plan_id)["baseline_revision"] == "1" * 40
+    assert store.get_plan(plan_id)["baseline_revision"] == captured_snapshot.head_oid
 
 
 def test_create_plan_relative_workspace_does_not_read_parent_cwd(
     tmp_path, monkeypatch,
 ):
+    source = _source()
     from agent import bestplan_state
 
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _init_repo(tmp_path / "repo")
     store = bestplan_state.BestplanStore(
         db_path=tmp_path / "state" / "state.db",
     )
-    captured_repo = type(
-        "CapturedRepo", (), {"worktree": str(repo), "workspace": str(repo)},
-    )()
-    captured_snapshot = type(
-        "CapturedSnapshot", (), {
-            "fingerprint": "f" * 64,
-            "head_oid": "1" * 40,
-        },
-    )()
+    captured_snapshot = _snapshot(repo)
+    captured_repo = captured_snapshot.repo
     calls = 0
 
     def blocked_parent_getcwd():
