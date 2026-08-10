@@ -2360,6 +2360,38 @@ def test_export_quarantines_staging_content_changed_while_later_blob_streams(
     assert (quarantines[0] / "a.txt").read_bytes() == b"foreign aa!\n"
 
 
+def test_export_requires_two_complete_observations_after_first_scan_mutation(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "exported"
+    real_scan = source._verify_exported_tree
+    scan_attempts = 0
+
+    def mutate_after_first_complete_scan(*args, **kwargs):
+        nonlocal scan_attempts
+        scan_attempts += 1
+        result = real_scan(*args, **kwargs)
+        if scan_attempts == 1:
+            (destination / "tracked.txt").write_bytes(b"forged!!!\n")
+        return result
+
+    monkeypatch.setattr(
+        source, "_verify_exported_tree", mutate_after_first_complete_scan,
+    )
+    with pytest.raises(source.SourceBoundaryError, match="quarantined") as raised:
+        source.export_exact_tree(snapshot, destination)
+
+    quarantines = list(tmp_path.glob(".exported.bestplan-quarantine-*"))
+    assert scan_attempts >= 2
+    assert not destination.exists()
+    assert len(quarantines) == 1
+    assert "concurrent changes" in str(raised.value)
+    assert (quarantines[0] / "tracked.txt").read_bytes() == b"forged!!!\n"
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -2574,6 +2606,56 @@ def test_export_post_publish_failure_preserves_concurrent_foreign_addition(
     assert str(quarantines[0]) in str(raised.value)
     assert "concurrent changes" in str(raised.value)
     assert (quarantines[0] / "foreign-sentinel").read_bytes() == b"foreign bytes\n"
+
+
+def test_quarantine_unchanged_classification_requires_two_observations(
+    tmp_path, monkeypatch,
+):
+    source = _source()
+    repo = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    destination = tmp_path / "exported"
+    authority = source._get_capture_authority(time.monotonic() + 3.0)
+    real_scan = source._verify_exported_tree
+    quarantine_scan_attempts = 0
+
+    monkeypatch.setattr(source, "recapture_matches", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        source,
+        "_verify_public_authority",
+        lambda *, deadline: authority,
+    )
+
+    def fail_only_after_publish(_authority, *, deadline):
+        assert deadline > time.monotonic()
+        if destination.exists():
+            raise source.SourceBoundaryError("synthetic post-publish failure")
+
+    def mutate_after_first_quarantine_scan(*args, **kwargs):
+        nonlocal quarantine_scan_attempts
+        quarantine_scan_attempts += 1
+        result = real_scan(*args, **kwargs)
+        quarantines = list(tmp_path.glob(".exported.bestplan-quarantine-*"))
+        if quarantines:
+            if quarantine_scan_attempts == 1:
+                (quarantines[0] / "tracked.txt").write_bytes(b"forged!!!\n")
+        return result
+
+    monkeypatch.setattr(
+        source, "_verify_public_authority_after", fail_only_after_publish,
+    )
+    monkeypatch.setattr(
+        source, "_verify_exported_tree", mutate_after_first_quarantine_scan,
+    )
+    with pytest.raises(source.SourceBoundaryError, match="quarantined") as raised:
+        source.export_exact_tree(snapshot, destination)
+
+    quarantines = list(tmp_path.glob(".exported.bestplan-quarantine-*"))
+    assert quarantine_scan_attempts >= 2
+    assert not destination.exists()
+    assert len(quarantines) == 1
+    assert "concurrent changes" in str(raised.value)
+    assert (quarantines[0] / "tracked.txt").read_bytes() == b"forged!!!\n"
 
 
 def test_quarantine_classifier_rechecks_regular_path_after_hashing(

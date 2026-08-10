@@ -30,6 +30,7 @@ DEFAULT_SOURCE_OPERATION_SECONDS = 20.0
 _DEFAULT_DEADLINE_SECONDS = DEFAULT_SOURCE_OPERATION_SECONDS
 _BUFFER_SIZE = 1024 * 1024
 _MAX_STABILIZATION_READS = 16
+_STABLE_EXPORT_OBSERVATIONS = 2
 _CAPTURE_CLEANUP_SECONDS = 1.0
 _EXPORT_CLEANUP_SECONDS = 1.0
 _MAX_GIT_METADATA_BYTES = 64 * 1024 * 1024
@@ -4650,23 +4651,34 @@ def _publish_staging_no_replace(
         ) from exc
 
 
-def _verify_published_destination(
-    prepared: _PreparedDestination, *, deadline: float,
+def _verify_owned_destination_name(
+    prepared: _PreparedDestination,
+    leaf: bytes,
+    *,
+    deadline: float,
 ) -> None:
     _remaining(deadline)
-    final = os.stat(
-        prepared.final_leaf,
+    named = os.stat(
+        leaf,
         dir_fd=prepared.parent_fds[-1],
         follow_symlinks=False,
     )
-    if not stat.S_ISDIR(final.st_mode) or (
-        final.st_dev,
-        final.st_ino,
+    if not stat.S_ISDIR(named.st_mode) or (
+        named.st_dev,
+        named.st_ino,
     ) != prepared.root_identity:
         raise SourceBoundaryError(
             "exact-tree destination was substituted during publication"
         )
     _verify_destination_parent(prepared, deadline=deadline)
+
+
+def _verify_published_destination(
+    prepared: _PreparedDestination, *, deadline: float,
+) -> None:
+    _verify_owned_destination_name(
+        prepared, prepared.final_leaf, deadline=deadline,
+    )
 
 
 def _verify_exported_tree(
@@ -4963,30 +4975,10 @@ def _verify_published_exact_tree(
     object_format: str,
     deadline: float,
 ) -> None:
-    """Bind the public destination name around the exact content walk."""
+    """Require two stable, name-bound observations of every published byte."""
 
-    _verify_published_destination(prepared, deadline=deadline)
-    _verify_exported_tree(
-        prepared,
-        entries,
-        witnesses,
-        object_format=object_format,
-        deadline=deadline,
-    )
-    _verify_published_destination(prepared, deadline=deadline)
-
-
-def _quarantined_tree_matches_export(
-    prepared: _PreparedDestination,
-    entries: tuple[_TreeEntry, ...],
-    witnesses: tuple[_ExportWitness, ...],
-    *,
-    object_format: str,
-    deadline: float,
-) -> bool:
-    """Classify a quarantine without deleting or trusting any of its contents."""
-
-    try:
+    for _observation in range(_STABLE_EXPORT_OBSERVATIONS):
+        _verify_published_destination(prepared, deadline=deadline)
         _verify_exported_tree(
             prepared,
             entries,
@@ -4994,6 +4986,35 @@ def _quarantined_tree_matches_export(
             object_format=object_format,
             deadline=deadline,
         )
+        _verify_published_destination(prepared, deadline=deadline)
+
+
+def _quarantined_tree_matches_export(
+    prepared: _PreparedDestination,
+    entries: tuple[_TreeEntry, ...],
+    witnesses: tuple[_ExportWitness, ...],
+    *,
+    quarantine_leaf: bytes,
+    object_format: str,
+    deadline: float,
+) -> bool:
+    """Classify a quarantine only after two stable, name-bound observations."""
+
+    try:
+        for _observation in range(_STABLE_EXPORT_OBSERVATIONS):
+            _verify_owned_destination_name(
+                prepared, quarantine_leaf, deadline=deadline,
+            )
+            _verify_exported_tree(
+                prepared,
+                entries,
+                witnesses,
+                object_format=object_format,
+                deadline=deadline,
+            )
+            _verify_owned_destination_name(
+                prepared, quarantine_leaf, deadline=deadline,
+            )
     except (OSError, SourceBoundaryError):
         return False
     return True
@@ -5061,12 +5082,14 @@ def _quarantine_owned_published(
             "owned exact-tree quarantine identity changed"
         )
     quarantine_path = os.path.join(prepared.canonical_parent, quarantine_leaf)
+    classification_deadline = time.monotonic() + _DEFAULT_DEADLINE_SECONDS
     unchanged = _quarantined_tree_matches_export(
         prepared,
         entries,
         witnesses,
+        quarantine_leaf=quarantine_leaf,
         object_format=object_format,
-        deadline=deadline,
+        deadline=classification_deadline,
     )
     return os.fsdecode(quarantine_path), unchanged
 
