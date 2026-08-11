@@ -135,10 +135,11 @@ authority.
 One explicit local enrollment command creates a content-addressed controller
 export outside the primary repository, pins the interpreter and runtime read
 paths, binds the exact check runtime, validates the check and review policy,
-records the normalized credential-free remote identity and refs, and writes a
-non-secret local enrollment under the Hermes home. It then writes only a
-versioned local-authority pointer and enrollment reference to `config.yaml`.
-The pointer cannot name a network endpoint.
+records the normalized credential-free remote identity and refs, binds finite
+preparation and publication timeout policies, and writes a non-secret local
+enrollment under the Hermes home. It then writes only a versioned
+local-authority pointer and enrollment reference to `config.yaml`. The pointer
+cannot name a network endpoint.
 
 The local enrollment stores stable repository, remote, controller, command,
 and runtime policy. It does not freeze a mutable remote tip for all future
@@ -209,9 +210,9 @@ manifest containing only non-secret identities and digests:
 - ordered candidate, check, and review receipt digests;
 - changed-path digest and expected-artifact digests;
 - local target ref and expected old object ID;
-- remote name, normalized push-identity fingerprint, remote ref, and expected
-  old object ID;
-- publication policy and schema versions.
+- display-only remote name, exact normalized credential-free push URL, its
+  fingerprint, remote ref, and expected old object ID;
+- publication policy, timeout-policy, and schema versions.
 
 The SHA-256 digest of the canonical bytes is the `artifact_digest`. The host
 stores those bytes at a content-addressed, mode-0600 path under the Hermes home
@@ -229,9 +230,10 @@ In a terminal, the operator confirms a prompt bound to the full artifact
 digest. Confirmation writes a short-lived durable approval receipt containing
 the artifact and integration digests, local and remote refs and approved old
 object IDs, remote identity fingerprint, issue and expiry times, and a receipt
-digest. The receipt is single-use except for reconciliation of its already
-recorded effect intent. In a non-interactive shell, preparation stops without
-approval and prints the exact follow-up form:
+digest. It also binds the exact normalized push URL and timeout-policy digest.
+The receipt is single-use except for reconciliation of its already recorded
+effect intent. In a non-interactive shell, preparation stops without approval
+and prints the exact follow-up form:
 
 ```text
 hermes bestplan approve <plan-id> --digest <full-artifact-digest>
@@ -254,8 +256,9 @@ the authority.
 The order is:
 
 1. revalidate the stored plan, contract, source, candidate set, controller,
-   integration ref, checks, review receipt, manifest bytes, local ref, remote
-   identity, and protected ambient state;
+   integration ref, checks, review receipt, manifest bytes, local ref, exact
+   remote URL and fingerprint, approved remote old object ID, and protected
+   ambient state;
 2. record a durable local-publication intent;
 3. advance local `main` only from the approved old object ID to the integration
    object ID;
@@ -263,9 +266,10 @@ The order is:
 5. record the local receipt and `main_fast_forwarded` proof event;
 6. reread the remote and require the approved old object ID;
 7. record a durable remote-publication intent;
-8. push the explicit `<integration-oid>:refs/heads/main` refspec without force;
-9. fetch the authorized remote ref into a private observation ref and require
-   the exact integration object ID;
+8. push the explicit `<integration-oid>:refs/heads/main` refspec to the frozen
+   URL without force;
+9. fetch the authorized remote ref from the frozen URL into a private
+   observation ref and require the exact integration object ID;
 10. record the remote receipt and `remote_verified` proof event.
 
 For a checked-out local `main`, publication uses `git merge --ff-only` with an
@@ -295,6 +299,31 @@ the instant of the server update: a concurrent move to another ancestor of the
 integration commit can be accepted. Exact server-side old-object
 compare-and-swap would require a lease or server API and is outside this
 literal non-force design.
+
+Every remote observation, push, and fetch uses the exact normalized,
+credential-free URL stored in the contract, manifest, and approval receipt.
+The configured remote name is display-only and is never a Git operand.
+Fingerprint comparison brackets each operation. Enrollment accepts only the
+explicit `file`, `ssh`, and `https` transports; helper-style and unknown
+transport schemes fail before approval.
+
+### Bounded execution and cancellation
+
+Enrollment binds finite preparation and publication durations and a cleanup
+reserve into the contract. Their policy digest is also bound into the manifest
+and approval receipt. Each `enroll`, `approve`, `publish`, or `retry` command
+derives one monotonic absolute deadline and one cancellation event from that
+policy. It passes those exact control objects through controller and runtime
+hashing, source scans, model relay calls, review, Git operations, credential
+helpers, observation, and cleanup. No nested operation creates a fresh budget.
+
+Every spawned process starts in an owned process group. Timeout, Ctrl-C, or CLI
+shutdown closes admission, terminates and reaps the group within the reserved
+part of the same deadline, and then observes the affected state. Cancellation
+before an effect intent has no target-ref effect. Cancellation after an intent
+adopts only an exact completed effect; otherwise it retains evidence and
+quarantines the operation. Failure to prove process extinction is itself a
+quarantined failure and never produces a success receipt.
 
 ### Durable state and retry
 
@@ -412,7 +441,8 @@ Use test-driven implementation and keep the following release gates:
    case/Unicode overlap rejection, filter rejection, interrupted checked-out
    update quarantine, local compare-and-swap failure, non-force push, the
    permitted concurrent-ancestor race, non-ancestor rejection, exact
-   post-fetch, and protected-state equality.
+   post-fetch, frozen-URL use despite remote-name retargeting, and
+   protected-state equality.
 4. Recovery tests cover a crash before local effect, after local effect before
    receipt, during a checked-out update, before push, and after push before
    receipt. They prove exact observe-before-retry and quarantine on mismatch.
@@ -421,7 +451,9 @@ Use test-driven implementation and keep the following release gates:
    live worker objects.
 6. CLI tests prove the production-shaped capture-to-`/go` authority factory,
    read-only status, separate durable exact-digest approval, non-interactive
-   no-effect preparation, expired approval, and fixed redacted errors.
+   no-effect preparation, expired approval, one propagated absolute deadline
+   and cancellation event, process-group extinction, and fixed redacted
+   errors.
 7. One end-to-end test drives candidates through integration, checks, review,
    manifest, approval, local publication, remote publication, and final
    `remote_verified` state. It asserts no live or activation call occurs.
@@ -491,11 +523,15 @@ The reduced release is complete only when:
 - approval binds the exact manifest, integration, local target, and remote
   target in a durable short-lived receipt and expires before an unstarted
   effect;
+- every preparation, publication, retry, and cleanup operation shares its
+  bound absolute deadline and cancellation event and leaves no live child;
 - protected dirty work remains exact and overlapping incoming paths block;
 - checked-out local `main` advances by a hook-free, no-autostash fast-forward
   only from the approved old object ID, or ambiguous partial state is
   quarantined;
 - the push is explicit and non-force;
+- every remote operation uses the approved frozen URL, never the mutable remote
+  alias;
 - an independent fetch observes the authorized remote ref at the exact
   integration object ID;
 - crash retry adopts only an exact intended effect and quarantines ambiguity;
