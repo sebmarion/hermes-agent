@@ -121,6 +121,12 @@ budget, token budget, and expiry. Credentials are held only by the foreground
 host and are not part of that record. Ambiguous or unsupported provider routes
 fail before launch.
 
+The Task 5 dispatcher passes the complete manifest-bound `resolved_runtime` to
+a per-attempt authority-client factory before `run_and_freeze_candidate`.
+Capability registration includes and rechecks that route digest; it never
+infers a provider route from the model name. The review launcher applies the
+same rule to its exact bound lane and route.
+
 One CLI-owned factory in `agent/bestplan_local_authority.py` is the sole
 production constructor. It loads the local enrollment, rebuilds and verifies
 the retained `BestplanHostRuntime`, constructs the relay, and attaches
@@ -173,6 +179,29 @@ these rows instead of live `FrozenCandidate` objects or redacted prose. It
 recomputes every digest, reconstructs `CandidateIntegrationBinding`, and
 rereads the exact private ref, commit, sole parent, tree, and changed paths
 before integration.
+
+### Promotion evidence persistence
+
+The later foreground commands must also survive restart after integration,
+checks, or review. The host therefore serializes canonical, non-secret forms of
+`FrozenIntegration`, `CheckSetReceipt`, and the strict review receipt. Each
+record retains every field needed to reconstruct its frozen type, including
+ordered applied-candidate and check receipts, exact object and contract
+bindings, review findings, packet digest, output digests, and receipt digest.
+Review findings pass through the existing bounded redaction boundary: the
+receipt keeps severity, stable location/code fields, a bounded redacted
+summary, and the full-text digest, never raw model prose. Redacted event prose
+is never the reconstruction source.
+
+The host first writes, fsyncs, rereads, and verifies each content-addressed
+mode-0600 evidence file. One proof-ledger transaction then binds its exact path
+and digest to the matching `integrated_proven`, `tests_verified`, or
+`review_verified` event. The manifest uses the same rule for
+`artifact_frozen`. A crash before the transaction leaves only an unreferenced
+file; an authority event can never name missing or partial evidence. On every
+later command, the reader reloads the canonical bytes, recomputes all receipt
+digests, revalidates the integration Git objects and refs, and rejects missing,
+extra, conflicting, or redacted-only evidence.
 
 ### Commit-bound review
 
@@ -249,19 +278,20 @@ new manifest and approval.
 ### Publication coordinator
 
 The foreground coordinator uses a same-user lock keyed by canonical Git common
-directory identity. The lock reduces accidental concurrent work; the local
-object-ID compare-and-swap and remote fast-forward plus final observation remain
-the authority.
+directory identity. The lock reduces accidental concurrent work. A
+non-checked-out local ref uses object-ID compare-and-swap. Checked-out local and
+remote refs use a pre-read, fast-forward-only effect, and exact final
+observation with the race limits stated below.
 
 The order is:
 
 1. revalidate the stored plan, contract, source, candidate set, controller,
-   integration ref, checks, review receipt, manifest bytes, local ref, exact
-   remote URL and fingerprint, approved remote old object ID, and protected
-   ambient state;
+   integration ref, checks, review receipt, manifest bytes, approved local old
+   object ID, exact remote URL and fingerprint, approved remote old object ID,
+   and protected ambient state;
 2. record a durable local-publication intent;
-3. advance local `main` only from the approved old object ID to the integration
-   object ID;
+3. reread the approved local old object ID and request a fast-forward to the
+   integration object ID;
 4. reread local `main`, the integration commit, and protected ambient state;
 5. record the local receipt and `main_fast_forwarded` proof event;
 6. reread the remote and require the approved old object ID;
@@ -276,12 +306,21 @@ For a checked-out local `main`, publication uses `git merge --ff-only` with an
 empty host-owned hooks directory and autostash disabled. It does so only after
 the source boundary proves every incoming path is disjoint from staged,
 unstaged, and untracked protected work. It rejects checkout filters and
-`working-tree-encoding` on incoming paths. After the update it requires the
+`working-tree-encoding` on incoming paths. A no-follow, component-wise scan of
+every incoming path and ancestor also rejects ignored and nonignored
+filesystem entries, symlink ancestors, and casefold or Unicode aliases that
+Git's normal untracked listing can omit. After the update it requires the
 logical staged, unstaged, untracked, mode, symlink, and byte state of every
 protected path to match the pre-effect snapshot. It does not require unrelated
 index entries changed by the fast-forward to remain byte-identical. For a
 target ref that is not checked out, it uses
 `update-ref <new> <expected-old>`.
+
+`git merge --ff-only` has no expected-old operand. After the final local
+pre-read, a concurrent move to another ancestor of the integration commit can
+therefore be accepted; a move to a non-ancestor fails. The final read must
+still equal the integration commit. Exact old-object compare-and-swap is
+claimed only for a non-checked-out ref updated with `update-ref`.
 
 An interrupted checked-out fast-forward is not repaired automatically. Retry
 may adopt it only if `HEAD` equals the integration commit, incoming index and
@@ -309,13 +348,19 @@ transport schemes fail before approval.
 
 ### Bounded execution and cancellation
 
-Enrollment binds finite preparation and publication durations and a cleanup
-reserve into the contract. Their policy digest is also bound into the manifest
-and approval receipt. Each `enroll`, `approve`, `publish`, or `retry` command
-derives one monotonic absolute deadline and one cancellation event from that
-policy. It passes those exact control objects through controller and runtime
-hashing, source scans, model relay calls, review, Git operations, credential
-helpers, observation, and cleanup. No nested operation creates a fresh budget.
+Enrollment binds finite capture, preparation, and publication durations and a
+cleanup reserve into the contract. Their policy digest is also bound into the
+manifest and approval receipt. Before any remote or credential-helper work,
+plan capture reads the local policy and derives one monotonic absolute deadline
+and one cancellation event. It passes them through enrollment lookup, remote
+observation, source capture, and cleanup. Capture failure stores no protocol-2
+plan row.
+
+Each `enroll`, `approve`, `publish`, or `retry` command likewise derives one
+monotonic absolute deadline and one cancellation event from the bound policy.
+It passes those exact control objects through controller and runtime hashing,
+source scans, model relay calls, review, Git operations, credential helpers,
+observation, and cleanup. No nested operation creates a fresh budget.
 
 Every spawned process starts in an owned process group. Timeout, Ctrl-C, or CLI
 shutdown closes admission, terminates and reaps the group within the reserved
@@ -434,21 +479,24 @@ Use test-driven implementation and keep the following release gates:
    commit and packet binding, blocking severities, malformed/unavailable
    behavior, and credential-free no-tool isolation.
 2. Local-authority tests prove retained controller/runtime pinning, route-bound
-   capability accounting, production CLI construction and shutdown, revocation,
-   and no worker/reviewer credentials.
+   per-attempt capability accounting, production CLI construction and shutdown,
+   capture-time remote deadline propagation, revocation, and no
+   worker/reviewer credentials.
 3. Real-Git publication tests use temporary clones and a bare remote. They
-   cover clean and dirty-disjoint fast-forward, staged/unstaged/untracked and
-   case/Unicode overlap rejection, filter rejection, interrupted checked-out
-   update quarantine, local compare-and-swap failure, non-force push, the
-   permitted concurrent-ancestor race, non-ancestor rejection, exact
-   post-fetch, frozen-URL use despite remote-name retargeting, and
+   cover clean and dirty-disjoint fast-forward, staged, unstaged, untracked,
+   ignored, ancestor, and case/Unicode overlap rejection, filter rejection,
+   interrupted checked-out update quarantine, detached-ref compare-and-swap
+   failure, the permitted checked-out concurrent-ancestor race, non-force push,
+   the permitted remote concurrent-ancestor race, non-ancestor rejection,
+   exact post-fetch, frozen-URL use despite remote-name retargeting, and
    protected-state equality.
 4. Recovery tests cover a crash before local effect, after local effect before
    receipt, during a checked-out update, before push, and after push before
    receipt. They prove exact observe-before-retry and quarantine on mismatch.
 5. Persistence tests restart after candidate-ready and reconstruct the exact
    manifest-ordered `CandidateIntegrationBinding` set without model output or
-   live worker objects.
+   live worker objects. They also restart after integration, checks, review,
+   and artifact freeze and reconstruct every exact canonical receipt.
 6. CLI tests prove the production-shaped capture-to-`/go` authority factory,
    read-only status, separate durable exact-digest approval, non-interactive
    no-effect preparation, expired approval, one propagated absolute deadline
@@ -518,6 +566,8 @@ The reduced release is complete only when:
   credential;
 - the reviewer runs the exact approved command from the retained controller;
 - checks and review bind the exact integration commit;
+- integration, check, review, and artifact evidence reloads exactly after a
+  process restart and is atomically bound to its authority phase;
 - critical/high or malformed review output blocks before publication;
 - the content-addressed publication manifest rereads to its recorded digest;
 - approval binds the exact manifest, integration, local target, and remote
@@ -526,9 +576,9 @@ The reduced release is complete only when:
 - every preparation, publication, retry, and cleanup operation shares its
   bound absolute deadline and cancellation event and leaves no live child;
 - protected dirty work remains exact and overlapping incoming paths block;
-- checked-out local `main` advances by a hook-free, no-autostash fast-forward
-  only from the approved old object ID, or ambiguous partial state is
-  quarantined;
+- checked-out local `main` uses the approved-old pre-read, a hook-free and
+  no-autostash fast-forward, and exact final observation within the stated
+  concurrent-ancestor race limit; ambiguous partial state is quarantined;
 - the push is explicit and non-force;
 - every remote operation uses the approved frozen URL, never the mutable remote
   alias;
