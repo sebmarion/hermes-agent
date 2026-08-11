@@ -10,10 +10,11 @@ BestPlan will:
 1. produce isolated candidate commits with the existing Tasks 1-5 pipeline;
 2. integrate and run the existing Task 6 checks;
 3. obtain a strict review bound to the exact integration commit;
-4. freeze a content-addressed publication manifest and receipt;
+4. freeze a content-addressed publication manifest;
 5. show the exact local and remote publication target to the operator;
-6. publish only after an explicit terminal approval;
-7. stop after it independently verifies the authorized remote ref.
+6. record a short-lived approval for that exact manifest;
+7. publish only when a foreground command consumes that approval;
+8. stop after it independently verifies the authorized remote ref.
 
 BestPlan will not activate a service, restart the gateway, claim that published
 code is live, or mark the plan `completed_verified`.
@@ -27,9 +28,9 @@ automatic rollback, and exhaustive crash matrix.
 
 The reduced release proves this statement:
 
-> One explicit operator action published the exact checked and reviewed
-> integration commit to the approved local and remote refs without force and
-> without discarding protected working-tree changes.
+> Publication occurred only after an explicit operator approval, and it moved
+> the approved local and remote refs to the exact checked and reviewed
+> integration commit without force or loss of protected working-tree changes.
 
 It does not prove that a service runs that commit.
 
@@ -54,8 +55,9 @@ is also outside this reduced claim.
 Candidate and reviewer subprocesses still receive no provider, Git, SSH,
 deployment, or cloud credentials. A same-user foreground host relay owns model
 credentials and forwards only bounded, capability-bound model requests. The
-publisher may use the operator's existing Git authentication only after the
-operator approves the frozen publication packet.
+foreground authority may use the operator's Git authentication for read-only
+remote observation during capture and approval preparation. It may request a
+remote write only after the operator approves the frozen publication packet.
 
 ## Supported scope
 
@@ -67,7 +69,8 @@ The first reduced release supports:
 - the existing maximum of two independent candidate slices;
 - current Task 4 macOS candidate containment;
 - current Task 6 integration and sandboxed checks;
-- OpenAI-compatible chat-completions candidate and review lanes;
+- candidate and review lanes supported by the existing bounded brokered-chat
+  transport;
 - explicit non-force publication;
 - foreground retry and reconciliation;
 - one local, same-user enrollment per repository.
@@ -77,8 +80,8 @@ remain read-only or candidate-only. `auto_live` is disabled for this release.
 
 The release fails closed for unsupported repositories already rejected by
 Tasks 1-6, dependency graphs, ambiguous model routes, unavailable reviewers,
-non-interactive publication without an exact digest, remote drift, dirty-path
-overlap, and any identity mismatch.
+non-interactive approval without an exact digest, observed pre-effect remote
+drift, dirty-path overlap, and any identity mismatch.
 
 ## Approaches considered
 
@@ -112,20 +115,63 @@ test seams:
 
 The adapter is not a daemon. It has no listening network service. It keeps
 model capabilities in memory and revokes them when each child exits. It binds
-each capability to one resolved route, provider, model, process identity,
-request budget, token budget, and expiry. Ambiguous or unsupported provider
-routes fail before launch.
+each capability to one canonical route record: lane, provider, model,
+normalized endpoint, API mode, route fingerprint, process identity, request
+budget, token budget, and expiry. Credentials are held only by the foreground
+host and are not part of that record. Ambiguous or unsupported provider routes
+fail before launch.
+
+One CLI-owned factory in `agent/bestplan_local_authority.py` is the sole
+production constructor. It loads the local enrollment, rebuilds and verifies
+the retained `BestplanHostRuntime`, constructs the relay, and attaches
+`candidate_host_runtime` and `bestplan_authority_client` to the CLI agent
+before BestPlan capture or `/go`. The execution, approval, publication, and
+retry commands use the same factory. Read-only `status` uses a separate pure
+reader and does not construct the relay. CLI shutdown revokes every capability
+and closes the relay. Gateway, messaging, background, and scheduler
+construction paths never call this factory and never receive publication
+authority.
 
 One explicit local enrollment command creates a content-addressed controller
 export outside the primary repository, pins the interpreter and runtime read
-paths, validates the check and review policy, records the normalized
-credential-free remote identity, and writes a non-secret local enrollment. It
-then writes only the local authority pointer and enrollment reference to
-`config.yaml`.
+paths, binds the exact check runtime, validates the check and review policy,
+records the normalized credential-free remote identity and refs, and writes a
+non-secret local enrollment under the Hermes home. It then writes only a
+versioned local-authority pointer and enrollment reference to `config.yaml`.
+The pointer cannot name a network endpoint.
+
+The local enrollment stores stable repository, remote, controller, command,
+and runtime policy. It does not freeze a mutable remote tip for all future
+plans. At each plan capture, the local authority observes the approved remote
+ref and binds that object ID into the new contract and digest. Missing,
+ambiguous, or changed remote identity blocks capture.
 
 Every use rehashes the retained controller and pinned runtime. A mismatch
 blocks before a worker starts. Refreshing that controller is a separate
 explicit operator action; publication does not advance it automatically.
+
+### Candidate binding persistence
+
+Publication must work after the original candidate process and CLI have
+exited. Protocol 2 therefore gains an append-only candidate-integration
+binding record for each manifest slice. Its canonical non-secret fields are:
+
+- manifest index and original manifest slice ID;
+- candidate, slice, and attempt IDs;
+- exact private candidate ref, commit, tree, and base object IDs;
+- sorted lossless `changed_paths_hex` values;
+- approval, contract, source, sandbox-policy, and candidate-receipt digests;
+- controller ID, repository ID, release object ID, and artifact digest;
+- the recomputed candidate-integration binding digest.
+
+A single proof-ledger transaction stores the complete manifest-ordered set of
+candidate receipts and binding records, verifies that no extra or conflicting
+row exists, and then appends the one `candidate_ready` authority event. A crash
+cannot expose `candidate_ready` with a partial binding set. Publication reloads
+these rows instead of live `FrozenCandidate` objects or redacted prose. It
+recomputes every digest, reconstructs `CandidateIntegrationBinding`, and
+rereads the exact private ref, commit, sole parent, tree, and changed paths
+before integration.
 
 ### Commit-bound review
 
@@ -138,10 +184,15 @@ Add a strict review packet and receipt. The host constructs the packet from:
 - project contribution rules;
 - the requested acceptance criteria.
 
-The isolated reviewer receives no file or terminal tools. It receives the
-bounded packet through the same-user model relay and must return one canonical
-JSON object. The response names the exact integration object ID and packet
-digest. Findings use only `critical`, `high`, `medium`, or `low`.
+The retained controller launches the exact pinned
+`contract.review.command`. That static worker imports no code from the
+integration tree. The host passes the dynamic packet through a bounded
+inherited channel rather than changing the approved command. The worker uses
+the exact bound review lane through the same-user relay. It receives no file
+or terminal tools, provider credentials, or publication credentials, and it
+must return one canonical JSON object. The response names the exact integration
+object ID and packet digest. Findings use only `critical`, `high`, `medium`, or
+`low`.
 
 Critical or high findings block. Timeout, unavailable routing, malformed JSON,
 unknown severity, missing fields, output overflow, or an identity mismatch
@@ -169,29 +220,36 @@ identical. This is an audit manifest, not a deployable source bundle.
 
 ### Operator approval
 
-`hermes bestplan publish <plan-id>` runs integration, checks, review, and
-manifest preparation in the foreground. It then prints a compact summary with
-the exact integration object ID, artifact digest, changed paths, check result,
-review findings, local target, and remote target.
+`hermes bestplan approve <plan-id>` runs or reuses integration, checks, review,
+and manifest preparation in the foreground. It then prints a compact summary
+with the exact integration object ID, artifact digest, changed paths, check
+result, review findings, local target, and remote target.
 
 In a terminal, the operator confirms a prompt bound to the full artifact
-digest. In a non-interactive shell, preparation stops without mutation and
-prints the exact follow-up form:
+digest. Confirmation writes a short-lived durable approval receipt containing
+the artifact and integration digests, local and remote refs and approved old
+object IDs, remote identity fingerprint, issue and expiry times, and a receipt
+digest. The receipt is single-use except for reconciliation of its already
+recorded effect intent. In a non-interactive shell, preparation stops without
+approval and prints the exact follow-up form:
 
 ```text
-hermes bestplan publish <plan-id> --approve <full-artifact-digest>
+hermes bestplan approve <plan-id> --digest <full-artifact-digest>
 ```
 
-There is no unbound `--yes` option. Approval expires before the first external
-effect. Once a matching effect intent is durable, retry may reconcile that
-same exact operation after expiry. A different integration, artifact, local
-tip, remote tip, ref, or remote identity requires a new manifest and approval.
+There is no unbound `--yes` option. `hermes bestplan publish <plan-id>` never
+prompts and consumes only that exact stored receipt. Approval expires before
+the first external effect. Once a matching effect intent is durable, retry may
+reconcile that same exact operation after expiry. A different integration,
+artifact, local tip, pre-effect remote tip, ref, or remote identity requires a
+new manifest and approval.
 
 ### Publication coordinator
 
 The foreground coordinator uses a same-user lock keyed by canonical Git common
 directory identity. The lock reduces accidental concurrent work; the local
-and remote compare-and-swap checks remain the authority.
+object-ID compare-and-swap and remote fast-forward plus final observation remain
+the authority.
 
 The order is:
 
@@ -210,26 +268,43 @@ The order is:
    the exact integration object ID;
 10. record the remote receipt and `remote_verified` proof event.
 
-For a checked-out local `main`, publication uses a fast-forward-only Git update
-with hooks and autostash disabled, but only after the existing source boundary
-proves every incoming path is disjoint from staged, unstaged, and untracked
-protected work. It then requires the protected files, modes, links, and index
-state to remain exact. For a target ref that is not checked out, it uses
+For a checked-out local `main`, publication uses `git merge --ff-only` with an
+empty host-owned hooks directory and autostash disabled. It does so only after
+the source boundary proves every incoming path is disjoint from staged,
+unstaged, and untracked protected work. It rejects checkout filters and
+`working-tree-encoding` on incoming paths. After the update it requires the
+logical staged, unstaged, untracked, mode, symlink, and byte state of every
+protected path to match the pre-effect snapshot. It does not require unrelated
+index entries changed by the fast-forward to remain byte-identical. For a
+target ref that is not checked out, it uses
 `update-ref <new> <expected-old>`.
 
-The remote guarantee is precise: the publisher first observes the approved old
-remote object ID, performs a normal non-force push, and then independently
-fetches the ref and requires the exact integration object ID. A concurrent
-change causes rejection or a post-fetch mismatch. The design does not claim a
-server-side old-object compare-and-swap beyond the remote's normal non-force
-receive rule.
+An interrupted checked-out fast-forward is not repaired automatically. Retry
+may adopt it only if `HEAD` equals the integration commit, incoming index and
+worktree state match that commit, and protected state is exact. It may retry
+from the old object ID only if the full captured pre-effect state is exact.
+Every partial or ambiguous state is quarantined for manual reconciliation.
+
+The remote guarantee is precise: immediately before push, the publisher
+observes and requires the approved old remote object ID. It then requests a
+normal fast-forward, non-force update and independently fetches the ref and
+requires the exact integration object ID. Under correct Git receive rules it
+cannot overwrite a remote tip that is not an ancestor of the integration
+commit. It does not prove that the approved old object ID was still present at
+the instant of the server update: a concurrent move to another ancestor of the
+integration commit can be accepted. Exact server-side old-object
+compare-and-swap would require a lease or server API and is outside this
+literal non-force design.
 
 ### Durable state and retry
 
 Add a separate operator-publication ledger. It stores the immutable operation
-fingerprint, approval issue and expiry times, expected and observed local and
+fingerprint, approval receipt and expiry, expected and observed local and
 remote object IDs, effect intents, receipts, status, and fixed error code. It
-stores no credential or raw command output.
+stores no credential or raw command output. Candidate-integration binding rows
+remain in the proof ledger because they are prerequisites of the
+`candidate_ready` authority event; publication intents remain in this separate
+operator ledger.
 
 Every effect follows:
 
@@ -250,18 +325,34 @@ Ambiguous state is quarantined for operator action.
 
 ### Proof and terminal state
 
-Add `operator_publish` as an explicit promotion mode. `candidate_only` still
-stops at `candidate_ready`. Existing `auto_live` contracts are not silently
-downgraded; they must be recaptured under the new mode.
+Add `operator_publish` as an explicit promotion mode and bump the exact
+enrollment and contract schema versions. An `operator_publish` enrollment
+requires a controller and zero live targets; its contract serializes
+`live_target: null`. `auto_live` retains exactly one fully bound live target.
+`candidate_only` keeps its existing compatibility shape and still stops at
+`candidate_ready`. Existing contracts are never silently reinterpreted or
+downgraded; they must be recaptured under the new schema and mode.
 
-The existing proof phases through `remote_verified` remain valid. For an
-`operator_publish` contract only, `remote_verified` projects
-`completed_unverified`. This is truthful: the approved publication completed,
-but no live target was verified. The row keeps `current_phase=remote_verified`
-and `remote_verified_at` for precise status.
+Integration accepts `operator_publish` as well as the existing `auto_live`
+mode, while binding the selected mode into its receipt. Candidate-only plans
+cannot enter integration or publication.
+
+The existing proof phases through `remote_verified` remain valid. One
+mode-aware invariant applies in event append validation, SQLite triggers,
+replay, rebuild, terminal verification, and status projection:
+
+- `operator_publish + remote_verified` projects `completed_unverified`;
+- `auto_live + remote_verified` remains running;
+- `candidate_only` cannot publish.
+
+The operator row keeps `current_phase=remote_verified` and
+`remote_verified_at` for precise status. This is truthful: the approved
+publication completed, but no live target was verified.
 
 The reduced flow never writes `live_verified`, never calls the verified setter,
-and never produces `completed_verified` or a live verification receipt.
+and never produces `completed_verified`, `AuthorityVerification`, or a live
+verification receipt. Proof replay rejects any such relation for
+`operator_publish` without weakening the existing `auto_live` rules.
 
 ### CLI surface
 
@@ -272,8 +363,10 @@ The reduced CLI is:
   local enrollment and retained controller after rendered confirmation;
 - `hermes bestplan status [plan-id]` — read-only local phase, exact identities,
   approval state, and blocker summary;
-- `hermes bestplan publish <plan-id> [--approve <digest>]` — prepare, approve,
-  and publish one exact packet;
+- `hermes bestplan approve <plan-id> [--digest <digest>]` — prepare and approve
+  one exact, short-lived packet;
+- `hermes bestplan publish <plan-id>` — consume the stored approval and publish
+  that packet in the foreground;
 - `hermes bestplan retry <plan-id>` — reconcile one already-approved partial
   publication.
 
@@ -286,13 +379,15 @@ activation command, or rollback command is added.
 
 ## Failure behavior
 
-Before operator approval, every failure has zero local-ref or remote-ref
-effect. Check or review failures preserve their bounded evidence and stop.
+Before operator approval, every failure has zero local-target or remote-target
+ref effect. Private candidate and integration refs and bounded evidence can be
+retained. Check or review failures preserve their bounded evidence and stop.
 
 Before the local effect, target, contract, candidate, review, manifest, dirty
-state, or remote drift invalidates approval. After an effect intent, retry can
-adopt only the exact intended object ID. A different object ID never inherits
-approval.
+state, or observed pre-effect remote drift invalidates approval. A remote move
+that races after the final read follows the narrower non-force guarantee above.
+After an effect intent, retry can adopt only the exact intended object ID. A
+different object ID never inherits approval.
 
 The publisher never runs stash, reset, clean, rebase, force-push, or an ambient
 auto-commit. It never deletes candidate, integration, manifest, or publication
@@ -306,23 +401,31 @@ fallback.
 
 Use test-driven implementation and keep the following release gates:
 
-1. Review tests prove exact commit and packet binding, blocking severities,
-   malformed/unavailable behavior, and credential-free no-tool isolation.
+1. Review tests prove the exact approved command, retained-controller origin,
+   commit and packet binding, blocking severities, malformed/unavailable
+   behavior, and credential-free no-tool isolation.
 2. Local-authority tests prove retained controller/runtime pinning, route-bound
-   capability accounting, revocation, and no worker/reviewer credentials.
+   capability accounting, production CLI construction and shutdown, revocation,
+   and no worker/reviewer credentials.
 3. Real-Git publication tests use temporary clones and a bare remote. They
    cover clean and dirty-disjoint fast-forward, staged/unstaged/untracked and
-   case/Unicode overlap rejection, local compare-and-swap failure, non-force
-   push, remote race/rejection, exact post-fetch, and protected-state equality.
+   case/Unicode overlap rejection, filter rejection, interrupted checked-out
+   update quarantine, local compare-and-swap failure, non-force push, the
+   permitted concurrent-ancestor race, non-ancestor rejection, exact
+   post-fetch, and protected-state equality.
 4. Recovery tests cover a crash before local effect, after local effect before
-   receipt, before push, and after push before receipt. They prove exact
-   observe-before-retry and quarantine on mismatch.
-5. CLI tests prove read-only status, exact-digest approval, non-interactive
+   receipt, during a checked-out update, before push, and after push before
+   receipt. They prove exact observe-before-retry and quarantine on mismatch.
+5. Persistence tests restart after candidate-ready and reconstruct the exact
+   manifest-ordered `CandidateIntegrationBinding` set without model output or
+   live worker objects.
+6. CLI tests prove the production-shaped capture-to-`/go` authority factory,
+   read-only status, separate durable exact-digest approval, non-interactive
    no-effect preparation, expired approval, and fixed redacted errors.
-6. One end-to-end test drives candidates through integration, checks, review,
+7. One end-to-end test drives candidates through integration, checks, review,
    manifest, approval, local publication, remote publication, and final
    `remote_verified` state. It asserts no live or activation call occurs.
-7. Run the focused BestPlan suite, then the complete project suite before
+8. Run the focused BestPlan suite, then the complete project suite before
    release.
 
 This intentionally omits the original exhaustive test of every possible
@@ -350,8 +453,9 @@ Modify:
 - `agent/bestplan_promotion.py`
 - `tools/delegate_tool.py`
 - `hermes_cli/subcommands/bestplan.py`
-- the CLI construction seam that attaches the local authority to the parent
-  agent;
+- `hermes_cli/cli_agent_setup_mixin.py` and `cli.py`, which attach and close the
+  local authority for interactive CLI use only;
+- BestPlan config defaults and validation for the versioned local pointer;
 - focused contract, proof, candidate, promotion, host-ingress, and CLI tests;
 - BestPlan CLI documentation.
 
@@ -360,9 +464,10 @@ rollback, or deployment-service modules.
 
 ## Delivery slices and estimate
 
-1. Same-user local enrollment, retained controller, and model relay: 2-3 days.
-2. Commit-bound strict review: 2-3 days.
-3. Manifest, operator approval, and proof projection: 2-3 days.
+1. Same-user local enrollment, retained controller, model relay, and CLI
+   construction: 2-3 days.
+2. Durable candidate bindings and commit-bound strict review: 2-3 days.
+3. Manifest, separate operator approval, and proof projection: 2-3 days.
 4. Dirty-preserving local and non-force remote publication with retry: 4-6 days.
 5. CLI, one end-to-end test, focused suite, and full-suite fixes: 2-3 days.
 
@@ -375,15 +480,21 @@ The reduced release is complete only when:
 
 - production CLI candidate execution has a real retained controller and model
   relay rather than a test-only injected host;
+- candidate-ready persists and reloads every exact integration binding without
+  depending on redacted output or a live worker;
 - candidate and reviewer subprocesses contain no provider or publication
   credential;
+- the reviewer runs the exact approved command from the retained controller;
 - checks and review bind the exact integration commit;
 - critical/high or malformed review output blocks before publication;
 - the content-addressed publication manifest rereads to its recorded digest;
 - approval binds the exact manifest, integration, local target, and remote
-  target and expires before an unstarted effect;
+  target in a durable short-lived receipt and expires before an unstarted
+  effect;
 - protected dirty work remains exact and overlapping incoming paths block;
-- local `main` advances only from the approved old object ID;
+- checked-out local `main` advances by a hook-free, no-autostash fast-forward
+  only from the approved old object ID, or ambiguous partial state is
+  quarantined;
 - the push is explicit and non-force;
 - an independent fetch observes the authorized remote ref at the exact
   integration object ID;
