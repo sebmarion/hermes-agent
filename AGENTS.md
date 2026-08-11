@@ -1486,21 +1486,6 @@ navigate safely.
 - Choose the simplest implementation that fully meets the current requirements.
 - Prefer established, well-maintained libraries over custom implementations.
 
-### Writing standards
-
-Write agent instructions, documentation, messages, comments, and user-facing
-text in ASD-STE100 (Simplified Technical English):
-
-Apply Zinsser's four principles:
-
-- **Simplicity:** Use common words and short sentences.
-- **Brevity:** Remove words that do not add meaning.
-- **Clarity:** Use active voice. State one idea per sentence. Make the action,
-  result, and next step clear.
-- **Humanity:** Use a respectful, natural tone.
-
-Define a required technical term the first time you use it.
-
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
