@@ -292,6 +292,132 @@ class ProofEventReceipt:
         }
 
 
+_LOCAL_TERMINAL_AUTHORITY_FIELDS = (
+    "integration_oid",
+    "artifact_digest",
+    "candidate_set_digest",
+    "proof_authority_epoch",
+    "proof_event_seq",
+    "proof_event_hash",
+    "verification_receipt_json",
+    "verification_receipt_digest",
+    "tests_verified_at",
+    "review_verified_at",
+    "remote_verified_at",
+    "live_verified_at",
+    "completed_at",
+    "verified_at",
+)
+_LOCAL_POST_LANDING_PUSH_STATES = frozenset(
+    {"awaiting", "pushing", "effect_unknown", "pushed", "declined", "expired", "stale"}
+)
+_LOCAL_FAILED_PUSH_STATES = frozenset({"expired", "not_landed", "stale"})
+
+
+def _validate_local_terminal_overlay(
+    values: Mapping[str, Any],
+    validated_plan: Any,
+    authority: list[ProofEventReceipt],
+    advisory: list[ProofEventReceipt],
+) -> bool:
+    """Accept only the exact host-owned terminal shape for local ``go``."""
+
+    contract = getattr(validated_plan, "contract", None)
+    state = values.get("state")
+    is_local = (
+        isinstance(contract, Mapping)
+        and contract.get("schema") == "hermes.bestplan.local-go.v1"
+        and contract.get("version") == 1
+        and contract.get("mode") == "local_main"
+    )
+    if not is_local or state not in {"completed_local", "failed"}:
+        return False
+    if authority:
+        raise ProofValidationError("local terminal overlay has authority events")
+    if (
+        values.get("current_phase") != "captured"
+        or any(values.get(name) is not None for name in _LOCAL_TERMINAL_AUTHORITY_FIELDS)
+    ):
+        raise ProofValidationError("local terminal overlay has authority projection")
+    if values.get("dispatch_state") != "terminal" or values.get("dispatch_owner") is not None:
+        raise ProofValidationError("local terminal overlay dispatch is not terminal")
+    if not advisory:
+        raise ProofValidationError("local terminal overlay has no advisory")
+
+    latest = advisory[-1]
+    push_state = values.get("local_push_state")
+    push_json = values.get("local_push_json")
+    if state == "completed_local":
+        if push_state not in _LOCAL_POST_LANDING_PUSH_STATES or not isinstance(
+            push_json, str,
+        ):
+            raise ProofValidationError("local landing push projection is invalid")
+        expected_kind = "local_landing_recovered_advisory"
+        expected_error = None
+        expected_source = "process"
+        expected_output = {"status": "local_landing_recovered"}
+    elif push_json is None and push_state is None:
+        expected_kind = "local_execution_failed_advisory"
+        expected_error = "dispatch_failed"
+        expected_source = "async"
+        expected_output = {"status": "local_execution_failed"}
+    else:
+        if push_state not in _LOCAL_FAILED_PUSH_STATES or not isinstance(push_json, str):
+            raise ProofValidationError("local failure push projection is invalid")
+        expected_kind = "local_execution_reconciled_failed_advisory"
+        expected_error = "dispatch_failed"
+        expected_source = "process"
+        expected_output = {
+            "status": "local_execution_failed",
+            "local_push_state": push_state,
+        }
+
+    if push_json is not None:
+        try:
+            from agent.bestplan_local_push import decode_local_push_row
+
+            decode_local_push_row(values, lambda _row: validated_plan)
+        except Exception:
+            raise ProofValidationError(
+                "local terminal push record failed revalidation"
+            ) from None
+    if (
+        latest.kind != expected_kind
+        or latest.previous_phase != "captured"
+        or latest.phase != "captured"
+        or latest.projected_state not in {"running", "waiting"}
+        or latest.origin != "gateway"
+        or latest.approval_digest != values.get("approval_digest")
+        or latest.contract_digest != values.get("promotion_contract_digest")
+        or latest.source_snapshot_digest != values.get("source_snapshot_digest")
+        or latest.base_oid != values.get("baseline_revision")
+        or latest.integration_oid is not None
+        or latest.artifact_digest is not None
+        or latest.candidate_set_digest is not None
+        or latest.contract_digest_input is not None
+        or latest.compatibility_error != expected_error
+        or latest.compatibility_dispatch_state != "terminal"
+        or latest.compatibility_delegation_ids_json is not None
+        or latest.compatibility_sandbox_workspace is not None
+        or latest.compatibility_clear_dispatch_owner != 1
+    ):
+        raise ProofValidationError("local terminal advisory differs")
+    try:
+        expected_redaction = redact_output(expected_output, source=expected_source)
+    except RedactionError:
+        raise ProofValidationError("local terminal advisory cannot be redacted") from None
+    if (
+        latest.payload_json != expected_redaction.canonical_json
+        or latest.payload_digest
+        != _digest(expected_redaction.canonical_json, REDACTED_DIGEST_DOMAIN)
+        or latest.raw_output_sha256 != expected_redaction.raw_sha256
+        or latest.raw_output_kind != expected_redaction.raw_kind
+        or latest.raw_output_framed_sha256 != expected_redaction.raw_framed_sha256
+    ):
+        raise ProofValidationError("local terminal advisory payload differs")
+    return True
+
+
 @dataclass(frozen=True)
 class CandidateReceipt:
     plan_id: str
@@ -2377,6 +2503,7 @@ class ProofLedger:
                 CandidateReceipt.from_row(candidate_row)
             )
         authority = [event for event in events if event.stream == "authority"]
+        advisory = [event for event in events if event.stream == "advisory"]
         previous_phase = "captured"
         previous_integration = None
         previous_artifact = None
@@ -2388,11 +2515,15 @@ class ProofLedger:
             "source_snapshot_digest": values.get("source_snapshot_digest"),
             "base_oid": values.get("baseline_revision"),
         }
-        if not authority:
+        local_terminal_overlay = _validate_local_terminal_overlay(
+            values, validated_plan, authority, advisory,
+        )
+        if not authority and not local_terminal_overlay:
             initial_states = {
                 "provisional",
                 "pending",
                 "approved",
+                "rejected",
                 "running",
                 "waiting",
             }
@@ -2570,7 +2701,6 @@ class ProofLedger:
                 raise ProofValidationError(
                     "plan completion timestamp differs from authority event"
                 )
-        advisory = [event for event in events if event.stream == "advisory"]
         if len({event.authority_epoch for event in advisory}) > 1:
             raise ProofValidationError("proof chain has more than one advisory epoch")
         evidence_json = values.get("evidence_json")

@@ -1,5 +1,11 @@
 # BestPlan Operator-Gated Publication Design
 
+> **Superseded on 2026-08-11.** This design added a publication system that
+> BestPlan does not need. In the replacement flow, `go` executes and checks the
+> approved plan, then fast-forwards local `main`; Hermes asks only whether to
+> push that exact commit. The slash-command reference defines the user-facing
+> contract.
+
 ## Decision
 
 Replace the remaining unattended live-promotion roadmap with a smaller,

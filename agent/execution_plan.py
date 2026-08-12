@@ -421,11 +421,12 @@ def compile_execution_plan(raw: Any) -> ExecutionPlan:
 
 
 _PLANNER_SYSTEM_PROMPT = """You produce a bounded local-first execution plan.
-Return only JSON matching the supplied schema. Prefer independent local slices,
-include observable acceptance checks, serialize overlapping write paths, and
-never schedule frontier_review as a task. Frontier review is a conditional
-escalation predicate only. Use direct mode for one indivisible unit. Maximum six
-slices."""
+Return only JSON matching the supplied schema. Prefer independent local slices.
+Every writable slice must include at least one exact acceptance command in the
+form `pytest -q -- tests/path.py::test_name`; prose criteria can be additional
+entries. Serialize overlapping write paths, and never schedule frontier_review
+as a task. Frontier review is a conditional escalation predicate only. Use
+direct mode for one indivisible unit. Maximum six slices."""
 
 
 def _response_content(response: Any) -> str:

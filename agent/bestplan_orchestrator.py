@@ -125,7 +125,9 @@ _V1_SYNTHESIS_CONTRACT = (
     "allowed_paths. A Review-only plan must use mode=sota, risk=high, exactly one "
     "kind=review slice with capability=frontier_review, read_only=true, "
     "allowed_paths=[], the exact workspace, and at least one escalation predicate. "
-    "Every slice needs non-empty expected_artifacts and acceptance."
+    "Every slice needs non-empty expected_artifacts and acceptance. Every writable "
+    "slice must include at least one exact acceptance entry in the form "
+    "pytest -q -- tests/path.py::test_name; prose criteria may be additional entries."
 )
 _MINIMUM_CHANGE_CONTRACT = (
     "Choose the smallest viable change that fully satisfies the task and its "

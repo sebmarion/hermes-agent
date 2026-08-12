@@ -2504,7 +2504,7 @@ def _format_async_delegation(evt: dict) -> str:
             r_summary = r.get("summary")
             r_error = r.get("error")
             r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
-            icon = "✓" if r_status in ("completed", "success") else "✗"
+            icon = "✓" if r_status in ("completed", "success", "frozen") else "✗"
             lines.append("")
             header = f"--- {icon} TASK {idx + 1}/{n}"
             if r_goal:
@@ -2516,7 +2516,7 @@ def _format_async_delegation(evt: dict) -> str:
                 header += f", {r['duration_seconds']}s"
             header += ") ---"
             lines.append(header)
-            if r_status in ("completed", "success") and r_summary:
+            if r_status in ("completed", "success", "frozen") and r_summary:
                 lines.append(r_summary)
             elif r_summary:
                 if r_error:

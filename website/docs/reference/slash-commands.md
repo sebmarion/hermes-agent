@@ -156,33 +156,41 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 bestplan response is executable only when it contains the validated
 `HERMES_BESTPLAN_V1` machine envelope emitted by that skill. After reviewing
 such a plan, a bare `go` atomically claims the one plan bound to the current
-session, profile, workspace, and Git baseline, then delegates each step through
-the configured `code_worker` or `smart_reviewer` lane. Invalid, changed, or
-ambiguous plans fail closed; ordinary conversational uses of “go” still reach
-the model when no pending plan exists.
+session, profile, workspace, and Git baseline. Hermes runs the approved slices,
+combines their commits, and runs the exact pytest nodes shown in the approval.
+Each writable slice must include at least one acceptance entry in this strict,
+non-shell form:
 
-This host-side execution path is off by default. Enable it with exactly:
-
-```bash
-hermes config set autonomy.go_enabled true
+```text
+pytest -q -- tests/path/test_file.py::test_name
 ```
 
-The executable host ingress is currently supported by the classic CLI and the
-coordinated Hermes WebUI integration. The TUI/desktop and messaging gateway do
-not claim this bare-`go` execution contract yet; on those surfaces `/bestplan`
-is planning-only, executable envelopes are stripped, and a follow-up bare
-`go` associated with that plan is rejected before the model. An unrelated bare
-`go` with no BestPlan context remains an ordinary model turn.
+Missing, unsafe, or prose-only acceptance checks make the plan planning-only.
+Hermes proves that the exact approved checks passed; it does not claim that the
+selected tests cover every possible defect.
+
+After the checks pass, Hermes fast-forwards the checked-out local `main` to the
+exact checked integration commit. It does not push. Hermes then asks `push` or
+`no`. Bare `no` leaves local `main` ahead of its remote. Bare `push` performs one
+normal non-force push to the configured remote for `main` and verifies the
+remote commit.
+
+If Hermes restarts before that answer, resume the same CLI session. A new,
+unrelated session cannot consume the pending `push` or `no` decision.
+
+The executable host ingress is supported by the classic CLI only. The
+TUI/desktop, WebUI, and messaging gateway keep `/bestplan` planning-only and
+reject a plan-bound bare `go` before it reaches the model. An unrelated bare
+`go` with no pending BestPlan remains an ordinary model turn.
 
 V1 execution also requires an enforceable host filesystem sandbox. macOS uses
 `/usr/bin/sandbox-exec` when a live capability probe succeeds. Other platforms,
 and managed environments where the probe is denied, fail closed before claim
 or dispatch; there is no cwd/chmod/prose fallback.
 
-Before enabling it, configure `delegation.lanes.code_worker.provider` and
-`.model` for implementation plans, and
-`delegation.lanes.smart_reviewer.provider` and `.model` for review plans. A
-missing required lane fails before the plan is claimed or dispatched.
+Configure `delegation.lanes.code_worker.provider` and `.model` for
+implementation plans. A missing required lane fails before the plan is claimed
+or dispatched.
 
 ### Quick Commands
 

@@ -224,6 +224,30 @@ def test_rich_reinjection_block_is_self_contained():
         assert needle in text, f"missing {needle!r}"
 
 
+def test_frozen_bestplan_candidate_renders_as_successful_batch_result():
+    text = format_process_notification(
+        {
+            "type": "async_delegation",
+            "delegation_id": "bp-local",
+            "is_batch": True,
+            "goals": ["Build the approved slice"],
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "frozen",
+                    "summary": "Candidate artifact frozen.",
+                }
+            ],
+        }
+    )
+
+    assert text is not None
+    assert "--- ✓ TASK 1/1" in text
+    assert "Candidate artifact frozen." in text
+    assert "✗" not in text
+    assert "Partial output:" not in text
+
+
 def test_dispatch_rejected_at_capacity():
     ev = threading.Event()
 
@@ -784,6 +808,542 @@ def test_gateway_cli_origin_event_left_unrouted():
     assert "platform" not in evt
 
 
+def _seed_local_recovery_plan(tmp_path):
+    from agent.bestplan_contract import (
+        BoundCommand,
+        ControllerIdentity,
+        source_snapshot_digest,
+        source_snapshot_json,
+    )
+    from agent.bestplan_local import (
+        build_local_go_contract,
+        local_go_approval_digest,
+        local_go_contract_digest,
+        local_go_contract_json,
+        local_go_manifest_digest,
+    )
+    from agent.bestplan_source import (
+        IndexEntry,
+        IndexFlags,
+        ProtectedManifest,
+        RepoIdentity,
+        SourceSnapshot,
+    )
+    from agent.bestplan_state import (
+        BESTPLAN_ENVELOPE_END,
+        BESTPLAN_ENVELOPE_START,
+        BestplanStore,
+    )
+    from agent.execution_plan import compile_execution_plan
+
+    workspace = (tmp_path / "repo").resolve()
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    repo = RepoIdentity(
+        workspace=str(workspace),
+        workspace_raw=str(workspace).encode(),
+        worktree=str(workspace),
+        worktree_raw=str(workspace).encode(),
+        git_dir=str(git_dir),
+        git_dir_raw=str(git_dir).encode(),
+        common_dir=str(git_dir),
+        common_dir_raw=str(git_dir).encode(),
+        common_dir_device=11,
+        common_dir_inode=22,
+        object_format="sha1",
+        repository_id="local-recovery-repo",
+    )
+    protected = ProtectedManifest(
+        index_entries=(IndexEntry(b"tracked.py", 0o100644, "1" * 40, 0),),
+        index_flags=(
+            IndexFlags(b"tracked.py", b"H ", b"", False, False, False, False),
+        ),
+        worktree_entries=(),
+        protected_paths=(b"tracked.py",),
+        staged_diff_sha256="2" * 64,
+        unstaged_diff_sha256="3" * 64,
+        digest="4" * 64,
+    )
+    snapshot = SourceSnapshot(
+        repo=repo,
+        head_symbolic=True,
+        head_ref=b"refs/heads/main",
+        head_raw=b"ref: refs/heads/main\n",
+        head_oid="5" * 40,
+        tree_oid="6" * 40,
+        protected_manifest=protected,
+        capture_implementation_sha256="7" * 64,
+        fingerprint="8" * 64,
+    )
+    plan = compile_execution_plan({
+        "version": 1,
+        "mode": "delegate",
+        "risk": "low",
+        "slices": [{
+            "id": "implement",
+            "kind": "implement",
+            "goal": "Implement the approved change",
+            "depends_on": [],
+            "capability": "fast_fallback",
+            "workspace": str(workspace),
+            "allowed_paths": ["feature.py"],
+            "read_only": False,
+            "expected_artifacts": ["feature.py"],
+            "acceptance": ["pytest -q"],
+        }],
+        "merge_policy": "Integrate after exact checks.",
+        "stop_condition": "All exact checks pass.",
+        "escalation_predicates": ["verification_failed_after_local_repair"],
+    })
+    manifest = plan.to_manifest()
+    controller = ControllerIdentity(
+        repository_id=repo.repository_id,
+        controller_id="local-test-controller",
+        release_oid=snapshot.head_oid,
+        artifact_sha256="9" * 64,
+    )
+    command = BoundCommand(
+        identifier="pytest",
+        executable="/usr/bin/true",
+        executable_sha256="a" * 64,
+        argv=(),
+        logical_cwd="integration",
+        env=(),
+        inputs=(),
+        cache=(),
+        timeout_seconds=60,
+        network_allowlist=(),
+    )
+    contract = build_local_go_contract(
+        snapshot=snapshot,
+        controller=controller,
+        commands=(command,),
+        manifest_digest=local_go_manifest_digest(manifest),
+        check_runtime_digest="b" * 64,
+    )
+    manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+    envelope = (
+        f"{BESTPLAN_ENVELOPE_START}\n"
+        + json.dumps(
+            {"version": 1, "manifest": manifest},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + f"\n{BESTPLAN_ENVELOPE_END}"
+    )
+    state_db_path = (tmp_path / "state" / "state.db").resolve()
+    store = BestplanStore(db_path=state_db_path, reconcile_push_state=False)
+    dispatch_id = "bestplan-bp-local"
+
+    def insert(conn):
+        now = time.time()
+        conn.execute(
+            """INSERT INTO bestplan_plans (
+                plan_id, version, created_at, session_id, profile, workspace,
+                baseline_revision, baseline_fingerprint, raw_request,
+                raw_plan_json, validated_manifest_json, state,
+                approval_digest, execution_protocol, promotion_contract_version,
+                promotion_contract_json, promotion_contract_digest,
+                promotion_mode, source_snapshot_json, source_snapshot_digest,
+                current_phase, dispatch_id, dispatch_state, dispatch_owner,
+                dispatch_started_at, dispatch_updated_at, resolved_runtime_json,
+                delegation_ids_json
+            ) VALUES (?, 1, ?, 'session-1', 'coder', ?, ?, ?, '', ?, ?,
+                      'running', ?, 2, 1, ?, ?, 'local_main', ?, ?, 'captured',
+                      ?, 'dispatching', 'pid:4242', ?, ?, '[]', ?)""",
+            (
+                "bp-local",
+                now,
+                str(workspace),
+                snapshot.head_oid,
+                snapshot.fingerprint,
+                envelope,
+                manifest_json,
+                local_go_approval_digest(manifest, contract),
+                local_go_contract_json(contract),
+                local_go_contract_digest(contract),
+                source_snapshot_json(snapshot),
+                source_snapshot_digest(snapshot),
+                dispatch_id,
+                now,
+                now,
+                json.dumps([dispatch_id]),
+            ),
+        )
+
+    store._execute_write(insert)
+    return store, snapshot, state_db_path
+
+
+def _write_dead_local_recovery_record(tracker, state_db_path):
+    tracker.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    record = {
+        "delegation_id": "bestplan-bp-local",
+        "goal": "Run the approved local plan",
+        "goals": ["Run the approved local plan"],
+        "session_key": "session-1",
+        "origin_tracker_path": str(tracker.resolve()),
+        "bestplan_plan_id": "bp-local",
+        "bestplan_state_db_path": str(state_db_path),
+        "bestplan_local_execution": True,
+        "status": "running",
+        "delivery_status": "running",
+        "dispatched_at": now,
+        "last_heartbeat_at": now,
+        "owner_pid": 4242,
+        "owner_started_at": 111,
+        "is_batch": True,
+    }
+    tracker.write_text(json.dumps({
+        "version": 1,
+        "records": {
+            record["delegation_id"]: {
+                "delegation_id": record["delegation_id"],
+                "record": record,
+                "status": "running",
+                "delivery_status": "running",
+            },
+        },
+    }), encoding="utf-8")
+    return record
+
+
+def _state_observing_queue(store):
+    published = []
+
+    class ObservingQueue:
+        def put(self, event):
+            published.append((store.get_plan("bp-local"), dict(event)))
+
+    return ObservingQueue(), published
+
+
+def _recover_local_record_and_observe_publish(monkeypatch, tracker, store):
+    target_queue, published = _state_observing_queue(store)
+
+    monkeypatch.setattr(ad, "_pid_exists", lambda pid: False)
+    result = ad.recover_async_delegations(
+        tracker,
+        target_queue=target_queue,
+        mark_restored=True,
+    )
+    assert result == {"queued": 1, "lost": 1}
+    assert len(published) == 1
+    return published[0]
+
+
+def _fail_bestplan_terminalization_once(monkeypatch):
+    from agent.bestplan_state import BestplanStore
+
+    real_mark = BestplanStore.mark_completed_unverified
+    calls = []
+
+    def transient_failure(store, plan_id, event):
+        calls.append((plan_id, event["status"]))
+        if len(calls) == 1:
+            raise OSError("transient BestPlan state database failure")
+        return real_mark(store, plan_id, event)
+
+    monkeypatch.setattr(
+        BestplanStore,
+        "mark_completed_unverified",
+        transient_failure,
+    )
+    return calls
+
+
+def test_recovery_preserves_prepared_local_effect_before_queueing_lost_event(
+    tmp_path, monkeypatch,
+):
+    from agent.bestplan_local_git import LOCAL_MAIN_REF, LocalMainPushTarget
+    from agent.bestplan_proof import ProofLedger
+    from agent.bestplan_state import PlanState
+
+    store, snapshot, state_db_path = _seed_local_recovery_plan(tmp_path)
+    try:
+        prepared = store.prepare_local_push(
+            "bp-local",
+            session_id="session-1",
+            profile="coder",
+            workspace=snapshot.repo.workspace,
+            expected_target_oid=snapshot.head_oid,
+            integration_oid="c" * 40,
+            check_set_digest="d" * 64,
+            target=LocalMainPushTarget(
+                remote_name="origin",
+                remote_ref=LOCAL_MAIN_REF,
+                display_url="ssh://git.example.invalid/project.git",
+                remote_identity_sha256="e" * 64,
+                observed_remote_oid=snapshot.head_oid,
+                integration_oid="c" * 40,
+            ),
+            expires_at=int(time.time()) + 600,
+        )
+        assert prepared is not None
+        tracker = state_db_path.parent / "async_delegations.json"
+        _write_dead_local_recovery_record(tracker, state_db_path)
+
+        row_at_publish, event = _recover_local_record_and_observe_publish(
+            monkeypatch, tracker, store,
+        )
+
+        assert event["restored"] is True
+        assert event["status"] == "lost"
+        assert row_at_publish["state"] == PlanState.RUNNING
+        assert row_at_publish["local_push_state"] == "prepared"
+        assert row_at_publish["dispatch_state"] == "unknown"
+        assert row_at_publish["dispatch_owner"] is None
+        current = store.get_plan("bp-local")
+        assert current["state"] == PlanState.RUNNING
+        assert current["local_push_state"] == "prepared"
+        assert current["dispatch_owner"] is None
+        assert ProofLedger(store).read_events("bp-local")[-1].kind == (
+            "local_effect_prepared_advisory"
+        )
+    finally:
+        store.close()
+
+
+def test_recovery_fails_local_plan_without_push_record_before_queueing_lost_event(
+    tmp_path, monkeypatch,
+):
+    from agent.bestplan_proof import ProofLedger
+    from agent.bestplan_state import PlanState
+
+    store, _snapshot, state_db_path = _seed_local_recovery_plan(tmp_path)
+    try:
+        tracker = state_db_path.parent / "async_delegations.json"
+        _write_dead_local_recovery_record(tracker, state_db_path)
+
+        row_at_publish, event = _recover_local_record_and_observe_publish(
+            monkeypatch, tracker, store,
+        )
+
+        assert event["restored"] is True
+        assert event["status"] == "lost"
+        assert row_at_publish["state"] == PlanState.FAILED
+        assert row_at_publish["local_push_state"] is None
+        assert row_at_publish["dispatch_state"] == "terminal"
+        assert row_at_publish["dispatch_owner"] is None
+        current = store.get_plan("bp-local")
+        assert current["state"] == PlanState.FAILED
+        assert current["local_push_state"] is None
+        assert current["dispatch_owner"] is None
+        assert ProofLedger(store).read_events("bp-local")[-1].kind == (
+            "local_execution_failed_advisory"
+        )
+    finally:
+        store.close()
+
+
+def test_recovery_retries_lost_local_terminalization_before_queueing(
+    tmp_path, monkeypatch,
+):
+    from agent.bestplan_state import PlanState
+
+    store, _snapshot, state_db_path = _seed_local_recovery_plan(tmp_path)
+    try:
+        tracker = tmp_path / "transport" / "async_delegations.json"
+        _write_dead_local_recovery_record(tracker, state_db_path)
+        calls = _fail_bestplan_terminalization_once(monkeypatch)
+        monkeypatch.setattr(ad, "_pid_exists", lambda pid: False)
+        target_queue, published = _state_observing_queue(store)
+
+        first = ad.recover_async_delegations(
+            tracker,
+            target_queue=target_queue,
+            mark_restored=True,
+        )
+
+        assert first == {"queued": 0, "lost": 1}
+        assert calls == [("bp-local", "lost")]
+        assert published == []
+        unchanged = store.get_plan("bp-local")
+        assert unchanged["state"] == PlanState.RUNNING
+        assert unchanged["dispatch_state"] == "dispatching"
+        assert unchanged["dispatch_owner"] == "pid:4242"
+        pending = json.loads(tracker.read_text())["records"]["bestplan-bp-local"]
+        assert pending["status"] == "lost"
+        assert pending["delivery_status"] == "pending"
+        assert pending["record"]["bestplan_terminalization_pending"] is True
+        assert pending["event"]["status"] == "lost"
+
+        second = ad.recover_async_delegations(
+            tracker,
+            target_queue=target_queue,
+            mark_restored=True,
+        )
+
+        assert second == {"queued": 1, "lost": 0}
+        assert calls == [("bp-local", "lost"), ("bp-local", "lost")]
+        assert len(published) == 1
+        row_at_publish, event = published[0]
+        assert row_at_publish["state"] == PlanState.FAILED
+        assert row_at_publish["dispatch_state"] == "terminal"
+        assert row_at_publish["dispatch_owner"] is None
+        assert event["status"] == "lost"
+        assert event["restored"] is True
+        queued = json.loads(tracker.read_text())["records"]["bestplan-bp-local"]
+        assert queued["delivery_status"] == "queued"
+        assert "bestplan_terminalization_pending" not in queued["record"]
+
+        third = ad.recover_async_delegations(
+            tracker,
+            target_queue=target_queue,
+            mark_restored=True,
+        )
+        assert third == {"queued": 0, "lost": 0}
+        assert len(published) == 1
+        assert len(calls) == 2
+    finally:
+        store.close()
+
+
+def test_batch_finalizer_retries_local_terminalization_before_queueing(
+    tmp_path, monkeypatch,
+):
+    from tests.agent.test_bestplan_local_push_state import _prepare
+
+    store, snapshot, state_db_path = _seed_local_recovery_plan(tmp_path)
+    try:
+        assert _prepare(store, snapshot, "c" * 40)
+        tracker = tmp_path / "transport" / "async_delegations.json"
+        tracker.parent.mkdir(parents=True)
+        record = _review_record(
+            "bestplan-bp-local",
+            is_batch=True,
+        )
+        record.update({
+            "origin_tracker_path": str(tracker.resolve()),
+            "bestplan_plan_id": "bp-local",
+            "bestplan_state_db_path": str(state_db_path),
+            "bestplan_local_execution": True,
+            "origin_profile": "coder",
+        })
+        assert ad._persist_record(record, delivery_status="running")
+        calls = _fail_bestplan_terminalization_once(monkeypatch)
+
+        ad._finalize_batch(
+            record["delegation_id"],
+            {"results": [{"status": "frozen", "summary": "finished"}]},
+            "completed",
+        )
+
+        assert calls == [("bp-local", "completed")]
+        assert process_registry.completion_queue.empty()
+        unchanged = store.get_plan("bp-local")
+        assert unchanged["state"] == "running"
+        assert unchanged["local_push_state"] == "prepared"
+        assert unchanged["dispatch_state"] == "dispatching"
+        assert unchanged["dispatch_owner"] == "pid:4242"
+        pending = json.loads(tracker.read_text())["records"]["bestplan-bp-local"]
+        assert pending["status"] == "completed"
+        assert pending["delivery_status"] == "pending"
+        assert pending["record"]["bestplan_terminalization_pending"] is True
+        assert pending["event"]["status"] == "completed"
+
+        target_queue, published = _state_observing_queue(store)
+        second = ad.recover_async_delegations(
+            tracker,
+            target_queue=target_queue,
+            mark_restored=True,
+        )
+
+        assert second == {"queued": 1, "lost": 0}
+        assert calls == [
+            ("bp-local", "completed"),
+            ("bp-local", "completed"),
+        ]
+        assert len(published) == 1
+        row_at_publish, event = published[0]
+        assert row_at_publish["state"] == "running"
+        assert row_at_publish["local_push_state"] == "prepared"
+        assert row_at_publish["dispatch_state"] == "unknown"
+        assert row_at_publish["dispatch_owner"] is None
+        assert event["status"] == "completed"
+        assert event["restored"] is True
+        queued = json.loads(tracker.read_text())["records"]["bestplan-bp-local"]
+        assert queued["delivery_status"] == "queued"
+        assert "bestplan_terminalization_pending" not in queued["record"]
+
+        third = ad.recover_async_delegations(
+            tracker,
+            target_queue=target_queue,
+            mark_restored=True,
+        )
+        assert third == {"queued": 0, "lost": 0}
+        assert len(published) == 1
+        assert len(calls) == 2
+    finally:
+        store.close()
+
+
+def test_cleanup_retains_pending_bestplan_terminalization_until_marker_clears(
+    monkeypatch,
+):
+    marker = "bestplan_terminalization_pending"
+
+    def entry(delegation_id, *, completed_at, terminalization_pending):
+        record = {
+            "delegation_id": delegation_id,
+            "status": "completed",
+            "completed_at": completed_at,
+        }
+        if terminalization_pending:
+            record[marker] = True
+        return {
+            "delegation_id": delegation_id,
+            "record": record,
+            "status": "completed",
+            "delivery_status": "pending",
+        }
+
+    policy = {
+        "completed_seconds": 10,
+        "failed_seconds": 10,
+        "lost_seconds": 10,
+        "max_bytes": 1024 * 1024,
+    }
+    monkeypatch.setattr(ad, "_retention_policy_from_config", lambda: policy)
+    aged = {"records": {
+        "pending-age": entry(
+            "pending-age",
+            completed_at=1,
+            terminalization_pending=True,
+        ),
+        "normal-age": entry(
+            "normal-age",
+            completed_at=1,
+            terminalization_pending=False,
+        ),
+    }}
+
+    assert ad._cleanup_persisted_data_locked(aged, now=100) == 1
+    assert set(aged["records"]) == {"pending-age"}
+
+    policy.update({"completed_seconds": 1000, "max_bytes": 1})
+    oversized = {"records": {
+        "pending-size": entry(
+            "pending-size",
+            completed_at=100,
+            terminalization_pending=True,
+        ),
+        "normal-size": entry(
+            "normal-size",
+            completed_at=100,
+            terminalization_pending=False,
+        ),
+    }}
+
+    assert ad._cleanup_persisted_data_locked(oversized, now=100) == 1
+    assert set(oversized["records"]) == {"pending-size"}
+
+    oversized["records"]["pending-size"]["record"].pop(marker)
+    assert ad._cleanup_persisted_data_locked(oversized, now=100) == 1
+    assert oversized["records"] == {}
+
+
 def test_recovery_marks_running_record_lost_when_owner_dead():
     """Recovery SHOULD mark a running record lost when its owner PID is dead."""
     import tempfile
@@ -1055,6 +1615,107 @@ def test_running_batch_interrupt_waits_for_finalize_and_emits_once():
     assert event["status"] == "completed"
     assert event["is_batch"] is True
     assert _drain_for(record["delegation_id"], timeout=0.2) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    ((True, True), (False, False), ("true", False), (1, False)),
+)
+def test_batch_event_preserves_only_an_exact_local_execution_marker(
+    value, expected, tmp_path,
+):
+    record = _review_record(
+        f"deleg_local_push_{value!s}", is_batch=True,
+    )
+    record["bestplan_plan_id"] = "bp-local"
+    record["bestplan_local_execution"] = value
+    store = None
+    if value is True:
+        store, _snapshot, state_db_path = _seed_local_recovery_plan(tmp_path)
+        record["bestplan_state_db_path"] = str(state_db_path)
+
+    try:
+        ad._finalize_batch(
+            record["delegation_id"],
+            {
+                "results": [{"status": "frozen", "summary": "finished"}],
+            },
+            "completed",
+        )
+
+        event = _drain_for(record["delegation_id"])
+        assert event is not None
+        assert event.get("bestplan_local_execution", False) is expected
+    finally:
+        if store is not None:
+            store.close()
+
+
+def test_batch_event_with_incomplete_local_binding_stays_pending(tmp_path):
+    tracker = tmp_path / "transport" / "async_delegations.json"
+    tracker.parent.mkdir(parents=True)
+    record = _review_record("deleg_local_incomplete", is_batch=True)
+    record.update({
+        "origin_tracker_path": str(tracker.resolve()),
+        "bestplan_plan_id": "bp-local",
+        "bestplan_local_execution": True,
+    })
+
+    ad._finalize_batch(
+        record["delegation_id"],
+        {"results": [{"status": "frozen", "summary": "finished"}]},
+        "completed",
+    )
+
+    assert _drain_for(record["delegation_id"], timeout=0.2) is None
+    pending = json.loads(tracker.read_text())["records"][record["delegation_id"]]
+    assert pending["status"] == "completed"
+    assert pending["delivery_status"] == "pending"
+    assert pending["record"]["bestplan_terminalization_pending"] is True
+    assert pending["event"]["bestplan_local_execution"] is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    ((True, True), (False, False), ("true", False), (1, False)),
+)
+def test_lost_event_preserves_only_an_exact_local_execution_marker(
+    value, expected,
+):
+    event = ad._event_for_lost_record({
+        "delegation_id": "deleg-lost-local",
+        "bestplan_plan_id": "bp-local",
+        "bestplan_local_execution": value,
+    })
+
+    assert event.get("bestplan_local_execution", False) is expected
+
+
+def test_batch_dispatch_hands_local_execution_marker_to_admission(
+    tmp_path, monkeypatch,
+):
+    captured = {}
+    monkeypatch.setattr(
+        ad,
+        "_dispatch_async_delegation_batch_admitted",
+        lambda **kwargs: captured.update(kwargs) or {"status": "rejected"},
+    )
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["local plan"],
+        context="local",
+        toolsets=None,
+        role="leaf",
+        model="model",
+        session_key="session",
+        runner=lambda: {"results": []},
+        bestplan_plan_id="bp-local",
+        bestplan_state_db_path=str((tmp_path / "state.db").resolve()),
+        bestplan_local_execution=True,
+    )
+
+    assert result == {"status": "rejected"}
+    assert captured["bestplan_local_execution"] is True
 
 
 def test_scheduled_batch_interrupt_uses_batch_event_shape():

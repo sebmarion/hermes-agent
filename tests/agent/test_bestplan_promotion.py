@@ -345,6 +345,47 @@ def _task3_candidate_receipt_digest(candidate) -> str:
     ).hexdigest()
 
 
+def _task6_contract_digest(contract) -> str:
+    from agent.bestplan_contract import contract_digest
+    from agent.bestplan_local import (
+        LOCAL_GO_CONTRACT_SCHEMA,
+        local_go_contract_digest,
+    )
+
+    if contract.get("schema") == LOCAL_GO_CONTRACT_SCHEMA:
+        return local_go_contract_digest(contract)
+    return contract_digest(contract)
+
+
+def _local_manifest_digest(plan) -> str:
+    from agent.bestplan_contract import canonical_json
+
+    return hashlib.sha256(
+        canonical_json(plan.to_manifest()).encode("utf-8")
+    ).hexdigest()
+
+
+def _raw_local_approval_digest(plan, contract) -> str:
+    from agent.bestplan_contract import canonical_json
+    from agent.bestplan_local import local_go_contract_json
+
+    manifest_json = canonical_json(plan.to_manifest()).encode("utf-8")
+    return hashlib.sha256(
+        b"hermes.bestplan.local-go-approval.v1\0"
+        + manifest_json
+        + b"\0"
+        + local_go_contract_json(contract).encode("utf-8")
+    ).hexdigest()
+
+
+def _local_approval_digest(plan, contract) -> str:
+    from agent.bestplan_contract import canonical_json
+
+    manifest_json = canonical_json(plan.to_manifest()).encode("utf-8")
+    assert contract["manifest_digest"] == hashlib.sha256(manifest_json).hexdigest()
+    return _raw_local_approval_digest(plan, contract)
+
+
 def _binding(
     promotion,
     snapshot,
@@ -354,7 +395,7 @@ def _binding(
     *,
     candidate_receipt_digest: str | None = None,
 ):
-    from agent.bestplan_contract import contract_digest, source_snapshot_digest
+    from agent.bestplan_contract import source_snapshot_digest
 
     controller = contract["controller"]
     values = {
@@ -368,7 +409,7 @@ def _binding(
         "changed_paths": candidate.changed_paths,
         "base_oid": snapshot.head_oid,
         "approval_digest": approved,
-        "contract_digest": contract_digest(contract),
+        "contract_digest": _task6_contract_digest(contract),
         "source_snapshot_digest": source_snapshot_digest(snapshot),
         "policy_digest": "b" * 64,
         "controller_id": controller["controller_id"],
@@ -392,6 +433,30 @@ def _bundle(tmp_path: Path, *slices: dict[str, object]):
     plan = _plan(repo, *slices)
     contract = _contract(snapshot, plan, repo)
     approved = approval_digest(plan.to_manifest(), contract)
+    return repo, snapshot, plan, contract, approved
+
+
+def _local_bundle(tmp_path: Path, *slices: dict[str, object]):
+    from agent.bestplan_contract import (
+        _command_from_dict,
+        _controller_from_dict,
+    )
+    from agent.bestplan_local import build_local_go_contract
+
+    repo, snapshot, plan, enrolled, _approved = _bundle(tmp_path, *slices)
+    contract = build_local_go_contract(
+        snapshot=snapshot,
+        controller=_controller_from_dict(
+            enrolled["controller"], "test local controller",
+        ),
+        commands=tuple(
+            _command_from_dict(item, f"test local command[{index}]")
+            for index, item in enumerate(enrolled["commands"])
+        ),
+        manifest_digest=_local_manifest_digest(plan),
+        check_runtime_digest="e" * 64,
+    )
+    approved = _local_approval_digest(plan, contract)
     return repo, snapshot, plan, contract, approved
 
 
@@ -530,6 +595,157 @@ def test_freeze_applies_candidates_in_manifest_order_not_caller_order(tmp_path):
     assert integration.candidates[0].artifact_digests == (
         ("one/result.txt", hashlib.sha256(b"one-result\n").hexdigest()),
     )
+
+
+def test_freeze_accepts_strict_local_go_contract(tmp_path):
+    from agent.bestplan_local import local_go_contract_digest
+
+    promotion = _promotion()
+    repo, snapshot, plan, contract, approved = _local_bundle(
+        tmp_path, _slice("one"),
+    )
+    candidate = _freeze_candidate(
+        tmp_path, snapshot, plan_id="bp-integration", slice_id="one",
+    )
+
+    integration = _freeze_integration(
+        promotion,
+        tmp_path,
+        snapshot,
+        plan,
+        contract,
+        approved,
+        (_binding(promotion, snapshot, contract, approved, candidate),),
+    )
+
+    assert integration.contract_digest == local_go_contract_digest(contract)
+    assert integration.approval_digest == approved
+    assert integration.target_ref == "refs/heads/main"
+    assert _git(repo, "show", f"{integration.integration_oid}:one/result.txt") == (
+        "one-result"
+    )
+
+
+def test_freeze_rejects_local_manifest_not_bound_to_plan_before_integration(
+    tmp_path,
+):
+    promotion = _promotion()
+    repo, snapshot, plan, contract, _approved = _local_bundle(
+        tmp_path, _slice("one"),
+    )
+    altered = copy.deepcopy(contract)
+    altered["manifest_digest"] = "f" * 64
+    approved = _raw_local_approval_digest(plan, altered)
+    candidate = _freeze_candidate(
+        tmp_path, snapshot, plan_id="bp-integration", slice_id="one",
+    )
+    binding = _binding(
+        promotion, snapshot, altered, approved, candidate,
+    )
+
+    with pytest.raises(
+        promotion.IntegrationValidationError,
+        match=r"(?i)manifest|approval|contract",
+    ):
+        _freeze_integration(
+            promotion,
+            tmp_path,
+            snapshot,
+            plan,
+            altered,
+            approved,
+            (binding,),
+        )
+
+    assert _integration_refs(repo) == ()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("repository", "repository"),
+        ("source", "source"),
+        ("controller_binding", "candidate binding|controller"),
+    ),
+)
+def test_freeze_binds_full_local_repository_source_and_controller_evidence(
+    tmp_path, mutation, message,
+):
+    promotion = _promotion()
+    repo, snapshot, plan, contract, _approved = _local_bundle(
+        tmp_path, _slice("one"),
+    )
+    altered = copy.deepcopy(contract)
+    if mutation == "repository":
+        replacement = str((tmp_path / "different-worktree").resolve())
+        altered["repository"]["workspace"] = replacement
+        altered["repository"]["workspace_raw_b64"] = base64.b64encode(
+            os.fsencode(replacement)
+        ).decode("ascii")
+    elif mutation == "source":
+        altered["source"]["base_oid"] = "e" * 40
+    approved = _raw_local_approval_digest(plan, altered)
+    candidate = _freeze_candidate(
+        tmp_path, snapshot, plan_id="bp-integration", slice_id="one",
+    )
+    binding = _binding(
+        promotion, snapshot, altered, approved, candidate,
+    )
+    if mutation == "controller_binding":
+        binding = _rebind(
+            promotion, binding, controller_id="different-controller",
+        )
+
+    with pytest.raises(
+        promotion.IntegrationValidationError,
+        match=rf"(?i){message}",
+    ):
+        _freeze_integration(
+            promotion,
+            tmp_path,
+            snapshot,
+            plan,
+            altered,
+            approved,
+            (binding,),
+        )
+
+    assert _integration_refs(repo) == ()
+
+
+def test_freeze_still_rejects_legacy_candidate_only_contract(tmp_path):
+    from agent.bestplan_contract import approval_digest, validate_execution_contract
+
+    promotion = _promotion()
+    repo, snapshot, plan, contract, _approved = _bundle(
+        tmp_path, _slice("one"),
+    )
+    candidate_only = copy.deepcopy(contract)
+    candidate_only["promotion_mode"] = "candidate_only"
+    candidate_only = validate_execution_contract(candidate_only)
+    approved = approval_digest(plan.to_manifest(), candidate_only)
+    candidate = _freeze_candidate(
+        tmp_path, snapshot, plan_id="bp-integration", slice_id="one",
+    )
+    binding = _binding(
+        promotion, snapshot, candidate_only, approved, candidate,
+    )
+
+    with pytest.raises(
+        promotion.IntegrationValidationError,
+        match=r"(?i)auto_live|mode|approval",
+    ):
+        _freeze_integration(
+            promotion,
+            tmp_path,
+            snapshot,
+            plan,
+            candidate_only,
+            approved,
+            (binding,),
+        )
+
+    assert _integration_refs(repo) == ()
 
 
 def test_frozen_integration_retains_exact_task5_ids_and_task3_binding_evidence(

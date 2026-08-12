@@ -5571,17 +5571,42 @@ def _endpoint_identity(value: Any) -> str:
     raw = str(value or "").strip()
     if not raw:
         return ""
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw):
+        raise ValueError("BestPlan runtime endpoint is malformed")
+    if "?" in raw or "#" in raw:
+        raise ValueError(
+            "BestPlan runtime endpoint cannot contain query or fragment"
+        )
     if raw.startswith("/"):
         return raw
     explicit_scheme = "://" in raw
-    parsed = urlsplit(raw if explicit_scheme else f"//{raw}")
-    host = parsed.hostname or ""
-    if parsed.port:
-        host = f"{host}:{parsed.port}"
+    try:
+        parsed = urlsplit(raw if explicit_scheme else f"//{raw}")
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise ValueError("BestPlan runtime endpoint is malformed") from None
+    if (
+        not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+    ):
+        raise ValueError(
+            "BestPlan runtime endpoint cannot contain userinfo, query, or fragment"
+        )
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    scheme = parsed.scheme.lower()
+    if (scheme, port) in {("https", 443), ("http", 80)}:
+        port = None
+    if port is not None:
+        host = f"{host}:{port}"
     path = parsed.path.rstrip("/")
     if not explicit_scheme:
-        return f"{host.lower()}{path}"
-    return urlunsplit((parsed.scheme.lower(), host.lower(), path, "", ""))
+        return f"{host}{path}"
+    return urlunsplit((scheme, host, path, "", ""))
 
 
 def _nonsecret_runtime_value(value: Any) -> Any:
@@ -5604,6 +5629,40 @@ def _nonsecret_runtime_value(value: Any) -> Any:
         return value
 
 
+def _bestplan_async_runtime_metadata(
+    runtime: Mapping[str, Any],
+    *,
+    candidate_toolsets: Iterable[str],
+    execution_protocol: int,
+) -> dict[str, Any]:
+    """Project only approved nonsecret identity into async status records."""
+
+    if not isinstance(runtime, Mapping):
+        raise ValueError("BestPlan runtime metadata must be an object")
+    if execution_protocol != 2:
+        projected = _nonsecret_runtime_value(dict(runtime))
+        if not isinstance(projected, dict):
+            raise ValueError("BestPlan runtime metadata is invalid")
+        return projected
+    toolsets = list(candidate_toolsets)
+    if toolsets not in (["file"], ["read_only_files"]):
+        raise ValueError("BestPlan runtime metadata toolsets are invalid")
+    from agent.bestplan_state import sanitize_runtime_metadata
+
+    projected = dict(runtime)
+    projected["toolsets"] = list(toolsets)
+    projected["bestplan_toolsets"] = list(toolsets)
+    try:
+        sanitized = sanitize_runtime_metadata(
+            [projected], execution_protocol=2,
+        )
+    except Exception as exc:
+        raise ValueError("BestPlan runtime metadata is invalid") from exc
+    if not isinstance(sanitized, list) or len(sanitized) != 1:
+        raise ValueError("BestPlan runtime metadata is invalid")
+    return sanitized[0]
+
+
 def _bestplan_runtime_identity(
     task: Dict[str, Any],
     runtime: Dict[str, Any],
@@ -5616,17 +5675,40 @@ def _bestplan_runtime_identity(
             if bool(task.get("_bestplan_read_only"))
             else ["file"]
         )
+        request_overrides = runtime.get("request_overrides") or {}
+        if not isinstance(request_overrides, Mapping):
+            raise ValueError("BestPlan runtime request_overrides must be an object")
+        safe_request_overrides = _nonsecret_runtime_value(request_overrides)
+        if (
+            not isinstance(safe_request_overrides, Mapping)
+            or safe_request_overrides != request_overrides
+        ):
+            raise ValueError(
+                "BestPlan runtime request override contains unsafe data"
+            )
         identity = {
             "execution_protocol": 2,
             "route": str(runtime.get("route") or task.get("route") or ""),
             "provider": str(runtime.get("provider") or ""),
             "model": str(runtime.get("model") or ""),
+            "endpoint": _endpoint_identity(
+                runtime.get("base_url") or runtime.get("endpoint")
+            ),
+            "api_mode": str(runtime.get("api_mode") or ""),
+            "auth_mode": (
+                "none" if runtime.get("no_auth") is True else "credential"
+            ),
+            "request_overrides": dict(safe_request_overrides),
             "toolsets": toolsets,
         }
         fingerprint = hashlib.sha256(
             b"hermes.bestplan.runtime-identity.v2\0"
             + json.dumps(
-                identity, sort_keys=True, separators=(",", ":"),
+                identity,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
         return {
@@ -5772,6 +5854,32 @@ def resolve_bestplan_runtime_specs(
             raise ValueError(f"BestPlan task {index} requires configured lane {route!r}")
         runtime = dict(_resolve_delegation_credentials(lane_cfg, parent_agent))
         runtime["route"] = route
+        no_auth = lane_cfg.get("no_auth", False)
+        if type(no_auth) is not bool:
+            raise ValueError(
+                f"delegation lane {route} no_auth must be true or false"
+            )
+        direct_endpoint = str(runtime.get("base_url") or "").strip()
+        resolved_key = str(runtime.get("api_key") or "").strip()
+        if direct_endpoint:
+            if not resolved_key and not no_auth:
+                raise ValueError(
+                    f"delegation lane {route} direct endpoint requires api_key "
+                    "or explicit no_auth"
+                )
+            if resolved_key and no_auth:
+                raise ValueError(
+                    f"delegation lane {route} cannot combine api_key and no_auth"
+                )
+            if no_auth and runtime.get("provider") != "custom":
+                raise ValueError(
+                    f"delegation lane {route} no_auth supports custom endpoints only"
+                )
+        elif no_auth:
+            raise ValueError(
+                f"delegation lane {route} no_auth requires a direct endpoint"
+            )
+        runtime["no_auth"] = no_auth
         if "toolsets" in lane_cfg:
             toolsets = _normalize_bestplan_toolsets(lane_cfg.get("toolsets"))
             if not toolsets:
@@ -6124,6 +6232,264 @@ def _persist_bestplan_candidates_ready(
         store.close()
 
 
+def _build_local_candidate_binding(
+    *,
+    frozen: object,
+    spec: object,
+    manifest_slice_id: str,
+    snapshot: object,
+    approval_digest: str,
+    contract_digest: str,
+) -> object:
+    """Bind one live Task 4 result to the exact local integration input."""
+
+    from agent.bestplan_contract import source_snapshot_digest
+    from agent.bestplan_promotion import (
+        CandidateIntegrationBinding,
+        candidate_integration_binding_digest,
+    )
+
+    receipt = _bestplan_host_candidate_receipt(
+        frozen=frozen,
+        manifest_slice_id=manifest_slice_id,
+        spec=spec,
+        promotion_contract_digest=contract_digest,
+    )
+    encoded = json.dumps(
+        receipt,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    receipt_digest = hashlib.sha256(
+        b"hermes.bestplan.host-candidate-receipt.v1\0" + encoded
+    ).hexdigest()
+    values = {
+        "manifest_slice_id": manifest_slice_id,
+        "candidate_id": frozen.candidate_id,
+        "slice_id": frozen.slice_id,
+        "attempt_id": frozen.attempt_id,
+        "ref_name": frozen.ref_name,
+        "commit_oid": frozen.commit_oid,
+        "tree_oid": frozen.tree_oid,
+        "changed_paths": tuple(frozen.changed_paths),
+        "base_oid": snapshot.head_oid,
+        "approval_digest": approval_digest,
+        "contract_digest": contract_digest,
+        "source_snapshot_digest": source_snapshot_digest(snapshot),
+        "policy_digest": frozen.policy_digest,
+        "controller_id": frozen.controller_id,
+        "controller_repository_id": frozen.controller_repository_id,
+        "controller_release_oid": frozen.controller_release_oid,
+        "controller_artifact_sha256": frozen.controller_artifact_sha256,
+        "candidate_receipt_digest": receipt_digest,
+    }
+    binding_digest = candidate_integration_binding_digest(values)
+    return CandidateIntegrationBinding(**values, binding_digest=binding_digest)
+
+
+def _finish_local_bestplan_batch(
+    *,
+    plan_id: str,
+    plan: object,
+    snapshot: object,
+    contract: Mapping[str, Any],
+    approval_digest: str,
+    contract_digest: str,
+    completed: list[tuple[object, object, str]],
+    projected_results: list[dict[str, Any]],
+    runtime: object,
+    state_db_path: Path,
+    session_id: str,
+    profile: str,
+    cancel_event: threading.Event | None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Integrate, check, durably prepare, and land one local BestPlan batch."""
+
+    from agent.bestplan_checks import run_integration_checks
+    from agent.bestplan_local_git import (
+        LocalMainEffectUnknown,
+        classify_local_main_for_push,
+        land_checked_integration,
+        observe_prelanding_local_main_push_target,
+    )
+    from agent.bestplan_promotion import freeze_integration
+    from agent.bestplan_state import BestplanStore
+
+    operation_timeout = getattr(runtime, "operation_timeout_seconds", None)
+    if (
+        isinstance(operation_timeout, bool)
+        or not isinstance(operation_timeout, (int, float))
+        or not math.isfinite(float(operation_timeout))
+        or not 0 < float(operation_timeout) <= 86_400.0
+    ):
+        raise BestplanCandidateBatchError("candidate batch failed")
+    started_at = time.time() if now is None else float(now)
+    if not math.isfinite(started_at):
+        raise BestplanCandidateBatchError("candidate batch failed")
+    if cancel_event is not None and cancel_event.is_set():
+        raise BestplanCandidateBatchError("candidate batch failed")
+    deadline = time.monotonic() + float(operation_timeout)
+    bindings = tuple(
+        _build_local_candidate_binding(
+            frozen=frozen,
+            spec=spec,
+            manifest_slice_id=manifest_slice_id,
+            snapshot=snapshot,
+            approval_digest=approval_digest,
+            contract_digest=contract_digest,
+        )
+        for frozen, spec, manifest_slice_id in completed
+    )
+    integration = freeze_integration(
+        plan_id=plan_id,
+        plan=plan,
+        snapshot=snapshot,
+        contract=contract,
+        approval_digest=approval_digest,
+        candidates=bindings,
+        temp_root=runtime.integration_root,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    checks = run_integration_checks(
+        snapshot=snapshot,
+        integration=integration,
+        contract=contract,
+        commands=runtime.check_plan.commands,
+        runtime=runtime.check_runtime,
+        checks_root=runtime.checks_root,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        raise BestplanCandidateBatchError("candidate batch failed")
+    target = observe_prelanding_local_main_push_target(
+        snapshot=snapshot,
+        expected_target_oid=integration.target_oid,
+        integration_oid=integration.integration_oid,
+        deadline=deadline,
+    )
+    store = BestplanStore(db_path=state_db_path)
+    try:
+        prepared = store.prepare_local_push(
+            plan_id,
+            session_id=session_id,
+            profile=profile,
+            workspace=snapshot.repo.workspace,
+            expected_target_oid=integration.target_oid,
+            integration_oid=integration.integration_oid,
+            check_set_digest=checks.receipt_digest,
+            target=target,
+            expires_at=math.ceil(time.time() + 15 * 60),
+        )
+        if prepared is None:
+            raise BestplanCandidateBatchError("candidate batch failed")
+
+        def terminalize_prepared(new_state: str) -> None:
+            try:
+                store._set_local_push_state(
+                    plan_id,
+                    expected_state="prepared",
+                    new_state=new_state,
+                )
+            except Exception:
+                # The durable prepared record remains the fail-closed state.
+                pass
+
+        if cancel_event is not None and cancel_event.is_set():
+            terminalize_prepared("not_landed")
+            raise BestplanCandidateBatchError("candidate batch failed")
+        try:
+            landing = land_checked_integration(
+                snapshot=snapshot,
+                integration=integration,
+                checks=checks,
+                commands=runtime.check_plan.commands,
+                deadline=deadline,
+            )
+        except LocalMainEffectUnknown:
+            raise
+        except Exception:
+            try:
+                local_state = classify_local_main_for_push(
+                    snapshot=snapshot,
+                    expected_target_oid=integration.target_oid,
+                    integration_oid=integration.integration_oid,
+                    deadline=deadline,
+                )
+            except Exception:
+                local_state = "unavailable"
+            terminalize_prepared(
+                "not_landed" if local_state == "expected" else "stale"
+            )
+            raise
+        if not store.activate_local_push(
+            plan_id,
+            landing_receipt=landing,
+        ):
+            raise BestplanCandidateBatchError("candidate batch failed")
+    finally:
+        store.close()
+
+    results = [dict(item) for item in projected_results]
+    if not results:
+        raise BestplanCandidateBatchError("candidate batch failed")
+    prompt = (
+        f"Local `main` is now `{integration.integration_oid}` and approved "
+        f"checks passed. Push this exact commit to `{target.display_url}` "
+        f"`{target.remote_ref}`? Reply `push` or `no`."
+    )
+    previous = str(results[-1].get("summary") or "").strip()
+    results[-1]["summary"] = "\n\n".join(
+        part for part in (previous, prompt) if part
+    )
+    return {
+        "results": results,
+        "integration_oid": integration.integration_oid,
+        "check_set_digest": checks.receipt_digest,
+        "local_main_oid": landing.new_oid,
+        "push_pending": True,
+    }
+
+
+def _ordered_bestplan_authority_clients(
+    resolved_runtimes: List[Dict[str, Any]],
+    *,
+    authority_client: object | None,
+    authority_bindings: object | None,
+) -> tuple[object, ...]:
+    """Resolve one exact authority for every manifest-position runtime."""
+
+    if authority_bindings is None:
+        if authority_client is None:
+            raise ValueError("BestPlan authority client is unavailable")
+        return tuple(authority_client for _runtime in resolved_runtimes)
+    if authority_client is not None:
+        raise ValueError("BestPlan authority inputs are ambiguous")
+    if not isinstance(authority_bindings, (list, tuple)) or len(
+        authority_bindings
+    ) != len(resolved_runtimes):
+        raise ValueError("BestPlan authority binding count differs")
+    ordered: list[object] = []
+    for position, (runtime, binding) in enumerate(
+        zip(resolved_runtimes, authority_bindings)
+    ):
+        if (
+            getattr(binding, "position", None) != position
+            or getattr(binding, "runtime_fingerprint", None)
+            != runtime.get("runtime_fingerprint")
+        ):
+            raise ValueError("BestPlan authority binding differs from runtime order")
+        authority = getattr(binding, "authority", None)
+        if authority is None:
+            raise ValueError("BestPlan authority binding is incomplete")
+        ordered.append(authority)
+    return tuple(ordered)
+
+
 def dispatch_bestplan_tasks_async(
     *,
     tasks: List[Dict[str, Any]],
@@ -6138,8 +6504,11 @@ def dispatch_bestplan_tasks_async(
     promotion_contract: Mapping[str, Any] | None = None,
     promotion_contract_digest: str = "",
     promotion_mode: str | None = None,
+    execution_plan: object | None = None,
+    local_execution_runtime: object | None = None,
     candidate_host_runtime: BestplanHostRuntime | None = None,
     authority_client: object | None = None,
+    authority_bindings: object | None = None,
     state_db_path: str | Path | None = None,
 ) -> Dict[str, Any]:
     """Admit one bounded async batch of independent Task 4 candidates."""
@@ -6148,7 +6517,11 @@ def dispatch_bestplan_tasks_async(
 
     if source_snapshot is None:
         return {"status": "rejected", "error": "source_snapshot_required"}
-    if candidate_host_runtime is None or authority_client is None or state_db_path is None:
+    if (
+        candidate_host_runtime is None
+        or (authority_client is None and authority_bindings is None)
+        or state_db_path is None
+    ):
         return {"status": "rejected", "error": "candidate_runtime_unavailable"}
     if type(execution_protocol) is not int or execution_protocol not in {1, 2}:
         return {"status": "rejected", "error": "candidate_protocol_invalid"}
@@ -6157,8 +6530,12 @@ def dispatch_bestplan_tasks_async(
             return {"status": "rejected", "error": "candidate_contract_invalid"}
         if not re.fullmatch(r"[0-9a-f]{64}", promotion_contract_digest or ""):
             return {"status": "rejected", "error": "candidate_contract_invalid"}
-        if promotion_mode not in {"candidate_only", "auto_live"}:
+        if promotion_mode not in {"candidate_only", "auto_live", "local_main"}:
             return {"status": "rejected", "error": "candidate_contract_invalid"}
+        if promotion_mode == "local_main" and (
+            execution_plan is None or local_execution_runtime is None
+        ):
+            return {"status": "rejected", "error": "candidate_runtime_unavailable"}
     try:
         prepared = _preflight_bestplan_candidates(
             tasks=tasks,
@@ -6168,6 +6545,11 @@ def dispatch_bestplan_tasks_async(
             source_snapshot=source_snapshot,
             candidate_host_runtime=candidate_host_runtime,
             promotion_contract=promotion_contract,
+        )
+        ordered_authorities = _ordered_bestplan_authority_clients(
+            resolved_runtimes,
+            authority_client=authority_client,
+            authority_bindings=authority_bindings,
         )
         durable_state_path = Path(state_db_path).expanduser().resolve()
     except _BestplanPreflightError as exc:
@@ -6192,14 +6574,14 @@ def dispatch_bestplan_tasks_async(
     cancellation = threading.Event()
     async_runtime_metadata: list[dict[str, Any]] = []
     for item, runtime_value in zip(prepared, resolved_runtimes):
-        projected_runtime = _nonsecret_runtime_value(runtime_value)
-        if not isinstance(projected_runtime, dict):
+        try:
+            projected_runtime = _bestplan_async_runtime_metadata(
+                runtime_value,
+                candidate_toolsets=item["spec"].toolsets,
+                execution_protocol=execution_protocol,
+            )
+        except ValueError:
             return {"status": "rejected", "error": "candidate_runtime_unavailable"}
-        if execution_protocol == 2:
-            candidate_toolsets = list(item["spec"].toolsets)
-            projected_runtime.pop("runtime_identity", None)
-            projected_runtime["toolsets"] = candidate_toolsets
-            projected_runtime["bestplan_toolsets"] = list(candidate_toolsets)
         async_runtime_metadata.append(projected_runtime)
 
     def runner() -> Dict[str, Any]:
@@ -6223,7 +6605,7 @@ def dispatch_bestplan_tasks_async(
                 controller_python=candidate_host_runtime.controller_python,
                 runtime_read_paths=candidate_host_runtime.runtime_read_paths,
                 expected_controller=candidate_host_runtime.controller,
-                authority_client=authority_client,
+                authority_client=ordered_authorities[item["position"]],
                 timeout_seconds=candidate_host_runtime.timeout_seconds,
                 attempt_id=item["attempt_id"],
                 cancel_event=cancellation,
@@ -6289,6 +6671,22 @@ def dispatch_bestplan_tasks_async(
             )
             for frozen, spec, manifest_slice_id in completed
         ]
+        if execution_protocol == 2 and promotion_mode == "local_main":
+            return _finish_local_bestplan_batch(
+                plan_id=plan_id,
+                plan=execution_plan,
+                snapshot=source_snapshot,
+                contract=promotion_contract,
+                approval_digest=approval_digest,
+                contract_digest=promotion_contract_digest,
+                completed=completed,
+                projected_results=projected,
+                runtime=local_execution_runtime,
+                state_db_path=durable_state_path,
+                session_id=str(identity.get("session_id") or ""),
+                profile=str(identity.get("profile") or ""),
+                cancel_event=cancellation,
+            )
         if execution_protocol == 2:
             _persist_bestplan_candidates_ready(
                 state_db_path=durable_state_path,
@@ -6318,6 +6716,9 @@ def dispatch_bestplan_tasks_async(
             origin_tracker_path=str(identity.get("tracker_path") or ""),
             bestplan_plan_id=plan_id,
             bestplan_state_db_path=str(durable_state_path),
+            bestplan_local_execution=(
+                execution_protocol == 2 and promotion_mode == "local_main"
+            ),
             resolved_runtimes=async_runtime_metadata,
         )
         return result

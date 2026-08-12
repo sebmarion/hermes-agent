@@ -292,6 +292,67 @@ def test_provisional_capture_is_inert_until_transcript_commit(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    ("prior_state", "expected_state"),
+    [
+        (PlanState.PENDING, PlanState.REJECTED),
+        (PlanState.APPROVED, PlanState.REJECTED),
+        (PlanState.RUNNING, PlanState.RUNNING),
+        (PlanState.WAITING, PlanState.WAITING),
+    ],
+)
+def test_new_durable_capture_supersedes_only_unstarted_matching_plan(
+    tmp_path, prior_state, expected_state,
+):
+    store = _store(tmp_path)
+    prior = _capture(store)
+    if prior_state == PlanState.APPROVED:
+        assert store.approve_plan(prior.plan_id)
+    elif prior_state in {PlanState.RUNNING, PlanState.WAITING}:
+        claimed = store.prepare_dispatch_intent(
+            prior.plan_id,
+            "base-1",
+            resolved_runtimes=[{
+                "route": "code_worker",
+                "provider": "test",
+                "model": "coder",
+            }],
+            session_id="s1",
+            profile="coder",
+            workspace="/tmp/work",
+        )
+        assert claimed is not None
+        if prior_state == PlanState.WAITING:
+            assert store.record_dispatch(
+                prior.plan_id,
+                delegation_ids=[f"bestplan-{prior.plan_id}"],
+            )
+
+    replacement = _capture(store, provisional=True)
+    assert store.commit_provisional_plan(replacement.plan_id)
+
+    assert store.get_plan(prior.plan_id)["state"] == expected_state
+    assert store.get_plan(replacement.plan_id)["state"] == PlanState.PENDING
+
+
+def test_delayed_older_commit_does_not_supersede_newer_exact_session_plan(
+    tmp_path, monkeypatch,
+):
+    import agent.bestplan_state as bestplan_state
+
+    store = _store(tmp_path)
+    monkeypatch.setattr(bestplan_state.time, "time", lambda: 100.0)
+    older = _capture(store, provisional=True)
+    monkeypatch.setattr(bestplan_state.time, "time", lambda: 200.0)
+    newer = _capture(store, provisional=True)
+
+    assert store.commit_provisional_plan(newer.plan_id)
+    assert store.commit_provisional_plan(older.plan_id)
+
+    assert store.get_plan(older.plan_id)["state"] == PlanState.PENDING
+    assert store.get_plan(newer.plan_id)["state"] == PlanState.PENDING
+
+
 def test_capture_strips_machine_envelope_and_host_renders_authority(tmp_path):
     store = _store(tmp_path)
     response = (

@@ -291,6 +291,8 @@ def test_cli_stack_binds_capability_profile_and_home(tmp_path):
 
 
 def test_startup_reconciles_scheduled_and_terminal_tracker_phases(tmp_path):
+    from gateway.status import get_process_start_time
+
     workspace = str(tmp_path.resolve())
     db_path = tmp_path / "state.db"
     store = BestplanStore(db_path=db_path)
@@ -314,6 +316,7 @@ def test_startup_reconciles_scheduled_and_terminal_tracker_phases(tmp_path):
             "record": {
                 "delegation_id": delegation_id, "status": "scheduled",
                 "owner_pid": os.getpid(),
+                "owner_started_at": get_process_start_time(os.getpid()),
             },
         }},
     }), encoding="utf-8")
@@ -347,13 +350,13 @@ def test_runtime_fingerprint_binds_every_execution_relevant_field(monkeypatch):
     }
     base = {
         "route": "code_worker", "provider": "p", "model": "m",
-        "base_url": "https://user:secret@example.test/v1?token=hidden",
+        "base_url": "https://example.test/v1",
         "api_mode": "chat_completions", "toolsets": ["terminal", "file"],
         "command": "worker", "args": ["--safe"], "max_output_tokens": 1000,
         "request_overrides": {"temperature": 0, "api_key": "not-fingerprinted"},
     }
     first = delegate_tool._bestplan_runtime_identity(task, base)
-    assert "secret" not in json.dumps(first["runtime_identity"])
+    assert "not-fingerprinted" not in json.dumps(first["runtime_identity"])
     for key, value in {
         "route": "smart_reviewer", "provider": "q", "model": "n",
         "base_url": "https://other.test/v2", "api_mode": "responses",
@@ -364,10 +367,9 @@ def test_runtime_fingerprint_binds_every_execution_relevant_field(monkeypatch):
         changed[key] = value
         assert delegate_tool._bestplan_runtime_identity(task, changed)["runtime_fingerprint"] != first["runtime_fingerprint"]
 
-    schemeless = dict(base, base_url="user:secret@example.test:8443/v1?token=hidden")
+    schemeless = dict(base, base_url="example.test:8443/v1")
     endpoint = delegate_tool._bestplan_runtime_identity(task, schemeless)["runtime_identity"]["endpoint"]
     assert endpoint == "example.test:8443/v1"
-    assert "secret" not in endpoint
 
     review_task = dict(task, _bestplan_read_only=True, _bestplan_leases=[])
     review = delegate_tool._bestplan_runtime_identity(review_task, base)

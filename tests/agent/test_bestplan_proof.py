@@ -5,6 +5,7 @@ import importlib
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -348,6 +349,348 @@ def _prepare_dispatching(store: BestplanStore) -> None:
     )
     assert claimed is not None
     assert store.begin_dispatch_attempt("bp_proof") is True
+
+
+def _insert_local_v2_plan(
+    store: BestplanStore,
+    *,
+    plan_id: str = "bp_local_proof",
+) -> SourceSnapshot:
+    from agent.bestplan_local import (
+        build_local_go_contract,
+        local_go_approval_digest,
+        local_go_contract_digest,
+        local_go_contract_json,
+        local_go_manifest_digest,
+    )
+
+    snapshot = _snapshot()
+    plan = _plan(snapshot.repo.workspace)
+    manifest = plan.to_manifest()
+    controller = ControllerIdentity(
+        repository_id=snapshot.repo.repository_id,
+        controller_id="local-proof-controller",
+        release_oid=snapshot.head_oid,
+        artifact_sha256="a" * 64,
+    )
+    contract = build_local_go_contract(
+        snapshot=snapshot,
+        controller=controller,
+        commands=(_command("pytest"),),
+        manifest_digest=local_go_manifest_digest(manifest),
+        check_runtime_digest="b" * 64,
+    )
+    envelope = (
+        f"{BESTPLAN_ENVELOPE_START}\n"
+        + json.dumps({"version": 1, "manifest": manifest}, sort_keys=True)
+        + f"\n{BESTPLAN_ENVELOPE_END}"
+    )
+    dispatch_id = f"bestplan-{plan_id}"
+    store._execute_write(
+        lambda conn: conn.execute(
+            """INSERT INTO bestplan_plans (
+                plan_id, version, created_at, session_id, profile, workspace,
+                baseline_revision, baseline_fingerprint, raw_request,
+                raw_plan_json, validated_manifest_json, state, approval_digest,
+                execution_protocol, promotion_contract_version,
+                promotion_contract_json, promotion_contract_digest,
+                promotion_mode, source_snapshot_json, source_snapshot_digest,
+                current_phase, dispatch_id, dispatch_state, dispatch_owner,
+                dispatch_started_at, dispatch_updated_at,
+                resolved_runtime_json, delegation_ids_json
+            ) VALUES (?, 1, 1, 'session', 'coder', ?, ?, ?, 'request', ?, ?,
+                      'running', ?, 2, 1, ?, ?, 'local_main', ?, ?, 'captured',
+                      ?, 'dispatching', 'pid:12345', 1, 1, '[]', ?)""",
+            (
+                plan_id,
+                snapshot.repo.workspace,
+                snapshot.head_oid,
+                snapshot.fingerprint,
+                envelope,
+                json.dumps(manifest, sort_keys=True),
+                local_go_approval_digest(manifest, contract),
+                local_go_contract_json(contract),
+                local_go_contract_digest(contract),
+                source_snapshot_json(snapshot),
+                source_snapshot_digest(snapshot),
+                dispatch_id,
+                json.dumps([dispatch_id]),
+            ),
+        )
+    )
+    return snapshot
+
+
+def _prepare_local_push(
+    store: BestplanStore,
+    snapshot: SourceSnapshot,
+    *,
+    plan_id: str = "bp_local_proof",
+    integration_oid: str = "c" * 40,
+) -> dict[str, object]:
+    from agent.bestplan_local_git import LocalMainPushTarget
+
+    prepared = store.prepare_local_push(
+        plan_id,
+        session_id="session",
+        profile="coder",
+        workspace=snapshot.repo.workspace,
+        expected_target_oid=snapshot.head_oid,
+        integration_oid=integration_oid,
+        check_set_digest="d" * 64,
+        target=LocalMainPushTarget(
+            remote_name="origin",
+            remote_ref="refs/heads/main",
+            display_url="ssh://git.example.invalid/proof.git",
+            remote_identity_sha256="e" * 64,
+            observed_remote_oid=snapshot.head_oid,
+            integration_oid=integration_oid,
+        ),
+        expires_at=int(time.time()) + 600,
+    )
+    assert prepared is not None
+    return prepared
+
+
+def _assert_local_terminal_shape(
+    store: BestplanStore,
+    proof,
+    *,
+    plan_id: str,
+    state: str,
+    push_state: str | None,
+    latest_kind: str,
+) -> None:
+    row = store.get_plan(plan_id)
+    assert row is not None
+    assert row["state"] == state
+    assert row["current_phase"] == "captured"
+    assert row["dispatch_state"] == "terminal"
+    assert row["dispatch_owner"] is None
+    assert row["local_push_state"] == push_state
+    assert all(
+        row[name] is None
+        for name in (
+            "integration_oid",
+            "artifact_digest",
+            "candidate_set_digest",
+            "proof_authority_epoch",
+            "proof_event_seq",
+            "proof_event_hash",
+            "verification_receipt_json",
+            "verification_receipt_digest",
+            "tests_verified_at",
+            "review_verified_at",
+            "remote_verified_at",
+            "live_verified_at",
+            "completed_at",
+            "verified_at",
+        )
+    )
+    events = proof.ProofLedger(store).read_events(plan_id)
+    assert events
+    assert all(event.stream == "advisory" for event in events)
+    assert events[-1].kind == latest_kind
+    assert events[-1].phase == "captured"
+    assert events[-1].compatibility_dispatch_state == "terminal"
+    assert events[-1].compatibility_clear_dispatch_owner == 1
+
+
+@pytest.mark.parametrize("recovered", (False, True), ids=("normal", "recovered"))
+def test_verify_chain_accepts_exact_local_landing_overlay(tmp_path, recovered):
+    from agent.bestplan_local_git import LocalMainLandingReceipt
+
+    proof = _proof()
+    store = _store(tmp_path / f"local-landing-{recovered}.db")
+    snapshot = _insert_local_v2_plan(store)
+    integration_oid = "c" * 40
+    prepared = _prepare_local_push(
+        store, snapshot, integration_oid=integration_oid,
+    )
+
+    if recovered:
+        assert store.mark_completed_unverified(
+            "bp_local_proof", {"status": "error", "results": []},
+        )
+        assert store.reconcile_local_pushes(
+            classify_local_main=lambda **_kwargs: "integration",
+        ) == 1
+    else:
+        assert store.activate_local_push(
+            "bp_local_proof",
+            landing_receipt=LocalMainLandingReceipt(
+                target_ref="refs/heads/main",
+                old_oid=snapshot.head_oid,
+                new_oid=integration_oid,
+                check_receipt_digest="d" * 64,
+            ),
+        )
+
+    row = store.get_plan("bp_local_proof")
+    assert row["local_push_json"] is not None
+    assert json.loads(row["local_push_json"])["integration_oid"] == integration_oid
+    assert row["local_push_json"] == json.dumps(
+        json.loads(row["local_push_json"]),
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert prepared["integration_oid"] == integration_oid
+    _assert_local_terminal_shape(
+        store,
+        proof,
+        plan_id="bp_local_proof",
+        state=PlanState.COMPLETED_LOCAL,
+        push_state="awaiting",
+        latest_kind="local_landing_recovered_advisory",
+    )
+    assert proof.ProofLedger(store).verify_chain("bp_local_proof") is True
+
+
+def test_verify_chain_accepts_exact_local_failure_without_push_record(tmp_path):
+    proof = _proof()
+    store = _store(tmp_path / "local-failed-before-prepare.db")
+    _insert_local_v2_plan(store)
+
+    assert store.mark_completed_unverified(
+        "bp_local_proof", {"status": "error", "results": []},
+    )
+
+    row = store.get_plan("bp_local_proof")
+    assert row["local_push_json"] is None
+    _assert_local_terminal_shape(
+        store,
+        proof,
+        plan_id="bp_local_proof",
+        state=PlanState.FAILED,
+        push_state=None,
+        latest_kind="local_execution_failed_advisory",
+    )
+    assert proof.ProofLedger(store).verify_chain("bp_local_proof") is True
+
+
+@pytest.mark.parametrize("push_state", ("not_landed", "stale"))
+def test_verify_chain_accepts_exact_known_local_failure(
+    tmp_path, push_state,
+):
+    from agent.bestplan_local_push import decode_local_push_row
+    from agent.bestplan_state import _validate_stored_plan_row
+
+    proof = _proof()
+    store = _store(tmp_path / f"local-reconciled-{push_state}.db")
+    snapshot = _insert_local_v2_plan(store)
+    _prepare_local_push(store, snapshot)
+    assert store.mark_completed_unverified(
+        "bp_local_proof", {"status": "error", "results": []},
+    )
+
+    prepared = store.get_plan("bp_local_proof")
+    assert store._set_local_push_state(
+        "bp_local_proof",
+        expected_state="prepared",
+        new_state=push_state,
+        expected_json=prepared["local_push_json"],
+    )
+
+    row = store.get_plan("bp_local_proof")
+    record, _validated = decode_local_push_row(row, _validate_stored_plan_row)
+    assert record["integration_oid"] == "c" * 40
+    _assert_local_terminal_shape(
+        store,
+        proof,
+        plan_id="bp_local_proof",
+        state=PlanState.FAILED,
+        push_state=push_state,
+        latest_kind="local_execution_reconciled_failed_advisory",
+    )
+    assert proof.ProofLedger(store).verify_chain("bp_local_proof") is True
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "current_phase",
+        "authority_projection",
+        "push_state_relationship",
+        "noncanonical_push_record",
+        "latest_advisory",
+        "dispatch_state",
+        "dispatch_owner",
+    ),
+)
+def test_verify_chain_rejects_inexact_local_terminal_overlay(tmp_path, corruption):
+    from agent.bestplan_local_git import LocalMainLandingReceipt
+
+    proof = _proof()
+    store = _store(tmp_path / f"local-overlay-{corruption}.db")
+    snapshot = _insert_local_v2_plan(store)
+    _prepare_local_push(store, snapshot)
+    assert store.activate_local_push(
+        "bp_local_proof",
+        landing_receipt=LocalMainLandingReceipt(
+            target_ref="refs/heads/main",
+            old_oid=snapshot.head_oid,
+            new_oid="c" * 40,
+            check_receipt_digest="d" * 64,
+        ),
+    )
+
+    if corruption == "latest_advisory":
+        proof.ProofLedger(store).append_advisory(
+            plan_id="bp_local_proof",
+            operation_id=_operation(999),
+            kind="unrelated_local_advisory",
+            raw_output={"status": "other"},
+            output_source="process",
+        )
+    else:
+        def corrupt(conn):
+            if corruption in {"current_phase", "authority_projection"}:
+                conn.execute("DROP TRIGGER bestplan_plans_v2_projection_guard_v1")
+            if corruption in {"dispatch_state", "dispatch_owner"}:
+                conn.execute("DROP TRIGGER bestplan_plans_v2_dispatch_guard_v1")
+            if corruption == "current_phase":
+                conn.execute(
+                    "UPDATE bestplan_plans SET current_phase='candidate_ready' "
+                    "WHERE plan_id='bp_local_proof'"
+                )
+            elif corruption == "authority_projection":
+                conn.execute(
+                    "UPDATE bestplan_plans SET integration_oid=? "
+                    "WHERE plan_id='bp_local_proof'",
+                    ("f" * 40,),
+                )
+            elif corruption == "push_state_relationship":
+                conn.execute(
+                    "UPDATE bestplan_plans SET local_push_state='not_landed' "
+                    "WHERE plan_id='bp_local_proof'"
+                )
+            elif corruption == "noncanonical_push_record":
+                row = conn.execute(
+                    "SELECT local_push_json FROM bestplan_plans "
+                    "WHERE plan_id='bp_local_proof'"
+                ).fetchone()
+                conn.execute(
+                    "UPDATE bestplan_plans SET local_push_json=? "
+                    "WHERE plan_id='bp_local_proof'",
+                    (json.dumps(json.loads(row[0]), sort_keys=True, indent=2),),
+                )
+            elif corruption == "dispatch_state":
+                conn.execute(
+                    "UPDATE bestplan_plans SET dispatch_state='unknown' "
+                    "WHERE plan_id='bp_local_proof'"
+                )
+            elif corruption == "dispatch_owner":
+                conn.execute(
+                    "UPDATE bestplan_plans SET dispatch_owner='pid:12345' "
+                    "WHERE plan_id='bp_local_proof'"
+                )
+
+        store._execute_write(corrupt)
+
+    with pytest.raises(proof.ProofValidationError):
+        proof.ProofLedger(store).verify_chain("bp_local_proof")
 
 
 def _append(

@@ -117,6 +117,7 @@ _RUNNING_CHECKPOINT_TIMEOUT_SECONDS = 10.0
 _recovery_attempted = False
 _replayed_persisted_ids: set[tuple[str, str]] = set()
 _PERSISTENCE_VERSION = 1
+_BESTPLAN_TERMINALIZATION_PENDING = "bestplan_terminalization_pending"
 # Lightweight liveness ping for status consumers (/agents, TUI/Desktop
 # delegation.status). Completion delivery still rides the shared process queue;
 # this heartbeat only proves that the async-delegation supervisor in this
@@ -867,6 +868,8 @@ def _cleanup_persisted_data_locked(data: Dict[str, Any], *, now: float) -> int:
         delivery_status = str(entry.get("delivery_status") or "")
         if status in _ACTIVE_STATUSES:
             continue
+        if record.get(_BESTPLAN_TERMINALIZATION_PENDING) is True:
+            continue
         age = _record_terminal_age(record, now)
         ttl = _terminal_retention_seconds(status, policy)
         if delivery_status != "delivered" and status not in {"completed", "interrupted"}:
@@ -885,6 +888,8 @@ def _cleanup_persisted_data_locked(data: Dict[str, Any], *, now: float) -> int:
             continue
         record = entry.get("record") if isinstance(entry.get("record"), dict) else entry
         if record.get("status") in _ACTIVE_STATUSES:
+            continue
+        if record.get(_BESTPLAN_TERMINALIZATION_PENDING) is True:
             continue
         terminal.append((rid, entry, record))
     terminal.sort(key=lambda item: item[2].get("completed_at") or item[2].get("dispatched_at") or 0)
@@ -1289,6 +1294,11 @@ def _event_for_lost_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "summary": result["summary"],
         "error": result["error"],
     }
+    if (
+        event["bestplan_plan_id"]
+        and record.get("bestplan_local_execution") is True
+    ):
+        event["bestplan_local_execution"] = True
     if record.get("is_batch"):
         event.update({
             "is_batch": True,
@@ -1338,6 +1348,7 @@ def recover_async_delegations(
             delivery_status = str(entry.get("delivery_status") or "")
             event = entry.get("event") if isinstance(entry.get("event"), dict) else None
             owner_liveness = _owner_liveness(record)
+            lost_now = False
             if status == "scheduled" and owner_liveness is False:
                 # The durable worker gate opens only after this phase is stored.
                 # A fresh process cannot own that queued Future, and the runner
@@ -1380,6 +1391,28 @@ def recover_async_delegations(
                 status = "lost"
                 delivery_status = "pending"
                 lost += 1
+                lost_now = True
+            exact_local_bestplan = bool(record.get("bestplan_plan_id")) and (
+                record.get("bestplan_local_execution") is True
+            )
+            terminalization_pending = (
+                record.get(_BESTPLAN_TERMINALIZATION_PENDING) is True
+            )
+            if terminalization_pending and not exact_local_bestplan:
+                continue
+            if exact_local_bestplan and (lost_now or terminalization_pending):
+                if not isinstance(event, dict) or not _mark_bestplan_completed_unverified(
+                    record, event,
+                ):
+                    record[_BESTPLAN_TERMINALIZATION_PENDING] = True
+                    entry["record"] = record
+                    entry["delivery_status"] = "pending"
+                    entry["updated_at"] = now
+                    continue
+                record = dict(record)
+                record.pop(_BESTPLAN_TERMINALIZATION_PENDING, None)
+                entry["record"] = record
+                entry["updated_at"] = now
             replay_identity = (str(_persistence_path(tracker_path)), str(rid))
             delivery_claim = str(entry.get("delivery_claim") or "")
             claim_stale = False
@@ -1422,7 +1455,13 @@ def recover_async_delegations(
     if restored_records:
         with _records_lock:
             for rid, restored in restored_records:
-                _records.setdefault(rid, restored)
+                live = _records.get(rid)
+                if live is None:
+                    _records[rid] = restored
+                elif live.get(_BESTPLAN_TERMINALIZATION_PENDING) is True:
+                    live.pop(_BESTPLAN_TERMINALIZATION_PENDING, None)
+                    live["delivery_status"] = "queued"
+                    live["queued_at"] = time.time()
     _recovery_attempted = True
     return {"queued": queued, "lost": lost}
 
@@ -2106,7 +2145,11 @@ def _set_delivery_failure(delegation_id: str, error: str) -> None:
 
 
 def _persist_and_queue_terminal(
-    record: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any]
+    record: Dict[str, Any],
+    result: Dict[str, Any],
+    evt: Dict[str, Any],
+    *,
+    publish: bool = True,
 ) -> bool:
     """Publish only after terminal state and queued delivery are durable."""
     delegation_id = str(record.get("delegation_id") or "")
@@ -2118,6 +2161,14 @@ def _persist_and_queue_terminal(
         _set_delivery_failure(delegation_id, error)
         logger.error("Async delegation %s: %s", delegation_id, error)
         return False
+    if not publish:
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None:
+                live[_BESTPLAN_TERMINALIZATION_PENDING] = True
+                live["delivery_status"] = "pending"
+                live.pop("delivery_error", None)
+        return True
     if not _mark_persisted_delivery(
         delegation_id, "queued", tracker_path=tracker_path
     ):
@@ -2175,6 +2226,49 @@ def _canonical_bestplan_state_db_path(value: object) -> str:
     return raw
 
 
+def _mark_bestplan_completed_unverified(
+    record: Dict[str, Any],
+    event: Dict[str, Any],
+) -> bool:
+    plan_id = str(record.get("bestplan_plan_id") or "")
+    if not plan_id:
+        return False
+    tracker_path = str(record.get("origin_tracker_path") or "")
+    handed_off_path = record.get("bestplan_state_db_path")
+    if record.get("bestplan_local_execution") is True and not handed_off_path:
+        return False
+    if not handed_off_path and not tracker_path:
+        return False
+    try:
+        from agent.bestplan_state import BestplanStore
+
+        resolved_path = (
+            Path(_canonical_bestplan_state_db_path(handed_off_path))
+            if handed_off_path
+            else Path(tracker_path).parent / "state.db"
+        )
+        plan_store = BestplanStore(db_path=resolved_path)
+        try:
+            completed = bool(
+                plan_store.mark_completed_unverified(plan_id, event)
+            )
+        finally:
+            plan_store.close()
+        if not completed:
+            logger.warning(
+                "BestPlan completion evidence persistence rejected for %s",
+                plan_id,
+            )
+        return completed
+    except Exception:
+        logger.warning(
+            "BestPlan completion evidence persistence failed for %s",
+            plan_id,
+            exc_info=True,
+        )
+        return False
+
+
 def dispatch_async_delegation_batch(
     *,
     goals: List[str],
@@ -2195,6 +2289,7 @@ def dispatch_async_delegation_batch(
     origin_tracker_path: str = "",
     bestplan_plan_id: str = "",
     bestplan_state_db_path: str = "",
+    bestplan_local_execution: bool = False,
     resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
     terminal_callback: Optional[
         Callable[[Dict[str, Any], str], None]
@@ -2234,6 +2329,9 @@ def dispatch_async_delegation_batch(
             origin_tracker_path=origin_tracker_path,
             bestplan_plan_id=bestplan_plan_id,
             bestplan_state_db_path=canonical_state_db_path,
+            bestplan_local_execution=(
+                bool(bestplan_plan_id) and bestplan_local_execution is True
+            ),
             resolved_runtimes=resolved_runtimes,
             terminal_callback=terminal_callback,
         )
@@ -2259,6 +2357,7 @@ def _dispatch_async_delegation_batch_admitted(
     origin_tracker_path: str = "",
     bestplan_plan_id: str = "",
     bestplan_state_db_path: str = "",
+    bestplan_local_execution: bool = False,
     resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
     terminal_callback: Optional[
         Callable[[Dict[str, Any], str], None]
@@ -2367,6 +2466,9 @@ def _dispatch_async_delegation_batch_admitted(
         "parent_session_id": parent_session_id,
         "bestplan_plan_id": bestplan_plan_id,
         "bestplan_state_db_path": bestplan_state_db_path,
+        "bestplan_local_execution": (
+            bool(bestplan_plan_id) and bestplan_local_execution is True
+        ),
         "resolved_runtimes": safe_resolved_runtimes,
         "status": "intent",
         "dispatched_at": dispatched_at,
@@ -2683,6 +2785,9 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    plan_id = str(event_record.get("bestplan_plan_id") or "")
+    if plan_id and event_record.get("bestplan_local_execution") is True:
+        evt["bestplan_local_execution"] = True
     for key in (
         "stalled_after_quiet_seconds",
         "stall_threshold_seconds",
@@ -2691,29 +2796,20 @@ def _finalize_batch(
     ):
         if key in combined:
             evt[key] = combined[key]
-    plan_id = str(event_record.get("bestplan_plan_id") or "")
-    tracker_path = str(event_record.get("origin_tracker_path") or "")
-    handed_off_path = str(event_record.get("bestplan_state_db_path") or "")
-    if plan_id and (handed_off_path or tracker_path):
-        try:
-            from agent.bestplan_state import BestplanStore
-
-            state_db_path = (
-                Path(_canonical_bestplan_state_db_path(handed_off_path))
-                if handed_off_path
-                else Path(tracker_path).parent / "state.db"
-            )
-            plan_store = BestplanStore(db_path=state_db_path)
-            try:
-                plan_store.mark_completed_unverified(plan_id, evt)
-            finally:
-                plan_store.close()
-        except Exception:
-            logger.warning(
-                "BestPlan completion evidence persistence failed for %s",
-                plan_id,
-                exc_info=True,
-            )
+    terminalized = _mark_bestplan_completed_unverified(event_record, evt)
+    if (
+        plan_id
+        and event_record.get("bestplan_local_execution") is True
+        and not terminalized
+    ):
+        event_record[_BESTPLAN_TERMINALIZATION_PENDING] = True
+        _persist_and_queue_terminal(
+            event_record,
+            combined,
+            evt,
+            publish=False,
+        )
+        return
     _persist_and_queue_terminal(event_record, combined, evt)
 
 

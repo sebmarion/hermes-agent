@@ -32,8 +32,16 @@ from agent.bestplan_candidates import (
     validate_raw_candidate_paths,
 )
 from agent.bestplan_contract import (
+    CONTRACT_SCHEMA,
+    BoundCommand,
+    ContractValidationError,
+    ControllerIdentity,
+    EnrolledRepository,
+    _command_from_dict,
+    _controller_from_dict,
     _repository_from_dict,
     approval_digest as compute_approval_digest,
+    canonical_json,
     contract_digest as compute_contract_digest,
     source_snapshot_digest,
     validate_execution_contract,
@@ -1237,6 +1245,98 @@ def _pinned_contract_inputs(
     return tuple(sorted(paths))
 
 
+@dataclass(frozen=True)
+class _ValidatedTask6Contract:
+    normalized: dict[str, Any]
+    schema: str
+    mode: str
+    repository: EnrolledRepository
+    source: dict[str, Any]
+    commands: tuple[BoundCommand, ...]
+    controller: ControllerIdentity
+    contract_digest: str
+    manifest_digest: str | None
+    check_runtime_digest: str | None
+
+
+def _validate_task6_contract(
+    contract: Mapping[str, Any],
+) -> _ValidatedTask6Contract:
+    """Dispatch exact legacy/local schemas into one immutable Task 6 view."""
+
+    schema = contract.get("schema") if isinstance(contract, Mapping) else None
+    if schema == CONTRACT_SCHEMA:
+        normalized = validate_execution_contract(contract)
+        if normalized["promotion_mode"] != "auto_live":
+            raise ContractValidationError(
+                "Task 6 legacy contract requires auto_live approval"
+            )
+        mode = normalized["promotion_mode"]
+        digest = compute_contract_digest(normalized)
+        manifest_digest = None
+        check_runtime_digest = None
+    else:
+        from agent.bestplan_local import (
+            LOCAL_GO_CONTRACT_SCHEMA,
+            local_go_contract_digest,
+            validate_local_go_contract,
+        )
+
+        if schema != LOCAL_GO_CONTRACT_SCHEMA:
+            raise ContractValidationError("Task 6 contract schema is unsupported")
+        normalized = validate_local_go_contract(contract)
+        mode = normalized["mode"]
+        digest = local_go_contract_digest(normalized)
+        manifest_digest = normalized["manifest_digest"]
+        check_runtime_digest = normalized["check_runtime_digest"]
+
+    repository = _repository_from_dict(
+        normalized["repository"], "Task 6 contract.repository",
+    )
+    controller = _controller_from_dict(
+        normalized["controller"], "Task 6 contract.controller",
+    )
+    commands = tuple(
+        _command_from_dict(item, f"Task 6 contract.commands[{index}]")
+        for index, item in enumerate(normalized["commands"])
+    )
+    return _ValidatedTask6Contract(
+        normalized=normalized,
+        schema=schema,
+        mode=mode,
+        repository=repository,
+        source=dict(normalized["source"]),
+        commands=commands,
+        controller=controller,
+        contract_digest=digest,
+        manifest_digest=manifest_digest,
+        check_runtime_digest=check_runtime_digest,
+    )
+
+
+def _task6_approval_digest(
+    manifest: Mapping[str, Any],
+    contract: _ValidatedTask6Contract,
+) -> str:
+    if contract.schema == CONTRACT_SCHEMA:
+        return compute_approval_digest(manifest, contract.normalized)
+
+    from agent.bestplan_local import local_go_contract_json
+
+    manifest_json = canonical_json(manifest).encode("utf-8")
+    manifest_digest = hashlib.sha256(manifest_json).hexdigest()
+    if contract.manifest_digest != manifest_digest:
+        raise ContractValidationError(
+            "local-go contract manifest digest differs from the approved plan"
+        )
+    return hashlib.sha256(
+        b"hermes.bestplan.local-go-approval.v1\0"
+        + manifest_json
+        + b"\0"
+        + local_go_contract_json(contract.normalized).encode("utf-8")
+    ).hexdigest()
+
+
 def _validate_contract_and_bindings(
     *,
     plan_id: str,
@@ -1255,12 +1355,21 @@ def _validate_contract_and_bindings(
         or len(plan_id.encode("utf-8")) > 1024
     ):
         raise IntegrationValidationError("integration plan id is invalid")
-    normalized = validate_execution_contract(contract)
-    contract_sha = compute_contract_digest(normalized)
+    try:
+        validated = _validate_task6_contract(contract)
+        expected_approval = _task6_approval_digest(
+            plan.to_manifest(), validated,
+        )
+    except ContractValidationError as exc:
+        raise IntegrationValidationError(
+            f"integration contract is invalid: {exc}"
+        ) from None
+    normalized = validated.normalized
+    contract_sha = validated.contract_digest
     snapshot_sha = source_snapshot_digest(snapshot)
-    if not _is_sha256(approved) or compute_approval_digest(plan.to_manifest(), normalized) != approved:
+    if not _is_sha256(approved) or expected_approval != approved:
         raise IntegrationValidationError("integration approval digest differs")
-    source = normalized["source"]
+    source = validated.source
     if (
         source["base_oid"] != snapshot.head_oid
         or source["tree_oid"] != snapshot.tree_oid
@@ -1269,24 +1378,14 @@ def _validate_contract_and_bindings(
         or source["protected_digest"] != snapshot.protected_manifest.digest
     ):
         raise IntegrationValidationError("integration source contract differs")
-    try:
-        enrolled_repository = _repository_from_dict(
-            normalized["repository"], "integration.repository",
-        )
-    except BaseException:
-        raise IntegrationValidationError(
-            "integration repository contract is malformed"
-        ) from None
-    if not enrolled_repository.matches(snapshot.repo):
+    if not validated.repository.matches(snapshot.repo):
         raise IntegrationValidationError("integration repository contract differs")
-    if normalized["promotion_mode"] != "auto_live":
-        raise IntegrationValidationError("integration requires auto_live approval")
     if any(item.depends_on for item in plan.slices):
         raise IntegrationValidationError("integration dependency manifests are unsupported")
     if len(candidates) != len(plan.slices):
         raise IntegrationValidationError("integration candidate set is incomplete")
     by_manifest: dict[str, CandidateIntegrationBinding] = {}
-    controller = normalized["controller"]
+    controller = validated.controller
     for binding in candidates:
         if not isinstance(binding, CandidateIntegrationBinding):
             raise IntegrationValidationError("integration candidate binding is invalid")
@@ -1297,10 +1396,10 @@ def _validate_contract_and_bindings(
             or binding.approval_digest != approved
             or binding.contract_digest != contract_sha
             or binding.source_snapshot_digest != snapshot_sha
-            or binding.controller_id != controller["controller_id"]
-            or binding.controller_repository_id != controller["repository_id"]
-            or binding.controller_release_oid != controller["release_oid"]
-            or binding.controller_artifact_sha256 != controller["artifact_sha256"]
+            or binding.controller_id != controller.controller_id
+            or binding.controller_repository_id != controller.repository_id
+            or binding.controller_release_oid != controller.release_oid
+            or binding.controller_artifact_sha256 != controller.artifact_sha256
         ):
             raise IntegrationValidationError("integration candidate binding differs")
         by_manifest[binding.manifest_slice_id] = binding

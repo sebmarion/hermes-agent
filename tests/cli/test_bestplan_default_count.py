@@ -169,3 +169,62 @@ def test_untrusted_go_keeps_existing_cli_resolver_routing():
     resolved_go.to_agent_result.assert_called_once()
     agent.run_conversation.assert_not_called()
     capture_result.assert_not_called()
+
+
+def test_bare_go_resolver_exception_never_falls_through_to_the_model():
+    from tests.cli.test_cli_interrupt_ack_race import (
+        _StubAgent,
+        _make_cli as _make_running_cli,
+    )
+
+    cli = _make_running_cli()
+    agent = _StubAgent(cli.session_id, turn_seconds=0)
+    agent.run_conversation = MagicMock(return_value={
+        "final_response": "model fallback",
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "model fallback"},
+        ],
+        "api_calls": 1,
+        "completed": True,
+        "partial": True,
+        "response_previewed": True,
+    })
+    cli.agent = agent
+    unresolved_push = SimpleNamespace(resolved=False)
+
+    with (
+        patch.object(cli, "_ensure_runtime_credentials", return_value=True),
+        patch.object(
+            cli,
+            "_resolve_turn_agent_config",
+            return_value={
+                "signature": cli._active_agent_route_signature,
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            },
+        ),
+        patch.object(cli, "_init_agent", return_value=True),
+        patch(
+            "agent.bestplan_local_push.try_resolve_local_push",
+            return_value=unresolved_push,
+        ),
+        patch(
+            "agent.bestplan_state.try_resolve_go",
+            side_effect=OSError("state read failed"),
+        ),
+        patch(
+            "agent.bestplan_state.is_go_enabled",
+            return_value=False,
+        ) as legacy_gate,
+        patch("agent.autonomy_shadow.submit_shadow_observation") as shadow,
+        patch("agent.title_generator.maybe_auto_title"),
+    ):
+        response = cli.chat("  GO  ")
+
+    assert "resolver_error" in response
+    assert "bestplan host resolver failed closed" in response
+    agent.run_conversation.assert_not_called()
+    shadow.assert_not_called()
+    legacy_gate.assert_not_called()

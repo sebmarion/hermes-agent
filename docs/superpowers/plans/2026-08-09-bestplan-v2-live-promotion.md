@@ -1,5 +1,11 @@
 # BestPlan V2 Live Promotion Implementation Plan
 
+> **Superseded on 2026-08-11 after Task 6.** Tasks 1–6 remain the hardened
+> candidate, integration, and check foundation. The remaining tasks are
+> replaced by the reduced local-main flow documented in the slash-command
+> reference. BestPlan no longer owns deployment, activation, live proof,
+> release artifacts, root authority, or rollback.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make BestPlan produce parallel, isolated candidates and automatically promote an enrolled V2 plan through review, local main, the authorized remote, and verified live gateway activation.

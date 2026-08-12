@@ -9,6 +9,7 @@ import math
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -33,6 +34,16 @@ from agent.bestplan_contract import (
     source_snapshot_json,
     source_snapshot_to_dict,
     validate_execution_contract,
+)
+from agent.bestplan_local_push import (
+    LOCAL_PUSH_ACTIVE_STATES,
+    LOCAL_PUSH_MAX_TTL_SECONDS,
+    LOCAL_PUSH_REF,
+    LOCAL_PUSH_STATES,
+    LocalPushStateError,
+    build_local_push_record,
+    canonical_local_push_json,
+    decode_local_push_row,
 )
 from agent.bestplan_source import (
     DEFAULT_SOURCE_OPERATION_SECONDS,
@@ -73,6 +84,7 @@ class PlanState:
     WAITING = "waiting"
     COMPLETED_UNVERIFIED = "completed_unverified"
     COMPLETED_VERIFIED = "completed_verified"
+    COMPLETED_LOCAL = "completed_local"
     REJECTED = "rejected"
     FAILED = "failed"
 
@@ -88,7 +100,6 @@ _LANE_FOR_SLICE = {
     ("implement", "fast_fallback"): "code_worker",
     ("review", "frontier_review"): "smart_reviewer",
 }
-
 
 class BestplanError(ValueError):
     """Raised when an envelope, state transition, or route is unsafe."""
@@ -120,6 +131,38 @@ class ResolvedGo:
 
     @property
     def response(self) -> str:
+        if self.status == "push_declined":
+            return (
+                f"Local `main` remains at the checked commit for plan {self.plan_id}. "
+                "Hermes did not change the remote."
+            )
+        if self.status == "push_complete":
+            return (
+                f"Pushed the exact checked local `main` commit for plan "
+                f"{self.plan_id}; remote `main` now matches it."
+            )
+        if self.status == "push_in_flight":
+            return (
+                f"The exact push for plan {self.plan_id} is already in flight. "
+                "No second push was started."
+            )
+        if self.status == "push_effect_unknown":
+            return (
+                f"The exact push result for plan {self.plan_id} is not yet proven. "
+                "Reply `push` again to reconcile the same target; Hermes will not "
+                "force-push."
+            )
+        if self.status == "push_expired":
+            return (
+                f"The push confirmation for plan {self.plan_id} expired. "
+                "Hermes did not start a new remote write."
+            )
+        if self.status in {"push_stale", "push_context_mismatch", "push_ambiguous"}:
+            return (
+                f"The push confirmation for plan {self.plan_id or '(unknown)'} "
+                f"failed closed ({self.status}): "
+                f"{self.reason or self.error or 'the exact target is not provable'}."
+            )
         if self.status == "waiting":
             return (
                 f"Plan {self.plan_id} was dispatched as delegation "
@@ -613,15 +656,12 @@ def _render_authoritative_manifest(
         f"- risk: {escaped(plan.risk)}",
         f"- workspace: {escaped(_canonical_workspace(workspace))}",
     ]
+    local_contract = (
+        isinstance(contract, Mapping)
+        and contract.get("schema") == "hermes.bestplan.local-go.v1"
+    )
     for item in plan.slices:
-        from agent.bestplan_sandbox import sandbox_backend_identity
-
         route = _LANE_FOR_SLICE[(item.kind, item.capability)]
-        sandbox = sandbox_backend_identity(
-            workspace=workspace,
-            allowed_paths=item.allowed_paths,
-            read_only=item.read_only,
-        )
         leases = (
             ", ".join(escaped(value) for value in item.allowed_paths)
             if item.allowed_paths
@@ -633,7 +673,7 @@ def _render_authoritative_manifest(
             else "none"
         )
         acceptance = "; ".join(escaped(value) for value in item.acceptance)
-        lines.extend([
+        slice_lines = [
             f"- slice {escaped(item.id)}:",
             f"  - route: {escaped(route)}",
             f"  - goal: {escaped(item.goal)}",
@@ -641,19 +681,35 @@ def _render_authoritative_manifest(
             f"  - read_only: {str(item.read_only).lower()}",
             f"  - write leases: {leases}",
             f"  - expected artifacts: {artifacts}",
-            f"  - sandbox backend: {escaped(sandbox['backend'])}",
-            f"  - sandbox policy digest: {escaped(sandbox['policy_digest'])}",
             f"  - acceptance: {acceptance}",
-        ])
-    contract_lines = render_execution_contract(
-        plan, contract, digest, _canonical_workspace(workspace),
-    ).splitlines()
-    protocol_index = next(
-        index
-        for index, line in enumerate(contract_lines)
-        if line.startswith("- execution protocol:")
-    )
-    lines.extend(contract_lines[protocol_index:])
+        ]
+        if not local_contract:
+            from agent.bestplan_sandbox import sandbox_backend_identity
+
+            sandbox = sandbox_backend_identity(
+                workspace=workspace,
+                allowed_paths=item.allowed_paths,
+                read_only=item.read_only,
+            )
+            slice_lines[-1:-1] = [
+                f"  - sandbox backend: {escaped(sandbox['backend'])}",
+                f"  - sandbox policy digest: {escaped(sandbox['policy_digest'])}",
+            ]
+        lines.extend(slice_lines)
+    if local_contract:
+        from agent.bestplan_local import render_local_go_contract
+
+        lines.extend(render_local_go_contract(contract).splitlines())
+    else:
+        contract_lines = render_execution_contract(
+            plan, contract, digest, _canonical_workspace(workspace),
+        ).splitlines()
+        protocol_index = next(
+            index
+            for index, line in enumerate(contract_lines)
+            if line.startswith("- execution protocol:")
+        )
+        lines.extend(contract_lines[protocol_index:])
     return "\n".join(lines)
 
 
@@ -706,7 +762,10 @@ CREATE TABLE IF NOT EXISTS bestplan_plans (
     review_verified_at REAL,
     remote_verified_at REAL,
     live_verified_at REAL,
-    verified_at REAL
+    verified_at REAL,
+    local_push_json TEXT,
+    local_push_state TEXT,
+    local_push_updated_at REAL
 )
 """
 _CREATE_INDEX_SQL = """CREATE INDEX IF NOT EXISTS idx_bestplan_plans_session_state
@@ -790,43 +849,98 @@ def _validate_stored_plan_row(
         elif stored_approval != expected_digest:
             raise BestplanError("approval digest does not match protocol-1 manifest")
     else:
-        if values.get("promotion_contract_version") != 2 or isinstance(
-            values.get("promotion_contract_version"), bool
-        ):
-            raise BestplanError("protocol-2 row has no contract version 2")
         if snapshot is None:
             raise BestplanError("protocol-2 row has no source snapshot")
         raw_contract = values.get("promotion_contract_json")
         stored_contract_digest = values.get("promotion_contract_digest")
         if not isinstance(raw_contract, str) or not isinstance(stored_contract_digest, str):
             raise BestplanError("protocol-2 row has incomplete contract storage")
-        try:
-            decoded_contract = json.loads(raw_contract)
-            contract = validate_execution_contract(decoded_contract)
-            if contract_json(contract) != raw_contract:
-                raise ContractValidationError("contract JSON is not canonical")
-        except Exception as exc:
-            raise BestplanError(f"stored promotion contract is invalid: {exc}") from exc
-        if contract_digest(contract) != stored_contract_digest:
-            raise BestplanError("stored promotion contract digest differs")
-        if values.get("promotion_mode") != contract["promotion_mode"]:
-            raise BestplanError("stored promotion mode differs from contract")
-        source = contract["source"]
-        if source["snapshot_digest"] != source_digest_raw:
-            raise BestplanError("contract/source snapshot digest differs")
-        if source["source_digest"] != snapshot.fingerprint:
-            raise BestplanError("contract/source fingerprint differs")
-        if source["protected_digest"] != snapshot.protected_manifest.digest:
-            raise BestplanError("contract/protected manifest digest differs")
-        if source["base_oid"] != snapshot.head_oid or source["local_main_oid"] != snapshot.head_oid:
-            raise BestplanError("contract/source base object differs")
-        if source["tree_oid"] != snapshot.tree_oid:
-            raise BestplanError("contract/source tree object differs")
-        if contract["repository"] != source_snapshot_to_dict(snapshot)["repository"]:
-            raise BestplanError("contract/source repository identity differs")
-        expected_digest = _approval_digest(stored_manifest, contract)
-        if values.get("approval_digest") != expected_digest:
-            raise BestplanError("approval digest does not match manifest and contract")
+        contract_version = values.get("promotion_contract_version")
+        if contract_version == 1 and not isinstance(contract_version, bool):
+            try:
+                from agent.bestplan_local import (
+                    LOCAL_GO_CONTRACT_SCHEMA,
+                    local_go_approval_digest,
+                    local_go_contract_digest,
+                    local_go_contract_json,
+                    local_go_manifest_digest,
+                    validate_local_go_contract,
+                )
+
+                decoded_contract = json.loads(raw_contract)
+                if not isinstance(decoded_contract, Mapping) or decoded_contract.get(
+                    "schema"
+                ) != LOCAL_GO_CONTRACT_SCHEMA:
+                    raise ContractValidationError(
+                        "local-go contract schema is unsupported"
+                    )
+                contract = validate_local_go_contract(decoded_contract)
+                if local_go_contract_json(contract) != raw_contract:
+                    raise ContractValidationError("contract JSON is not canonical")
+            except Exception as exc:
+                raise BestplanError(
+                    f"stored local-go contract is invalid: {exc}"
+                ) from exc
+            if local_go_contract_digest(contract) != stored_contract_digest:
+                raise BestplanError("stored local-go contract digest differs")
+            if values.get("promotion_mode") != contract["mode"]:
+                raise BestplanError("stored local-go mode differs from contract")
+            if contract["manifest_digest"] != local_go_manifest_digest(
+                stored_manifest
+            ):
+                raise BestplanError("local-go contract manifest digest differs")
+            source = contract["source"]
+            if source["snapshot_digest"] != source_digest_raw:
+                raise BestplanError("contract/source snapshot digest differs")
+            if source["source_digest"] != snapshot.fingerprint:
+                raise BestplanError("contract/source fingerprint differs")
+            if source["protected_digest"] != snapshot.protected_manifest.digest:
+                raise BestplanError("contract/protected manifest digest differs")
+            if (
+                source["base_oid"] != snapshot.head_oid
+                or source["local_ref"] != LOCAL_PUSH_REF
+            ):
+                raise BestplanError("contract/source base object differs")
+            if source["tree_oid"] != snapshot.tree_oid:
+                raise BestplanError("contract/source tree object differs")
+            if contract["repository"] != source_snapshot_to_dict(snapshot)["repository"]:
+                raise BestplanError("contract/source repository identity differs")
+            expected_digest = local_go_approval_digest(stored_manifest, contract)
+            if values.get("approval_digest") != expected_digest:
+                raise BestplanError(
+                    "approval digest does not match manifest and local-go contract"
+                )
+        else:
+            # Preserve the existing controlled-promotion V2 path byte-for-byte.
+            if contract_version != 2 or isinstance(contract_version, bool):
+                raise BestplanError("protocol-2 row has no contract version 2")
+            try:
+                decoded_contract = json.loads(raw_contract)
+                contract = validate_execution_contract(decoded_contract)
+                if contract_json(contract) != raw_contract:
+                    raise ContractValidationError("contract JSON is not canonical")
+            except Exception as exc:
+                raise BestplanError(f"stored promotion contract is invalid: {exc}") from exc
+            if contract_digest(contract) != stored_contract_digest:
+                raise BestplanError("stored promotion contract digest differs")
+            if values.get("promotion_mode") != contract["promotion_mode"]:
+                raise BestplanError("stored promotion mode differs from contract")
+            source = contract["source"]
+            if source["snapshot_digest"] != source_digest_raw:
+                raise BestplanError("contract/source snapshot digest differs")
+            if source["source_digest"] != snapshot.fingerprint:
+                raise BestplanError("contract/source fingerprint differs")
+            if source["protected_digest"] != snapshot.protected_manifest.digest:
+                raise BestplanError("contract/protected manifest digest differs")
+            if source["base_oid"] != snapshot.head_oid or source["local_main_oid"] != snapshot.head_oid:
+                raise BestplanError("contract/source base object differs")
+            if source["tree_oid"] != snapshot.tree_oid:
+                raise BestplanError("contract/source tree object differs")
+            if contract["repository"] != source_snapshot_to_dict(snapshot)["repository"]:
+                raise BestplanError("contract/source repository identity differs")
+            expected_digest = _approval_digest(stored_manifest, contract)
+            if values.get("approval_digest") != expected_digest:
+                raise BestplanError("approval digest does not match manifest and contract")
 
     return _ValidatedStoredPlan(
         execution_protocol=protocol,
@@ -841,7 +955,13 @@ def _validate_stored_plan_row(
 class BestplanStore:
     """SQLite authority for immutable plan envelopes and atomic claims."""
 
-    def __init__(self, session_db=None, db_path: Optional[Path] = None):
+    def __init__(
+        self,
+        session_db=None,
+        db_path: Optional[Path] = None,
+        *,
+        reconcile_push_state: bool = True,
+    ):
         self._session_db = session_db
         self._db_path = Path(db_path) if db_path is not None else None
         self._lock = threading.RLock()
@@ -873,6 +993,8 @@ class BestplanStore:
             self._owned_connection.commit()
         self._ensure_schema()
         self.reconcile_async_tracker()
+        if reconcile_push_state:
+            self.reconcile_local_pushes()
 
     def close(self) -> None:
         with self._lock:
@@ -943,6 +1065,9 @@ class BestplanStore:
             "remote_verified_at": "REAL",
             "live_verified_at": "REAL",
             "verified_at": "REAL",
+            "local_push_json": "TEXT",
+            "local_push_state": "TEXT",
+            "local_push_updated_at": "REAL",
         }
 
         def migrate(conn):
@@ -1004,9 +1129,10 @@ class BestplanStore:
 
     def reconcile_async_tracker(self) -> int:
         """Reconcile plan rows with the deterministic async tracker at startup."""
-        if self._db_path is None:
+        state_path = self.state_db_path
+        if state_path is None:
             return 0
-        tracker = self._db_path.parent / "async_delegations.json"
+        tracker = state_path.parent / "async_delegations.json"
         try:
             raw = json.loads(tracker.read_text(encoding="utf-8"))
             records = raw.get("records") or {}
@@ -1014,6 +1140,7 @@ class BestplanStore:
             return 0
         if not isinstance(records, dict):
             return 0
+        from tools.async_delegation import _owner_liveness
 
         def reconcile(conn):
             changed = 0
@@ -1049,16 +1176,9 @@ class BestplanStore:
                         "interrupted",
                     }
                     if phase in {"scheduled", "running"}:
-                        try:
-                            owner_pid = int(record.get("owner_pid"))
-                            if owner_pid <= 0:
-                                raise ValueError("invalid owner pid")
-                            os.kill(owner_pid, 0)
-                            owner_live = True
-                        except (ProcessLookupError, TypeError, ValueError):
-                            owner_live = False
-                        except PermissionError:
-                            owner_live = True
+                        owner_live = _owner_liveness(record)
+                        if owner_live is None:
+                            continue
                         if owner_live:
                             advisory_kind = "async_tracker_running_advisory"
                             dispatch_state = "scheduled"
@@ -1071,6 +1191,7 @@ class BestplanStore:
                             advisory_kind = "async_tracker_lost_advisory"
                             compatibility_error = "recapture_required"
                             dispatch_state = "terminal"
+                            clear_owner = True
                             advisory_output = {
                                 "delegation_id": delegation_id,
                                 "status": "lost",
@@ -1131,16 +1252,9 @@ class BestplanStore:
                         changed += 1
                     continue
                 if phase in {"scheduled", "running"}:
-                    try:
-                        owner_pid = int(record.get("owner_pid"))
-                        if owner_pid <= 0:
-                            raise ValueError("invalid owner pid")
-                        os.kill(owner_pid, 0)
-                        owner_live = True
-                    except (ProcessLookupError, TypeError, ValueError):
-                        owner_live = False
-                    except PermissionError:
-                        owner_live = True
+                    owner_live = _owner_liveness(record)
+                    if owner_live is None:
+                        continue
                     if owner_live:
                         changed += conn.execute(
                             "UPDATE bestplan_plans SET state=?, dispatch_state='scheduled', "
@@ -1217,7 +1331,10 @@ class BestplanStore:
         provisional: bool = False,
         config: Optional[dict[str, Any]] = None,
         authority_client: BestplanAuthorityClient | None = None,
+        local_execution: bool = False,
     ) -> str:
+        if type(local_execution) is not bool:
+            raise BestplanError("local_execution must be true or false")
         workspace = _workspace_hint(workspace)
         supplied_fingerprint = (
             None if baseline_fingerprint is None else str(baseline_fingerprint)
@@ -1229,7 +1346,12 @@ class BestplanStore:
         contract_value: dict[str, Any] | None = None
         contract_json_value: str | None = None
         contract_digest_value: str | None = None
+        manifest = plan.to_manifest()
         if not strong_source_capture_supported():
+            if local_execution:
+                raise BaselineFingerprintError(
+                    "local BestPlan requires strong Git source capture"
+                )
             try:
                 workspace, captured_fingerprint = capture_legacy_v1_fingerprint(
                     workspace,
@@ -1273,6 +1395,11 @@ class BestplanStore:
             try:
                 repo = resolve_repo_identity(workspace)
             except SourceBoundaryError as exc:
+                if local_execution:
+                    raise BaselineFingerprintError(
+                        f"strong git baseline unavailable for {workspace}: "
+                        f"{exc.code}: {exc}"
+                    ) from exc
                 if not supplied_fingerprint:
                     raise BaselineFingerprintError(
                         f"strong git baseline unavailable for {workspace}: {exc.code}: {exc}"
@@ -1298,14 +1425,16 @@ class BestplanStore:
                 baseline_fingerprint = supplied_fingerprint
             else:
                 workspace = repo.workspace
-                try:
-                    enrollment = resolve_matching_enrollment(
-                        config or {}, repo, authority_client,
-                    )
-                except Exception as exc:
-                    raise BestplanError(
-                        f"matching promotion enrollment is invalid: {exc}"
-                    ) from exc
+                enrollment = None
+                if not local_execution:
+                    try:
+                        enrollment = resolve_matching_enrollment(
+                            config or {}, repo, authority_client,
+                        )
+                    except Exception as exc:
+                        raise BestplanError(
+                            f"matching promotion enrollment is invalid: {exc}"
+                        ) from exc
                 capture_seconds = (
                     enrollment.capture_budget_seconds
                     if enrollment is not None
@@ -1331,7 +1460,46 @@ class BestplanStore:
                 baseline_revision = snapshot.head_oid
                 source_json_value = source_snapshot_json(snapshot)
                 source_digest_value = source_snapshot_digest(snapshot)
-                if enrollment is not None:
+                if local_execution:
+                    try:
+                        from agent.bestplan_local import (
+                            build_local_go_contract,
+                            capture_local_execution_inputs,
+                            local_go_contract_digest,
+                            local_go_contract_json,
+                            local_go_manifest_digest,
+                        )
+
+                        local_inputs = capture_local_execution_inputs(
+                            snapshot=snapshot,
+                            controller_python=Path(sys.executable),
+                            manifest=manifest,
+                            deadline=(
+                                time.monotonic()
+                                + DEFAULT_SOURCE_OPERATION_SECONDS
+                            ),
+                        )
+                        contract_value = build_local_go_contract(
+                            snapshot=snapshot,
+                            controller=local_inputs.controller,
+                            commands=local_inputs.check_plan.commands,
+                            manifest_digest=local_go_manifest_digest(manifest),
+                            check_runtime_digest=(
+                                local_inputs.check_plan.check_runtime_digest
+                            ),
+                        )
+                        contract_json_value = local_go_contract_json(
+                            contract_value
+                        )
+                        contract_digest_value = local_go_contract_digest(
+                            contract_value
+                        )
+                    except Exception as exc:
+                        raise BestplanError(
+                            f"local BestPlan runtime capture failed: {exc}"
+                        ) from exc
+                    execution_protocol = 2
+                elif enrollment is not None:
                     try:
                         contract_value = build_execution_contract(
                             plan, snapshot, enrollment, enrollment.controller,
@@ -1343,7 +1511,6 @@ class BestplanStore:
                             f"matching promotion enrollment cannot issue a contract: {exc}"
                         ) from exc
                     execution_protocol = 2
-        manifest = plan.to_manifest()
         manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
         if raw_envelope is None:
             raw = (
@@ -1358,7 +1525,22 @@ class BestplanStore:
         else:
             raw = str(raw_envelope)
         plan_id = f"bp_{uuid.uuid4().hex}"
-        digest = _approval_digest(manifest, contract_value)
+        if local_execution:
+            from agent.bestplan_local import local_go_approval_digest
+
+            digest = local_go_approval_digest(manifest, contract_value or {})
+        else:
+            digest = _approval_digest(manifest, contract_value)
+        contract_version_value = (
+            1 if local_execution else 2 if execution_protocol == 2 else None
+        )
+        promotion_mode_value = None
+        if contract_value is not None:
+            promotion_mode_value = (
+                contract_value.get("mode")
+                if local_execution
+                else contract_value.get("promotion_mode")
+            )
 
         def insert(conn):
             conn.execute(
@@ -1377,9 +1559,9 @@ class BestplanStore:
                     str(raw_request or ""), raw, manifest_json,
                     PlanState.PROVISIONAL if provisional else PlanState.PENDING,
                     digest, execution_protocol,
-                    2 if execution_protocol == 2 else None,
+                    contract_version_value,
                     contract_json_value, contract_digest_value,
-                    contract_value["promotion_mode"] if contract_value is not None else None,
+                    promotion_mode_value,
                     source_json_value, source_digest_value,
                     "captured" if execution_protocol == 2 else None,
                 ),
@@ -1395,16 +1577,424 @@ class BestplanStore:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def _session_matches_visible_continuation(
+        self,
+        stored_session_id: str,
+        visible_session_id: str,
+    ) -> bool:
+        """Match an immutable owner to its exact compression continuation."""
+
+        stored = str(stored_session_id)
+        visible = str(visible_session_id)
+        if stored == visible:
+            return True
+        session_db = self._session_db
+        resolver = getattr(session_db, "resolve_resume_session_id", None)
+        if not callable(resolver):
+            return False
+        try:
+            return str(resolver(stored)) == visible
+        except Exception:
+            return False
+
     def list_for_session(self, session_id: str, *, open_only: bool = True) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM bestplan_plans WHERE session_id = ?"
-        params: list[Any] = [str(session_id)]
+        visible_session_id = str(session_id)
+        sql = (
+            "SELECT * FROM bestplan_plans WHERE "
+            "(session_id = ? OR (execution_protocol=2 "
+            "AND promotion_contract_version=1 "
+            "AND promotion_mode='local_main'))"
+        )
+        params: list[Any] = [visible_session_id]
         if open_only:
             sql += " AND state IN (?, ?, ?, ?)"
             params.extend(_OPEN_STATES)
         sql += " ORDER BY created_at DESC"
         with self._read_lock():
             rows = self._connection().execute(sql, params).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            dict(row)
+            for row in rows
+            if self._session_matches_visible_continuation(
+                row["session_id"], visible_session_id,
+            )
+        ]
+
+    def _record_local_landing(self, conn, row) -> int:
+        """Project one exact local landing while its push remains independent."""
+
+        from agent.bestplan_proof import ProofLedger
+
+        now = time.time()
+        ProofLedger(self).append_advisory_in_transaction(
+            conn,
+            plan_id=str(row["plan_id"]),
+            kind="local_landing_recovered_advisory",
+            raw_output={"status": "local_landing_recovered"},
+            output_source="process",
+            compatibility_dispatch_state="terminal",
+            compatibility_clear_dispatch_owner=True,
+        )
+        return conn.execute(
+            """UPDATE bestplan_plans
+               SET local_push_state='awaiting', local_push_updated_at=?,
+                   state=?
+               WHERE plan_id=? AND local_push_state='prepared'
+                 AND local_push_json=? AND state IN (?, ?)""",
+            (
+                now,
+                PlanState.COMPLETED_LOCAL,
+                row["plan_id"],
+                row["local_push_json"],
+                PlanState.RUNNING,
+                PlanState.WAITING,
+            ),
+        ).rowcount
+
+    def prepare_local_push(
+        self,
+        plan_id: str,
+        *,
+        session_id: str,
+        profile: str,
+        workspace: str,
+        expected_target_oid: str,
+        integration_oid: str,
+        check_set_digest: str,
+        target: Any,
+        expires_at: int,
+    ) -> Optional[dict[str, Any]]:
+        """Durably bind one prompt before the checked local-main effect."""
+
+        from agent.bestplan_local_git import LocalMainPushTarget
+
+        now = time.time()
+        if (
+            not isinstance(target, LocalMainPushTarget)
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, int)
+            or expires_at <= now
+            or expires_at - now > LOCAL_PUSH_MAX_TTL_SECONDS
+        ):
+            return None
+        expected_workspace = _canonical_workspace(workspace)
+
+        def prepare(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=?", (str(plan_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            values = dict(row)
+            try:
+                validated = _validate_stored_plan_row(values)
+            except BestplanError:
+                return None
+            contract = validated.contract
+            snapshot = validated.source_snapshot
+            if (
+                validated.execution_protocol != 2
+                or not isinstance(contract, Mapping)
+                or contract.get("schema") != "hermes.bestplan.local-go.v1"
+                or contract.get("version") != 1
+                or contract.get("mode") != "local_main"
+                or snapshot is None
+                or values.get("state") not in {PlanState.RUNNING, PlanState.WAITING}
+                or values.get("session_id") != str(session_id)
+                or values.get("profile") != str(profile)
+                or values.get("workspace") != expected_workspace
+                or expected_target_oid != snapshot.head_oid
+                or target.integration_oid != integration_oid
+                or values.get("current_phase") != "captured"
+                or any(
+                    values.get(name) is not None
+                    for name in (
+                        "integration_oid",
+                        "artifact_digest",
+                        "candidate_set_digest",
+                        "proof_authority_epoch",
+                        "proof_event_seq",
+                        "proof_event_hash",
+                        "verification_receipt_json",
+                        "verification_receipt_digest",
+                        "tests_verified_at",
+                        "review_verified_at",
+                        "remote_verified_at",
+                        "live_verified_at",
+                        "verified_at",
+                        "completed_at",
+                    )
+                )
+            ):
+                return None
+            try:
+                record = build_local_push_record(
+                    row=values,
+                    plan=validated,
+                    plan_id=str(plan_id),
+                    session_id=str(session_id),
+                    profile=str(profile),
+                    workspace=expected_workspace,
+                    expected_target_oid=expected_target_oid,
+                    integration_oid=integration_oid,
+                    check_set_digest=check_set_digest,
+                    target=target,
+                    expires_at=expires_at,
+                )
+                raw = canonical_local_push_json(record)
+            except LocalPushStateError:
+                return None
+            existing_raw = values.get("local_push_json")
+            existing_state = values.get("local_push_state")
+            if existing_raw is not None or existing_state is not None:
+                if existing_raw == raw and existing_state == "prepared":
+                    return {**record, "state": "prepared"}
+                return None
+            changed = conn.execute(
+                """UPDATE bestplan_plans
+                   SET local_push_json=?, local_push_state='prepared',
+                       local_push_updated_at=?
+                   WHERE plan_id=? AND local_push_json IS NULL
+                     AND local_push_state IS NULL""",
+                (raw, now, str(plan_id)),
+            ).rowcount
+            return (
+                {**record, "state": "prepared"}
+                if changed == 1
+                else None
+            )
+
+        return self._execute_write(prepare)
+
+    def activate_local_push(
+        self,
+        plan_id: str,
+        *,
+        landing_receipt: Any,
+    ) -> bool:
+        """Expose a prompt only after the exact local landing postflight."""
+
+        from agent.bestplan_local_git import LocalMainLandingReceipt
+
+        if not isinstance(landing_receipt, LocalMainLandingReceipt):
+            return False
+
+        def activate(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=?", (str(plan_id),),
+            ).fetchone()
+            if row is None or row["local_push_state"] != "prepared":
+                return 0
+            try:
+                record, _validated = decode_local_push_row(
+                    row, _validate_stored_plan_row,
+                )
+            except LocalPushStateError:
+                return 0
+            if (
+                landing_receipt.target_ref != record["local_ref"]
+                or landing_receipt.old_oid != record["expected_target_oid"]
+                or landing_receipt.new_oid != record["integration_oid"]
+                or landing_receipt.check_receipt_digest
+                != record["check_set_digest"]
+            ):
+                return 0
+            return self._record_local_landing(conn, row)
+
+        return bool(self._execute_write(activate))
+
+    def _set_local_push_state(
+        self,
+        plan_id: str,
+        *,
+        expected_state: str,
+        new_state: str,
+        expected_json: str | None = None,
+    ) -> bool:
+        if expected_state not in LOCAL_PUSH_STATES or new_state not in LOCAL_PUSH_STATES:
+            return False
+
+        def transition(conn):
+            if expected_state == "prepared" and new_state == "awaiting":
+                row = conn.execute(
+                    "SELECT * FROM bestplan_plans WHERE plan_id=?",
+                    (str(plan_id),),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["local_push_state"] != "prepared"
+                    or expected_json is not None
+                    and row["local_push_json"] != expected_json
+                ):
+                    return 0
+                try:
+                    _record, _validated = decode_local_push_row(
+                        row, _validate_stored_plan_row,
+                    )
+                except LocalPushStateError:
+                    return 0
+                return self._record_local_landing(conn, row)
+            if expected_state == "prepared" and new_state in {
+                "expired", "not_landed", "stale",
+            }:
+                from agent.bestplan_proof import ProofLedger
+
+                now = time.time()
+                row = conn.execute(
+                    "SELECT * FROM bestplan_plans WHERE plan_id=?",
+                    (str(plan_id),),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["local_push_state"] != "prepared"
+                    or row["state"] not in {PlanState.RUNNING, PlanState.WAITING}
+                    or expected_json is not None
+                    and row["local_push_json"] != expected_json
+                ):
+                    return 0
+                ProofLedger(self).append_advisory_in_transaction(
+                    conn,
+                    plan_id=str(plan_id),
+                    kind="local_execution_reconciled_failed_advisory",
+                    raw_output={
+                        "status": "local_execution_failed",
+                        "local_push_state": new_state,
+                    },
+                    output_source="process",
+                    compatibility_error="dispatch_failed",
+                    compatibility_dispatch_state="terminal",
+                    compatibility_clear_dispatch_owner=True,
+                )
+                return conn.execute(
+                    """UPDATE bestplan_plans
+                       SET local_push_state=?, local_push_updated_at=?, state=?
+                       WHERE plan_id=? AND local_push_state='prepared'
+                         AND state IN (?, ?)
+                         AND (? IS NULL OR local_push_json=?)""",
+                    (
+                        new_state,
+                        now,
+                        PlanState.FAILED,
+                        str(plan_id),
+                        PlanState.RUNNING,
+                        PlanState.WAITING,
+                        expected_json,
+                        expected_json,
+                    ),
+                ).rowcount
+            sql = (
+                "UPDATE bestplan_plans SET local_push_state=?, "
+                "local_push_updated_at=? WHERE plan_id=? AND local_push_state=?"
+            )
+            params: list[Any] = [
+                new_state, time.time(), str(plan_id), expected_state,
+            ]
+            if expected_json is not None:
+                sql += " AND local_push_json=?"
+                params.append(expected_json)
+            return conn.execute(sql, params).rowcount
+
+        return bool(self._execute_write(transition))
+
+    def claim_local_push(
+        self,
+        plan_id: str,
+        *,
+        now: float | None = None,
+    ) -> Optional[dict[str, Any]]:
+        """Atomically claim one awaiting or exact-recovery push effect."""
+
+        observed_now = time.time() if now is None else float(now)
+        if not math.isfinite(observed_now):
+            return None
+
+        def claim(conn):
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=?", (str(plan_id),),
+            ).fetchone()
+            if row is None or row["local_push_state"] not in {
+                "awaiting", "effect_unknown",
+            }:
+                return None
+            try:
+                record, _validated = decode_local_push_row(
+                    row, _validate_stored_plan_row,
+                )
+            except LocalPushStateError:
+                conn.execute(
+                    "UPDATE bestplan_plans SET local_push_state='stale', "
+                    "local_push_updated_at=? WHERE plan_id=? AND local_push_state=?",
+                    (time.time(), str(plan_id), row["local_push_state"]),
+                )
+                return None
+            if observed_now >= record["expires_at"]:
+                conn.execute(
+                    "UPDATE bestplan_plans SET local_push_state='expired', "
+                    "local_push_updated_at=? WHERE plan_id=? AND local_push_state=? "
+                    "AND local_push_json=?",
+                    (
+                        time.time(), str(plan_id), row["local_push_state"],
+                        row["local_push_json"],
+                    ),
+                )
+                return None
+            previous = row["local_push_state"]
+            changed = conn.execute(
+                """UPDATE bestplan_plans
+                   SET local_push_state='pushing', local_push_updated_at=?
+                   WHERE plan_id=? AND local_push_state=?
+                     AND local_push_json=?""",
+                (
+                    time.time(), str(plan_id), previous,
+                    row["local_push_json"],
+                ),
+            ).rowcount
+            return {**record, "state": "pushing"} if changed == 1 else None
+
+        return self._execute_write(claim)
+
+    def list_active_local_pushes(self, session_id: str) -> list[dict[str, Any]]:
+        visible_session_id = str(session_id)
+        placeholders = ",".join("?" for _ in LOCAL_PUSH_ACTIVE_STATES)
+        params: list[Any] = [
+            *LOCAL_PUSH_ACTIVE_STATES,
+            visible_session_id,
+        ]
+        with self._read_lock():
+            rows = self._connection().execute(
+                "SELECT * FROM bestplan_plans "
+                f"WHERE local_push_state IN ({placeholders}) "
+                "AND (session_id=? OR (execution_protocol=2 "
+                "AND promotion_contract_version=1 "
+                "AND promotion_mode='local_main')) "
+                "ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+        return [
+            dict(row)
+            for row in rows
+            if self._session_matches_visible_continuation(
+                row["session_id"], visible_session_id,
+            )
+        ]
+
+    def reconcile_local_pushes(
+        self,
+        *,
+        classify_local_main: Optional[Callable[..., str]] = None,
+        classify_remote: Optional[Callable[..., str]] = None,
+        now: float | None = None,
+    ) -> int:
+        """Resolve crash-retained prompt states from exact Git read-back."""
+
+        from agent.bestplan_local_push import reconcile_local_pushes
+
+        return reconcile_local_pushes(
+            self,
+            classify_local_main=classify_local_main,
+            classify_remote=classify_remote,
+            now=now,
+        )
 
     def approve_plan(self, plan_id: str, approver: str = "user") -> bool:
         def approve(conn):
@@ -1458,10 +2048,80 @@ class BestplanStore:
                 _validate_stored_plan_row(row)
             except BestplanError:
                 return 0
-            return conn.execute(
+            changed = conn.execute(
                 "UPDATE bestplan_plans SET state=? WHERE plan_id=? AND state=?",
                 (PlanState.PENDING, plan_id, PlanState.PROVISIONAL),
             ).rowcount
+            if changed != 1:
+                return 0
+            conn.execute(
+                """UPDATE bestplan_plans SET state=?
+                   WHERE plan_id!=? AND session_id=? AND profile=? AND workspace=?
+                   AND baseline_fingerprint=? AND created_at<?
+                   AND state IN (?, ?)""",
+                (
+                    PlanState.REJECTED,
+                    plan_id,
+                    row["session_id"],
+                    row["profile"],
+                    row["workspace"],
+                    row["baseline_fingerprint"],
+                    row["created_at"],
+                    PlanState.PENDING,
+                    PlanState.APPROVED,
+                ),
+            )
+            is_local_go = (
+                int(row["execution_protocol"] or 1) == 2
+                and int(row["promotion_contract_version"] or 0) == 1
+                and row["promotion_mode"] == "local_main"
+            )
+            has_sessions = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
+            ).fetchone()
+            if is_local_go and has_sessions is not None:
+                conn.execute(
+                    """WITH RECURSIVE compression_lineage(id) AS (
+                           SELECT ?
+                           UNION
+                           SELECT parent.id
+                           FROM compression_lineage AS lineage
+                           JOIN sessions AS child ON child.id=lineage.id
+                           JOIN sessions AS parent
+                             ON parent.id=child.parent_session_id
+                           WHERE parent.end_reason='compression'
+                             AND json_extract(
+                                   COALESCE(child.model_config, '{}'),
+                                   '$._branched_from'
+                                 ) IS NULL
+                             AND json_extract(
+                                   COALESCE(child.model_config, '{}'),
+                                   '$._delegate_from'
+                                 ) IS NULL
+                             AND COALESCE(child.source, '')!='tool'
+                       )
+                       UPDATE bestplan_plans SET state=?
+                       WHERE plan_id!=?
+                         AND session_id IN (SELECT id FROM compression_lineage)
+                         AND profile=? AND workspace=? AND baseline_fingerprint=?
+                         AND execution_protocol=2
+                         AND promotion_contract_version=1
+                         AND promotion_mode='local_main'
+                         AND created_at<?
+                         AND state IN (?, ?)""",
+                    (
+                        row["session_id"],
+                        PlanState.REJECTED,
+                        plan_id,
+                        row["profile"],
+                        row["workspace"],
+                        row["baseline_fingerprint"],
+                        row["created_at"],
+                        PlanState.PENDING,
+                        PlanState.APPROVED,
+                    ),
+                )
+            return changed
 
         return bool(self._execute_write(commit))
 
@@ -1730,6 +2390,17 @@ class BestplanStore:
                 "SELECT * FROM bestplan_plans WHERE plan_id=?",
                 (plan_id,),
             ).fetchone()
+            if row is not None and row["state"] == PlanState.COMPLETED_LOCAL:
+                try:
+                    validated = _validate_stored_plan_row(row)
+                    decode_local_push_row(row, _validate_stored_plan_row)
+                except (BestplanError, LocalPushStateError):
+                    return 0
+                return int(
+                    isinstance(validated.contract, Mapping)
+                    and validated.contract.get("schema")
+                    == "hermes.bestplan.local-go.v1"
+                )
             if row is None or row["state"] not in {
                 PlanState.RUNNING, PlanState.COMPLETED_UNVERIFIED,
             }:
@@ -1864,12 +2535,78 @@ class BestplanStore:
             row = conn.execute(
                 "SELECT * FROM bestplan_plans WHERE plan_id=?", (plan_id,)
             ).fetchone()
-            if row is None or row["state"] not in {
-                PlanState.RUNNING,
-                PlanState.WAITING,
-            }:
+            if row is None:
                 return 0
             if int(row["execution_protocol"] or 1) == 2:
+                try:
+                    validated = _validate_stored_plan_row(row)
+                except BestplanError:
+                    return 0
+                if (
+                    isinstance(validated.contract, Mapping)
+                    and validated.contract.get("schema")
+                    == "hermes.bestplan.local-go.v1"
+                ):
+                    if row["state"] == PlanState.COMPLETED_LOCAL:
+                        try:
+                            decode_local_push_row(
+                                row, _validate_stored_plan_row,
+                            )
+                        except LocalPushStateError:
+                            return 0
+                        return 1
+                    if row["local_push_state"] == "prepared":
+                        try:
+                            decode_local_push_row(
+                                row, _validate_stored_plan_row,
+                            )
+                        except LocalPushStateError:
+                            return 0
+                        # The local Git effect may have completed after the
+                        # durable prepared record but before activation.  Git
+                        # read-back, not the async wrapper, decides this row.
+                        from agent.bestplan_proof import ProofLedger
+
+                        ProofLedger(self).append_advisory_in_transaction(
+                            conn,
+                            plan_id=plan_id,
+                            kind="local_effect_prepared_advisory",
+                            raw_output={"status": "local_effect_prepared"},
+                            output_source="async",
+                            compatibility_dispatch_state="unknown",
+                            compatibility_clear_dispatch_owner=True,
+                        )
+                        return 1
+                    if row["state"] not in {
+                        PlanState.RUNNING,
+                        PlanState.WAITING,
+                    }:
+                        return 0
+                    from agent.bestplan_proof import ProofLedger
+
+                    ProofLedger(self).append_advisory_in_transaction(
+                        conn,
+                        plan_id=plan_id,
+                        kind="local_execution_failed_advisory",
+                        raw_output={"status": "local_execution_failed"},
+                        output_source="async",
+                        compatibility_error="dispatch_failed",
+                        compatibility_dispatch_state="terminal",
+                        compatibility_clear_dispatch_owner=True,
+                    )
+                    return conn.execute(
+                        """UPDATE bestplan_plans
+                           SET state=?
+                           WHERE plan_id=? AND state IN (?, ?)""",
+                        (
+                            PlanState.FAILED,
+                            plan_id,
+                            PlanState.RUNNING,
+                            PlanState.WAITING,
+                        ),
+                    ).rowcount
+                if row["state"] not in {PlanState.RUNNING, PlanState.WAITING}:
+                    return 0
                 from agent.bestplan_proof import ProofLedger
 
                 if row["current_phase"] == "captured":
@@ -1894,6 +2631,8 @@ class BestplanStore:
                     **compatibility,
                 )
                 return 1
+            if row["state"] not in {PlanState.RUNNING, PlanState.WAITING}:
+                return 0
             return conn.execute(
                 "UPDATE bestplan_plans SET state=?, dispatch_state='terminal', "
                 "evidence_json=?, completed_at=? WHERE plan_id=? AND state IN (?, ?)",
@@ -1951,6 +2690,7 @@ def capture_bestplan_response(
     provisional: bool = False,
     config: Optional[dict[str, Any]] = None,
     authority_client: BestplanAuthorityClient | None = None,
+    local_execution: bool = False,
 ) -> PlanCapture:
     """Validate and persist the explicit envelope in a /bestplan response."""
     try:
@@ -1971,6 +2711,7 @@ def capture_bestplan_response(
             provisional=provisional,
             config=config,
             authority_client=authority_client,
+            local_execution=local_execution,
         )
         row = store.get_plan(plan_id)
         if row is None:
@@ -2173,6 +2914,7 @@ def capture_bestplan_agent_result(
     provisional: bool = False,
     config: Optional[dict[str, Any]] = None,
     authority_client: BestplanAuthorityClient | None = None,
+    local_execution: bool = False,
 ) -> dict[str, Any]:
     """Attach the host-validated executable receipt to a planning result."""
     if not is_executable_bestplan_invocation(invocation_message) or not isinstance(result, dict):
@@ -2190,6 +2932,7 @@ def capture_bestplan_agent_result(
         provisional=provisional,
         config=config if config is not None else _load_config(),
         authority_client=injected_client,
+        local_execution=local_execution,
     )
     updated = dict(result)
     updated["final_response"] = capture.response
@@ -2322,8 +3065,7 @@ def try_resolve_go(
 ) -> ResolvedGo:
     """Resolve bare ``go`` before the model loop, failing closed around a plan."""
     cfg = config if config is not None else _load_config()
-    if not is_go_enabled(cfg):
-        return ResolvedGo(False, "disabled", reason="autonomy.go_enabled=false")
+    go_enabled = is_go_enabled(cfg)
     if not _is_go_trigger(message):
         return ResolvedGo(False, "not_a_trigger", reason="only bare go is recognized")
 
@@ -2331,6 +3073,10 @@ def try_resolve_go(
     recover_bestplan_dispatch_outbox(store)
     candidates = store.list_for_session(session_id)
     if not candidates:
+        if not go_enabled:
+            return ResolvedGo(
+                False, "disabled", reason="autonomy.go_enabled=false"
+            )
         return ResolvedGo(False, "no_plan", reason="no pending plan exists for this session")
 
     expected_workspace = _canonical_workspace(workspace)
@@ -2362,6 +3108,38 @@ def try_resolve_go(
         return ResolvedGo(
             True, "invalid_plan", plan_id=plan_id, reason=error, error=error,
         )
+    local_contract = (
+        protocol2
+        and isinstance(validated.contract, Mapping)
+        and validated.contract.get("schema") == "hermes.bestplan.local-go.v1"
+        and validated.contract.get("mode") == "local_main"
+    )
+    if not go_enabled and not local_contract:
+        return ResolvedGo(
+            False, "disabled", reason="autonomy.go_enabled=false"
+        )
+    if local_contract:
+        try:
+            pending_pushes = [
+                row
+                for row in store.list_active_local_pushes(session_id)
+                if row.get("profile") == expected_profile
+                and row.get("workspace") == expected_workspace
+            ]
+        except Exception:
+            return ResolvedGo(
+                True,
+                "push_state_unavailable",
+                plan_id=plan_id,
+                reason="the pending local push state is unavailable",
+            )
+        if pending_pushes:
+            return ResolvedGo(
+                True,
+                "push_pending",
+                plan_id=plan_id,
+                reason="reply push or no before running another local plan",
+            )
     if protocol2 and str(candidate.get("current_phase") or "captured") != "captured":
         return ResolvedGo(
             True,
@@ -2399,7 +3177,17 @@ def try_resolve_go(
     )
     state_db_path = store.state_db_path
     host_runtime_projection: dict[str, Any] = {}
-    if not legacy_injected_p1:
+    local_execution_runtime: Any = None
+    authority_bindings: Any = None
+    if local_contract and state_db_path is None:
+        return ResolvedGo(
+            True,
+            "candidate_runtime_unavailable",
+            plan_id=plan_id,
+            reason="candidate_runtime_unavailable",
+            error="candidate_runtime_unavailable",
+        )
+    if not legacy_injected_p1 and not local_contract:
         try:
             from tools.delegate_tool import (
                 BestplanHostRuntime,
@@ -2451,16 +3239,20 @@ def try_resolve_go(
             stored_runtimes = json.loads(candidate.get("resolved_runtime_json") or "[]")
         except Exception:
             stored_runtimes = []
-        if not legacy_injected_p1 and (
-            not isinstance(stored_runtimes, list)
-            or len(stored_runtimes) != len(tasks)
-            or any(
-                not isinstance(item, dict)
+        if (
+            not legacy_injected_p1
+            and not local_contract
+            and (
+                not isinstance(stored_runtimes, list)
+                or len(stored_runtimes) != len(tasks)
                 or any(
-                    item.get(key) != value
-                    for key, value in host_runtime_projection.items()
+                    not isinstance(item, dict)
+                    or any(
+                        item.get(key) != value
+                        for key, value in host_runtime_projection.items()
+                    )
+                    for item in stored_runtimes
                 )
-                for item in stored_runtimes
             )
         ):
             return ResolvedGo(
@@ -2489,19 +3281,79 @@ def try_resolve_go(
             )
         if protocol2:
             try:
+                if local_contract:
+                    from agent.bestplan_local import build_local_authority_bindings
+
+                    authority_bindings = build_local_authority_bindings(
+                        resolved_runtimes
+                    )
                 resolved_runtimes = _bind_v2_candidate_toolsets(
                     resolved_runtimes, tasks,
                 )
                 resolved_runtimes = _filter_v2_runtime_execution(
                     resolved_runtimes
                 )
-            except BestplanError:
+            except Exception:
                 return ResolvedGo(
                     True,
                     "lane_unavailable",
                     plan_id=plan_id,
                     reason="lane_unavailable",
                     error="lane_unavailable",
+                )
+        if local_contract:
+            try:
+                from agent.bestplan_local import build_local_execution_runtime
+                from tools.delegate_tool import (
+                    _bestplan_host_runtime_projection,
+                    _validate_bestplan_host_runtime,
+                )
+
+                local_execution_runtime = build_local_execution_runtime(
+                    plan_id=plan_id,
+                    snapshot=validated.source_snapshot,
+                    manifest=validated.manifest,
+                    contract=validated.contract,
+                    controller_python=Path(sys.executable),
+                    deadline=time.monotonic() + 60.0,
+                )
+                effective_host_runtime = (
+                    local_execution_runtime.candidate_runtime
+                )
+                _validate_bestplan_host_runtime(
+                    effective_host_runtime,
+                    source_snapshot=validated.source_snapshot,
+                    promotion_contract=validated.contract,
+                )
+                host_runtime_projection = _bestplan_host_runtime_projection(
+                    effective_host_runtime
+                )
+            except Exception:
+                return ResolvedGo(
+                    True,
+                    "candidate_runtime_unavailable",
+                    plan_id=plan_id,
+                    reason="candidate_runtime_unavailable",
+                    error="candidate_runtime_unavailable",
+                )
+            if (
+                not isinstance(stored_runtimes, list)
+                or len(stored_runtimes) != len(tasks)
+                or any(
+                    not isinstance(item, dict)
+                    or any(
+                        item.get(key) != value
+                        for key, value in host_runtime_projection.items()
+                    )
+                    for item in stored_runtimes
+                )
+            ):
+                return ResolvedGo(
+                    True,
+                    "candidate_runtime_unavailable",
+                    plan_id=plan_id,
+                    reason="candidate_runtime_unavailable",
+                    error="candidate_runtime_unavailable",
                 )
     else:
         if runtime_resolver is None and delegate is not None:
@@ -2541,6 +3393,12 @@ def try_resolve_go(
         resolved_runtimes_for_storage = resolved_runtimes
         if protocol2:
             try:
+                if local_contract:
+                    from agent.bestplan_local import build_local_authority_bindings
+
+                    authority_bindings = build_local_authority_bindings(
+                        resolved_runtimes
+                    )
                 resolved_runtimes = _bind_v2_candidate_toolsets(
                     resolved_runtimes, tasks,
                 )
@@ -2551,13 +3409,48 @@ def try_resolve_go(
                     resolved_runtimes,
                     execution_protocol=2,
                 )
-            except BestplanError:
+            except Exception:
                 return ResolvedGo(
                     True,
                     "lane_unavailable",
                     plan_id=plan_id,
                     reason="lane_unavailable",
                     error="lane_unavailable",
+                )
+        if local_contract:
+            try:
+                from agent.bestplan_local import build_local_execution_runtime
+                from tools.delegate_tool import (
+                    _bestplan_host_runtime_projection,
+                    _validate_bestplan_host_runtime,
+                )
+
+                local_execution_runtime = build_local_execution_runtime(
+                    plan_id=plan_id,
+                    snapshot=validated.source_snapshot,
+                    manifest=validated.manifest,
+                    contract=validated.contract,
+                    controller_python=Path(sys.executable),
+                    deadline=time.monotonic() + 60.0,
+                )
+                effective_host_runtime = (
+                    local_execution_runtime.candidate_runtime
+                )
+                _validate_bestplan_host_runtime(
+                    effective_host_runtime,
+                    source_snapshot=validated.source_snapshot,
+                    promotion_contract=validated.contract,
+                )
+                host_runtime_projection = _bestplan_host_runtime_projection(
+                    effective_host_runtime
+                )
+            except Exception:
+                return ResolvedGo(
+                    True,
+                    "candidate_runtime_unavailable",
+                    plan_id=plan_id,
+                    reason="candidate_runtime_unavailable",
+                    error="candidate_runtime_unavailable",
                 )
         resolved_runtimes_for_storage = [
             {**dict(item), **host_runtime_projection}
@@ -2623,12 +3516,26 @@ def try_resolve_go(
                     else ""
                 ),
                 promotion_mode=(
-                    str(validated.contract.get("promotion_mode") or "")
+                    str(
+                        validated.contract.get(
+                            "mode" if local_contract else "promotion_mode"
+                        )
+                        or ""
+                    )
                     if protocol2 and validated.contract is not None
                     else None
                 ),
+                execution_plan=validated.plan if local_contract else None,
+                local_execution_runtime=(
+                    local_execution_runtime if local_contract else None
+                ),
                 candidate_host_runtime=effective_host_runtime,
-                authority_client=effective_authority_client,
+                authority_client=(
+                    None if local_contract else effective_authority_client
+                ),
+                authority_bindings=(
+                    authority_bindings if local_contract else None
+                ),
                 state_db_path=state_db_path,
             )
         result = json.loads(raw_result) if isinstance(raw_result, str) else raw_result

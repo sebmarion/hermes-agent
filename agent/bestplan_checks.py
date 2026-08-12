@@ -38,8 +38,15 @@ from agent.bestplan_candidates import (
     _TreeRecord,
     _scan_candidate_tree,
 )
-from agent.bestplan_contract import BoundCommand, ControllerIdentity, PinnedInput
+from agent.bestplan_contract import (
+    BoundCommand,
+    ControllerIdentity,
+    PinnedInput,
+    canonical_json,
+    source_snapshot_digest,
+)
 from agent.bestplan_sandbox import (
+    _launcher_identity,
     _new_artifact_budget,
     _stable_artifact_tree_identity,
 )
@@ -147,11 +154,23 @@ class CheckHostRuntime:
     policy_version: str = CHECK_SANDBOX_POLICY_VERSION
     max_output_bytes: int = 4 * 1024 * 1024
     reap_grace_seconds: float = 1.0
+    controller_python_launcher: Path | None = None
+    pytest_module_path: Path | None = None
 
     def __post_init__(self) -> None:
         controller_source = Path(self.controller_source)
         sandbox = Path(self.sandbox_executable)
         cache_seed = Path(self.cache_seed_root)
+        launcher = (
+            None
+            if self.controller_python_launcher is None
+            else Path(self.controller_python_launcher)
+        )
+        pytest_module = (
+            None
+            if self.pytest_module_path is None
+            else Path(self.pytest_module_path)
+        )
         if not isinstance(self.controller, ControllerIdentity):
             raise CheckValidationError("check controller identity is invalid")
         if not controller_source.is_absolute() or not cache_seed.is_absolute():
@@ -167,6 +186,14 @@ class CheckHostRuntime:
             raise CheckValidationError("check runtime pins must be sorted")
         if len({str(item.path) for item in runtime_paths}) != len(runtime_paths):
             raise CheckValidationError("check runtime pins are duplicated")
+        if (launcher is None) != (pytest_module is None):
+            raise CheckValidationError("local check runtime proof is incomplete")
+        if launcher is not None and (
+            not launcher.is_absolute()
+            or pytest_module is None
+            or not pytest_module.is_absolute()
+        ):
+            raise CheckValidationError("local check runtime proof paths must be absolute")
         if self.policy_version != CHECK_SANDBOX_POLICY_VERSION:
             raise CheckValidationError("check sandbox policy version is unsupported")
         if (
@@ -185,6 +212,8 @@ class CheckHostRuntime:
         object.__setattr__(self, "sandbox_executable", sandbox)
         object.__setattr__(self, "cache_seed_root", cache_seed)
         object.__setattr__(self, "runtime_read_paths", runtime_paths)
+        object.__setattr__(self, "controller_python_launcher", launcher)
+        object.__setattr__(self, "pytest_module_path", pytest_module)
 
 
 @dataclass(frozen=True)
@@ -1703,9 +1732,26 @@ def _assert_host_runtime(
     )
     if actual_controller != runtime.controller.artifact_sha256:
         raise CheckProofStale("check controller artifact changed")
+    local_budget = (
+        _new_artifact_budget(absolute_deadline)
+        if runtime.controller_python_launcher is not None
+        else None
+    )
     for item in runtime.runtime_read_paths:
         _check_absolute_deadline(absolute_deadline, "check runtime")
-        if pinned_path_sha256(item.path, deadline=absolute_deadline) != item.sha256:
+        if local_budget is None:
+            actual_digest = pinned_path_sha256(
+                item.path, deadline=absolute_deadline,
+            )
+        else:
+            try:
+                identity = _stable_artifact_tree_identity(item.path, local_budget)
+            except (OSError, RuntimeError, ValueError):
+                raise CheckProofStale(
+                    "check runtime dependency changed"
+                ) from None
+            actual_digest = identity.get("sha256")
+        if actual_digest != item.sha256:
             raise CheckProofStale("check runtime dependency changed")
 
 
@@ -2016,6 +2062,112 @@ def _validate_command_paths(command: BoundCommand) -> None:
     parse_network_allowlist(command.network_allowlist)
 
 
+def _local_check_runtime_digest(
+    runtime: CheckHostRuntime,
+    commands: Sequence[BoundCommand],
+    *,
+    deadline: float,
+) -> str:
+    """Rebuild the approved local runtime identity from live pinned inputs."""
+
+    launcher = runtime.controller_python_launcher
+    pytest_module = runtime.pytest_module_path
+    if launcher is None or pytest_module is None:
+        raise CheckValidationError("local check runtime proof is required")
+    if not commands:
+        raise CheckValidationError("local check command set is empty")
+
+    executable = Path(commands[0].executable)
+    executable_sha256 = commands[0].executable_sha256
+    if not executable.is_absolute() or any(
+        Path(command.executable) != executable
+        or command.executable_sha256 != executable_sha256
+        for command in commands
+    ):
+        raise CheckValidationError(
+            "local check commands must use one exact resolved executable"
+        )
+    for command in commands:
+        environment = dict(command.env)
+        bound_launcher = environment.get("__PYVENV_LAUNCHER__")
+        if bound_launcher is not None and bound_launcher != str(launcher):
+            raise CheckValidationError(
+                "local check command launcher differs from the runtime proof"
+            )
+    if runtime.policy_version != CHECK_SANDBOX_POLICY_VERSION:
+        raise CheckValidationError("local check runtime policy differs")
+
+    try:
+        resolved_executable = executable.resolve(strict=True)
+        resolved_launcher = launcher.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise CheckProofStale("local check runtime launcher changed") from None
+    if resolved_executable != executable:
+        raise CheckValidationError(
+            "local check command executable must be a resolved path"
+        )
+    if resolved_launcher != executable:
+        raise CheckProofStale("local check runtime launcher changed")
+
+    budget = _new_artifact_budget(deadline)
+    try:
+        launcher_identity = _launcher_identity(launcher, executable, budget)
+        runtime_identities = tuple(
+            _stable_artifact_tree_identity(item.path, budget)
+            for item in runtime.runtime_read_paths
+        )
+        sandbox_identity = _stable_artifact_tree_identity(
+            runtime.sandbox_executable, budget,
+        )
+        module_info = pytest_module.lstat()
+        resolved_module = pytest_module.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        raise CheckProofStale("local check runtime dependency changed") from None
+
+    resolved_identity = launcher_identity.get("resolved_identity")
+    if (
+        not isinstance(resolved_identity, Mapping)
+        or resolved_identity.get("sha256") != executable_sha256
+    ):
+        raise CheckProofStale("local check executable digest changed")
+    if any(
+        identity.get("sha256") != pin.sha256
+        for pin, identity in zip(
+            runtime.runtime_read_paths, runtime_identities, strict=True,
+        )
+    ):
+        raise CheckProofStale("local check runtime dependency changed")
+    if sandbox_identity.get("sha256") != runtime.sandbox_executable_sha256:
+        raise CheckProofStale("local check sandbox digest changed")
+    if (
+        resolved_module != pytest_module
+        or not stat.S_ISREG(module_info.st_mode)
+        or stat.S_ISLNK(module_info.st_mode)
+    ):
+        raise CheckValidationError("local pytest module proof is invalid")
+    if not any(
+        pytest_module == Path(identity["path"])
+        or Path(identity["path"]) in pytest_module.parents
+        for identity in runtime_identities
+    ):
+        raise CheckValidationError(
+            "local pytest module is outside the pinned runtime"
+        )
+
+    body = {
+        "schema": "hermes.bestplan.local-check-runtime.v1",
+        "launcher": launcher_identity,
+        "runtime_read_paths": list(runtime_identities),
+        "sandbox": sandbox_identity,
+        "policy_version": runtime.policy_version,
+        "pytest_module_path": str(pytest_module),
+    }
+    return hashlib.sha256(
+        b"hermes.bestplan.local-check-runtime.v1\0"
+        + canonical_json(body).encode("utf-8")
+    ).hexdigest()
+
+
 def _read_current_target_oid(
     snapshot: object,
     integration: object,
@@ -2040,48 +2192,35 @@ def _validated_contract_commands(
     contract: Mapping[str, object],
     commands: Sequence[BoundCommand],
     runtime: CheckHostRuntime,
+    deadline: float,
 ) -> tuple[tuple[BoundCommand, ...], str]:
-    from agent.bestplan_contract import (
-        ContractValidationError,
-        _command_from_dict,
-        _controller_from_dict,
-        _repository_from_dict,
-        contract_digest,
-        source_snapshot_digest,
-        validate_execution_contract,
-    )
+    from agent.bestplan_contract import ContractValidationError
+    from agent.bestplan_promotion import _validate_task6_contract
 
     try:
-        normalized = validate_execution_contract(contract)
-        digest = contract_digest(normalized)
-        required = tuple(
-            _command_from_dict(item, f"contract.commands[{index}]")
-            for index, item in enumerate(normalized["commands"])
-        )
-        repository = _repository_from_dict(
-            normalized["repository"],
-            "contract.repository",
-        )
-        controller = _controller_from_dict(
-            normalized["controller"],
-            "contract.controller",
-        )
+        validated = _validate_task6_contract(contract)
     except (ContractValidationError, KeyError, TypeError, ValueError):
         raise CheckValidationError("check promotion contract is invalid") from None
+    digest = validated.contract_digest
+    required = validated.commands
+    repository = validated.repository
+    controller = validated.controller
     if integration.contract_digest != digest:
         raise CheckProofStale("check integration contract digest differs")
     snapshot_digest = source_snapshot_digest(snapshot)
     if (
-        normalized["source"]["snapshot_digest"] != snapshot_digest
+        validated.source["snapshot_digest"] != snapshot_digest
         or integration.source_snapshot_digest != snapshot_digest
     ):
         raise CheckProofStale("check source snapshot digest differs")
     if not repository.matches(snapshot.repo):
         raise CheckValidationError("check contract repository identity differs")
-    source = normalized["source"]
+    source = validated.source
+    if source["base_oid"] != snapshot.head_oid:
+        raise CheckProofStale("check contract source base differs")
     if (
-        source["base_oid"] != snapshot.head_oid
-        or source["local_main_oid"] != snapshot.head_oid
+        validated.check_runtime_digest is None
+        and source["local_main_oid"] != snapshot.head_oid
     ):
         raise CheckProofStale("check contract source base differs")
     if source["tree_oid"] != snapshot.tree_oid:
@@ -2104,6 +2243,20 @@ def _validated_contract_commands(
     supplied = tuple(commands)
     if supplied != required:
         raise CheckValidationError("check command set differs from contract")
+    if validated.check_runtime_digest is None:
+        if (
+            runtime.controller_python_launcher is not None
+            or runtime.pytest_module_path is not None
+        ):
+            raise CheckValidationError(
+                "legacy check contract cannot use local runtime proof"
+            )
+    else:
+        actual_runtime_digest = _local_check_runtime_digest(
+            runtime, required, deadline=deadline,
+        )
+        if actual_runtime_digest != validated.check_runtime_digest:
+            raise CheckProofStale("local check runtime digest differs")
     return required, digest
 
 
@@ -2146,6 +2299,7 @@ def run_integration_checks(
         contract=contract,
         commands=ordered_commands,
         runtime=runtime,
+        deadline=absolute_deadline,
     )
     if _read_current_target_oid(
         snapshot,

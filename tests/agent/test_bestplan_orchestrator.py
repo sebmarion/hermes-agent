@@ -1297,6 +1297,11 @@ def test_minimum_change_contract_reaches_every_planning_stage(monkeypatch, tmp_p
     )
     assert "candidate plans are alternatives" in synth_prompt.lower()
     assert "do not union" in synth_prompt.lower()
+    assert "pytest -q -- tests/path.py::test_name" in synth_prompt
+    repair_prompt = next(
+        prompt for prompt in prompts if "BestPlan envelope repair" in prompt
+    )
+    assert "pytest -q -- tests/path.py::test_name" in repair_prompt
 
 
 def test_conversation_loop_passes_prior_canonical_messages_to_bestplan(monkeypatch):

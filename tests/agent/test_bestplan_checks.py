@@ -615,14 +615,117 @@ def _task6_runtime(checks, tmp_path, controller):
     )
 
 
+def _task6_local_contract_bundle(checks, tmp_path):
+    from agent.bestplan_contract import canonical_json
+    from agent.bestplan_local import build_local_go_contract
+    from agent.bestplan_sandbox import (
+        _launcher_identity,
+        _new_artifact_budget,
+        _stable_artifact_tree_identity,
+    )
+
+    proof_root = tmp_path / "local-check-proof"
+    launcher = proof_root / "venv" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    executable = proof_root / "python3.99"
+    executable.write_bytes(b"test-local-python-executable\n")
+    executable.chmod(0o755)
+    launcher.symlink_to(executable)
+    runtime_root = proof_root / "runtime"
+    runtime_root.mkdir()
+    pytest_module = runtime_root / "pytest" / "__init__.py"
+    pytest_module.parent.mkdir()
+    pytest_module.write_text("__version__ = 'test'\n", encoding="utf-8")
+
+    snapshot, _enrolled, controller, required = _task6_contract_bundle(
+        tmp_path, executable=executable,
+    )
+    required = tuple(
+        replace(
+            command,
+            env=tuple(sorted((
+                *command.env,
+                ("__PYVENV_LAUNCHER__", str(launcher)),
+            ))),
+        )
+        for command in required
+    )
+    deadline = time.monotonic() + 20.0
+    budget = _new_artifact_budget(deadline)
+    resolved = executable.resolve(strict=True)
+    launcher_identity = _launcher_identity(launcher, resolved, budget)
+    runtime_identity = _stable_artifact_tree_identity(runtime_root, budget)
+    sandbox = Path("/usr/bin/sandbox-exec")
+    sandbox_identity = _stable_artifact_tree_identity(sandbox, budget)
+    runtime_pin = checks.PinnedRuntimePath(
+        path=runtime_root,
+        sha256=runtime_identity["sha256"],
+    )
+    runtime_kwargs = {
+        "controller_source": tmp_path / "controller",
+        "controller": controller,
+        "sandbox_executable": sandbox,
+        "sandbox_executable_sha256": sandbox_identity["sha256"],
+        "runtime_read_paths": (runtime_pin,),
+        "cache_seed_root": tmp_path / "cache-seed",
+    }
+    Path(runtime_kwargs["controller_source"]).mkdir(exist_ok=True)
+    Path(runtime_kwargs["cache_seed_root"]).mkdir(exist_ok=True)
+    parameters = inspect.signature(checks.CheckHostRuntime).parameters
+    if {
+        "controller_python_launcher", "pytest_module_path",
+    } <= set(parameters):
+        runtime_kwargs.update({
+            "controller_python_launcher": launcher,
+            "pytest_module_path": pytest_module,
+        })
+    runtime = checks.CheckHostRuntime(**runtime_kwargs)
+    # Keep the public-path objective RED runnable before the new optional
+    # dataclass fields exist. A separate API assertion requires those fields.
+    if "controller_python_launcher" not in parameters:
+        object.__setattr__(runtime, "controller_python_launcher", launcher)
+        object.__setattr__(runtime, "pytest_module_path", pytest_module)
+
+    runtime_body = {
+        "schema": "hermes.bestplan.local-check-runtime.v1",
+        "launcher": launcher_identity,
+        "runtime_read_paths": [runtime_identity],
+        "sandbox": sandbox_identity,
+        "policy_version": checks.CHECK_SANDBOX_POLICY_VERSION,
+        "pytest_module_path": str(pytest_module),
+    }
+    runtime_digest = hashlib.sha256(
+        b"hermes.bestplan.local-check-runtime.v1\0"
+        + canonical_json(runtime_body).encode("utf-8")
+    ).hexdigest()
+    contract = build_local_go_contract(
+        snapshot=snapshot,
+        controller=controller,
+        commands=required,
+        manifest_digest="f" * 64,
+        check_runtime_digest=runtime_digest,
+    )
+    return snapshot, contract, controller, required, runtime, pytest_module
+
+
 def _task6_integration(snapshot, contract):
     from agent.bestplan_contract import contract_digest, source_snapshot_digest
+    from agent.bestplan_local import (
+        LOCAL_GO_CONTRACT_SCHEMA,
+        local_go_contract_digest,
+    )
     from agent.bestplan_promotion import FrozenIntegration
+
+    exact_contract_digest = (
+        local_go_contract_digest(contract)
+        if contract.get("schema") == LOCAL_GO_CONTRACT_SCHEMA
+        else contract_digest(contract)
+    )
 
     return FrozenIntegration(
         plan_id="task6-plan",
         approval_digest="a" * 64,
-        contract_digest=contract_digest(contract),
+        contract_digest=exact_contract_digest,
         source_snapshot_digest=source_snapshot_digest(snapshot),
         target_ref="refs/heads/main",
         target_oid=snapshot.head_oid,
@@ -796,6 +899,115 @@ def test_public_checker_derives_exact_contract_commands_and_binds_receipt(
         item.command_id for item in receipt.ordered_receipts
     }
     assert receipt.contract_digest == contract_digest(contract)
+
+
+def test_check_host_runtime_keeps_local_proof_inputs_optional_for_legacy(
+    tmp_path,
+):
+    checks = _checks()
+    parameters = inspect.signature(checks.CheckHostRuntime).parameters
+
+    assert parameters["controller_python_launcher"].default is None
+    assert parameters["pytest_module_path"].default is None
+
+    _snapshot, _contract, controller, _required = _task6_contract_bundle(tmp_path)
+    runtime = _task6_runtime(checks, tmp_path, controller)
+    assert runtime.controller_python_launcher is None
+    assert runtime.pytest_module_path is None
+
+
+def test_public_checker_accepts_strict_local_go_contract_and_binds_receipt(
+    tmp_path, monkeypatch,
+):
+    from agent.bestplan_local import local_go_contract_digest
+
+    checks = _checks()
+    snapshot, contract, _controller, required, runtime, _pytest_module = (
+        _task6_local_contract_bundle(checks, tmp_path)
+    )
+    integration = _task6_integration(snapshot, contract)
+    seen = {"materialize": 0, "launch": []}
+    _allow_task6_runner_preconditions(checks, monkeypatch)
+    _stub_task6_execution(checks, monkeypatch, seen)
+
+    receipt = _run_task6_contract(
+        checks,
+        snapshot=snapshot,
+        integration=integration,
+        contract=contract,
+        commands=required,
+        runtime=runtime,
+        checks_root=tmp_path / "checks",
+        deadline=time.monotonic() + 30,
+    )
+
+    assert seen["materialize"] == 1
+    assert tuple(item.command_id for item in receipt.ordered_receipts) == tuple(
+        item.identifier for item in required
+    )
+    assert receipt.contract_digest == local_go_contract_digest(contract)
+
+
+def test_public_checker_requires_exact_local_runtime_proof_before_materialization(
+    tmp_path, monkeypatch,
+):
+    checks = _checks()
+    snapshot, contract, controller, required, _runtime, _pytest_module = (
+        _task6_local_contract_bundle(checks, tmp_path)
+    )
+    integration = _task6_integration(snapshot, contract)
+    legacy_runtime = _task6_runtime(checks, tmp_path, controller)
+    seen = []
+    _allow_task6_runner_preconditions(checks, monkeypatch)
+    _forbid_task6_execution(checks, monkeypatch, seen)
+
+    with pytest.raises(
+        checks.CheckValidationError,
+        match=r"(?i)local.*runtime|runtime.*proof|launcher|pytest",
+    ):
+        _run_task6_contract(
+            checks,
+            snapshot=snapshot,
+            integration=integration,
+            contract=contract,
+            commands=required,
+            runtime=legacy_runtime,
+            checks_root=tmp_path / "checks",
+            deadline=time.monotonic() + 30,
+        )
+
+    assert seen == []
+
+
+def test_public_checker_recomputes_local_runtime_identity_before_materialization(
+    tmp_path, monkeypatch,
+):
+    checks = _checks()
+    snapshot, contract, _controller, required, runtime, pytest_module = (
+        _task6_local_contract_bundle(checks, tmp_path)
+    )
+    integration = _task6_integration(snapshot, contract)
+    pytest_module.write_text("__version__ = 'changed'\n", encoding="utf-8")
+    seen = []
+    _allow_task6_runner_preconditions(checks, monkeypatch)
+    _forbid_task6_execution(checks, monkeypatch, seen)
+
+    with pytest.raises(
+        checks.CheckProofStale,
+        match=r"(?i)local.*runtime|runtime.*digest|dependency.*changed",
+    ):
+        _run_task6_contract(
+            checks,
+            snapshot=snapshot,
+            integration=integration,
+            contract=contract,
+            commands=required,
+            runtime=runtime,
+            checks_root=tmp_path / "checks",
+            deadline=time.monotonic() + 30,
+        )
+
+    assert seen == []
 
 
 @pytest.mark.parametrize("mutation", ("subset", "substitute"))

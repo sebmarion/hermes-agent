@@ -46,6 +46,8 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+_BESTPLAN_LOCAL_COMPLETION_RETRY_SECONDS = 1.0
+
 
 def _capture_cli_bestplan_result(
     result: dict,
@@ -74,6 +76,7 @@ def _capture_cli_bestplan_result(
             store=store,
             host_agent=host_agent,
             provisional=True,
+            local_execution=True,
         )
         capture = (
             captured.get("bestplan_capture")
@@ -9198,6 +9201,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Print through the active command-safe console."""
         self._output_console().print(*args, **kwargs)
 
+    def _show_recovered_local_push_prompt(self) -> None:
+        """Render one durable local-push question without starting an effect."""
+
+        try:
+            from agent.bestplan_local_push import (
+                LOCAL_PUSH_PROMPT_RECOVERY_SECONDS,
+                recover_local_push_prompt,
+            )
+
+            prompt = recover_local_push_prompt(
+                session_id=str(getattr(self, "session_id", "") or ""),
+                profile=str(os.environ.get("HERMES_PROFILE") or ""),
+                workspace=os.getcwd(),
+                deadline=(
+                    time.monotonic() + LOCAL_PUSH_PROMPT_RECOVERY_SECONDS
+                ),
+            )
+        except Exception:
+            logger.debug("local push prompt recovery failed closed", exc_info=True)
+            return
+        if prompt is not None:
+            self._console_print(prompt, highlight=False, markup=False)
+
     def handle_bang_shell(self, text: str) -> bool:
         """Run a ``!<command>`` submission. Returns True when it was handled.
 
@@ -10191,12 +10217,116 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             resolved_key = event_key
         return str(resolved_key) == current_key
 
+    def _bestplan_local_completion_state(self, event: dict) -> str:
+        """Classify one local completion from its bound durable plan row."""
+
+        plan_id = str(event.get("bestplan_plan_id") or "")
+        if not plan_id:
+            return "unavailable"
+        store = None
+        try:
+            from agent.bestplan_state import (
+                BestplanStore,
+                PlanState,
+                _canonical_workspace,
+            )
+
+            store = BestplanStore(reconcile_push_state=False)
+            expected_profile = str(os.environ.get("HERMES_PROFILE") or "")
+            expected_workspace = _canonical_workspace(os.getcwd())
+            rows = store.list_for_session(
+                str(getattr(self, "session_id", "") or ""),
+                open_only=False,
+            )
+            matching = [
+                row for row in rows
+                if str(row.get("plan_id") or "") == plan_id
+                and str(row.get("profile") or "") == expected_profile
+                and row.get("workspace") == expected_workspace
+                and int(row.get("execution_protocol") or 1) == 2
+                and int(row.get("promotion_contract_version") or 0) == 1
+                and row.get("promotion_mode") == "local_main"
+            ]
+            if len(matching) != 1:
+                return "unavailable"
+            row = matching[0]
+            if (
+                row.get("local_push_state") == "prepared"
+                and row.get("state") in {PlanState.RUNNING, PlanState.WAITING}
+            ):
+                return "prepared"
+            if row.get("state") == PlanState.FAILED:
+                return "failed"
+            return "settled"
+        except Exception:
+            logger.debug(
+                "local BestPlan completion state read failed closed",
+                exc_info=True,
+            )
+            return "unavailable"
+        finally:
+            if store is not None:
+                store.close()
+
+    def _render_bestplan_local_completion(self, event: dict) -> bool:
+        """Render a terminal local result, or return false while it is prepared."""
+
+        prompt = None
+        try:
+            from agent.bestplan_local_push import (
+                LOCAL_PUSH_PROMPT_RECOVERY_SECONDS,
+                recover_local_push_prompt,
+            )
+
+            prompt = recover_local_push_prompt(
+                session_id=str(getattr(self, "session_id", "") or ""),
+                profile=str(os.environ.get("HERMES_PROFILE") or ""),
+                workspace=os.getcwd(),
+                deadline=(
+                    time.monotonic() + LOCAL_PUSH_PROMPT_RECOVERY_SECONDS
+                ),
+            )
+        except Exception:
+            logger.debug(
+                "local BestPlan completion recovery failed closed",
+                exc_info=True,
+            )
+        if prompt is not None:
+            self._console_print(prompt, highlight=False, markup=False)
+            return True
+
+        durable_state = self._bestplan_local_completion_state(event)
+        if durable_state == "prepared":
+            return False
+        if durable_state == "failed":
+            reason = {
+                "candidate_batch_failed": "candidate batch failed",
+                "async delegation lost during process restart": (
+                    "coordinator was lost during process restart"
+                ),
+            }.get(
+                str(event.get("error") or ""),
+                "local checks or integration did not complete",
+            )
+            message = (
+                f"BestPlan local execution failed: {reason}. "
+                "No remote push was attempted."
+            )
+        else:
+            message = (
+                "BestPlan finished, but Hermes could not verify the local "
+                "push decision. No remote push was attempted."
+            )
+        self._console_print(message, highlight=False, markup=False)
+        return True
+
     def _drain_process_notifications(self, consumer: str) -> None:
         """Queue background notifications owned by this visible CLI session."""
         from tools.process_registry import process_registry
         from tools.async_delegation import (
             claim_event_delivery,
             complete_event_delivery,
+            release_completion_delivery,
         )
 
         session_key = getattr(self, "session_id", "") or ""
@@ -10204,10 +10334,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             session_key=session_key,
             owns_event=self._owns_process_notification,
         ):
-            claim = claim_event_delivery(event, consumer)
+            local_bestplan = event.get("bestplan_local_execution") is True
+            claim = (
+                str(event.pop("_bestplan_delivery_claim", "") or "")
+                if local_bestplan
+                else ""
+            )
+            if not claim:
+                claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
+            if local_bestplan:
+                if not self._render_bestplan_local_completion(event):
+                    try:
+                        released = release_completion_delivery(
+                            str(event.get("delegation_id") or ""), claim,
+                        )
+                    except Exception:
+                        released = False
+                        logger.debug(
+                            "local BestPlan completion claim release failed",
+                            exc_info=True,
+                        )
+                    retry_event = dict(event)
+                    if not released:
+                        retry_event["_bestplan_delivery_claim"] = claim
+                    if _BESTPLAN_LOCAL_COMPLETION_RETRY_SECONDS <= 0:
+                        process_registry.completion_queue.put(retry_event)
+                    else:
+                        retry = threading.Timer(
+                            _BESTPLAN_LOCAL_COMPLETION_RETRY_SECONDS,
+                            process_registry.completion_queue.put,
+                            args=(retry_event,),
+                        )
+                        retry.daemon = True
+                        retry.start()
+                    continue
+            else:
+                self._pending_input.put(synthetic_message)
             complete_event_delivery(event, claim)
 
 
@@ -13849,13 +14013,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 try:
                     from agent.bestplan_state import (
                         ResolvedGo,
-                        is_go_enabled,
                         try_resolve_go,
                     )
+                    from agent.bestplan_local_push import try_resolve_local_push
 
-                    if _bestplan_cfg is not None:
+                    try:
+                        _go_result = try_resolve_local_push(
+                            message,
+                            session_id=str(getattr(self, "session_id", "") or ""),
+                            profile=str(os.environ.get("HERMES_PROFILE") or ""),
+                            workspace=os.getcwd(),
+                        )
+                    except Exception as _push_exc:
+                        if (
+                            isinstance(message, str)
+                            and message.strip().casefold() in {"push", "no"}
+                        ):
+                            _go_result = ResolvedGo(
+                                True,
+                                "push_stale",
+                                reason="local push resolver failed closed",
+                                error=str(_push_exc),
+                            )
+                        else:
+                            _go_result = None
+                        logging.exception("bestplan local push resolver error")
+                    if (
+                        (_go_result is None or not _go_result.resolved)
+                        and _bestplan_cfg is not None
+                    ):
                         _go_result = None
-                    else:
+                    elif _go_result is None or not _go_result.resolved:
                         try:
                             _go_result = try_resolve_go(
                                 message,
@@ -13868,7 +14056,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             if (
                                 isinstance(message, str)
                                 and message.strip().casefold() == "go"
-                                and is_go_enabled()
                             ):
                                 _go_result = ResolvedGo(
                                     True,
@@ -14800,6 +14987,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
             _welcome_color = "#FFF8DC"
         self._console_print(f"[{_welcome_color}]{_welcome_text}[/]")
+        self._show_recovered_local_push_prompt()
 
         # Warm the /model picker's provider-models cache off-thread during this
         # idle window (banner shown, user about to type). The no-args picker
