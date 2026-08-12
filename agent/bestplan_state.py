@@ -1474,10 +1474,6 @@ class BestplanStore:
                             snapshot=snapshot,
                             controller_python=Path(sys.executable),
                             manifest=manifest,
-                            deadline=(
-                                time.monotonic()
-                                + DEFAULT_SOURCE_OPERATION_SECONDS
-                            ),
                         )
                         contract_value = build_local_go_contract(
                             snapshot=snapshot,

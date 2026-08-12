@@ -378,6 +378,38 @@ def test_local_capture_binds_exact_manifest_acceptance_checks(tmp_path, monkeypa
     assert "check_config" not in calls[0]
 
 
+def test_local_capture_leaves_runtime_deadline_to_local_policy(
+    tmp_path, monkeypatch,
+):
+    from agent import bestplan_local
+    from agent.bestplan_state import BestplanStore, capture_bestplan_response
+
+    repo = _repo(tmp_path)
+    calls = []
+
+    def capture_inputs(**kwargs):
+        calls.append(kwargs)
+        return _local_inputs(kwargs["snapshot"], tmp_path)
+
+    monkeypatch.setattr(
+        bestplan_local,
+        "capture_local_execution_inputs",
+        capture_inputs,
+    )
+    store = BestplanStore(db_path=tmp_path / "state" / "state.db")
+    captured = capture_bestplan_response(
+        _response(str(repo)),
+        session_id="local-session",
+        profile="coder",
+        workspace=str(repo),
+        store=store,
+        local_execution=True,
+    )
+
+    assert captured.executable is True
+    assert "deadline" not in calls[0]
+
+
 def test_bare_go_rejects_a_second_local_plan_while_push_decision_is_pending(
     tmp_path, monkeypatch,
 ):
