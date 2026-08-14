@@ -36,7 +36,7 @@ _RECORD_KEYS = {
     "repository", "source_snapshot_digest", "expected_target_oid",
     "integration_oid", "check_set_digest", "local_ref", "remote_name",
     "display_url", "remote_identity_sha256", "remote_ref",
-    "observed_remote_oid", "expires_at",
+    "observed_remote_oid", "expires_at", "review",
 }
 
 
@@ -142,6 +142,30 @@ def validate_local_push_record(
         raise LocalPushStateError("local push digest is malformed")
     if value["local_ref"] != LOCAL_PUSH_REF or value["remote_ref"] != LOCAL_PUSH_REF:
         raise LocalPushStateError("local push ref is not refs/heads/main")
+    review = value["review"]
+    if not isinstance(review, Mapping) or set(review) != {
+        "job_id",
+        "receipt_digest",
+        "target_digest",
+    }:
+        raise LocalPushStateError("local push review binding is malformed")
+    review_binding = {
+        "job_id": _text(review["job_id"], "review job identity", 256),
+        "receipt_digest": review["receipt_digest"],
+        "target_digest": review["target_digest"],
+    }
+    if any(
+        not isinstance(review_binding[name], str)
+        or _SHA256_RE.fullmatch(review_binding[name]) is None
+        for name in ("receipt_digest", "target_digest")
+    ):
+        raise LocalPushStateError("local push review digest is malformed")
+    if (
+        row.get("review_job_id") != review_binding["job_id"]
+        or row.get("review_target_digest") != review_binding["target_digest"]
+        or row.get("review_receipt_digest") != review_binding["receipt_digest"]
+    ):
+        raise LocalPushStateError("local push review binding differs from its plan")
     remote_name = _text(value["remote_name"], "remote name", 128)
     if _REMOTE_NAME_RE.fullmatch(remote_name) is None:
         raise LocalPushStateError("local push remote name is malformed")
@@ -164,6 +188,7 @@ def validate_local_push_record(
         "remote_ref": LOCAL_PUSH_REF,
         "observed_remote_oid": observed_oid,
         "expires_at": expires_at,
+        "review": review_binding,
     }
     if canonical_local_push_json(record) != canonical_local_push_json(value):
         raise LocalPushStateError("local push record is not canonical")
@@ -350,6 +375,9 @@ def build_local_push_record(
     expected_target_oid: str,
     integration_oid: str,
     check_set_digest: str,
+    review_job_id: str,
+    review_target_digest: str,
+    review_receipt_digest: str,
     target: Any,
     expires_at: int,
 ) -> dict[str, Any]:
@@ -366,6 +394,11 @@ def build_local_push_record(
         "expected_target_oid": expected_target_oid,
         "integration_oid": integration_oid,
         "check_set_digest": check_set_digest,
+        "review": {
+            "job_id": review_job_id,
+            "receipt_digest": review_receipt_digest,
+            "target_digest": review_target_digest,
+        },
         "local_ref": LOCAL_PUSH_REF,
         "remote_name": target.remote_name,
         "display_url": target.display_url,
@@ -393,6 +426,38 @@ def _owner_is_live(row: Mapping[str, Any]) -> bool:
     return True
 
 
+def _landing_effect_owner_is_live(pid: int, start_id: str) -> bool:
+    """Prove whether the exact PID plus kernel-start identity is still live."""
+
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid < 1
+        or not isinstance(start_id, str)
+        or not start_id.startswith("kernel-start:")
+    ):
+        return True
+    try:
+        expected_start = int(start_id.split(":", 1)[1])
+    except (TypeError, ValueError):
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    try:
+        from gateway.status import get_process_start_time
+
+        actual_start = get_process_start_time(pid)
+    except Exception:
+        return True
+    if actual_start is None:
+        return True
+    return int(actual_start) == expected_start
+
+
 def reconcile_local_pushes(
     store: BestplanStore,
     *,
@@ -413,7 +478,7 @@ def reconcile_local_pushes(
         params = (str(plan_id),)
     with store._read_lock():
         rows = store._connection().execute(
-            f"SELECT * FROM bestplan_plans WHERE {where} ORDER BY created_at ASC",
+            f"SELECT * FROM bestplan_plans WHERE {where} ORDER BY rowid ASC",
             params,
         ).fetchall()
     if not rows:
@@ -445,6 +510,40 @@ def reconcile_local_pushes(
                 continue
             next_state = "stale"
         else:
+            if state == "prepared":
+                try:
+                    with store._read_lock():
+                        review_job = store._connection().execute(
+                            "SELECT state FROM review_jobs WHERE job_id=?",
+                            (record["review"]["job_id"],),
+                        ).fetchone()
+                except Exception:
+                    review_job = None
+                if (
+                    review_job is not None
+                    and str(review_job["state"] or "") == "landing_claimed"
+                ):
+                    # A claimed landing owns the external Git effect. Only the
+                    # claim-aware recovery path can reconcile it; the generic
+                    # local-main classifier must not bypass the review journal.
+                    store.recover_landing_claim(
+                        plan_id,
+                        owner_is_live=_landing_effect_owner_is_live,
+                        observe_local_main=classify_local_main,
+                        now_ns=time.time_ns(),
+                    )
+                    with store._read_lock():
+                        recovered_row = store._connection().execute(
+                            "SELECT local_push_state FROM bestplan_plans "
+                            "WHERE plan_id=?",
+                            (plan_id,),
+                        ).fetchone()
+                    if (
+                        recovered_row is not None
+                        and str(recovered_row["local_push_state"] or "") != state
+                    ):
+                        changed += 1
+                    continue
             if state in {"prepared", "pushing"} and _owner_is_live(row):
                 continue
             expired = observed_now >= record["expires_at"]

@@ -2477,14 +2477,47 @@ def _format_async_delegation(evt: dict) -> str:
         goals = evt.get("goals") or []
         n = len(results) if results else len(goals)
         total_dur = evt.get("total_duration_seconds", duration)
-        lines = [
-            f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
-            f"A background fan-out of {n} subagent(s) you dispatched earlier "
-            "has finished. All ran in parallel and waited on each other; their "
-            "consolidated results are below. You may have moved on since "
-            "dispatching — act on these or re-dispatch if things have changed.",
-            "",
-        ]
+        waiting_statuses = {
+            "review_waiting",
+            "review_requeued",
+            "blocked_requires_authority",
+        }
+        has_failed_result = any(
+            item.get("status") not in {"completed", "success", "frozen"}
+            for item in results
+        )
+        if status == "candidate_ready" and evt.get("bestplan_plan_id"):
+            lines = [
+                f"[BESTPLAN CANDIDATES READY — {deleg_id}]",
+                f"Candidate generation finished for {n} BestPlan slice(s). "
+                "The BestPlan is still running. Its exact candidates must pass "
+                "integration, checks, and review before completion.",
+                "",
+            ]
+        elif status in waiting_statuses and evt.get("bestplan_plan_id"):
+            lines = [
+                f"[BESTPLAN REVIEW WAITING — {deleg_id}]",
+                "The BestPlan has not finished. It is waiting for another "
+                "repair attempt, check run, review attempt, or the required "
+                "repair authority. It cannot land in this state.",
+                "",
+            ]
+        elif status not in {"completed", "success"} or error or has_failed_result:
+            lines = [
+                f"[ASYNC DELEGATION BATCH ERROR — {deleg_id}]",
+                f"A background fan-out of {n} subagent(s) did not complete "
+                "successfully. Its available results are below.",
+                "",
+            ]
+        else:
+            lines = [
+                f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
+                f"A background fan-out of {n} subagent(s) you dispatched earlier "
+                "has finished. All ran in parallel and waited on each other; their "
+                "consolidated results are below. You may have moved on since "
+                "dispatching — act on these or re-dispatch if things have changed.",
+                "",
+            ]
         if isinstance(dispatched_at, (int, float)):
             ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(dispatched_at))
             age = f" ({_format_age(completed_at - dispatched_at)} ago)"

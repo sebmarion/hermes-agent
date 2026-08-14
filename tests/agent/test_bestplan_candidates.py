@@ -174,6 +174,107 @@ def test_attempt_exports_captured_base_after_head_moves_and_never_imports_git_or
     assert _git(repo, "rev-parse", first.base_ref_name) == snapshot.head_oid
 
 
+def _frozen_integration_base(repo: Path, snapshot, *, content: str):
+    from agent import bestplan_promotion as promotion
+
+    (repo / "allowed" / "base.txt").write_text(content, encoding="utf-8")
+    _git(repo, "add", "allowed/base.txt")
+    tree_oid = _git(repo, "write-tree")
+    integration_oid = subprocess.run(
+        ["git", "commit-tree", tree_oid, "-p", snapshot.head_oid],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        input="Hermes repair base\n",
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Candidate Test",
+            "GIT_AUTHOR_EMAIL": "candidate@example.test",
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+            "GIT_COMMITTER_NAME": "Candidate Test",
+            "GIT_COMMITTER_EMAIL": "candidate@example.test",
+            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+        },
+    ).stdout.strip()
+    ref_name = "refs/hermes-bestplan-integrations/repair-test/base"
+    _git(repo, "update-ref", ref_name, integration_oid)
+    integration = promotion.FrozenIntegration(
+        plan_id="bp-plan-1",
+        approval_digest="a" * 64,
+        contract_digest="b" * 64,
+        source_snapshot_digest="c" * 64,
+        target_ref=snapshot.head_ref.decode("ascii"),
+        target_oid=snapshot.head_oid,
+        integration_oid=integration_oid,
+        tree_oid=tree_oid,
+        ref_name=ref_name,
+        candidates=(),
+        receipt_digest="",
+    )
+    return promotion.FrozenIntegration(
+        **{
+            **integration.__dict__,
+            "receipt_digest": promotion._receipt_digest(integration),
+        }
+    )
+
+
+def test_repair_attempt_reads_the_exact_prior_integration_and_freezes_a_new_parent(
+    tmp_path,
+):
+    candidates = _candidates()
+    repo = _repo(tmp_path / "repo")
+    snapshot = _snapshot(repo)
+    base = _frozen_integration_base(repo, snapshot, content="implemented\n")
+    spec = _spec(
+        candidates,
+        plan_id="repair-plan-1",
+        candidate_id="repair-candidate-1",
+        slice_id="repair-slice-1",
+        expected_artifacts=("allowed/base.txt",),
+    )
+
+    attempt = candidates.create_repair_candidate_attempt(
+        snapshot,
+        candidate_base=base,
+        plan_id=spec.plan_id,
+        slice_id=spec.slice_id,
+        attempts_root=tmp_path / "attempts",
+        attempt_id="repair-attempt-1",
+    )
+
+    assert (attempt.source_dir / "allowed" / "base.txt").read_text() == (
+        "implemented\n"
+    )
+    assert _git(repo, "rev-parse", attempt.base_ref_name) == base.integration_oid
+    (attempt.source_dir / "allowed" / "base.txt").write_text(
+        "implemented and repaired\n", encoding="utf-8",
+    )
+    sealed = candidates.seal_candidate_attempt(attempt)
+    frozen = candidates._freeze_sealed_repair_candidate_for_test(
+        snapshot,
+        candidate_base=base,
+        sealed=sealed,
+        spec=spec,
+        raw_receipt={"status": "completed", "summary": "repair"},
+    )
+
+    assert _git(repo, "rev-parse", f"{frozen.commit_oid}^") == (
+        base.integration_oid
+    )
+    assert _git(repo, "show", f"{frozen.commit_oid}:allowed/base.txt") == (
+        "implemented and repaired"
+    )
+    assert _git(repo, "show", f"{snapshot.head_oid}:allowed/base.txt") == "base"
+    assert not _git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/hermes-bestplan-bases/repair-plan-1/repair-slice-1",
+    )
+
+
 def test_attempt_ids_and_layout_are_unique_and_non_reusable(tmp_path):
     candidates = _candidates()
     snapshot = _snapshot(_repo(tmp_path / "repo"))

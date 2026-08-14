@@ -39,19 +39,16 @@ def test_cli_bestplan_without_count_defaults_to_all_four_configured_lanes():
     }
 
 
-def test_bare_cli_bestplan_queues_four_lane_auto_review():
+def test_bare_cli_bestplan_rejects_and_points_to_review():
     cli = _make_cli()
 
-    with patch("cli._cprint"):
+    with patch("cli._cprint") as cprint:
         assert cli.process_command("/bestplan") is True
 
-    task, images, internal_meta = cli._pending_input.get_nowait()
-    assert "adversarial review of the previous plan" in task.lower()
-    assert images == []
-    assert internal_meta == {
-        "kind": "bestplan",
-        "config": {"count": DEFAULT_EXPLORER_COUNT},
-    }
+    assert cli._pending_input.empty()
+    rendered = " ".join(str(call.args[0]) for call in cprint.call_args_list)
+    assert "provide a task" in rendered.lower()
+    assert "/review" in rendered
 
 
 @pytest.mark.parametrize("task", ["/status", "!cmd", "1", "go"])
@@ -122,7 +119,7 @@ def test_cli_owned_bestplan_control_shaped_tasks_reach_the_agent(task):
     }
     resolve_go.assert_not_called()
     assert len(capture_calls) == 1
-    assert capture_calls[0]["invocation_message"] == "/bestplan"
+    assert capture_calls[0]["invocation_message"] == f"/bestplan {task}"
 
 
 def test_untrusted_go_keeps_existing_cli_resolver_routing():

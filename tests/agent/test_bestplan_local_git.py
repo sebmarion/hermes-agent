@@ -24,6 +24,47 @@ from agent.bestplan_promotion import FrozenIntegration
 from agent.bestplan_source import capture_source_snapshot, resolve_repo_identity
 
 
+@pytest.fixture(autouse=True)
+def _issue_test_landing_authority(monkeypatch):
+    """Keep low-level Git tests focused behind the reviewed landing gate."""
+
+    from agent import bestplan_local_git
+    from agent.review_engine import _issue_landing_authorization
+
+    real_land = bestplan_local_git.land_checked_integration
+
+    def authorized_land(*, snapshot, integration, checks, authorization=None, **kwargs):
+        if authorization is None:
+            lock_path = str(
+                Path(snapshot.repo.common_dir) / "test-bestplan-landing.lock"
+            )
+            lock_handle = open(lock_path, "a+b")
+            authorization = _issue_landing_authorization(
+                lock_handle=lock_handle,
+                plan_id="local-git-test",
+                review_job_id="local-git-review-test",
+                target_digest="7" * 64,
+                integration_oid=integration.integration_oid,
+                check_receipt_digest=checks.receipt_digest,
+                fencing_token=1,
+                owner_pid=os.getpid(),
+                owner_process_start_id="test-process-start",
+                repository_id=snapshot.repo.repository_id,
+                repository_effect_lock_path=lock_path,
+            )
+        return real_land(
+            snapshot=snapshot,
+            integration=integration,
+            checks=checks,
+            authorization=authorization,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        bestplan_local_git, "land_checked_integration", authorized_land,
+    )
+
+
 def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
     result = subprocess.run(
         ["git", *args],

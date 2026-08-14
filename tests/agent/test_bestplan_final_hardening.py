@@ -146,9 +146,9 @@ def test_authoritative_approval_renders_artifacts_and_sandbox_identity(tmp_path)
         baseline_fingerprint=baseline, store=store,
     )
     assert capture.executable
-    assert "expected artifacts: allowed/result.txt" in capture.response
-    assert "sandbox backend:" in capture.response
-    assert "sandbox policy digest:" in capture.response
+    assert "Create or update `allowed/result.txt`." in capture.response
+    assert "sandbox backend:" not in capture.response
+    assert "sandbox policy digest:" not in capture.response
 
 
 @pytest.mark.skipif(sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists(), reason="macOS sandbox-exec required")
@@ -228,7 +228,7 @@ def test_detached_sandbox_preserves_approved_git_subdirectory(tmp_path, monkeypa
     assert (detached / "tracked.txt").read_text(encoding="utf-8") == "base"
 
 
-def test_fast_completion_evidence_wins_over_late_dispatch_write(tmp_path):
+def test_candidate_evidence_stays_nonterminal_across_late_dispatch_write(tmp_path):
     workspace = str(tmp_path.resolve())
     store = BestplanStore(db_path=tmp_path / "state.db")
     plan_id = store.create_plan(
@@ -243,10 +243,16 @@ def test_fast_completion_evidence_wins_over_late_dispatch_write(tmp_path):
     )
     assert store.begin_dispatch_attempt(plan_id)
     assert store.mark_completed_unverified(plan_id, {"delegation_id": f"bestplan-{plan_id}"})
+    candidate_row = store.get_plan(plan_id)
+    assert candidate_row["state"] == PlanState.RUNNING
+    assert candidate_row["dispatch_state"] == "terminal"
+    assert candidate_row["completed_at"] is None
     assert store.record_dispatch(plan_id, delegation_ids=[f"bestplan-{plan_id}"])
     row = store.get_plan(plan_id)
-    assert row["state"] == PlanState.COMPLETED_UNVERIFIED
-    assert row["dispatch_state"] == "terminal"
+    assert row["state"] == PlanState.WAITING
+    assert row["dispatch_state"] == "scheduled"
+    assert row["completed_at"] is None
+    assert json.loads(row["evidence_json"])["delegation_id"] == f"bestplan-{plan_id}"
 
 
 def test_cli_stack_binds_capability_profile_and_home(tmp_path):

@@ -1731,6 +1731,78 @@ def _validate_authority_receipt_contract(
         raise ProofValidationError("authority receipt contract binding differs")
 
 
+def _require_exact_review_pass(
+    connection: sqlite3.Connection,
+    *,
+    plan_row: Mapping[str, Any],
+) -> None:
+    """Require one current two-slot ReviewStore pass for this integration."""
+
+    try:
+        plan_id = _nonempty(plan_row.get("plan_id"), "plan_id")
+        integration_oid = _oid(
+            plan_row.get("integration_oid"), "integration_oid"
+        )
+        rows = connection.execute(
+            """
+            SELECT pass.review_receipt_digest, generation.target_json
+            FROM review_pass_receipts AS pass
+            JOIN review_jobs AS job ON job.job_id=pass.job_id
+            JOIN review_generations AS generation
+              ON generation.job_id=pass.job_id
+             AND generation.generation=pass.generation
+            WHERE job.source_kind='bestplan_integration'
+              AND job.source_id=? AND job.state='passed'
+              AND job.cancel_requested=0
+              AND job.current_generation=pass.generation
+              AND pass.integration_oid=?
+              AND pass.fencing_token=job.fencing_token
+              AND generation.state='passed'
+            """,
+            (plan_id, integration_oid),
+        ).fetchall()
+        if len(rows) != 1:
+            raise ProofValidationError(
+                "exact canonical review pass is required"
+            )
+        target_payload = json.loads(str(rows[0]["target_json"]))
+        if not isinstance(target_payload, dict):
+            raise ProofValidationError(
+                "exact canonical review pass is required"
+            )
+        source_kind = target_payload.pop("source_kind", None)
+        if source_kind != "bestplan_integration":
+            raise ProofValidationError(
+                "exact canonical review pass is required"
+            )
+        from agent.review_engine import ReviewStore, ReviewTarget
+
+        target = ReviewTarget.bestplan_integration(**target_payload)
+        if (
+            target.plan_id != plan_id
+            or target.base_oid != plan_row.get("baseline_revision")
+            or target.local_target_oid != plan_row.get("baseline_revision")
+            or target.integration_oid != integration_oid
+            or target.approval_digest != plan_row.get("approval_digest")
+            or target.contract_digest
+            != plan_row.get("promotion_contract_digest")
+        ):
+            raise ProofValidationError(
+                "exact canonical review pass is required"
+            )
+        ReviewStore.latest_exact_pass_in_transaction(
+            connection,
+            target=target,
+            review_receipt_digest=str(rows[0]["review_receipt_digest"]),
+        )
+    except ProofValidationError:
+        raise
+    except Exception as exc:
+        raise ProofValidationError(
+            "exact canonical review pass is required"
+        ) from exc
+
+
 class ProofLedger:
     """Transactional append/read/verify interface over a ``BestplanStore``."""
 
@@ -2198,6 +2270,13 @@ class ProofLedger:
             elif projected_state != "running":
                 raise ProofValidationError(
                     "authority milestone cannot change the plan state"
+                )
+            if phase == "review_verified":
+                review_values = dict(values)
+                review_values["integration_oid"] = integration_oid
+                _require_exact_review_pass(
+                    conn,
+                    plan_row=review_values,
                 )
         else:
             previous_phase = str(values.get("current_phase") or "captured")
@@ -3034,6 +3113,10 @@ class ProofLedger:
             raise ProofValidationError("authority receipt is not fresh")
         self.verify_chain(plan_id)
         self._validate_terminal_snapshot(snapshot, verification)
+        _require_exact_review_pass(
+            self.store._connection(),
+            plan_row=snapshot,
+        )
         try:
             accepted = verifier(verification, dict(snapshot))
         except Exception as exc:
@@ -3064,6 +3147,7 @@ class ProofLedger:
                 raise ProofValidationError("terminal projection changed before CAS")
             self._verify_chain_snapshot(conn, plan_id)
             self._validate_terminal_snapshot(current, verification, conn=conn)
+            _require_exact_review_pass(conn, plan_row=current)
             from agent.bestplan_state import _validate_stored_plan_row
 
             try:

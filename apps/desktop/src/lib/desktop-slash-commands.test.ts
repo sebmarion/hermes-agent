@@ -300,6 +300,22 @@ describe('desktop slash command curation', () => {
     // Skill / quick commands aren't in the registry.
     expect(resolveDesktopCommand('/gif-search')).toBeNull()
   })
+
+  it('routes /bestplan to the bestplan.submit RPC with text argument mode', () => {
+    expect(isDesktopSlashSuggestion('/bestplan')).toBe(true)
+    expect(isDesktopSlashCommand('/bestplan')).toBe(true)
+    expect(desktopSlashCommandArgumentMode('/bestplan')).toBe('text')
+    const surface = resolveDesktopCommand('/bestplan')?.surface
+    expect(surface?.kind).toBe('rpc')
+    if (surface?.kind !== 'rpc') {
+      return
+    }
+    expect(surface.rpc).toBe('bestplan.submit')
+    expect(surface.buildParams({ arg: '2 repair it', command: '/bestplan', name: 'bestplan', sessionId: 's-1' })).toEqual({
+      session_id: 's-1',
+      arg: '2 repair it'
+    })
+  })
 })
 
 describe('rankSkillCommands', () => {

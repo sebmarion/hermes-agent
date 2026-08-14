@@ -6,7 +6,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
-from agent.bestplan_orchestrator import DEFAULT_EXPLORER_COUNT, TURN_MARKER
+from agent.bestplan_orchestrator import TURN_MARKER
 from gateway.run import GatewayRunner
 
 
@@ -60,8 +60,19 @@ def _make_event(text="/bestplan"):
     return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
 
 
+def test_bestplan_command_identity_is_host_owned_without_taking_bp_alias():
+    from hermes_cli.commands import resolve_command, should_bypass_active_session
+
+    bestplan = resolve_command("bestplan")
+    assert bestplan is not None
+    assert bestplan.name == "bestplan"
+    assert bestplan.busy_policy == "reject"
+    assert should_bypass_active_session("bestplan") is True
+    assert resolve_command("bp").name == "blueprint"
+
+
 @pytest.mark.asyncio
-async def test_bare_gateway_bestplan_falls_through_public_message_pipeline():
+async def test_bare_gateway_bestplan_rejects_and_points_to_review():
     runner = _make_runner()
     event = _make_event()
     forwarded = []
@@ -70,16 +81,7 @@ async def test_bare_gateway_bestplan_falls_through_public_message_pipeline():
         forwarded.append(inner_event.text)
         return "planning-only-result"
 
-    def fake_build(_cmd_key, user_instruction, task_id=None):
-        assert task_id
-        assert user_instruction == (
-            f"{DEFAULT_EXPLORER_COUNT} "
-            "adversarial review of the previous plan in this conversation"
-        )
-        return (
-            '[IMPORTANT: The user has invoked the "bestplan" skill, indicating '
-            "a planning-only turn.]"
-        )
+    build_skill = MagicMock(return_value="legacy planning-only bestplan")
 
     with (
         patch.object(GatewayRunner, "_handle_message_with_agent", fake_inner),
@@ -87,15 +89,33 @@ async def test_bare_gateway_bestplan_falls_through_public_message_pipeline():
             "/bestplan": {"name": "bestplan"}
         }),
         patch("agent.skill_commands.resolve_skill_command_key", return_value="/bestplan"),
-        patch("agent.skill_commands.build_skill_invocation_message", side_effect=fake_build),
+        patch("agent.skill_commands.build_skill_invocation_message", build_skill),
     ):
         result = await runner._handle_message(event)
 
-    assert result == "planning-only-result"
-    assert forwarded == [
-        '[IMPORTANT: The user has invoked the "bestplan" skill, indicating '
-        "a planning-only turn.]"
-    ]
+    assert result is not None
+    assert "provide a task" in result.lower()
+    assert "/review" in result
+    assert forwarded == []
+    build_skill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_busy_gateway_bestplan_rejects_without_interrupting_active_turn():
+    runner = _make_runner()
+    event = _make_event("/bestplan inspect this release")
+    session_key = runner._session_key_for_source(event.source)
+    running_agent = MagicMock()
+    runner._running_agents[session_key] = running_agent
+    runner._busy_input_mode = "interrupt"
+    runner.session_store = None
+
+    result = await runner._handle_message(event)
+
+    running_agent.interrupt.assert_not_called()
+    assert result is not None
+    assert "can't run mid-turn" in result
+    assert "/bestplan" in result
 
 
 @pytest.mark.asyncio

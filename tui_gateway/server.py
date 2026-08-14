@@ -144,6 +144,8 @@ from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
+# JSON-RPC clients cannot forge this process-local object identity.
+_BESTPLAN_SUBMIT_AUTHORITY = object()
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
@@ -1642,6 +1644,7 @@ def _compute_host_turn_frame(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    bestplan_config: dict | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1651,7 +1654,7 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
-    return {
+    frame = {
         "type": "turn.start",
         "sid": sid,
         "request_id": rid,
@@ -1669,6 +1672,9 @@ def _compute_host_turn_frame(
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
     }
+    if bestplan_config is not None:
+        frame["bestplan_config"] = bestplan_config
+    return frame
 
 
 def _metadata_mirror(session: dict | None) -> dict:
@@ -1745,6 +1751,7 @@ def _submit_prompt_to_compute_host(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    bestplan_config: dict | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1754,6 +1761,7 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        bestplan_config=bestplan_config,
     )
 
     def _complete(done: dict) -> None:
@@ -7435,6 +7443,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    bestplan_config: dict | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7449,6 +7458,8 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if bestplan_config is not None:
+        queued["bestplan_config"] = dict(bestplan_config)
     existing = session.get("queued_prompt")
     if (
         existing
@@ -7503,7 +7514,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    bestplan_config: dict | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7524,7 +7541,7 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
-    mode = "queue" if queued else _load_busy_input_mode()
+    mode = "queue" if queued or bestplan_config is not None else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
         if not session.get("running"):
@@ -7576,7 +7593,13 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            bestplan_config=bestplan_config,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -7611,6 +7634,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     dispatch_failed = False
+    bestplan_config = queued.get("bestplan_config")
     try:
         if use_compute_host:
             if queued.get("image_paths"):
@@ -7621,10 +7645,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    bestplan_config=bestplan_config,
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    bestplan_config=bestplan_config,
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -7642,6 +7672,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    bestplan_config=bestplan_config,
                 )
             else:
                 _run_prompt_submit(
@@ -7650,6 +7681,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    bestplan_config=bestplan_config,
                 )
     except Exception as exc:
         print(
@@ -9469,6 +9501,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    bestplan_config: dict | None = None,
 ) -> None:
     with session["history_lock"]:
         if (
@@ -9775,6 +9808,8 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if bestplan_config is not None:
+                run_kwargs["bestplan_config"] = dict(bestplan_config)
             # Route every TUI turn through the shared BestPlan ingress guard.
             # The TUI is planning-only: executable V1 envelopes and bare
             # ``go`` must be rejected before they reach the model/dispatcher.
@@ -9783,13 +9818,32 @@ def _run_prompt_submit(
             def _run_tui_model_turn():
                 return agent.run_conversation(run_message, **run_kwargs)
 
-            result = run_planning_only_bestplan_turn(
-                invocation_message=prompt,
-                conversation_history=history,
-                host_name="tui",
-                host_agent=agent,
-                run_model_turn=_run_tui_model_turn,
-            )
+            if bestplan_config is None:
+                result = run_planning_only_bestplan_turn(
+                    invocation_message=prompt,
+                    conversation_history=history,
+                    host_name="tui",
+                    host_agent=agent,
+                    run_model_turn=_run_tui_model_turn,
+                )
+            else:
+                result = agent.run_conversation(run_message, **run_kwargs)
+                from tui_gateway.bestplan import capture_gateway_bestplan_result
+
+                profile_home = session.get("profile_home")
+                profile = (
+                    Path(profile_home).name
+                    if profile_home
+                    else _current_profile_name()
+                )
+                result = capture_gateway_bestplan_result(
+                    result,
+                    invocation_message=f"/bestplan {prompt}".strip(),
+                    session_id=str(session.get("session_key") or ""),
+                    profile=profile,
+                    workspace=_session_cwd(session),
+                    host_agent=agent,
+                )
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")

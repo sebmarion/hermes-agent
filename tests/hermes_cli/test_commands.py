@@ -192,6 +192,13 @@ class TestSlackSubcommandMap:
             if cmd.cli_only and not cmd.gateway_config_gate:
                 assert cmd.name not in mapping
 
+    def test_bestplan_uses_slack_catchall_and_native_telegram_without_taking_bp(self):
+        assert "bestplan" in _SLACK_VIA_HERMES_ONLY
+        assert "bestplan" not in {name for name, _desc, _hint in slack_native_slashes()}
+        assert slack_subcommand_map()["bestplan"] == "/bestplan"
+        assert "bestplan" in {name for name, _desc in telegram_bot_commands()}
+        assert resolve_command("bp").name == "blueprint"
+
 
 class TestSlackNativeSlashes:
     """Slack native slash command generation — used to register every

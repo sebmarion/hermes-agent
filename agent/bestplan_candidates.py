@@ -752,6 +752,141 @@ def create_candidate_attempt(
         raise
 
 
+def _repair_base_identity(
+    snapshot: SourceSnapshot,
+    candidate_base: object,
+    *,
+    deadline: float,
+) -> tuple[str, str]:
+    """Validate one immutable prior integration as a candidate read base."""
+
+    from agent import bestplan_promotion as promotion
+
+    if not isinstance(snapshot, SourceSnapshot) or not isinstance(
+        candidate_base, promotion.FrozenIntegration,
+    ):
+        raise CandidateValidationError("candidate repair base is invalid")
+    if not candidate_base.ref_name.startswith(
+        "refs/hermes-bestplan-integrations/"
+    ):
+        raise CandidateValidationError("candidate repair base ref is invalid")
+    empty_receipt = promotion.FrozenIntegration(
+        **{**candidate_base.__dict__, "receipt_digest": ""}
+    )
+    if promotion._receipt_digest(empty_receipt) != candidate_base.receipt_digest:
+        raise CandidateValidationError("candidate repair base receipt differs")
+    _assert_repository_identity(snapshot.repo, deadline=deadline)
+    if _read_ref(
+        snapshot.repo, candidate_base.ref_name, deadline=deadline,
+    ) != candidate_base.integration_oid:
+        raise CandidateProofStale("candidate repair base ref changed")
+    if _read_ref(
+        snapshot.repo, candidate_base.target_ref, deadline=deadline,
+    ) != candidate_base.target_oid:
+        raise CandidateProofStale("candidate repair target changed")
+    tree_oid = _git(
+        snapshot.repo,
+        "rev-parse",
+        f"{candidate_base.integration_oid}^{{tree}}",
+        deadline=deadline,
+    ).stdout.decode("ascii").strip()
+    parents = _git(
+        snapshot.repo,
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        candidate_base.integration_oid,
+        deadline=deadline,
+    ).stdout.decode("ascii").split()
+    if (
+        tree_oid != candidate_base.tree_oid
+        or parents != [candidate_base.integration_oid, candidate_base.target_oid]
+    ):
+        raise CandidateProofStale("candidate repair base commit differs")
+    return candidate_base.integration_oid, candidate_base.tree_oid
+
+
+def create_repair_candidate_attempt(
+    snapshot: SourceSnapshot,
+    *,
+    candidate_base: object,
+    plan_id: str,
+    slice_id: str,
+    attempts_root: str | Path,
+    attempt_id: str | None = None,
+    deadline: float | None = None,
+) -> CandidateAttempt:
+    """Create one isolated attempt from an immutable prior integration."""
+
+    from agent.bestplan_promotion import materialize_integration_tree
+
+    absolute_deadline = (
+        time.monotonic() + DEFAULT_CANDIDATE_GIT_SECONDS
+        if deadline is None
+        else float(deadline)
+    )
+    if time.monotonic() >= absolute_deadline:
+        raise CandidateExecutionError("candidate repair deadline expired")
+    base_oid, _base_tree_oid = _repair_base_identity(
+        snapshot, candidate_base, deadline=absolute_deadline,
+    )
+    _validated_identifier(plan_id, "plan")
+    _validated_identifier(slice_id, "slice")
+    attempt_id = (
+        f"attempt-{uuid.uuid4().hex[:16]}" if attempt_id is None else attempt_id
+    )
+    _validated_identifier(attempt_id, "attempt")
+    root_parent = _assert_attempts_root_disjoint(attempts_root, snapshot.repo)
+    root_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root = root_parent / attempt_id
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise CandidateValidationError("candidate attempt already exists") from exc
+    source_dir = root / "source"
+    runtime_dir = root / "runtime"
+    scratch_dir = root / "scratch"
+    control_dir = root / "control"
+    ref_name = candidate_ref_name(plan_id, slice_id, attempt_id)
+    base_ref_name = _base_ref_name(plan_id, slice_id, attempt_id)
+    anchored = False
+    try:
+        _anchor_candidate_ref(
+            snapshot.repo, base_ref_name, base_oid, deadline=absolute_deadline,
+        )
+        anchored = True
+        for directory in (runtime_dir, scratch_dir, control_dir):
+            directory.mkdir(mode=0o700)
+        materialize_integration_tree(
+            snapshot=snapshot,
+            integration=candidate_base,
+            destination=source_dir,
+            deadline=absolute_deadline,
+        )
+        records, _paths, _witness = _scan_candidate_tree(
+            source_dir, deadline=absolute_deadline,
+        )
+        return CandidateAttempt(
+            attempt_id=attempt_id,
+            root=root,
+            source_dir=source_dir,
+            runtime_dir=runtime_dir,
+            scratch_dir=scratch_dir,
+            control_dir=control_dir,
+            ref_name=ref_name,
+            base_ref_name=base_ref_name,
+            _base_records=records,
+        )
+    except BaseException:
+        if anchored:
+            _delete_ref(
+                snapshot.repo, base_ref_name, base_oid,
+                deadline=max(absolute_deadline, time.monotonic() + 2.0),
+            )
+        raise
+
+
 def validate_raw_candidate_paths(paths: Iterable[bytes]) -> tuple[bytes, ...]:
     output: list[bytes] = []
     aliases: dict[str, bytes] = {}
@@ -1056,10 +1191,27 @@ def _write_tree(
     *,
     deadline: float,
 ) -> str:
+    return _write_tree_against(
+        repo,
+        base_tree_oid=snapshot.tree_oid,
+        sealed=sealed,
+        changed=changed,
+        deadline=deadline,
+    )
+
+
+def _write_tree_against(
+    repo: RepoIdentity,
+    *,
+    base_tree_oid: str,
+    sealed: SealedCandidate,
+    changed: tuple[bytes, ...],
+    deadline: float,
+) -> str:
     if not changed:
-        return snapshot.tree_oid
+        return base_tree_oid
     current = {item.path: item for item in sealed.records}
-    zero_oid = b"0" * len(snapshot.tree_oid)
+    zero_oid = b"0" * len(base_tree_oid)
     with tempfile.TemporaryDirectory(
         prefix="bestplan-index-", dir=sealed.attempt.control_dir,
     ) as index_root:
@@ -1068,7 +1220,7 @@ def _write_tree(
         _git(
             repo,
             "read-tree",
-            snapshot.tree_oid,
+            base_tree_oid,
             extra_environment=environment,
             deadline=deadline,
         )
@@ -1178,6 +1330,8 @@ def _freeze_sealed_candidate(
     *,
     raw_receipt: Mapping[str, object],
     deadline: float | None = None,
+    _base_oid: str | None = None,
+    _base_tree_oid: str | None = None,
 ) -> FrozenCandidateArtifact:
     if not isinstance(snapshot, SourceSnapshot) or not isinstance(sealed, SealedCandidate):
         raise CandidateValidationError("candidate freeze inputs are invalid")
@@ -1191,6 +1345,17 @@ def _freeze_sealed_candidate(
     if time.monotonic() >= deadline:
         raise CandidateExecutionError("candidate freeze deadline expired")
     _assert_repository_identity(snapshot.repo, deadline=deadline)
+    base_oid = snapshot.head_oid if _base_oid is None else _base_oid
+    base_tree_oid = snapshot.tree_oid if _base_tree_oid is None else _base_tree_oid
+    if (
+        not isinstance(base_oid, str)
+        or not isinstance(base_tree_oid, str)
+        or len(base_oid) != len(snapshot.head_oid)
+        or len(base_tree_oid) != len(snapshot.tree_oid)
+        or not re.fullmatch(r"[0-9a-f]+", base_oid)
+        or not re.fullmatch(r"[0-9a-f]+", base_tree_oid)
+    ):
+        raise CandidateValidationError("candidate base identity is invalid")
     try:
         receipt_json = json.dumps(
             raw_receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -1201,11 +1366,15 @@ def _freeze_sealed_candidate(
     if len(receipt_json.encode("utf-8")) > 256 * 1024:
         raise CandidateValidationError("candidate receipt exceeds the bounded limit")
     changed = _validated_delta(sealed, spec, deadline=deadline)
-    tree_oid = _write_tree(
-        snapshot.repo, snapshot, sealed, changed, deadline=deadline,
+    tree_oid = _write_tree_against(
+        snapshot.repo,
+        base_tree_oid=base_tree_oid,
+        sealed=sealed,
+        changed=changed,
+        deadline=deadline,
     )
     commit_oid = _write_commit(
-        snapshot.repo, tree_oid, snapshot.head_oid, spec, deadline=deadline,
+        snapshot.repo, tree_oid, base_oid, spec, deadline=deadline,
     )
     anchored = False
     try:
@@ -1218,14 +1387,14 @@ def _freeze_sealed_candidate(
             ref_name=sealed.attempt.ref_name,
             commit_oid=commit_oid,
             tree_oid=tree_oid,
-            parent_oid=snapshot.head_oid,
+            parent_oid=base_oid,
             deadline=deadline,
         )
         _assert_repository_identity(snapshot.repo, deadline=deadline)
         _delete_ref(
             snapshot.repo,
             sealed.attempt.base_ref_name,
-            snapshot.head_oid,
+            base_oid,
             deadline=deadline,
         )
     except BaseException:
@@ -1236,7 +1405,7 @@ def _freeze_sealed_candidate(
                     snapshot.repo,
                     (
                         (sealed.attempt.ref_name, commit_oid),
-                        (sealed.attempt.base_ref_name, snapshot.head_oid),
+                        (sealed.attempt.base_ref_name, base_oid),
                     ),
                     deadline=cleanup_deadline,
                 )
@@ -1274,6 +1443,36 @@ def _freeze_sealed_candidate_for_test(
 
     return _freeze_sealed_candidate(
         snapshot, sealed, spec, raw_receipt=raw_receipt, deadline=deadline,
+    )
+
+
+def _freeze_sealed_repair_candidate_for_test(
+    snapshot: SourceSnapshot,
+    *,
+    candidate_base: object,
+    sealed: SealedCandidate,
+    spec: CandidateSpec,
+    raw_receipt: Mapping[str, object],
+    deadline: float | None = None,
+) -> FrozenCandidateArtifact:
+    """Private repair-freeze seam for exact-generation tests."""
+
+    absolute_deadline = (
+        time.monotonic() + DEFAULT_CANDIDATE_GIT_SECONDS
+        if deadline is None
+        else float(deadline)
+    )
+    base_oid, base_tree_oid = _repair_base_identity(
+        snapshot, candidate_base, deadline=absolute_deadline,
+    )
+    return _freeze_sealed_candidate(
+        snapshot,
+        sealed,
+        spec,
+        raw_receipt=raw_receipt,
+        deadline=absolute_deadline,
+        _base_oid=base_oid,
+        _base_tree_oid=base_tree_oid,
     )
 
 
@@ -2099,6 +2298,7 @@ def _run_and_freeze_candidate(
     sandbox_factory: Callable[..., object] | None = None,
     process_identity_resolver: Callable[[int, Path], WorkerIdentity] | None = None,
     process_group_reaper: Callable[..., None] = terminate_process_group,
+    candidate_base: object | None = None,
 ) -> FrozenCandidate:
     from agent.bestplan_sandbox import create_bestplan_candidate_sandbox_launch
 
@@ -2126,6 +2326,13 @@ def _run_and_freeze_candidate(
     if spec.expires_at <= time.time():
         raise CandidateValidationError("candidate spec expired before execution")
     deadline = time.monotonic() + float(timeout_seconds)
+    repair_base_identity = (
+        None
+        if candidate_base is None
+        else _repair_base_identity(
+            snapshot, candidate_base, deadline=deadline,
+        )
+    )
     try:
         parent_channel, child_channel = socket.socketpair()
     except OSError:
@@ -2135,13 +2342,24 @@ def _run_and_freeze_candidate(
     try:
         if cancel_event is not None and bool(cancel_event.is_set()):
             raise CandidateExecutionError("candidate cancelled")
-        attempt = create_candidate_attempt(
-            snapshot,
-            plan_id=spec.plan_id,
-            slice_id=spec.slice_id,
-            attempts_root=attempts_root,
-            attempt_id=attempt_id,
-        )
+        if candidate_base is None:
+            attempt = create_candidate_attempt(
+                snapshot,
+                plan_id=spec.plan_id,
+                slice_id=spec.slice_id,
+                attempts_root=attempts_root,
+                attempt_id=attempt_id,
+            )
+        else:
+            attempt = create_repair_candidate_attempt(
+                snapshot,
+                candidate_base=candidate_base,
+                plan_id=spec.plan_id,
+                slice_id=spec.slice_id,
+                attempts_root=attempts_root,
+                attempt_id=attempt_id,
+                deadline=deadline,
+            )
     except BaseException:
         _close_broker_channel(parent_channel)
         _close_broker_channel(child_channel)
@@ -2336,18 +2554,23 @@ def _run_and_freeze_candidate(
         sealed = seal_candidate_attempt(attempt, deadline=deadline)
         if cancel_event is not None and bool(cancel_event.is_set()):
             raise CandidateExecutionError("candidate cancelled")
-        artifact = _freeze_sealed_candidate(
-            snapshot,
-            sealed,
-            spec,
-            raw_receipt={
+        freeze_kwargs = {
+            "raw_receipt": {
                 "status": result["status"],
                 "summary": result["summary"],
                 "request_count": accounting.requests,
                 "input_tokens": accounting.input_tokens,
                 "output_tokens": accounting.output_tokens,
             },
-            deadline=deadline,
+            "deadline": deadline,
+        }
+        if repair_base_identity is not None:
+            freeze_kwargs.update({
+                "_base_oid": repair_base_identity[0],
+                "_base_tree_oid": repair_base_identity[1],
+            })
+        artifact = _freeze_sealed_candidate(
+            snapshot, sealed, spec, **freeze_kwargs,
         )
         policy_digest = getattr(launch, "policy_digest", None)
         controller_id = getattr(expected_controller, "controller_id", None)
@@ -2414,7 +2637,12 @@ def _run_and_freeze_candidate(
             except BaseException:
                 pass
         if ordinary_failure and group_extinct:
-            _delete_ref(snapshot.repo, attempt.base_ref_name, snapshot.head_oid)
+            base_oid = (
+                snapshot.head_oid
+                if repair_base_identity is None
+                else repair_base_identity[0]
+            )
+            _delete_ref(snapshot.repo, attempt.base_ref_name, base_oid)
         if extinction_failure:
             raise CandidateExecutionError(
                 "candidate worker extinction proof failed; reconciliation retained"
@@ -2441,6 +2669,44 @@ def run_and_freeze_candidate(
 
     return _run_and_freeze_candidate(
         snapshot=snapshot,
+        spec=spec,
+        attempts_root=attempts_root,
+        controller_source=controller_source,
+        controller_python=controller_python,
+        runtime_read_paths=runtime_read_paths,
+        expected_controller=expected_controller,
+        authority_client=authority_client,
+        timeout_seconds=timeout_seconds,
+        attempt_id=attempt_id,
+        cancel_event=cancel_event,
+        sandbox_factory=create_bestplan_candidate_sandbox_launch,
+        process_identity_resolver=_default_process_identity,
+        process_group_reaper=terminate_process_group,
+    )
+
+
+def run_and_freeze_repair_candidate(
+    *,
+    snapshot: SourceSnapshot,
+    candidate_base: object,
+    spec: CandidateSpec,
+    attempts_root: str | Path,
+    controller_source: str | Path,
+    controller_python: str | Path,
+    runtime_read_paths: Iterable[str | Path],
+    expected_controller: object,
+    authority_client: object,
+    timeout_seconds: float,
+    attempt_id: str | None = None,
+    cancel_event: object | None = None,
+) -> FrozenCandidate:
+    """Run one repair candidate from the latest immutable integration."""
+
+    from agent.bestplan_sandbox import create_bestplan_candidate_sandbox_launch
+
+    return _run_and_freeze_candidate(
+        snapshot=snapshot,
+        candidate_base=candidate_base,
         spec=spec,
         attempts_root=attempts_root,
         controller_source=controller_source,

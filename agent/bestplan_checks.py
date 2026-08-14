@@ -601,7 +601,14 @@ def _check_profile_text(
     scratch = Path(scratch_root).absolute()
     executable_path = Path(executable).absolute()
     resolved_executable = executable_path.resolve(strict=True)
-    dependencies = tuple(Path(path).resolve(strict=True) for path in runtime_read_paths)
+    dependencies = tuple(dict.fromkeys(
+        candidate
+        for path in runtime_read_paths
+        for candidate in (
+            Path(path).absolute(),
+            Path(path).resolve(strict=True),
+        )
+    ))
     caches = tuple(Path(path).absolute() for path in cache_roots)
     endpoints = parse_network_allowlist(network_allowlist)
     rules = [

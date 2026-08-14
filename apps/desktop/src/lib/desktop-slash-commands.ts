@@ -248,6 +248,12 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     surface: exec(),
     argumentMode: 'text'
   },
+  {
+    name: '/bestplan',
+    description: 'Submit a BestPlan task',
+    surface: rpc('bestplan.submit', ctx => ({ session_id: ctx.sessionId, arg: ctx.arg })),
+    argumentMode: 'text'
+  },
   // /compress must be an action (session.compress RPC), not exec: the slash
   // worker route times out on large sessions (30s WS / 45s pipe) before the
   // LLM summarise call finishes, then command.dispatch surfaces a bogus

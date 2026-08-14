@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -98,9 +99,15 @@ def _plan(workspace: str = "/tmp/proof-work"):
     )
 
 
-def _repo(workspace: str = "/tmp/proof-work") -> RepoIdentity:
+def _repo(
+    workspace: str = "/tmp/proof-work",
+    *,
+    common_dir: str | Path = "/tmp/proof-repo/.git",
+    common_dir_device: int = 11,
+    common_dir_inode: int = 22,
+) -> RepoIdentity:
     workspace = str(Path(workspace).resolve())
-    common = "/tmp/proof-repo/.git"
+    common = str(Path(common_dir).resolve())
     return RepoIdentity(
         workspace=workspace,
         workspace_raw=workspace.encode(),
@@ -110,8 +117,8 @@ def _repo(workspace: str = "/tmp/proof-work") -> RepoIdentity:
         git_dir_raw=common.encode(),
         common_dir=common,
         common_dir_raw=common.encode(),
-        common_dir_device=11,
-        common_dir_inode=22,
+        common_dir_device=common_dir_device,
+        common_dir_inode=common_dir_inode,
         object_format="sha1",
         repository_id="proof-repository",
     )
@@ -355,6 +362,7 @@ def _insert_local_v2_plan(
     store: BestplanStore,
     *,
     plan_id: str = "bp_local_proof",
+    repository_dir: Path | None = None,
 ) -> SourceSnapshot:
     from agent.bestplan_local import (
         build_local_go_contract,
@@ -364,7 +372,21 @@ def _insert_local_v2_plan(
         local_go_manifest_digest,
     )
 
-    snapshot = _snapshot()
+    if repository_dir is None:
+        snapshot = _snapshot()
+    else:
+        repository_dir = repository_dir.resolve()
+        common_dir = repository_dir / ".git"
+        common_dir.mkdir(parents=True)
+        common_dir_info = common_dir.stat()
+        snapshot = _snapshot(
+            _repo(
+                str(repository_dir),
+                common_dir=common_dir,
+                common_dir_device=common_dir_info.st_dev,
+                common_dir_inode=common_dir_info.st_ino,
+            ),
+        )
     plan = _plan(snapshot.repo.workspace)
     manifest = plan.to_manifest()
     controller = ControllerIdentity(
@@ -427,9 +449,16 @@ def _prepare_local_push(
     *,
     plan_id: str = "bp_local_proof",
     integration_oid: str = "c" * 40,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], object]:
     from agent.bestplan_local_git import LocalMainPushTarget
 
+    review_target, review_receipt_digest, review_claim = _local_review_pass(
+        store,
+        snapshot,
+        plan_id=plan_id,
+        integration_oid=integration_oid,
+        check_receipt_digest="d" * 64,
+    )
     prepared = store.prepare_local_push(
         plan_id,
         session_id="session",
@@ -438,6 +467,8 @@ def _prepare_local_push(
         expected_target_oid=snapshot.head_oid,
         integration_oid=integration_oid,
         check_set_digest="d" * 64,
+        review_target=review_target,
+        review_receipt_digest=review_receipt_digest,
         target=LocalMainPushTarget(
             remote_name="origin",
             remote_ref="refs/heads/main",
@@ -449,7 +480,152 @@ def _prepare_local_push(
         expires_at=int(time.time()) + 600,
     )
     assert prepared is not None
-    return prepared
+    return prepared, review_claim
+
+
+def _local_review_pass(
+    store: BestplanStore,
+    snapshot: SourceSnapshot,
+    *,
+    plan_id: str = "bp_local_proof",
+    integration_oid: str = "c" * 40,
+    check_receipt_digest: str = "d" * 64,
+):
+    from agent.review_engine import ReviewStore, ReviewTarget
+
+    row = store.get_plan(plan_id)
+    target = ReviewTarget.bestplan_integration(
+        plan_id=plan_id,
+        generation=0,
+        base_oid=snapshot.head_oid,
+        local_target_oid=snapshot.head_oid,
+        integration_oid=integration_oid,
+        integration_tree_oid=integration_oid,
+        integration_ref=f"refs/hermes-bestplan-integrations/{plan_id}/0",
+        integration_receipt_digest="1" * 64,
+        check_receipt_digest=check_receipt_digest,
+        approval_digest=row["approval_digest"],
+        contract_digest=row["promotion_contract_digest"],
+        diff_sha256="2" * 64,
+        acceptance_digest="3" * 64,
+        policy_digest="4" * 64,
+    )
+    review_store = ReviewStore(store.state_db_path)
+    review_store.create_job(
+        job_id=f"review-{plan_id}",
+        source_kind=target.source_kind,
+        source_id=target.plan_id,
+        target_digest=target.target_digest,
+        policy_digest=target.policy_digest,
+        integration_oid=target.integration_oid,
+        check_receipt_digest=target.check_receipt_digest,
+    )
+    claim = review_store.claim_job(
+        job_id=f"review-{plan_id}",
+        owner_id="review-worker",
+        now_ns=time.time_ns(),
+        lease_duration_ns=60_000_000_000,
+        expected_fencing_token=0,
+    )
+    review_store.begin_generation(
+        job_id=f"review-{plan_id}",
+        generation=0,
+        target=target,
+        owner_id="review-worker",
+        fencing_token=claim.fencing_token,
+        operation_id="generation-0",
+    )
+    for slot in ("smart_reviewer", "code_worker"):
+        review_store.record_reviewer_receipt(
+            job_id=f"review-{plan_id}",
+            generation=0,
+            slot=slot,
+            target_digest=target.target_digest,
+            integration_oid=target.integration_oid,
+            output_digest=hashlib.sha256(f"output-{slot}".encode()).hexdigest(),
+            verdict_digest=hashlib.sha256(f"verdict-{slot}".encode()).hexdigest(),
+            passed=True,
+            owner_id="review-worker",
+            fencing_token=claim.fencing_token,
+            operation_id=f"receipt-{slot}",
+        )
+    receipt_digest = hashlib.sha256(target.canonical_json.encode()).hexdigest()
+    review_store.record_generation_pass(
+        job_id=f"review-{plan_id}",
+        generation=0,
+        target_digest=target.target_digest,
+        integration_oid=target.integration_oid,
+        check_receipt_digest=target.check_receipt_digest,
+        review_receipt_digest=receipt_digest,
+        owner_id="review-worker",
+        fencing_token=claim.fencing_token,
+        operation_id="pass-0",
+    )
+    return target, receipt_digest, claim
+
+
+def _claim_local_landing(
+    store: BestplanStore,
+    review_claim: object,
+    *,
+    plan_id: str = "bp_local_proof",
+):
+    from gateway.status import get_process_start_time
+
+    process_start = get_process_start_time(os.getpid())
+    assert process_start is not None
+    return store.claim_landing(
+        plan_id,
+        owner_id="review-worker",
+        fencing_token=review_claim.fencing_token,
+        owner_pid=os.getpid(),
+        owner_process_start_id=f"kernel-start:{process_start}",
+        operation_id=f"claim-landing-{plan_id}",
+    )
+
+
+def test_local_push_review_gate_does_not_project_a_proof_phase(tmp_path):
+    from agent.bestplan_local_git import LocalMainPushTarget
+
+    proof = _proof()
+    store = _store(tmp_path / "local-review-gate.db")
+    snapshot = _insert_local_v2_plan(store)
+    target, receipt_digest, _claim = _local_review_pass(store, snapshot)
+    assert proof.ProofLedger(store).read_events("bp_local_proof") == []
+
+    prepared = store.prepare_local_push(
+        "bp_local_proof",
+        session_id="session",
+        profile="coder",
+        workspace=snapshot.repo.workspace,
+        expected_target_oid=snapshot.head_oid,
+        integration_oid=target.integration_oid,
+        check_set_digest=target.check_receipt_digest,
+        review_target=target,
+        review_receipt_digest=receipt_digest,
+        target=LocalMainPushTarget(
+            remote_name="origin",
+            remote_ref="refs/heads/main",
+            display_url="ssh://git.example.invalid/proof.git",
+            remote_identity_sha256="e" * 64,
+            observed_remote_oid=snapshot.head_oid,
+            integration_oid=target.integration_oid,
+        ),
+        expires_at=int(time.time()) + 600,
+    )
+
+    assert prepared is not None
+    row = store.get_plan("bp_local_proof")
+    assert row["current_phase"] == "captured"
+    assert row["proof_event_seq"] is None
+    assert row["proof_event_hash"] is None
+    assert row["review_verified_at"] is None
+    assert proof.ProofLedger(store).read_events("bp_local_proof") == []
+    assert json.loads(row["local_push_json"])["review"] == {
+        "job_id": "review-bp_local_proof",
+        "receipt_digest": receipt_digest,
+        "target_digest": target.target_digest,
+    }
 
 
 def _assert_local_terminal_shape(
@@ -502,9 +678,12 @@ def test_verify_chain_accepts_exact_local_landing_overlay(tmp_path, recovered):
 
     proof = _proof()
     store = _store(tmp_path / f"local-landing-{recovered}.db")
-    snapshot = _insert_local_v2_plan(store)
+    snapshot = _insert_local_v2_plan(
+        store,
+        repository_dir=tmp_path / "repo",
+    )
     integration_oid = "c" * 40
-    prepared = _prepare_local_push(
+    prepared, review_claim = _prepare_local_push(
         store, snapshot, integration_oid=integration_oid,
     )
 
@@ -516,6 +695,7 @@ def test_verify_chain_accepts_exact_local_landing_overlay(tmp_path, recovered):
             classify_local_main=lambda **_kwargs: "integration",
         ) == 1
     else:
+        authorization = _claim_local_landing(store, review_claim)
         assert store.activate_local_push(
             "bp_local_proof",
             landing_receipt=LocalMainLandingReceipt(
@@ -523,6 +703,7 @@ def test_verify_chain_accepts_exact_local_landing_overlay(tmp_path, recovered):
                 old_oid=snapshot.head_oid,
                 new_oid=integration_oid,
                 check_receipt_digest="d" * 64,
+                authorization_digest=authorization.authorization_digest,
             ),
         )
 
@@ -580,7 +761,7 @@ def test_verify_chain_accepts_exact_known_local_failure(
     proof = _proof()
     store = _store(tmp_path / f"local-reconciled-{push_state}.db")
     snapshot = _insert_local_v2_plan(store)
-    _prepare_local_push(store, snapshot)
+    _prepared, _review_claim = _prepare_local_push(store, snapshot)
     assert store.mark_completed_unverified(
         "bp_local_proof", {"status": "error", "results": []},
     )
@@ -624,8 +805,12 @@ def test_verify_chain_rejects_inexact_local_terminal_overlay(tmp_path, corruptio
 
     proof = _proof()
     store = _store(tmp_path / f"local-overlay-{corruption}.db")
-    snapshot = _insert_local_v2_plan(store)
-    _prepare_local_push(store, snapshot)
+    snapshot = _insert_local_v2_plan(
+        store,
+        repository_dir=tmp_path / "repo",
+    )
+    _prepared, review_claim = _prepare_local_push(store, snapshot)
+    authorization = _claim_local_landing(store, review_claim)
     assert store.activate_local_push(
         "bp_local_proof",
         landing_receipt=LocalMainLandingReceipt(
@@ -633,6 +818,7 @@ def test_verify_chain_rejects_inexact_local_terminal_overlay(tmp_path, corruptio
             old_oid=snapshot.head_oid,
             new_oid="c" * 40,
             check_receipt_digest="d" * 64,
+            authorization_digest=authorization.authorization_digest,
         ),
     )
 
@@ -905,6 +1091,56 @@ def test_authority_phase_skips_and_regressions_are_rejected(tmp_path):
     assert store.get_plan("bp_proof")["current_phase"] == "integrated_proven"
 
 
+def test_auto_live_review_verified_rejects_claims_without_exact_review_pass(
+    tmp_path,
+):
+    proof = _proof()
+    store = _store(tmp_path / "review-pass-required.db")
+    _insert_v2_plan(store)
+    ledger = proof.ProofLedger(store)
+    candidate_ready = _append(ledger)
+    integrated = _append(
+        ledger,
+        operation=2,
+        expected_seq=candidate_ready.event_seq,
+        expected_hash=candidate_ready.event_hash,
+        kind="integrated_proven",
+        phase="integrated_proven",
+        integration_oid="a" * 40,
+        created_at_ns=2_000_000_000,
+    )
+    tests_verified = _append(
+        ledger,
+        operation=3,
+        expected_seq=integrated.event_seq,
+        expected_hash=integrated.event_hash,
+        kind="tests_verified",
+        phase="tests_verified",
+        integration_oid="a" * 40,
+        created_at_ns=3_000_000_000,
+    )
+
+    with pytest.raises(proof.ProofValidationError, match="review pass"):
+        _append(
+            ledger,
+            operation=4,
+            expected_seq=tests_verified.event_seq,
+            expected_hash=tests_verified.event_hash,
+            kind="review_verified",
+            phase="review_verified",
+            integration_oid="a" * 40,
+            raw_output={
+                "status": "passed",
+                "reviewers": ["smart_reviewer", "code_worker"],
+            },
+            created_at_ns=4_000_000_000,
+        )
+
+    row = store.get_plan("bp_proof")
+    assert row["current_phase"] == "tests_verified"
+    assert row["review_verified_at"] is None
+
+
 def test_authority_append_requires_running_projection_and_monotonic_time(tmp_path):
     proof = _proof()
     pending_store = _store(tmp_path / "pending-authority.db")
@@ -945,6 +1181,8 @@ def test_artifact_identity_appears_only_at_explicit_frozen_milestone(tmp_path):
         ("candidate_ready", "integrated_proven", "tests_verified", "review_verified"),
         start=1,
     ):
+        if phase == "review_verified":
+            _auto_live_review_pass(store)
         previous = _append(
             ledger,
             operation=number,
@@ -1127,7 +1365,7 @@ def test_candidate_set_is_frozen_bound_to_authority_chain_and_replace_safe(tmp_p
     assert candidate.receipt_digest
 
 
-def test_v2_direct_terminal_flip_and_legacy_setter_are_blocked_but_v1_works(tmp_path):
+def test_direct_terminal_flip_and_legacy_verified_setter_are_always_blocked(tmp_path):
     store = _store(tmp_path / "state.db")
     _insert_v2_plan(store, state=PlanState.COMPLETED_UNVERIFIED)
     _insert_v1_plan(store)
@@ -1140,8 +1378,8 @@ def test_v2_direct_terminal_flip_and_legacy_setter_are_blocked_but_v1_works(tmp_
             )
         )
     assert store.mark_completed_verified("bp_proof") is False
-    assert store.mark_completed_verified("bp_legacy") is True
-    assert store.get_plan("bp_legacy")["state"] == PlanState.COMPLETED_VERIFIED
+    assert store.mark_completed_verified("bp_legacy") is False
+    assert store.get_plan("bp_legacy")["state"] == PlanState.COMPLETED_UNVERIFIED
 
 
 def test_protocol2_legacy_atomic_claim_and_state_only_running_transition_are_blocked(
@@ -1200,6 +1438,81 @@ def test_protocol2_async_terminal_is_redacted_advisory_and_requires_recapture(tm
     ).hexdigest()
 
 
+def _auto_live_review_pass(store, *, plan_id="bp_proof", integration_oid="a" * 40):
+    from agent.review_engine import ReviewStore, ReviewTarget
+
+    row = store.get_plan(plan_id)
+    target = ReviewTarget.bestplan_integration(
+        plan_id=plan_id,
+        generation=0,
+        base_oid=row["baseline_revision"],
+        local_target_oid=row["baseline_revision"],
+        integration_oid=integration_oid,
+        integration_tree_oid=integration_oid,
+        integration_ref=f"refs/hermes-bestplan-integrations/{plan_id}/0",
+        integration_receipt_digest="1" * 64,
+        check_receipt_digest="2" * 64,
+        approval_digest=row["approval_digest"],
+        contract_digest=row["promotion_contract_digest"],
+        diff_sha256="3" * 64,
+        acceptance_digest="4" * 64,
+        policy_digest="5" * 64,
+    )
+    review_store = ReviewStore(store.state_db_path)
+    job_id = f"auto-live-review-{plan_id}"
+    review_store.create_job(
+        job_id=job_id,
+        source_kind=target.source_kind,
+        source_id=target.plan_id,
+        target_digest=target.target_digest,
+        policy_digest=target.policy_digest,
+        integration_oid=target.integration_oid,
+        check_receipt_digest=target.check_receipt_digest,
+    )
+    claim = review_store.claim_job(
+        job_id=job_id,
+        owner_id="review-worker",
+        now_ns=time.time_ns(),
+        lease_duration_ns=60_000_000_000,
+        expected_fencing_token=0,
+    )
+    review_store.begin_generation(
+        job_id=job_id,
+        generation=target.generation,
+        target=target,
+        owner_id=claim.owner_id,
+        fencing_token=claim.fencing_token,
+        operation_id="generation-0",
+    )
+    for slot in ("smart_reviewer", "code_worker"):
+        review_store.record_reviewer_receipt(
+            job_id=job_id,
+            generation=target.generation,
+            slot=slot,
+            target_digest=target.target_digest,
+            integration_oid=target.integration_oid,
+            output_digest=hashlib.sha256(f"output-{slot}".encode()).hexdigest(),
+            verdict_digest=hashlib.sha256(f"verdict-{slot}".encode()).hexdigest(),
+            passed=True,
+            owner_id=claim.owner_id,
+            fencing_token=claim.fencing_token,
+            operation_id=f"receipt-{slot}",
+        )
+    receipt_digest = hashlib.sha256(target.canonical_json.encode()).hexdigest()
+    review_store.record_generation_pass(
+        job_id=job_id,
+        generation=target.generation,
+        target_digest=target.target_digest,
+        integration_oid=target.integration_oid,
+        check_receipt_digest=target.check_receipt_digest,
+        review_receipt_digest=receipt_digest,
+        owner_id=claim.owner_id,
+        fencing_token=claim.fencing_token,
+        operation_id="pass-0",
+    )
+    return review_store, target, claim
+
+
 def _advance_to_remote(proof, ledger, *, ensure_candidate: bool = True):
     previous = None
     for number, phase in enumerate(
@@ -1214,6 +1527,8 @@ def _advance_to_remote(proof, ledger, *, ensure_candidate: bool = True):
         ),
         start=1,
     ):
+        if phase == "review_verified":
+            _auto_live_review_pass(ledger.store)
         previous = _append(
             ledger,
             operation=number,
@@ -2170,6 +2485,37 @@ def test_complete_verified_requires_fresh_external_verification_and_exact_bindin
     assert row["verification_receipt_digest"] == verification.receipt_digest
     assert row["proof_event_seq"] == event.event_seq
     assert row["proof_event_hash"] == event.event_hash
+
+
+def test_complete_verified_rejects_chain_after_exact_review_pass_is_canceled(tmp_path):
+    from agent.review_engine import ReviewStore
+
+    proof = _proof()
+    store = _store(tmp_path / "completion-review-pass-required.db")
+    _insert_v2_plan(store)
+    verification, _event = _authority_event(proof, store)
+    ledger = proof.ProofLedger(store)
+    review_store = ReviewStore(store.state_db_path)
+    job = review_store.get_job("auto-live-review-bp_proof")
+    review_store.request_cancel(
+        job_id=job.job_id,
+        owner_id=job.owner_id,
+        fencing_token=job.fencing_token,
+        operation_id="cancel-before-completion",
+        signal_children=lambda: None,
+    )
+
+    with pytest.raises(proof.ProofValidationError, match="review pass"):
+        ledger.complete_verified(
+            "bp_proof",
+            verification,
+            verifier=lambda *_args: True,
+            now_ns=13_000_000_000,
+        )
+
+    row = store.get_plan("bp_proof")
+    assert row["state"] == PlanState.COMPLETED_UNVERIFIED
+    assert row["verified_at"] is None
 
 
 def test_authority_verification_rejects_extra_top_level_plaintext(tmp_path):

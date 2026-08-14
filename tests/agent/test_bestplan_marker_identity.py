@@ -75,6 +75,7 @@ def test_explicit_bestplan_config_dispatches_without_a_text_marker(monkeypatch):
     from agent import bestplan_orchestrator, conversation_loop, turn_finalizer
 
     captured = {}
+    agent = SimpleNamespace()
 
     def fake_build(_agent, message, *_args, **_kwargs):
         captured["decoded_message"] = message
@@ -88,6 +89,7 @@ def test_explicit_bestplan_config_dispatches_without_a_text_marker(monkeypatch):
             "run_id": "run-1",
             "body": "plan body",
             "final_response": "final plan",
+            "bestplan_receipt_metadata": {"host": "receipt"},
         }
 
     monkeypatch.setattr(conversation_loop, "build_turn_context", fake_build)
@@ -99,7 +101,7 @@ def test_explicit_bestplan_config_dispatches_without_a_text_marker(monkeypatch):
     )
 
     result = conversation_loop._run_conversation(
-        SimpleNamespace(),
+        agent,
         "inspect it",
         bestplan_config={"count": 4},
     )
@@ -109,6 +111,68 @@ def test_explicit_bestplan_config_dispatches_without_a_text_marker(monkeypatch):
     assert captured["kwargs"]["count"] == 4
     assert set(captured["kwargs"]) == {"count", "conversation_history"}
     assert result["final_response"] == "final plan"
+    assert agent._bestplan_receipt_metadata == {"host": "receipt"}
+
+
+def test_failed_bestplan_branch_uses_host_failure_summary(monkeypatch):
+    from agent import bestplan_orchestrator, conversation_loop, turn_finalizer
+
+    agent = SimpleNamespace()
+
+    def fake_build(_agent, message, *_args, **_kwargs):
+        return _turn_context(message)
+
+    metadata = {
+        "attempts": [
+            {
+                "configured": {"model": "deepseek-model", "provider": "novita"},
+                "resolved": {"model": "deepseek-model", "provider": "novita"},
+                "status": "success",
+                "reason_code": None,
+            },
+            {
+                "configured": {"model": "sol-model", "provider": "openai-codex"},
+                "resolved": {"model": "sol-model", "provider": "openai-codex"},
+                "status": "failed",
+                "reason_code": "provider_error",
+            },
+        ],
+        "synthesizer": {
+            "configured": {"model": "sol-model", "provider": "openai-codex"},
+            "status": "not_started",
+            "reason_code": "quorum_unavailable",
+        },
+    }
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", fake_build)
+    monkeypatch.setattr(
+        bestplan_orchestrator,
+        "run_bestplan",
+        lambda *_args, **_kwargs: {
+            "status": "failed",
+            "error": "BestPlan explorer quorum unavailable",
+            "reason_code": "quorum_unavailable",
+            "successes": 1,
+            "quorum": 2,
+            "bestplan_receipt_metadata": metadata,
+        },
+    )
+    monkeypatch.setattr(
+        turn_finalizer,
+        "finalize_turn",
+        lambda _agent, **kwargs: kwargs,
+    )
+
+    result = conversation_loop._run_conversation(
+        agent,
+        "inspect it",
+        bestplan_config={"count": 2},
+    )
+
+    assert "1 of 2 were usable; at least 2 were needed" in result["final_response"]
+    assert "DeepSeek Model" in result["final_response"]
+    assert "Sol Model" in result["final_response"]
+    assert "No plan was created or executed." in result["final_response"]
 
 
 @pytest.mark.parametrize(

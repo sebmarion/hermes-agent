@@ -529,6 +529,7 @@ def test_bare_go_builds_local_runtime_and_hands_exact_local_batch_to_dispatcher(
     local_runtime = SimpleNamespace(candidate_runtime=object())
     runtime_calls = []
     authority_calls = []
+    review_authority_calls = []
     dispatched = {}
 
     def build_runtime(**kwargs):
@@ -539,8 +540,17 @@ def test_bare_go_builds_local_runtime_and_hands_exact_local_batch_to_dispatcher(
         authority_calls.append(runtimes)
         return ("authority-binding",)
 
+    def build_review_authorities(runtimes):
+        review_authority_calls.append(runtimes)
+        return ("smart-review-binding", "code-review-binding")
+
     monkeypatch.setattr(bestplan_local, "build_local_execution_runtime", build_runtime)
     monkeypatch.setattr(bestplan_local, "build_local_authority_bindings", build_authorities)
+    monkeypatch.setattr(
+        bestplan_local,
+        "build_local_review_authority_bindings",
+        build_review_authorities,
+    )
     monkeypatch.setattr(
         delegate_tool,
         "_validate_bestplan_host_runtime",
@@ -564,6 +574,26 @@ def test_bare_go_builds_local_runtime_and_hands_exact_local_batch_to_dispatcher(
         "api_mode": "chat_completions",
         "runtime_fingerprint": "a" * 64,
     }
+    review_runtimes = [
+        {
+            "route": "smart_reviewer",
+            "provider": "anthropic",
+            "model": "claude-review",
+        },
+        {
+            "route": "code_worker",
+            "provider": "openai",
+            "model": "gpt-review",
+        },
+    ]
+
+    def resolve_runtimes(tasks, _parent):
+        routes = [task["route"] for task in tasks]
+        if routes == ["smart_reviewer", "code_worker"]:
+            assert all(task["_bestplan_read_only"] is True for task in tasks)
+            assert all(task["_bestplan_leases"] == [] for task in tasks)
+            return [dict(item) for item in review_runtimes]
+        return [dict(raw_runtime)]
 
     def strict_dispatcher(**kwargs):
         dispatched.update(kwargs)
@@ -577,7 +607,7 @@ def test_bare_go_builds_local_runtime_and_hands_exact_local_batch_to_dispatcher(
         baseline_fingerprint=snapshot.fingerprint,
         parent_agent=SimpleNamespace(),
         store=store,
-        runtime_resolver=lambda _tasks, _parent: [dict(raw_runtime)],
+        runtime_resolver=resolve_runtimes,
         strict_dispatcher=strict_dispatcher,
     )
 
@@ -586,6 +616,7 @@ def test_bare_go_builds_local_runtime_and_hands_exact_local_batch_to_dispatcher(
     assert runtime_calls[0]["plan_id"] == captured.plan_id
     assert runtime_calls[0]["snapshot"] == snapshot
     assert authority_calls == [[raw_runtime]]
+    assert review_authority_calls == [review_runtimes]
     assert dispatched["promotion_mode"] == "local_main"
     assert dispatched["execution_plan"].to_manifest() == _manifest(
         snapshot.repo.workspace
@@ -594,6 +625,10 @@ def test_bare_go_builds_local_runtime_and_hands_exact_local_batch_to_dispatcher(
     assert dispatched["candidate_host_runtime"] is local_runtime.candidate_runtime
     assert dispatched["authority_client"] is None
     assert dispatched["authority_bindings"] == ("authority-binding",)
+    assert dispatched["review_authority_bindings"] == (
+        "smart-review-binding",
+        "code-review-binding",
+    )
     stored = store.get_plan(captured.plan_id)["resolved_runtime_json"]
     assert "host-only-secret" not in stored
 

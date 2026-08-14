@@ -5430,6 +5430,8 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_message"] = ctx.message
             if ctx.moa_config is not None:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
+            if ctx.review_config is not None:
+                _conversation_kwargs["review_config"] = ctx.review_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
             # BestPlan is executable only on its dedicated, capability-bound
@@ -5441,18 +5443,19 @@ class TurnRunner:
                 # Autonomy planning is shadow-only at gateway ingress. It is
                 # deliberately fail-open and asynchronous: the normal model
                 # turn remains the authoritative execution path.
-                try:
-                    from agent.autonomy_shadow import submit_shadow_observation
+                if ctx.review_config is None:
+                    try:
+                        from agent.autonomy_shadow import submit_shadow_observation
 
-                    submit_shadow_observation(
-                        ctx.message,
-                        session_id=ctx.session_id,
-                        source=f"gateway:{source.platform}",
-                        workspace=os.getcwd(),
-                        parent_agent=agent,
-                    )
-                except Exception as _shadow_exc:
-                    logger.debug("autonomy ingress failed open: %s", _shadow_exc)
+                        submit_shadow_observation(
+                            ctx.message,
+                            session_id=ctx.session_id,
+                            source=f"gateway:{source.platform}",
+                            workspace=os.getcwd(),
+                            parent_agent=agent,
+                        )
+                    except Exception as _shadow_exc:
+                        logger.debug("autonomy ingress failed open: %s", _shadow_exc)
                 return agent.run_conversation(_api_run_message, **_conversation_kwargs)
 
             result = run_planning_only_bestplan_turn(
@@ -15425,6 +15428,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "subgoal":
             return await self._handle_subgoal_command(event)
 
+        if canonical == "review":
+            # Review authority is host-owned. Keep the user's raw command on
+            # the event for persistence, but carry the parsed scope through a
+            # separate trusted channel and suppress plugin/skill expansion.
+            event._review_config = {
+                "scope": (event.get_command_args() or "").strip(),
+            }
+            command = None
+
         if canonical == "bestplan":
             bestplan_reply = await self._handle_bestplan_command(event)
             if bestplan_reply:
@@ -17590,6 +17602,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
+                **(
+                    {"review_config": getattr(event, "_review_config")}
+                    if getattr(event, "_review_config", None) is not None
+                    else {}
+                ),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
@@ -18719,22 +18736,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_bestplan_command(self, event: MessageEvent) -> str:
         """Handle /bestplan in the gateway.
 
-        If args provided: keep /bestplan with those args for skill expansion.
-        If no args: auto-review the previous plan in the conversation.
+        If args are present, keep /bestplan for host-aware skill expansion.
+        A bare command is invalid because BestPlan requires an implementation
+        task; manual review is owned by /review.
         """
         args = (event.get_command_args() or "").strip()
 
         if not args:
-            # No args - auto-review previous plan in conversation
-            # We'll rewrite the event text to trigger a plan review
-            from agent.bestplan_orchestrator import DEFAULT_EXPLORER_COUNT
-
-            event.text = (
-                f"/bestplan {DEFAULT_EXPLORER_COUNT} "
-                "adversarial review of the previous plan in this conversation"
+            return (
+                "BestPlan unavailable: provide a task, or use /review "
+                "for manual review."
             )
-            # Fall through to agent processing
-            return ""
 
         # Keep the slash form so the shared skill dispatcher below recognizes
         # and expands it before the planning-only gateway model turn.
@@ -24184,6 +24196,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
+        review_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
@@ -24203,6 +24216,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
+                review_config=review_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
@@ -24215,6 +24229,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
+                review_config=review_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
@@ -24337,6 +24352,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
+        review_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
@@ -24354,7 +24370,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Supports interruption via new messages.
         """
         # ---- Proxy mode: delegate to remote API server ----
-        if self._get_proxy_url():
+        if self._get_proxy_url() and review_config is None:
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -24622,6 +24638,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
             moa_config=moa_config,
+            review_config=review_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
         )

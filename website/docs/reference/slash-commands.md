@@ -55,6 +55,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/subgoal <text>` | Append a user-supplied criterion to the active goal mid-loop. The continuation prompt surfaces all subgoals to the agent verbatim, and the judge factors them into its DONE/CONTINUE verdict — so the goal isn't marked done until the original goal **and** every subgoal are met. Subcommands: `/subgoal` (list), `/subgoal remove <N>`, `/subgoal clear`. Requires an active `/goal`. |
 | `/heartbeat every <interval> <prompt>` (alias: `/hb`) | Set a recurring prompt that re-enters **this session** as a normal user turn whenever it's idle and the interval has elapsed (min 60s; missed ticks coalesce). Subcommands: `/heartbeat status`, `/heartbeat pause`, `/heartbeat resume`, `/heartbeat clear`. Session-scoped and in-process — use `hermes cron` for durable isolated schedules. See [Session Heartbeats](/user-guide/features/heartbeat). |
 | `/refine [focus]` | Run the background memory/skill self-improvement review **now** instead of waiting for the automatic post-turn trigger. Optional focus text steers the review (e.g. `/refine save the deploy workflow as a skill`). Runs in a background fork against a conversation snapshot — the live session and prompt cache are untouched; results are reported when done. |
+| `/review [scope]` | Review the current objective artifact with the host review engine. Hermes uses two distinct reviewer model families. Critical and high findings enter the same scoped repair, check, and fresh-review loop used by BestPlan. The command never expands the legacy review skill. |
 | `/moa <prompt>` | Run a single prompt through the default [Mixture of Agents](/user-guide/features/mixture-of-agents) preset, then restore your current model. One-shot — does not change your session model. |
 | `/resume [name]` | Resume a previously-named session |
 | `/sessions` (TUI alias: `/switch`) | Classic CLI: browse and resume previous sessions in an interactive picker. TUI: open the live session switcher for currently open TUI sessions. Use `/sessions new` in the TUI to start another live session immediately. |
@@ -152,10 +153,16 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 
 #### Executing an approved `/bestplan` with `go`
 
-`/bestplan` remains an installed dynamic skill rather than a built-in command. A
-bestplan response is executable only when it contains the validated
-`HERMES_BESTPLAN_V1` machine envelope emitted by that skill. After reviewing
-such a plan, a bare `go` atomically claims the one plan bound to the current
+`/bestplan <task>` is a host-owned planning command. A BestPlan response is
+executable only when it contains a validated `HERMES_BESTPLAN_V1` machine
+envelope. The human response shows an executive brief: the decision, risk,
+proposed action, what will not change, the success condition, a short planning
+model summary, and one executable receipt ID. Internal planning terms, raw
+acceptance commands, workspace paths, the envelope, receipt JSON, and validated
+execution contract remain host-owned and are not shown in the human response.
+Bare `/bestplan` is rejected; use `/review` for a manual review of the current
+objective artifact. After inspecting a plan, a bare `go` atomically
+claims the one plan bound to the current
 session, profile, workspace, and Git baseline. Hermes runs the approved slices,
 combines their commits, and runs the exact pytest nodes shown in the approval.
 Each writable slice must include at least one acceptance entry in this strict,
@@ -167,20 +174,32 @@ pytest -q -- tests/path/test_file.py::test_name
 
 Missing, unsafe, or prose-only acceptance checks make the plan planning-only.
 Hermes proves that the exact approved checks passed; it does not claim that the
-selected tests cover every possible defect.
+selected tests cover every possible defect. It then sends the exact frozen
+integration to two read-only reviewer lanes from distinct model families. The
+reviewers receive no tools or write authority. If either reviewer reports a
+validated critical or high finding, Hermes repairs only the approved paths,
+freezes a new integration, reruns every approved check, and reviews the new
+target. This loop has no review-round limit. A provider outage or per-attempt
+timeout leaves the job waiting for automatic recovery; it never becomes an
+approval.
 
-After the checks pass, Hermes fast-forwards the checked-out local `main` to the
-exact checked integration commit. It does not push. Hermes then asks `push` or
-`no`. Bare `no` leaves local `main` ahead of its remote. Bare `push` performs one
-normal non-force push to the configured remote for `main` and verifies the
+Only the latest exact target with both passing reviewer receipts can cross the
+landing gate. Hermes then fast-forwards the checked-out local `main` to that
+checked and reviewed integration commit. It does not push. Hermes asks `push`
+or `no`. Bare `no` leaves local `main` ahead of its remote. Bare `push` performs
+one normal non-force push to the configured remote for `main` and verifies the
 remote commit.
 
 If Hermes restarts before that answer, resume the same CLI session. A new,
 unrelated session cannot consume the pending `push` or `no` decision.
 
-The executable host ingress is supported by the classic CLI only. The
-TUI/desktop, WebUI, and messaging gateway keep `/bestplan` planning-only and
-reject a plan-bound bare `go` before it reaches the model. An unrelated bare
+The executable local-main ingress is supported by the classic CLI and WebUI.
+The TUI/desktop and messaging gateway keep `/bestplan` planning-only, remove
+executable authority from its response, and reject a plan-bound bare `go`
+before it reaches the model. BestPlan accepts implementation tasks only; use
+`/review` for review-only work. Local-execution hosts also reject older
+unstarted plans in the same visible session, profile, and workspace, so bare
+`go` cannot dispatch hidden prior authority. An unrelated bare
 `go` with no pending BestPlan remains an ordinary model turn.
 
 V1 execution also requires an enforceable host filesystem sandbox. macOS uses

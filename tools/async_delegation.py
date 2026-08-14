@@ -37,8 +37,10 @@ logic stays in one place.
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import os
+import queue
 import sqlite3
 import tempfile
 import threading
@@ -49,7 +51,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
 
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
@@ -86,6 +88,9 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _ACTIVE_STATUSES = frozenset({
     "scheduled", "running", "stalling", "interrupting", "finalizing",
 })
+_DURABLE_NONTERMINAL_STATUSES = frozenset({
+    "review_waiting", "review_requeued",
+})
 _STATUS_PHASE = {
     "intent": 0,
     "scheduled": 1,
@@ -93,6 +98,9 @@ _STATUS_PHASE = {
     "stalling": 3,
     "interrupting": 4,
     "finalizing": 5,
+    "review_waiting": 6,
+    "review_requeued": 6,
+    "interrupted": 7,
 }
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
@@ -118,6 +126,30 @@ _recovery_attempted = False
 _replayed_persisted_ids: set[tuple[str, str]] = set()
 _PERSISTENCE_VERSION = 1
 _BESTPLAN_TERMINALIZATION_PENDING = "bestplan_terminalization_pending"
+_OWNED_REVIEW_RECOVERY_QUEUE = object()
+_bestplan_review_recovery_queue: queue.Queue = queue.Queue()
+_bestplan_review_recovery_wake = threading.Event()
+_bestplan_review_recovery_thread: threading.Thread | None = None
+_bestplan_review_recovery_thread_lock = threading.Lock()
+_manual_review_recovery_queue: queue.Queue = queue.Queue()
+_manual_review_recovery_wake = threading.Event()
+_manual_review_recovery_thread: threading.Thread | None = None
+_manual_review_recovery_thread_lock = threading.Lock()
+_manual_review_recovery_pending: set[tuple[str, str]] = set()
+_manual_review_recovery_pending_lock = threading.Lock()
+
+
+def _is_retained_nonterminal(
+    record: Mapping[str, Any], *, status: object | None = None,
+) -> bool:
+    """Keep every durable work phase out of terminal retention cleanup."""
+
+    phase = str(record.get("status") if status is None else status)
+    return bool(
+        phase == "intent"
+        or phase in _ACTIVE_STATUSES
+        or phase in _DURABLE_NONTERMINAL_STATUSES
+    )
 # Lightweight liveness ping for status consumers (/agents, TUI/Desktop
 # delegation.status). Completion delivery still rides the shared process queue;
 # this heartbeat only proves that the async-delegation supervisor in this
@@ -399,7 +431,7 @@ def _prune_completed_locked() -> None:
     completed = [
         (rid, r)
         for rid, r in _records.items()
-        if r.get("status") not in _ACTIVE_STATUSES
+        if not _is_retained_nonterminal(r)
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -866,7 +898,7 @@ def _cleanup_persisted_data_locked(data: Dict[str, Any], *, now: float) -> int:
         record = entry.get("record") if isinstance(entry.get("record"), dict) else entry
         status = str(entry.get("status") or record.get("status") or "")
         delivery_status = str(entry.get("delivery_status") or "")
-        if status in _ACTIVE_STATUSES:
+        if _is_retained_nonterminal(record, status=status):
             continue
         if record.get(_BESTPLAN_TERMINALIZATION_PENDING) is True:
             continue
@@ -887,7 +919,7 @@ def _cleanup_persisted_data_locked(data: Dict[str, Any], *, now: float) -> int:
         if not isinstance(entry, dict):
             continue
         record = entry.get("record") if isinstance(entry.get("record"), dict) else entry
-        if record.get("status") in _ACTIVE_STATUSES:
+        if _is_retained_nonterminal(record):
             continue
         if record.get(_BESTPLAN_TERMINALIZATION_PENDING) is True:
             continue
@@ -947,7 +979,13 @@ def _persist_record(
                 incoming_status = str(record.get("status") or "")
                 existing_phase = _STATUS_PHASE.get(existing_status, 4)
                 incoming_phase = _STATUS_PHASE.get(incoming_status, 4)
-                if incoming_phase < existing_phase:
+                operator_cancel_advance = bool(
+                    incoming_status == "interrupting"
+                    and existing_status in _DURABLE_NONTERMINAL_STATUSES
+                    and record.get("interrupt_requested_at") is not None
+                    and record.get("bestplan_local_execution") is True
+                )
+                if incoming_phase < existing_phase and not operator_cancel_advance:
                     logger.warning(
                         "Rejected stale async checkpoint %s: %s -> %s",
                         delegation_id,
@@ -1310,21 +1348,504 @@ def _event_for_lost_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return event
 
 
+def _event_for_interrupted_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Build terminal evidence for a cancellation completed after restart."""
+
+    event = _event_for_lost_record(record)
+    result = dict(event["result"])
+    result.update({
+        "status": "interrupted",
+        "summary": "Async delegation was interrupted after child extinction.",
+        "error": "interrupted after child extinction",
+        "exit_reason": "interrupted",
+    })
+    event.update({
+        "result": result,
+        "status": "interrupted",
+        "summary": result["summary"],
+        "error": result["error"],
+    })
+    return event
+
+
+def _bestplan_review_resume_request(
+    record: Dict[str, Any],
+    *,
+    tracker_path: str | Path | None = None,
+    cancel_finalize_only: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Rebuild a non-secret review handoff from durable store identity."""
+
+    if (
+        record.get("bestplan_local_execution") is not True
+        or not record.get("bestplan_plan_id")
+        or not record.get("bestplan_review_job_id")
+    ):
+        return None
+    try:
+        state_db_path = _canonical_bestplan_state_db_path(
+            record.get("bestplan_state_db_path")
+        )
+        if not state_db_path or not Path(state_db_path).is_file():
+            return None
+        from agent.review_engine import ReviewStore, ReviewValidationError
+
+        job_id = str(record["bestplan_review_job_id"])
+        store = ReviewStore(state_db_path)
+        try:
+            job = store.get_job(job_id)
+        except ReviewValidationError:
+            pipeline = store.get_execution_pipeline(
+                str(record.get("bestplan_plan_id") or "")
+            )
+            plan_id = str(record.get("bestplan_plan_id") or "")
+            session_id = str(record.get("origin_session_id") or "")
+            profile = str(record.get("origin_profile") or "")
+            pipeline_is_eligible = (
+                pipeline.cancel_requested
+                and pipeline.state in {"cancel_requested", "cancelled"}
+                if cancel_finalize_only
+                else pipeline.state == "pending" and not pipeline.cancel_requested
+            )
+            if (
+                not pipeline_is_eligible
+                or pipeline.delegation_id
+                != str(record.get("delegation_id") or "")
+                or pipeline.job_id != job_id
+                or pipeline.owner_session_id != session_id
+                or pipeline.owner_profile != profile
+                or not pipeline.workspace
+            ):
+                return None
+            request: Dict[str, Any] = {
+                "kind": "bestplan_execution_resume",
+                "delegation_id": pipeline.delegation_id,
+                "job_id": pipeline.job_id,
+                "plan_id": plan_id,
+                "state_db_path": state_db_path,
+                "tracker_path": str(_persistence_path(tracker_path)),
+                "adapter_version": pipeline.adapter_version,
+                "session_id": session_id,
+                "profile": profile,
+                "workspace": pipeline.workspace,
+            }
+            if cancel_finalize_only:
+                request["_cancel_finalize_only"] = True
+            return request
+    except Exception:
+        logger.debug("BestPlan review recovery identity is invalid", exc_info=True)
+        return None
+    plan_id = str(record.get("bestplan_plan_id") or "")
+    session_id = str(record.get("origin_session_id") or "")
+    profile = str(record.get("origin_profile") or "")
+    if (
+        not job.adapter_version
+        or job.source_kind != "bestplan_integration"
+        or job.source_id != plan_id
+        or job.owner_session_id != session_id
+        or job.owner_profile != profile
+        or not job.workspace
+        or (
+            cancel_finalize_only
+            and not (job.cancel_requested or job.state == "cancelled")
+        )
+    ):
+        return None
+    request = {
+        "kind": "bestplan_review_resume",
+        "delegation_id": str(record.get("delegation_id") or ""),
+        "job_id": job.job_id,
+        "plan_id": plan_id,
+        "state_db_path": state_db_path,
+        "tracker_path": str(_persistence_path(tracker_path)),
+        "adapter_version": job.adapter_version,
+        "session_id": session_id,
+        "profile": profile,
+        "workspace": job.workspace,
+    }
+    if cancel_finalize_only:
+        request["_cancel_finalize_only"] = True
+    return request
+
+
+def enqueue_bestplan_review_job(
+    *,
+    state_db_path: str,
+    job_id: str,
+) -> bool:
+    """Queue one exact durable BestPlan review after a manual attachment."""
+
+    try:
+        canonical_state_db_path = _canonical_bestplan_state_db_path(
+            state_db_path
+        )
+    except ValueError:
+        return False
+    if (
+        not canonical_state_db_path
+        or not Path(canonical_state_db_path).is_file()
+        or not isinstance(job_id, str)
+        or not job_id
+        or len(job_id) > 256
+        or any(
+            ord(character) < 0x20 or ord(character) == 0x7F
+            for character in job_id
+        )
+    ):
+        return False
+
+    with _records_lock:
+        matches: list[tuple[str, Dict[str, Any]]] = []
+        for delegation_id, candidate in _records.items():
+            if (
+                not isinstance(candidate, dict)
+                or candidate.get("bestplan_local_execution") is not True
+                or candidate.get("bestplan_review_job_id") != job_id
+            ):
+                continue
+            try:
+                candidate_state_db_path = _canonical_bestplan_state_db_path(
+                    candidate.get("bestplan_state_db_path")
+                )
+            except ValueError:
+                continue
+            if candidate_state_db_path == canonical_state_db_path:
+                matches.append((delegation_id, candidate))
+        if len(matches) != 1:
+            return False
+        delegation_id, live = matches[0]
+        if live.get("status") not in {
+            "running",
+            "stalling",
+            "interrupting",
+            "review_waiting",
+            "review_requeued",
+        }:
+            return False
+        if live.get("_bestplan_review_enqueue_token"):
+            return False
+        if _durable_review_cancelled(live):
+            return False
+        tracker_path = str(live.get("origin_tracker_path") or "")
+        request = _bestplan_review_resume_request(
+            live,
+            tracker_path=tracker_path or None,
+        )
+        if (
+            request is None
+            or request.get("kind") != "bestplan_review_resume"
+            or request.get("delegation_id") != delegation_id
+            or request.get("job_id") != job_id
+            or request.get("state_db_path") != canonical_state_db_path
+        ):
+            return False
+        if live.get("status") == "review_requeued":
+            return True
+        enqueue_token = uuid.uuid4().hex
+        live["_bestplan_review_enqueue_token"] = enqueue_token
+        prior_status = str(live.get("status") or "")
+        snapshot = dict(live)
+        snapshot.pop("_bestplan_review_enqueue_token", None)
+        snapshot["status"] = "review_requeued"
+        snapshot["delivery_status"] = "review_requeued"
+        snapshot["review_recovery_reason_code"] = "manual_attachment"
+        snapshot["review_recovery_requested_at"] = time.time()
+        snapshot.pop("completed_at", None)
+
+    if not _persist_record(snapshot, delivery_status="review_requeued"):
+        with _records_lock:
+            current = _records.get(delegation_id)
+            if (
+                current is live
+                and current.get("_bestplan_review_enqueue_token")
+                == enqueue_token
+            ):
+                current.pop("_bestplan_review_enqueue_token", None)
+        return False
+
+    with _records_lock:
+        current = _records.get(delegation_id)
+        if (
+            current is not live
+            or current.get("_bestplan_review_enqueue_token") != enqueue_token
+            or str(current.get("status") or "") != prior_status
+            or current.get("bestplan_review_job_id") != job_id
+        ):
+            if current is live:
+                current.pop("_bestplan_review_enqueue_token", None)
+            return False
+        current.pop("_bestplan_review_enqueue_token", None)
+        current.update(
+            {
+                "status": "review_requeued",
+                "delivery_status": "review_requeued",
+                "review_recovery_reason_code": "manual_attachment",
+                "review_recovery_requested_at": snapshot[
+                    "review_recovery_requested_at"
+                ],
+                "interrupt_fn": None,
+            }
+        )
+        current.pop("completed_at", None)
+        heartbeat_stop = current.get("heartbeat_stop")
+        if hasattr(heartbeat_stop, "set"):
+            heartbeat_stop.set()
+
+    _bestplan_review_recovery_queue.put(request)
+    _start_bestplan_review_recovery_consumer()
+    return True
+
+
+def _execution_pipeline_matches_tracker_identity(
+    pipeline: object,
+    record: Mapping[str, Any],
+    *,
+    state_path: str,
+) -> bool:
+    """Bind a pre-review pipeline to its canonical plan and tracker."""
+
+    plan_id = str(record.get("bestplan_plan_id") or "")
+    delegation_id = str(record.get("delegation_id") or "")
+    job_id = str(record.get("bestplan_review_job_id") or "")
+    session_id = str(record.get("origin_session_id") or "")
+    raw_profile = record.get("origin_profile")
+    if not isinstance(raw_profile, str):
+        return False
+    profile = raw_profile
+    raw_tracker_path = str(record.get("origin_tracker_path") or "")
+    if not all(
+        (
+            plan_id,
+            delegation_id,
+            job_id,
+            session_id,
+            raw_tracker_path,
+        )
+    ):
+        return False
+    try:
+        state_db = Path(state_path)
+        tracker = Path(raw_tracker_path)
+        canonical_tracker = tracker.resolve(strict=False)
+        expected_tracker = state_db.parent / "async_delegations.json"
+        if (
+            not state_db.is_file()
+            or not tracker.is_absolute()
+            or str(canonical_tracker) != raw_tracker_path
+            or canonical_tracker != expected_tracker
+        ):
+            return False
+        connection = sqlite3.connect(
+            f"{state_db.as_uri()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            plan_row = connection.execute(
+                "SELECT plan_id, session_id, profile, workspace "
+                "FROM bestplan_plans WHERE plan_id=?",
+                (plan_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, RuntimeError, sqlite3.Error, ValueError):
+        return False
+    if plan_row is None:
+        return False
+    workspace = str(plan_row["workspace"] or "")
+    return bool(
+        getattr(pipeline, "plan_id", None) == plan_id
+        and getattr(pipeline, "delegation_id", None) == delegation_id
+        and getattr(pipeline, "job_id", None) == job_id
+        and getattr(pipeline, "owner_session_id", None)
+        == plan_row["session_id"]
+        == session_id
+        and getattr(pipeline, "owner_profile", None)
+        == plan_row["profile"]
+        == profile
+        and bool(workspace)
+        and getattr(pipeline, "workspace", None) == workspace
+    )
+
+
+def _durable_review_cancelled(record: Mapping[str, Any]) -> bool:
+    """Read the durable cancellation bit before any recovery handoff."""
+
+    if record.get("bestplan_local_execution") is not True:
+        return False
+    try:
+        state_path = _canonical_bestplan_state_db_path(
+            record.get("bestplan_state_db_path")
+        )
+        job_id = str(record.get("bestplan_review_job_id") or "")
+        if not state_path or not job_id:
+            return False
+        from agent.review_engine import ReviewStore, ReviewValidationError
+
+        store = ReviewStore(state_path)
+        try:
+            job = store.get_job(job_id)
+        except ReviewValidationError:
+            pipeline = store.get_execution_pipeline(
+                str(record.get("bestplan_plan_id") or "")
+            )
+            if not _execution_pipeline_matches_tracker_identity(
+                pipeline,
+                record,
+                state_path=state_path,
+            ):
+                return False
+            return bool(
+                pipeline.cancel_requested or pipeline.state == "cancelled"
+            )
+        return bool(
+            job.cancel_requested
+            or job.state in {"cancel_requested", "cancelled"}
+        )
+    except Exception:
+        return False
+
+
+def _finalize_durable_review_cancel(
+    record: Mapping[str, Any],
+) -> bool:
+    """Finalize only after the caller proves its child action has unwound."""
+
+    if record.get("bestplan_local_execution") is not True:
+        return False
+    try:
+        state_path = _canonical_bestplan_state_db_path(
+            record.get("bestplan_state_db_path")
+        )
+        job_id = str(record.get("bestplan_review_job_id") or "")
+        if not state_path or not job_id:
+            return False
+        from agent.review_engine import ReviewStore, ReviewValidationError
+
+        store = ReviewStore(state_path)
+        try:
+            job = store.get_job(job_id)
+        except ReviewValidationError:
+            pipeline = store.get_execution_pipeline(
+                str(record.get("bestplan_plan_id") or "")
+            )
+            if not _execution_pipeline_matches_tracker_identity(
+                pipeline,
+                record,
+                state_path=state_path,
+            ):
+                return False
+            if pipeline.state == "cancelled" and pipeline.cancel_requested:
+                return True
+            if (
+                pipeline.state != "cancel_requested"
+                or not pipeline.cancel_requested
+            ):
+                return False
+            store.finalize_execution_pipeline_cancel(
+                plan_id=pipeline.plan_id,
+                delegation_id=str(record.get("delegation_id") or ""),
+                job_id=job_id,
+            )
+            return True
+        if job.state == "cancelled":
+            return True
+        if (
+            not job.cancel_requested
+            or job.state != "cancel_requested"
+            or job.owner_id is None
+            or job.lease_expires_at_ns is None
+        ):
+            return False
+        store.finalize_cancel(
+            job_id=job_id,
+            owner_id=job.owner_id,
+            fencing_token=job.fencing_token,
+            operation_id="async-cancel-finalized-" + uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{record.get('delegation_id')}:{job_id}",
+            ).hex,
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "BestPlan durable cancellation could not be finalized",
+            exc_info=True,
+        )
+        return False
+
+
+def _handoff_running_bestplan_review(
+    delegation_id: str,
+    *,
+    reason_code: str,
+) -> bool:
+    """Move one live local BestPlan failure onto its durable review rail."""
+
+    with _records_lock:
+        live = _records.get(delegation_id)
+        if (
+            live is None
+            or live.get("bestplan_local_execution") is not True
+            or live.get("status") not in {"running", "stalling", "interrupting"}
+        ):
+            return False
+        if _durable_review_cancelled(live):
+            return False
+        tracker_path = str(live.get("origin_tracker_path") or "")
+        request = _bestplan_review_resume_request(
+            live, tracker_path=tracker_path or None,
+        )
+        if request is None:
+            return False
+        live["status"] = "review_requeued"
+        live["delivery_status"] = "review_requeued"
+        live["review_recovery_reason_code"] = str(reason_code or "deferred")
+        live["review_recovery_requested_at"] = time.time()
+        live.pop("completed_at", None)
+        heartbeat_stop = live.get("heartbeat_stop")
+        if hasattr(heartbeat_stop, "set"):
+            heartbeat_stop.set()
+        live["interrupt_fn"] = None
+        snapshot = dict(live)
+    if not _persist_record(snapshot, delivery_status="review_requeued"):
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None and live.get("status") == "review_requeued":
+                live["status"] = "review_waiting"
+                live["delivery_status"] = "review_waiting"
+        return False
+    _bestplan_review_recovery_queue.put(request)
+    _start_bestplan_review_recovery_consumer()
+    return True
+
+
 def recover_async_delegations(
     tracker_path: str | Path | None = None,
     *,
     target_queue=None,
     mark_restored: bool = False,
+    review_recovery_queue=_OWNED_REVIEW_RECOVERY_QUEUE,
 ) -> Dict[str, Any]:
     """Replay undelivered completions and mark previous-process runners lost."""
     global _recovery_attempted
+    use_owned_review_queue = (
+        review_recovery_queue is _OWNED_REVIEW_RECOVERY_QUEUE
+    )
+    if use_owned_review_queue:
+        review_recovery_queue = _bestplan_review_recovery_queue
     queued = 0
     lost = 0
+    review_requeued = 0
+    review_waiting = 0
     now = time.time()
     restored_records: List[tuple[str, Dict[str, Any]]] = []
     notifications: List[
         tuple[tuple[str, str], str, Dict[str, Any], Dict[str, Any]]
     ] = []
+    review_notifications: List[tuple[str, Dict[str, str], Dict[str, Any]]] = []
+    recovered_active_records: List[tuple[str, Dict[str, Any]]] = []
     if target_queue is None:
         try:
             from tools.process_registry import process_registry
@@ -1349,6 +1870,99 @@ def recover_async_delegations(
             event = entry.get("event") if isinstance(entry.get("event"), dict) else None
             owner_liveness = _owner_liveness(record)
             lost_now = False
+            exact_local_bestplan = bool(record.get("bestplan_plan_id")) and (
+                record.get("bestplan_local_execution") is True
+            )
+            if (
+                exact_local_bestplan
+                and owner_liveness is None
+                and status in {
+                    "intent",
+                    "scheduled",
+                    "running",
+                    "interrupting",
+                    "review_waiting",
+                    "review_requeued",
+                }
+            ):
+                # Unknown is not dead: expose the exact durable work to status
+                # and stop handlers, but never replay a possibly live owner.
+                record = dict(record)
+                record["owner_liveness"] = "unknown"
+                entry["record"] = record
+                entry["updated_at"] = now
+                recovered_active_records.append((str(rid), dict(record)))
+                continue
+            if status in {"review_waiting", "review_requeued"}:
+                cancel_finalize_pending = False
+                if _durable_review_cancelled(record):
+                    # A dead process proves every process-local child is
+                    # extinct. Finalize the durable cancellation before the
+                    # tracker becomes terminal.
+                    if (
+                        _finalize_durable_review_cancel(record)
+                        and _mark_bestplan_cancelled_terminal(record)
+                    ):
+                        record = dict(record)
+                        record["status"] = "interrupted"
+                        record["delivery_status"] = "interrupted"
+                        record["completed_at"] = now
+                        entry["record"] = record
+                        entry["status"] = "interrupted"
+                        entry["delivery_status"] = "interrupted"
+                        entry["updated_at"] = now
+                        continue
+                    cancel_finalize_pending = True
+                resume_request = _bestplan_review_resume_request(
+                    record, tracker_path=tracker_path,
+                )
+                if resume_request is None and cancel_finalize_pending:
+                    resume_request = _bestplan_review_resume_request(
+                        record,
+                        tracker_path=tracker_path,
+                        cancel_finalize_only=True,
+                    )
+                if resume_request is None:
+                    if cancel_finalize_pending:
+                        record = dict(record)
+                        record["status"] = "review_waiting"
+                        record["delivery_status"] = "review_waiting"
+                        record["review_recovery_reason_code"] = (
+                            "cancel_finalize_failed"
+                        )
+                        entry["record"] = record
+                        entry["status"] = "review_waiting"
+                        entry["delivery_status"] = "review_waiting"
+                        entry.pop("event", None)
+                        entry.pop("result", None)
+                        entry["updated_at"] = now
+                        review_waiting += 1
+                        recovered_active_records.append((str(rid), dict(record)))
+                    continue
+                if review_recovery_queue is not None:
+                    if cancel_finalize_pending:
+                        resume_request = dict(resume_request)
+                        resume_request["_cancel_finalize_only"] = True
+                    record = dict(record)
+                    record["status"] = "review_requeued"
+                    record["delivery_status"] = "review_requeued"
+                    entry["record"] = record
+                    entry["status"] = "review_requeued"
+                    entry["delivery_status"] = "review_requeued"
+                    entry["updated_at"] = now
+                    review_notifications.append((str(rid), resume_request, record))
+                    review_requeued += 1
+                else:
+                    record = dict(record)
+                    record["status"] = "review_waiting"
+                    record["delivery_status"] = "review_waiting"
+                    entry["record"] = record
+                    entry["status"] = "review_waiting"
+                    entry["delivery_status"] = "review_waiting"
+                    entry["updated_at"] = now
+                    review_waiting += 1
+                    recovered_active_records.append((str(rid), dict(record)))
+                continue
             if status == "scheduled" and owner_liveness is False:
                 # The durable worker gate opens only after this phase is stored.
                 # A fresh process cannot own that queued Future, and the runner
@@ -1368,6 +1982,84 @@ def recover_async_delegations(
                 entry["record"] = record
                 entry["updated_at"] = now
                 continue
+            if status == "intent":
+                if owner_liveness is True:
+                    continue
+                if owner_liveness is None:
+                    record = dict(record)
+                    record["owner_liveness"] = "unknown"
+                    entry["record"] = record
+                    entry["updated_at"] = now
+                    continue
+                cancel_finalize_pending = False
+                if _durable_review_cancelled(record):
+                    if (
+                        _finalize_durable_review_cancel(record)
+                        and _mark_bestplan_cancelled_terminal(record)
+                    ):
+                        record = dict(record)
+                        record["status"] = "interrupted"
+                        record["delivery_status"] = "interrupted"
+                        record["completed_at"] = now
+                        entry["record"] = record
+                        entry["status"] = "interrupted"
+                        entry["delivery_status"] = "interrupted"
+                        entry["updated_at"] = now
+                        continue
+                    cancel_finalize_pending = True
+                resume_request = _bestplan_review_resume_request(
+                    record, tracker_path=tracker_path,
+                )
+                if resume_request is None and cancel_finalize_pending:
+                    resume_request = _bestplan_review_resume_request(
+                        record,
+                        tracker_path=tracker_path,
+                        cancel_finalize_only=True,
+                    )
+                if resume_request is None:
+                    if cancel_finalize_pending:
+                        record = dict(record)
+                        record["status"] = "review_waiting"
+                        record["delivery_status"] = "review_waiting"
+                        record["review_recovery_reason_code"] = (
+                            "cancel_finalize_failed"
+                        )
+                        entry["record"] = record
+                        entry["status"] = "review_waiting"
+                        entry["delivery_status"] = "review_waiting"
+                        entry["updated_at"] = now
+                        review_waiting += 1
+                        recovered_active_records.append(
+                            (str(rid), dict(record))
+                        )
+                    continue
+                next_status = (
+                    "review_requeued"
+                    if review_recovery_queue is not None
+                    else "review_waiting"
+                )
+                record = dict(record)
+                record["status"] = next_status
+                record["delivery_status"] = next_status
+                record["review_recovery_requested_at"] = now
+                entry["record"] = record
+                entry["status"] = next_status
+                entry["delivery_status"] = next_status
+                entry.pop("event", None)
+                entry.pop("result", None)
+                entry["updated_at"] = now
+                if review_recovery_queue is None:
+                    review_waiting += 1
+                    recovered_active_records.append((str(rid), dict(record)))
+                else:
+                    if cancel_finalize_pending:
+                        resume_request = dict(resume_request)
+                        resume_request["_cancel_finalize_only"] = True
+                    review_notifications.append(
+                        (str(rid), resume_request, record)
+                    )
+                    review_requeued += 1
+                continue
             if status in {"running", "interrupting"}:
                 if owner_liveness is True:
                     continue
@@ -1376,6 +2068,82 @@ def recover_async_delegations(
                     record["owner_liveness"] = "unknown"
                     entry["record"] = record
                     entry["updated_at"] = now
+                    continue
+                cancel_finalize_pending = False
+                if _durable_review_cancelled(record):
+                    # The persisted owner is dead, so its process-local child
+                    # is extinct. Close the durable cancellation before the
+                    # tracker becomes terminal.
+                    if (
+                        _finalize_durable_review_cancel(record)
+                        and _mark_bestplan_cancelled_terminal(record)
+                    ):
+                        record = dict(record)
+                        record["status"] = "interrupted"
+                        record["delivery_status"] = "interrupted"
+                        record["completed_at"] = now
+                        entry["record"] = record
+                        entry["status"] = "interrupted"
+                        entry["delivery_status"] = "interrupted"
+                        entry["updated_at"] = now
+                        continue
+                    cancel_finalize_pending = True
+                resume_request = _bestplan_review_resume_request(
+                    record, tracker_path=tracker_path,
+                )
+                if resume_request is None and cancel_finalize_pending:
+                    resume_request = _bestplan_review_resume_request(
+                        record,
+                        tracker_path=tracker_path,
+                        cancel_finalize_only=True,
+                    )
+                if resume_request is not None:
+                    if cancel_finalize_pending:
+                        resume_request = dict(resume_request)
+                        resume_request["_cancel_finalize_only"] = True
+                    record = dict(record)
+                    next_status = (
+                        "review_requeued"
+                        if review_recovery_queue is not None
+                        else "review_waiting"
+                    )
+                    record["status"] = next_status
+                    record["delivery_status"] = next_status
+                    record["review_recovery_requested_at"] = now
+                    entry["record"] = record
+                    entry["status"] = next_status
+                    entry["delivery_status"] = next_status
+                    entry.pop("event", None)
+                    entry.pop("result", None)
+                    entry["updated_at"] = now
+                    status = next_status
+                    delivery_status = next_status
+                    if review_recovery_queue is None:
+                        review_waiting += 1
+                        recovered_active_records.append(
+                            (str(rid), dict(record))
+                        )
+                    else:
+                        review_notifications.append(
+                            (str(rid), resume_request, record)
+                        )
+                        review_requeued += 1
+                    continue
+                if cancel_finalize_pending:
+                    record = dict(record)
+                    record["status"] = "review_waiting"
+                    record["delivery_status"] = "review_waiting"
+                    record["review_recovery_reason_code"] = (
+                        "cancel_finalize_failed"
+                    )
+                    entry["record"] = record
+                    entry["status"] = "review_waiting"
+                    entry["delivery_status"] = "review_waiting"
+                    entry.pop("event", None)
+                    entry.pop("result", None)
+                    entry["updated_at"] = now
+                    review_waiting += 1
+                    recovered_active_records.append((str(rid), dict(record)))
                     continue
                 record = dict(record)
                 record["status"] = "lost"
@@ -1392,9 +2160,6 @@ def recover_async_delegations(
                 delivery_status = "pending"
                 lost += 1
                 lost_now = True
-            exact_local_bestplan = bool(record.get("bestplan_plan_id")) and (
-                record.get("bestplan_local_execution") is True
-            )
             terminalization_pending = (
                 record.get(_BESTPLAN_TERMINALIZATION_PENDING) is True
             )
@@ -1442,6 +2207,9 @@ def recover_async_delegations(
                 notifications.append((replay_identity, str(rid), event, dict(record)))
         _cleanup_persisted_data_locked(data, now=now)
         _write_persisted_unlocked(data, tracker_path)
+        for rid, request, record in review_notifications:
+            review_recovery_queue.put(request)
+            recovered_active_records.append((rid, dict(record)))
         for replay_identity, rid, event, record in notifications:
             queued_event = dict(event)
             if mark_restored:
@@ -1452,7 +2220,7 @@ def recover_async_delegations(
             restored = dict(record)
             restored["delivery_status"] = "queued"
             restored_records.append((rid, restored))
-    if restored_records:
+    if restored_records or recovered_active_records:
         with _records_lock:
             for rid, restored in restored_records:
                 live = _records.get(rid)
@@ -1462,19 +2230,1228 @@ def recover_async_delegations(
                     live.pop(_BESTPLAN_TERMINALIZATION_PENDING, None)
                     live["delivery_status"] = "queued"
                     live["queued_at"] = time.time()
+            for rid, recovered in recovered_active_records:
+                if rid not in _records:
+                    recovered["interrupt_fn"] = None
+                    _records[rid] = recovered
     _recovery_attempted = True
-    return {"queued": queued, "lost": lost}
+    if use_owned_review_queue:
+        _start_bestplan_review_recovery_consumer()
+    result = {"queued": queued, "lost": lost}
+    if review_requeued:
+        result["review_requeued"] = review_requeued
+    if review_waiting:
+        result["review_waiting"] = review_waiting
+    return result
+
+
+def _defer_bestplan_review_recovery(
+    request: Dict[str, str],
+    *,
+    reason_code: str,
+) -> None:
+    """Return one failed-closed recovery handoff to its durable wait state."""
+
+    delegation_id = str(request.get("delegation_id") or "")
+    tracker_path = str(request.get("tracker_path") or "")
+    job_id = str(request.get("job_id") or "")
+    if not delegation_id or not tracker_path or not job_id:
+        return
+    now = time.time()
+    with _persist_lock:
+        data = _read_persisted_unlocked(tracker_path)
+        entry = (data.get("records") or {}).get(delegation_id)
+        record = (
+            entry.get("record")
+            if isinstance(entry, dict) and isinstance(entry.get("record"), dict)
+            else None
+        )
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(record, dict)
+            or record.get("bestplan_review_job_id") != job_id
+            or str(entry.get("status") or record.get("status") or "")
+            not in {"review_requeued", "review_waiting"}
+        ):
+            return
+        record = dict(record)
+        record["status"] = "review_waiting"
+        record["delivery_status"] = "review_waiting"
+        record["review_recovery_reason_code"] = str(reason_code or "deferred")
+        entry["record"] = record
+        entry["status"] = "review_waiting"
+        entry["delivery_status"] = "review_waiting"
+        entry["updated_at"] = now
+        _write_persisted_unlocked(data, tracker_path)
+    with _records_lock:
+        live = _records.get(delegation_id)
+        if live is not None and live.get("bestplan_review_job_id") == job_id:
+            live["status"] = "review_waiting"
+            live["delivery_status"] = "review_waiting"
+            live["review_recovery_reason_code"] = str(
+                reason_code or "deferred"
+            )
+
+
+def _try_defer_bestplan_review_recovery(
+    request: Dict[str, str],
+    *,
+    reason_code: str,
+) -> bool:
+    """Keep a failed defer write from terminating the recovery consumer."""
+
+    try:
+        _defer_bestplan_review_recovery(
+            request, reason_code=reason_code,
+        )
+        return True
+    except Exception:
+        logger.error(
+            "BestPlan review defer checkpoint failed for %s (%s)",
+            request.get("delegation_id") or "<unknown>",
+            reason_code,
+            exc_info=True,
+        )
+        return False
+
+
+def _durable_review_cancel_record(
+    request: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Build the exact durable cancel identity without invoking a worker."""
+
+    delegation_id = str(request.get("delegation_id") or "")
+    job_id = str(request.get("job_id") or "")
+    with _records_lock:
+        live = _records.get(delegation_id)
+        if live is not None and live.get("bestplan_review_job_id") == job_id:
+            return dict(live)
+    return {
+        "delegation_id": delegation_id,
+        "bestplan_plan_id": str(request.get("plan_id") or ""),
+        "bestplan_local_execution": True,
+        "bestplan_state_db_path": str(request.get("state_db_path") or ""),
+        "bestplan_review_job_id": job_id,
+        "origin_tracker_path": str(request.get("tracker_path") or ""),
+    }
+
+
+def _terminalize_durable_review_cancel_tracker(
+    request: Mapping[str, Any],
+) -> bool:
+    """Mark the tracker interrupted only after durable cancel finalization."""
+
+    delegation_id = str(request.get("delegation_id") or "")
+    job_id = str(request.get("job_id") or "")
+    if not delegation_id or not job_id:
+        return False
+    with _records_lock:
+        live = _records.get(delegation_id)
+        if live is not None and live.get("bestplan_review_job_id") == job_id:
+            live_status = str(live.get("status") or "")
+            if live_status not in {
+                "intent", "scheduled", "running", "stalling", "interrupting",
+                "review_waiting", "review_requeued", "interrupted",
+            }:
+                return False
+            if live_status != "interrupted":
+                live["status"] = "interrupting"
+                live["delivery_status"] = "interrupting"
+            live_snapshot = dict(live)
+        else:
+            live_snapshot = None
+    if live_snapshot is not None:
+        if live_snapshot.get("status") != "interrupted":
+            _finalize_batch(
+                delegation_id,
+                {
+                    "results": [],
+                    "error": "interrupted after child extinction",
+                },
+                "interrupted",
+            )
+        with _records_lock:
+            current = _records.get(delegation_id)
+            if (
+                current is None
+                or current.get("bestplan_review_job_id") != job_id
+                or current.get("status") != "interrupted"
+            ):
+                return False
+            current_snapshot = dict(current)
+        if not _mark_bestplan_cancelled_terminal(current_snapshot):
+            return False
+        if current_snapshot.get(_BESTPLAN_TERMINALIZATION_PENDING) is not True:
+            return True
+        tracker_path = str(current_snapshot.get("origin_tracker_path") or "")
+        if not tracker_path:
+            return False
+        try:
+            with _persist_lock:
+                data = _read_persisted_unlocked(tracker_path)
+                entry = (data.get("records") or {}).get(delegation_id)
+                result = entry.get("result") if isinstance(entry, dict) else None
+                event = entry.get("event") if isinstance(entry, dict) else None
+            if not isinstance(result, dict) or not isinstance(event, dict):
+                return False
+            repaired = dict(current_snapshot)
+            repaired.pop(_BESTPLAN_TERMINALIZATION_PENDING, None)
+            if not _persist_and_queue_terminal(repaired, result, event):
+                return False
+            with _records_lock:
+                current = _records.get(delegation_id)
+                if (
+                    current is not None
+                    and current.get("bestplan_review_job_id") == job_id
+                    and current.get("status") == "interrupted"
+                ):
+                    current.pop(_BESTPLAN_TERMINALIZATION_PENDING, None)
+            return True
+        except Exception:
+            logger.error(
+                "BestPlan cancelled terminal delivery repair failed for %s",
+                delegation_id,
+                exc_info=True,
+            )
+            return False
+
+    tracker_path = str(request.get("tracker_path") or "")
+    if not tracker_path:
+        return False
+    now = time.time()
+    try:
+        with _persist_lock:
+            data = _read_persisted_unlocked(tracker_path)
+            entry = (data.get("records") or {}).get(delegation_id)
+            record = (
+                entry.get("record")
+                if isinstance(entry, dict)
+                and isinstance(entry.get("record"), dict)
+                else None
+            )
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(record, dict)
+                or record.get("bestplan_review_job_id") != job_id
+                or record.get("bestplan_local_execution") is not True
+            ):
+                return False
+            if not _mark_bestplan_cancelled_terminal(record):
+                return False
+            if str(entry.get("status") or record.get("status") or "") == (
+                "interrupted"
+            ):
+                return True
+            record = dict(record)
+            record["status"] = "interrupted"
+            record["delivery_status"] = "interrupted"
+            record["completed_at"] = now
+            entry["record"] = record
+            entry["status"] = "interrupted"
+            entry["delivery_status"] = "interrupted"
+            entry.pop("event", None)
+            entry.pop("result", None)
+            entry["updated_at"] = now
+            _write_persisted_unlocked(data, tracker_path)
+        return True
+    except Exception:
+        logger.error(
+            "BestPlan cancelled tracker terminalization failed for %s",
+            delegation_id,
+            exc_info=True,
+        )
+        return False
+
+
+def _retry_durable_review_cancel_finalization(
+    request: Dict[str, Any],
+) -> None:
+    """Schedule model-free durable cancel finalization with normal backoff."""
+
+    retry_request = dict(request)
+    retry_request["_cancel_finalize_only"] = True
+    _try_defer_bestplan_review_recovery(
+        retry_request, reason_code="cancel_finalize_failed",
+    )
+    _schedule_bestplan_review_recovery_retry(
+        retry_request, reason_code="cancel_finalize_failed",
+    )
+
+
+def _complete_bestplan_review_recovery(
+    request: Dict[str, str],
+    completion: Mapping[str, Any],
+) -> bool:
+    """Publish one landed recovery through the normal durable terminal rail."""
+
+    delegation_id = str(request.get("delegation_id") or "")
+    tracker_path = str(request.get("tracker_path") or "")
+    job_id = str(request.get("job_id") or "")
+    if not delegation_id or not tracker_path or not job_id:
+        return False
+    now = time.time()
+    with _persist_lock:
+        data = _read_persisted_unlocked(tracker_path)
+        entry = (data.get("records") or {}).get(delegation_id)
+        record = (
+            entry.get("record")
+            if isinstance(entry, dict) and isinstance(entry.get("record"), dict)
+            else None
+        )
+        if not isinstance(entry, dict) or not isinstance(record, dict):
+            return False
+        status = str(entry.get("status") or record.get("status") or "")
+        if status == "completed":
+            return False
+        if (
+            status not in {"review_requeued", "review_waiting"}
+            or record.get("bestplan_review_job_id") != job_id
+            or record.get("bestplan_local_execution") is not True
+        ):
+            return False
+        record = dict(record)
+        record["status"] = "completed"
+        record["completed_at"] = now
+        record["last_heartbeat_at"] = now
+        record["delivery_status"] = "finalizing"
+        record.pop("review_recovery_reason_code", None)
+        event = {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "session_key": record.get("session_key", ""),
+            "origin_ui_session_id": record.get("origin_ui_session_id", ""),
+            "origin_session_id": record.get("origin_session_id", ""),
+            "origin_profile": record.get("origin_profile", ""),
+            "origin_tracker_path": record.get("origin_tracker_path", ""),
+            "parent_session_id": record.get("parent_session_id"),
+            "bestplan_plan_id": record.get("bestplan_plan_id", ""),
+            "bestplan_local_execution": True,
+            "resolved_runtimes": record.get("resolved_runtimes") or [],
+            "goal": record.get("goal", ""),
+            "goals": record.get("goals"),
+            "context": record.get("context"),
+            "toolsets": record.get("toolsets"),
+            "role": record.get("role"),
+            "model": record.get("model"),
+            "status": "completed",
+            "is_batch": True,
+            "results": list(completion.get("results") or []),
+            "error": completion.get("error"),
+            "total_duration_seconds": round(
+                now - float(record.get("dispatched_at") or now), 2,
+            ),
+            "dispatched_at": record.get("dispatched_at") or now,
+            "completed_at": now,
+        }
+        if not _mark_bestplan_completed_unverified(record, event):
+            return False
+        entry["record"] = record
+        entry["status"] = "completed"
+        entry["result"] = dict(completion)
+        entry["event"] = event
+        entry["delivery_status"] = "pending"
+        entry["updated_at"] = now
+        _write_persisted_unlocked(data, tracker_path)
+    if not _mark_persisted_delivery(
+        delegation_id, "queued", tracker_path=tracker_path,
+    ):
+        return False
+    try:
+        from tools.process_registry import process_registry
+
+        process_registry.completion_queue.put(event)
+    except Exception:
+        _mark_persisted_delivery(
+            delegation_id, "pending", tracker_path=tracker_path,
+        )
+        return False
+    with _records_lock:
+        live = _records.get(delegation_id)
+        if live is not None and live.get("bestplan_review_job_id") == job_id:
+            live.update(record)
+            live["delivery_status"] = "queued"
+    return True
+
+
+def _fail_bestplan_review_recovery(
+    request: Dict[str, str], *, reason_code: str,
+) -> bool:
+    """Publish one truthful terminal integrity failure, never a pass."""
+
+    delegation_id = str(request.get("delegation_id") or "")
+    tracker_path = str(request.get("tracker_path") or "")
+    job_id = str(request.get("job_id") or "")
+    if not delegation_id or not tracker_path or not job_id:
+        return False
+    now = time.time()
+    with _persist_lock:
+        data = _read_persisted_unlocked(tracker_path)
+        entry = (data.get("records") or {}).get(delegation_id)
+        record = (
+            entry.get("record")
+            if isinstance(entry, dict) and isinstance(entry.get("record"), dict)
+            else None
+        )
+        if not isinstance(entry, dict) or not isinstance(record, dict):
+            return False
+        status = str(entry.get("status") or record.get("status") or "")
+        if (
+            status not in {"review_requeued", "review_waiting"}
+            or record.get("bestplan_review_job_id") != job_id
+            or record.get("bestplan_local_execution") is not True
+        ):
+            return False
+        record = dict(record)
+        record["status"] = "error"
+        record["completed_at"] = now
+        record["last_heartbeat_at"] = now
+        record["delivery_status"] = "finalizing"
+        record["review_recovery_reason_code"] = reason_code
+        event = {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "session_key": record.get("session_key", ""),
+            "origin_ui_session_id": record.get("origin_ui_session_id", ""),
+            "origin_session_id": record.get("origin_session_id", ""),
+            "origin_profile": record.get("origin_profile", ""),
+            "origin_tracker_path": record.get("origin_tracker_path", ""),
+            "parent_session_id": record.get("parent_session_id"),
+            "bestplan_plan_id": record.get("bestplan_plan_id", ""),
+            "bestplan_local_execution": True,
+            "resolved_runtimes": record.get("resolved_runtimes") or [],
+            "goal": record.get("goal", ""),
+            "goals": record.get("goals"),
+            "context": record.get("context"),
+            "toolsets": record.get("toolsets"),
+            "role": record.get("role"),
+            "model": record.get("model"),
+            "status": "error",
+            "is_batch": True,
+            "results": [],
+            "error": f"automatic review integrity failure: {reason_code}",
+            "total_duration_seconds": round(
+                now - float(record.get("dispatched_at") or now), 2,
+            ),
+            "dispatched_at": record.get("dispatched_at") or now,
+            "completed_at": now,
+        }
+        if not _mark_bestplan_completed_unverified(record, event):
+            return False
+        entry["record"] = record
+        entry["status"] = "error"
+        entry["result"] = {
+            "results": [],
+            "error": event["error"],
+        }
+        entry["event"] = event
+        entry["delivery_status"] = "pending"
+        entry["updated_at"] = now
+        _write_persisted_unlocked(data, tracker_path)
+    if not _mark_persisted_delivery(
+        delegation_id, "queued", tracker_path=tracker_path,
+    ):
+        return False
+    try:
+        from tools.process_registry import process_registry
+
+        process_registry.completion_queue.put(event)
+    except Exception:
+        _mark_persisted_delivery(
+            delegation_id, "pending", tracker_path=tracker_path,
+        )
+        return False
+    with _records_lock:
+        live = _records.get(delegation_id)
+        if live is not None and live.get("bestplan_review_job_id") == job_id:
+            live.update(record)
+            live["delivery_status"] = "queued"
+    return True
+
+
+def consume_bestplan_review_recoveries(
+    review_recovery_queue,
+    *,
+    worker: Callable[[Dict[str, str]], Dict[str, Any]],
+    max_items: int | None = None,
+) -> Dict[str, int]:
+    """Drain durable review handoffs through one live, non-persisted worker."""
+
+    if not callable(worker):
+        raise TypeError("BestPlan review recovery worker must be callable")
+    if max_items is not None and (
+        isinstance(max_items, bool)
+        or not isinstance(max_items, int)
+        or max_items < 1
+    ):
+        raise ValueError("BestPlan review recovery limit is invalid")
+    consumed = 0
+    completed = 0
+    deferred = 0
+    while max_items is None or consumed < max_items:
+        try:
+            request = review_recovery_queue.get_nowait()
+        except queue.Empty:
+            break
+        if not isinstance(request, dict):
+            deferred += 1
+            consumed += 1
+            continue
+        cancel_record = _durable_review_cancel_record(request)
+        if (
+            request.get("_cancel_finalize_only") is True
+            or _durable_review_cancelled(cancel_record)
+        ):
+            if (
+                _finalize_durable_review_cancel(cancel_record)
+                and _terminalize_durable_review_cancel_tracker(request)
+            ):
+                consumed += 1
+                continue
+            _retry_durable_review_cancel_finalization(request)
+            deferred += 1
+            consumed += 1
+            continue
+        worker_request = {
+            key: value
+            for key, value in request.items()
+            if not str(key).startswith("_")
+        }
+        delegation_id = str(request.get("delegation_id") or "")
+        cancel_event = threading.Event()
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None and live.get("bestplan_review_job_id") == (
+                request.get("job_id")
+            ):
+                live["interrupt_fn"] = cancel_event.set
+                live["review_cancel_event"] = cancel_event
+                if live.get("status") == "review_waiting":
+                    live["status"] = "review_requeued"
+                live["delivery_status"] = "review_requeued"
+        try:
+            try:
+                worker_parameters = inspect.signature(worker).parameters
+            except (TypeError, ValueError):
+                worker_parameters = {}
+            accepts_cancel = "cancel_event" in worker_parameters or any(
+                item.kind == inspect.Parameter.VAR_KEYWORD
+                for item in worker_parameters.values()
+            )
+            result = (
+                worker(worker_request, cancel_event=cancel_event)
+                if accepts_cancel
+                else worker(worker_request)
+            )
+            if not isinstance(result, dict):
+                raise TypeError("BestPlan review recovery result is invalid")
+            nested_status = (
+                result["result"].get("status")
+                if isinstance(result.get("result"), dict)
+                else None
+            )
+            with _records_lock:
+                current = _records.get(delegation_id)
+                cancelled_record = dict(current or cancel_record)
+            cancelled_after_worker = (
+                cancel_event.is_set()
+                or _durable_review_cancelled(cancelled_record)
+            )
+            if cancelled_after_worker:
+                if not (
+                    _finalize_durable_review_cancel(cancelled_record)
+                    and _terminalize_durable_review_cancel_tracker(request)
+                ):
+                    _retry_durable_review_cancel_finalization(request)
+                    deferred += 1
+            elif (
+                result.get("status") == "completed"
+                or nested_status == "completed"
+            ):
+                completion = (
+                    result["result"].get("completion")
+                    if isinstance(result.get("result"), dict)
+                    else result.get("completion")
+                )
+                if not isinstance(completion, Mapping):
+                    raise TypeError(
+                        "BestPlan review completion is invalid"
+                    )
+                if _complete_bestplan_review_recovery(request, completion):
+                    completed += 1
+                else:
+                    reason_code = "completion_persist_failed"
+                    _try_defer_bestplan_review_recovery(
+                        request, reason_code=reason_code,
+                    )
+                    _schedule_bestplan_review_recovery_retry(
+                        request, reason_code=reason_code,
+                    )
+                    deferred += 1
+            elif (
+                result.get("status") == "resumed"
+                and nested_status == "checkpoint_advanced"
+            ):
+                review_recovery_queue.put(dict(request))
+            elif nested_status == "blocked_requires_authority":
+                defer_persisted = _try_defer_bestplan_review_recovery(
+                    request, reason_code="blocked_requires_authority",
+                )
+                if not defer_persisted:
+                    _schedule_bestplan_review_recovery_retry(
+                        request, reason_code="defer_persist_failed",
+                    )
+                deferred += 1
+        except Exception as exc:  # fail closed; durable state remains resumable
+            code = str(getattr(exc, "code", "") or type(exc).__name__)
+            cancelled = cancel_event.is_set()
+            if not cancelled:
+                with _records_lock:
+                    current = _records.get(delegation_id)
+                    cancelled = bool(
+                        current is not None
+                        and _durable_review_cancelled(current)
+                    )
+            if cancelled:
+                with _records_lock:
+                    current = _records.get(delegation_id)
+                    cancelled_record = dict(current or {})
+                if not cancelled_record:
+                    cancelled_record = _durable_review_cancel_record(request)
+                if (
+                    _finalize_durable_review_cancel(cancelled_record)
+                    and _terminalize_durable_review_cancel_tracker(request)
+                ):
+                    pass
+                else:
+                    _retry_durable_review_cancel_finalization(request)
+                    deferred += 1
+            elif code in _BESTPLAN_REVIEW_INTEGRITY_FAILURE_CODES:
+                if not _fail_bestplan_review_recovery(
+                    request, reason_code=code,
+                ):
+                    _try_defer_bestplan_review_recovery(
+                        request, reason_code="integrity_terminalization_failed",
+                    )
+                    _schedule_bestplan_review_recovery_retry(
+                        request,
+                        reason_code="integrity_terminalization_failed",
+                    )
+                    deferred += 1
+            else:
+                defer_persisted = _try_defer_bestplan_review_recovery(
+                    request, reason_code=code,
+                )
+                if (
+                    _bestplan_review_failure_is_retryable(code)
+                    or not defer_persisted
+                ):
+                    _schedule_bestplan_review_recovery_retry(
+                        request, reason_code=code,
+                    )
+                deferred += 1
+            logger.warning(
+                "BestPlan review recovery deferred for %s (%s)",
+                request.get("delegation_id") or "<unknown>",
+                code,
+            )
+        finally:
+            with _records_lock:
+                live = _records.get(delegation_id)
+                if (
+                    live is not None
+                    and live.get("review_cancel_event") is cancel_event
+                ):
+                    live.pop("review_cancel_event", None)
+                    live["interrupt_fn"] = None
+        consumed += 1
+    return {
+        "consumed": consumed,
+        "completed": completed,
+        "deferred": deferred,
+    }
+
+
+_BESTPLAN_REVIEW_OPERATOR_WAIT_CODES = frozenset({
+    "blocked_requires_authority",
+    "execution_authority_unavailable",
+    "execution_owner_live",
+    "execution_owner_unknown",
+    "execution_runtime_drift",
+    "execution_source_drift",
+    "landing_target_drift",
+    "review_profile_unavailable",
+    "review_operator_authority_required",
+    "review_runtime_fingerprint_changed",
+    "review_workspace_changed",
+})
+
+_BESTPLAN_REVIEW_INTEGRITY_FAILURE_CODES = frozenset({
+    "execution_intent_invalid",
+    "execution_owner_identity_invalid",
+    "execution_plan_invalid",
+    "execution_request_invalid",
+    "execution_tracker_invalid",
+    "review_action_result_invalid",
+    "review_adapter_invalid",
+    "review_cancel_invalid",
+    "review_checkpoint_incomplete",
+    "review_checkpoint_invalid",
+    "review_checkpoint_stale",
+    "review_job_identity_changed",
+    "review_plan_identity_changed",
+    "review_plan_invalid",
+    "review_receipt_stale",
+    "review_receipts_incomplete",
+    "review_request_invalid",
+    "review_state_invalid",
+})
+
+
+def _bestplan_review_failure_is_retryable(code: str) -> bool:
+    """Retry unknown operational failures unless evidence needs an operator."""
+
+    normalized = str(code or "")
+    return (
+        normalized not in _BESTPLAN_REVIEW_OPERATOR_WAIT_CODES
+        and normalized not in _BESTPLAN_REVIEW_INTEGRITY_FAILURE_CODES
+        and normalized != "review_cancelled"
+    )
+
+
+def _manual_review_recovery_key(
+    request: Mapping[str, object],
+) -> tuple[str, str] | None:
+    state_db_path = request.get("state_db_path")
+    job_id = request.get("job_id")
+    if not isinstance(state_db_path, str) or not isinstance(job_id, str):
+        return None
+    return state_db_path, job_id
+
+
+def _validate_manual_review_recovery_request(
+    request: Mapping[str, object],
+) -> dict[str, str] | None:
+    """Rebuild one manual request from the store and compare every field."""
+
+    try:
+        from agent.review_engine import build_manual_review_resume_request
+
+        expected = build_manual_review_resume_request(
+            state_db_path=request.get("state_db_path"),
+            job_id=str(request.get("job_id") or ""),
+        )
+    except Exception:
+        return None
+    return expected if dict(request) == expected else None
+
+
+def enqueue_manual_review_recovery(
+    request: Mapping[str, object],
+) -> bool:
+    """Queue one exact manual review recovery request at most once."""
+
+    validated = _validate_manual_review_recovery_request(request)
+    if validated is None:
+        return False
+    key = _manual_review_recovery_key(validated)
+    assert key is not None
+    with _manual_review_recovery_pending_lock:
+        if key in _manual_review_recovery_pending:
+            return True
+        _manual_review_recovery_pending.add(key)
+    _manual_review_recovery_queue.put(validated)
+    _start_manual_review_recovery_consumer()
+    return True
+
+
+def recover_manual_review_jobs(
+    *,
+    state_db_path: str | Path,
+    profile: str,
+    recovery_queue=_OWNED_REVIEW_RECOVERY_QUEUE,
+) -> Dict[str, int]:
+    """Queue recoverable manual jobs from one exact configured state store."""
+
+    requested_profile = str(profile or "").strip()
+    if not requested_profile or len(requested_profile) > 256:
+        raise ValueError("manual recovery profile is invalid")
+    try:
+        canonical_state = Path(state_db_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("manual recovery state database is unavailable") from exc
+    if not canonical_state.is_file():
+        raise ValueError("manual recovery state database is unavailable")
+
+    from agent.review_engine import (
+        ReviewStore,
+        build_manual_review_resume_request,
+    )
+
+    store = ReviewStore(canonical_state)
+    recovery_now_ns = time.time_ns()
+    store.finalize_expired_manual_cancellations(
+        owner_profile=requested_profile,
+        now_ns=recovery_now_ns,
+    )
+    jobs = store.list_recoverable_manual_jobs(
+        owner_profile=requested_profile,
+        now_ns=recovery_now_ns,
+    )
+    use_owned_queue = recovery_queue is _OWNED_REVIEW_RECOVERY_QUEUE
+    target_queue = (
+        _manual_review_recovery_queue if use_owned_queue else recovery_queue
+    )
+    if not hasattr(target_queue, "put"):
+        raise TypeError("manual recovery queue is invalid")
+
+    queued = 0
+    for job in jobs:
+        request = build_manual_review_resume_request(
+            state_db_path=canonical_state,
+            job_id=job.job_id,
+        )
+        if request.get("profile") != requested_profile:
+            raise ValueError("manual recovery profile differs from durable owner")
+        if use_owned_queue:
+            key = _manual_review_recovery_key(request)
+            assert key is not None
+            with _manual_review_recovery_pending_lock:
+                if key in _manual_review_recovery_pending:
+                    continue
+                _manual_review_recovery_pending.add(key)
+        target_queue.put(request)
+        queued += 1
+
+    if use_owned_queue and queued:
+        _start_manual_review_recovery_consumer()
+    return {"queued": queued}
+
+
+def _manual_review_requires_operator(
+    request: Mapping[str, object],
+    result: Mapping[str, object],
+) -> bool:
+    if str(result.get("review_state") or "") == "blocked_requires_authority":
+        return True
+    try:
+        from agent.review_engine import ReviewStore
+
+        events = ReviewStore(str(request["state_db_path"])).list_events(
+            str(request["job_id"])
+        )
+    except Exception:
+        return False
+    return bool(events and events[-1].kind in {
+        "blocked_requires_authority",
+        "target_drift",
+    })
+
+
+def _schedule_manual_review_recovery_retry(
+    request: dict[str, str],
+    *,
+    attempts: int,
+) -> None:
+    delay = min(30.0, 0.25 * (2 ** min(max(attempts, 0), 7)))
+    retry_request: dict[str, object] = dict(request)
+    retry_request["_transient_attempt"] = attempts + 1
+
+    def requeue() -> None:
+        _manual_review_recovery_queue.put(retry_request)
+        _manual_review_recovery_wake.set()
+
+    timer = threading.Timer(delay, requeue)
+    timer.name = "manual-review-retry"
+    timer.daemon = True
+    timer.start()
+
+
+def _terminalize_manual_review_integrity_failure(
+    request: Mapping[str, object],
+    exc: BaseException,
+) -> bool:
+    """Persist one corrupt manual recovery as a truthful terminal failure."""
+
+    try:
+        from agent.review_engine import ReviewStore
+
+        ReviewStore(str(request["state_db_path"])).terminalize_manual_recovery_integrity(
+            job_id=str(request["job_id"]),
+            reason_code=type(exc).__name__,
+        )
+        return True
+    except Exception:
+        logger.error(
+            "Manual review integrity failure could not be terminalized for %s",
+            request.get("job_id") or "<unknown>",
+            exc_info=True,
+        )
+        return False
+
+
+def consume_manual_review_recoveries(
+    recovery_queue,
+    *,
+    worker: Callable[[Dict[str, str]], Dict[str, Any]],
+    max_items: int | None = None,
+) -> Dict[str, int]:
+    """Drain exact manual requests with durable retry and no callback reuse."""
+
+    if not callable(worker):
+        raise TypeError("manual review recovery worker must be callable")
+    if max_items is not None and (
+        isinstance(max_items, bool)
+        or not isinstance(max_items, int)
+        or max_items < 1
+    ):
+        raise ValueError("manual review recovery limit is invalid")
+    consumed = 0
+    completed = 0
+    deferred = 0
+    while max_items is None or consumed < max_items:
+        try:
+            raw_request = recovery_queue.get_nowait()
+        except queue.Empty:
+            break
+        consumed += 1
+        transient_attempt = 0
+        validation_request = raw_request
+        if isinstance(raw_request, Mapping):
+            validation_request = dict(raw_request)
+            raw_attempt = validation_request.pop("_transient_attempt", 0)
+            if (
+                isinstance(raw_attempt, bool)
+                or not isinstance(raw_attempt, int)
+                or raw_attempt < 0
+            ):
+                validation_request = {}
+            else:
+                transient_attempt = raw_attempt
+        validated = (
+            _validate_manual_review_recovery_request(validation_request)
+            if isinstance(validation_request, Mapping)
+            else None
+        )
+        if validated is None:
+            if isinstance(raw_request, Mapping):
+                invalid_key = _manual_review_recovery_key(raw_request)
+                if invalid_key is not None:
+                    with _manual_review_recovery_pending_lock:
+                        _manual_review_recovery_pending.discard(invalid_key)
+            deferred += 1
+            continue
+        key = _manual_review_recovery_key(validated)
+        assert key is not None
+        with _manual_review_recovery_pending_lock:
+            _manual_review_recovery_pending.add(key)
+        should_retry = False
+        operator_wait = False
+        integrity_failed = False
+        item_completed = False
+        try:
+            result = worker(dict(validated))
+            if not isinstance(result, dict):
+                raise TypeError("manual review recovery result is invalid")
+            if result.get("completed") is True:
+                item_completed = True
+                completed += 1
+            else:
+                operator_wait = _manual_review_requires_operator(
+                    validated, result
+                )
+                should_retry = not operator_wait
+                deferred += 1
+        except Exception as exc:
+            from agent.review_engine import (
+                ReviewLeaseConflict,
+                ReviewRequiresAuthority,
+                ReviewStoreConflict,
+                ReviewValidationError,
+            )
+
+            if isinstance(exc, ReviewRequiresAuthority):
+                operator_wait = True
+            elif isinstance(exc, ReviewLeaseConflict):
+                should_retry = True
+            elif isinstance(exc, (ReviewStoreConflict, ReviewValidationError)):
+                integrity_failed = _terminalize_manual_review_integrity_failure(
+                    validated, exc,
+                )
+                should_retry = not integrity_failed
+            else:
+                should_retry = True
+            deferred += 1
+            if should_retry:
+                logger.warning(
+                    "Manual review recovery deferred for %s",
+                    validated.get("job_id") or "<unknown>",
+                    exc_info=True,
+                )
+        if item_completed or operator_wait or integrity_failed:
+            with _manual_review_recovery_pending_lock:
+                _manual_review_recovery_pending.discard(key)
+        elif should_retry:
+            _schedule_manual_review_recovery_retry(
+                validated, attempts=transient_attempt
+            )
+    return {
+        "completed": completed,
+        "consumed": consumed,
+        "deferred": deferred,
+    }
+
+
+def _default_manual_review_recovery_worker(
+    request: Dict[str, str],
+) -> Dict[str, Any]:
+    """Rebuild a fresh manual host from the owning profile and state store."""
+
+    from types import SimpleNamespace
+
+    from gateway.run import _profile_runtime_scope
+    from hermes_cli.profiles import get_profile_dir, normalize_profile_name
+    from hermes_state import SessionDB
+    from agent.review_engine import resume_manual_review_job
+
+    profile = str(request.get("profile") or "").strip()
+    try:
+        profile_home = get_profile_dir(normalize_profile_name(profile)).resolve(
+            strict=True
+        )
+        state_db_path = Path(request["state_db_path"]).resolve(strict=True)
+        if state_db_path != (profile_home / "state.db").resolve(strict=False):
+            raise ValueError("manual recovery state is outside its profile")
+    except (KeyError, OSError, RuntimeError, ValueError):
+        raise RuntimeError("manual_review_profile_unavailable") from None
+    with _profile_runtime_scope(profile_home):
+        database = SessionDB(db_path=state_db_path)
+        agent = SimpleNamespace(
+            session_id=request["session_id"],
+            _session_db=database,
+            platform="manual_recovery",
+        )
+        return resume_manual_review_job(agent, request)
+
+
+def _manual_review_recovery_consumer() -> None:
+    while True:
+        _manual_review_recovery_wake.wait()
+        _manual_review_recovery_wake.clear()
+        try:
+            consume_manual_review_recoveries(
+                _manual_review_recovery_queue,
+                worker=_default_manual_review_recovery_worker,
+            )
+        except Exception:
+            logger.error(
+                "Manual review recovery drain failed; consumer remains live",
+                exc_info=True,
+            )
+
+
+def _start_manual_review_recovery_consumer() -> None:
+    global _manual_review_recovery_thread
+    with _manual_review_recovery_thread_lock:
+        thread = _manual_review_recovery_thread
+        if thread is None or not thread.is_alive():
+            thread = threading.Thread(
+                target=_manual_review_recovery_consumer,
+                name="manual-review-recovery",
+                daemon=True,
+            )
+            _manual_review_recovery_thread = thread
+            thread.start()
+    _manual_review_recovery_wake.set()
+
+
+def _profile_home_for_bestplan_recovery(
+    request: Mapping[str, object],
+) -> Path:
+    """Resolve one owning profile and its exact configured state database."""
+
+    from hermes_cli.profiles import get_profile_dir, normalize_profile_name
+    from hermes_constants import get_hermes_home
+    from tools.delegate_tool import BestplanReviewRecoveryDeferred
+
+    requested_profile = str(request.get("profile") or "").strip()
+    try:
+        if requested_profile:
+            profile_home = get_profile_dir(
+                normalize_profile_name(requested_profile)
+            )
+            if (
+                requested_profile.casefold() != "default"
+                and not profile_home.is_dir()
+            ):
+                raise ValueError("owning profile is unavailable")
+        else:
+            profile_home = get_hermes_home()
+        profile_home = profile_home.resolve(strict=True)
+        state_db_path = Path(str(request["state_db_path"])).resolve(
+            strict=True
+        )
+        if state_db_path != (profile_home / "state.db").resolve(
+            strict=False
+        ):
+            raise ValueError("BestPlan recovery state is outside its profile")
+    except KeyError:
+        raise BestplanReviewRecoveryDeferred(
+            "review_state_unavailable"
+        ) from None
+    except (OSError, RuntimeError, ValueError):
+        raise BestplanReviewRecoveryDeferred(
+            "review_profile_unavailable"
+        ) from None
+    return profile_home
+
+
+def _default_bestplan_review_recovery_worker(
+    request: Dict[str, str],
+    *,
+    cancel_event: threading.Event | None = None,
+) -> Dict[str, Any]:
+    """Resume through live config; no authority or credential is persisted."""
+
+    from gateway.run import _profile_runtime_scope
+    from tools.delegate_tool import (
+        BestplanReviewRecoveryDeferred,
+        LocalBestplanReviewRecoveryAdapter,
+        resume_bestplan_execution_request,
+        resume_bestplan_review_request,
+    )
+
+    profile_home = _profile_home_for_bestplan_recovery(request)
+
+    with _profile_runtime_scope(profile_home):
+        if request.get("kind") == "bestplan_execution_resume":
+            try:
+                tracker_path = str(request["tracker_path"])
+                payload = json.loads(
+                    Path(tracker_path).read_text(encoding="utf-8")
+                )
+                record = payload["records"][request["delegation_id"]][
+                    "record"
+                ]
+                current_request = _bestplan_review_resume_request(
+                    record, tracker_path=tracker_path,
+                )
+            except Exception:
+                raise BestplanReviewRecoveryDeferred(
+                    "execution_tracker_invalid"
+                ) from None
+            if current_request is None:
+                raise BestplanReviewRecoveryDeferred(
+                    "execution_tracker_invalid"
+                )
+            if current_request.get("kind") == "bestplan_review_resume":
+                adapter = LocalBestplanReviewRecoveryAdapter()
+                if cancel_event is not None:
+                    adapter.bind_cancel_event(cancel_event)
+                return resume_bestplan_review_request(
+                    current_request, adapter=adapter,
+                )
+            if current_request != request:
+                raise BestplanReviewRecoveryDeferred(
+                    "execution_request_invalid"
+                )
+            return resume_bestplan_execution_request(
+                request, cancel_event=cancel_event,
+            )
+        if request.get("kind") != "bestplan_review_resume":
+            raise BestplanReviewRecoveryDeferred("review_request_invalid")
+        adapter = LocalBestplanReviewRecoveryAdapter()
+        if cancel_event is not None:
+            adapter.bind_cancel_event(cancel_event)
+        return resume_bestplan_review_request(request, adapter=adapter)
+
+
+def _schedule_bestplan_review_recovery_retry(
+    request: Dict[str, str],
+    *,
+    reason_code: str,
+) -> None:
+    """Wake one transient recovery again with a bounded exponential delay."""
+
+    retry_request = dict(request)
+    attempts = retry_request.get("_transient_attempt", 0)
+    if isinstance(attempts, bool) or not isinstance(attempts, int):
+        attempts = 0
+    attempts = min(attempts + 1, 8)
+    retry_request["_transient_attempt"] = attempts
+    delay = min(30.0, 0.25 * (2 ** (attempts - 1)))
+
+    def requeue() -> None:
+        _bestplan_review_recovery_queue.put(retry_request)
+        _bestplan_review_recovery_wake.set()
+
+    timer = threading.Timer(delay, requeue)
+    timer.name = f"bestplan-review-retry-{reason_code}"
+    timer.daemon = True
+    timer.start()
+
+
+def _bestplan_review_recovery_consumer() -> None:
+    """Drain every startup/live recovery wake on one daemon worker."""
+
+    while True:
+        _bestplan_review_recovery_wake.wait()
+        _bestplan_review_recovery_wake.clear()
+        try:
+            consume_bestplan_review_recoveries(
+                _bestplan_review_recovery_queue,
+                worker=_default_bestplan_review_recovery_worker,
+            )
+        except Exception:
+            logger.error(
+                "BestPlan review recovery drain failed; consumer remains live",
+                exc_info=True,
+            )
+
+
+def _start_bestplan_review_recovery_consumer() -> None:
+    """Start the owned recovery consumer once and wake it after queue writes."""
+
+    global _bestplan_review_recovery_thread
+    with _bestplan_review_recovery_thread_lock:
+        thread = _bestplan_review_recovery_thread
+        if thread is None or not thread.is_alive():
+            thread = threading.Thread(
+                target=_bestplan_review_recovery_consumer,
+                name="bestplan-review-recovery",
+                daemon=True,
+            )
+            _bestplan_review_recovery_thread = thread
+            thread.start()
+    _bestplan_review_recovery_wake.set()
 
 
 def restore_undelivered_completions(target_queue) -> int:
     """Restore durable completion events onto the registry's supplied queue."""
-    result = recover_async_delegations(target_queue=target_queue, mark_restored=True)
+    result = recover_async_delegations(
+        target_queue=target_queue,
+        mark_restored=True,
+        review_recovery_queue=_bestplan_review_recovery_queue,
+    )
+    _start_bestplan_review_recovery_consumer()
     queued = int(result.get("queued", 0))
+    configured_state: Path | None = None
+    try:
+        candidate_state = Path(_db_path()).expanduser().resolve(strict=True)
+        if candidate_state.is_file():
+            configured_state = candidate_state
+            from hermes_cli.profiles import get_active_profile_name
+
+            recover_manual_review_jobs(
+                state_db_path=configured_state,
+                profile=get_active_profile_name(),
+            )
+    except Exception:
+        logger.debug("Manual review startup recovery failed", exc_info=True)
     # Older gateway producers persisted their completion in SQLite. Read that
     # ledger only when it exists so normal JSON checkpoint startup remains
     # side-effect free, while restart recovery still covers both formats.
     try:
-        if Path(_db_path()).exists():
+        if configured_state is not None:
             queued += _restore_sqlite_undelivered(target_queue)
     except Exception:
         logger.debug("SQLite async completion restore failed", exc_info=True)
@@ -1503,7 +3480,7 @@ def _cleanup_locked(now: Optional[float] = None, policy: Optional[Dict[str, floa
     # heartbeat looks stale.
     for rid, record in list(_records.items()):
         status = str(record.get("status") or "")
-        if status in _ACTIVE_STATUSES:
+        if _is_retained_nonterminal(record, status=status):
             continue
         age = _record_terminal_age(record, now)
         if age > _terminal_retention_seconds(status, policy):
@@ -1520,7 +3497,7 @@ def _cleanup_locked(now: Optional[float] = None, policy: Optional[Dict[str, floa
     terminal = [
         (rid, r)
         for rid, r in _records.items()
-        if r.get("status") not in _ACTIVE_STATUSES
+        if not _is_retained_nonterminal(r)
     ]
     terminal.sort(
         key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0
@@ -2269,6 +4246,44 @@ def _mark_bestplan_completed_unverified(
         return False
 
 
+def _mark_bestplan_cancelled_terminal(record: Dict[str, Any]) -> bool:
+    """Close the canonical plan once for an extinct cancelled delegation."""
+
+    plan_id = str(record.get("bestplan_plan_id") or "")
+    state_path = record.get("bestplan_state_db_path")
+    if not plan_id or not state_path:
+        return False
+    try:
+        from agent.bestplan_state import BestplanStore, PlanState
+
+        plan_store = BestplanStore(
+            db_path=Path(_canonical_bestplan_state_db_path(state_path))
+        )
+        try:
+            row = plan_store.get_plan(plan_id)
+        finally:
+            plan_store.close()
+        if not isinstance(row, Mapping):
+            return False
+        if (
+            row.get("state")
+            in {PlanState.COMPLETED_UNVERIFIED, PlanState.FAILED}
+            and row.get("dispatch_state") == "terminal"
+            and not row.get("dispatch_owner")
+        ):
+            return True
+    except Exception:
+        logger.warning(
+            "BestPlan cancelled terminal state could not be read for %s",
+            plan_id,
+            exc_info=True,
+        )
+        return False
+    return _mark_bestplan_completed_unverified(
+        record, _event_for_interrupted_record(record),
+    )
+
+
 def dispatch_async_delegation_batch(
     *,
     goals: List[str],
@@ -2289,6 +4304,7 @@ def dispatch_async_delegation_batch(
     origin_tracker_path: str = "",
     bestplan_plan_id: str = "",
     bestplan_state_db_path: str = "",
+    bestplan_review_job_id: str = "",
     bestplan_local_execution: bool = False,
     resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
     terminal_callback: Optional[
@@ -2329,6 +4345,7 @@ def dispatch_async_delegation_batch(
             origin_tracker_path=origin_tracker_path,
             bestplan_plan_id=bestplan_plan_id,
             bestplan_state_db_path=canonical_state_db_path,
+            bestplan_review_job_id=bestplan_review_job_id,
             bestplan_local_execution=(
                 bool(bestplan_plan_id) and bestplan_local_execution is True
             ),
@@ -2357,6 +4374,7 @@ def _dispatch_async_delegation_batch_admitted(
     origin_tracker_path: str = "",
     bestplan_plan_id: str = "",
     bestplan_state_db_path: str = "",
+    bestplan_review_job_id: str = "",
     bestplan_local_execution: bool = False,
     resolved_runtimes: Optional[List[Dict[str, Any]]] = None,
     terminal_callback: Optional[
@@ -2400,7 +4418,7 @@ def _dispatch_async_delegation_batch_admitted(
             existing = (persisted.get("records") or {}).get(delegation_id)
         if isinstance(existing, dict):
             phase = str(existing.get("status") or (existing.get("record") or {}).get("status") or "")
-            if phase in _ACTIVE_STATUSES:
+            if phase in _ACTIVE_STATUSES or phase in _DURABLE_NONTERMINAL_STATUSES:
                 owner_record = existing.get("record") or {}
                 owner_liveness = _owner_liveness(owner_record)
                 if phase == "scheduled" and owner_liveness is False:
@@ -2466,6 +4484,11 @@ def _dispatch_async_delegation_batch_admitted(
         "parent_session_id": parent_session_id,
         "bestplan_plan_id": bestplan_plan_id,
         "bestplan_state_db_path": bestplan_state_db_path,
+        "bestplan_review_job_id": (
+            str(bestplan_review_job_id)
+            if bestplan_local_execution is True and bestplan_plan_id
+            else ""
+        ),
         "bestplan_local_execution": (
             bool(bestplan_plan_id) and bestplan_local_execution is True
         ),
@@ -2596,6 +4619,7 @@ def _dispatch_async_delegation_batch_admitted(
             return
         combined: Dict[str, Any] = {}
         status = "error"
+        review_handed_off = False
         try:
             combined = runner() or {}
             child_results = combined.get("results") or []
@@ -2604,7 +4628,11 @@ def _dispatch_async_delegation_batch_admitted(
                 # result phase; ordinary delegated workers retain the legacy
                 # completed/success contract.
                 status = (
-                    "completed"
+                    (
+                        "completed"
+                        if bestplan_local_execution
+                        else "candidate_ready"
+                    )
                     if child_results
                     and all(r.get("status") == "frozen" for r in child_results)
                     else "error"
@@ -2617,19 +4645,45 @@ def _dispatch_async_delegation_batch_admitted(
             else:
                 status = "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
-            logger.exception("Async delegation batch %s crashed", delegation_id)
-            combined = {
-                "results": [],
-                "error": (
-                    "candidate_batch_failed"
-                    if bestplan_plan_id
-                    else f"{type(exc).__name__}: {exc}"
-                ),
-                "total_duration_seconds": round(time.time() - dispatched_at, 2),
-            }
-            status = "error"
+            reason_code = str(
+                getattr(exc, "code", "") or type(exc).__name__
+            )
+            if bestplan_local_execution and _handoff_running_bestplan_review(
+                delegation_id, reason_code=reason_code,
+            ):
+                review_handed_off = True
+            else:
+                logger.exception(
+                    "Async delegation batch %s crashed", delegation_id
+                )
+                combined = {
+                    "results": [],
+                    "error": (
+                        "candidate_batch_failed"
+                        if bestplan_plan_id
+                        else f"{type(exc).__name__}: {exc}"
+                    ),
+                    "total_duration_seconds": round(
+                        time.time() - dispatched_at, 2
+                    ),
+                }
+                status = "error"
         finally:
-            _finalize_batch(delegation_id, combined, status)
+            if not review_handed_off:
+                with _records_lock:
+                    terminal_record = dict(
+                        _records.get(delegation_id) or {}
+                    )
+                if _finalize_durable_review_cancel(terminal_record):
+                    combined = {
+                        "results": [],
+                        "error": "interrupted after child extinction",
+                        "total_duration_seconds": round(
+                            time.time() - dispatched_at, 2
+                        ),
+                    }
+                    status = "interrupted"
+                _finalize_batch(delegation_id, combined, status)
 
     try:
         # Propagate the dispatching profile to the detached batch children.
@@ -2826,19 +4880,140 @@ def list_async_delegations() -> List[Dict[str, Any]]:
     return [_serialise_record(r, now) for r in records]
 
 
+def _signal_interrupt_with_durable_review_cancel(
+    target: Dict[str, Any],
+    *,
+    signal_children: Callable[[], object],
+) -> bool:
+    """Persist a stop and report a durable pre-review no-child proof."""
+
+    if (
+        target.get("bestplan_local_execution") is not True
+        or not target.get("bestplan_plan_id")
+        or not target.get("bestplan_review_job_id")
+        or not target.get("bestplan_state_db_path")
+    ):
+        signal_children()
+        return False
+
+    try:
+        from agent.review_engine import (
+            ReviewLeaseConflict,
+            ReviewStore,
+            ReviewValidationError,
+        )
+
+        state_db_path = _canonical_bestplan_state_db_path(
+            target.get("bestplan_state_db_path")
+        )
+        store = ReviewStore(state_db_path)
+        job_id = str(target["bestplan_review_job_id"])
+        try:
+            job = store.get_job(job_id)
+        except ReviewValidationError:
+            cancelled_pipeline = store.request_execution_pipeline_cancel(
+                plan_id=str(target.get("bestplan_plan_id") or ""),
+                delegation_id=str(target.get("delegation_id") or ""),
+                job_id=job_id,
+            )
+            if cancelled_pipeline:
+                pipeline = store.get_execution_pipeline(
+                    str(target.get("bestplan_plan_id") or "")
+                )
+                no_active_attempt = bool(
+                    pipeline.active_attempt_ordinal is None
+                    and pipeline.attempt_owner_pid is None
+                    and pipeline.attempt_owner_process_start_id is None
+                )
+                signal_children()
+                return no_active_attempt
+            # Review creation won the same database fence. Continue through
+            # the normal durable review cancellation path.
+            job = store.get_job(job_id)
+    except ReviewValidationError:
+        raise ReviewLeaseConflict(
+            "BestPlan cancellation has no durable execution target"
+        ) from None
+
+    if (
+        job.source_kind != "bestplan_integration"
+        or job.source_id != str(target.get("bestplan_plan_id") or "")
+    ):
+        raise ReviewLeaseConflict("review job identity does not match BestPlan")
+    if job.state in {"landing_claimed", "landed"}:
+        raise ReviewLeaseConflict("landing_already_claimed")
+    if job.cancel_requested:
+        signal_children()
+        return False
+    if job.owner_id is None or job.lease_expires_at_ns is None:
+        interrupt_owner = "review-interrupt-" + uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{target.get('delegation_id')}:{job_id}",
+        ).hex
+        job = store.claim_job(
+            job_id=job_id,
+            owner_id=interrupt_owner,
+            now_ns=time.time_ns(),
+            lease_duration_ns=30_000_000_000,
+            expected_fencing_token=job.fencing_token,
+        )
+    operation_id = "async-cancel-" + uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"{target.get('delegation_id')}:{job_id}",
+    ).hex
+    store.request_cancel(
+        job_id=job_id,
+        owner_id=str(job.owner_id),
+        fencing_token=job.fencing_token,
+        operation_id=operation_id,
+        signal_children=signal_children,
+    )
+    return False
+
+
+def _record_is_interruptible(record: Mapping[str, Any]) -> bool:
+    """Select exact durable phases that an operator can safely stop."""
+
+    phase = str(record.get("status") or "")
+    if phase in {
+        "scheduled", "running", "stalling",
+        "review_requeued", "review_waiting",
+    }:
+        return True
+    return bool(
+        phase in {"intent", "interrupting"}
+        and record.get("bestplan_local_execution") is True
+        and record.get("bestplan_plan_id")
+        and record.get("bestplan_review_job_id")
+        and record.get("bestplan_state_db_path")
+    )
+
+
 def _interrupt_records(
     targets: List[Dict[str, Any]], *, reason: str, source: str
 ) -> int:
     """Cancel not-yet-started work or request a truthful running interrupt."""
+    interruptible = {
+        "intent",
+        "scheduled",
+        "running",
+        "stalling",
+        "interrupting",
+        "review_requeued",
+        "review_waiting",
+    }
     count = 0
     for target in targets:
         delegation_id = str(target.get("delegation_id") or "")
         with _records_lock:
             live = _records.get(delegation_id)
-            if live is None or live.get("status") not in {"scheduled", "running", "stalling"}:
+            if live is None or live.get("status") not in interruptible:
                 continue
             phase = str(live.get("status"))
-            if phase == "scheduled":
+            if (
+                phase in {"intent", "scheduled"}
+                and live.get("owner_liveness") != "unknown"
+            ):
                 # Claim cancellation atomically before the gated worker can
                 # cross scheduled -> running. No callback acknowledgement is
                 # needed because user code has not begun.
@@ -2851,6 +5026,40 @@ def _interrupt_records(
                 scheduled_snapshot = None
 
         if scheduled_snapshot is not None:
+            if scheduled_snapshot.get("bestplan_local_execution") is True:
+                try:
+                    # The scheduled gate proves that no user child began. Keep
+                    # the tracker nonterminal until the exact durable pipeline
+                    # records both the stop request and child extinction.
+                    _signal_interrupt_with_durable_review_cancel(
+                        scheduled_snapshot,
+                        signal_children=lambda: None,
+                    )
+                    if not _finalize_durable_review_cancel(scheduled_snapshot):
+                        raise RuntimeError(
+                            "scheduled BestPlan cancellation was not finalized"
+                        )
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    with _records_lock:
+                        live = _records.get(delegation_id)
+                        if live is not None and live.get("status") == "interrupting":
+                            live["interrupt_error"] = error
+                            failed_snapshot = dict(live)
+                        else:
+                            failed_snapshot = None
+                    if failed_snapshot is not None:
+                        _persist_record(
+                            failed_snapshot,
+                            delivery_status="interrupting",
+                        )
+                    logger.debug(
+                        "%s: %s scheduled interrupt failed: %s",
+                        source,
+                        delegation_id,
+                        exc,
+                    )
+                    continue
             count += 1
             if scheduled_snapshot.get("is_batch"):
                 _finalize_batch(
@@ -2872,11 +5081,24 @@ def _interrupt_records(
             continue
 
         fn = target.get("interrupt_fn")
+        finalize_wait_without_worker = (
+            phase == "review_waiting"
+            and not callable(fn)
+            and target.get("owner_liveness") != "unknown"
+            and target.get("bestplan_local_execution") is True
+            and bool(target.get("bestplan_review_job_id"))
+        )
+        if (
+            not callable(fn)
+            and target.get("bestplan_local_execution") is True
+            and target.get("bestplan_review_job_id")
+        ):
+            fn = lambda: None
         if not callable(fn):
             error = "interrupt callback unavailable"
             with _records_lock:
                 live = _records.get(delegation_id)
-                if live is not None and live.get("status") in {"running", "stalling"}:
+                if live is not None and live.get("status") in interruptible:
                     live["interrupt_error"] = error
                     live["interrupt_requested_at"] = time.time()
                     failed_snapshot = dict(live)
@@ -2889,12 +5111,15 @@ def _interrupt_records(
                 )
             continue
         try:
-            fn()
+            durable_no_active_attempt = _signal_interrupt_with_durable_review_cancel(
+                target,
+                signal_children=fn,
+            )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             with _records_lock:
                 live = _records.get(delegation_id)
-                if live is not None and live.get("status") in {"running", "stalling"}:
+                if live is not None and live.get("status") in interruptible:
                     live["interrupt_error"] = error
                     live["interrupt_requested_at"] = time.time()
                     failed_snapshot = dict(live)
@@ -2908,9 +5133,104 @@ def _interrupt_records(
             logger.debug("%s: %s interrupt failed: %s", source, delegation_id, exc)
             continue
 
+        if durable_no_active_attempt:
+            with _records_lock:
+                live = _records.get(delegation_id)
+                if live is None or live.get("status") not in interruptible:
+                    continue
+                live["status"] = "interrupting"
+                live["delivery_status"] = "interrupting"
+                live["interrupt_requested_at"] = time.time()
+                live["interrupt_reason"] = reason
+                live.pop("interrupt_error", None)
+                live["interrupt_fn"] = None
+                interrupting_snapshot = dict(live)
+            _persist_record(
+                interrupting_snapshot, delivery_status="interrupting"
+            )
+            cancel_request = _bestplan_review_resume_request(
+                interrupting_snapshot,
+                tracker_path=interrupting_snapshot.get(
+                    "origin_tracker_path"
+                ) or None,
+                cancel_finalize_only=True,
+            )
+            if (
+                cancel_request is not None
+                and _finalize_durable_review_cancel(interrupting_snapshot)
+                and _terminalize_durable_review_cancel_tracker(cancel_request)
+            ):
+                count += 1
+                continue
+            if cancel_request is not None:
+                _retry_durable_review_cancel_finalization(cancel_request)
+            count += 1
+            continue
+
+        if finalize_wait_without_worker:
+            if not _finalize_durable_review_cancel(target):
+                error = "durable review cancellation was not finalized"
+                with _records_lock:
+                    live = _records.get(delegation_id)
+                    if live is not None and live.get("status") == "review_waiting":
+                        live["interrupt_error"] = error
+                        live["interrupt_requested_at"] = time.time()
+                        waiting_snapshot = dict(live)
+                    else:
+                        waiting_snapshot = None
+                if waiting_snapshot is not None:
+                    _persist_record(
+                        waiting_snapshot, delivery_status="review_waiting",
+                    )
+                    resume_request = _bestplan_review_resume_request(
+                        waiting_snapshot,
+                        tracker_path=waiting_snapshot.get(
+                            "origin_tracker_path"
+                        ) or None,
+                    )
+                    if resume_request is not None:
+                        _schedule_bestplan_review_recovery_retry(
+                            resume_request,
+                            reason_code="cancel_finalize_failed",
+                        )
+                count += 1
+                continue
+            with _records_lock:
+                live = _records.get(delegation_id)
+                if live is None or live.get("status") != "review_waiting":
+                    continue
+                live["status"] = "interrupting"
+                live["delivery_status"] = "interrupting"
+                live["interrupt_requested_at"] = time.time()
+                live["interrupt_reason"] = reason
+                live.pop("interrupt_error", None)
+                live["interrupt_fn"] = None
+            count += 1
+            if target.get("is_batch"):
+                _finalize_batch(
+                    delegation_id,
+                    {
+                        "results": [],
+                        "error": "interrupted after child extinction",
+                    },
+                    "interrupted",
+                )
+            else:
+                _finalize(
+                    delegation_id,
+                    {
+                        "status": "interrupted",
+                        "summary": "Async delegation review was interrupted.",
+                        "error": "interrupted after child extinction",
+                        "exit_reason": "interrupted",
+                    },
+                    "interrupted",
+                )
+            continue
+
         with _records_lock:
             live = _records.get(delegation_id)
-            if live is None or live.get("status") not in {"running", "stalling"}:
+            if live is None or live.get("status") not in interruptible:
                 continue
             live["status"] = "interrupting"
             live["delivery_status"] = "interrupting"
@@ -2938,7 +5258,7 @@ def interrupt_all(reason: str = "shutdown") -> int:
     with _records_lock:
         targets = [
             r for r in _records.values()
-            if r.get("status") in {"scheduled", "running", "stalling"}
+            if _record_is_interruptible(r)
         ]
     count = _interrupt_records(targets, reason=reason, source="interrupt_all")
     if count:
@@ -2958,7 +5278,7 @@ def interrupt_for_session(
     with _records_lock:
         targets = [
             r for r in _records.values()
-            if r.get("status") in {"scheduled", "running", "stalling"}
+            if _record_is_interruptible(r)
             and _matches_session_selectors(
                 r,
                 session_key=session_key,

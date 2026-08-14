@@ -480,10 +480,19 @@ def test_local_runtime_path_capture_uses_one_streaming_budget(
     import agent.bestplan_sandbox as bestplan_sandbox
 
     launcher = tmp_path / "venv" / "bin" / "python"
-    executable = tmp_path / "runtime" / "python3.11"
+    executable = tmp_path / "runtime" / "bin" / "python3.11"
     pyvenv = launcher.parent.parent / "pyvenv.cfg"
     runtime_root = tmp_path / "runtime" / "lib" / "python3.11"
-    for path in (launcher.parent, executable.parent, runtime_root, pyvenv.parent):
+    site_root = (
+        launcher.parent.parent / "lib" / "python3.11" / "site-packages"
+    )
+    for path in (
+        launcher.parent,
+        executable.parent,
+        runtime_root,
+        site_root,
+        pyvenv.parent,
+    ):
         path.mkdir(parents=True, exist_ok=True)
     launcher.symlink_to(executable)
     executable.write_bytes(b"python")
@@ -496,7 +505,7 @@ def test_local_runtime_path_capture_uses_one_streaming_budget(
     monkeypatch.setattr(
         bestplan_sandbox,
         "pinned_candidate_runtime_paths",
-        lambda _path: (runtime_root,),
+        lambda _path: (runtime_root, site_root),
     )
 
     def stable_identity(path, identity_budget):
@@ -518,9 +527,39 @@ def test_local_runtime_path_capture_uses_one_streaming_budget(
         cancel_event=None,
     )
 
-    assert {item.path for item in pins} == {pyvenv, runtime_root}
-    assert {path for path, _budget in seen} == {pyvenv, runtime_root}
+    assert {item.path for item in pins} == {pyvenv, runtime_root, site_root}
+    assert {path for path, _budget in seen} == {
+        pyvenv,
+        runtime_root,
+        site_root,
+    }
     assert all(identity_budget is budget for _path, identity_budget in seen)
+
+
+def test_local_python_launch_canonicalizes_symlinked_parent_only(tmp_path):
+    from agent.bestplan_local import _local_python_launch
+
+    real_home = tmp_path / "real-home"
+    alias_home = tmp_path / "alias-home"
+    launcher = real_home / "venv" / "bin" / "python"
+    executable = real_home / "runtime" / "bin" / "python3.11"
+    pyvenv = real_home / "venv" / "pyvenv.cfg"
+    launcher.parent.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python")
+    executable.chmod(0o755)
+    launcher.symlink_to(executable)
+    pyvenv.write_text("home = /runtime\n", encoding="utf-8")
+    alias_home.symlink_to(real_home, target_is_directory=True)
+
+    pinned_launcher, resolved, pinned_pyvenv = _local_python_launch(
+        alias_home / "venv" / "bin" / "python"
+    )
+
+    assert pinned_launcher == launcher
+    assert pinned_launcher.is_symlink()
+    assert resolved == executable
+    assert pinned_pyvenv == pyvenv
 
 
 def test_local_python_check_detection_is_host_owned_and_process_fixed(tmp_path):
@@ -819,6 +858,359 @@ class _ProjectedCompletions(_FakeCompletions):
         body["choices"][0]["provider_route"] = "https://provider.invalid/v1"
         body["choices"][0]["message"]["credential"] = "nested-message-secret"
         return SimpleNamespace(model_dump=lambda mode="json": body)
+
+
+def _review_runtime(
+    route: str,
+    provider: str,
+    model: str,
+    *,
+    api_key: str = "review-secret",
+):
+    runtime_fingerprint = hashlib.sha256(
+        f"{route}\0{provider}\0{model}".encode("utf-8")
+    ).hexdigest()
+    return {
+        "route": route,
+        "provider": provider,
+        "model": model,
+        "base_url": "",
+        "api_mode": "chat_completions",
+        "api_key": api_key,
+        "no_auth": False,
+        "request_overrides": {},
+        "runtime_fingerprint": runtime_fingerprint,
+    }
+
+
+def _review_response(
+    model: str,
+    *,
+    content='{"findings":[]}',
+    tool_calls=None,
+):
+    return {
+        "id": "chatcmpl-review",
+        "object": "chat.completion",
+        "created": 1,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
+                },
+            },
+        ],
+        "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 1,
+            "total_tokens": 4,
+        },
+    }
+
+
+def test_local_review_authority_builder_binds_exact_diverse_slots():
+    from agent.bestplan_local import (
+        LocalBestplanAuthority,
+        build_local_review_authority_bindings,
+    )
+
+    bindings = build_local_review_authority_bindings([
+        _review_runtime(
+            "code_worker",
+            "openrouter",
+            "qwen/qwen3-coder",
+            api_key="code-worker-secret",
+        ),
+        _review_runtime(
+            "smart_reviewer",
+            "anthropic",
+            "claude-sonnet-4-6",
+            api_key="smart-reviewer-secret",
+        ),
+    ])
+
+    assert [item.slot for item in bindings] == ["smart_reviewer", "code_worker"]
+    assert [item.provider for item in bindings] == ["anthropic", "openrouter"]
+    assert [item.model for item in bindings] == [
+        "claude-sonnet-4-6",
+        "qwen/qwen3-coder",
+    ]
+    assert [item.model_family for item in bindings] == ["claude", "qwen"]
+    assert all(isinstance(item.authority, LocalBestplanAuthority) for item in bindings)
+    assert bindings[0].authority is not bindings[1].authority
+    rendered = repr(bindings)
+    assert "smart-reviewer-secret" not in rendered
+    assert "code-worker-secret" not in rendered
+
+
+def test_local_review_authority_bindings_refresh_for_each_generation():
+    from agent.bestplan_local import (
+        build_local_review_authority_bindings,
+        refresh_local_review_authority_bindings,
+    )
+
+    first = build_local_review_authority_bindings([
+        _review_runtime(
+            "smart_reviewer",
+            "anthropic",
+            "claude-sonnet-4-6",
+            api_key="smart-reviewer-secret",
+        ),
+        _review_runtime(
+            "code_worker",
+            "openrouter",
+            "qwen/qwen3-coder",
+            api_key="code-worker-secret",
+        ),
+    ])
+
+    second = refresh_local_review_authority_bindings(first)
+
+    assert [
+        (item.slot, item.provider, item.model, item.model_family)
+        for item in second
+    ] == [
+        (item.slot, item.provider, item.model, item.model_family)
+        for item in first
+    ]
+    assert all(
+        refreshed.authority is not original.authority
+        for original, refreshed in zip(first, second)
+    )
+    rendered = repr(second)
+    assert "smart-reviewer-secret" not in rendered
+    assert "code-worker-secret" not in rendered
+
+
+@pytest.mark.parametrize(
+    "runtimes,match",
+    [
+        (
+            [_review_runtime("smart_reviewer", "anthropic", "claude-sonnet-4-6")],
+            "exactly two",
+        ),
+        (
+            [
+                _review_runtime("smart_reviewer", "anthropic", "claude-sonnet-4-6"),
+                _review_runtime("smart_reviewer", "openrouter", "qwen/qwen3-coder"),
+            ],
+            "slots",
+        ),
+        (
+            [
+                _review_runtime("smart_reviewer", "anthropic", "claude-sonnet-4-6"),
+                _review_runtime("other", "openrouter", "qwen/qwen3-coder"),
+            ],
+            "slots",
+        ),
+        (
+            [
+                _review_runtime("smart_reviewer", "anthropic", "claude-sonnet-4-6"),
+                _review_runtime("code_worker", "custom", "private-special-model"),
+            ],
+            "family",
+        ),
+        (
+            [
+                _review_runtime("smart_reviewer", "anthropic", "claude-sonnet-4-6"),
+                _review_runtime(
+                    "code_worker",
+                    "bedrock",
+                    "us.anthropic.claude-sonnet-4-6-v1:0",
+                ),
+            ],
+            "distinct",
+        ),
+    ],
+)
+def test_local_review_authority_builder_fails_closed(runtimes, match):
+    from agent.bestplan_local import (
+        LocalGoValidationError,
+        build_local_review_authority_bindings,
+    )
+
+    with pytest.raises(LocalGoValidationError, match=match):
+        build_local_review_authority_bindings(runtimes)
+
+
+def test_local_review_call_is_one_shot_canonical_and_has_no_tools(monkeypatch):
+    from agent.bestplan_authority_client import AuthorityProtocolError
+    from agent.bestplan_local import (
+        build_local_review_authority_bindings,
+        call_local_review_authority,
+    )
+
+    provider_calls: list[dict] = []
+    model = "claude-sonnet-4-6"
+
+    def resolve(provider, requested_model, **kwargs):
+        assert provider == "anthropic"
+        return SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **call: (
+                        provider_calls.append(call)
+                        or SimpleNamespace(
+                            model_dump=lambda mode="json": _review_response(model)
+                        )
+                    )
+                )
+            )
+        ), requested_model
+
+    monkeypatch.setattr("agent.bestplan_local.resolve_provider_client", resolve)
+    binding = build_local_review_authority_bindings([
+        _review_runtime("smart_reviewer", "anthropic", model),
+        _review_runtime("code_worker", "openrouter", "qwen/qwen3-coder"),
+    ])[0]
+    request = {
+        "messages": [
+            {"role": "system", "content": "Return JSON. Do not use tools."},
+            {"role": "user", "content": "review packet"},
+        ],
+        "tools": [],
+    }
+
+    assert call_local_review_authority(
+        binding, request, max_output_tokens=321,
+    ) == '{"findings":[]}'
+    assert provider_calls == [{
+        "max_completion_tokens": 321,
+        "messages": request["messages"],
+        "model": model,
+        "stream": False,
+        "tools": [],
+    }]
+    with pytest.raises(AuthorityProtocolError, match="already used"):
+        call_local_review_authority(binding, request, max_output_tokens=321)
+    assert len(provider_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "review_request,max_output_tokens",
+    [
+        ({"messages": [], "tools": [{"type": "function"}]}, 64),
+        ({"messages": []}, 64),
+        ({"messages": [], "tools": [], "stream": False}, 64),
+        ({"messages": [{"role": "user", "content": "review"}], "tools": []}, 0),
+        (
+            {"messages": [{"role": "user", "content": "review"}], "tools": []},
+            True,
+        ),
+        (
+            {"messages": [{"role": "user", "content": "review"}], "tools": []},
+            8193,
+        ),
+    ],
+)
+def test_local_review_call_rejects_noncanonical_or_unbounded_input(
+    monkeypatch, review_request, max_output_tokens,
+):
+    from agent.bestplan_authority_client import AuthorityProtocolError
+    from agent.bestplan_local import (
+        build_local_review_authority_bindings,
+        call_local_review_authority,
+    )
+
+    provider_calls: list[dict] = []
+    monkeypatch.setattr(
+        "agent.bestplan_local.resolve_provider_client",
+        lambda provider, model, **kwargs: (
+            SimpleNamespace(
+                chat=SimpleNamespace(
+                    completions=SimpleNamespace(
+                        create=lambda **call: provider_calls.append(call)
+                    )
+                )
+            ),
+            model,
+        ),
+    )
+    binding = build_local_review_authority_bindings([
+        _review_runtime("smart_reviewer", "anthropic", "claude-sonnet-4-6"),
+        _review_runtime("code_worker", "openrouter", "qwen/qwen3-coder"),
+    ])[0]
+
+    with pytest.raises(AuthorityProtocolError):
+        call_local_review_authority(
+            binding, review_request, max_output_tokens=max_output_tokens,
+        )
+    assert provider_calls == []
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (
+            lambda body: body["choices"][0]["message"].__setitem__(
+                "tool_calls",
+                [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            ),
+            "tool calls",
+        ),
+        (
+            lambda body: body["choices"][0]["message"].__setitem__(
+                "content", None,
+            ),
+            "text",
+        ),
+        (lambda body: body.__setitem__("model", "other-model"), "model"),
+        (lambda body: body.pop("usage"), "incomplete"),
+        (
+            lambda body: body["choices"][0]["message"].__setitem__(
+                "content", "not-json",
+            ),
+            "JSON object",
+        ),
+    ],
+)
+def test_local_review_call_rejects_invalid_provider_response(
+    monkeypatch, mutate, match,
+):
+    from agent.bestplan_authority_client import AuthorityProtocolError
+    from agent.bestplan_local import (
+        build_local_review_authority_bindings,
+        call_local_review_authority,
+    )
+
+    model = "claude-sonnet-4-6"
+    body = _review_response(model)
+    mutate(body)
+    monkeypatch.setattr(
+        "agent.bestplan_local.resolve_provider_client",
+        lambda provider, requested_model, **kwargs: (
+            SimpleNamespace(
+                chat=SimpleNamespace(
+                    completions=SimpleNamespace(
+                        create=lambda **call: SimpleNamespace(
+                            model_dump=lambda mode="json": body
+                        )
+                    )
+                )
+            ),
+            requested_model,
+        ),
+    )
+    binding = build_local_review_authority_bindings([
+        _review_runtime("smart_reviewer", "anthropic", model),
+        _review_runtime("code_worker", "openrouter", "qwen/qwen3-coder"),
+    ])[0]
+
+    with pytest.raises(AuthorityProtocolError, match=match):
+        call_local_review_authority(
+            binding,
+            {"messages": [{"role": "user", "content": "review"}], "tools": []},
+            max_output_tokens=64,
+        )
 
 
 def test_local_model_relay_binds_same_model_to_distinct_exact_routes(monkeypatch):

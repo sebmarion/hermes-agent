@@ -24,6 +24,7 @@ from agent.bestplan_source import (
     resolve_repo_identity,
 )
 from agent.bestplan_state import BestplanStore, PlanState
+from agent.review_engine import ReviewLeaseConflict, ReviewStore, ReviewTarget
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -223,12 +224,156 @@ def _target(snapshot, integration_oid: str) -> LocalMainPushTarget:
     )
 
 
+def _review_target(
+    store: BestplanStore,
+    snapshot,
+    integration_oid: str,
+    *,
+    plan_id: str = "bp-local",
+    generation: int = 0,
+    check_receipt_digest: str = "c" * 64,
+    diff_bytes: bytes = b"diff --git a/feature.py b/feature.py\n+reviewed\n",
+) -> ReviewTarget:
+    row = store.get_plan(plan_id)
+    assert row is not None
+    return ReviewTarget.bestplan_integration(
+        plan_id=plan_id,
+        generation=generation,
+        base_oid=snapshot.head_oid,
+        local_target_oid=snapshot.head_oid,
+        integration_oid=integration_oid,
+        integration_tree_oid=integration_oid,
+        integration_ref=(
+            f"refs/hermes-bestplan-integrations/{plan_id}/{generation}"
+        ),
+        integration_receipt_digest=hashlib.sha256(
+            f"integration-{generation}".encode()
+        ).hexdigest(),
+        check_receipt_digest=check_receipt_digest,
+        approval_digest=row["approval_digest"],
+        contract_digest=row["promotion_contract_digest"],
+        diff_sha256=hashlib.sha256(diff_bytes).hexdigest(),
+        acceptance_digest=hashlib.sha256(b"focused acceptance").hexdigest(),
+        policy_digest=hashlib.sha256(b"strict review policy").hexdigest(),
+    )
+
+
+def _seed_review_pass(
+    store: BestplanStore,
+    target: ReviewTarget,
+    *,
+    job_id: str = "review-job-local",
+    recovery_identity: bool = False,
+):
+    review_store = ReviewStore(store.state_db_path)
+    plan_row = store.get_plan(target.plan_id)
+    recovery_fields = (
+        {
+            "adapter_version": "local-bestplan.v1",
+            "owner_session_id": str(plan_row["session_id"]),
+            "owner_profile": str(plan_row["profile"]),
+            "workspace": str(plan_row["workspace"]),
+            "adapter_state": {
+                "projected_results": [
+                    {"status": "frozen", "summary": "reviewed and landed"}
+                ],
+                "schema": "hermes.bestplan.local-review-adapter.v1",
+            },
+            "runtime_routes": [],
+        }
+        if recovery_identity and plan_row is not None
+        else {}
+    )
+    review_store.create_job(
+        job_id=job_id,
+        source_kind=target.source_kind,
+        source_id=target.plan_id,
+        target_digest=target.target_digest,
+        policy_digest=target.policy_digest,
+        integration_oid=target.integration_oid,
+        check_receipt_digest=target.check_receipt_digest,
+        **recovery_fields,
+    )
+    claim = review_store.claim_job(
+        job_id=job_id,
+        owner_id="review-worker",
+        now_ns=time.time_ns(),
+        lease_duration_ns=60_000_000_000,
+        expected_fencing_token=0,
+    )
+    review_store.begin_generation(
+        job_id=job_id,
+        generation=target.generation,
+        target=target,
+        owner_id="review-worker",
+        fencing_token=claim.fencing_token,
+        operation_id=f"generation-{target.generation}",
+    )
+    for slot in ("smart_reviewer", "code_worker"):
+        review_store.record_reviewer_receipt(
+            job_id=job_id,
+            generation=target.generation,
+            slot=slot,
+            target_digest=target.target_digest,
+            integration_oid=target.integration_oid,
+            output_digest=hashlib.sha256(f"output-{slot}".encode()).hexdigest(),
+            verdict_digest=hashlib.sha256(f"verdict-{slot}".encode()).hexdigest(),
+            passed=True,
+            owner_id="review-worker",
+            fencing_token=claim.fencing_token,
+            operation_id=f"receipt-{target.generation}-{slot}",
+        )
+    review_receipt_digest = hashlib.sha256(
+        target.canonical_json.encode("utf-8")
+    ).hexdigest()
+    review_store.record_generation_pass(
+        job_id=job_id,
+        generation=target.generation,
+        target_digest=target.target_digest,
+        integration_oid=target.integration_oid,
+        check_receipt_digest=target.check_receipt_digest,
+        review_receipt_digest=review_receipt_digest,
+        owner_id="review-worker",
+        fencing_token=claim.fencing_token,
+        operation_id=f"pass-{target.generation}",
+    )
+    return review_store, claim, review_receipt_digest
+
+
 def _prepare(
     store: BestplanStore,
     snapshot,
     integration_oid: str,
     *,
     expires_at: int | None = None,
+):
+    review_target = _review_target(store, snapshot, integration_oid)
+    _review_store, _claim, review_receipt_digest = _seed_review_pass(
+        store, review_target
+    )
+    return store.prepare_local_push(
+        "bp-local",
+        session_id="session-1",
+        profile="coder",
+        workspace=snapshot.repo.workspace,
+        expected_target_oid=snapshot.head_oid,
+        integration_oid=integration_oid,
+        check_set_digest="c" * 64,
+        review_target=review_target,
+        review_receipt_digest=review_receipt_digest,
+        target=_target(snapshot, integration_oid),
+        expires_at=expires_at or int(time.time()) + 600,
+    )
+
+
+def _prepare_with_review(
+    store: BestplanStore,
+    snapshot,
+    integration_oid: str,
+    *,
+    review_target: ReviewTarget,
+    review_receipt_digest: str,
+    push_target: LocalMainPushTarget | None = None,
 ):
     return store.prepare_local_push(
         "bp-local",
@@ -238,8 +383,10 @@ def _prepare(
         expected_target_oid=snapshot.head_oid,
         integration_oid=integration_oid,
         check_set_digest="c" * 64,
-        target=_target(snapshot, integration_oid),
-        expires_at=expires_at or int(time.time()) + 600,
+        review_target=review_target,
+        review_receipt_digest=review_receipt_digest,
+        target=push_target or _target(snapshot, integration_oid),
+        expires_at=int(time.time()) + 600,
     )
 
 
@@ -248,15 +395,32 @@ def _activate(
     snapshot,
     integration_oid: str,
 ) -> bool:
-    return store.activate_local_push(
+    review_store = ReviewStore(store.state_db_path)
+    review_job = review_store.get_job("review-job-local")
+    try:
+        authorization = store.claim_landing(
+            "bp-local",
+            owner_id=str(review_job.owner_id),
+            fencing_token=review_job.fencing_token,
+            owner_pid=os.getpid(),
+            owner_process_start_id="test-process-start",
+            operation_id="claim-landing",
+        )
+    except ReviewLeaseConflict:
+        return False
+    activated = store.activate_local_push(
         "bp-local",
         landing_receipt=LocalMainLandingReceipt(
             target_ref=LOCAL_MAIN_REF,
             old_oid=snapshot.head_oid,
             new_oid=integration_oid,
             check_receipt_digest="c" * 64,
+            authorization_digest=authorization.authorization_digest,
         ),
     )
+    if activated:
+        assert review_store.get_job("review-job-local").state == "landed"
+    return activated
 
 
 def _finalize_prepared_and_reopen(store: BestplanStore) -> BestplanStore:
@@ -320,6 +484,252 @@ def test_prepare_is_canonical_context_bound_and_durable_before_local_effect(tmp_
             "WHERE plan_id='bp-local'"
         ).fetchone()
     assert durable == (raw, "prepared")
+
+
+def test_prepare_consumes_the_exact_review_pass_in_its_local_push_transaction(
+    tmp_path,
+):
+    repo = _repo(tmp_path)
+    snapshot = _snapshot(repo)
+    integration_oid = "1" * len(snapshot.head_oid)
+    store = _store(tmp_path)
+    _seed_local_plan(store, snapshot, integration_oid)
+    review_target = _review_target(store, snapshot, integration_oid)
+    review_store, _claim, review_receipt_digest = _seed_review_pass(
+        store, review_target
+    )
+    invalid_push_target = LocalMainPushTarget(
+        remote_name="sebmarion",
+        remote_ref=LOCAL_MAIN_REF,
+        display_url="ssh://user@git.example.invalid/project.git",
+        remote_identity_sha256=hashlib.sha256(b"exact remote").hexdigest(),
+        observed_remote_oid=snapshot.head_oid,
+        integration_oid=integration_oid,
+    )
+
+    assert _prepare_with_review(
+        store,
+        snapshot,
+        integration_oid,
+        review_target=review_target,
+        review_receipt_digest=review_receipt_digest,
+        push_target=invalid_push_target,
+    ) is None
+    assert review_store.get_job("review-job-local").state == "passed"
+    with sqlite3.connect(store.state_db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM review_pass_consumptions"
+        ).fetchone()[0] == 0
+
+    prepared = _prepare_with_review(
+        store,
+        snapshot,
+        integration_oid,
+        review_target=review_target,
+        review_receipt_digest=review_receipt_digest,
+    )
+
+    assert prepared is not None
+    assert prepared["review"] == {
+        "job_id": "review-job-local",
+        "target_digest": review_target.target_digest,
+        "receipt_digest": review_receipt_digest,
+    }
+    row = store.get_plan("bp-local")
+    assert row["review_job_id"] == "review-job-local"
+    assert row["review_target_digest"] == review_target.target_digest
+    assert row["review_receipt_digest"] == review_receipt_digest
+    assert row["current_phase"] == "captured"
+    assert row["proof_event_seq"] is None
+    assert row["verification_receipt_digest"] is None
+    assert review_store.get_job("review-job-local").state == "landing_prepared"
+    with sqlite3.connect(store.state_db_path) as connection:
+        consumption = connection.execute(
+            "SELECT consumer_plan_id, target_digest, review_receipt_digest "
+            "FROM review_pass_consumptions"
+        ).fetchone()
+    assert consumption == (
+        "bp-local",
+        review_target.target_digest,
+        review_receipt_digest,
+    )
+
+
+def test_prepare_rejects_wrong_review_target_or_pass_receipt_without_consuming(
+    tmp_path,
+):
+    repo = _repo(tmp_path)
+    snapshot = _snapshot(repo)
+    integration_oid = "1" * len(snapshot.head_oid)
+    store = _store(tmp_path)
+    _seed_local_plan(store, snapshot, integration_oid)
+    review_target = _review_target(store, snapshot, integration_oid)
+    review_store, _claim, review_receipt_digest = _seed_review_pass(
+        store, review_target
+    )
+    wrong_target = _review_target(
+        store,
+        snapshot,
+        integration_oid,
+        diff_bytes=b"diff --git a/feature.py b/feature.py\n+tampered\n",
+    )
+
+    assert _prepare_with_review(
+        store,
+        snapshot,
+        integration_oid,
+        review_target=wrong_target,
+        review_receipt_digest=review_receipt_digest,
+    ) is None
+    assert _prepare_with_review(
+        store,
+        snapshot,
+        integration_oid,
+        review_target=review_target,
+        review_receipt_digest="0" * 64,
+    ) is None
+    assert review_store.get_job("review-job-local").state == "passed"
+    assert store.get_plan("bp-local")["local_push_json"] is None
+
+
+def test_prepare_rejects_an_older_pass_after_a_later_generation_exists(tmp_path):
+    repo = _repo(tmp_path)
+    snapshot = _snapshot(repo)
+    integration_oid = "1" * len(snapshot.head_oid)
+    store = _store(tmp_path)
+    _seed_local_plan(store, snapshot, integration_oid)
+    first_target = _review_target(store, snapshot, integration_oid)
+    review_store, claim, first_receipt_digest = _seed_review_pass(
+        store, first_target
+    )
+    next_target = _review_target(
+        store,
+        snapshot,
+        "2" * len(snapshot.head_oid),
+        generation=1,
+        check_receipt_digest="d" * 64,
+        diff_bytes=b"diff --git a/feature.py b/feature.py\n+next\n",
+    )
+    review_store.begin_generation(
+        job_id="review-job-local",
+        generation=1,
+        target=next_target,
+        owner_id="review-worker",
+        fencing_token=claim.fencing_token,
+        operation_id="generation-1",
+    )
+
+    assert _prepare_with_review(
+        store,
+        snapshot,
+        integration_oid,
+        review_target=first_target,
+        review_receipt_digest=first_receipt_digest,
+    ) is None
+    assert store.get_plan("bp-local")["local_push_json"] is None
+
+
+def test_review_job_and_plan_binding_freeze_after_local_push_prepare(tmp_path):
+    repo = _repo(tmp_path)
+    snapshot = _snapshot(repo)
+    integration_oid = "1" * len(snapshot.head_oid)
+    store = _store(tmp_path)
+    _seed_local_plan(store, snapshot, integration_oid)
+    review_target = _review_target(store, snapshot, integration_oid)
+    review_store, claim, review_receipt_digest = _seed_review_pass(
+        store, review_target
+    )
+    assert _prepare_with_review(
+        store,
+        snapshot,
+        integration_oid,
+        review_target=review_target,
+        review_receipt_digest=review_receipt_digest,
+    ) is not None
+
+    cancelled = review_store.request_cancel(
+        job_id="review-job-local",
+        owner_id="review-worker",
+        fencing_token=claim.fencing_token,
+        operation_id="late-cancel",
+        signal_children=lambda: None,
+    )
+    assert cancelled.state == "cancel_requested"
+    with sqlite3.connect(store.state_db_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable|frozen"):
+            connection.execute(
+                "UPDATE bestplan_plans SET review_receipt_digest=? "
+                "WHERE plan_id='bp-local'",
+                ("0" * 64,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable|frozen"):
+            connection.execute(
+                "INSERT INTO review_generations "
+                "(job_id, generation, state, target_digest, integration_oid, "
+                "check_receipt_digest, target_json) "
+                "VALUES ('review-job-local', 1, 'reviewing', ?, ?, ?, '{}')",
+                ("0" * 64, integration_oid, "0" * 64),
+            )
+
+
+def test_restart_decode_preserves_and_validates_nested_review_binding(tmp_path):
+    repo = _repo(tmp_path)
+    snapshot = _snapshot(repo)
+    integration_oid = "1" * len(snapshot.head_oid)
+    store = _store(tmp_path)
+    _seed_local_plan(store, snapshot, integration_oid)
+    review_target = _review_target(store, snapshot, integration_oid)
+    _review_store, _claim, review_receipt_digest = _seed_review_pass(
+        store, review_target
+    )
+    prepared = _prepare_with_review(
+        store,
+        snapshot,
+        integration_oid,
+        review_target=review_target,
+        review_receipt_digest=review_receipt_digest,
+    )
+    assert prepared is not None
+    state_path = store.state_db_path
+    store.close()
+
+    reopened = BestplanStore(db_path=state_path, reconcile_push_state=False)
+    row = reopened.get_plan("bp-local")
+    decoded, _plan = __import__(
+        "agent.bestplan_local_push", fromlist=["decode_local_push_row"]
+    ).decode_local_push_row(
+        row,
+        __import__(
+            "agent.bestplan_state", fromlist=["_validate_stored_plan_row"]
+        )._validate_stored_plan_row,
+    )
+    assert decoded["review"] == prepared["review"]
+
+    tampered = json.loads(row["local_push_json"])
+    tampered["review"]["receipt_digest"] = "0" * 64
+    reopened._execute_write(
+        lambda connection: connection.execute(
+            "UPDATE bestplan_plans SET local_push_json=? WHERE plan_id='bp-local'",
+            (
+                json.dumps(
+                    tampered,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+    )
+    with pytest.raises(Exception, match="review|binding|differs"):
+        __import__(
+            "agent.bestplan_local_push", fromlist=["decode_local_push_row"]
+        ).decode_local_push_row(
+            reopened.get_plan("bp-local"),
+            __import__(
+                "agent.bestplan_state", fromlist=["_validate_stored_plan_row"]
+            )._validate_stored_plan_row,
+        )
 
 
 def test_activate_requires_the_exact_postflight_landing_receipt(tmp_path):
@@ -1325,6 +1735,18 @@ def test_restart_prompt_hides_ambiguous_invalid_expired_or_terminal_records(
         session_id="session-1",
         profile="coder",
     )
+    other_review_target = _review_target(
+        store,
+        snapshot,
+        other_oid,
+        plan_id="bp-other",
+        check_receipt_digest="d" * 64,
+    )
+    _other_review_store, other_claim, other_review_receipt = _seed_review_pass(
+        store,
+        other_review_target,
+        job_id="review-job-other",
+    )
     assert store.prepare_local_push(
         "bp-other",
         session_id="session-1",
@@ -1333,9 +1755,19 @@ def test_restart_prompt_hides_ambiguous_invalid_expired_or_terminal_records(
         expected_target_oid=snapshot.head_oid,
         integration_oid=other_oid,
         check_set_digest="d" * 64,
+        review_target=other_review_target,
+        review_receipt_digest=other_review_receipt,
         target=_target(snapshot, other_oid),
         expires_at=int(now) + 600,
     ) is not None
+    other_authorization = store.claim_landing(
+        "bp-other",
+        owner_id="review-worker",
+        fencing_token=other_claim.fencing_token,
+        owner_pid=os.getpid(),
+        owner_process_start_id="test-process-start",
+        operation_id="claim-landing-other",
+    )
     assert store.activate_local_push(
         "bp-other",
         landing_receipt=LocalMainLandingReceipt(
@@ -1343,6 +1775,7 @@ def test_restart_prompt_hides_ambiguous_invalid_expired_or_terminal_records(
             old_oid=snapshot.head_oid,
             new_oid=other_oid,
             check_receipt_digest="d" * 64,
+            authorization_digest=other_authorization.authorization_digest,
         ),
     )
     assert recover() is None

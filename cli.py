@@ -9662,6 +9662,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_fast_command(cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
+        elif canonical == "review":
+            parts = cmd_original.split(None, 1)
+            scope = parts[1].strip() if len(parts) > 1 else ""
+            if hasattr(self, "_pending_input"):
+                self._pending_input.put((
+                    scope,
+                    [],
+                    {
+                        "kind": "review",
+                        "config": {"scope": scope},
+                    },
+                ))
         elif canonical == "bestplan":
             self._handle_bestplan_command(cmd_original)
         elif canonical == "usage":
@@ -13328,10 +13340,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         parts = cmd_original.split(None, 1)
         args = parts[1].strip() if len(parts) > 1 else ""
         if not args:
-            requested = DEFAULT_EXPLORER_COUNT
-            task = (
-                "adversarial review of the previous plan in this conversation"
+            _cprint(
+                "  BestPlan unavailable: provide a task, or use /review "
+                "for manual review."
             )
+            return
         else:
             tokens = args.split(maxsplit=1)
             has_count = bool(tokens and tokens[0].isascii() and tokens[0].isdigit())
@@ -13340,7 +13353,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 "" if has_count else args
             )
             if not task:
-                _cprint("  BestPlan unavailable: provide a task after the count.")
+                _cprint(
+                    "  BestPlan unavailable: provide a task after the count, "
+                    "or use /review for manual review."
+                )
                 return
         if hasattr(self, "_pending_input"):
             self._pending_input.put((
@@ -13681,9 +13697,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _user_input: Any,
         *,
         bestplan_config: Optional[Dict[str, Any]],
+        review_config: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Return whether queued text may enter ordinary CLI control routing."""
-        return bestplan_config is None
+        return bestplan_config is None and review_config is None
 
     def chat(
         self,
@@ -13691,6 +13708,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         images: list = None,
         *,
         bestplan_config: Optional[Dict[str, Any]] = None,
+        review_config: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -13708,6 +13726,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             images: Optional list of Path objects for attached images
             bestplan_config: Trusted host-owned configuration supplied out of
                 band by the CLI command dispatcher.
+            review_config: Trusted host-owned manual-review scope supplied out
+                of band by the CLI command dispatcher.
             
         Returns:
             The agent's response, or None on error
@@ -13718,6 +13738,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _bestplan_cfg = (
             dict(bestplan_config) if bestplan_config is not None else None
         )
+        _review_cfg = dict(review_config) if review_config is not None else None
 
         # Reset the per-turn interrupt flag. Any subsequent path that
         # discovers an interrupt (below, after run_conversation) will flip
@@ -14017,33 +14038,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                     from agent.bestplan_local_push import try_resolve_local_push
 
-                    try:
-                        _go_result = try_resolve_local_push(
-                            message,
-                            session_id=str(getattr(self, "session_id", "") or ""),
-                            profile=str(os.environ.get("HERMES_PROFILE") or ""),
-                            workspace=os.getcwd(),
-                        )
-                    except Exception as _push_exc:
-                        if (
-                            isinstance(message, str)
-                            and message.strip().casefold() in {"push", "no"}
-                        ):
-                            _go_result = ResolvedGo(
-                                True,
-                                "push_stale",
-                                reason="local push resolver failed closed",
-                                error=str(_push_exc),
+                    if _review_cfg is not None:
+                        _go_result = None
+                    else:
+                        try:
+                            _go_result = try_resolve_local_push(
+                                message,
+                                session_id=str(getattr(self, "session_id", "") or ""),
+                                profile=str(os.environ.get("HERMES_PROFILE") or ""),
+                                workspace=os.getcwd(),
                             )
-                        else:
-                            _go_result = None
-                        logging.exception("bestplan local push resolver error")
+                        except Exception as _push_exc:
+                            if (
+                                isinstance(message, str)
+                                and message.strip().casefold() in {"push", "no"}
+                            ):
+                                _go_result = ResolvedGo(
+                                    True,
+                                    "push_stale",
+                                    reason="local push resolver failed closed",
+                                    error=str(_push_exc),
+                                )
+                            else:
+                                _go_result = None
+                            logging.exception("bestplan local push resolver error")
                     if (
                         (_go_result is None or not _go_result.resolved)
                         and _bestplan_cfg is not None
                     ):
                         _go_result = None
-                    elif _go_result is None or not _go_result.resolved:
+                    elif (
+                        _review_cfg is None
+                        and (_go_result is None or not _go_result.resolved)
+                    ):
                         try:
                             _go_result = try_resolve_go(
                                 message,
@@ -14073,31 +14100,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             host_agent=self.agent,
                         )
                     else:
-                        try:
-                            from agent.autonomy_shadow import submit_shadow_observation
+                        if _review_cfg is None:
+                            try:
+                                from agent.autonomy_shadow import submit_shadow_observation
 
-                            submit_shadow_observation(
-                                message,
-                                session_id=str(getattr(self, "session_id", "") or ""),
-                                source="cli",
-                                workspace=os.getcwd(),
-                                parent_agent=self.agent,
-                            )
-                        except Exception as _shadow_exc:
-                            logging.debug("autonomy ingress failed open: %s", _shadow_exc)
-                        result = self.agent.run_conversation(
-                            user_message=agent_message,
-                            conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
-                            stream_callback=stream_callback,
-                            task_id=self.session_id,
-                            persist_user_message=message if _voice_prefix else None,
-                            moa_config=_moa_cfg,
-                            bestplan_config=_bestplan_cfg,
-                        )
+                                submit_shadow_observation(
+                                    message,
+                                    session_id=str(getattr(self, "session_id", "") or ""),
+                                    source="cli",
+                                    workspace=os.getcwd(),
+                                    parent_agent=self.agent,
+                                )
+                            except Exception as _shadow_exc:
+                                logging.debug("autonomy ingress failed open: %s", _shadow_exc)
+                        _conversation_kwargs = {
+                            "user_message": agent_message,
+                            "conversation_history": self.conversation_history[:-1],
+                            "stream_callback": stream_callback,
+                            "task_id": self.session_id,
+                            "persist_user_message": message if _voice_prefix else None,
+                            "moa_config": _moa_cfg,
+                            "bestplan_config": _bestplan_cfg,
+                        }
+                        if _review_cfg is not None:
+                            _conversation_kwargs["review_config"] = _review_cfg
+                        result = self.agent.run_conversation(**_conversation_kwargs)
                         if _bestplan_cfg is not None:
                             result = _capture_cli_bestplan_result(
                                 result,
-                                invocation_message="/bestplan",
+                                invocation_message=f"/bestplan {message}".strip(),
                                 session_id=str(getattr(self, "session_id", "") or ""),
                                 profile=str(os.environ.get("HERMES_PROFILE") or ""),
                                 workspace=os.getcwd(),
@@ -17234,6 +17265,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     submit_images = []
                     _internal_meta = None
                     _bestplan_config = None
+                    _review_config = None
                     if isinstance(user_input, tuple):
                         if len(user_input) == 3:
                             user_input, submit_images, _internal_meta = user_input
@@ -17264,11 +17296,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             _cprint("  BestPlan unavailable: invalid internal turn metadata.")
                             continue
                         _bestplan_config = {"count": _raw_bestplan_count}
+                    elif isinstance(_internal_meta, dict) and _internal_meta.get("kind") == "review":
+                        _raw_review_config = _internal_meta.get("config")
+                        _raw_review_scope = (
+                            _raw_review_config.get("scope")
+                            if isinstance(_raw_review_config, dict)
+                            else None
+                        )
+                        if (
+                            not isinstance(_raw_review_scope, str)
+                            or set(_raw_review_config) != {"scope"}
+                        ):
+                            _cprint("  Review unavailable: invalid internal turn metadata.")
+                            continue
+                        _review_config = {"scope": _raw_review_scope}
 
                     _route_pending_input_controls = (
                         self._should_route_pending_input_controls(
                             user_input,
                             bestplan_config=_bestplan_config,
+                            review_config=_review_config,
                         )
                     )
 
@@ -17378,7 +17425,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        if _bestplan_config is None:
+                        if _review_config is not None:
+                            self.chat(
+                                user_input,
+                                images=submit_images or None,
+                                review_config=_review_config,
+                            )
+                        elif _bestplan_config is None:
                             self.chat(user_input, images=submit_images or None)
                         else:
                             self.chat(

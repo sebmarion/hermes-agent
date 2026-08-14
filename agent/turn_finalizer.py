@@ -760,6 +760,7 @@ def finalize_turn(
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "bestplan_receipt_metadata": getattr(agent, "_bestplan_receipt_metadata", None),
+        "bestplan_receipt_warning": getattr(agent, "_bestplan_receipt_warning", None),
         "model": agent.model,
         "provider": agent.provider,
         "base_url": agent.base_url,

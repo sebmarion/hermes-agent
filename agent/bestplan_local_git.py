@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import math
 import os
 import re
@@ -94,6 +95,7 @@ class LocalMainLandingReceipt:
     old_oid: str
     new_oid: str
     check_receipt_digest: str
+    authorization_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -201,11 +203,17 @@ def _run_uninterruptible_git_effect(
             )
         except OSError:
             raise LocalMainError("local main fast-forward could not start") from None
-        try:
-            returncode = process.wait()
-        except BaseException:
-            # Do not signal a possibly mutating Git process.  The durable
-            # prepared record and Git refs are the recovery authority.
+        wait_interrupted = False
+        while True:
+            try:
+                returncode = process.wait()
+                break
+            except BaseException:
+                # Do not signal a possibly mutating Git process or release its
+                # durable effect lock while it can still write.  Reap this
+                # exact child before recovery is allowed to observe the refs.
+                wait_interrupted = True
+        if wait_interrupted:
             raise LocalMainEffectUnknown(
                 "local main fast-forward outcome is unknown"
             ) from None
@@ -1470,11 +1478,30 @@ def land_checked_integration(
     integration: FrozenIntegration,
     checks: CheckSetReceipt,
     commands: Sequence[BoundCommand],
+    authorization: object | None = None,
     deadline: float,
 ) -> LocalMainLandingReceipt:
     """Fast-forward checked-out local ``main`` to one checked commit."""
 
+    from agent.review_engine import LandingAuthorization
+
     absolute_deadline = _validated_deadline(deadline)
+    if (
+        not isinstance(authorization, LandingAuthorization)
+        or not authorization.validate_digest()
+        or authorization.integration_oid != integration.integration_oid
+        or authorization.check_receipt_digest != checks.receipt_digest
+        or authorization.repository_id != snapshot.repo.repository_id
+        or authorization.owner_pid != os.getpid()
+    ):
+        raise LocalMainProofStale("local main landing authorization differs")
+    handle = authorization._lock_handle
+    try:
+        if handle.closed:
+            raise ValueError
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (AttributeError, OSError, ValueError):
+        raise LocalMainProofStale("local main landing authorization is stale") from None
     _assert_inputs(snapshot, integration, checks, commands)
     _assert_repository_identity(snapshot, deadline=absolute_deadline)
     _assert_target(
@@ -1550,4 +1577,5 @@ def land_checked_integration(
         old_oid=snapshot.head_oid,
         new_oid=integration.integration_oid,
         check_receipt_digest=checks.receipt_digest,
+        authorization_digest=authorization.authorization_digest,
     )

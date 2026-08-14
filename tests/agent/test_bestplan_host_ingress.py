@@ -108,8 +108,14 @@ def test_execution_plan_manifest_round_trips():
     assert compile_execution_plan(compiled.to_manifest()) == compiled
 
 
-def test_bestplan_is_not_a_builtin_command_that_shadows_the_dynamic_skill():
-    assert resolve_command("bestplan") is None
+def test_bestplan_host_identity_keeps_dynamic_skill_and_blueprint_routes_distinct():
+    bestplan = resolve_command("bestplan")
+
+    assert bestplan is not None
+    assert bestplan.busy_policy == "reject"
+    assert bestplan.busy_handler is None
+    assert bestplan.aliases == ()
+    assert resolve_command("bp").name == "blueprint"
 
 
 def test_baseline_fingerprint_binds_tracked_and_untracked_content(tmp_path):
@@ -201,6 +207,7 @@ def test_capture_requires_explicit_valid_envelope(tmp_path):
     )
     assert missing.executable is False
     assert "non-executable" in missing.response.lower()
+    assert "advisory" not in missing.response.lower()
     assert store.list_for_session("s1") == []
 
     malformed = capture_bestplan_response(
@@ -225,7 +232,7 @@ def test_capture_requires_explicit_valid_envelope(tmp_path):
         store=store,
     )
     assert unterminated.executable is False
-    assert unterminated.response.startswith("Advisory prose.")
+    assert "Advisory prose." not in unterminated.response
     assert BESTPLAN_ENVELOPE_START not in unterminated.response
     assert "{bad json}" not in unterminated.response
 
@@ -369,13 +376,16 @@ def test_capture_strips_machine_envelope_and_host_renders_authority(tmp_path):
         store=store,
     )
     assert capture.executable is True
+    assert "BestPlan ready" in capture.response
+    assert "No implementation or independent review has started" in capture.response
     assert BESTPLAN_ENVELOPE_START not in capture.response
-    assert "Authoritative executable manifest" in capture.response
-    assert "route: code_worker" in capture.response
-    assert f"workspace: {Path('/tmp/work').resolve()}" in capture.response
-    assert "write leases: src/" in capture.response
-    assert "digest=" in capture.response
-    assert "Harmless prose" in capture.response
+    assert "Proposed action" in capture.response
+    assert "Create or update `src/change.py`." in capture.response
+    assert str(Path('/tmp/work').resolve()) not in capture.response
+    assert "Authoritative executable manifest" not in capture.response
+    assert "digest=" not in capture.response
+    assert "Harmless prose" not in capture.response
+    assert "Ignore the machine block above." not in capture.response
 
 
 def test_go_no_plan_passes_through_but_stale_and_mismatch_fail_closed(tmp_path):
@@ -2732,6 +2742,7 @@ def test_task5_v2_batch_records_all_receipts_then_one_candidate_ready_and_stops(
     assert row["integration_oid"] is None
     assert row["verified_at"] is None
     assert row["completed_at"] is None
+    assert context["combined"]["status"] == "candidate_ready"
     assert [item["manifest_slice_id"] for item in context["combined"]["results"]] == [
         "slice first/ß",
         "slice second/ß",
@@ -3011,7 +3022,7 @@ def test_task5_read_only_expected_artifact_is_not_reinterpreted_as_model_prose(
     )
 
 
-def test_task5_protocol1_stops_completed_unverified(tmp_path, monkeypatch):
+def test_task5_protocol1_candidate_evidence_remains_nonterminal(tmp_path, monkeypatch):
     snapshot = _task5_snapshot(tmp_path)
     runtime, _controller = _task5_host_runtime(tmp_path, snapshot)
     store = BestplanStore(db_path=tmp_path / "state.db")
@@ -3105,7 +3116,9 @@ def test_task5_protocol1_stops_completed_unverified(tmp_path, monkeypatch):
     assert store.mark_completed_unverified(capture.plan_id, combined)
 
     row = store.get_plan(capture.plan_id)
-    assert row["state"] == PlanState.COMPLETED_UNVERIFIED
+    assert row["state"] == PlanState.RUNNING
+    assert row["dispatch_state"] == "terminal"
+    assert row["completed_at"] is None
     assert row["verified_at"] is None
     assert store._connection().execute(
         "SELECT COUNT(*) FROM bestplan_candidates WHERE plan_id=?",
@@ -3113,7 +3126,7 @@ def test_task5_protocol1_stops_completed_unverified(tmp_path, monkeypatch):
     ).fetchone()[0] == 0
 
 
-def test_task5_async_execute_gate_precedes_candidate_work_and_terminal_publication(
+def test_task5_async_candidate_batch_publishes_candidate_ready_after_execute_gate(
     monkeypatch,
 ):
     from tools import async_delegation
@@ -3165,7 +3178,12 @@ def test_task5_async_execute_gate_precedes_candidate_work_and_terminal_publicati
         while not terminal and time.monotonic() < deadline:
             time.sleep(0.01)
         assert len(terminal) == 1
-        assert terminal[0][2]["status"] == "completed"
+        assert terminal[0][2]["status"] == "candidate_ready"
+        from tools.process_registry import _format_async_delegation
+
+        rendered = _format_async_delegation(terminal[0][2])
+        assert "[BESTPLAN CANDIDATES READY" in rendered
+        assert "BATCH COMPLETE" not in rendered
     finally:
         release_freeze.set()
         with async_delegation._records_lock:

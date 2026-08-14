@@ -29,6 +29,7 @@ import uuid
 
 logger = logging.getLogger(__name__)
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -42,6 +43,7 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -5199,16 +5201,45 @@ _BESTPLAN_HOST_RUNTIME_DIGEST_DOMAIN = b"hermes.bestplan.host-runtime.v1\0"
 _BESTPLAN_CHANGED_PATHS_DIGEST_DOMAIN = b"hermes.bestplan.changed-paths.v1\0"
 _BESTPLAN_MAX_CAPABILITY_TTL_SECONDS = 86_400.0
 _BESTPLAN_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_BESTPLAN_RECOVERY_LEASE_DURATION_NS = 30_000_000_000
+_BESTPLAN_RECOVERY_HEARTBEAT_SECONDS = 10.0
+_BESTPLAN_EXECUTION_REQUEST_MAX_BYTES = 256 * 1024
 
 
 class BestplanCandidateBatchError(RuntimeError):
     """One or more isolated candidates failed or were cancelled."""
 
 
+class BestplanReviewRecoveryDeferred(RuntimeError):
+    """A durable review remains safe but cannot resume on this live host."""
+
+    def __init__(self, code: str):
+        self.code = str(code or "review_recovery_deferred")
+        super().__init__(self.code)
+
+
 class _BestplanPreflightError(ValueError):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+def _bestplan_execution_request_text(value: object) -> str:
+    """Return one exact bounded task prompt that a restart can reconstruct."""
+
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or "\x00" in value
+    ):
+        raise ValueError("BestPlan execution request is invalid")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("BestPlan execution request is invalid") from None
+    if len(encoded) > _BESTPLAN_EXECUTION_REQUEST_MAX_BYTES:
+        raise ValueError("BestPlan execution request is oversized")
+    return value
 
 
 @dataclass(frozen=True)
@@ -5436,6 +5467,25 @@ def _bestplan_safe_identifier(prefix: str, *values: object) -> str:
         separators=(",", ":"),
     ).encode("ascii")
     return f"{prefix}-{hashlib.sha256(payload).hexdigest()[:24]}"
+
+
+def _bestplan_execution_attempt_plan_id(
+    logical_plan_id: str,
+    attempt_ordinal: int,
+) -> str:
+    """Derive one collision-free artifact namespace from a durable ordinal."""
+
+    if (
+        not isinstance(logical_plan_id, str)
+        or not logical_plan_id
+        or isinstance(attempt_ordinal, bool)
+        or not isinstance(attempt_ordinal, int)
+        or attempt_ordinal < 0
+    ):
+        raise ValueError("BestPlan execution attempt identity is invalid")
+    return _bestplan_safe_identifier(
+        "execution-attempt", logical_plan_id, attempt_ordinal,
+    )
 
 
 def _bestplan_rebased_path(source_snapshot: object, raw_path: object) -> str:
@@ -5912,6 +5962,7 @@ def _preflight_bestplan_candidates(
     source_snapshot: object,
     candidate_host_runtime: BestplanHostRuntime,
     promotion_contract: Mapping[str, Any] | None,
+    identity_plan_id: str | None = None,
 ) -> list[dict[str, Any]]:
     from agent.bestplan_candidates import CandidateSpec
 
@@ -5948,7 +5999,7 @@ def _preflight_bestplan_candidates(
     except (TypeError, UnicodeError, ValueError):
         raise _BestplanPreflightError("protected_manifest_inconsistent") from None
 
-    raw_plan_id = str(plan_id or "")
+    raw_plan_id = str(identity_plan_id or plan_id or "")
     candidate_plan_id = (
         raw_plan_id
         if _BESTPLAN_IDENTIFIER_RE.fullmatch(raw_plan_id)
@@ -6240,6 +6291,7 @@ def _build_local_candidate_binding(
     snapshot: object,
     approval_digest: str,
     contract_digest: str,
+    candidate_base_oid: str | None = None,
 ) -> object:
     """Bind one live Task 4 result to the exact local integration input."""
 
@@ -6274,7 +6326,11 @@ def _build_local_candidate_binding(
         "commit_oid": frozen.commit_oid,
         "tree_oid": frozen.tree_oid,
         "changed_paths": tuple(frozen.changed_paths),
-        "base_oid": snapshot.head_oid,
+        "base_oid": (
+            snapshot.head_oid
+            if candidate_base_oid is None
+            else candidate_base_oid
+        ),
         "approval_digest": approval_digest,
         "contract_digest": contract_digest,
         "source_snapshot_digest": source_snapshot_digest(snapshot),
@@ -6289,35 +6345,3312 @@ def _build_local_candidate_binding(
     return CandidateIntegrationBinding(**values, binding_digest=binding_digest)
 
 
-def _finish_local_bestplan_batch(
+@dataclass(frozen=True)
+class _LocalBestplanReviewResult:
+    integration: object
+    checks: object
+    target: object
+    receipt: object
+    job_id: str
+    owner_id: str
+    fencing_token: int
+
+
+class _RecoveredReviewReceipt(NamedTuple):
+    receipt_digest: str
+    passed: bool = True
+
+
+def _bestplan_review_integration_payload(integration: object) -> dict[str, object]:
+    """Project one frozen integration into non-secret immutable recovery data."""
+
+    candidate_fields = (
+        "manifest_index",
+        "manifest_slice_id",
+        "slice_id",
+        "candidate_id",
+        "attempt_id",
+        "ref_name",
+        "commit_oid",
+        "tree_oid",
+        "policy_digest",
+        "candidate_receipt_digest",
+        "binding_digest",
+        "changed_paths_sha256",
+        "artifact_digests",
+    )
+    candidates = []
+    for candidate in tuple(getattr(integration, "candidates", ()) or ()):
+        item = {
+            name: getattr(candidate, name)
+            for name in candidate_fields
+        }
+        item["artifact_digests"] = [
+            list(pair) for pair in tuple(item["artifact_digests"] or ())
+        ]
+        candidates.append(item)
+    fields = (
+        "plan_id",
+        "approval_digest",
+        "contract_digest",
+        "source_snapshot_digest",
+        "target_ref",
+        "target_oid",
+        "integration_oid",
+        "tree_oid",
+        "ref_name",
+        "receipt_digest",
+    )
+    return {
+        "schema": "hermes.bestplan.frozen-integration-receipt.v1",
+        **{name: getattr(integration, name) for name in fields},
+        "candidates": candidates,
+    }
+
+
+def _bestplan_review_check_set_payload(checks: object) -> dict[str, object]:
+    """Project hashes and exit evidence for one immutable check set."""
+
+    receipt_fields = (
+        "integration_oid",
+        "command_id",
+        "command_digest",
+        "policy_digest",
+        "exit_code",
+        "stdout_sha256",
+        "stderr_sha256",
+        "stdout_size",
+        "stderr_size",
+        "output_framed_sha256",
+        "pre_tree_digest",
+        "post_tree_digest",
+        "receipt_digest",
+    )
+    ordered = []
+    for receipt in tuple(getattr(checks, "ordered_receipts", ()) or ()):
+        ordered.append({
+            name: getattr(receipt, name)
+            for name in receipt_fields
+        })
+    return {
+        "schema": "hermes.bestplan.check-set.v1",
+        "integration_oid": getattr(checks, "integration_oid"),
+        "contract_digest": getattr(checks, "contract_digest"),
+        "ordered_receipts": ordered,
+        "receipt_digest": getattr(checks, "receipt_digest"),
+    }
+
+
+def _bestplan_review_integration_from_payload(payload: object) -> object:
+    """Rebuild one frozen integration from its exact recovery receipt."""
+
+    from agent.bestplan_promotion import AppliedCandidate, FrozenIntegration
+
+    integration_fields = {
+        "approval_digest",
+        "candidates",
+        "contract_digest",
+        "integration_oid",
+        "plan_id",
+        "receipt_digest",
+        "ref_name",
+        "schema",
+        "source_snapshot_digest",
+        "target_oid",
+        "target_ref",
+        "tree_oid",
+    }
+    candidate_fields = {
+        "artifact_digests",
+        "attempt_id",
+        "binding_digest",
+        "candidate_id",
+        "candidate_receipt_digest",
+        "changed_paths_sha256",
+        "commit_oid",
+        "manifest_index",
+        "manifest_slice_id",
+        "policy_digest",
+        "ref_name",
+        "slice_id",
+        "tree_oid",
+    }
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != integration_fields
+        or payload.get("schema")
+        != "hermes.bestplan.frozen-integration-receipt.v1"
+        or not isinstance(payload.get("candidates"), list)
+    ):
+        raise ValueError("BestPlan recovery integration receipt is invalid")
+    candidates = []
+    for raw_candidate in payload["candidates"]:
+        if (
+            not isinstance(raw_candidate, Mapping)
+            or set(raw_candidate) != candidate_fields
+            or type(raw_candidate.get("manifest_index")) is not int
+            or not isinstance(raw_candidate.get("artifact_digests"), list)
+        ):
+            raise ValueError("BestPlan recovery candidate receipt is invalid")
+        artifact_digests = raw_candidate["artifact_digests"]
+        if any(
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or any(not isinstance(item, str) for item in pair)
+            for pair in artifact_digests
+        ):
+            raise ValueError("BestPlan recovery artifact digest is invalid")
+        values = dict(raw_candidate)
+        values["artifact_digests"] = tuple(
+            (pair[0], pair[1]) for pair in artifact_digests
+        )
+        try:
+            candidates.append(AppliedCandidate(**values))
+        except TypeError:
+            raise ValueError(
+                "BestPlan recovery candidate receipt is invalid"
+            ) from None
+    values = {name: payload[name] for name in integration_fields - {"schema"}}
+    values["candidates"] = tuple(candidates)
+    try:
+        return FrozenIntegration(**values)
+    except TypeError:
+        raise ValueError(
+            "BestPlan recovery integration receipt is invalid"
+        ) from None
+
+
+def _bestplan_review_check_set_from_payload(payload: object) -> object:
+    """Rebuild one immutable check set from its exact recovery receipt."""
+
+    from agent.bestplan_checks import CheckReceipt, CheckSetReceipt
+
+    set_fields = {
+        "contract_digest",
+        "integration_oid",
+        "ordered_receipts",
+        "receipt_digest",
+        "schema",
+    }
+    receipt_fields = {
+        "command_digest",
+        "command_id",
+        "exit_code",
+        "integration_oid",
+        "output_framed_sha256",
+        "policy_digest",
+        "post_tree_digest",
+        "pre_tree_digest",
+        "receipt_digest",
+        "stderr_sha256",
+        "stderr_size",
+        "stdout_sha256",
+        "stdout_size",
+    }
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != set_fields
+        or payload.get("schema") != "hermes.bestplan.check-set.v1"
+        or not isinstance(payload.get("ordered_receipts"), list)
+    ):
+        raise ValueError("BestPlan recovery check receipt is invalid")
+    receipts = []
+    for raw_receipt in payload["ordered_receipts"]:
+        if (
+            not isinstance(raw_receipt, Mapping)
+            or set(raw_receipt) != receipt_fields
+            or type(raw_receipt.get("exit_code")) is not int
+            or type(raw_receipt.get("stdout_size")) is not int
+            or type(raw_receipt.get("stderr_size")) is not int
+        ):
+            raise ValueError("BestPlan recovery check receipt is invalid")
+        try:
+            receipts.append(CheckReceipt(**dict(raw_receipt)))
+        except TypeError:
+            raise ValueError(
+                "BestPlan recovery check receipt is invalid"
+            ) from None
+    try:
+        return CheckSetReceipt(
+            integration_oid=payload["integration_oid"],
+            contract_digest=payload["contract_digest"],
+            ordered_receipts=tuple(receipts),
+            receipt_digest=payload["receipt_digest"],
+        )
+    except TypeError:
+        raise ValueError("BestPlan recovery check receipt is invalid") from None
+
+
+class LocalBestplanReviewRecoveryAdapter:
+    """Rebuild live review authorities and execute durable next actions."""
+
+    def __init__(self) -> None:
+        self._candidate_bindings: tuple[object, ...] = ()
+        self._candidate_runtimes: list[dict[str, Any]] = []
+        self._resolved_candidate_runtimes: list[dict[str, Any]] = []
+        self._review_bindings: tuple[object, ...] = ()
+        self._review_runtimes: list[dict[str, Any]] = []
+        self._state_db_path: Path | None = None
+        self._local_runtime: object | None = None
+        self._prepared_candidates: tuple[dict[str, Any], ...] = ()
+        self._cancel_event: threading.Event | None = None
+        self._bound_plan_context: dict[str, object] | None = None
+
+    def resolve_runtime_routes(
+        self,
+        *,
+        job: object,
+        request: Mapping[str, object],
+    ) -> list[dict[str, Any]]:
+        from agent.bestplan_local import (
+            build_local_authority_bindings,
+            build_local_review_authority_bindings,
+        )
+        from agent.bestplan_state import (
+            _local_review_runtime_tasks,
+            _plan_to_delegate_tasks,
+        )
+        from agent.execution_plan import compile_execution_plan
+
+        workspace = str(request.get("workspace") or "")
+        if workspace != str(getattr(job, "workspace", "")):
+            raise BestplanReviewRecoveryDeferred("review_workspace_changed")
+        try:
+            stored_routes = json.loads(str(job.runtime_routes_json))
+            if not isinstance(stored_routes, list):
+                raise ValueError
+            candidate_routes = [
+                dict(item)
+                for item in stored_routes
+                if isinstance(item, dict)
+                and str(item.get("route") or "").startswith("candidate-")
+            ]
+            candidate_runtimes: list[dict[str, Any]] = []
+            if candidate_routes:
+                if [item.get("route") for item in candidate_routes] != [
+                    f"candidate-{index}"
+                    for index in range(len(candidate_routes))
+                ]:
+                    raise ValueError
+                checkpoint = self._checkpoint_payload(job)
+                plan = compile_execution_plan(checkpoint.get("manifest"))
+                candidate_tasks = _plan_to_delegate_tasks(
+                    plan, workspace=workspace,
+                )
+                if len(candidate_tasks) != len(candidate_routes):
+                    raise ValueError
+                resolved_candidates = resolve_bestplan_runtime_specs(
+                    candidate_tasks,
+                    None,
+                    expected=candidate_routes,
+                    execution_protocol=2,
+                )
+                self._candidate_bindings = build_local_authority_bindings(
+                    resolved_candidates
+                )
+                self._resolved_candidate_runtimes = [
+                    dict(item) for item in resolved_candidates
+                ]
+                candidate_runtimes = [
+                    {**dict(item), "route": f"candidate-{index}"}
+                    for index, item in enumerate(resolved_candidates)
+                ]
+            review_tasks = _local_review_runtime_tasks(workspace)
+            review_runtimes = resolve_bestplan_runtime_specs(
+                review_tasks,
+                None,
+                execution_protocol=2,
+            )
+            review_bindings = build_local_review_authority_bindings(
+                review_runtimes
+            )
+        except BestplanReviewRecoveryDeferred:
+            raise
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "review_runtime_unavailable"
+            ) from None
+        self._candidate_runtimes = candidate_runtimes
+        self._review_runtimes = [dict(item) for item in review_runtimes]
+        self._review_bindings = tuple(review_bindings)
+        return [*self._candidate_runtimes, *self._review_runtimes]
+
+    def bind_request(self, request: Mapping[str, object]) -> None:
+        try:
+            path = Path(str(request["state_db_path"])).resolve(strict=True)
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "review_state_unavailable"
+            ) from None
+        self._state_db_path = path
+
+    def bind_cancel_event(self, cancel_event: threading.Event) -> None:
+        if not isinstance(cancel_event, threading.Event):
+            raise BestplanReviewRecoveryDeferred("review_cancel_invalid")
+        self._cancel_event = cancel_event
+
+    def cancel_for_lease_loss(self) -> None:
+        """Stop live recovery children after this process loses its lease."""
+
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+
+    def _check_cancelled(self, *, job: object | None = None) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise BestplanReviewRecoveryDeferred("review_cancelled")
+        if job is not None and self._state_db_path is not None:
+            try:
+                from agent.review_engine import ReviewStore
+
+                current = ReviewStore(self._state_db_path).get_job(job.job_id)
+            except Exception:
+                raise BestplanReviewRecoveryDeferred(
+                    "review_state_unavailable"
+                ) from None
+            if current.cancel_requested or current.state == "cancel_requested":
+                raise BestplanReviewRecoveryDeferred("review_cancelled")
+
+    @staticmethod
+    def _checkpoint_payload(job: object) -> dict[str, object]:
+        try:
+            payload = json.loads(str(job.adapter_state_json))
+        except (AttributeError, json.JSONDecodeError, TypeError):
+            raise BestplanReviewRecoveryDeferred(
+                "review_checkpoint_invalid"
+            ) from None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema")
+            != "hermes.bestplan.local-review-adapter.v1"
+        ):
+            raise BestplanReviewRecoveryDeferred("review_checkpoint_invalid")
+        return payload
+
+    @staticmethod
+    def _target_for_resume(store: object, resume: object) -> object:
+        try:
+            with store._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT target_json FROM review_generations
+                    WHERE job_id=? AND generation=?
+                    """,
+                    (resume.job_id, resume.generation),
+                ).fetchone()
+            if row is None:
+                raise ValueError
+            payload = json.loads(str(row["target_json"]))
+            from agent.review_engine import ReviewTarget
+
+            return ReviewTarget.bestplan_integration(
+                plan_id=payload["plan_id"],
+                generation=payload["generation"],
+                base_oid=payload["base_oid"],
+                local_target_oid=payload["local_target_oid"],
+                integration_oid=payload["integration_oid"],
+                integration_tree_oid=payload["integration_tree_oid"],
+                integration_ref=payload["integration_ref"],
+                integration_receipt_digest=payload[
+                    "integration_receipt_digest"
+                ],
+                check_receipt_digest=payload["check_receipt_digest"],
+                approval_digest=payload["approval_digest"],
+                contract_digest=payload["contract_digest"],
+                diff_sha256=payload["diff_sha256"],
+                acceptance_digest=payload["acceptance_digest"],
+                policy_digest=payload["policy_digest"],
+            )
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "review_checkpoint_invalid"
+            ) from None
+
+    def start_generation(self, **kwargs: object) -> dict[str, object]:
+        store = kwargs["store"]
+        job = kwargs["job"]
+        claim = kwargs["claim"]
+        resume = kwargs["resume"]
+        self._check_cancelled(job=job)
+        context = self._load_context(job=job, resume=resume)
+        bundle = context["bundle"]
+        store.begin_generation(
+            job_id=job.job_id,
+            generation=resume.generation,
+            target=bundle.target,
+            artifact=bundle.artifact,
+            owner_id=claim.owner_id,
+            fencing_token=claim.fencing_token,
+            operation_id=_bestplan_review_operation_id(
+                job.source_id, resume.generation, "generation-started",
+            ),
+        )
+        return {"status": "checkpoint_advanced"}
+
+    def initial_checks(self, **kwargs: object) -> dict[str, object]:
+        """Retry the unchanged initial integration before any repair action."""
+
+        from agent import bestplan_checks
+        from agent.bestplan_review import build_bestplan_review_bundle
+
+        store = kwargs["store"]
+        job = kwargs["job"]
+        claim = kwargs["claim"]
+        resume = kwargs["resume"]
+        self._check_cancelled(job=job)
+        plan_context = self._load_plan_context(job=job)
+        adapter_state = plan_context["adapter_state"]
+        pending = adapter_state.get("initial_check_pending")
+        if not isinstance(pending, Mapping):
+            raise BestplanReviewRecoveryDeferred(
+                "review_checkpoint_invalid"
+            )
+        execution = self._execution_context(
+            job=job, plan_context=plan_context,
+        )
+        validated = plan_context["validated"]
+        runtime = execution["runtime"]
+        try:
+            integration = _bestplan_review_integration_from_payload(
+                pending["integration"]
+            )
+            checks = bestplan_checks.run_integration_checks(
+                snapshot=validated.source_snapshot,
+                integration=integration,
+                contract=validated.contract,
+                commands=runtime.check_plan.commands,
+                runtime=runtime.check_runtime,
+                checks_root=runtime.checks_root,
+                deadline=time.monotonic() + runtime.operation_timeout_seconds,
+                cancel_event=self._cancel_event,
+            )
+        except bestplan_checks.CheckExecutionError as exc:
+            if "returned nonzero" not in str(exc):
+                raise BestplanReviewRecoveryDeferred(
+                    "checks_runtime_unavailable"
+                ) from None
+            failure_digest = hashlib.sha256(
+                b"hermes.bestplan.initial-check-failure.v1\0"
+                + str(exc).encode("utf-8")
+            ).hexdigest()
+            target = self._target_from_initial_check(
+                job=job,
+                plan_context=plan_context,
+                integration=integration,
+                check_receipt_digest=failure_digest,
+            )
+            failure_payload = _bestplan_initial_check_failure_payload(
+                check_error=exc, failure_digest=failure_digest,
+            )
+            store.record_initial_check_failure(
+                job_id=job.job_id,
+                target=target,
+                check_failure_digest=failure_digest,
+                blocking_findings_json=json.dumps(
+                    [failure_payload],
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                owner_id=claim.owner_id,
+                fencing_token=claim.fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    job.source_id, 0, "initial-check-failure",
+                ),
+            )
+            store.append_event(
+                job_id=job.job_id,
+                generation=0,
+                owner_id=claim.owner_id,
+                fencing_token=claim.fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    job.source_id, 0, "initial-checks-failed",
+                ),
+                kind="initial_checks_failed",
+                target_digest=target.target_digest,
+                payload={"failure_digest": failure_digest},
+            )
+            return {"status": "checkpoint_advanced"}
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "checks_runtime_unavailable"
+            ) from None
+        bundle = build_bestplan_review_bundle(
+            plan_id=job.source_id,
+            generation=0,
+            raw_request=plan_context["raw_request"],
+            plan=validated.plan,
+            snapshot=validated.source_snapshot,
+            integration=integration,
+            checks=checks,
+            contract=validated.contract,
+            approval_digest=validated.approval_digest,
+            policy_digest=job.policy_digest,
+            dispositions=(),
+            deadline=time.monotonic() + runtime.operation_timeout_seconds,
+            cancel_event=self._cancel_event,
+        )
+        check_receipt_json = json.dumps(
+            {
+                "check_set": _bestplan_review_check_set_payload(checks),
+                "dispositions": [],
+                "schema": "hermes.bestplan.review-checkpoint.v1",
+                "status": "passed",
+            },
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        store.resolve_initial_check_pending(
+            job_id=job.job_id,
+            target=bundle.target,
+            artifact=bundle.artifact,
+            check_receipt_json=check_receipt_json,
+            owner_id=claim.owner_id,
+            fencing_token=claim.fencing_token,
+            operation_id=_bestplan_review_operation_id(
+                job.source_id, 0, "initial-checks-passed",
+            ),
+        )
+        return {"status": "checkpoint_advanced"}
+
+    @staticmethod
+    def _target_from_initial_check(
+        *, job: object, plan_context: Mapping[str, object],
+        integration: object, check_receipt_digest: str,
+    ) -> object:
+        from agent.review_engine import ReviewTarget
+
+        validated = plan_context["validated"]
+        adapter_state = plan_context["adapter_state"]
+        raw_request = str(plan_context["raw_request"])
+        return ReviewTarget.bestplan_integration(
+            plan_id=job.source_id,
+            generation=0,
+            base_oid=validated.source_snapshot.head_oid,
+            local_target_oid=integration.target_oid,
+            integration_oid=integration.integration_oid,
+            integration_tree_oid=integration.tree_oid,
+            integration_ref=integration.ref_name,
+            integration_receipt_digest=integration.receipt_digest,
+            check_receipt_digest=check_receipt_digest,
+            approval_digest=validated.approval_digest,
+            contract_digest=str(adapter_state["contract_digest"]),
+            diff_sha256=hashlib.sha256(b"").hexdigest(),
+            acceptance_digest=hashlib.sha256(
+                b"hermes.bestplan.initial-check-acceptance.v1\0"
+                + raw_request.encode("utf-8")
+                + json.dumps(
+                    validated.plan.to_manifest(),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            policy_digest=job.policy_digest,
+        )
+
+    def review_missing_slots(self, **kwargs: object) -> dict[str, object]:
+        """Adopt complete slots and call only the durable missing reviewers."""
+
+        from agent.bestplan_local import (
+            LocalReviewAuthorityBinding,
+            call_local_review_authority,
+            refresh_local_review_authority_bindings,
+        )
+        from agent.review_engine import (
+            ReviewLeaseConflict,
+            ReviewRequiresAuthority,
+            ReviewStoreConflict,
+            ReviewerBinding,
+            ReviewerReceipt,
+            parse_review_verdict,
+        )
+
+        store = kwargs["store"]
+        job = kwargs["job"]
+        claim = kwargs["claim"]
+        resume = kwargs["resume"]
+        self._check_cancelled(job=job)
+        context = self._load_context(job=job, resume=resume)
+        bundle = context["bundle"]
+        action_bindings = self._review_bindings
+        if all(
+            isinstance(binding, LocalReviewAuthorityBinding)
+            for binding in action_bindings
+        ):
+            try:
+                action_bindings = refresh_local_review_authority_bindings(
+                    action_bindings
+                )
+            except Exception:
+                raise BestplanReviewRecoveryDeferred(
+                    "review_runtime_unavailable"
+                ) from None
+        by_binding = {
+            str(binding.slot): binding for binding in action_bindings
+        }
+        adopted: list[object] = []
+        for stored in resume.adopted_reviewer_receipts:
+            try:
+                raw_payload = json.loads(stored.receipt_json)
+                raw_output = raw_payload["raw_output"]
+                binding = by_binding[stored.slot]
+                verdict = parse_review_verdict(
+                    raw_output,
+                    target=bundle.target,
+                    evidence=bundle.evidence,
+                )
+                output_digest = hashlib.sha256(
+                    b"hermes.bestplan.review-output.v1\0"
+                    + raw_output.encode("utf-8")
+                ).hexdigest()
+                if (
+                    raw_payload.get("runtime_fingerprint")
+                    != binding.runtime_fingerprint
+                    or raw_payload.get("provider") != binding.provider
+                    or raw_payload.get("model") != binding.model
+                    or raw_payload.get("model_family") != binding.model_family
+                    or output_digest != stored.output_digest
+                ):
+                    raise ValueError
+                adopted.append(ReviewerReceipt(
+                    slot=stored.slot,
+                    provider=binding.provider,
+                    model=binding.model,
+                    model_family=binding.model_family,
+                    output_digest=output_digest,
+                    verdict=verdict,
+                ))
+            except Exception:
+                raise BestplanReviewRecoveryDeferred(
+                    "review_receipt_stale"
+                ) from None
+
+        missing = tuple(resume.missing_reviewer_slots)
+        fresh: list[object] = []
+        generation_receipt = None
+
+        def handle_reviewer_failure(exc: Exception) -> dict[str, object]:
+            if isinstance(exc, BestplanReviewRecoveryDeferred):
+                raise exc
+            if isinstance(exc, ReviewRequiresAuthority):
+                store.wait_for_host(
+                    job_id=job.job_id,
+                    generation=resume.generation,
+                    target_digest=resume.target_digest,
+                    owner_id=claim.owner_id,
+                    fencing_token=claim.fencing_token,
+                    operation_id=_bestplan_review_operation_id(
+                        job.source_id,
+                        resume.generation,
+                        "review-blocked-requires-authority",
+                    ),
+                    reason_code="blocked_requires_authority",
+                    payload={"detail": str(exc)[:1024]},
+                )
+                return {"status": "blocked_requires_authority"}
+            if isinstance(exc, ReviewLeaseConflict):
+                raise BestplanReviewRecoveryDeferred(
+                    "review_lease_active"
+                ) from None
+            if isinstance(exc, ReviewStoreConflict):
+                raise BestplanReviewRecoveryDeferred(
+                    "review_state_unavailable"
+                ) from None
+            raise BestplanReviewRecoveryDeferred(
+                "review_runtime_unavailable"
+            ) from None
+
+        if missing:
+            def persist(item: object, raw_output: str) -> None:
+                authority = by_binding[item.slot]
+                stored_payload = {
+                    "schema": "hermes.bestplan.stored-reviewer-receipt.v1",
+                    "slot": item.slot,
+                    "provider": item.provider,
+                    "model": item.model,
+                    "model_family": item.model_family,
+                    "runtime_fingerprint": authority.runtime_fingerprint,
+                    "target_digest": bundle.target.target_digest,
+                    "integration_oid": bundle.target.integration_oid,
+                    "output_digest": item.output_digest,
+                    "raw_output": raw_output,
+                    "findings": [
+                        _bestplan_blocker_payload(finding)
+                        for finding in item.verdict.findings
+                    ],
+                }
+                store.record_reviewer_receipt(
+                    job_id=job.job_id,
+                    generation=resume.generation,
+                    slot=item.slot,
+                    target_digest=bundle.target.target_digest,
+                    integration_oid=bundle.target.integration_oid,
+                    output_digest=item.output_digest,
+                    verdict_digest=_bestplan_review_verdict_digest(item),
+                    passed=item.verdict.passed,
+                    receipt_json=json.dumps(
+                        stored_payload,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    owner_id=claim.owner_id,
+                    fencing_token=claim.fencing_token,
+                    operation_id=_bestplan_review_operation_id(
+                        job.source_id,
+                        resume.generation,
+                        "reviewer-receipt",
+                        item.slot,
+                    ),
+                )
+                fresh.append(item)
+            from agent import review_engine
+
+            if not adopted and set(missing) == {
+                "smart_reviewer", "code_worker",
+            }:
+                reviewer_bindings = tuple(
+                    ReviewerBinding(
+                        slot=str(binding.slot),
+                        provider=str(binding.provider),
+                        model=str(binding.model),
+                        model_family=str(binding.model_family),
+                    )
+                    for binding in action_bindings
+                )
+
+                def reviewer_call(
+                    binding: object, request: dict[str, object],
+                ) -> str:
+                    self._check_cancelled(job=job)
+                    return call_local_review_authority(
+                        by_binding[str(binding.slot)], request,
+                    )
+
+                try:
+                    generation_receipt = review_engine.run_review_generation(
+                        bundle.target,
+                        reviewer_bindings,
+                        artifact=bundle.artifact,
+                        evidence=bundle.evidence,
+                        reviewer_call=reviewer_call,
+                        receipt_callback=persist,
+                    )
+                except Exception as exc:
+                    return handle_reviewer_failure(exc)
+            else:
+                for slot in missing:
+                    self._check_cancelled(job=job)
+                    binding = by_binding[slot]
+                    try:
+                        raw_output = call_local_review_authority(
+                            binding,
+                            review_engine._review_request(bundle.packet),
+                        )
+                        verdict = parse_review_verdict(
+                            raw_output,
+                            target=bundle.target,
+                            evidence=bundle.evidence,
+                        )
+                    except Exception as exc:
+                        return handle_reviewer_failure(exc)
+                    item = ReviewerReceipt(
+                        slot=slot,
+                        provider=binding.provider,
+                        model=binding.model,
+                        model_family=binding.model_family,
+                        output_digest=hashlib.sha256(
+                            b"hermes.bestplan.review-output.v1\0"
+                            + raw_output.encode("utf-8")
+                        ).hexdigest(),
+                        verdict=verdict,
+                    )
+                    persist(item, raw_output)
+        receipt = generation_receipt or _bestplan_review_generation_receipt(
+            bundle.target, (*adopted, *fresh),
+        )
+        if receipt.passed:
+            store.record_generation_pass(
+                job_id=job.job_id,
+                generation=resume.generation,
+                target_digest=bundle.target.target_digest,
+                integration_oid=bundle.target.integration_oid,
+                check_receipt_digest=bundle.target.check_receipt_digest,
+                review_receipt_digest=receipt.receipt_digest,
+                owner_id=claim.owner_id,
+                fencing_token=claim.fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    job.source_id, resume.generation, "review-pass",
+                ),
+            )
+        else:
+            store.record_generation_blocked(
+                job_id=job.job_id,
+                generation=resume.generation,
+                target_digest=bundle.target.target_digest,
+                integration_oid=bundle.target.integration_oid,
+                check_receipt_digest=bundle.target.check_receipt_digest,
+                review_receipt_digest=receipt.receipt_digest,
+                blocking_findings_json=json.dumps(
+                    [
+                        _bestplan_blocker_payload(item)
+                        for item in receipt.blocking_findings
+                    ],
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                owner_id=claim.owner_id,
+                fencing_token=claim.fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    job.source_id, resume.generation, "review-blocked",
+                ),
+            )
+        return {"status": "checkpoint_advanced"}
+
+    def _load_plan_context(self, *, job: object) -> dict[str, object]:
+        """Revalidate the stored plan without trusting persisted authority."""
+
+        if self._bound_plan_context is not None:
+            return dict(self._bound_plan_context)
+
+        from agent.bestplan_state import BestplanStore, _validate_stored_plan_row
+
+        request_path = Path(job.workspace)
+        payload = self._checkpoint_payload(job)
+        state_path = getattr(self, "_state_db_path", None)
+        if state_path is None:
+            raise BestplanReviewRecoveryDeferred("review_state_unavailable")
+        plan_store = BestplanStore(db_path=state_path)
+        try:
+            plan_row = plan_store.get_plan(job.source_id)
+            if plan_row is None:
+                raise ValueError
+            validated = _validate_stored_plan_row(plan_row)
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "review_plan_invalid"
+            ) from None
+        finally:
+            plan_store.close()
+        if (
+            validated.source_snapshot is None
+            or Path(validated.source_snapshot.repo.workspace).resolve()
+            != request_path.resolve()
+            or validated.contract is None
+        ):
+            raise BestplanReviewRecoveryDeferred("review_plan_identity_changed")
+        try:
+            raw_request = _bestplan_execution_request_text(
+                payload.get("raw_request")
+            )
+        except ValueError:
+            raise BestplanReviewRecoveryDeferred(
+                "review_checkpoint_invalid"
+            ) from None
+        if payload.get("raw_request_sha256") != hashlib.sha256(
+            raw_request.encode("utf-8")
+        ).hexdigest():
+            raise BestplanReviewRecoveryDeferred("review_checkpoint_invalid")
+        return {
+            "validated": validated,
+            "plan_row": plan_row,
+            "raw_request": raw_request,
+            "adapter_state": payload,
+        }
+
+    def _execution_context(
+        self, *, job: object, plan_context: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Rebuild bounded host runtime and candidate authority in memory."""
+
+        from agent.bestplan_local import build_local_execution_runtime
+        from agent.bestplan_state import _plan_to_delegate_tasks
+        from agent.review_engine import ReviewStore
+
+        validated = plan_context["validated"]
+        if self._local_runtime is None:
+            if not self._resolved_candidate_runtimes:
+                raise BestplanReviewRecoveryDeferred(
+                    "repair_runtime_unavailable"
+                )
+            try:
+                if self._state_db_path is None:
+                    raise ValueError("review state path is unavailable")
+                current_job = ReviewStore(self._state_db_path).get_job(
+                    job.job_id
+                )
+                if (
+                    current_job.source_id != job.source_id
+                    or current_job.owner_id is None
+                    or current_job.fencing_token < 1
+                ):
+                    raise ValueError("review recovery claim is unavailable")
+                runtime_plan_id = _bestplan_safe_identifier(
+                    "review-runtime",
+                    job.source_id,
+                    job.job_id,
+                    current_job.fencing_token,
+                )
+                runtime = build_local_execution_runtime(
+                    plan_id=runtime_plan_id,
+                    snapshot=validated.source_snapshot,
+                    manifest=validated.plan.to_manifest(),
+                    contract=validated.contract,
+                    controller_python=Path(sys.executable),
+                    deadline=time.monotonic() + 60.0,
+                )
+                tasks = _plan_to_delegate_tasks(
+                    validated.plan, workspace=job.workspace,
+                )
+                prepared = _preflight_bestplan_candidates(
+                    tasks=tasks,
+                    resolved_runtimes=self._resolved_candidate_runtimes,
+                    plan_id=job.source_id,
+                    workspace=job.workspace,
+                    source_snapshot=validated.source_snapshot,
+                    candidate_host_runtime=runtime.candidate_runtime,
+                    promotion_contract=validated.contract,
+                )
+            except BestplanReviewRecoveryDeferred:
+                raise
+            except Exception:
+                raise BestplanReviewRecoveryDeferred(
+                    "repair_runtime_unavailable"
+                ) from None
+            self._local_runtime = runtime
+            self._prepared_candidates = tuple(prepared)
+        return {
+            "runtime": self._local_runtime,
+            "prepared": self._prepared_candidates,
+            "candidate_authorities": tuple(
+                binding.authority for binding in self._candidate_bindings
+            ),
+        }
+
+    def _load_context(self, *, job: object, resume: object) -> dict[str, object]:
+        """Revalidate the stored plan and rebuild immutable review evidence."""
+
+        from agent.bestplan_review import build_bestplan_review_bundle
+
+        plan_context = self._load_plan_context(job=job)
+        validated = plan_context["validated"]
+        payload = plan_context["adapter_state"]
+        state_path = self._state_db_path
+        if state_path is None:
+            raise BestplanReviewRecoveryDeferred("review_state_unavailable")
+        if resume.generation == 0:
+            pending = payload.get("initial_check_pending")
+            integration_payload = payload.get("initial_integration")
+            if integration_payload is None and isinstance(pending, Mapping):
+                integration_payload = pending.get("integration")
+            checks_payload = payload.get("initial_checks")
+            if checks_payload is None and resume.check_receipt_json is not None:
+                try:
+                    initial_checkpoint = json.loads(resume.check_receipt_json)
+                    checks_payload = initial_checkpoint["check_set"]
+                except Exception:
+                    raise BestplanReviewRecoveryDeferred(
+                        "review_checkpoint_invalid"
+                    ) from None
+            dispositions: tuple[dict[str, str], ...] = ()
+        else:
+            if resume.check_receipt_json is None:
+                raise BestplanReviewRecoveryDeferred(
+                    "review_checkpoint_incomplete"
+                )
+            try:
+                checkpoint = json.loads(resume.check_receipt_json)
+                checks_payload = checkpoint["check_set"]
+                dispositions = tuple(checkpoint.get("dispositions") or ())
+            except Exception:
+                raise BestplanReviewRecoveryDeferred(
+                    "review_checkpoint_invalid"
+                ) from None
+            try:
+                with __import__("sqlite3").connect(state_path) as connection:
+                    checkpoint_row = connection.execute(
+                        """
+                        SELECT candidate_receipts_json
+                        FROM review_repair_checkpoints
+                        WHERE job_id=? AND generation=?
+                        """,
+                        (job.job_id, resume.generation),
+                    ).fetchone()
+                integration_payload = json.loads(
+                    checkpoint_row[0]
+                )[0]["integration"]
+            except Exception:
+                raise BestplanReviewRecoveryDeferred(
+                    "review_checkpoint_invalid"
+                ) from None
+        integration = _bestplan_review_integration_from_payload(
+            integration_payload
+        )
+        checks = _bestplan_review_check_set_from_payload(checks_payload)
+        raw_request = str(plan_context["raw_request"])
+        deadline = time.monotonic() + 3600.0
+        bundle = build_bestplan_review_bundle(
+            plan_id=job.source_id,
+            generation=resume.generation,
+            raw_request=raw_request,
+            plan=validated.plan,
+            snapshot=validated.source_snapshot,
+            integration=integration,
+            checks=checks,
+            contract=validated.contract,
+            approval_digest=validated.approval_digest,
+            policy_digest=job.policy_digest,
+            dispositions=dispositions,
+            deadline=deadline,
+            cancel_event=None,
+        )
+        if bundle.target.target_digest != resume.target_digest:
+            raise BestplanReviewRecoveryDeferred("review_checkpoint_stale")
+        return {
+            "bundle": bundle,
+            "integration": integration,
+            "checks": checks,
+            "validated": validated,
+            "plan_row": plan_context["plan_row"],
+            "raw_request": raw_request,
+            "adapter_state": payload,
+        }
+
+    def repair(self, **kwargs: object) -> dict[str, object]:
+        from agent import bestplan_candidates, bestplan_promotion
+
+        store = kwargs["store"]
+        job = kwargs["job"]
+        claim = kwargs["claim"]
+        resume = kwargs["resume"]
+        self._check_cancelled(job=job)
+        adapter_state = self._checkpoint_payload(job)
+        initial_failure = adapter_state.get("initial_check_failure")
+        initial_pending = adapter_state.get("initial_check_pending")
+        if not resume.adopted_reviewer_receipts:
+            plan_context = self._load_plan_context(job=job)
+            try:
+                if resume.generation == 0:
+                    initial_source = (
+                        initial_failure
+                        if isinstance(initial_failure, Mapping)
+                        else initial_pending
+                    )
+                    if not isinstance(initial_source, Mapping):
+                        raise ValueError
+                    integration_payload = initial_source["integration"]
+                else:
+                    if self._state_db_path is None:
+                        raise ValueError
+                    with __import__("sqlite3").connect(
+                        self._state_db_path
+                    ) as connection:
+                        checkpoint_row = connection.execute(
+                            "SELECT candidate_receipts_json "
+                            "FROM review_repair_checkpoints "
+                            "WHERE job_id=? AND generation=?",
+                            (job.job_id, resume.generation),
+                        ).fetchone()
+                    repair_candidates = json.loads(checkpoint_row[0])
+                    integration_payload = repair_candidates[0]["integration"]
+                integration = _bestplan_review_integration_from_payload(
+                    integration_payload
+                )
+                raw_blockers = json.loads(resume.blocking_findings_json)
+                if not raw_blockers:
+                    raise ValueError
+                blockers = tuple(
+                    SimpleNamespace(
+                        fingerprint=str(item["fingerprint"]),
+                        blast_radius=str(item.get("blast_radius") or ""),
+                        observed_failure=str(
+                            item.get("observed_failure") or ""
+                        ),
+                        severity=str(item.get("severity") or "high"),
+                        title=str(item.get("title") or "check failure"),
+                        trigger=str(item.get("trigger") or "host check"),
+                        locator=SimpleNamespace(
+                            end_line=item["locator"].get("end_line"),
+                            kind=str(item["locator"]["kind"]),
+                            locator_id=item["locator"].get("locator_id"),
+                            path=item["locator"].get("path"),
+                            start_line=item["locator"].get("start_line"),
+                        ),
+                    )
+                    for item in raw_blockers
+                )
+            except Exception:
+                raise BestplanReviewRecoveryDeferred(
+                    "review_checkpoint_invalid"
+                ) from None
+            context = {
+                **plan_context,
+                "integration": integration,
+                "adapter_state": adapter_state,
+                "host_repair_slice_ids": tuple(
+                    str(item.get("slice_id") or "")
+                    for item in (
+                        repair_candidates
+                        if resume.generation > 0
+                        else ()
+                    )
+                    if isinstance(item, Mapping)
+                    and str(item.get("slice_id") or "")
+                ),
+            }
+        else:
+            context = self._load_context(job=job, resume=resume)
+            plan_context = {
+                key: context[key]
+                for key in (
+                    "validated", "plan_row", "raw_request", "adapter_state"
+                )
+            }
+            bundle = context["bundle"]
+            blockers = _bestplan_blockers_from_stored_receipts(
+                resume.adopted_reviewer_receipts,
+                target=bundle.target,
+                evidence=bundle.evidence,
+            )
+        execution = self._execution_context(
+            job=job, plan_context=plan_context,
+        )
+        validated = context["validated"]
+        runtime = execution["runtime"]
+        prepared = execution["prepared"]
+        candidate_authorities = execution["candidate_authorities"]
+        base_completed = tuple(
+            (None, item["spec"], item["manifest_slice_id"])
+            for item in prepared
+        )
+        mapped, unresolved = _map_bestplan_blockers_to_slices(
+            blockers, base_completed,
+        )
+        host_repair_slice_ids = set(
+            context.get("host_repair_slice_ids") or ()
+        )
+        if host_repair_slice_ids:
+            mapped = {
+                index: blockers
+                for index, item in enumerate(prepared)
+                if item["manifest_slice_id"] in host_repair_slice_ids
+            }
+            unresolved = () if mapped else blockers
+        if unresolved or not mapped:
+            store.wait_for_host(
+                job_id=job.job_id,
+                generation=resume.generation,
+                target_digest=resume.target_digest,
+                owner_id=claim.owner_id,
+                fencing_token=claim.fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    job.source_id,
+                    resume.generation,
+                    "blocked-requires-authority",
+                ),
+                reason_code="blocked_requires_authority",
+                payload={
+                    "blockers": [
+                        _bestplan_blocker_payload(item) for item in unresolved
+                    ],
+                },
+            )
+            return {"status": "blocked_requires_authority"}
+
+        next_generation = resume.generation + 1
+        repaired: list[tuple[object, object, str]] = []
+        repair_evidence: dict[int, dict[str, object]] = {}
+        try:
+            events = store.list_events(job.job_id)
+            invalidated_candidates: set[tuple[str, int]] = set()
+            for event in events:
+                if event.kind != "repair_candidate_stale":
+                    continue
+                try:
+                    payload = json.loads(event.payload_json)
+                    key = (
+                        str(payload["manifest_slice_id"]),
+                        int(payload["repair_attempt"]),
+                    )
+                except Exception:
+                    raise BestplanReviewRecoveryDeferred(
+                        "review_checkpoint_invalid"
+                    ) from None
+                invalidated_candidates.add(key)
+            stored_candidates: dict[str, object] = {}
+            for item in store.list_repair_candidates(
+                job.job_id, prior_generation=resume.generation,
+            ):
+                if (
+                    item.manifest_slice_id,
+                    item.repair_attempt,
+                ) not in invalidated_candidates:
+                    stored_candidates[item.manifest_slice_id] = item
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "review_state_unavailable"
+            ) from None
+        mapped_slice_ids = {
+            str(prepared[index]["manifest_slice_id"])
+            for index in mapped
+        }
+        if not set(stored_candidates).issubset(mapped_slice_ids):
+            raise BestplanReviewRecoveryDeferred(
+                "review_checkpoint_invalid"
+            )
+
+        for index, slice_blockers in mapped.items():
+            original_spec = prepared[index]["spec"]
+            manifest_slice_id = prepared[index]["manifest_slice_id"]
+
+            def attempt_values(
+                ordinal: int, *, expires_at: int | None = None,
+            ) -> tuple[object, str, str]:
+                retry_suffix = json.dumps(
+                    {
+                        "blockers": [
+                            _bestplan_blocker_payload(item)
+                            for item in slice_blockers
+                        ],
+                        "generation": next_generation,
+                        "prior_integration_oid": context[
+                            "integration"
+                        ].integration_oid,
+                        "repair_attempt": ordinal,
+                        "rules": [
+                            "Change only this slice's approved paths.",
+                            "Preserve all expected artifacts.",
+                            "The host reruns checks and review.",
+                        ],
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                attempt_plan_id = _bestplan_safe_identifier(
+                    "repair-plan",
+                    job.source_id,
+                    next_generation,
+                    ordinal,
+                )
+                repair_spec = replace(
+                    original_spec,
+                    plan_id=attempt_plan_id,
+                    candidate_id=_bestplan_safe_identifier(
+                        "candidate",
+                        attempt_plan_id,
+                        index,
+                        manifest_slice_id,
+                    ),
+                    slice_id=_bestplan_safe_identifier(
+                        "slice", attempt_plan_id, index, manifest_slice_id,
+                    ),
+                    goal=(
+                        f"{original_spec.goal}\n\n"
+                        f"Automatic review repair evidence:\n{retry_suffix}"
+                    ),
+                    expires_at=(
+                        math.ceil(
+                            time.time()
+                            + runtime.candidate_runtime.capability_ttl_seconds
+                        )
+                        if expires_at is None
+                        else expires_at
+                    ),
+                )
+                attempt_id = _bestplan_safe_identifier(
+                    "attempt",
+                    attempt_plan_id,
+                    index,
+                    manifest_slice_id,
+                    ordinal,
+                )
+                return repair_spec, attempt_id, attempt_plan_id
+
+            durable_candidate = stored_candidates.get(manifest_slice_id)
+            if durable_candidate is not None:
+                try:
+                    receipt = json.loads(
+                        durable_candidate.candidate_receipt_json
+                    )
+                    changed_paths = tuple(
+                        str(path) for path in json.loads(
+                            durable_candidate.changed_paths_json
+                        )
+                    )
+                    repair_spec, attempt_id, attempt_plan_id = attempt_values(
+                        durable_candidate.repair_attempt,
+                        # Capability expiry gates the provider call. It does
+                        # not invalidate immutable host-frozen evidence after
+                        # the child is extinct. Use a current structural spec,
+                        # then compare the historical receipt separately.
+                        expires_at=max(
+                            int(receipt["candidate_expires_at"]),
+                            math.ceil(time.time() + 1.0),
+                        ),
+                    )
+                    controller = receipt["controller"]
+                    admitted = receipt["admitted"]
+                    frozen = bestplan_candidates.FrozenCandidate(
+                        candidate_id=str(receipt["candidate_id"]),
+                        slice_id=str(receipt["slice_id"]),
+                        attempt_id=str(receipt["attempt_id"]),
+                        commit_oid=str(receipt["commit_oid"]),
+                        tree_oid=str(receipt["tree_oid"]),
+                        ref_name=str(receipt["candidate_ref"]),
+                        changed_paths=tuple(
+                            path.encode("utf-8", "strict")
+                            for path in changed_paths
+                        ),
+                        raw_receipt=dict(receipt["worker_receipt"]),
+                        raw_receipt_sha256=str(
+                            receipt["worker_receipt_sha256"]
+                        ),
+                        policy_digest=str(receipt["policy_digest"]),
+                        controller_id=str(controller["id"]),
+                        controller_repository_id=str(
+                            controller["repository_id"]
+                        ),
+                        controller_release_oid=str(controller["release_oid"]),
+                        controller_artifact_sha256=str(
+                            controller["artifact_sha256"]
+                        ),
+                        admitted_requests=int(admitted["requests"]),
+                        admitted_input_tokens=int(admitted["input_tokens"]),
+                        admitted_output_tokens=int(admitted["output_tokens"]),
+                    )
+                    _validate_bestplan_frozen_candidate(
+                        frozen,
+                        spec=repair_spec,
+                        attempt_id=attempt_id,
+                        runtime=runtime.candidate_runtime,
+                    )
+                    reconstructed_receipt = json.dumps(
+                        _bestplan_host_candidate_receipt(
+                            frozen=frozen,
+                            manifest_slice_id=manifest_slice_id,
+                            spec=SimpleNamespace(
+                                expires_at=int(receipt["candidate_expires_at"])
+                            ),
+                            promotion_contract_digest=context[
+                                "adapter_state"
+                            ]["contract_digest"],
+                        ),
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    if (
+                        durable_candidate.prior_target_digest
+                        != resume.target_digest
+                        or durable_candidate.base_integration_oid
+                        != context["integration"].integration_oid
+                        or durable_candidate.attempt_plan_id != attempt_plan_id
+                        or reconstructed_receipt
+                        != durable_candidate.candidate_receipt_json
+                    ):
+                        raise ValueError
+                except Exception:
+                    raise BestplanReviewRecoveryDeferred(
+                        "review_checkpoint_invalid"
+                    ) from None
+                try:
+                    current_ref = bestplan_candidates._read_ref(
+                        validated.source_snapshot.repo,
+                        frozen.ref_name,
+                        deadline=(
+                            time.monotonic()
+                            + runtime.operation_timeout_seconds
+                        ),
+                    )
+                except Exception:
+                    raise BestplanReviewRecoveryDeferred(
+                        "repair_runtime_unavailable"
+                    ) from None
+                if current_ref == frozen.commit_oid:
+                    repaired.append((frozen, repair_spec, manifest_slice_id))
+                    repair_evidence[index] = {
+                        "changed_paths": changed_paths,
+                        "receipt_digest": frozen.raw_receipt_sha256,
+                    }
+                    continue
+                try:
+                    store.append_event(
+                        job_id=job.job_id,
+                        generation=resume.generation,
+                        owner_id=claim.owner_id,
+                        fencing_token=claim.fencing_token,
+                        operation_id=_bestplan_review_operation_id(
+                            job.source_id,
+                            resume.generation,
+                            "repair-candidate-stale",
+                            (
+                                f"{manifest_slice_id}-"
+                                f"{durable_candidate.repair_attempt}"
+                            ),
+                        ),
+                        kind="repair_candidate_stale",
+                        target_digest=resume.target_digest,
+                        payload={
+                            "manifest_slice_id": manifest_slice_id,
+                            "repair_attempt": (
+                                durable_candidate.repair_attempt
+                            ),
+                            "reason": "candidate_ref_differs",
+                        },
+                    )
+                    events = (*events, SimpleNamespace(
+                        generation=resume.generation,
+                        kind="repair_candidate_stale",
+                        payload_json=json.dumps({
+                            "manifest_slice_id": manifest_slice_id,
+                            "repair_attempt": (
+                                durable_candidate.repair_attempt
+                            ),
+                            "reason": "candidate_ref_differs",
+                        }),
+                    ))
+                except Exception:
+                    raise BestplanReviewRecoveryDeferred(
+                        "review_state_unavailable"
+                    ) from None
+
+            prior_attempts = []
+            for event in events:
+                if event.kind not in {
+                    "repair_attempt_started", "repair_no_change",
+                }:
+                    continue
+                try:
+                    payload = json.loads(event.payload_json)
+                except Exception:
+                    continue
+                if (
+                    event.generation == resume.generation
+                    and payload.get("manifest_slice_id") == manifest_slice_id
+                    and type(payload.get("repair_attempt")) is int
+                ):
+                    prior_attempts.append(int(payload["repair_attempt"]))
+            ordinal = max(prior_attempts, default=-1) + 1
+            while True:
+                self._check_cancelled(job=job)
+                repair_spec, attempt_id, attempt_plan_id = attempt_values(
+                    ordinal
+                )
+                try:
+                    store.append_event(
+                        job_id=job.job_id,
+                        generation=resume.generation,
+                        owner_id=claim.owner_id,
+                        fencing_token=claim.fencing_token,
+                        operation_id=_bestplan_review_operation_id(
+                            job.source_id,
+                            resume.generation,
+                            "repair-attempt-started",
+                            f"{manifest_slice_id}-{ordinal}",
+                        ),
+                        kind="repair_attempt_started",
+                        target_digest=resume.target_digest,
+                        payload={
+                            "attempt_id": attempt_id,
+                            "attempt_plan_id": attempt_plan_id,
+                            "base_integration_oid": context[
+                                "integration"
+                            ].integration_oid,
+                            "candidate_id": repair_spec.candidate_id,
+                            "manifest_slice_id": manifest_slice_id,
+                            "repair_attempt": ordinal,
+                            "slice_id": repair_spec.slice_id,
+                        },
+                    )
+                except Exception:
+                    raise BestplanReviewRecoveryDeferred(
+                        "review_state_unavailable"
+                    ) from None
+                try:
+                    frozen = bestplan_candidates.run_and_freeze_repair_candidate(
+                        snapshot=validated.source_snapshot,
+                        candidate_base=context["integration"],
+                        spec=repair_spec,
+                        attempts_root=runtime.candidate_runtime.attempts_root,
+                        controller_source=(
+                            runtime.candidate_runtime.controller_source
+                        ),
+                        controller_python=(
+                            runtime.candidate_runtime.controller_python
+                        ),
+                        runtime_read_paths=(
+                            runtime.candidate_runtime.runtime_read_paths
+                        ),
+                        expected_controller=runtime.candidate_runtime.controller,
+                        authority_client=candidate_authorities[index],
+                        timeout_seconds=runtime.candidate_runtime.timeout_seconds,
+                        attempt_id=attempt_id,
+                        cancel_event=self._cancel_event,
+                    )
+                    _validate_bestplan_frozen_candidate(
+                        frozen,
+                        spec=repair_spec,
+                        attempt_id=attempt_id,
+                        runtime=runtime.candidate_runtime,
+                    )
+                except Exception:
+                    raise BestplanReviewRecoveryDeferred(
+                        "repair_runtime_unavailable"
+                    ) from None
+                changed_paths = tuple(
+                    path.decode("utf-8", "strict")
+                    for path in frozen.changed_paths
+                )
+                if changed_paths:
+                    candidate_receipt_json = json.dumps(
+                        _bestplan_host_candidate_receipt(
+                            frozen=frozen,
+                            manifest_slice_id=manifest_slice_id,
+                            spec=repair_spec,
+                            promotion_contract_digest=context[
+                                "adapter_state"
+                            ]["contract_digest"],
+                        ),
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    try:
+                        store.record_repair_candidate_frozen(
+                            job_id=job.job_id,
+                            prior_generation=resume.generation,
+                            prior_target_digest=resume.target_digest,
+                            base_integration_oid=context[
+                                "integration"
+                            ].integration_oid,
+                            manifest_slice_id=manifest_slice_id,
+                            repair_attempt=ordinal,
+                            attempt_plan_id=attempt_plan_id,
+                            candidate_receipt_json=candidate_receipt_json,
+                            changed_paths_json=json.dumps(
+                                list(changed_paths),
+                                ensure_ascii=True,
+                                allow_nan=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            owner_id=claim.owner_id,
+                            fencing_token=claim.fencing_token,
+                            operation_id=_bestplan_review_operation_id(
+                                job.source_id,
+                                resume.generation,
+                                "repair-candidate-frozen",
+                                f"{manifest_slice_id}-{ordinal}",
+                            ),
+                        )
+                    except Exception:
+                        raise BestplanReviewRecoveryDeferred(
+                            "review_state_unavailable"
+                        ) from None
+                    repaired.append((frozen, repair_spec, manifest_slice_id))
+                    repair_evidence[index] = {
+                        "changed_paths": changed_paths,
+                        "receipt_digest": frozen.raw_receipt_sha256,
+                    }
+                    break
+                store.append_event(
+                    job_id=job.job_id,
+                    generation=resume.generation,
+                    owner_id=claim.owner_id,
+                    fencing_token=claim.fencing_token,
+                    operation_id=_bestplan_review_operation_id(
+                        job.source_id,
+                        resume.generation,
+                        "repair-no-change",
+                        f"{manifest_slice_id}-{ordinal}",
+                    ),
+                    kind="repair_no_change",
+                    target_digest=resume.target_digest,
+                    payload={
+                        "attempt_id": attempt_id,
+                        "manifest_slice_id": manifest_slice_id,
+                        "repair_attempt": ordinal,
+                    },
+                )
+                ordinal += 1
+
+        repair_bindings = tuple(
+            _build_local_candidate_binding(
+                frozen=frozen,
+                spec=spec,
+                manifest_slice_id=manifest_slice_id,
+                snapshot=validated.source_snapshot,
+                approval_digest=validated.approval_digest,
+                contract_digest=context["adapter_state"]["contract_digest"],
+                candidate_base_oid=context["integration"].integration_oid,
+            )
+            for frozen, spec, manifest_slice_id in repaired
+        )
+        try:
+            integration = bestplan_promotion.freeze_repair_integration(
+                plan_id=job.source_id,
+                generation=next_generation,
+                prior=context["integration"],
+                plan=validated.plan,
+                snapshot=validated.source_snapshot,
+                contract=validated.contract,
+                approval_digest=validated.approval_digest,
+                candidates=repair_bindings,
+                temp_root=runtime.integration_root,
+                deadline=time.monotonic() + runtime.operation_timeout_seconds,
+                cancel_event=self._cancel_event,
+            )
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "repair_runtime_unavailable"
+            ) from None
+        candidates_payload = [
+            {
+                "candidate_oid": frozen.commit_oid,
+                "candidate_receipt_digest": frozen.raw_receipt_sha256,
+                "candidate_ref": frozen.ref_name,
+                "changed_paths": [
+                    path.decode("utf-8", "strict")
+                    for path in frozen.changed_paths
+                ],
+                "slice_id": manifest_slice_id,
+            }
+            for frozen, _spec, manifest_slice_id in repaired
+        ]
+        candidates_payload[0]["integration"] = (
+            _bestplan_review_integration_payload(integration)
+        )
+        candidates_payload[0]["repair_evidence"] = {
+            str(index): {
+                "changed_paths": list(item["changed_paths"]),
+                "receipt_digest": item["receipt_digest"],
+            }
+            for index, item in repair_evidence.items()
+        }
+        store.record_repair_frozen(
+            job_id=job.job_id,
+            prior_generation=resume.generation,
+            generation=next_generation,
+            prior_target_digest=resume.target_digest,
+            integration_oid=integration.integration_oid,
+            integration_tree_oid=integration.tree_oid,
+            integration_ref=integration.ref_name,
+            integration_receipt_digest=integration.receipt_digest,
+            candidate_receipts_json=json.dumps(
+                candidates_payload,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            owner_id=claim.owner_id,
+            fencing_token=claim.fencing_token,
+            operation_id=_bestplan_review_operation_id(
+                job.source_id, next_generation, "repair-frozen",
+            ),
+        )
+        return {"status": "checkpoint_advanced"}
+
+    def checks(self, **kwargs: object) -> dict[str, object]:
+        from agent import bestplan_checks
+        from agent.bestplan_review import build_bestplan_review_bundle
+
+        store = kwargs["store"]
+        job = kwargs["job"]
+        claim = kwargs["claim"]
+        resume = kwargs["resume"]
+        self._check_cancelled(job=job)
+        plan_context = self._load_plan_context(job=job)
+        execution = self._execution_context(
+            job=job, plan_context=plan_context,
+        )
+        validated = plan_context["validated"]
+        runtime = execution["runtime"]
+        try:
+            candidates_payload = json.loads(
+                resume.repair_checkpoint.candidate_receipts_json
+            )
+            integration = _bestplan_review_integration_from_payload(
+                candidates_payload[0]["integration"]
+            )
+            checks = bestplan_checks.run_integration_checks(
+                snapshot=validated.source_snapshot,
+                integration=integration,
+                contract=validated.contract,
+                commands=runtime.check_plan.commands,
+                runtime=runtime.check_runtime,
+                checks_root=runtime.checks_root,
+                deadline=time.monotonic() + runtime.operation_timeout_seconds,
+                cancel_event=self._cancel_event,
+            )
+        except bestplan_checks.CheckExecutionError as exc:
+            if "returned nonzero" not in str(exc):
+                raise BestplanReviewRecoveryDeferred(
+                    "checks_runtime_unavailable"
+                ) from None
+            prior_resume = SimpleNamespace(
+                job_id=job.job_id,
+                generation=resume.repair_checkpoint.prior_generation,
+            )
+            prior_target = self._target_for_resume(store, prior_resume)
+            (
+                failure_target,
+                _failure_blocker,
+                failure_payload,
+                failure_digest,
+            ) = _bestplan_repair_check_failure_evidence(
+                plan_id=job.source_id,
+                generation=resume.generation,
+                prior_target=prior_target,
+                integration=integration,
+                check_error=exc,
+            )
+            store.record_repair_check_failure(
+                job_id=job.job_id,
+                generation=resume.generation,
+                target=failure_target,
+                check_failure_digest=failure_digest,
+                blocking_findings_json=json.dumps(
+                    [failure_payload],
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                owner_id=claim.owner_id,
+                fencing_token=claim.fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    job.source_id,
+                    resume.generation,
+                    "repair-check-failure",
+                ),
+            )
+            return {"status": "checkpoint_advanced"}
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "checks_runtime_unavailable"
+            ) from None
+        dispositions = tuple(
+            {
+                "evidence": (
+                    f"Repair generation {resume.generation} changed approved "
+                    "paths; the host reran every approved check."
+                ),
+                "finding_fingerprint": item["fingerprint"],
+                "status": "fixed",
+            }
+            for item in json.loads(resume.blocking_findings_json)
+        )
+        bundle = build_bestplan_review_bundle(
+            plan_id=job.source_id,
+            generation=resume.generation,
+            raw_request=plan_context["raw_request"],
+            plan=validated.plan,
+            snapshot=validated.source_snapshot,
+            integration=integration,
+            checks=checks,
+            contract=validated.contract,
+            approval_digest=validated.approval_digest,
+            policy_digest=job.policy_digest,
+            dispositions=dispositions,
+            deadline=time.monotonic() + runtime.operation_timeout_seconds,
+            cancel_event=self._cancel_event,
+        )
+        store.record_checks_passed(
+            job_id=job.job_id,
+            generation=resume.generation,
+            target=bundle.target,
+            artifact=bundle.artifact,
+            check_receipt_json=json.dumps(
+                {
+                    "check_set": _bestplan_review_check_set_payload(checks),
+                    "dispositions": list(dispositions),
+                    "schema": "hermes.bestplan.review-checkpoint.v1",
+                    "status": "passed",
+                },
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            owner_id=claim.owner_id,
+            fencing_token=claim.fencing_token,
+            operation_id=_bestplan_review_operation_id(
+                job.source_id, resume.generation, "checks-passed",
+            ),
+        )
+        return {"status": "checkpoint_advanced"}
+
+    def handoff_pass(self, **kwargs: object) -> dict[str, object]:
+        from agent.bestplan_local_git import LocalMainEffectUnknown, LocalPushStale
+
+        job = kwargs["job"]
+        claim = kwargs["claim"]
+        resume = kwargs["resume"]
+        self._check_cancelled(job=job)
+        if resume.review_pass is None:
+            raise BestplanReviewRecoveryDeferred(
+                "review_checkpoint_incomplete"
+            )
+        context = self._load_context(job=job, resume=resume)
+        execution = self._execution_context(
+            job=job,
+            plan_context={
+                key: context[key]
+                for key in (
+                    "validated",
+                    "plan_row",
+                    "raw_request",
+                    "adapter_state",
+                )
+            },
+        )
+        reviewed = _LocalBestplanReviewResult(
+            integration=context["integration"],
+            checks=context["checks"],
+            target=context["bundle"].target,
+            receipt=_RecoveredReviewReceipt(
+                resume.review_pass.review_receipt_digest
+            ),
+            job_id=job.job_id,
+            owner_id=claim.owner_id,
+            fencing_token=claim.fencing_token,
+        )
+        try:
+            completion = _land_reviewed_local_bestplan(
+                plan_id=job.source_id,
+                snapshot=context["validated"].source_snapshot,
+                runtime=execution["runtime"],
+                state_db_path=self._state_db_path,
+                session_id=job.owner_session_id,
+                profile=job.owner_profile,
+                reviewed=reviewed,
+                projected_results=context["adapter_state"].get(
+                    "projected_results", ()
+                ),
+                deadline=(
+                    time.monotonic()
+                    + execution["runtime"].operation_timeout_seconds
+                ),
+                cancel_event=self._cancel_event,
+            )
+        except LocalMainEffectUnknown:
+            raise BestplanReviewRecoveryDeferred(
+                "landing_effect_unknown"
+            ) from None
+        except LocalPushStale:
+            raise BestplanReviewRecoveryDeferred(
+                "landing_target_drift"
+            ) from None
+        except BestplanReviewRecoveryDeferred:
+            raise
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "landing_runtime_unavailable"
+            ) from None
+        return {"status": "completed", "completion": completion}
+
+    def wait_for_host(self, **kwargs: object) -> dict[str, object]:
+        raise BestplanReviewRecoveryDeferred("review_operator_authority_required")
+
+
+def _load_bestplan_execution_tracker_record(
+    request: Mapping[str, object],
+    *,
+    pipeline: object,
+) -> dict[str, object]:
+    """Read and exact-match the durable async dispatch record for one restart."""
+
+    try:
+        raw_path = str(request["tracker_path"])
+        tracker_path = Path(raw_path)
+        canonical_path = tracker_path.resolve(strict=True)
+        if (
+            not tracker_path.is_absolute()
+            or str(canonical_path) != raw_path
+            or not canonical_path.is_file()
+            or canonical_path.stat().st_size > 250 * 1024 * 1024
+        ):
+            raise ValueError
+        payload = json.loads(canonical_path.read_text(encoding="utf-8"))
+        records = payload["records"]
+        entry = records[str(request["delegation_id"])]
+        record = entry["record"]
+    except Exception:
+        raise BestplanReviewRecoveryDeferred(
+            "execution_tracker_invalid"
+        ) from None
+    if not isinstance(record, dict) or (
+        str(entry.get("status") or record.get("status") or "")
+        not in {"review_requeued", "review_waiting"}
+        or record.get("bestplan_local_execution") is not True
+        or record.get("delegation_id") != request.get("delegation_id")
+        or record.get("bestplan_plan_id") != request.get("plan_id")
+        or record.get("bestplan_review_job_id") != request.get("job_id")
+        or record.get("bestplan_state_db_path") != request.get("state_db_path")
+        or str(record.get("origin_tracker_path") or "")
+        != request.get("tracker_path")
+        or str(record.get("origin_session_id") or "")
+        != request.get("session_id")
+        or str(record.get("origin_profile") or "")
+        != request.get("profile")
+        or getattr(pipeline, "delegation_id", None)
+        != request.get("delegation_id")
+    ):
+        raise BestplanReviewRecoveryDeferred("execution_tracker_invalid")
+    return dict(record)
+
+
+def _load_bestplan_execution_plan_context(
+    request: Mapping[str, object],
+    *,
+    pipeline: object,
+) -> dict[str, object]:
+    """Rebuild and bind every immutable pre-review execution input."""
+
+    from agent.bestplan_contract import source_snapshot_digest
+    from agent.bestplan_local import (
+        LOCAL_GO_CONTRACT_SCHEMA,
+        local_go_manifest_digest,
+    )
+    from agent.bestplan_state import PlanState, _validate_stored_plan_row
+
+    state_path = Path(str(request["state_db_path"]))
+    try:
+        with sqlite3.connect(state_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=?",
+                (str(request["plan_id"]),),
+            ).fetchone()
+        if row is None:
+            raise ValueError
+        plan_row = dict(row)
+        validated = _validate_stored_plan_row(plan_row)
+        adapter_state = json.loads(str(pipeline.adapter_state_json))
+        runtime_routes = json.loads(str(pipeline.runtime_routes_json))
+    except BestplanReviewRecoveryDeferred:
+        raise
+    except Exception:
+        raise BestplanReviewRecoveryDeferred(
+            "execution_plan_invalid"
+        ) from None
+    raw_request: str | None = None
+    required_intent = {
+        "approval_digest",
+        "contract_digest",
+        "manifest_digest",
+        "raw_request",
+        "raw_request_sha256",
+        "schema",
+        "source_snapshot_digest",
+    }
+    if isinstance(adapter_state, dict):
+        try:
+            raw_request = _bestplan_execution_request_text(
+                adapter_state.get("raw_request")
+            )
+        except ValueError:
+            raise BestplanReviewRecoveryDeferred(
+                "execution_intent_invalid"
+            ) from None
+    if (
+        validated.execution_protocol != 2
+        or validated.source_snapshot is None
+        or not isinstance(validated.contract, Mapping)
+        or validated.contract.get("schema") != LOCAL_GO_CONTRACT_SCHEMA
+        or validated.contract.get("mode") != "local_main"
+        or plan_row.get("state") not in {PlanState.RUNNING, PlanState.WAITING}
+        or plan_row.get("current_phase") != "captured"
+        or plan_row.get("session_id") != request.get("session_id")
+        or plan_row.get("profile") != request.get("profile")
+        or plan_row.get("workspace") != request.get("workspace")
+        or plan_row.get("dispatch_id") != request.get("delegation_id")
+        or pipeline.plan_id != request.get("plan_id")
+        or pipeline.job_id != request.get("job_id")
+        or pipeline.owner_session_id != request.get("session_id")
+        or pipeline.owner_profile != request.get("profile")
+        or pipeline.workspace != request.get("workspace")
+        or pipeline.adapter_version != request.get("adapter_version")
+        or pipeline.adapter_version != "local-bestplan-execution.v1"
+        or pipeline.state != "pending"
+        or not isinstance(adapter_state, dict)
+        or set(adapter_state) != required_intent
+        or adapter_state.get("schema")
+        != "hermes.bestplan.execution-intent.v1"
+        or adapter_state.get("approval_digest") != validated.approval_digest
+        or adapter_state.get("contract_digest")
+        != plan_row.get("promotion_contract_digest")
+        or adapter_state.get("manifest_digest")
+        != local_go_manifest_digest(validated.manifest)
+        or adapter_state.get("raw_request_sha256")
+        != hashlib.sha256(str(raw_request).encode("utf-8")).hexdigest()
+        or adapter_state.get("source_snapshot_digest")
+        != source_snapshot_digest(validated.source_snapshot)
+        or not isinstance(runtime_routes, list)
+        or len(runtime_routes) != pipeline.candidate_count + 2
+    ):
+        raise BestplanReviewRecoveryDeferred("execution_intent_invalid")
+    try:
+        stored_plan_runtimes = json.loads(
+            str(plan_row.get("resolved_runtime_json") or "[]")
+        )
+    except Exception:
+        raise BestplanReviewRecoveryDeferred(
+            "execution_intent_invalid"
+        ) from None
+    candidate_routes = runtime_routes[:pipeline.candidate_count]
+    review_routes = runtime_routes[pipeline.candidate_count:]
+    if (
+        not isinstance(stored_plan_runtimes, list)
+        or len(stored_plan_runtimes) != pipeline.candidate_count
+        or any(not isinstance(item, dict) for item in runtime_routes)
+        or [item.get("route") for item in candidate_routes]
+        != [f"candidate-{index}" for index in range(pipeline.candidate_count)]
+        or [item.get("route") for item in review_routes]
+        != ["smart_reviewer", "code_worker"]
+    ):
+        raise BestplanReviewRecoveryDeferred("execution_intent_invalid")
+    for planned, durable in zip(
+        stored_plan_runtimes, candidate_routes, strict=True,
+    ):
+        if not isinstance(planned, dict) or any(
+            planned.get(field) != durable.get(field)
+            for field in ("provider", "model", "runtime_fingerprint")
+        ):
+            raise BestplanReviewRecoveryDeferred("execution_intent_invalid")
+    return {
+        "adapter_state": adapter_state,
+        "candidate_routes": candidate_routes,
+        "plan_row": plan_row,
+        "raw_request": str(raw_request),
+        "review_routes": review_routes,
+        "runtime_routes": runtime_routes,
+        "validated": validated,
+    }
+
+
+def _resolve_bestplan_execution_authorities(
+    *,
+    context: Mapping[str, object],
+    workspace: str,
+) -> dict[str, object]:
+    """Resolve live credentials and compare their non-secret route identity."""
+
+    from agent.bestplan_local import (
+        build_local_authority_bindings,
+        build_local_review_authority_bindings,
+    )
+    from agent.bestplan_state import (
+        _local_review_runtime_tasks,
+        _plan_to_delegate_tasks,
+    )
+
+    validated = context["validated"]
+    tasks = _plan_to_delegate_tasks(validated.plan, workspace=workspace)
+    try:
+        candidate_runtimes = resolve_bestplan_runtime_specs(
+            tasks, None, execution_protocol=2,
+        )
+        review_runtimes = resolve_bestplan_runtime_specs(
+            _local_review_runtime_tasks(workspace),
+            None,
+            execution_protocol=2,
+        )
+        candidate_bindings = build_local_authority_bindings(
+            candidate_runtimes
+        )
+        review_bindings = build_local_review_authority_bindings(
+            review_runtimes
+        )
+        live_candidates = [
+            {
+                **_bestplan_async_runtime_metadata(
+                    runtime,
+                    candidate_toolsets=(
+                        ("read_only_files",)
+                        if bool(task.get("_bestplan_read_only"))
+                        else ("file",)
+                    ),
+                    execution_protocol=2,
+                ),
+                "route": f"candidate-{index}",
+            }
+            for index, (task, runtime) in enumerate(
+                zip(tasks, candidate_runtimes, strict=True)
+            )
+        ]
+        live_reviews = _bestplan_sanitized_review_runtime_routes(
+            review_bindings
+        )
+    except BestplanReviewRecoveryDeferred:
+        raise
+    except Exception:
+        raise BestplanReviewRecoveryDeferred(
+            "execution_authority_unavailable"
+        ) from None
+    if (
+        live_candidates != context["candidate_routes"]
+        or live_reviews != context["review_routes"]
+    ):
+        raise BestplanReviewRecoveryDeferred("execution_runtime_drift")
+    return {
+        "candidate_bindings": candidate_bindings,
+        "candidate_runtimes": candidate_runtimes,
+        "review_bindings": review_bindings,
+        "review_runtimes": review_runtimes,
+        "tasks": tasks,
+    }
+
+
+def resume_bestplan_execution_request(
+    request: Mapping[str, object],
+    *,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, object]:
+    """Rerun one dead pre-review batch under a fresh durable namespace."""
+
+    from agent import bestplan_source
+    from agent.bestplan_local import build_local_execution_runtime
+    from agent.review_engine import ReviewStore, ReviewValidationError
+    from gateway.status import _pid_exists, get_process_start_time
+
+    required = {
+        "adapter_version", "delegation_id", "job_id", "kind", "plan_id",
+        "profile", "session_id", "state_db_path", "tracker_path",
+        "workspace",
+    }
+    if (
+        not isinstance(request, Mapping)
+        or set(request) != required
+        or request.get("kind") != "bestplan_execution_resume"
+    ):
+        raise BestplanReviewRecoveryDeferred("execution_request_invalid")
+    try:
+        raw_state_path = str(request["state_db_path"])
+        state_path = Path(raw_state_path)
+        canonical_state_path = state_path.resolve(strict=True)
+        raw_workspace = str(request["workspace"])
+        workspace = Path(raw_workspace)
+        canonical_workspace = workspace.resolve(strict=True)
+    except Exception:
+        raise BestplanReviewRecoveryDeferred(
+            "execution_state_unavailable"
+        ) from None
+    if (
+        not state_path.is_absolute()
+        or str(canonical_state_path) != raw_state_path
+        or not workspace.is_absolute()
+        or str(canonical_workspace) != raw_workspace
+    ):
+        raise BestplanReviewRecoveryDeferred("execution_request_invalid")
+    store = ReviewStore(canonical_state_path)
+    try:
+        pipeline = store.get_execution_pipeline(str(request["plan_id"]))
+    except Exception:
+        raise BestplanReviewRecoveryDeferred(
+            "execution_intent_invalid"
+        ) from None
+    if pipeline.cancel_requested or pipeline.state == "cancelled":
+        raise BestplanReviewRecoveryDeferred("execution_cancelled")
+    try:
+        store.get_job(str(request["job_id"]))
+    except ReviewValidationError:
+        pass
+    else:
+        raise BestplanReviewRecoveryDeferred("execution_review_already_started")
+    _load_bestplan_execution_tracker_record(
+        request, pipeline=pipeline,
+    )
+    context = _load_bestplan_execution_plan_context(
+        request, pipeline=pipeline,
+    )
+    validated = context["validated"]
+    try:
+        actual_repo = bestplan_source.resolve_repo_identity(raw_workspace)
+        if actual_repo != validated.source_snapshot.repo:
+            raise BestplanReviewRecoveryDeferred("execution_source_drift")
+        actual_snapshot = bestplan_source.capture_source_snapshot(
+            actual_repo, time.monotonic() + 60.0,
+        )
+    except BestplanReviewRecoveryDeferred:
+        raise
+    except Exception:
+        raise BestplanReviewRecoveryDeferred(
+            "execution_source_unavailable"
+        ) from None
+    if actual_snapshot != validated.source_snapshot:
+        raise BestplanReviewRecoveryDeferred("execution_source_drift")
+    authorities = _resolve_bestplan_execution_authorities(
+        context=context, workspace=raw_workspace,
+    )
+
+    expected_owner_pid: int | None = None
+    expected_owner_start: str | None = None
+    if pipeline.attempt_owner_pid is not None:
+        expected_owner_pid = pipeline.attempt_owner_pid
+        expected_owner_start = pipeline.attempt_owner_process_start_id
+        if expected_owner_start is None:
+            raise BestplanReviewRecoveryDeferred(
+                "execution_owner_identity_invalid"
+            )
+        if _pid_exists(expected_owner_pid):
+            live_start = get_process_start_time(expected_owner_pid)
+            if live_start is None:
+                raise BestplanReviewRecoveryDeferred(
+                    "execution_owner_unknown"
+                )
+            if str(live_start) == expected_owner_start:
+                raise BestplanReviewRecoveryDeferred("execution_owner_live")
+    owner_pid = os.getpid()
+    owner_start = get_process_start_time(owner_pid)
+    if owner_start is None:
+        raise BestplanReviewRecoveryDeferred(
+            "execution_owner_unknown"
+        )
+    ordinal = store.allocate_execution_attempt(
+        str(request["plan_id"]),
+        owner_pid=owner_pid,
+        owner_process_start_id=str(owner_start),
+        expected_owner_pid=expected_owner_pid,
+        expected_owner_process_start_id=expected_owner_start,
+    )
+    identity_plan_id = _bestplan_execution_attempt_plan_id(
+        str(request["plan_id"]), ordinal,
+    )
+    effective_cancel = cancel_event or threading.Event()
+    try:
+        runtime = build_local_execution_runtime(
+            plan_id=identity_plan_id,
+            snapshot=validated.source_snapshot,
+            manifest=validated.manifest,
+            contract=validated.contract,
+            controller_python=Path(sys.executable),
+            deadline=time.monotonic() + 60.0,
+            cancel_event=effective_cancel,
+        )
+        _validate_bestplan_host_runtime(
+            runtime.candidate_runtime,
+            source_snapshot=validated.source_snapshot,
+            promotion_contract=validated.contract,
+        )
+        prepared = _preflight_bestplan_candidates(
+            tasks=authorities["tasks"],
+            resolved_runtimes=authorities["candidate_runtimes"],
+            plan_id=str(request["plan_id"]),
+            identity_plan_id=identity_plan_id,
+            workspace=raw_workspace,
+            source_snapshot=validated.source_snapshot,
+            candidate_host_runtime=runtime.candidate_runtime,
+            promotion_contract=validated.contract,
+        )
+        result = _execute_bestplan_candidate_batch(
+            prepared=prepared,
+            ordered_authorities=tuple(
+                binding.authority
+                for binding in authorities["candidate_bindings"]
+            ),
+            source_snapshot=validated.source_snapshot,
+            candidate_host_runtime=runtime.candidate_runtime,
+            cancellation=effective_cancel,
+            execution_protocol=2,
+            promotion_mode="local_main",
+            promotion_contract=validated.contract,
+            approval_digest=validated.approval_digest,
+            promotion_contract_digest=str(
+                context["plan_row"]["promotion_contract_digest"]
+            ),
+            plan_id=str(request["plan_id"]),
+            identity_plan_id=identity_plan_id,
+            execution_plan=validated.plan,
+            local_execution_runtime=runtime,
+            durable_state_path=canonical_state_path,
+            session_id=str(request["session_id"]),
+            profile=str(request["profile"]),
+            raw_request=str(context["raw_request"]),
+            review_authority_bindings=authorities["review_bindings"],
+            candidate_runtime_routes=context["candidate_routes"],
+        )
+    except BaseException as exc:
+        try:
+            store.release_execution_attempt(
+                str(request["plan_id"]),
+                owner_pid=owner_pid,
+                owner_process_start_id=str(owner_start),
+            )
+        except Exception:
+            # A successful batch may already have atomically moved the
+            # pipeline to review. In that state no pre-review release applies.
+            try:
+                if store.get_execution_pipeline(
+                    str(request["plan_id"])
+                ).state == "pending":
+                    raise
+            except Exception:
+                raise BestplanReviewRecoveryDeferred(
+                    "execution_state_unavailable"
+                ) from None
+        if isinstance(exc, BestplanReviewRecoveryDeferred):
+            raise exc
+        raise BestplanReviewRecoveryDeferred(
+            "execution_runtime_unavailable"
+        ) from None
+    return {"status": "completed", "completion": result}
+
+
+def resume_bestplan_review_request(
+    request: Mapping[str, object],
+    *,
+    adapter: object | None = None,
+    now_ns: int | None = None,
+) -> dict[str, object]:
+    """Reclaim one durable review and run only its declared next action."""
+
+    from agent.bestplan_state import (
+        BestplanStore,
+        PlanState,
+        _validate_stored_plan_row,
+        decode_local_push_row,
+        sanitize_runtime_metadata,
+    )
+    from agent.review_engine import ReviewLeaseConflict, ReviewStore
+
+    if not isinstance(request, Mapping):
+        raise BestplanReviewRecoveryDeferred("review_request_invalid")
+    required = {
+        "adapter_version",
+        "delegation_id",
+        "job_id",
+        "kind",
+        "plan_id",
+        "profile",
+        "session_id",
+        "state_db_path",
+        "tracker_path",
+        "workspace",
+    }
+    if set(request) != required or request.get("kind") != "bestplan_review_resume":
+        raise BestplanReviewRecoveryDeferred("review_request_invalid")
+    state_db_path = str(request.get("state_db_path") or "")
+    state_path = Path(state_db_path)
+    try:
+        canonical_state_path = state_path.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        raise BestplanReviewRecoveryDeferred("review_state_unavailable") from None
+    if not state_path.is_absolute() or str(canonical_state_path) != state_db_path:
+        raise BestplanReviewRecoveryDeferred("review_state_invalid")
+    store = ReviewStore(canonical_state_path)
+    job_id = str(request.get("job_id") or "")
+    try:
+        job = store.get_job(job_id)
+    except Exception:
+        raise BestplanReviewRecoveryDeferred("review_job_unavailable") from None
+    if job.cancel_requested or job.state == "cancel_requested":
+        raise BestplanReviewRecoveryDeferred("review_cancelled")
+    if (
+        job.adapter_version != request.get("adapter_version")
+        or job.adapter_version != "local-bestplan.v1"
+        or job.source_kind != "bestplan_integration"
+        or job.source_id != request.get("plan_id")
+        or job.owner_session_id != request.get("session_id")
+        or job.owner_profile != request.get("profile")
+        or job.workspace != request.get("workspace")
+    ):
+        raise BestplanReviewRecoveryDeferred("review_job_identity_changed")
+    def landed_completion(current_job: object) -> dict[str, object]:
+        plan_store = BestplanStore(
+            db_path=canonical_state_path,
+            reconcile_push_state=False,
+        )
+        try:
+            plan_row = plan_store.get_plan(current_job.source_id)
+            if not isinstance(plan_row, Mapping):
+                raise ValueError
+            local_push, _validated = decode_local_push_row(
+                plan_row, _validate_stored_plan_row,
+            )
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "landing_effect_unknown"
+            ) from None
+        finally:
+            plan_store.close()
+        review = local_push.get("review")
+        if (
+            current_job.state != "landed"
+            or plan_row.get("state") != PlanState.COMPLETED_LOCAL
+            or plan_row.get("local_push_state") != "awaiting"
+            or not isinstance(review, Mapping)
+            or review.get("job_id") != current_job.job_id
+            or review.get("target_digest") != current_job.target_digest
+            or review.get("receipt_digest")
+            != current_job.prepared_review_receipt_digest
+            or local_push.get("integration_oid") != current_job.integration_oid
+            or local_push.get("check_set_digest")
+            != current_job.check_receipt_digest
+        ):
+            raise BestplanReviewRecoveryDeferred("landing_effect_unknown")
+        try:
+            projected = json.loads(current_job.adapter_state_json).get(
+                "projected_results", ()
+            )
+        except Exception:
+            projected = ()
+        return {
+            "results": [
+                dict(item) for item in projected if isinstance(item, Mapping)
+            ],
+            "integration_oid": current_job.integration_oid,
+            "check_set_digest": current_job.check_receipt_digest,
+            "review_receipt_digest": (
+                current_job.prepared_review_receipt_digest or ""
+            ),
+            "local_main_oid": current_job.integration_oid,
+            "push_pending": True,
+        }
+
+    if job.state == "landed":
+        return {
+            "status": "resumed",
+            "delegation_id": str(request.get("delegation_id") or ""),
+            "job_id": job.job_id,
+            "next_action": "complete_landed",
+            "result": {
+                "status": "completed",
+                "completion": landed_completion(job),
+            },
+        }
+    if job.state == "landing_claimed":
+        from agent.bestplan_local_git import classify_local_main_for_push
+        from agent.bestplan_local_push import _landing_effect_owner_is_live
+
+        plan_store = BestplanStore(
+            db_path=canonical_state_path,
+            reconcile_push_state=False,
+        )
+        try:
+            recovery = plan_store.recover_landing_claim(
+                job.source_id,
+                owner_is_live=_landing_effect_owner_is_live,
+                observe_local_main=classify_local_main_for_push,
+                now_ns=time.time_ns(),
+            )
+        finally:
+            plan_store.close()
+        if recovery.status == "landed":
+            job = store.get_job(job.job_id)
+            return {
+                "status": "resumed",
+                "delegation_id": str(request.get("delegation_id") or ""),
+                "job_id": job.job_id,
+                "next_action": "reconcile_landing",
+                "result": {
+                    "status": "completed",
+                    "completion": landed_completion(job),
+                },
+            }
+        if recovery.status == "owner_alive":
+            raise BestplanReviewRecoveryDeferred("landing_claim_active")
+        if recovery.status == "retry_pre_effect":
+            job = store.get_job(job.job_id)
+        elif recovery.status == "observation_unavailable":
+            raise BestplanReviewRecoveryDeferred(
+                "landing_effect_unknown"
+            )
+        else:
+            raise BestplanReviewRecoveryDeferred("landing_target_drift")
+    if adapter is None:
+        raise BestplanReviewRecoveryDeferred("review_adapter_unavailable")
+    bind_request = getattr(adapter, "bind_request", None)
+    if callable(bind_request):
+        bind_request(dict(request))
+    resolve_routes = getattr(adapter, "resolve_runtime_routes", None)
+    if not callable(resolve_routes):
+        raise BestplanReviewRecoveryDeferred("review_adapter_invalid")
+    try:
+        live_routes = sanitize_runtime_metadata(
+            resolve_routes(job=job, request=dict(request)),
+            execution_protocol=2,
+        )
+        stored_routes = json.loads(job.runtime_routes_json)
+    except Exception:
+        raise BestplanReviewRecoveryDeferred("review_runtime_unavailable") from None
+    if live_routes != stored_routes:
+        raise BestplanReviewRecoveryDeferred("review_runtime_fingerprint_changed")
+    claim_time_ns = time.time_ns() if now_ns is None else now_ns
+    if isinstance(claim_time_ns, bool) or not isinstance(claim_time_ns, int):
+        raise BestplanReviewRecoveryDeferred("review_clock_invalid")
+    owner_id = _bestplan_safe_identifier(
+        "review-recovery-owner",
+        request.get("delegation_id"),
+        os.getpid(),
+        claim_time_ns,
+    )
+    try:
+        claim = store.claim_job(
+            job_id=job.job_id,
+            owner_id=owner_id,
+            now_ns=claim_time_ns,
+            lease_duration_ns=_BESTPLAN_RECOVERY_LEASE_DURATION_NS,
+            expected_fencing_token=job.fencing_token,
+        )
+        resume = store.resume_job(
+            job_id=job.job_id,
+            owner_id=claim.owner_id,
+            fencing_token=claim.fencing_token,
+        )
+    except ReviewLeaseConflict:
+        raise BestplanReviewRecoveryDeferred("review_lease_active") from None
+    action = getattr(adapter, resume.next_action, None)
+    if not callable(action):
+        raise BestplanReviewRecoveryDeferred("review_action_unavailable")
+    heartbeat_stop = threading.Event()
+    heartbeat_failures: list[BaseException] = []
+
+    def renew_recovery_lease() -> None:
+        while not heartbeat_stop.wait(_BESTPLAN_RECOVERY_HEARTBEAT_SECONDS):
+            try:
+                store.renew_lease(
+                    job_id=job.job_id,
+                    owner_id=claim.owner_id,
+                    fencing_token=claim.fencing_token,
+                    now_ns=time.time_ns(),
+                    lease_duration_ns=_BESTPLAN_RECOVERY_LEASE_DURATION_NS,
+                )
+            except BaseException as exc:
+                heartbeat_failures.append(exc)
+                cancel_for_lease_loss = getattr(
+                    adapter, "cancel_for_lease_loss", None,
+                )
+                if callable(cancel_for_lease_loss):
+                    cancel_for_lease_loss()
+                return
+
+    heartbeat_thread = threading.Thread(
+        target=renew_recovery_lease,
+        name=f"bestplan-review-recovery-heartbeat-{job.job_id[:32]}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        action_result = action(
+            request=dict(request),
+            store=store,
+            job=job,
+            claim=claim,
+            resume=resume,
+        )
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(
+            timeout=max(1.0, _BESTPLAN_RECOVERY_HEARTBEAT_SECONDS * 2),
+        )
+    if heartbeat_failures:
+        try:
+            current = store.get_job(job.job_id)
+        except Exception:
+            current = None
+        if current is not None and (
+            current.cancel_requested or current.state == "cancel_requested"
+        ):
+            raise BestplanReviewRecoveryDeferred("review_cancelled")
+        raise BestplanReviewRecoveryDeferred("review_lease_active")
+    if not isinstance(action_result, Mapping):
+        raise BestplanReviewRecoveryDeferred("review_action_result_invalid")
+    return {
+        "status": "resumed",
+        "delegation_id": str(request.get("delegation_id") or ""),
+        "job_id": job.job_id,
+        "next_action": resume.next_action,
+        "result": dict(action_result),
+    }
+
+
+def _bestplan_review_operation_id(
+    plan_id: str,
+    generation: int,
+    kind: str,
+    slot: str = "",
+) -> str:
+    return _bestplan_safe_identifier(
+        "review-operation", plan_id, generation, kind, slot,
+    )
+
+
+def _bestplan_review_verdict_digest(receipt: object) -> str:
+    verdict = receipt.verdict
+    payload = {
+        "blocking_fingerprints": [
+            finding.fingerprint for finding in verdict.blocking_findings
+        ],
+        "integration_oid": verdict.integration_oid,
+        "output_digest": receipt.output_digest,
+        "passed": verdict.passed,
+        "slot": receipt.slot,
+        "target_digest": verdict.target_digest,
+    }
+    return hashlib.sha256(
+        b"hermes.bestplan.review-verdict-receipt.v1\0"
+        + json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    ).hexdigest()
+
+
+def _bestplan_review_generation_receipt(
+    target: object,
+    receipts: Iterable[object],
+) -> object:
+    """Combine exact adopted/fresh slots into the canonical generation receipt."""
+
+    from agent import review_engine
+
+    by_slot = {str(item.slot): item for item in receipts}
+    required = ("smart_reviewer", "code_worker")
+    if set(by_slot) != set(required):
+        raise BestplanReviewRecoveryDeferred("review_receipts_incomplete")
+    ordered = tuple(by_slot[slot] for slot in required)
+    blockers = tuple(sorted(
+        (
+            finding
+            for item in ordered
+            for finding in item.verdict.blocking_findings
+        ),
+        key=lambda item: review_engine._SEVERITY_ORDER[item.severity],
+    ))
+    payload = {
+        "integration_oid": target.integration_oid,
+        "reviewers": [
+            {
+                "model": item.model,
+                "model_family": item.model_family,
+                "output_digest": item.output_digest,
+                "provider": item.provider,
+                "slot": item.slot,
+            }
+            for item in ordered
+        ],
+        "target_digest": target.target_digest,
+    }
+    canonical = review_engine._canonical_json(payload)
+    return review_engine.ReviewGenerationReceipt(
+        target_digest=target.target_digest,
+        integration_oid=target.integration_oid,
+        reviewer_receipts=ordered,
+        blocking_findings=blockers,
+        passed=not blockers,
+        receipt_digest=review_engine._domain_digest(
+            review_engine._RECEIPT_DOMAIN, canonical,
+        ),
+    )
+
+
+def _bestplan_blocker_payload(finding: object) -> dict[str, object]:
+    locator = finding.locator
+    return {
+        "blast_radius": finding.blast_radius,
+        "fingerprint": finding.fingerprint,
+        "locator": {
+            "end_line": locator.end_line,
+            "kind": locator.kind,
+            "locator_id": locator.locator_id,
+            "path": locator.path,
+            "start_line": locator.start_line,
+        },
+        "observed_failure": finding.observed_failure,
+        "severity": finding.severity,
+        "title": finding.title,
+        "trigger": finding.trigger,
+    }
+
+
+def _bestplan_repair_check_failure_evidence(
     *,
     plan_id: str,
+    generation: int,
+    prior_target: object,
+    integration: object,
+    check_error: BaseException,
+) -> tuple[object, object, dict[str, object], str]:
+    """Build host-only check evidence. It is never a reviewer receipt."""
+
+    from agent.review_engine import ReviewTarget
+
+    payload = {
+        "error_type": type(check_error).__name__,
+        "generation": generation,
+        "message": str(check_error),
+        "schema": "hermes.bestplan.repair-check-failure.v1",
+    }
+    failure_digest = hashlib.sha256(
+        b"hermes.bestplan.repair-check-failure.v1\0"
+        + json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    ).hexdigest()
+    target = ReviewTarget.bestplan_integration(
+        plan_id=plan_id,
+        generation=generation,
+        base_oid=prior_target.base_oid,
+        local_target_oid=integration.target_oid,
+        integration_oid=integration.integration_oid,
+        integration_tree_oid=integration.tree_oid,
+        integration_ref=integration.ref_name,
+        integration_receipt_digest=integration.receipt_digest,
+        check_receipt_digest=failure_digest,
+        approval_digest=prior_target.approval_digest,
+        contract_digest=prior_target.contract_digest,
+        diff_sha256=prior_target.diff_sha256,
+        acceptance_digest=prior_target.acceptance_digest,
+        policy_digest=prior_target.policy_digest,
+    )
+    blocker_payload = {
+        "blast_radius": "The repaired BestPlan cannot land.",
+        "fingerprint": failure_digest,
+        "locator": {
+            "kind": "contract_or_receipt",
+            "locator_id": f"repair-check-failure-{generation}",
+        },
+        "observed_failure": str(check_error),
+        "reproduction": {
+            "kind": "not_applicable",
+            "reason": "The host check receipt is the exact evidence.",
+        },
+        "severity": "high",
+        "title": "The repaired approved check failed",
+        "trigger": "The host reran the approval-bound check set.",
+    }
+    blocker = SimpleNamespace(
+        fingerprint=failure_digest,
+        blast_radius=blocker_payload["blast_radius"],
+        observed_failure=blocker_payload["observed_failure"],
+        severity="high",
+        title=blocker_payload["title"],
+        trigger=blocker_payload["trigger"],
+        locator=SimpleNamespace(
+            end_line=None,
+            kind="contract_or_receipt",
+            locator_id=blocker_payload["locator"]["locator_id"],
+            path=None,
+            start_line=None,
+        ),
+    )
+    return target, blocker, blocker_payload, failure_digest
+
+
+def _bestplan_initial_check_failure_payload(
+    *, check_error: BaseException, failure_digest: str,
+) -> dict[str, object]:
+    return {
+        "blast_radius": "The approved BestPlan cannot land.",
+        "fingerprint": failure_digest,
+        "locator": {
+            "kind": "contract_or_receipt",
+            "locator_id": "initial-check-failure",
+        },
+        "observed_failure": str(check_error),
+        "reproduction": {
+            "kind": "not_applicable",
+            "reason": "The host check receipt is the exact evidence.",
+        },
+        "severity": "high",
+        "title": "The initial approved check failed",
+        "trigger": "The host ran the approval-bound check set.",
+    }
+
+
+def _bestplan_blockers_from_stored_receipts(
+    receipts: Iterable[object],
+    *,
+    target: object,
+    evidence: object,
+) -> tuple[object, ...]:
+    """Reparse immutable reviewer bytes and return exact blocking findings."""
+
+    from agent.review_engine import parse_review_verdict
+
+    blockers: list[object] = []
+    for stored in receipts:
+        try:
+            payload = json.loads(stored.receipt_json)
+            verdict = parse_review_verdict(
+                payload["raw_output"], target=target, evidence=evidence,
+            )
+        except Exception:
+            raise BestplanReviewRecoveryDeferred(
+                "review_receipt_stale"
+            ) from None
+        blockers.extend(verdict.blocking_findings)
+    return tuple(blockers)
+
+
+def _bestplan_path_in_lease(path: str, lease: str) -> bool:
+    base = lease[:-1] if lease.endswith("/") else lease
+    return path == base or path.startswith(base + "/")
+
+
+def _map_bestplan_blockers_to_slices(
+    blockers: Iterable[object],
+    completed: tuple[tuple[object, object, str], ...],
+) -> tuple[dict[int, tuple[object, ...]], tuple[object, ...]]:
+    """Map validated blockers to the smallest approved repair authority."""
+
+    mapped: dict[int, list[object]] = {}
+    unresolved: list[object] = []
+    for blocker in blockers:
+        locator = blocker.locator
+        if locator.kind == "contract_or_receipt":
+            indexes = tuple(range(len(completed)))
+        else:
+            path = str(locator.path or "")
+            indexes = tuple(
+                index
+                for index, (_frozen, spec, _manifest_slice_id) in enumerate(completed)
+                if path in tuple(spec.expected_artifacts)
+                or any(
+                    _bestplan_path_in_lease(path, lease)
+                    for lease in tuple(spec.allowed_paths)
+                )
+            )
+        if not indexes:
+            unresolved.append(blocker)
+            continue
+        for index in indexes:
+            mapped.setdefault(index, []).append(blocker)
+    return (
+        {index: tuple(items) for index, items in sorted(mapped.items())},
+        tuple(unresolved),
+    )
+
+
+def _drive_bound_local_bestplan_review_to_pass(
+    *,
+    store: object,
+    job_id: str,
+    owner_id: str,
+    fencing_token: int,
+    adapter: LocalBestplanReviewRecoveryAdapter,
+    request: Mapping[str, object],
+) -> _LocalBestplanReviewResult:
+    """Run durable actions until an exact pass exists, without an attempt cap."""
+
+    while True:
+        current_job = store.get_job(job_id)
+        if current_job.cancel_requested or current_job.state == "cancel_requested":
+            raise BestplanReviewRecoveryDeferred("review_cancelled")
+        resume = store.resume_job(
+            job_id=job_id,
+            owner_id=owner_id,
+            fencing_token=fencing_token,
+        )
+        if resume.next_action == "handoff_pass":
+            if resume.review_pass is None:
+                raise BestplanReviewRecoveryDeferred(
+                    "review_checkpoint_invalid"
+                )
+            context = adapter._load_context(job=current_job, resume=resume)
+            return _LocalBestplanReviewResult(
+                integration=context["integration"],
+                checks=context["checks"],
+                target=context["bundle"].target,
+                receipt=_RecoveredReviewReceipt(
+                    resume.review_pass.review_receipt_digest,
+                ),
+                job_id=job_id,
+                owner_id=owner_id,
+                fencing_token=fencing_token,
+            )
+        if resume.next_action == "wait_for_host":
+            raise BestplanReviewRecoveryDeferred(
+                "review_operator_authority_required"
+            )
+        action = getattr(adapter, resume.next_action, None)
+        if not callable(action):
+            raise BestplanReviewRecoveryDeferred(
+                "review_action_unavailable"
+            )
+        result = action(
+            request=dict(request),
+            store=store,
+            job=current_job,
+            claim=SimpleNamespace(
+                owner_id=owner_id, fencing_token=fencing_token,
+            ),
+            resume=resume,
+        )
+        if not isinstance(result, Mapping):
+            raise BestplanReviewRecoveryDeferred(
+                "review_action_result_invalid"
+            )
+        status = str(result.get("status") or "")
+        if status == "checkpoint_advanced":
+            continue
+        if status == "blocked_requires_authority":
+            raise BestplanReviewRecoveryDeferred(
+                "review_operator_authority_required"
+            )
+        raise BestplanReviewRecoveryDeferred(
+            status or "review_checkpoint_invalid"
+        )
+
+
+def _recover_initial_bestplan_check_failure(
+    *,
+    plan_id: str,
+    raw_request: str,
+    plan: object,
+    snapshot: object,
+    contract: Mapping[str, Any],
+    approval_digest: str,
+    contract_digest: str,
+    completed: Iterable[tuple[object, object, str]],
+    candidate_authorities: Iterable[object],
+    review_authority_bindings: Iterable[object],
+    candidate_runtime_routes: Iterable[Mapping[str, Any]],
+    integration: object,
+    check_error: BaseException,
+    runtime: object,
+    state_db_path: Path,
+    session_id: str,
+    profile: str,
+    deadline: float,
+    cancel_event: threading.Event | None,
+    projected_results: Iterable[Mapping[str, Any]],
+) -> _LocalBestplanReviewResult:
+    """Persist a failed first check as repair evidence and continue safely."""
+
+    from agent.bestplan_contract import source_snapshot_digest
+    from agent.bestplan_review import bestplan_review_policy_digest
+    from agent.review_engine import ReviewStore, ReviewTarget
+
+    completed = tuple(completed)
+    candidate_authorities = tuple(candidate_authorities)
+    review_bindings = tuple(review_authority_bindings)
+    candidate_routes = tuple(candidate_runtime_routes)
+    try:
+        raw_request = _bestplan_execution_request_text(raw_request)
+    except ValueError:
+        raise BestplanCandidateBatchError("candidate batch failed") from None
+    if (
+        not completed
+        or len(completed) != len(candidate_authorities)
+        or len(review_bindings) != 2
+        or (candidate_routes and len(candidate_routes) != len(completed))
+    ):
+        raise BestplanCandidateBatchError("candidate batch failed")
+    if cancel_event is not None and cancel_event.is_set():
+        raise BestplanReviewRecoveryDeferred("review_cancelled")
+
+    policy_digest = bestplan_review_policy_digest(review_bindings)
+    failure_payload = {
+        "error_type": type(check_error).__name__,
+        "message": str(check_error),
+        "schema": "hermes.bestplan.initial-check-failure.v1",
+    }
+    failure_digest = hashlib.sha256(
+        b"hermes.bestplan.initial-check-failure.v1\0"
+        + json.dumps(
+            failure_payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    ).hexdigest()
+    target = ReviewTarget.bestplan_integration(
+        plan_id=plan_id,
+        generation=0,
+        base_oid=snapshot.head_oid,
+        local_target_oid=integration.target_oid,
+        integration_oid=integration.integration_oid,
+        integration_tree_oid=integration.tree_oid,
+        integration_ref=integration.ref_name,
+        integration_receipt_digest=integration.receipt_digest,
+        check_receipt_digest=failure_digest,
+        approval_digest=approval_digest,
+        contract_digest=contract_digest,
+        diff_sha256=hashlib.sha256(b"").hexdigest(),
+        acceptance_digest=hashlib.sha256(
+            b"hermes.bestplan.initial-check-acceptance.v1\0"
+            + raw_request.encode("utf-8")
+            + json.dumps(
+                plan.to_manifest(),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        policy_digest=policy_digest,
+    )
+    adapter_state = {
+        "schema": "hermes.bestplan.local-review-adapter.v1",
+        "approval_digest": approval_digest,
+        "contract_digest": contract_digest,
+        "initial_check_failure": {
+            **failure_payload,
+            "failure_digest": failure_digest,
+            "integration": _bestplan_review_integration_payload(integration),
+        },
+        "manifest": plan.to_manifest(),
+        "projected_results": [dict(item) for item in projected_results],
+        "raw_request": raw_request,
+        "raw_request_sha256": hashlib.sha256(
+            raw_request.encode("utf-8")
+        ).hexdigest(),
+        "source_snapshot_digest": source_snapshot_digest(snapshot),
+    }
+    deterministic_failure = "returned nonzero" in str(check_error)
+    if not deterministic_failure:
+        adapter_state.pop("initial_check_failure", None)
+        adapter_state["initial_check_pending"] = {
+            **failure_payload,
+            "failure_digest": failure_digest,
+            "integration": _bestplan_review_integration_payload(integration),
+        }
+    runtime_routes = [
+        {**dict(item), "route": f"candidate-{index}"}
+        for index, item in enumerate(candidate_routes)
+    ] + [
+        {
+            "route": str(binding.slot),
+            "provider": str(binding.provider),
+            "model": str(binding.model),
+            "runtime_fingerprint": str(
+                getattr(binding, "runtime_fingerprint", "")
+                or hashlib.sha256(
+                    json.dumps(
+                        {
+                            "model": str(binding.model),
+                            "provider": str(binding.provider),
+                            "route": str(binding.slot),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+            ),
+        }
+        for binding in review_bindings
+    ]
+    state_db_path = Path(state_db_path)
+    store = ReviewStore(state_db_path)
+    job_id = _bestplan_safe_identifier("review-job", plan_id)
+    job = store.create_job(
+        job_id=job_id,
+        source_kind=target.source_kind,
+        source_id=plan_id,
+        target_digest=target.target_digest,
+        policy_digest=policy_digest,
+        integration_oid=target.integration_oid,
+        check_receipt_digest=target.check_receipt_digest,
+        adapter_version="local-bestplan.v1",
+        owner_session_id=session_id,
+        owner_profile=profile,
+        workspace=str(Path(snapshot.repo.workspace).resolve()),
+        adapter_state=adapter_state,
+        runtime_routes=runtime_routes,
+    )
+    owner_id = _bestplan_safe_identifier(
+        "review-owner",
+        plan_id,
+        os.getpid(),
+        threading.get_ident(),
+        uuid.uuid4().hex,
+    )
+    claim = store.claim_job(
+        job_id=job_id,
+        owner_id=owner_id,
+        now_ns=time.time_ns(),
+        lease_duration_ns=30_000_000_000,
+        expected_fencing_token=job.fencing_token,
+    )
+    if not deterministic_failure:
+        raise BestplanReviewRecoveryDeferred("checks_runtime_unavailable")
+    store.begin_generation(
+        job_id=job_id,
+        generation=0,
+        target=target,
+        owner_id=owner_id,
+        fencing_token=claim.fencing_token,
+        operation_id=_bestplan_review_operation_id(
+            plan_id, 0, "generation-started",
+        ),
+    )
+    blocker_payload = _bestplan_initial_check_failure_payload(
+        check_error=check_error, failure_digest=failure_digest,
+    )
+    store.record_host_check_failure(
+        job_id=job_id,
+        generation=0,
+        target_digest=target.target_digest,
+        integration_oid=target.integration_oid,
+        check_failure_digest=failure_digest,
+        blocking_findings_json=json.dumps(
+            [blocker_payload],
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        owner_id=owner_id,
+        fencing_token=claim.fencing_token,
+        operation_id=_bestplan_review_operation_id(
+            plan_id, 0, "initial-check-failure",
+        ),
+    )
+    store.append_event(
+        job_id=job_id,
+        generation=0,
+        owner_id=owner_id,
+        fencing_token=claim.fencing_token,
+        operation_id=_bestplan_review_operation_id(
+            plan_id, 0, "initial-checks-failed",
+        ),
+        kind="initial_checks_failed",
+        target_digest=target.target_digest,
+        payload={"failure_digest": failure_digest},
+    )
+    adapter = LocalBestplanReviewRecoveryAdapter()
+    adapter._state_db_path = state_db_path
+    adapter._local_runtime = runtime
+    adapter._prepared_candidates = tuple(
+        {
+            "spec": spec,
+            "manifest_slice_id": manifest_slice_id,
+        }
+        for _frozen, spec, manifest_slice_id in completed
+    )
+    adapter._candidate_bindings = tuple(
+        SimpleNamespace(authority=authority)
+        for authority in candidate_authorities
+    )
+    adapter._review_bindings = review_bindings
+    adapter._cancel_event = cancel_event
+    adapter._bound_plan_context = {
+        "validated": SimpleNamespace(
+            approval_digest=approval_digest,
+            contract=contract,
+            plan=plan,
+            source_snapshot=snapshot,
+        ),
+        "plan_row": {"raw_request": raw_request},
+        "raw_request": raw_request,
+        "adapter_state": adapter_state,
+    }
+    request = {
+        "adapter_version": "local-bestplan.v1",
+        "delegation_id": _bestplan_safe_identifier(
+            "review-live", plan_id,
+        ),
+        "job_id": job_id,
+        "kind": "bestplan_review_resume",
+        "plan_id": plan_id,
+        "profile": profile,
+        "session_id": session_id,
+        "state_db_path": str(state_db_path.resolve()),
+        "tracker_path": str(state_db_path.resolve()),
+        "workspace": str(Path(snapshot.repo.workspace).resolve()),
+    }
+    return _drive_bound_local_bestplan_review_to_pass(
+        store=store,
+        job_id=job_id,
+        owner_id=owner_id,
+        fencing_token=claim.fencing_token,
+        adapter=adapter,
+        request=request,
+    )
+
+
+def _run_local_bestplan_review_loop(
+    *,
+    plan_id: str,
+    raw_request: str,
     plan: object,
     snapshot: object,
     contract: Mapping[str, Any],
     approval_digest: str,
     contract_digest: str,
     completed: list[tuple[object, object, str]],
-    projected_results: list[dict[str, Any]],
+    candidate_authorities: Iterable[object],
+    review_authority_bindings: Iterable[object],
+    candidate_runtime_routes: Iterable[Mapping[str, Any]] = (),
+    integration: object,
+    checks: object,
     runtime: object,
     state_db_path: Path,
     session_id: str,
     profile: str,
+    deadline: float,
     cancel_event: threading.Event | None,
-    now: float | None = None,
-) -> dict[str, Any]:
-    """Integrate, check, durably prepare, and land one local BestPlan batch."""
+    projected_results: Iterable[Mapping[str, Any]] = (),
+) -> _LocalBestplanReviewResult:
+    """Review, repair, recheck, and repeat until the exact target passes."""
 
-    from agent.bestplan_checks import run_integration_checks
-    from agent.bestplan_local_git import (
-        LocalMainEffectUnknown,
-        classify_local_main_for_push,
-        land_checked_integration,
-        observe_prelanding_local_main_push_target,
+    from agent import bestplan_candidates, bestplan_checks, bestplan_promotion
+    from agent.bestplan_local import (
+        LocalReviewAuthorityBinding,
+        call_local_review_authority,
+        refresh_local_review_authority_bindings,
     )
-    from agent.bestplan_promotion import freeze_integration
-    from agent.bestplan_state import BestplanStore
+    from agent.bestplan_review import (
+        bestplan_review_policy_digest,
+        build_bestplan_review_bundle,
+    )
+    from agent.review_engine import (
+        ReviewStore,
+        ReviewValidationError,
+        ReviewerBinding,
+        run_review_generation,
+    )
+    from agent.bestplan_contract import source_snapshot_digest
 
+    if not isinstance(state_db_path, Path):
+        state_db_path = Path(state_db_path)
+    candidate_authorities = tuple(candidate_authorities)
+    candidate_runtime_routes = tuple(candidate_runtime_routes)
+    base_completed = tuple(completed)
+    initial_review_bindings = tuple(review_authority_bindings)
+    if (
+        len(base_completed) != len(candidate_authorities)
+        or (
+            candidate_runtime_routes
+            and len(candidate_runtime_routes) != len(candidate_authorities)
+        )
+        or len(initial_review_bindings) != 2
+    ):
+        raise BestplanCandidateBatchError("candidate batch failed")
+    if not isinstance(raw_request, str) or not raw_request.strip():
+        raw_request = "\n".join(
+            str(getattr(item, "goal", "")).strip()
+            for _frozen, item, _slice_id in base_completed
+            if str(getattr(item, "goal", "")).strip()
+        )
+    if not raw_request:
+        raise BestplanCandidateBatchError("candidate batch failed")
+    try:
+        raw_request = _bestplan_execution_request_text(raw_request)
+    except ValueError:
+        raise BestplanCandidateBatchError("candidate batch failed") from None
     operation_timeout = getattr(runtime, "operation_timeout_seconds", None)
     if (
         isinstance(operation_timeout, bool)
@@ -6326,46 +9659,805 @@ def _finish_local_bestplan_batch(
         or not 0 < float(operation_timeout) <= 86_400.0
     ):
         raise BestplanCandidateBatchError("candidate batch failed")
-    started_at = time.time() if now is None else float(now)
-    if not math.isfinite(started_at):
-        raise BestplanCandidateBatchError("candidate batch failed")
-    if cancel_event is not None and cancel_event.is_set():
-        raise BestplanCandidateBatchError("candidate batch failed")
-    deadline = time.monotonic() + float(operation_timeout)
-    bindings = tuple(
-        _build_local_candidate_binding(
-            frozen=frozen,
-            spec=spec,
-            manifest_slice_id=manifest_slice_id,
-            snapshot=snapshot,
-            approval_digest=approval_digest,
-            contract_digest=contract_digest,
-        )
-        for frozen, spec, manifest_slice_id in completed
-    )
-    integration = freeze_integration(
+    effective_cancel = cancel_event or threading.Event()
+    heartbeat_error: list[BaseException] = []
+
+    def check_control() -> None:
+        if heartbeat_error:
+            raise BestplanCandidateBatchError("candidate batch failed") from heartbeat_error[0]
+        if effective_cancel.is_set():
+            raise BestplanCandidateBatchError("candidate batch failed")
+
+    def operation_deadline() -> float:
+        check_control()
+        return time.monotonic() + float(operation_timeout)
+
+    check_control()
+    policy_digest = bestplan_review_policy_digest(initial_review_bindings)
+    generation = 0
+    dispositions: tuple[dict[str, str], ...] = ()
+    current_integration = integration
+    current_checks = checks
+    current_review_bindings = initial_review_bindings
+    bundle = build_bestplan_review_bundle(
         plan_id=plan_id,
+        generation=generation,
+        raw_request=raw_request,
         plan=plan,
         snapshot=snapshot,
+        integration=current_integration,
+        checks=current_checks,
         contract=contract,
         approval_digest=approval_digest,
-        candidates=bindings,
-        temp_root=runtime.integration_root,
-        deadline=deadline,
-        cancel_event=cancel_event,
+        policy_digest=policy_digest,
+        dispositions=dispositions,
+        deadline=operation_deadline(),
+        cancel_event=effective_cancel,
     )
-    checks = run_integration_checks(
-        snapshot=snapshot,
-        integration=integration,
-        contract=contract,
-        commands=runtime.check_plan.commands,
-        runtime=runtime.check_runtime,
-        checks_root=runtime.checks_root,
-        deadline=deadline,
-        cancel_event=cancel_event,
+    store = ReviewStore(state_db_path)
+    job_id = _bestplan_safe_identifier("review-job", plan_id)
+    owner_id = _bestplan_safe_identifier(
+        "review-owner",
+        plan_id,
+        os.getpid(),
+        threading.get_ident(),
+        uuid.uuid4().hex,
     )
-    if cancel_event is not None and cancel_event.is_set():
-        raise BestplanCandidateBatchError("candidate batch failed")
+    job = store.create_job(
+        job_id=job_id,
+        source_kind=bundle.target.source_kind,
+        source_id=plan_id,
+        target_digest=bundle.target.target_digest,
+        policy_digest=policy_digest,
+        integration_oid=bundle.target.integration_oid,
+        check_receipt_digest=bundle.target.check_receipt_digest,
+        adapter_version="local-bestplan.v1",
+        owner_session_id=session_id,
+        owner_profile=profile,
+        workspace=str(Path(snapshot.repo.workspace).resolve()),
+        adapter_state={
+            "schema": "hermes.bestplan.local-review-adapter.v1",
+            "approval_digest": approval_digest,
+            "contract_digest": contract_digest,
+            "initial_checks": _bestplan_review_check_set_payload(checks),
+            "initial_integration": _bestplan_review_integration_payload(
+                integration
+            ),
+            "manifest": plan.to_manifest(),
+            "projected_results": [
+                dict(item) for item in projected_results
+            ],
+            "raw_request": raw_request,
+            "raw_request_sha256": hashlib.sha256(
+                raw_request.encode("utf-8")
+            ).hexdigest(),
+            "source_snapshot_digest": source_snapshot_digest(snapshot),
+        },
+        runtime_routes=[
+            {
+                **dict(item),
+                "route": f"candidate-{index}",
+            }
+            for index, item in enumerate(candidate_runtime_routes)
+        ] + [
+            {
+                "route": str(binding.slot),
+                "provider": str(binding.provider),
+                "model": str(binding.model),
+                "runtime_fingerprint": str(
+                    getattr(binding, "runtime_fingerprint", "")
+                    or hashlib.sha256(
+                        json.dumps(
+                            {
+                                "model": str(binding.model),
+                                "provider": str(binding.provider),
+                                "route": str(binding.slot),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                ),
+            }
+            for binding in initial_review_bindings
+        ],
+    )
+    try:
+        store.mark_execution_pipeline_review_started(plan_id)
+    except ReviewValidationError:
+        # Direct/internal callers that predate async dispatch have no intent.
+        pass
+    lease_duration_ns = 30_000_000_000
+    claimed = store.claim_job(
+        job_id=job_id,
+        owner_id=owner_id,
+        now_ns=time.time_ns(),
+        lease_duration_ns=lease_duration_ns,
+        expected_fencing_token=job.fencing_token,
+    )
+    fencing_token = claimed.fencing_token
+    heartbeat_stop = threading.Event()
+
+    def heartbeat() -> None:
+        while not heartbeat_stop.wait(10.0):
+            try:
+                store.renew_lease(
+                    job_id=job_id,
+                    owner_id=owner_id,
+                    fencing_token=fencing_token,
+                    now_ns=time.time_ns(),
+                    lease_duration_ns=lease_duration_ns,
+                )
+            except BaseException as exc:
+                heartbeat_error.append(exc)
+                effective_cancel.set()
+                return
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat,
+        name=f"bestplan-review-heartbeat-{plan_id[:32]}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        while True:
+            check_control()
+            store.begin_generation(
+                job_id=job_id,
+                generation=generation,
+                target=bundle.target,
+                artifact=bundle.artifact,
+                owner_id=owner_id,
+                fencing_token=fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    plan_id, generation, "generation-started",
+                ),
+            )
+            reviewer_bindings = tuple(
+                ReviewerBinding(
+                    slot=str(binding.slot),
+                    provider=str(binding.provider),
+                    model=str(binding.model),
+                    model_family=str(binding.model_family),
+                )
+                for binding in current_review_bindings
+            )
+            authorities_by_slot = {
+                str(binding.slot): binding
+                for binding in current_review_bindings
+            }
+
+            def reviewer_call(binding: object, request: dict[str, object]) -> str:
+                check_control()
+                authority = authorities_by_slot.get(str(binding.slot))
+                if authority is None:
+                    raise BestplanCandidateBatchError("candidate batch failed")
+                result = call_local_review_authority(authority, request)
+                check_control()
+                return result
+
+            def persist_reviewer_receipt(
+                reviewer_receipt: object, raw_output: str,
+            ) -> None:
+                stored_receipt = {
+                    "schema": "hermes.bestplan.stored-reviewer-receipt.v1",
+                    "slot": reviewer_receipt.slot,
+                    "provider": reviewer_receipt.provider,
+                    "model": reviewer_receipt.model,
+                    "model_family": reviewer_receipt.model_family,
+                    "runtime_fingerprint": str(
+                        getattr(
+                            authorities_by_slot[reviewer_receipt.slot],
+                            "runtime_fingerprint",
+                            "",
+                        )
+                    ),
+                    "target_digest": bundle.target.target_digest,
+                    "integration_oid": bundle.target.integration_oid,
+                    "output_digest": reviewer_receipt.output_digest,
+                    "raw_output": raw_output,
+                    "findings": [
+                        _bestplan_blocker_payload(item)
+                        for item in reviewer_receipt.verdict.findings
+                    ],
+                }
+                store.record_reviewer_receipt(
+                    job_id=job_id,
+                    generation=generation,
+                    slot=reviewer_receipt.slot,
+                    target_digest=bundle.target.target_digest,
+                    integration_oid=bundle.target.integration_oid,
+                    output_digest=reviewer_receipt.output_digest,
+                    verdict_digest=_bestplan_review_verdict_digest(
+                        reviewer_receipt
+                    ),
+                    passed=reviewer_receipt.verdict.passed,
+                    receipt_json=json.dumps(
+                        stored_receipt,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    owner_id=owner_id,
+                    fencing_token=fencing_token,
+                    operation_id=_bestplan_review_operation_id(
+                        plan_id,
+                        generation,
+                        "reviewer-receipt",
+                        reviewer_receipt.slot,
+                    ),
+                )
+
+            receipt = run_review_generation(
+                bundle.target,
+                reviewer_bindings,
+                artifact=bundle.artifact,
+                evidence=bundle.evidence,
+                reviewer_call=reviewer_call,
+                receipt_callback=persist_reviewer_receipt,
+            )
+            check_control()
+            if receipt.passed:
+                store.record_generation_pass(
+                    job_id=job_id,
+                    generation=generation,
+                    target_digest=bundle.target.target_digest,
+                    integration_oid=bundle.target.integration_oid,
+                    check_receipt_digest=bundle.target.check_receipt_digest,
+                    review_receipt_digest=receipt.receipt_digest,
+                    owner_id=owner_id,
+                    fencing_token=fencing_token,
+                    operation_id=_bestplan_review_operation_id(
+                        plan_id, generation, "review-pass",
+                    ),
+                )
+                return _LocalBestplanReviewResult(
+                    integration=current_integration,
+                    checks=current_checks,
+                    target=bundle.target,
+                    receipt=receipt,
+                    job_id=job_id,
+                    owner_id=owner_id,
+                    fencing_token=fencing_token,
+                )
+
+            blockers = tuple(receipt.blocking_findings)
+            if not blockers:
+                raise BestplanCandidateBatchError("candidate batch failed")
+            blocker_payload = [
+                _bestplan_blocker_payload(item) for item in blockers
+            ]
+            store.record_generation_blocked(
+                job_id=job_id,
+                generation=generation,
+                target_digest=bundle.target.target_digest,
+                integration_oid=bundle.target.integration_oid,
+                check_receipt_digest=bundle.target.check_receipt_digest,
+                review_receipt_digest=receipt.receipt_digest,
+                blocking_findings_json=json.dumps(
+                    blocker_payload,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                owner_id=owner_id,
+                fencing_token=fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    plan_id, generation, "review-blocked",
+                ),
+            )
+            check_control()
+            next_generation = generation + 1
+            mapped_blockers, unresolved_blockers = (
+                _map_bestplan_blockers_to_slices(blockers, base_completed)
+            )
+            if unresolved_blockers:
+                store.wait_for_host(
+                    job_id=job_id,
+                    generation=generation,
+                    owner_id=owner_id,
+                    fencing_token=fencing_token,
+                    operation_id=_bestplan_review_operation_id(
+                        plan_id, generation, "blocked-requires-authority",
+                    ),
+                    reason_code="blocked_requires_authority",
+                    target_digest=bundle.target.target_digest,
+                    payload={"blockers": [
+                        _bestplan_blocker_payload(item)
+                        for item in unresolved_blockers
+                    ]},
+                )
+                raise BestplanReviewRecoveryDeferred(
+                    "review_operator_authority_required"
+                )
+            store.append_event(
+                job_id=job_id,
+                generation=generation,
+                owner_id=owner_id,
+                fencing_token=fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    plan_id, generation, "repair-mapped",
+                ),
+                kind="repair_mapped",
+                target_digest=bundle.target.target_digest,
+                payload={
+                    "slice_blockers": {
+                        base_completed[index][2]: [
+                            item.fingerprint for item in items
+                        ]
+                        for index, items in mapped_blockers.items()
+                    }
+                },
+            )
+            repaired: list[tuple[object, object, str]] = []
+            repair_evidence_by_index: dict[int, dict[str, object]] = {}
+            for index, slice_blockers in mapped_blockers.items():
+                _prior_frozen, original_spec, manifest_slice_id = base_completed[index]
+                authority = candidate_authorities[index]
+                prior_attempts: list[int] = []
+                for event in store.list_events(job_id):
+                    if event.kind not in {
+                        "repair_attempt_started", "repair_no_change",
+                    }:
+                        continue
+                    try:
+                        event_payload = json.loads(event.payload_json)
+                    except Exception:
+                        continue
+                    if (
+                        event.generation == generation
+                        and event_payload.get("manifest_slice_id")
+                        == manifest_slice_id
+                        and type(event_payload.get("repair_attempt")) is int
+                    ):
+                        prior_attempts.append(
+                            int(event_payload["repair_attempt"])
+                        )
+                ordinal = max(prior_attempts, default=-1) + 1
+                while True:
+                    check_control()
+                    generation_plan_id = _bestplan_safe_identifier(
+                        "repair-plan", plan_id, next_generation, ordinal,
+                    )
+                    repair_goal_suffix = json.dumps(
+                        {
+                            "blockers": [
+                                _bestplan_blocker_payload(item)
+                                for item in slice_blockers
+                            ],
+                            "generation": next_generation,
+                            "prior_integration_oid": (
+                                current_integration.integration_oid
+                            ),
+                            "repair_attempt": ordinal,
+                            "rules": [
+                                "Change only this slice's original approved paths.",
+                                "Preserve all expected artifacts.",
+                                "Do not claim pass; the host reruns checks and review.",
+                            ],
+                        },
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    repair_spec = replace(
+                        original_spec,
+                        plan_id=generation_plan_id,
+                        candidate_id=_bestplan_safe_identifier(
+                            "candidate", generation_plan_id, index,
+                            manifest_slice_id, ordinal,
+                        ),
+                        slice_id=_bestplan_safe_identifier(
+                            "slice", generation_plan_id, index,
+                            manifest_slice_id, ordinal,
+                        ),
+                        goal=(
+                            f"{original_spec.goal}\n\n"
+                            f"Automatic review repair evidence:\n"
+                            f"{repair_goal_suffix}"
+                        ),
+                        expires_at=math.ceil(
+                            time.time()
+                            + runtime.candidate_runtime.capability_ttl_seconds
+                        ),
+                    )
+                    attempt_id = _bestplan_safe_identifier(
+                        "attempt", generation_plan_id, index,
+                        manifest_slice_id, ordinal,
+                    )
+                    store.append_event(
+                        job_id=job_id,
+                        generation=generation,
+                        owner_id=owner_id,
+                        fencing_token=fencing_token,
+                        operation_id=_bestplan_review_operation_id(
+                            plan_id,
+                            generation,
+                            "repair-attempt-started",
+                            f"{manifest_slice_id}-{ordinal}",
+                        ),
+                        kind="repair_attempt_started",
+                        target_digest=bundle.target.target_digest,
+                        payload={
+                            "attempt_id": attempt_id,
+                            "attempt_plan_id": generation_plan_id,
+                            "base_integration_oid": (
+                                current_integration.integration_oid
+                            ),
+                            "candidate_id": repair_spec.candidate_id,
+                            "manifest_slice_id": manifest_slice_id,
+                            "repair_attempt": ordinal,
+                            "slice_id": repair_spec.slice_id,
+                        },
+                    )
+                    frozen = bestplan_candidates.run_and_freeze_repair_candidate(
+                        snapshot=snapshot,
+                        candidate_base=current_integration,
+                        spec=repair_spec,
+                        attempts_root=runtime.candidate_runtime.attempts_root,
+                        controller_source=runtime.candidate_runtime.controller_source,
+                        controller_python=runtime.candidate_runtime.controller_python,
+                        runtime_read_paths=runtime.candidate_runtime.runtime_read_paths,
+                        expected_controller=runtime.candidate_runtime.controller,
+                        authority_client=authority,
+                        timeout_seconds=runtime.candidate_runtime.timeout_seconds,
+                        attempt_id=attempt_id,
+                        cancel_event=effective_cancel,
+                    )
+                    _validate_bestplan_frozen_candidate(
+                        frozen,
+                        spec=repair_spec,
+                        attempt_id=attempt_id,
+                        runtime=runtime.candidate_runtime,
+                    )
+                    changed_paths = tuple(
+                        path.decode("utf-8", "strict")
+                        for path in frozen.changed_paths
+                    )
+                    if changed_paths:
+                        store.record_repair_candidate_frozen(
+                            job_id=job_id,
+                            prior_generation=generation,
+                            prior_target_digest=bundle.target.target_digest,
+                            base_integration_oid=(
+                                current_integration.integration_oid
+                            ),
+                            manifest_slice_id=manifest_slice_id,
+                            repair_attempt=ordinal,
+                            attempt_plan_id=generation_plan_id,
+                            candidate_receipt_json=json.dumps(
+                                _bestplan_host_candidate_receipt(
+                                    frozen=frozen,
+                                    manifest_slice_id=manifest_slice_id,
+                                    spec=repair_spec,
+                                    promotion_contract_digest=contract_digest,
+                                ),
+                                ensure_ascii=True,
+                                allow_nan=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            changed_paths_json=json.dumps(
+                                list(changed_paths),
+                                ensure_ascii=True,
+                                allow_nan=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            owner_id=owner_id,
+                            fencing_token=fencing_token,
+                            operation_id=_bestplan_review_operation_id(
+                                plan_id,
+                                generation,
+                                "repair-candidate-frozen",
+                                f"{manifest_slice_id}-{ordinal}",
+                            ),
+                        )
+                        break
+                    store.append_event(
+                        job_id=job_id,
+                        generation=generation,
+                        owner_id=owner_id,
+                        fencing_token=fencing_token,
+                        operation_id=_bestplan_review_operation_id(
+                            plan_id, generation, "repair-no-change",
+                            f"{manifest_slice_id}-{ordinal}",
+                        ),
+                        kind="repair_no_change",
+                        target_digest=bundle.target.target_digest,
+                        payload={
+                            "attempt_id": attempt_id,
+                            "manifest_slice_id": manifest_slice_id,
+                            "repair_attempt": ordinal,
+                        },
+                    )
+                    ordinal += 1
+                repaired.append((frozen, repair_spec, manifest_slice_id))
+                repair_evidence_by_index[index] = {
+                    "changed_paths": changed_paths,
+                    "receipt_digest": frozen.raw_receipt_sha256,
+                }
+            repair_bindings = tuple(
+                _build_local_candidate_binding(
+                    frozen=frozen,
+                    spec=spec,
+                    manifest_slice_id=manifest_slice_id,
+                    snapshot=snapshot,
+                    approval_digest=approval_digest,
+                    contract_digest=contract_digest,
+                    candidate_base_oid=current_integration.integration_oid,
+                )
+                for frozen, spec, manifest_slice_id in repaired
+            )
+            prior_integration = current_integration
+            current_integration = bestplan_promotion.freeze_repair_integration(
+                plan_id=plan_id,
+                generation=next_generation,
+                prior=prior_integration,
+                plan=plan,
+                snapshot=snapshot,
+                contract=contract,
+                approval_digest=approval_digest,
+                candidates=repair_bindings,
+                temp_root=runtime.integration_root,
+                deadline=operation_deadline(),
+                cancel_event=effective_cancel,
+            )
+            repair_candidate_receipts = [
+                {
+                    "candidate_oid": frozen.commit_oid,
+                    "candidate_receipt_digest": frozen.raw_receipt_sha256,
+                    "candidate_ref": frozen.ref_name,
+                    "changed_paths": [
+                        path.decode("utf-8", "strict")
+                        for path in frozen.changed_paths
+                    ],
+                    "slice_id": manifest_slice_id,
+                }
+                for frozen, _spec, manifest_slice_id in repaired
+            ]
+            if not repair_candidate_receipts:
+                raise BestplanCandidateBatchError("candidate batch failed")
+            repair_candidate_receipts[0]["integration"] = (
+                _bestplan_review_integration_payload(current_integration)
+            )
+            store.record_repair_frozen(
+                job_id=job_id,
+                prior_generation=generation,
+                generation=next_generation,
+                prior_target_digest=bundle.target.target_digest,
+                integration_oid=current_integration.integration_oid,
+                integration_tree_oid=current_integration.tree_oid,
+                integration_ref=current_integration.ref_name,
+                integration_receipt_digest=current_integration.receipt_digest,
+                candidate_receipts_json=json.dumps(
+                    repair_candidate_receipts,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                owner_id=owner_id,
+                fencing_token=fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    plan_id, next_generation, "repair-frozen",
+                ),
+            )
+            try:
+                current_checks = bestplan_checks.run_integration_checks(
+                    snapshot=snapshot,
+                    integration=current_integration,
+                    contract=contract,
+                    commands=runtime.check_plan.commands,
+                    runtime=runtime.check_runtime,
+                    checks_root=runtime.checks_root,
+                    deadline=operation_deadline(),
+                    cancel_event=effective_cancel,
+                )
+            except bestplan_checks.CheckExecutionError as exc:
+                if "returned nonzero" not in str(exc):
+                    raise BestplanReviewRecoveryDeferred(
+                        "checks_runtime_unavailable"
+                    ) from None
+                (
+                    failure_target,
+                    _failure_blocker,
+                    failure_payload,
+                    failure_digest,
+                ) = _bestplan_repair_check_failure_evidence(
+                    plan_id=plan_id,
+                    generation=next_generation,
+                    prior_target=bundle.target,
+                    integration=current_integration,
+                    check_error=exc,
+                )
+                store.record_repair_check_failure(
+                    job_id=job_id,
+                    generation=next_generation,
+                    target=failure_target,
+                    check_failure_digest=failure_digest,
+                    blocking_findings_json=json.dumps(
+                        [failure_payload],
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    owner_id=owner_id,
+                    fencing_token=fencing_token,
+                    operation_id=_bestplan_review_operation_id(
+                        plan_id,
+                        next_generation,
+                        "repair-check-failure",
+                    ),
+                )
+                adapter = LocalBestplanReviewRecoveryAdapter()
+                adapter._state_db_path = Path(state_db_path)
+                adapter._local_runtime = runtime
+                adapter._prepared_candidates = tuple(
+                    {
+                        "spec": spec,
+                        "manifest_slice_id": manifest_slice_id,
+                    }
+                    for _frozen, spec, manifest_slice_id in base_completed
+                )
+                adapter._candidate_bindings = tuple(
+                    SimpleNamespace(authority=authority)
+                    for authority in candidate_authorities
+                )
+                adapter._review_bindings = tuple(current_review_bindings)
+                adapter._cancel_event = effective_cancel
+                adapter_state = json.loads(
+                    store.get_job(job_id).adapter_state_json
+                )
+                adapter._bound_plan_context = {
+                    "validated": SimpleNamespace(
+                        approval_digest=approval_digest,
+                        contract=contract,
+                        plan=plan,
+                        source_snapshot=snapshot,
+                    ),
+                    "plan_row": {"raw_request": raw_request},
+                    "raw_request": raw_request,
+                    "adapter_state": adapter_state,
+                }
+                request = {
+                    "adapter_version": "local-bestplan.v1",
+                    "delegation_id": _bestplan_safe_identifier(
+                        "review-live", plan_id,
+                    ),
+                    "job_id": job_id,
+                    "kind": "bestplan_review_resume",
+                    "plan_id": plan_id,
+                    "profile": profile,
+                    "session_id": session_id,
+                    "state_db_path": str(Path(state_db_path).resolve()),
+                    "tracker_path": str(Path(state_db_path).resolve()),
+                    "workspace": str(Path(snapshot.repo.workspace).resolve()),
+                }
+                return _drive_bound_local_bestplan_review_to_pass(
+                    store=store,
+                    job_id=job_id,
+                    owner_id=owner_id,
+                    fencing_token=fencing_token,
+                    adapter=adapter,
+                    request=request,
+                )
+            dispositions_list: list[dict[str, str]] = []
+            for blocker in blockers:
+                indexes = [
+                    index
+                    for index, items in mapped_blockers.items()
+                    if blocker in items
+                ]
+                exact_evidence = [
+                    repair_evidence_by_index[index] for index in indexes
+                ]
+                dispositions_list.append({
+                    "evidence": (
+                        f"Repair generation {next_generation} changed "
+                        + ",".join(
+                            path
+                            for item in exact_evidence
+                            for path in item["changed_paths"]
+                        )
+                        + "; candidate receipts "
+                        + ",".join(
+                            str(item["receipt_digest"])
+                            for item in exact_evidence
+                        )
+                        + "; the host reran every approved check."
+                    ),
+                    "finding_fingerprint": blocker.fingerprint,
+                    "status": "fixed",
+                })
+            dispositions = tuple(dispositions_list)
+            generation = next_generation
+            if all(
+                isinstance(binding, LocalReviewAuthorityBinding)
+                for binding in current_review_bindings
+            ):
+                current_review_bindings = (
+                    refresh_local_review_authority_bindings(
+                        current_review_bindings
+                    )
+                )
+            bundle = build_bestplan_review_bundle(
+                plan_id=plan_id,
+                generation=generation,
+                raw_request=raw_request,
+                plan=plan,
+                snapshot=snapshot,
+                integration=current_integration,
+                checks=current_checks,
+                contract=contract,
+                approval_digest=approval_digest,
+                policy_digest=policy_digest,
+                dispositions=dispositions,
+                deadline=operation_deadline(),
+                cancel_event=effective_cancel,
+            )
+            store.record_checks_passed(
+                job_id=job_id,
+                generation=generation,
+                target=bundle.target,
+                artifact=bundle.artifact,
+                check_receipt_json=json.dumps(
+                    {
+                        "check_set": _bestplan_review_check_set_payload(
+                            current_checks
+                        ),
+                        "dispositions": list(dispositions),
+                        "schema": "hermes.bestplan.review-checkpoint.v1",
+                        "status": "passed",
+                    },
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                owner_id=owner_id,
+                fencing_token=fencing_token,
+                operation_id=_bestplan_review_operation_id(
+                    plan_id, generation, "checks-passed",
+                ),
+            )
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2.0)
+
+
+def _land_reviewed_local_bestplan(
+    *,
+    plan_id: str,
+    snapshot: object,
+    runtime: object,
+    state_db_path: Path,
+    session_id: str,
+    profile: str,
+    reviewed: _LocalBestplanReviewResult,
+    projected_results: Iterable[Mapping[str, Any]],
+    deadline: float,
+    cancel_event: threading.Event | None,
+) -> dict[str, Any]:
+    """Consume one durable pass, land it, and activate the local push."""
+
+    from agent.bestplan_local_git import (
+        LOCAL_MAIN_REF,
+        LocalMainEffectUnknown,
+        LocalMainLandingReceipt,
+        LocalPushStale,
+        classify_local_main_for_push,
+        land_checked_integration,
+        observe_prelanding_local_main_push_target,
+    )
+    from agent.bestplan_state import BestplanStore
+
+    integration = reviewed.integration
+    checks = reviewed.checks
     target = observe_prelanding_local_main_push_target(
         snapshot=snapshot,
         expected_target_oid=integration.target_oid,
@@ -6383,6 +10475,8 @@ def _finish_local_bestplan_batch(
             integration_oid=integration.integration_oid,
             check_set_digest=checks.receipt_digest,
             target=target,
+            review_target=reviewed.target,
+            review_receipt_digest=reviewed.receipt.receipt_digest,
             expires_at=math.ceil(time.time() + 15 * 60),
         )
         if prepared is None:
@@ -6402,15 +10496,43 @@ def _finish_local_bestplan_batch(
         if cancel_event is not None and cancel_event.is_set():
             terminalize_prepared("not_landed")
             raise BestplanCandidateBatchError("candidate batch failed")
+        from gateway.status import get_process_start_time
+
+        process_start = get_process_start_time(os.getpid())
+        if process_start is None:
+            raise BestplanCandidateBatchError("candidate batch failed")
+        authorization = store.claim_landing(
+            plan_id,
+            owner_id=reviewed.owner_id,
+            fencing_token=reviewed.fencing_token,
+            owner_pid=os.getpid(),
+            owner_process_start_id=f"kernel-start:{process_start}",
+            operation_id=_bestplan_review_operation_id(
+                plan_id, reviewed.target.generation, "landing-claimed",
+            ),
+        )
+
+        def finish_effect_operation() -> None:
+            try:
+                marked = store.mark_landing_observation_pending(
+                    plan_id, authorization=authorization,
+                )
+            except Exception:
+                marked = False
+            if not marked:
+                authorization.release_effect_lock()
+
         try:
             landing = land_checked_integration(
                 snapshot=snapshot,
                 integration=integration,
                 checks=checks,
                 commands=runtime.check_plan.commands,
+                authorization=authorization,
                 deadline=deadline,
             )
         except LocalMainEffectUnknown:
+            finish_effect_operation()
             raise
         except Exception:
             try:
@@ -6422,15 +10544,53 @@ def _finish_local_bestplan_batch(
                 )
             except Exception:
                 local_state = "unavailable"
-            terminalize_prepared(
-                "not_landed" if local_state == "expected" else "stale"
+            if local_state == "integration":
+                landing = LocalMainLandingReceipt(
+                    target_ref=LOCAL_MAIN_REF,
+                    old_oid=integration.target_oid,
+                    new_oid=integration.integration_oid,
+                    check_receipt_digest=checks.receipt_digest,
+                    authorization_digest=authorization.authorization_digest,
+                )
+            else:
+                finish_effect_operation()
+                if local_state == "unavailable":
+                    raise LocalMainEffectUnknown(
+                        "local main effect read-back is unavailable"
+                    ) from None
+                if local_state not in {"expected", "integration"}:
+                    raise LocalPushStale(
+                        "local main target changed outside the approved effect"
+                    ) from None
+                try:
+                    recovery = store.recover_landing_claim(
+                        plan_id,
+                        owner_is_live=lambda _pid, _start_id: False,
+                        observe_local_main=lambda **_kwargs: "expected",
+                        now_ns=time.time_ns(),
+                    )
+                except Exception:
+                    recovery = None
+                if getattr(recovery, "status", "") != "retry_pre_effect":
+                    raise LocalMainEffectUnknown(
+                        "pre-effect landing could not be released"
+                    ) from None
+                raise
+        try:
+            activated = store.activate_local_push(
+                plan_id,
+                landing_receipt=landing,
             )
-            raise
-        if not store.activate_local_push(
-            plan_id,
-            landing_receipt=landing,
-        ):
-            raise BestplanCandidateBatchError("candidate batch failed")
+        except BaseException:
+            finish_effect_operation()
+            raise LocalMainEffectUnknown(
+                "local main landing activation is unavailable"
+            ) from None
+        if not activated:
+            finish_effect_operation()
+            raise LocalMainEffectUnknown(
+                "local main landing activation is not yet durable"
+            )
     finally:
         store.close()
 
@@ -6450,9 +10610,162 @@ def _finish_local_bestplan_batch(
         "results": results,
         "integration_oid": integration.integration_oid,
         "check_set_digest": checks.receipt_digest,
+        "review_receipt_digest": reviewed.receipt.receipt_digest,
         "local_main_oid": landing.new_oid,
         "push_pending": True,
     }
+
+
+def _finish_local_bestplan_batch(
+    *,
+    plan_id: str,
+    plan: object,
+    snapshot: object,
+    contract: Mapping[str, Any],
+    approval_digest: str,
+    contract_digest: str,
+    completed: list[tuple[object, object, str]],
+    projected_results: list[dict[str, Any]],
+    runtime: object,
+    state_db_path: Path,
+    session_id: str,
+    profile: str,
+    cancel_event: threading.Event | None,
+    now: float | None = None,
+    raw_request: str = "",
+    candidate_authorities: Iterable[object] = (),
+    review_authority_bindings: Iterable[object] = (),
+    candidate_runtime_routes: Iterable[Mapping[str, Any]] = (),
+    identity_plan_id: str | None = None,
+) -> dict[str, Any]:
+    """Integrate, check, durably prepare, and land one local BestPlan batch."""
+
+    from agent.bestplan_checks import CheckExecutionError, run_integration_checks
+    from agent.bestplan_promotion import freeze_integration
+
+    operation_timeout = getattr(runtime, "operation_timeout_seconds", None)
+    if (
+        isinstance(operation_timeout, bool)
+        or not isinstance(operation_timeout, (int, float))
+        or not math.isfinite(float(operation_timeout))
+        or not 0 < float(operation_timeout) <= 86_400.0
+    ):
+        raise BestplanCandidateBatchError("candidate batch failed")
+    started_at = time.time() if now is None else float(now)
+    if not math.isfinite(started_at):
+        raise BestplanCandidateBatchError("candidate batch failed")
+    if cancel_event is not None and cancel_event.is_set():
+        raise BestplanCandidateBatchError("candidate batch failed")
+    def operation_deadline() -> float:
+        if cancel_event is not None and cancel_event.is_set():
+            raise BestplanCandidateBatchError("candidate batch failed")
+        return time.monotonic() + float(operation_timeout)
+
+    bindings = tuple(
+        _build_local_candidate_binding(
+            frozen=frozen,
+            spec=spec,
+            manifest_slice_id=manifest_slice_id,
+            snapshot=snapshot,
+            approval_digest=approval_digest,
+            contract_digest=contract_digest,
+        )
+        for frozen, spec, manifest_slice_id in completed
+    )
+    integration = freeze_integration(
+        plan_id=plan_id,
+        plan=plan,
+        snapshot=snapshot,
+        contract=contract,
+        approval_digest=approval_digest,
+        candidates=bindings,
+        temp_root=runtime.integration_root,
+        deadline=operation_deadline(),
+        cancel_event=cancel_event,
+        identity_plan_id=identity_plan_id,
+    )
+    try:
+        checks = run_integration_checks(
+            snapshot=snapshot,
+            integration=integration,
+            contract=contract,
+            commands=runtime.check_plan.commands,
+            runtime=runtime.check_runtime,
+            checks_root=runtime.checks_root,
+            deadline=operation_deadline(),
+            cancel_event=cancel_event,
+        )
+    except CheckExecutionError as exc:
+        reviewed = _recover_initial_bestplan_check_failure(
+            plan_id=plan_id,
+            raw_request=raw_request,
+            plan=plan,
+            snapshot=snapshot,
+            contract=contract,
+            approval_digest=approval_digest,
+            contract_digest=contract_digest,
+            completed=completed,
+            candidate_authorities=candidate_authorities,
+            review_authority_bindings=review_authority_bindings,
+            candidate_runtime_routes=candidate_runtime_routes,
+            integration=integration,
+            check_error=exc,
+            runtime=runtime,
+            state_db_path=state_db_path,
+            session_id=session_id,
+            profile=profile,
+            deadline=operation_deadline(),
+            cancel_event=cancel_event,
+            projected_results=projected_results,
+        )
+        return _land_reviewed_local_bestplan(
+            plan_id=plan_id,
+            snapshot=snapshot,
+            runtime=runtime,
+            state_db_path=state_db_path,
+            session_id=session_id,
+            profile=profile,
+            reviewed=reviewed,
+            projected_results=projected_results,
+            deadline=operation_deadline(),
+            cancel_event=cancel_event,
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        raise BestplanCandidateBatchError("candidate batch failed")
+    reviewed = _run_local_bestplan_review_loop(
+        plan_id=plan_id,
+        raw_request=raw_request,
+        plan=plan,
+        snapshot=snapshot,
+        contract=contract,
+        approval_digest=approval_digest,
+        contract_digest=contract_digest,
+        completed=completed,
+        candidate_authorities=candidate_authorities,
+        review_authority_bindings=review_authority_bindings,
+        candidate_runtime_routes=candidate_runtime_routes,
+        integration=integration,
+        checks=checks,
+        runtime=runtime,
+        state_db_path=state_db_path,
+        session_id=session_id,
+        profile=profile,
+        deadline=operation_deadline(),
+        cancel_event=cancel_event,
+        projected_results=projected_results,
+    )
+    return _land_reviewed_local_bestplan(
+        plan_id=plan_id,
+        snapshot=snapshot,
+        runtime=runtime,
+        state_db_path=state_db_path,
+        session_id=session_id,
+        profile=profile,
+        reviewed=reviewed,
+        projected_results=projected_results,
+        deadline=operation_deadline(),
+        cancel_event=cancel_event,
+    )
 
 
 def _ordered_bestplan_authority_clients(
@@ -6490,6 +10803,193 @@ def _ordered_bestplan_authority_clients(
     return tuple(ordered)
 
 
+def _execute_bestplan_candidate_batch(
+    *,
+    prepared: list[dict[str, Any]],
+    ordered_authorities: tuple[object, ...],
+    source_snapshot: object,
+    candidate_host_runtime: BestplanHostRuntime,
+    cancellation: threading.Event,
+    execution_protocol: int,
+    promotion_mode: str | None,
+    promotion_contract: Mapping[str, Any] | None,
+    approval_digest: str,
+    promotion_contract_digest: str,
+    plan_id: str,
+    execution_plan: object | None,
+    local_execution_runtime: object | None,
+    durable_state_path: Path,
+    session_id: str,
+    profile: str,
+    raw_request: str,
+    review_authority_bindings: object | None,
+    candidate_runtime_routes: Iterable[Mapping[str, Any]],
+    identity_plan_id: str | None = None,
+) -> Dict[str, Any]:
+    """Run one isolated candidate attempt, then enter the durable review rail."""
+
+    from agent.bestplan_candidates import run_and_freeze_candidate
+
+    count = len(prepared)
+    maximum = min(count, max(1, int(_get_max_concurrent_children())))
+    slots: list[tuple[object, object, str] | None] = [None] * count
+    first_failure: BaseException | None = None
+
+    def run_one(item: dict[str, Any]) -> tuple[object, object, str]:
+        if cancellation.is_set():
+            raise BestplanCandidateBatchError("candidate batch failed")
+        expires_at = math.ceil(
+            time.time() + candidate_host_runtime.capability_ttl_seconds
+        )
+        spec = replace(item["spec"], expires_at=expires_at)
+        frozen = run_and_freeze_candidate(
+            snapshot=source_snapshot,
+            spec=spec,
+            attempts_root=candidate_host_runtime.attempts_root,
+            controller_source=candidate_host_runtime.controller_source,
+            controller_python=candidate_host_runtime.controller_python,
+            runtime_read_paths=candidate_host_runtime.runtime_read_paths,
+            expected_controller=candidate_host_runtime.controller,
+            authority_client=ordered_authorities[item["position"]],
+            timeout_seconds=candidate_host_runtime.timeout_seconds,
+            attempt_id=item["attempt_id"],
+            cancel_event=cancellation,
+        )
+        _validate_bestplan_frozen_candidate(
+            frozen,
+            spec=spec,
+            attempt_id=item["attempt_id"],
+            runtime=candidate_host_runtime,
+        )
+        return frozen, spec, item["manifest_slice_id"]
+
+    if cancellation.is_set():
+        raise BestplanCandidateBatchError("candidate batch failed")
+    executor = ThreadPoolExecutor(
+        max_workers=maximum,
+        thread_name_prefix="bestplan-candidate",
+    )
+    futures: dict[object, int] = {}
+    next_position = 0
+    try:
+        while next_position < maximum:
+            future = executor.submit(run_one, prepared[next_position])
+            futures[future] = next_position
+            next_position += 1
+        while futures:
+            done, _pending = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            successes: list[tuple[int, tuple[object, object, str]]] = []
+            for future in done:
+                position = futures.pop(future)
+                try:
+                    successes.append((position, future.result()))
+                except BaseException as exc:
+                    if first_failure is None:
+                        first_failure = exc
+            if first_failure is not None or cancellation.is_set():
+                cancellation.set()
+                for future in futures:
+                    future.cancel()
+                continue
+            for position, completed in successes:
+                slots[position] = completed
+            while next_position < count and len(futures) < maximum:
+                future = executor.submit(run_one, prepared[next_position])
+                futures[future] = next_position
+                next_position += 1
+    finally:
+        if first_failure is not None or cancellation.is_set():
+            cancellation.set()
+            for future in futures:
+                future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+    if first_failure is not None or cancellation.is_set() or any(
+        item is None for item in slots
+    ):
+        raise BestplanCandidateBatchError("candidate batch failed") from None
+    completed = [item for item in slots if item is not None]
+    projected = [
+        _bestplan_candidate_projection(
+            frozen=frozen,
+            spec=spec,
+            manifest_slice_id=manifest_slice_id,
+        )
+        for frozen, spec, manifest_slice_id in completed
+    ]
+    if execution_protocol == 2 and promotion_mode == "local_main":
+        if execution_plan is None or local_execution_runtime is None:
+            raise BestplanCandidateBatchError("candidate batch failed")
+        return _finish_local_bestplan_batch(
+            plan_id=plan_id,
+            plan=execution_plan,
+            snapshot=source_snapshot,
+            contract=promotion_contract or {},
+            approval_digest=approval_digest,
+            contract_digest=promotion_contract_digest,
+            completed=completed,
+            projected_results=projected,
+            runtime=local_execution_runtime,
+            state_db_path=durable_state_path,
+            session_id=session_id,
+            profile=profile,
+            cancel_event=cancellation,
+            raw_request=raw_request,
+            candidate_authorities=ordered_authorities,
+            review_authority_bindings=review_authority_bindings or (),
+            candidate_runtime_routes=candidate_runtime_routes,
+            identity_plan_id=identity_plan_id,
+        )
+    if execution_protocol == 2:
+        _persist_bestplan_candidates_ready(
+            state_db_path=durable_state_path,
+            plan_id=plan_id,
+            promotion_contract=promotion_contract or {},
+            promotion_contract_digest=promotion_contract_digest,
+            completed=completed,
+            projected_results=projected,
+        )
+        return {"status": "candidate_ready", "results": projected}
+    return {"results": projected}
+
+
+def _bestplan_sanitized_review_runtime_routes(
+    bindings: object,
+) -> list[dict[str, str]]:
+    """Project only exact typed reviewer identities into durable intent."""
+
+    from agent.bestplan_local import LocalReviewAuthorityBinding
+
+    if not isinstance(bindings, (list, tuple)) or len(bindings) != 2:
+        raise ValueError("review authority binding count differs")
+    routes: list[dict[str, str]] = []
+    families: set[str] = set()
+    for expected_slot, binding in zip(
+        ("smart_reviewer", "code_worker"), bindings, strict=True
+    ):
+        if not isinstance(binding, LocalReviewAuthorityBinding):
+            raise ValueError("review authority binding is invalid")
+        if binding.slot != expected_slot:
+            raise ValueError("review authority binding order differs")
+        values = (binding.provider, binding.model, binding.model_family)
+        if any(
+            not isinstance(value, str) or not value or "\x00" in value
+            for value in values
+        ) or not re.fullmatch(r"[0-9a-f]{64}", binding.runtime_fingerprint):
+            raise ValueError("review authority binding identity is invalid")
+        families.add(binding.model_family.casefold())
+        routes.append(
+            {
+                "route": binding.slot,
+                "provider": binding.provider,
+                "model": binding.model,
+                "runtime_fingerprint": binding.runtime_fingerprint,
+            }
+        )
+    if len(families) != 2:
+        raise ValueError("review authority binding families are not diverse")
+    return routes
+
+
 def dispatch_bestplan_tasks_async(
     *,
     tasks: List[Dict[str, Any]],
@@ -6509,6 +11009,8 @@ def dispatch_bestplan_tasks_async(
     candidate_host_runtime: BestplanHostRuntime | None = None,
     authority_client: object | None = None,
     authority_bindings: object | None = None,
+    review_authority_bindings: object | None = None,
+    raw_request: str = "",
     state_db_path: str | Path | None = None,
 ) -> Dict[str, Any]:
     """Admit one bounded async batch of independent Task 4 candidates."""
@@ -6533,9 +11035,17 @@ def dispatch_bestplan_tasks_async(
         if promotion_mode not in {"candidate_only", "auto_live", "local_main"}:
             return {"status": "rejected", "error": "candidate_contract_invalid"}
         if promotion_mode == "local_main" and (
-            execution_plan is None or local_execution_runtime is None
+            execution_plan is None
+            or local_execution_runtime is None
+            or not isinstance(review_authority_bindings, (list, tuple))
+            or len(review_authority_bindings) != 2
         ):
             return {"status": "rejected", "error": "candidate_runtime_unavailable"}
+        if promotion_mode == "local_main":
+            try:
+                raw_request = _bestplan_execution_request_text(raw_request)
+            except ValueError:
+                return {"status": "rejected", "error": "candidate_request_invalid"}
     try:
         prepared = _preflight_bestplan_candidates(
             tasks=tasks,
@@ -6584,119 +11094,152 @@ def dispatch_bestplan_tasks_async(
             return {"status": "rejected", "error": "candidate_runtime_unavailable"}
         async_runtime_metadata.append(projected_runtime)
 
-    def runner() -> Dict[str, Any]:
-        count = len(prepared)
-        maximum = min(count, max(1, int(_get_max_concurrent_children())))
-        slots: list[tuple[object, object, str] | None] = [None] * count
-        first_failure: BaseException | None = None
-
-        def run_one(item: dict[str, Any]) -> tuple[object, object, str]:
-            if cancellation.is_set():
-                raise BestplanCandidateBatchError("candidate batch failed")
-            expires_at = math.ceil(
-                time.time() + candidate_host_runtime.capability_ttl_seconds
-            )
-            spec = replace(item["spec"], expires_at=expires_at)
-            frozen = run_and_freeze_candidate(
-                snapshot=source_snapshot,
-                spec=spec,
-                attempts_root=candidate_host_runtime.attempts_root,
-                controller_source=candidate_host_runtime.controller_source,
-                controller_python=candidate_host_runtime.controller_python,
-                runtime_read_paths=candidate_host_runtime.runtime_read_paths,
-                expected_controller=candidate_host_runtime.controller,
-                authority_client=ordered_authorities[item["position"]],
-                timeout_seconds=candidate_host_runtime.timeout_seconds,
-                attempt_id=item["attempt_id"],
-                cancel_event=cancellation,
-            )
-            _validate_bestplan_frozen_candidate(
-                frozen,
-                spec=spec,
-                attempt_id=item["attempt_id"],
-                runtime=candidate_host_runtime,
-            )
-            return frozen, spec, item["manifest_slice_id"]
-
-        if cancellation.is_set():
-            raise BestplanCandidateBatchError("candidate batch failed")
-        executor = ThreadPoolExecutor(
-            max_workers=maximum,
-            thread_name_prefix="bestplan-candidate",
-        )
-        futures: dict[object, int] = {}
-        next_position = 0
+    if execution_protocol == 2 and promotion_mode == "local_main":
         try:
-            while next_position < maximum:
-                future = executor.submit(run_one, prepared[next_position])
-                futures[future] = next_position
-                next_position += 1
-            while futures:
-                done, _pending = wait(tuple(futures), return_when=FIRST_COMPLETED)
-                successes: list[tuple[int, tuple[object, object, str]]] = []
-                for future in done:
-                    position = futures.pop(future)
-                    try:
-                        successes.append((position, future.result()))
-                    except BaseException as exc:
-                        if first_failure is None:
-                            first_failure = exc
-                if first_failure is not None or cancellation.is_set():
-                    cancellation.set()
-                    for future in futures:
-                        future.cancel()
-                    continue
-                for position, completed in successes:
-                    slots[position] = completed
-                while next_position < count and len(futures) < maximum:
-                    future = executor.submit(run_one, prepared[next_position])
-                    futures[future] = next_position
-                    next_position += 1
-        finally:
-            if first_failure is not None or cancellation.is_set():
-                cancellation.set()
-                for future in futures:
-                    future.cancel()
-            executor.shutdown(wait=True, cancel_futures=True)
-        if first_failure is not None or cancellation.is_set() or any(
-            item is None for item in slots
-        ):
-            raise BestplanCandidateBatchError("candidate batch failed") from None
-        completed = [item for item in slots if item is not None]
-        projected = [
-            _bestplan_candidate_projection(
-                frozen=frozen,
-                spec=spec,
-                manifest_slice_id=manifest_slice_id,
+            from agent.bestplan_contract import source_snapshot_digest
+            from agent.bestplan_local import local_go_manifest_digest
+            from agent.review_engine import ReviewStore
+
+            review_routes = _bestplan_sanitized_review_runtime_routes(
+                review_authority_bindings
             )
-            for frozen, spec, manifest_slice_id in completed
-        ]
+            ReviewStore(durable_state_path).create_execution_pipeline(
+                plan_id=plan_id,
+                delegation_id=dispatch_id,
+                job_id=_bestplan_safe_identifier("review-job", plan_id),
+                owner_session_id=str(identity.get("session_id") or ""),
+                owner_profile=str(identity.get("profile") or ""),
+                workspace=str(Path(workspace).expanduser().resolve()),
+                adapter_state={
+                    "schema": "hermes.bestplan.execution-intent.v1",
+                    "approval_digest": approval_digest,
+                    "contract_digest": promotion_contract_digest,
+                    "manifest_digest": local_go_manifest_digest(
+                        execution_plan.to_manifest()
+                    ),
+                    "raw_request": raw_request,
+                    "raw_request_sha256": hashlib.sha256(
+                        raw_request.encode("utf-8")
+                    ).hexdigest(),
+                    "source_snapshot_digest": source_snapshot_digest(
+                        source_snapshot
+                    ),
+                },
+                runtime_routes=[
+                    {
+                        **dict(item),
+                        "route": f"candidate-{index}",
+                    }
+                    for index, item in enumerate(async_runtime_metadata)
+                ] + review_routes,
+                candidate_count=len(prepared),
+            )
+        except Exception:
+            logger.warning(
+                "strict BestPlan restart intent could not be persisted",
+                exc_info=True,
+            )
+            return {"status": "rejected", "error": "candidate_recovery_unavailable"}
+
+    def runner() -> Dict[str, Any]:
         if execution_protocol == 2 and promotion_mode == "local_main":
-            return _finish_local_bestplan_batch(
-                plan_id=plan_id,
-                plan=execution_plan,
-                snapshot=source_snapshot,
-                contract=promotion_contract,
-                approval_digest=approval_digest,
-                contract_digest=promotion_contract_digest,
-                completed=completed,
-                projected_results=projected,
-                runtime=local_execution_runtime,
-                state_db_path=durable_state_path,
-                session_id=str(identity.get("session_id") or ""),
-                profile=str(identity.get("profile") or ""),
-                cancel_event=cancellation,
+            from agent.bestplan_local import build_local_execution_runtime
+            from agent.review_engine import ReviewStore
+            from gateway.status import get_process_start_time
+
+            owner_start = get_process_start_time(os.getpid())
+            if owner_start is None:
+                raise BestplanCandidateBatchError("candidate batch failed")
+            attempt_store = ReviewStore(durable_state_path)
+            ordinal = attempt_store.allocate_execution_attempt(
+                plan_id,
+                owner_pid=os.getpid(),
+                owner_process_start_id=str(owner_start),
             )
-        if execution_protocol == 2:
-            _persist_bestplan_candidates_ready(
-                state_db_path=durable_state_path,
-                plan_id=plan_id,
-                promotion_contract=promotion_contract,
-                promotion_contract_digest=promotion_contract_digest,
-                completed=completed,
-                projected_results=projected,
-            )
-        return {"results": projected}
+            try:
+                identity_plan_id = _bestplan_execution_attempt_plan_id(
+                    plan_id, ordinal,
+                )
+                attempt_runtime = build_local_execution_runtime(
+                    plan_id=identity_plan_id,
+                    snapshot=source_snapshot,
+                    manifest=execution_plan.to_manifest(),
+                    contract=promotion_contract,
+                    controller_python=Path(
+                        local_execution_runtime.candidate_runtime.controller_python
+                    ),
+                    deadline=time.monotonic() + 60.0,
+                    cancel_event=cancellation,
+                )
+                attempt_host_runtime = attempt_runtime.candidate_runtime
+                _validate_bestplan_host_runtime(
+                    attempt_host_runtime,
+                    source_snapshot=source_snapshot,
+                    promotion_contract=promotion_contract,
+                )
+                attempt_prepared = _preflight_bestplan_candidates(
+                    tasks=tasks,
+                    resolved_runtimes=resolved_runtimes,
+                    plan_id=plan_id,
+                    identity_plan_id=identity_plan_id,
+                    workspace=workspace,
+                    source_snapshot=source_snapshot,
+                    candidate_host_runtime=attempt_host_runtime,
+                    promotion_contract=promotion_contract,
+                )
+                return _execute_bestplan_candidate_batch(
+                    prepared=attempt_prepared,
+                    ordered_authorities=ordered_authorities,
+                    source_snapshot=source_snapshot,
+                    candidate_host_runtime=attempt_host_runtime,
+                    cancellation=cancellation,
+                    execution_protocol=execution_protocol,
+                    promotion_mode=promotion_mode,
+                    promotion_contract=promotion_contract,
+                    approval_digest=approval_digest,
+                    promotion_contract_digest=promotion_contract_digest,
+                    plan_id=plan_id,
+                    identity_plan_id=identity_plan_id,
+                    execution_plan=execution_plan,
+                    local_execution_runtime=attempt_runtime,
+                    durable_state_path=durable_state_path,
+                    session_id=str(identity.get("session_id") or ""),
+                    profile=str(identity.get("profile") or ""),
+                    raw_request=raw_request,
+                    review_authority_bindings=review_authority_bindings,
+                    candidate_runtime_routes=async_runtime_metadata,
+                )
+            except BaseException:
+                # The runner owns all child execution at this point. Once it
+                # unwinds, no attempt-side effect remains live, so clear the
+                # PID/start fence before the async host queues recovery.
+                attempt_store.release_execution_attempt(
+                    plan_id,
+                    owner_pid=os.getpid(),
+                    owner_process_start_id=str(owner_start),
+                )
+                raise
+        return _execute_bestplan_candidate_batch(
+            prepared=prepared,
+            ordered_authorities=ordered_authorities,
+            source_snapshot=source_snapshot,
+            candidate_host_runtime=candidate_host_runtime,
+            cancellation=cancellation,
+            execution_protocol=execution_protocol,
+            promotion_mode=promotion_mode,
+            promotion_contract=promotion_contract,
+            approval_digest=approval_digest,
+            promotion_contract_digest=promotion_contract_digest,
+            plan_id=plan_id,
+            execution_plan=execution_plan,
+            local_execution_runtime=local_execution_runtime,
+            durable_state_path=durable_state_path,
+            session_id=str(identity.get("session_id") or ""),
+            profile=str(identity.get("profile") or ""),
+            raw_request=raw_request,
+            review_authority_bindings=review_authority_bindings,
+            candidate_runtime_routes=async_runtime_metadata,
+        )
 
     try:
         result = dispatch_async_delegation_batch(
@@ -6708,6 +11251,7 @@ def dispatch_bestplan_tasks_async(
             session_key=str(identity.get("session_key") or ""),
             parent_session_id=str(identity.get("session_id") or ""),
             origin_ui_session_id=str(identity.get("ui_session_id") or ""),
+            origin_session_id=str(identity.get("session_id") or ""),
             interrupt_fn=cancellation.set,
             runner=runner,
             max_async_children=_get_max_async_children(),
@@ -6716,6 +11260,11 @@ def dispatch_bestplan_tasks_async(
             origin_tracker_path=str(identity.get("tracker_path") or ""),
             bestplan_plan_id=plan_id,
             bestplan_state_db_path=str(durable_state_path),
+            bestplan_review_job_id=(
+                _bestplan_safe_identifier("review-job", plan_id)
+                if execution_protocol == 2 and promotion_mode == "local_main"
+                else ""
+            ),
             bestplan_local_execution=(
                 execution_protocol == 2 and promotion_mode == "local_main"
             ),

@@ -669,3 +669,76 @@ def test_build_reuses_only_exact_empty_private_plan_roots(
     with pytest.raises(bestplan_local.LocalGoValidationError, match="unsafe"):
         build("retry-identity")
     assert list(outside.iterdir()) == []
+
+
+def test_recovery_fencing_id_gets_fresh_roots_after_crashed_attempt_artifacts(
+    monkeypatch, tmp_path,
+):
+    import agent.bestplan_local as bestplan_local
+    import hermes_constants
+    from tools.delegate_tool import _bestplan_safe_identifier
+
+    snapshot = _target_snapshot(tmp_path)
+    controller_checkout, _release_oid = _controller_checkout(tmp_path)
+    launcher, check_plan = _fake_check_plan(tmp_path)
+    _stub_check_capture(monkeypatch, bestplan_local, check_plan)
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir(mode=0o700)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: hermes_home)
+    manifest = _manifest()
+    captured = bestplan_local.capture_local_execution_inputs(
+        snapshot=snapshot,
+        controller_python=launcher,
+        manifest=manifest,
+        deadline=time.monotonic() + 10.0,
+        _controller_checkout=controller_checkout,
+    )
+    contract = _local_contract_for_inputs(
+        bestplan_local, snapshot, manifest, captured,
+    )
+
+    def build(plan_id: str):
+        return bestplan_local.build_local_execution_runtime(
+            plan_id=plan_id,
+            snapshot=snapshot,
+            manifest=manifest,
+            contract=contract,
+            controller_python=launcher,
+            deadline=time.monotonic() + 10.0,
+            _controller_checkout=controller_checkout,
+        )
+
+    crashed = build("recoverable-plan")
+    orphan = crashed.candidate_runtime.attempts_root / "orphan-attempt"
+    orphan.mkdir(mode=0o700)
+    (orphan / "candidate.json").write_text("incomplete\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "git", "update-ref",
+            "refs/hermes-bestplan/orphan-plan/orphan-slice/orphan-attempt",
+            snapshot.head_oid,
+        ],
+        cwd=Path(snapshot.repo.worktree),
+        check=True,
+    )
+    recovery_id = _bestplan_safe_identifier(
+        "review-runtime", "recoverable-plan", "review-job", 2,
+    )
+
+    recovered = build(recovery_id)
+
+    assert recovered.candidate_runtime.attempts_root != (
+        crashed.candidate_runtime.attempts_root
+    )
+    assert list(recovered.candidate_runtime.attempts_root.iterdir()) == []
+    assert orphan.is_dir()
+    assert subprocess.run(
+        [
+            "git", "rev-parse", "--verify",
+            "refs/hermes-bestplan/orphan-plan/orphan-slice/orphan-attempt",
+        ],
+        cwd=Path(snapshot.repo.worktree),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == snapshot.head_oid

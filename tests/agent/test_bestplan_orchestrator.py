@@ -211,7 +211,7 @@ def test_count_and_quorum():
     assert normalize_count(None) == 4
     assert normalize_count(1) == 2
     assert normalize_count(9) == 5
-    assert [quorum_for(n) for n in range(2, 6)] == [2, 2, 3, 4]
+    assert [quorum_for(n) for n in range(2, 6)] == [2, 2, 2, 2]
 
 
 def _default_lanes_by_name() -> dict:
@@ -840,8 +840,103 @@ def test_run_bestplan_omitted_count_executes_all_four_configured_lanes(
     assert all(attempt["status"] == "success" for attempt in result["attempts"])
     assert sorted(explorer_models) == sorted(lane["model"] for lane in lanes)
     receipt = json.loads(result["final_response"].splitlines()[1])
+    assert result["bestplan_receipt_metadata"] == receipt
+    receipts_path = tmp_path / "bestplan" / "receipts.jsonl"
+    assert receipt in [
+        json.loads(line) for line in receipts_path.read_text().splitlines()
+    ]
     assert receipt["requested_count"] == 4
     assert receipt["effective_count"] == 4
+
+
+def test_run_bestplan_synthesizes_with_two_of_four_successful_explorers(
+    monkeypatch, tmp_path
+):
+    import agent.bestplan_orchestrator as orchestrator
+    import run_agent
+
+    lanes = [
+        {
+            "name": name,
+            "provider": f"provider-{name}",
+            "model": f"model-{name}",
+            "api_mode": "chat_completions",
+            "reasoning_effort": "high",
+        }
+        for name in ("a", "b", "c", "d")
+    ]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+
+        def run_conversation(self, prompt):
+            if "active BestPlan synthesizer" in prompt:
+                return {
+                    "final_response": _synth_plan_envelope(workspace=str(tmp_path))
+                }
+            if self.model in {"model-a", "model-b"}:
+                return {"final_response": _candidate_text(self.model)}
+            return {
+                "final_response": "",
+                "completed": False,
+                "error": "provider unavailable",
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_resolve_lane_credentials",
+        lambda _agent, configured, **_kwargs: _identity(configured),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    result = run_bestplan(
+        object(),
+        "plan this release",
+        config=_runtime_config(lanes, synthesizer="b"),
+    )
+
+    assert result["status"] == "completed"
+    assert result["successes"] == 2
+    assert result["quorum"] == 2
+
+
+def test_bestplan_explorer_uses_standard_subagent_iteration_budget(
+    monkeypatch, tmp_path
+):
+    import run_agent
+
+    captures = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captures.append(kwargs)
+            self.tools = []
+            self.valid_tool_names = set()
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    lane = {
+        "name": "sol",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_app_server",
+        "reasoning_effort": "ultra",
+    }
+    runtime = {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_app_server",
+        "_bestplan_workspace": str(tmp_path),
+    }
+
+    _build_child_agent(SimpleNamespace(session_id="parent"), lane, runtime)
+
+    assert captures[0]["max_iterations"] == 50
 
 
 @pytest.mark.parametrize(
@@ -1359,7 +1454,7 @@ def test_conversation_loop_passes_prior_canonical_messages_to_bestplan(monkeypat
     assert result["final_response"] == "final plan"
 
 
-def test_strict_v1_envelope_accepts_only_executable_implementation_or_review():
+def test_strict_v1_envelope_accepts_implementation_and_rejects_manual_review():
     implementation = _validated_plan_envelope(
         _synth_plan_envelope(), workspace="/tmp/work"
     )
@@ -1368,9 +1463,8 @@ def test_strict_v1_envelope_accepts_only_executable_implementation_or_review():
     )
 
     assert implementation is not None
-    assert review is not None
+    assert review is None
     assert json.loads(implementation.splitlines()[1])["manifest"]["mode"] == "delegate"
-    assert json.loads(review.splitlines()[1])["manifest"]["mode"] == "sota"
     assert _validated_plan_envelope(
         "commentary\n" + _synth_plan_envelope(), workspace="/tmp/work"
     ) is None
@@ -1406,6 +1500,14 @@ def test_codex_schema_copy_strips_unique_items_without_mutating_host_schema():
     assert compatible is not EXECUTION_PLAN_GENERATION_SCHEMA
     assert contains_unique_items(compatible) is False
     assert contains_unique_items(EXECUTION_PLAN_GENERATION_SCHEMA) is True
+    assert compatible["properties"]["mode"]["enum"] == ["delegate"]
+    assert compatible["properties"]["slices"]["maxItems"] == 2
+    slice_properties = compatible["properties"]["slices"]["items"]["properties"]
+    assert slice_properties["kind"]["enum"] == ["implement"]
+    assert slice_properties["capability"]["enum"] == ["fast_fallback"]
+    assert slice_properties["read_only"]["const"] is False
+    assert slice_properties["allowed_paths"]["minItems"] == 1
+    assert slice_properties["depends_on"]["maxItems"] == 0
 
 
 def test_codex_raw_manifest_is_host_canonicalized_and_v1_validated():

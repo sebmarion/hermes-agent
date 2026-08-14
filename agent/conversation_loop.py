@@ -1091,6 +1091,7 @@ def _run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
     bestplan_config: Optional[dict[str, Any]] = None,
+    review_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1113,6 +1114,21 @@ def _run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    if review_config is not None:
+        if (
+            not isinstance(review_config, dict)
+            or set(review_config) != {"scope"}
+            or not isinstance(review_config.get("scope"), str)
+        ):
+            raise ValueError("invalid review configuration")
+        from agent.review_engine import run_manual_review_request
+
+        return run_manual_review_request(
+            agent,
+            scope=review_config["scope"],
+            conversation_history=list(conversation_history or []),
+        )
+
     _synchronize_context_engine_identity(agent)
 
     if moa_config is None:
@@ -1192,14 +1208,23 @@ def _run_conversation(
         bestplan_kwargs = dict(bestplan_config)
         bestplan_kwargs["conversation_history"] = messages[:current_turn_user_idx]
         outcome = run_bestplan(agent, user_message, **bestplan_kwargs)
-        response = outcome.get("final_response") or (
-            "BestPlan unavailable: " + str(outcome.get("error", "unknown error"))
+        if outcome.get("status") == "failed":
+            from agent.bestplan_state import render_bestplan_failure
+
+            response = render_bestplan_failure(outcome)
+        else:
+            response = outcome.get("final_response") or (
+                "BestPlan unavailable: " + str(outcome.get("error", "unknown error"))
+            )
+        # Carry the complete receipt record through the host-owned result.
+        # ``capture_bestplan_agent_result`` validates this against the exact
+        # envelope body; it must never parse model-visible receipt text.
+        agent._bestplan_receipt_metadata = outcome.get(
+            "bestplan_receipt_metadata"
         )
-        agent._bestplan_receipt_metadata = {
-            "bestplan_receipt_version": 2,
-            "run_id": outcome.get("run_id"),
-            "body_sha256": outcome.get("body") and __import__("hashlib").sha256(outcome["body"].encode()).hexdigest(),
-        }
+        agent._bestplan_receipt_warning = outcome.get(
+            "bestplan_receipt_warning"
+        )
         bestplan_interrupted = outcome.get("interrupted") is True
         from agent.turn_finalizer import finalize_turn
         return finalize_turn(
@@ -7388,6 +7413,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
     bestplan_config: Optional[dict[str, Any]] = None,
+    review_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one turn and close its lifecycle on every return or exception.
 
@@ -7418,6 +7444,7 @@ def run_conversation(
             persist_user_display_metadata=persist_user_display_metadata,
             moa_config=moa_config,
             bestplan_config=bestplan_config,
+            review_config=review_config,
         )
         return result
     finally:

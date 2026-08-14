@@ -189,6 +189,76 @@ def test_completed_turn_still_clears_inflight(emits, turn_env):
     assert server._inflight_snapshot(session) is None
 
 
+def test_explicit_bestplan_captures_before_session_history_update(
+    emits, turn_env, monkeypatch, tmp_path
+):
+    seen = {}
+    captured = {
+        "final_response": "durable receipt",
+        "messages": [
+            {"role": "user", "content": "fix it"},
+            {"role": "assistant", "content": "durable receipt"},
+        ],
+    }
+
+    def run_conversation(message, **kwargs):
+        seen["run_message"] = message
+        seen["bestplan_config"] = kwargs.get("bestplan_config")
+        return {
+            "final_response": "raw plan",
+            "messages": [
+                {"role": "user", "content": "fix it"},
+                {"role": "assistant", "content": "raw plan"},
+            ],
+        }
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=run_conversation,
+        clear_interrupt=lambda: None,
+        _persist_session=lambda *args, **kwargs: True,
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        profile_home=str(tmp_path / "profiles" / "coder"),
+    )
+
+    def fake_capture(result, **kwargs):
+        assert session["history"] == []
+        seen["capture_result"] = result
+        seen["capture_kwargs"] = kwargs
+        return captured
+
+    monkeypatch.setattr(
+        "tui_gateway.bestplan.capture_gateway_bestplan_result", fake_capture
+    )
+    monkeypatch.setattr(
+        "agent.bestplan_state.run_planning_only_bestplan_turn",
+        lambda **kwargs: pytest.fail("trusted BestPlan used the planning-only path"),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "fix it",
+        bestplan_config={"count": 2},
+    )
+
+    assert seen["run_message"] == "fix it"
+    assert seen["bestplan_config"] == {"count": 2}
+    assert seen["capture_result"]["final_response"] == "raw plan"
+    assert seen["capture_kwargs"]["invocation_message"] == "/bestplan fix it"
+    assert seen["capture_kwargs"]["session_id"] == "session-key"
+    assert seen["capture_kwargs"]["profile"] == "coder"
+    assert seen["capture_kwargs"]["workspace"] == str(tmp_path)
+    assert seen["capture_kwargs"]["host_agent"] is agent
+    assert session["history"] is captured["messages"]
+    completes = _events(emits, "message.complete")
+    assert completes[-1]["text"] == "durable receipt"
+
+
 # ── Exception path ─────────────────────────────────────────────────────
 
 

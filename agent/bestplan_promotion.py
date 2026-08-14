@@ -1345,6 +1345,9 @@ def _validate_contract_and_bindings(
     contract: Mapping[str, Any],
     approved: str,
     candidates: Sequence[CandidateIntegrationBinding],
+    candidate_base_oid: str | None = None,
+    identity_plan_id: str | None = None,
+    allow_partial: bool = False,
 ) -> tuple[dict[str, Any], str, str, dict[str, CandidateIntegrationBinding]]:
     if not isinstance(plan, ExecutionPlan) or not isinstance(snapshot, SourceSnapshot):
         raise IntegrationValidationError("integration plan/source input is invalid")
@@ -1382,17 +1385,25 @@ def _validate_contract_and_bindings(
         raise IntegrationValidationError("integration repository contract differs")
     if any(item.depends_on for item in plan.slices):
         raise IntegrationValidationError("integration dependency manifests are unsupported")
-    if len(candidates) != len(plan.slices):
+    if not candidates or (
+        not allow_partial and len(candidates) != len(plan.slices)
+    ):
         raise IntegrationValidationError("integration candidate set is incomplete")
     by_manifest: dict[str, CandidateIntegrationBinding] = {}
     controller = validated.controller
+    expected_candidate_base = (
+        snapshot.head_oid
+        if candidate_base_oid is None
+        else candidate_base_oid
+    )
+    effective_identity_plan_id = identity_plan_id or plan_id
     for binding in candidates:
         if not isinstance(binding, CandidateIntegrationBinding):
             raise IntegrationValidationError("integration candidate binding is invalid")
         if binding.manifest_slice_id in by_manifest:
             raise IntegrationValidationError("integration candidate binding is duplicated")
         if (
-            binding.base_oid != snapshot.head_oid
+            binding.base_oid != expected_candidate_base
             or binding.approval_digest != approved
             or binding.contract_digest != contract_sha
             or binding.source_snapshot_digest != snapshot_sha
@@ -1403,23 +1414,28 @@ def _validate_contract_and_bindings(
         ):
             raise IntegrationValidationError("integration candidate binding differs")
         by_manifest[binding.manifest_slice_id] = binding
-    if set(by_manifest) != {item.id for item in plan.slices}:
+    manifest_ids = {item.id for item in plan.slices}
+    if not set(by_manifest).issubset(manifest_ids) or (
+        not allow_partial and set(by_manifest) != manifest_ids
+    ):
         raise IntegrationValidationError("integration candidate set differs from the manifest")
-    candidate_plan_id = _candidate_plan_id(plan_id)
+    candidate_plan_id = _candidate_plan_id(effective_identity_plan_id)
     for index, manifest_slice in enumerate(plan.slices):
+        if manifest_slice.id not in by_manifest:
+            continue
         binding = by_manifest[manifest_slice.id]
         expected_slice_id = _safe_identifier(
-            "slice", plan_id, index, manifest_slice.id,
+            "slice", effective_identity_plan_id, index, manifest_slice.id,
         )
         expected_candidate_id = _safe_identifier(
-            "candidate", plan_id, index, manifest_slice.id,
+            "candidate", effective_identity_plan_id, index, manifest_slice.id,
         )
         expected_attempt_id = _safe_identifier(
-            "attempt", plan_id, index, manifest_slice.id,
+            "attempt", effective_identity_plan_id, index, manifest_slice.id,
         )
         if (
             not _binding_slice_matches_manifest(
-            plan_id=plan_id,
+            plan_id=effective_identity_plan_id,
             manifest_index=index,
             manifest_slice_id=manifest_slice.id,
             slice_id=binding.slice_id,
@@ -1772,6 +1788,9 @@ def freeze_integration(
     temp_root: str | Path,
     deadline: float,
     cancel_event: threading.Event | None = None,
+    identity_plan_id: str | None = None,
+    _generation: int = 0,
+    _prior: FrozenIntegration | None = None,
 ) -> FrozenIntegration:
     """Freeze one exact, single-parent integration commit without moving main."""
 
@@ -1780,6 +1799,28 @@ def freeze_integration(
     _check_control(
         deadline=absolute_deadline, cancel_event=cancel_event,
     )
+    if (
+        isinstance(_generation, bool)
+        or not isinstance(_generation, int)
+        or _generation < 0
+        or (_generation == 0) != (_prior is None)
+        or (_prior is not None and not isinstance(_prior, FrozenIntegration))
+    ):
+        raise IntegrationValidationError(
+            "integration repair generation is invalid"
+        )
+    if identity_plan_id is not None and _prior is not None:
+        raise IntegrationValidationError(
+            "integration attempt identity is initial-generation only"
+        )
+    effective_identity_plan_id = (
+        identity_plan_id or plan_id
+        if _prior is None
+        else _safe_identifier("repair-plan", plan_id, _generation)
+    )
+    candidate_base_oid = (
+        snapshot.head_oid if _prior is None else _prior.integration_oid
+    )
     normalized, contract_sha, snapshot_sha, by_manifest = _validate_contract_and_bindings(
         plan_id=plan_id,
         plan=plan,
@@ -1787,6 +1828,9 @@ def freeze_integration(
         contract=contract,
         approved=approval_digest,
         candidates=tuple(candidates),
+        candidate_base_oid=candidate_base_oid,
+        identity_plan_id=effective_identity_plan_id,
+        allow_partial=_prior is not None,
     )
     _assert_repo_identity(snapshot.repo, deadline=absolute_deadline)
     assert_supported_repository(snapshot.repo, deadline=absolute_deadline)
@@ -1800,7 +1844,41 @@ def freeze_integration(
     )
     if target_oid is None:
         raise IntegrationProofStale("integration target ref is missing")
-    existing_ref = _integration_ref(plan_id, approval_digest)
+    if _prior is not None:
+        if (
+            not isinstance(_prior, FrozenIntegration)
+            or _receipt_digest(FrozenIntegration(
+                **{**_prior.__dict__, "receipt_digest": ""}
+            )) != _prior.receipt_digest
+            or _prior.plan_id != plan_id
+            or _prior.approval_digest != approval_digest
+            or _prior.contract_digest != contract_sha
+            or _prior.source_snapshot_digest != snapshot_sha
+            or _prior.target_ref != target_ref
+            or _prior.target_oid != target_oid
+        ):
+            raise IntegrationValidationError(
+                "integration repair base differs from the approved target"
+            )
+        if _read_ref(
+            snapshot.repo,
+            _prior.ref_name,
+            deadline=absolute_deadline,
+            cancel_event=cancel_event,
+        ) != _prior.integration_oid:
+            raise IntegrationProofStale("integration repair base ref changed")
+        prior_tree_oid, prior_parents = _commit_proof(
+            snapshot.repo,
+            _prior.integration_oid,
+            deadline=absolute_deadline,
+            cancel_event=cancel_event,
+        )
+        if (
+            prior_tree_oid != _prior.tree_oid
+            or prior_parents != (target_oid,)
+        ):
+            raise IntegrationProofStale("integration repair base commit differs")
+    existing_ref = _integration_ref(effective_identity_plan_id, approval_digest)
     existing_oid = _read_ref(
         snapshot.repo, existing_ref, deadline=absolute_deadline, cancel_event=cancel_event,
     )
@@ -1810,12 +1888,14 @@ def freeze_integration(
         )
         if existing_parents != (target_oid,):
             expected_message = _integration_commit_message(
-                plan_id=plan_id,
+                plan_id=effective_identity_plan_id,
                 approved=approval_digest,
                 contract_sha=contract_sha,
                 snapshot_sha=snapshot_sha,
                 candidates=tuple(
-                    by_manifest[item.id] for item in plan.slices
+                    by_manifest[item.id]
+                    for item in plan.slices
+                    if item.id in by_manifest
                 ),
             )
             if not _is_owned_integration_commit(
@@ -1843,8 +1923,14 @@ def freeze_integration(
     )
     if ancestry.returncode != 0:
         raise IntegrationProofStale("integration target does not descend from the admitted base")
+    candidate_base_tree_oid = (
+        snapshot.tree_oid if _prior is None else _prior.tree_oid
+    )
     base_tree = _tree_map(
-        snapshot.repo, snapshot.tree_oid, deadline=absolute_deadline, cancel_event=cancel_event,
+        snapshot.repo,
+        candidate_base_tree_oid,
+        deadline=absolute_deadline,
+        cancel_event=cancel_event,
     )
     target_tree_oid, _target_parents = _commit_proof(
         snapshot.repo, target_oid, deadline=absolute_deadline, cancel_event=cancel_event,
@@ -1852,8 +1938,18 @@ def freeze_integration(
     target_tree = _tree_map(
         snapshot.repo, target_tree_oid, deadline=absolute_deadline, cancel_event=cancel_event,
     )
+    target_change_base = (
+        base_tree
+        if _prior is None
+        else _tree_map(
+            snapshot.repo,
+            snapshot.tree_oid,
+            deadline=absolute_deadline,
+            cancel_event=cancel_event,
+        )
+    )
     target_changes = _changed_paths(
-        base_tree,
+        target_change_base,
         target_tree,
         deadline=absolute_deadline,
         cancel_event=cancel_event,
@@ -1871,7 +1967,7 @@ def freeze_integration(
     )
     owned: _OwnedTempAttempt | None = None
     applied_paths: list[bytes] = []
-    current_tree = dict(target_tree)
+    current_tree = dict(target_tree if _prior is None else base_tree)
     applied: list[AppliedCandidate] = []
     candidate_refs: list[tuple[str, str]] = []
     expected_artifacts: list[tuple[bytes, str]] = []
@@ -1884,6 +1980,8 @@ def freeze_integration(
         for index, manifest_slice in enumerate(plan.slices):
             if cancel_event is not None and cancel_event.is_set():
                 raise PromotionError("integration cancelled")
+            if manifest_slice.id not in by_manifest:
+                continue
             binding = by_manifest[manifest_slice.id]
             if _read_ref(
                 snapshot.repo,
@@ -1898,7 +1996,7 @@ def freeze_integration(
                 deadline=absolute_deadline,
                 cancel_event=cancel_event,
             )
-            if parents != (snapshot.head_oid,):
+            if parents != (candidate_base_oid,):
                 raise IntegrationProofStale("integration candidate ancestry or parent differs")
             if candidate_tree_oid != binding.tree_oid:
                 raise IntegrationProofStale("integration candidate tree differs")
@@ -2030,7 +2128,7 @@ def freeze_integration(
             snapshot.repo,
             tree_oid=integration_tree_oid,
             parent_oid=target_oid,
-            plan_id=plan_id,
+            plan_id=effective_identity_plan_id,
             approved=approval_digest,
             contract_sha=contract_sha,
             snapshot_sha=snapshot_sha,
@@ -2104,6 +2202,37 @@ def freeze_integration(
                 os.close(prepared_root.descriptor)
             except OSError:
                 pass
+
+
+def freeze_repair_integration(
+    *,
+    plan_id: str,
+    generation: int,
+    prior: FrozenIntegration,
+    plan: ExecutionPlan,
+    snapshot: SourceSnapshot,
+    contract: Mapping[str, Any],
+    approval_digest: str,
+    candidates: Sequence[CandidateIntegrationBinding],
+    temp_root: str | Path,
+    deadline: float,
+    cancel_event: threading.Event | None = None,
+) -> FrozenIntegration:
+    """Freeze a fresh immutable integration over the prior reviewed target."""
+
+    return freeze_integration(
+        plan_id=plan_id,
+        plan=plan,
+        snapshot=snapshot,
+        contract=contract,
+        approval_digest=approval_digest,
+        candidates=candidates,
+        temp_root=temp_root,
+        deadline=deadline,
+        cancel_event=cancel_event,
+        _generation=generation,
+        _prior=prior,
+    )
 
 
 def _owned_parent_state(info: os.stat_result) -> tuple[int, int, int, int]:

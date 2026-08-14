@@ -65,6 +65,9 @@ DEFAULT_RUNTIME = {
 }
 SINGLE_PROVIDER_MOE_REPLICAS = 3
 DEFAULT_EXPLORER_COUNT = 4
+# BestPlan explorers are bounded subagents. Keep their budget aligned with the
+# documented delegation default instead of imposing a smaller unexplained cap.
+BESTPLAN_EXPLORER_MAX_ITERATIONS = 50
 ALLOWED_TOOLS = frozenset({"read_only_files", "web"})
 TURN_MARKER = "\x00HERMES_BESTPLAN_CONFIG:"
 _CHILD_CLEANUP_GRACE_SECONDS = 5.0
@@ -119,12 +122,11 @@ _REASON_CODES = frozenset(
 )
 _V1_SYNTHESIS_CONTRACT = (
     "V1 host invariants: use one independent wave and set depends_on=[] for every "
-    "slice; never mix implement and review slices. An implementation plan must use "
+    "slice. BestPlan produces implementation plans; manual review uses /review and "
+    "must never be emitted as a BestPlan slice. The plan must use "
     "mode=delegate, kind=implement, capability=fast_fallback, read_only=false, the "
     "exact workspace, and one or two slices with non-empty narrow relative "
-    "allowed_paths. A Review-only plan must use mode=sota, risk=high, exactly one "
-    "kind=review slice with capability=frontier_review, read_only=true, "
-    "allowed_paths=[], the exact workspace, and at least one escalation predicate. "
+    "allowed_paths. "
     "Every slice needs non-empty expected_artifacts and acceptance. Every writable "
     "slice must include at least one exact acceptance entry in the form "
     "pytest -q -- tests/path.py::test_name; prose criteria may be additional entries."
@@ -241,8 +243,15 @@ def decode_bestplan_turn(
 
 
 def quorum_for(count: int) -> int:
-    count = normalize_count(count)
-    return max(2, math.ceil(2 * count / 3))
+    """Return the minimum independent candidates required for synthesis.
+
+    Two independent explorer results are sufficient. Additional configured
+    explorers improve evidence when they succeed, but they do not raise the
+    execution gate above two.
+    """
+
+    normalize_count(count)
+    return 2
 
 
 def _normalize_explorer(entry: Any, index: int) -> dict[str, str]:
@@ -1087,7 +1096,7 @@ def _build_child_agent(
             base_url=runtime.get("base_url"),
             api_key=runtime.get("api_key"),
             reasoning_config=parse_reasoning_effort(lane.get("reasoning_effort")),
-            max_iterations=12,
+            max_iterations=BESTPLAN_EXPLORER_MAX_ITERATIONS,
             quiet_mode=True,
             enabled_toolsets=["read_only_files", "web"],
             skip_memory=True,
@@ -1236,7 +1245,7 @@ def _synthesis_repair_prompt(
 
 
 def _codex_bestplan_output_schema() -> dict[str, Any]:
-    """Copy the plan schema without Codex-unsupported uniqueness keywords."""
+    """Return the Codex-compatible, implementation-only BestPlan schema."""
 
     def compatible(value: Any) -> Any:
         if isinstance(value, dict):
@@ -1252,6 +1261,19 @@ def _codex_bestplan_output_schema() -> dict[str, Any]:
     schema = compatible(EXECUTION_PLAN_GENERATION_SCHEMA)
     if not isinstance(schema, dict):  # pragma: no cover - module invariant
         raise RuntimeError("BestPlan generation schema must be an object")
+    properties = schema["properties"]
+    properties["mode"] = {"type": "string", "enum": ["delegate"]}
+    slices = properties["slices"]
+    slices["maxItems"] = 2
+    slice_properties = slices["items"]["properties"]
+    slice_properties["kind"] = {"type": "string", "enum": ["implement"]}
+    slice_properties["capability"] = {
+        "type": "string",
+        "enum": ["fast_fallback"],
+    }
+    slice_properties["read_only"] = {"type": "boolean", "const": False}
+    slice_properties["allowed_paths"]["minItems"] = 1
+    slice_properties["depends_on"]["maxItems"] = 0
     return schema
 
 
@@ -1299,6 +1321,8 @@ def _validated_plan_envelope(
         from agent.bestplan_state import _v1_plan_constraints
 
         _v1_plan_constraints(plan, workspace=workspace)
+        if plan.mode != "delegate" or any(item.kind != "implement" for item in plan.slices):
+            return None
         manifest = plan.to_manifest()
     except (TypeError, ValueError):
         return None
@@ -1753,12 +1777,16 @@ def run_bestplan(
                 "quorum": quorum,
                 "attempts": receipt_attempts,
                 "receipt": receipt,
+                # Host-owned structured metadata.  The human renderer must
+                # not recover this from model-visible receipt text.
+                "bestplan_receipt_metadata": receipt_record,
                 "provider_mode": provider_mode,
             }
             if cleanup_incomplete:
                 payload["cleanup_incomplete"] = True
             if not receipt_persisted:
                 payload["receipt_persisted"] = False
+                payload["bestplan_receipt_warning"] = "receipt_persistence_failed"
             if extra:
                 payload.update(extra)
             return payload
@@ -1779,6 +1807,9 @@ def run_bestplan(
             "successes": successes,
             "quorum": quorum,
             "attempts": receipt_attempts,
+            # Host-owned structured metadata.  The human renderer must not
+            # recover this from model-visible receipt text.
+            "bestplan_receipt_metadata": receipt_record,
             "provider_mode": provider_mode,
             "runtime": {
                 "lane": synth_name,
@@ -1790,6 +1821,7 @@ def run_bestplan(
         if not receipt_persisted:
             payload["receipt_persisted"] = False
             payload["warning_reason_code"] = "receipt_persistence_failed"
+            payload["bestplan_receipt_warning"] = "receipt_persistence_failed"
         return payload
 
     def cancelled_result(
@@ -2423,7 +2455,7 @@ def run_bestplan(
 
 __all__ = [
     "ALLOWED_TOOLS", "BestPlanRuntimeInvalid", "BestPlanUnavailable", "DEFAULT_RUNTIME", "ExplorerResult",
-    "DEFAULT_EXPLORER_COUNT", "RECEIPT_BEGIN", "RECEIPT_END", "TURN_MARKER", "append_receipt", "body_sha256", "decode_bestplan_turn", "make_receipt",
+    "BESTPLAN_EXPLORER_MAX_ITERATIONS", "DEFAULT_EXPLORER_COUNT", "RECEIPT_BEGIN", "RECEIPT_END", "TURN_MARKER", "append_receipt", "body_sha256", "decode_bestplan_turn", "make_receipt",
     "normalize_count", "quorum_for", "reconcile_bestplan_receipts", "run_bestplan",
     "build_explorer_schedule", "SINGLE_PROVIDER_MOE_REPLICAS",
     "validate_candidate", "validate_receipt", "validate_runtime",

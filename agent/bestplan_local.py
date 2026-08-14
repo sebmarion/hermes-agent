@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
@@ -90,6 +90,7 @@ _LOCAL_CANDIDATE_REQUEST_BUDGET = 64
 _LOCAL_CANDIDATE_TOKEN_BUDGET = 262_144
 _LOCAL_CANDIDATE_MAX_ITERATIONS = 64
 _LOCAL_CANDIDATE_MAX_OUTPUT_TOKENS = 8192
+_LOCAL_REVIEW_MAX_OUTPUT_TOKENS = 8192
 _LOCAL_CANDIDATE_TIMEOUT_SECONDS = 900.0
 _LOCAL_CANDIDATE_CAPABILITY_TTL_SECONDS = 1200.0
 _RESPONSE_FIELDS = {"id", "object", "created", "model", "choices", "usage"}
@@ -102,6 +103,23 @@ _ALLOWED_REQUEST_OVERRIDE_FIELDS = frozenset({
     "temperature",
     "top_p",
 })
+_LOCAL_REVIEW_SLOTS = ("smart_reviewer", "code_worker")
+_LOCAL_REVIEW_FAMILIES = {
+    "anthropic": "claude",
+    "openai": "gpt",
+    "google": "gemini",
+    "deepseek": "deepseek",
+    "z-ai": "glm",
+    "moonshotai": "kimi",
+    "minimax": "minimax",
+    "x-ai": "grok",
+    "qwen": "qwen",
+    "xiaomi": "mimo",
+    "arcee-ai": "trinity",
+    "nvidia": "nemotron",
+    "meta-llama": "llama",
+    "stepfun": "step",
+}
 _LOCAL_PYTEST_ARGV_PREFIX = ("-I", "-B", "-m", "pytest", "-q", "--")
 _LOCAL_PYTEST_PATH_PART_RE = re.compile(r"[A-Za-z0-9_.-]+")
 _LOCAL_PYTEST_SELECTOR_PART_RE = re.compile(
@@ -379,8 +397,13 @@ def _local_capture_checkpoint(
 def _local_python_launch(
     controller_python: Path,
 ) -> tuple[Path, Path, Path | None]:
-    launcher = Path(controller_python).expanduser().absolute()
+    requested_launcher = Path(controller_python).expanduser().absolute()
     try:
+        # Resolve ancestor aliases (for example ``~/.hermes``) but preserve the
+        # final venv ``python`` symlink. CPython uses __PYVENV_LAUNCHER__ to
+        # derive sys.prefix; giving it an ancestor-symlinked path makes macOS
+        # sandbox path matching lose the otherwise pinned site-packages root.
+        launcher = requested_launcher.parent.resolve(strict=True) / requested_launcher.name
         resolved = launcher.resolve(strict=True)
         info = resolved.stat()
         if not stat.S_ISREG(info.st_mode) or not os.access(resolved, os.X_OK):
@@ -420,7 +443,48 @@ def _capture_runtime_read_paths(
         pinned_candidate_runtime_paths,
     )
 
-    paths = list(pinned_candidate_runtime_paths(launcher))
+    canonical_paths = tuple(pinned_candidate_runtime_paths(launcher))
+    canonical_by_resolved = {
+        path.resolve(strict=True): path for path in canonical_paths
+    }
+    paths = list(canonical_paths)
+    # CPython retains lexical venv and base-runtime paths in ``sys.path``.
+    # If HERMES_HOME or the versioned runtime directory is a symlink, macOS
+    # sandbox rules for only the resolved roots do not authorize those lexical
+    # reads. Bind each alias only when it resolves to an already-pinned root.
+    resolved_launcher = launcher.resolve(strict=True)
+    version_match = re.search(r"python(?P<version>\d+\.\d+)$", resolved_launcher.name)
+    if version_match is None:
+        raise LocalGoValidationError(
+            "the pinned controller Python version is ambiguous"
+        )
+    version = version_match.group("version")
+    alias_installations = [launcher.parent.parent]
+    if launcher.is_symlink():
+        raw_target = Path(os.readlink(launcher))
+        if not raw_target.is_absolute():
+            raw_target = launcher.parent / raw_target
+        alias_installations.append(raw_target.absolute().parent.parent)
+    alias_candidates: list[Path] = []
+    for installation in alias_installations:
+        stdlib = installation / "lib" / f"python{version}"
+        alias_candidates.extend((
+            stdlib,
+            stdlib / "lib-dynload",
+            stdlib / "site-packages",
+            stdlib / "dist-packages",
+            installation / "lib" / f"libpython{version}.dylib",
+            installation / "lib" / f"libpython{version}.so",
+            installation / "lib" / f"libpython{version}.so.1.0",
+        ))
+    for candidate in alias_candidates:
+        lexical = candidate.absolute()
+        try:
+            resolved_candidate = lexical.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved_candidate in canonical_by_resolved:
+            paths.append(lexical)
     if pyvenv is not None:
         paths.append(pyvenv)
     unique = sorted({Path(path).absolute() for path in paths}, key=str)
@@ -649,7 +713,12 @@ def _probe_local_pytest_import(
         raise LocalGoValidationError(
             "the local pytest sandbox probe returned invalid evidence"
         )
-    module_path = Path(module_value)
+    try:
+        module_path = Path(module_value).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise LocalGoValidationError(
+            "the local pytest sandbox probe returned invalid evidence"
+        ) from exc
     if not module_path.is_absolute() or not any(
         module_path == item.path or item.path in module_path.parents
         for item in runtime_read_paths
@@ -2153,6 +2222,7 @@ class LocalBestplanAuthority:
         self._attempts: dict[str, _AttemptAuthority] = {}
         self._attempt_ids: set[str] = set()
         self._client: Any | None = None
+        self._review_used = False
         self._lock = threading.Lock()
 
     @classmethod
@@ -2231,6 +2301,19 @@ class LocalBestplanAuthority:
             api_key=api_key,
             no_auth=no_auth,
             request_overrides=copied_overrides,
+        )
+
+    def clone_for_review(self) -> "LocalBestplanAuthority":
+        """Return a fresh one-shot holder for a later review generation."""
+
+        return type(self)(
+            provider=self._provider,
+            model=self._model,
+            base_url=self._base_url,
+            api_mode=self._api_mode,
+            api_key=self._api_key,
+            no_auth=self._no_auth,
+            request_overrides=self._request_overrides,
         )
 
     def lookup_enrollment(self, repo_identity: Any) -> None:
@@ -2608,6 +2691,79 @@ class LocalBestplanAuthority:
                     current.in_flight = False
             raise
 
+    def review_request(self, request: BrokerTurnRequest) -> str:
+        """Make one bounded, tool-free review call on this exact model route."""
+
+        if not isinstance(request, BrokerTurnRequest):
+            raise AuthorityProtocolError(
+                "local review requires a canonical broker turn"
+            )
+        try:
+            body = json.loads(request.request_json)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise AuthorityProtocolError("local review request is invalid") from exc
+        if not isinstance(body, dict) or set(body) != {
+            "max_completion_tokens",
+            "messages",
+            "model",
+            "stream",
+            "tools",
+        }:
+            raise AuthorityProtocolError("local review request fields differ")
+        if body["model"] != self._model:
+            raise AuthorityProtocolError("local review request model differs")
+        if body["tools"] != []:
+            raise AuthorityProtocolError("local review request must not use tools")
+        if body["stream"] is not False:
+            raise AuthorityProtocolError("local review request must not stream")
+        if not isinstance(body["messages"], list) or not body["messages"]:
+            raise AuthorityProtocolError("local review messages are invalid")
+        requested_tokens = body["max_completion_tokens"]
+        if (
+            isinstance(requested_tokens, bool)
+            or not isinstance(requested_tokens, int)
+            or requested_tokens != request.max_output_tokens
+            or not 1 <= requested_tokens <= _LOCAL_REVIEW_MAX_OUTPUT_TOKENS
+        ):
+            raise AuthorityProtocolError("local review output budget differs")
+
+        with self._lock:
+            if self._review_used:
+                raise AuthorityProtocolError("local review authority is already used")
+            self._review_used = True
+
+        kwargs = dict(body)
+        kwargs.update(self._request_overrides)
+        client = self._resolve_client()
+        response = client.chat.completions.create(**kwargs)
+        broker_response = self._broker_response(request, response)
+        try:
+            response_body = json.loads(broker_response.response_json)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise AuthorityProtocolError("local review response is invalid") from exc
+        choices = response_body.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1:
+            raise AuthorityProtocolError("local review response is malformed")
+        message = choices[0].get("message")
+        if not isinstance(message, Mapping):
+            raise AuthorityProtocolError("local review response is malformed")
+        if message.get("tool_calls") not in (None, []):
+            raise AuthorityProtocolError("local review response contains tool calls")
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise AuthorityProtocolError("local review response must be text")
+        try:
+            decoded_content = json.loads(content)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise AuthorityProtocolError(
+                "local review response must be one JSON object"
+            ) from exc
+        if not isinstance(decoded_content, dict):
+            raise AuthorityProtocolError(
+                "local review response must be one JSON object"
+            )
+        return content
+
     def revoke_model_attempt(self, capability: BrokerCapability) -> None:
         with self._lock:
             if not isinstance(capability, BrokerCapability):
@@ -2629,6 +2785,18 @@ class LocalAuthorityBinding:
     position: int
     runtime_fingerprint: str
     authority: LocalBestplanAuthority
+
+
+@dataclass(frozen=True)
+class LocalReviewAuthorityBinding:
+    """One required reviewer lane and its foreground credential holder."""
+
+    slot: str
+    provider: str
+    model: str
+    model_family: str
+    runtime_fingerprint: str
+    authority: LocalBestplanAuthority = field(repr=False, compare=False)
 
 
 def build_local_authority_bindings(
@@ -2657,3 +2825,159 @@ def build_local_authority_bindings(
             authority=LocalBestplanAuthority.from_runtime(runtime),
         ))
     return tuple(bindings)
+
+
+def _local_review_model_family(model: str) -> str:
+    from hermes_cli.model_normalize import detect_vendor
+
+    if "anthropic.claude" in model.casefold():
+        return "claude"
+    vendor = detect_vendor(model)
+    family = _LOCAL_REVIEW_FAMILIES.get(vendor or "")
+    if family is None:
+        raise LocalGoValidationError("reviewer runtime model family is unknown")
+    return family
+
+
+def build_local_review_authority_bindings(
+    resolved_runtimes: Sequence[Mapping[str, Any]],
+) -> tuple[LocalReviewAuthorityBinding, LocalReviewAuthorityBinding]:
+    """Bind the two exact, diverse reviewer lanes to credential holders."""
+
+    if not isinstance(resolved_runtimes, (list, tuple)) or len(resolved_runtimes) != 2:
+        raise LocalGoValidationError(
+            "reviewer runtimes must contain exactly two slots"
+        )
+    by_slot: dict[str, tuple[Mapping[str, Any], str, str, str]] = {}
+    for runtime in resolved_runtimes:
+        if not isinstance(runtime, Mapping):
+            raise LocalGoValidationError("reviewer runtime must be an object")
+        slot = runtime.get("route")
+        if slot not in _LOCAL_REVIEW_SLOTS or slot in by_slot:
+            raise LocalGoValidationError(
+                "reviewer runtime slots must match the required unique slots"
+            )
+        provider = runtime.get("provider")
+        model = runtime.get("model")
+        if (
+            not isinstance(provider, str)
+            or not provider
+            or "\x00" in provider
+            or not isinstance(model, str)
+            or not model
+            or "\x00" in model
+        ):
+            raise LocalGoValidationError(
+                "reviewer runtime provider and model must be nonempty strings"
+            )
+        runtime_fingerprint = runtime.get("runtime_fingerprint")
+        if not isinstance(runtime_fingerprint, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", runtime_fingerprint,
+        ):
+            raise LocalGoValidationError(
+                "reviewer runtime fingerprint is invalid"
+            )
+        by_slot[slot] = (
+            runtime,
+            provider,
+            model,
+            _local_review_model_family(model),
+        )
+    if set(by_slot) != set(_LOCAL_REVIEW_SLOTS):
+        raise LocalGoValidationError(
+            "reviewer runtime slots must match the required slots"
+        )
+    if len({item[3] for item in by_slot.values()}) != 2:
+        raise LocalGoValidationError(
+            "reviewer runtime model families must be distinct"
+        )
+    ordered: list[LocalReviewAuthorityBinding] = []
+    for slot in _LOCAL_REVIEW_SLOTS:
+        runtime, provider, model, model_family = by_slot[slot]
+        ordered.append(LocalReviewAuthorityBinding(
+            slot=slot,
+            provider=provider,
+            model=model,
+            model_family=model_family,
+            runtime_fingerprint=str(runtime["runtime_fingerprint"]),
+            authority=LocalBestplanAuthority.from_runtime(runtime),
+        ))
+    return ordered[0], ordered[1]
+
+
+def refresh_local_review_authority_bindings(
+    bindings: Sequence[LocalReviewAuthorityBinding],
+) -> tuple[LocalReviewAuthorityBinding, LocalReviewAuthorityBinding]:
+    """Clone the exact foreground routes for one fresh review generation."""
+
+    if not isinstance(bindings, (list, tuple)) or len(bindings) != 2:
+        raise LocalGoValidationError(
+            "review authority bindings must contain exactly two slots"
+        )
+    refreshed: list[LocalReviewAuthorityBinding] = []
+    for binding in bindings:
+        if not isinstance(binding, LocalReviewAuthorityBinding):
+            raise LocalGoValidationError("review authority binding is invalid")
+        refreshed.append(LocalReviewAuthorityBinding(
+            slot=binding.slot,
+            provider=binding.provider,
+            model=binding.model,
+            model_family=binding.model_family,
+            runtime_fingerprint=binding.runtime_fingerprint,
+            authority=binding.authority.clone_for_review(),
+        ))
+    if tuple(item.slot for item in refreshed) != _LOCAL_REVIEW_SLOTS:
+        raise LocalGoValidationError("review authority binding slots differ")
+    if len({item.model_family for item in refreshed}) != 2:
+        raise LocalGoValidationError("review authority model families must be distinct")
+    return refreshed[0], refreshed[1]
+
+
+def call_local_review_authority(
+    binding: LocalReviewAuthorityBinding,
+    request: Mapping[str, Any],
+    *,
+    max_output_tokens: int = _LOCAL_REVIEW_MAX_OUTPUT_TOKENS,
+) -> str:
+    """Send one canonical no-tool review request through its bound authority."""
+
+    if not isinstance(binding, LocalReviewAuthorityBinding):
+        raise AuthorityProtocolError("local review authority binding is invalid")
+    if not isinstance(request, Mapping) or set(request) != {"messages", "tools"}:
+        raise AuthorityProtocolError("local review request fields differ")
+    if request["tools"] != []:
+        raise AuthorityProtocolError("local review request must not use tools")
+    messages = request["messages"]
+    if not isinstance(messages, list) or not messages:
+        raise AuthorityProtocolError("local review messages are invalid")
+    if (
+        isinstance(max_output_tokens, bool)
+        or not isinstance(max_output_tokens, int)
+        or not 1 <= max_output_tokens <= _LOCAL_REVIEW_MAX_OUTPUT_TOKENS
+    ):
+        raise AuthorityProtocolError("local review output budget is invalid")
+    body = {
+        "max_completion_tokens": max_output_tokens,
+        "messages": messages,
+        "model": binding.model,
+        "stream": False,
+        "tools": [],
+    }
+    try:
+        request_json = json.dumps(
+            body,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        broker_request = BrokerTurnRequest(
+            request_id=f"review-{secrets.token_hex(16)}",
+            request_json=request_json,
+            max_output_tokens=max_output_tokens,
+        )
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise AuthorityProtocolError(
+            "local review request is not bounded canonical JSON"
+        ) from exc
+    return binding.authority.review_request(broker_request)

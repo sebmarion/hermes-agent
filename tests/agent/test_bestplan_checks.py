@@ -110,6 +110,42 @@ def test_check_profile_is_default_deny_and_grants_only_frozen_roots(tmp_path):
     assert f'(allow file-read* (subpath "{tmp_path.parent}"))' not in profile
 
 
+def test_check_profile_preserves_pinned_symlink_alias_and_resolved_target(
+    tmp_path,
+):
+    checks = _checks()
+    integration = tmp_path / "integration"
+    runtime = tmp_path / "runtime"
+    scratch = tmp_path / "scratch"
+    target = tmp_path / "real-runtime"
+    alias = tmp_path / "runtime-alias"
+    executable = tmp_path / "bin" / "checker"
+    for directory in (
+        integration,
+        runtime,
+        scratch,
+        target,
+        executable.parent,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    alias.symlink_to(target, target_is_directory=True)
+    executable.write_bytes(b"checker\n")
+    executable.chmod(0o755)
+
+    profile = checks._check_profile_text(
+        integration_root=integration,
+        runtime_root=runtime,
+        scratch_root=scratch,
+        cache_roots=(),
+        executable=executable,
+        runtime_read_paths=(alias,),
+        network_allowlist=(),
+    )
+
+    assert f'(allow file-read* (subpath "{alias}"))' in profile
+    assert f'(allow file-read* (subpath "{target}"))' in profile
+
+
 @pytest.mark.parametrize(
     "endpoint",
     (

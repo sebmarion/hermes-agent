@@ -1059,9 +1059,22 @@ def test_recovery_preserves_prepared_local_effect_before_queueing_lost_event(
     from agent.bestplan_local_git import LOCAL_MAIN_REF, LocalMainPushTarget
     from agent.bestplan_proof import ProofLedger
     from agent.bestplan_state import PlanState
+    from tests.agent.test_bestplan_local_push_state import (
+        _review_target,
+        _seed_review_pass,
+    )
 
     store, snapshot, state_db_path = _seed_local_recovery_plan(tmp_path)
     try:
+        review_target = _review_target(
+            store,
+            snapshot,
+            "c" * 40,
+            check_receipt_digest="d" * 64,
+        )
+        _review_store, _review_claim, review_receipt_digest = (
+            _seed_review_pass(store, review_target)
+        )
         prepared = store.prepare_local_push(
             "bp-local",
             session_id="session-1",
@@ -1070,6 +1083,8 @@ def test_recovery_preserves_prepared_local_effect_before_queueing_lost_event(
             expected_target_oid=snapshot.head_oid,
             integration_oid="c" * 40,
             check_set_digest="d" * 64,
+            review_target=review_target,
+            review_receipt_digest=review_receipt_digest,
             target=LocalMainPushTarget(
                 remote_name="origin",
                 remote_ref=LOCAL_MAIN_REF,

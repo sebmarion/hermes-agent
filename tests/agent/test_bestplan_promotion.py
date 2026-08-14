@@ -474,6 +474,7 @@ def _freeze_integration(
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
     precreate_temp_root: bool = True,
+    identity_plan_id: str | None = None,
 ):
     root = tmp_path / "integration-temp" if temp_root is None else Path(temp_root)
     if (
@@ -492,6 +493,7 @@ def _freeze_integration(
         temp_root=root,
         deadline=time.monotonic() + 30 if deadline is None else deadline,
         cancel_event=cancel_event,
+        identity_plan_id=identity_plan_id,
     )
 
 
@@ -622,6 +624,182 @@ def test_freeze_accepts_strict_local_go_contract(tmp_path):
     assert integration.approval_digest == approved
     assert integration.target_ref == "refs/heads/main"
     assert _git(repo, "show", f"{integration.integration_oid}:one/result.txt") == (
+        "one-result"
+    )
+
+
+def test_initial_integration_uses_attempt_identity_but_keeps_logical_owner(
+    tmp_path,
+):
+    promotion = _promotion()
+    repo, snapshot, plan, contract, approved = _local_bundle(
+        tmp_path, _slice("one"),
+    )
+    logical_plan_id = "bp-integration"
+    attempt_plan_id = "execution-attempt-0123456789abcdef"
+    candidate = _freeze_candidate(
+        tmp_path,
+        snapshot,
+        plan_id=attempt_plan_id,
+        slice_id="one",
+    )
+
+    integration = _freeze_integration(
+        promotion,
+        tmp_path,
+        snapshot,
+        plan,
+        contract,
+        approved,
+        (_binding(promotion, snapshot, contract, approved, candidate),),
+        plan_id=logical_plan_id,
+        identity_plan_id=attempt_plan_id,
+    )
+
+    assert integration.plan_id == logical_plan_id
+    assert integration.ref_name == promotion._integration_ref(
+        attempt_plan_id, approved,
+    )
+    assert integration.ref_name != promotion._integration_ref(
+        logical_plan_id, approved,
+    )
+    assert _git(repo, "rev-parse", integration.ref_name) == (
+        integration.integration_oid
+    )
+
+
+def _freeze_repair_candidate(
+    tmp_path: Path,
+    snapshot,
+    prior,
+    *,
+    plan_id: str,
+    generation: int,
+    manifest_index: int,
+    manifest_slice_id: str,
+    changes: dict[str, str],
+    allowed_paths: tuple[str, ...],
+    expected_artifacts: tuple[str, ...],
+):
+    from agent import bestplan_candidates as candidates
+
+    identity_plan_id = _task5_safe_identifier(
+        "repair-plan", plan_id, generation,
+    )
+    slice_id = _task5_safe_identifier(
+        "slice", identity_plan_id, manifest_index, manifest_slice_id,
+    )
+    candidate_id = _task5_safe_identifier(
+        "candidate", identity_plan_id, manifest_index, manifest_slice_id,
+    )
+    attempt_id = _task5_safe_identifier(
+        "attempt", identity_plan_id, manifest_index, manifest_slice_id,
+    )
+    spec = candidates.CandidateSpec(
+        plan_id=identity_plan_id,
+        candidate_id=candidate_id,
+        slice_id=slice_id,
+        goal=f"Repair {manifest_slice_id}",
+        allowed_paths=allowed_paths,
+        read_only=False,
+        expected_artifacts=expected_artifacts,
+        model="test/model",
+        request_budget=2,
+        token_budget=2048,
+        expires_at=int(time.time()) + 600,
+        max_iterations=5,
+        max_output_tokens=512,
+        toolsets=("file",),
+    )
+    attempt = candidates.create_repair_candidate_attempt(
+        snapshot,
+        candidate_base=prior,
+        plan_id=spec.plan_id,
+        slice_id=spec.slice_id,
+        attempts_root=tmp_path / f"repair-attempts-{generation}",
+        attempt_id=attempt_id,
+    )
+    for logical_path, content in changes.items():
+        destination = attempt.source_dir / logical_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+    sealed = candidates.seal_candidate_attempt(attempt)
+    return candidates._freeze_sealed_repair_candidate_for_test(
+        snapshot,
+        candidate_base=prior,
+        sealed=sealed,
+        spec=spec,
+        raw_receipt={
+            "candidate_id": candidate_id,
+            "manifest_slice_id": manifest_slice_id,
+            "status": "completed",
+        },
+    )
+
+
+def test_repair_generations_compose_over_prior_but_remain_children_of_target(
+    tmp_path,
+):
+    promotion = _promotion()
+    repo, snapshot, plan, contract, approved = _bundle(
+        tmp_path, _slice("one"),
+    )
+    original = _freeze_candidate(
+        tmp_path, snapshot, plan_id="bp-integration", slice_id="one",
+    )
+    first = _freeze_integration(
+        promotion,
+        tmp_path,
+        snapshot,
+        plan,
+        contract,
+        approved,
+        (_binding(promotion, snapshot, contract, approved, original),),
+    )
+    repair = _freeze_repair_candidate(
+        tmp_path,
+        snapshot,
+        first,
+        plan_id="bp-integration",
+        generation=1,
+        manifest_index=0,
+        manifest_slice_id="one",
+        changes={"one/result.txt": "one-repaired\n"},
+        allowed_paths=("one/",),
+        expected_artifacts=("one/result.txt",),
+    )
+    binding = _binding(
+        promotion, snapshot, contract, approved, repair,
+    )
+    binding = _rebind(promotion, binding, base_oid=first.integration_oid)
+
+    repair_integration_root = tmp_path / "repair-integration-temp"
+    repair_integration_root.mkdir(mode=0o700)
+    repaired = promotion.freeze_repair_integration(
+        plan_id="bp-integration",
+        generation=1,
+        prior=first,
+        plan=plan,
+        snapshot=snapshot,
+        contract=contract,
+        approval_digest=approved,
+        candidates=(binding,),
+        temp_root=repair_integration_root,
+        deadline=time.monotonic() + 30,
+    )
+
+    assert repaired.ref_name != first.ref_name
+    assert _git(repo, "rev-parse", first.ref_name) == first.integration_oid
+    assert _git(repo, "rev-parse", f"{repair.commit_oid}^") == (
+        first.integration_oid
+    )
+    assert _git(repo, "rev-parse", f"{repaired.integration_oid}^") == (
+        snapshot.head_oid
+    )
+    assert _git(repo, "show", f"{repaired.integration_oid}:one/result.txt") == (
+        "one-repaired"
+    )
+    assert _git(repo, "show", f"{first.integration_oid}:one/result.txt") == (
         "one-result"
     )
 

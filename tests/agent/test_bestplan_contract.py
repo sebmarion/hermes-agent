@@ -859,7 +859,7 @@ def test_capture_persists_and_renders_exact_subdirectory_workspace(tmp_path, mon
     assert capture.executable is True
     row = store.get_plan(capture.plan_id)
     assert row["workspace"] == workspace
-    assert f"- workspace: {workspace}" in capture.response
+    assert workspace not in capture.response
 
 
 def test_strong_unmatched_v1_persists_source_and_capture_order_once(tmp_path, monkeypatch):
@@ -1095,8 +1095,11 @@ def test_capture_renders_v2_and_malformed_matching_enrollment_is_visible_error(
         authority_client=_Authority(_enrollment()),
     )
     assert capture.executable is True
-    assert "execution protocol: 2" in capture.response
-    assert "automatic deployment-failure rollback" in capture.response
+    assert "BestPlan ready" in capture.response
+    assert "Plan" in capture.response
+    assert "After approval" in capture.response
+    assert "execution protocol: 2" not in capture.response
+    assert "automatic deployment-failure rollback" not in capture.response
 
     malformed = enrollment_to_dict(_enrollment())
     malformed["unknown"] = "value"

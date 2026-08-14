@@ -71,6 +71,22 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    bestplan_config = None
+    if params.get("_bestplan_authority") is _BESTPLAN_SUBMIT_AUTHORITY:
+        raw_bestplan_config = params.get("_bestplan_config")
+        if (
+            not isinstance(raw_bestplan_config, dict)
+            or set(raw_bestplan_config) != {"count"}
+        ):
+            return _err(rid, 4004, "invalid internal BestPlan configuration")
+        count = raw_bestplan_config["count"]
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or not 2 <= count <= 5
+        ):
+            return _err(rid, 4004, "invalid internal BestPlan configuration")
+        bestplan_config = {"count": count}
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -142,6 +158,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            bestplan_config=bestplan_config,
         )
         if busy_response is not None:
             return busy_response
@@ -244,7 +261,13 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_response = _submit_prompt_to_compute_host(
+            rid,
+            sid,
+            session,
+            text,
+            bestplan_config=bestplan_config,
+        )
         if not isolated_response.get("error"):
             return isolated_response
         logger.warning(
@@ -323,7 +346,13 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            bestplan_config=bestplan_config,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -331,6 +360,47 @@ def _(rid, params: dict) -> dict:
     session["_run_thread"] = run_thread
     run_thread.start()
     return _ok(rid, {"status": "streaming"})
+
+
+@method("bestplan.submit")
+def _(rid, params: dict) -> dict:
+    from agent.bestplan_orchestrator import (
+        DEFAULT_EXPLORER_COUNT,
+        normalize_count,
+    )
+
+    raw_arg = params.get("arg")
+    if not isinstance(raw_arg, str) or not raw_arg.strip():
+        return _err(rid, 4004, "bestplan.submit requires a non-empty task")
+
+    stripped = raw_arg.strip()
+    parts = stripped.split(maxsplit=1)
+    has_count = bool(
+        parts and parts[0].isascii() and parts[0].isdigit()
+    )
+    if has_count and len(parts) == 1:
+        return _err(rid, 4004, "bestplan.submit requires a task after the count")
+
+    task = parts[1].strip() if has_count else stripped
+    if not task:
+        return _err(rid, 4004, "bestplan.submit requires a non-empty task")
+    count = normalize_count(parts[0]) if has_count else DEFAULT_EXPLORER_COUNT
+
+    prompt_params = {
+        "session_id": params.get("session_id"),
+        "text": task,
+        "_bestplan_config": {"count": count},
+        "_bestplan_authority": _BESTPLAN_SUBMIT_AUTHORITY,
+    }
+    if "profile" in params:
+        prompt_params["profile"] = params["profile"]
+
+    response = _methods["prompt.submit"](rid, prompt_params)
+    if isinstance(response, dict) and isinstance(response.get("result"), dict):
+        response = dict(response)
+        response["result"] = dict(response["result"])
+        response["result"]["output"] = "BestPlan started."
+    return response
 
 
 @method("clipboard.paste")

@@ -71,6 +71,32 @@ class TestApiModeAccepted:
         agent = _make_codex_agent()
         assert agent.api_mode == "codex_app_server"
 
+    def test_app_server_auth_does_not_require_raw_provider_credentials(
+        self, monkeypatch
+    ):
+        from agent import auxiliary_client
+
+        def raw_provider_resolution_must_not_run(*args, **kwargs):
+            raise AssertionError("Codex app-server owns auth through the Codex CLI")
+
+        monkeypatch.setattr(
+            auxiliary_client,
+            "resolve_provider_client",
+            raw_provider_resolution_must_not_run,
+        )
+
+        agent = run_agent.AIAgent(
+            model="gpt-5.6-sol",
+            provider="openai-codex",
+            api_mode="codex_app_server",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+        assert agent.api_mode == "codex_app_server"
+        assert agent.client is None
+
 
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):

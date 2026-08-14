@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import fcntl
 import logging
 import math
 import os
 import re
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -489,6 +491,115 @@ def _strip_bestplan_envelope(value: Any) -> str:
     return visible.replace(BESTPLAN_ENVELOPE_END, "").strip()
 
 
+def _bestplan_marked_blocks(value: Any) -> list[str]:
+    """Return complete host-marked receipt blocks without trusting their data."""
+
+    from agent.bestplan_orchestrator import (
+        RECEIPT_BEGIN,
+        RECEIPT_BEGIN_V1,
+        RECEIPT_END,
+        RECEIPT_END_V1,
+    )
+
+    text = str(value or "")
+    blocks: list[str] = []
+    for begin, end in (
+        (RECEIPT_BEGIN, RECEIPT_END),
+        (RECEIPT_BEGIN_V1, RECEIPT_END_V1),
+    ):
+        cursor = 0
+        while True:
+            start = text.find(begin, cursor)
+            if start < 0:
+                break
+            finish = text.find(end, start + len(begin))
+            if finish < 0:
+                break
+            blocks.append(text[start : finish + len(end)].strip())
+            cursor = finish + len(end)
+    return blocks
+
+
+def _bestplan_receipt_metadata(
+    host_metadata: Mapping[str, Any] | None,
+    response: str,
+    body: str,
+) -> dict[str, Any] | None:
+    """Validate host-owned receipt metadata against the exact plan body.
+
+    The response is model-visible text and is never the source of model
+    identities.  If it contains a receipt marker, the marker must match the
+    host-owned metadata; otherwise the summary omits model details.
+    """
+
+    from agent.bestplan_orchestrator import _valid_v2_receipt_metadata
+
+    if not isinstance(host_metadata, Mapping):
+        return None
+    metadata = dict(host_metadata)
+    if not _valid_v2_receipt_metadata(metadata, body):
+        return None
+
+    blocks = _bestplan_marked_blocks(response)
+    if not blocks:
+        from agent.bestplan_orchestrator import RECEIPT_BEGIN, RECEIPT_BEGIN_V1
+
+        if RECEIPT_BEGIN in response or RECEIPT_BEGIN_V1 in response:
+            # A receipt marker without one complete matching block is an
+            # invalid model-visible artifact, not a source of host metadata.
+            return None
+        return metadata
+    if len(blocks) != 1:
+        return None
+    try:
+        lines = blocks[0].splitlines()
+        marker_metadata = json.loads(lines[1])
+    except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(marker_metadata, dict) or marker_metadata != metadata:
+        return None
+    return metadata
+
+
+def _strip_bestplan_internal_artifacts(value: Any) -> str:
+    """Remove the machine envelope and host receipt from human-facing text."""
+
+    visible = _strip_bestplan_envelope(value)
+    from agent.bestplan_orchestrator import (
+        RECEIPT_BEGIN,
+        RECEIPT_BEGIN_V1,
+        RECEIPT_END,
+        RECEIPT_END_V1,
+    )
+
+    for begin, end in (
+        (RECEIPT_BEGIN, RECEIPT_END),
+        (RECEIPT_BEGIN_V1, RECEIPT_END_V1),
+    ):
+        while True:
+            start = visible.find(begin)
+            if start < 0:
+                break
+            finish = visible.find(end, start + len(begin))
+            if finish < 0:
+                visible = visible[:start].rstrip()
+                break
+            visible = visible[:start] + visible[finish + len(end) :]
+    return visible.strip()
+
+
+def _render_host_receipt_warning(code: Any) -> str:
+    """Render only a known host warning, never warning text from the model."""
+
+    if code != "receipt_persistence_failed":
+        return ""
+    return (
+        "Warning\n"
+        "- The BestPlan receipt audit could not be persisted; the plan remains "
+        "pending and must be checked before approval."
+    )
+
+
 def compute_baseline_fingerprint(workspace: str) -> str:
     """Compatibility wrapper for the stable Git source/protected-state proof."""
 
@@ -638,6 +749,31 @@ def _plan_to_delegate_tasks(
     return tasks
 
 
+def _local_review_runtime_tasks(workspace: str) -> list[dict[str, Any]]:
+    """Return the two exact read-only lanes required by automatic review."""
+
+    canonical_workspace = _canonical_workspace(workspace)
+    return [
+        {
+            "goal": "Review the exact checked BestPlan integration",
+            "context": "Host-owned automatic code review; return strict JSON only.",
+            "route": slot,
+            "role": "leaf",
+            "_bestplan_slice_id": f"automatic-review-{slot}",
+            "_bestplan_manifest_index": index,
+            "_bestplan_depends_on": [],
+            "_bestplan_read_only": True,
+            "_bestplan_leases": [],
+            "_bestplan_workspace": canonical_workspace,
+            "_bestplan_expected_artifacts": [],
+            "_bestplan_acceptance": [
+                "Return one exact hermes.bestplan.review-verdict.v1 object"
+            ],
+        }
+        for index, slot in enumerate(("smart_reviewer", "code_worker"))
+    ]
+
+
 def _render_authoritative_manifest(
     plan: ExecutionPlan,
     *,
@@ -713,6 +849,387 @@ def _render_authoritative_manifest(
     return "\n".join(lines)
 
 
+def _model_identity(value: Any) -> tuple[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    model = value.get("model")
+    provider = value.get("provider")
+    if not isinstance(model, str) or not model.strip():
+        return None
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    return provider.strip(), model.strip()
+
+
+def _status_counts(attempts: list[Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            continue
+        identity = _model_identity(attempt.get("resolved")) or _model_identity(
+            attempt.get("configured")
+        )
+        if identity is None:
+            continue
+        item = grouped.setdefault(
+            identity,
+            {"success": 0, "failed": 0, "timeout": 0, "reasons": []},
+        )
+        status = str(attempt.get("status") or "unknown")
+        if status == "success":
+            item["success"] += 1
+        elif status == "timeout":
+            item["timeout"] += 1
+        else:
+            item["failed"] += 1
+        reason = attempt.get("reason_code")
+        if isinstance(reason, str) and reason.strip():
+            item["reasons"].append(reason.replace("_", " "))
+    return grouped
+
+
+def _display_model_name(value: Any) -> str:
+    """Return a short model name suitable for an executive status line."""
+
+    raw = str(value or "").strip()
+    if "/" in raw:
+        raw = raw.rsplit("/", 1)[-1]
+    known = {
+        "deepseek-v4-flash-0731": "DeepSeek v4 Flash",
+        "gpt-5.6-sol": "GPT-5.6 Sol",
+    }
+    if raw in known:
+        return known[raw]
+    words = re.split(r"[-_]+", raw)
+    brand_names = {"deepseek": "DeepSeek", "claude": "Claude", "gemini": "Gemini"}
+    return " ".join(
+        word.upper()
+        if word.casefold() in {"gpt", "api", "llm"}
+        else brand_names.get(word.casefold(), word.capitalize())
+        for word in words
+        if word
+    ) or "Unknown model"
+
+
+def _model_outcome_text(counts: Mapping[str, Any]) -> str:
+    outcomes: list[str] = []
+    success = int(counts.get("success") or 0)
+    failed = int(counts.get("failed") or 0)
+    timeout = int(counts.get("timeout") or 0)
+    if success:
+        outcomes.append(f"{success} successful run{'s' if success != 1 else ''}")
+    unsuccessful = failed + timeout
+    if unsuccessful:
+        outcomes.append(
+            f"{unsuccessful} unsuccessful run{'s' if unsuccessful != 1 else ''}"
+        )
+    return "; ".join(outcomes) or "no usable result"
+
+
+def _render_model_summary(metadata: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(metadata, Mapping):
+        return ["- The planning model summary is unavailable."]
+
+    lines: list[str] = []
+    grouped = _status_counts(list(metadata.get("attempts") or []))
+    for (_provider, model), counts in grouped.items():
+        lines.append(
+            f"- {_display_model_name(model)}: {_model_outcome_text(counts)}."
+        )
+
+    synthesizer = metadata.get("synthesizer")
+    if isinstance(synthesizer, Mapping):
+        identity = _model_identity(synthesizer.get("resolved")) or _model_identity(
+            synthesizer.get("configured")
+        )
+        if identity is not None:
+            _provider, model = identity
+            status = str(synthesizer.get("status") or "unknown").casefold()
+            status_text = {
+                "success": "wrote the final plan",
+                "failed": "could not write the final plan",
+                "timeout": "did not finish the final plan",
+                "not_started": "was not started",
+            }.get(status, "status unavailable")
+            lines.append(f"- Final plan writer: {_display_model_name(model)} ({status_text}).")
+    return lines or ["- The planning model summary is unavailable."]
+
+
+def _plan_text(plan: ExecutionPlan) -> str:
+    values: list[str] = [plan.merge_policy, plan.stop_condition]
+    values.extend(plan.escalation_predicates)
+    for item in plan.slices:
+        values.append(item.goal)
+        values.extend(item.expected_artifacts)
+        values.extend(item.acceptance)
+    return " ".join(_inline_text(value) for value in values).casefold()
+
+
+def _is_evidence_hold_plan(plan: ExecutionPlan) -> bool:
+    text = _plan_text(plan)
+    return (
+        "hold" in text
+        and ("evidence" in text or "authorized" in text or "current-state" in text)
+    )
+
+
+def _artifact_reference(value: Any) -> str:
+    text = _inline_text(value).rstrip(".")
+    for separator in (" containing ", " that ", " with ", " — "):
+        position = text.casefold().find(separator)
+        if position > 0:
+            text = text[:position].rstrip(" .")
+    return text
+
+
+def _is_plans_path(value: Any) -> bool:
+    path = _artifact_reference(value).replace("\\", "/").strip("`")
+    return path == ".plans" or path.startswith(".plans/")
+
+
+def _is_documentation_only_plan(plan: ExecutionPlan) -> bool:
+    writable = [item for item in plan.slices if not item.read_only]
+    if not writable:
+        return False
+    return all(
+        _is_plans_path(path)
+        for item in writable
+        for path in (*item.allowed_paths, *item.expected_artifacts)
+    )
+
+
+def _render_executive_actions(plan: ExecutionPlan, *, hold: bool) -> list[str]:
+    lines: list[str] = []
+    for item in plan.slices:
+        artifacts = tuple(
+            dict.fromkeys(
+                _artifact_reference(value)
+                for value in item.expected_artifacts
+                if _artifact_reference(value)
+            )
+        )
+        if hold and artifacts:
+            for artifact in artifacts:
+                lines.append(f"- Create the written status record at `{artifact}`.")
+        elif artifacts:
+            lines.append(
+                "- Create or update "
+                + ", ".join(f"`{artifact}`" for artifact in artifacts)
+                + "."
+            )
+        elif item.read_only:
+            lines.append("- Review the approved information and report the findings.")
+        else:
+            lines.append("- Make the approved change within the agreed project scope.")
+    return lines or ["- Complete the approved work within the agreed project scope."]
+
+
+def render_bestplan_failure(outcome: Mapping[str, Any] | None) -> str:
+    """Render a concise host-owned explanation for a failed BestPlan run."""
+
+    if not isinstance(outcome, Mapping):
+        outcome = {}
+    reason_code = str(outcome.get("reason_code") or "").casefold()
+    error = {
+        "quorum_unavailable": "There were not enough usable planning results.",
+        "provider_error": "One or more planning services failed.",
+        "overall_timeout": "Planning did not finish within the allowed time.",
+        "synthesizer_failed": "The final plan could not be written.",
+        "credential_unavailable": "A required planning service was unavailable.",
+    }.get(reason_code, "The planning run did not complete.")
+    lines = [
+        "BestPlan unavailable",
+        "",
+        f"- Reason: {error}",
+    ]
+
+    successes = outcome.get("successes")
+    quorum = outcome.get("quorum")
+    metadata = outcome.get("bestplan_receipt_metadata")
+    attempts = metadata.get("attempts") if isinstance(metadata, Mapping) else None
+    effective_count = (
+        metadata.get("effective_count")
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    if not isinstance(effective_count, int) or isinstance(effective_count, bool):
+        effective_count = len(attempts) if isinstance(attempts, list) else None
+    if (
+        isinstance(successes, int)
+        and not isinstance(successes, bool)
+        and isinstance(quorum, int)
+        and not isinstance(quorum, bool)
+        and isinstance(effective_count, int)
+        and not isinstance(effective_count, bool)
+    ):
+        lines.append(
+            f"- Planning results: {successes} of {effective_count} were usable; "
+            f"at least {quorum} were needed."
+        )
+
+    lines.extend(["", "Planning models"])
+    lines.extend(_render_model_summary(metadata))
+    lines.extend(["", "- No plan was created or executed."])
+    return "\n".join(lines)
+
+
+def _inline_text(value: Any) -> str:
+    text = str(value or "").replace("`", "'")
+    # Keep the human projection one-line and deterministic even if a trusted
+    # source contains control characters.
+    text = "".join(
+        character if ord(character) >= 0x20 and ord(character) != 0x7F else " "
+        for character in text
+    )
+    return " ".join(text.split())
+
+
+def _bestplan_topic_from_invocation(value: Any) -> str:
+    """Extract the user's task from the host-owned BestPlan invocation."""
+
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    from agent.bestplan_orchestrator import TURN_MARKER, decode_bestplan_turn
+
+    if text.startswith(TURN_MARKER):
+        task, marker_config, marker_error = decode_bestplan_turn(text)
+        if marker_config is None or marker_error is not None:
+            return ""
+        return _inline_text(task)
+
+    match = re.match(r"^/(?:bestplan|bp)(?:\s|$)", text, re.IGNORECASE)
+    if match is None:
+        return ""
+    task = text[match.end() :].strip()
+    parts = task.split(maxsplit=1)
+    if parts and parts[0].isdigit():
+        task = parts[1] if len(parts) == 2 else ""
+    return _inline_text(task)
+
+
+def _executive_topic(value: Any) -> str:
+    """Make a trusted task line understandable without exposing plan jargon."""
+
+    topic = _inline_text(value)
+    if not topic:
+        return "The requested work"
+    replacements = (
+        ("Gate G0 HOLD receipt", "status record for a paused initial evidence check"),
+        ("G0 HOLD receipt", "status record for a paused initial evidence check"),
+        ("explicitly authorized in-workspace evidence", "approved evidence in the project folder"),
+        ("explicitly authorized evidence paths", "approved evidence locations"),
+        ("absence of explicitly authorized evidence", "missing approved evidence"),
+        ("inferred current-state claims", "guesses about the live system"),
+        ("current-state claims", "claims about the live system"),
+        ("non-operational", "documentation-only"),
+        ("non-executable", "for information only"),
+        ("P1 proposal", "follow-up proposal"),
+        ("Gate G0", "initial evidence check"),
+        ("G0", "initial evidence check"),
+        ("LaunchAgent", "macOS service"),
+        ("launch-agent", "macOS service"),
+        ("model routing", "AI model selection"),
+        ("acceptance criteria", "required checks"),
+        ("criteria", "requirements"),
+        ("criterion", "requirement"),
+        ("from only approved evidence", "using only approved evidence"),
+        ("acceptance", "required checks"),
+        ("receipt", "status record"),
+        ("auditable", "traceable"),
+        ("include a for information only follow-up proposal only if", "include a follow-up suggestion only if"),
+    )
+    for source, target in replacements:
+        topic = re.sub(re.escape(source), target, topic, flags=re.IGNORECASE)
+    return topic.rstrip(".!?") or "The requested work"
+
+
+def _render_human_plan(
+    plan: ExecutionPlan,
+    *,
+    workspace: str,
+    plan_id: str,
+    contract: Mapping[str, Any] | None,
+    receipt_metadata: Mapping[str, Any] | None,
+    topic: str | None = None,
+) -> str:
+    """Render the smallest human-readable approval summary from host truth."""
+
+    hold = _is_evidence_hold_plan(plan)
+    documentation_only = _is_documentation_only_plan(plan)
+    lines = [
+        "BestPlan ready",
+        "",
+        "Topic",
+        f"- {_executive_topic(topic)}.",
+        "",
+        "Decision",
+    ]
+    if hold:
+        lines.append(
+            "- Hold — there is not enough approved evidence to make a reliable "
+            "statement about the current system."
+        )
+    else:
+        lines.append("- Ready for approval — the scope and required checks are defined.")
+    lines.append(f"- Risk: {_inline_text(plan.risk).capitalize()}.")
+    lines.append("- No implementation or independent review has started.")
+
+    lines.extend(["", "Proposed action"])
+    lines.extend(_render_executive_actions(plan, hold=hold))
+    if documentation_only:
+        lines.append("- This is a documentation-only change.")
+    elif all(item.read_only for item in plan.slices):
+        lines.append("- No file changes are proposed.")
+
+    lines.extend(["", "What will not change"])
+    if hold or documentation_only:
+        lines.append(
+            "- No source code, settings, scheduled jobs, services, AI model "
+            "selection, version history, or remote systems will change."
+        )
+    else:
+        lines.append("- Nothing outside the approved files will change.")
+
+    lines.extend(["", "Success condition"])
+    if hold:
+        lines.append(
+            "- The written status record is complete and the required check passes. "
+            "If evidence is still missing, the final status remains Hold."
+        )
+    else:
+        lines.append(
+            "- All required checks pass. If any check fails, Hermes stops before "
+            "integrating changes."
+        )
+
+    local_contract = (
+        isinstance(contract, Mapping)
+        and contract.get("schema") == "hermes.bestplan.local-go.v1"
+    )
+    lines.extend(["", "After approval"])
+    if local_contract:
+        lines.extend([
+            "- Hermes will run the approved work and checks.",
+            "- Changes reach the local main branch only after every check passes.",
+            "- Hermes will not publish to a remote system without separate approval.",
+        ])
+    else:
+        lines.append("- Hermes will verify the approved scope before starting the work.")
+
+    lines.extend(["", "Planning models"])
+    lines.extend(_render_model_summary(receipt_metadata))
+    lines.extend([
+        "",
+        "Approval",
+        f"Bestplan executable receipt: {_inline_text(plan_id)}.",
+        f"Reply with bare `go` to approve and dispatch plan `{_inline_text(plan_id)}`.",
+    ])
+    return "\n".join(lines)
+
+
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS bestplan_plans (
     plan_id TEXT PRIMARY KEY,
@@ -765,7 +1282,10 @@ CREATE TABLE IF NOT EXISTS bestplan_plans (
     verified_at REAL,
     local_push_json TEXT,
     local_push_state TEXT,
-    local_push_updated_at REAL
+    local_push_updated_at REAL,
+    review_job_id TEXT,
+    review_target_digest TEXT,
+    review_receipt_digest TEXT
 )
 """
 _CREATE_INDEX_SQL = """CREATE INDEX IF NOT EXISTS idx_bestplan_plans_session_state
@@ -780,6 +1300,83 @@ class _ValidatedStoredPlan:
     approval_digest: str
     contract: dict[str, Any] | None
     source_snapshot: Any | None
+
+
+@dataclass(frozen=True)
+class LandingRecoveryResult:
+    """Observed outcome of one dead landing owner; Git is never replayed."""
+
+    status: str
+
+
+class _RepositoryEffectLock:
+    """Closeable handle for one identity-bound repository directory lock."""
+
+    def __init__(self, descriptor: int):
+        self._descriptor = descriptor
+
+    @property
+    def closed(self) -> bool:
+        return self._descriptor < 0
+
+    def fileno(self) -> int:
+        if self.closed:
+            raise ValueError("repository effect lock is closed")
+        return self._descriptor
+
+    def close(self) -> None:
+        descriptor = self._descriptor
+        if descriptor < 0:
+            return
+        self._descriptor = -1
+        os.close(descriptor)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
+
+
+def _open_repository_effect_lock(
+    repo: object,
+) -> tuple[str, _RepositoryEffectLock]:
+    """Open the exact stored Git common directory as the effect lock inode."""
+
+    path = getattr(repo, "common_dir", None)
+    expected_device = getattr(repo, "common_dir_device", None)
+    expected_inode = getattr(repo, "common_dir_inode", None)
+    if (
+        not isinstance(path, str)
+        or not path
+        or isinstance(expected_device, bool)
+        or not isinstance(expected_device, int)
+        or isinstance(expected_inode, bool)
+        or not isinstance(expected_inode, int)
+    ):
+        raise BestplanError("repository effect lock identity is invalid")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (expected_device, expected_inode)
+        ):
+            raise BestplanError("repository effect lock identity changed")
+        handle = _RepositoryEffectLock(descriptor)
+        descriptor = -1
+        return path, handle
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _validate_stored_plan_row(
@@ -1068,6 +1665,9 @@ class BestplanStore:
             "local_push_json": "TEXT",
             "local_push_state": "TEXT",
             "local_push_updated_at": "REAL",
+            "review_job_id": "TEXT",
+            "review_target_digest": "TEXT",
+            "review_receipt_digest": "TEXT",
         }
 
         def migrate(conn):
@@ -1121,6 +1721,22 @@ class BestplanStore:
             from agent.bestplan_proof import install_proof_schema
 
             install_proof_schema(conn)
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS
+                    trg_bestplan_review_binding_immutable
+                BEFORE UPDATE OF review_job_id, review_target_digest,
+                    review_receipt_digest ON bestplan_plans
+                WHEN OLD.review_job_id IS NOT NULL AND (
+                    NEW.review_job_id IS NOT OLD.review_job_id
+                    OR NEW.review_target_digest IS NOT OLD.review_target_digest
+                    OR NEW.review_receipt_digest IS NOT OLD.review_receipt_digest
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'bestplan review binding is immutable');
+                END
+                """
+            )
 
         self._execute_write(migrate)
 
@@ -1143,11 +1759,182 @@ class BestplanStore:
         from tools.async_delegation import _owner_liveness
 
         def reconcile(conn):
+            def exact_pending_execution_owner(
+                plan_row: sqlite3.Row,
+                delegation_id: str,
+                record: dict[str, Any],
+            ) -> tuple[bool, dict[str, Any] | None]:
+                """Return whether a pipeline exists and its exact valid owner."""
+
+                try:
+                    from agent.bestplan_local import local_go_manifest_digest
+
+                    pipeline = conn.execute(
+                        "SELECT * FROM bestplan_execution_pipelines "
+                        "WHERE plan_id=? AND delegation_id=?",
+                        (plan_row["plan_id"], delegation_id),
+                    ).fetchone()
+                    if pipeline is None:
+                        return False, None
+                    intent = json.loads(str(pipeline["adapter_state_json"]))
+                    routes = json.loads(str(pipeline["runtime_routes_json"]))
+                    planned_runtimes = json.loads(
+                        str(plan_row["resolved_runtime_json"] or "[]")
+                    )
+                    validated = _validate_stored_plan_row(plan_row)
+                    candidate_count = pipeline["candidate_count"]
+                    next_ordinal = pipeline["next_attempt_ordinal"]
+                    active_ordinal = pipeline["active_attempt_ordinal"]
+                    attempt_owner_pid = pipeline["attempt_owner_pid"]
+                    attempt_owner_start = pipeline[
+                        "attempt_owner_process_start_id"
+                    ]
+                    raw_request = intent.get("raw_request")
+                    if not isinstance(raw_request, str):
+                        return None
+                    request_bytes = raw_request.encode("utf-8")
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    UnicodeError,
+                    sqlite3.DatabaseError,
+                    json.JSONDecodeError,
+                ):
+                    return True, None
+                if (
+                    not isinstance(intent, dict)
+                    or not isinstance(routes, list)
+                    or not all(isinstance(item, dict) for item in routes)
+                    or not isinstance(planned_runtimes, list)
+                    or not all(
+                        isinstance(item, dict) for item in planned_runtimes
+                    )
+                    or isinstance(candidate_count, bool)
+                    or not isinstance(candidate_count, int)
+                    or candidate_count <= 0
+                    or isinstance(next_ordinal, bool)
+                    or not isinstance(next_ordinal, int)
+                    or next_ordinal < 0
+                    or len(planned_runtimes) != candidate_count
+                    or len(routes) != candidate_count + 2
+                ):
+                    return True, None
+                candidate_routes = routes[:candidate_count]
+                review_routes = routes[candidate_count:]
+                candidate_routes_match = all(
+                    all(
+                        planned.get(field) == durable.get(field)
+                        for field in (
+                            "provider", "model", "runtime_fingerprint",
+                        )
+                    )
+                    for planned, durable in zip(
+                        planned_runtimes, candidate_routes, strict=True,
+                    )
+                )
+                reviewer_routes_valid = all(
+                    isinstance(item.get("provider"), str)
+                    and bool(item["provider"])
+                    and isinstance(item.get("model"), str)
+                    and bool(item["model"])
+                    and isinstance(item.get("runtime_fingerprint"), str)
+                    and bool(re.fullmatch(
+                        r"[0-9a-f]{64}", item["runtime_fingerprint"],
+                    ))
+                    for item in review_routes
+                )
+                owner_is_unclaimed = (
+                    attempt_owner_pid is None
+                    and attempt_owner_start is None
+                    and active_ordinal is None
+                )
+                owner_is_claimed = (
+                    not isinstance(attempt_owner_pid, bool)
+                    and isinstance(attempt_owner_pid, int)
+                    and attempt_owner_pid > 0
+                    and isinstance(attempt_owner_start, str)
+                    and bool(attempt_owner_start.strip())
+                    and len(attempt_owner_start) <= 256
+                    and not isinstance(active_ordinal, bool)
+                    and isinstance(active_ordinal, int)
+                    and active_ordinal >= 0
+                    and next_ordinal == active_ordinal + 1
+                )
+                if not owner_is_unclaimed and not owner_is_claimed:
+                    return True, None
+                exact_execution = bool(
+                    pipeline["state"] == "pending"
+                    and pipeline["job_id"]
+                    == record.get("bestplan_review_job_id")
+                    and pipeline["owner_session_id"]
+                    == plan_row["session_id"]
+                    == record.get("origin_session_id")
+                    and pipeline["owner_profile"]
+                    == plan_row["profile"]
+                    == record.get("origin_profile")
+                    and pipeline["workspace"] == plan_row["workspace"]
+                    and pipeline["adapter_version"]
+                    == "local-bestplan-execution.v1"
+                    and record.get("bestplan_local_execution") is True
+                    and record.get("bestplan_plan_id") == plan_row["plan_id"]
+                    and record.get("bestplan_state_db_path")
+                    == str(state_path.resolve())
+                    and record.get("origin_tracker_path")
+                    == str(tracker.resolve())
+                    and validated.execution_protocol == 2
+                    and validated.source_snapshot is not None
+                    and isinstance(validated.contract, Mapping)
+                    and validated.contract.get("schema")
+                    == "hermes.bestplan.local-go.v1"
+                    and validated.contract.get("mode") == "local_main"
+                    and candidate_count == len(validated.plan.slices)
+                    and set(intent) == {
+                        "approval_digest",
+                        "contract_digest",
+                        "manifest_digest",
+                        "raw_request",
+                        "raw_request_sha256",
+                        "schema",
+                        "source_snapshot_digest",
+                    }
+                    and intent.get("schema")
+                    == "hermes.bestplan.execution-intent.v1"
+                    and intent.get("approval_digest")
+                    == validated.approval_digest
+                    and intent.get("contract_digest")
+                    == plan_row["promotion_contract_digest"]
+                    and intent.get("manifest_digest")
+                    == local_go_manifest_digest(validated.manifest)
+                    and intent.get("source_snapshot_digest")
+                    == source_snapshot_digest(validated.source_snapshot)
+                    and bool(raw_request.strip())
+                    and b"\x00" not in request_bytes
+                    and len(request_bytes) <= 256 * 1024
+                    and intent.get("raw_request_sha256")
+                    == hashlib.sha256(request_bytes).hexdigest()
+                    and candidate_routes_match
+                    and reviewer_routes_valid
+                    and [item.get("route") for item in candidate_routes]
+                    == [
+                        f"candidate-{index}"
+                        for index in range(candidate_count)
+                    ]
+                    and [item.get("route") for item in review_routes]
+                    == ["smart_reviewer", "code_worker"]
+                )
+                if not exact_execution:
+                    return True, None
+                if owner_is_unclaimed:
+                    return True, {}
+                return True, {
+                    "owner_pid": attempt_owner_pid,
+                    "owner_started_at": attempt_owner_start,
+                }
+
             changed = 0
             rows = conn.execute(
-                "SELECT plan_id, state, dispatch_id, execution_protocol, "
-                "current_phase, dispatch_state "
-                "FROM bestplan_plans "
+                "SELECT * FROM bestplan_plans "
                 "WHERE state IN (?, ?)",
                 (PlanState.RUNNING, PlanState.WAITING),
             ).fetchall()
@@ -1176,7 +1963,23 @@ class BestplanStore:
                         "interrupted",
                     }
                     if phase in {"scheduled", "running"}:
-                        owner_live = _owner_liveness(record)
+                        exact_owner: dict[str, Any] | None = None
+                        pipeline_present = False
+                        if phase == "running":
+                            pipeline_present, exact_owner = exact_pending_execution_owner(
+                                row, delegation_id, record,
+                            )
+                            owner_live = (
+                                _owner_liveness(exact_owner)
+                                if pipeline_present and exact_owner
+                                else (
+                                    False
+                                    if pipeline_present
+                                    else _owner_liveness(record)
+                                )
+                            )
+                        else:
+                            owner_live = _owner_liveness(record)
                         if owner_live is None:
                             continue
                         if owner_live:
@@ -1187,6 +1990,12 @@ class BestplanStore:
                             compatibility_error = "recovered_pre_run_schedule"
                             dispatch_state = "intent"
                             clear_owner = True
+                        elif pipeline_present and exact_owner is not None:
+                            # The immutable execution intent, not this
+                            # compatibility projection, owns pre-review crash
+                            # recovery. The async recovery queue will prove the
+                            # same identities and claim a fresh attempt.
+                            continue
                         else:
                             advisory_kind = "async_tracker_lost_advisory"
                             compatibility_error = "recapture_required"
@@ -1620,6 +2429,64 @@ class BestplanStore:
         """Project one exact local landing while its push remains independent."""
 
         from agent.bestplan_proof import ProofLedger
+        from agent.review_engine import ReviewStore
+
+        try:
+            record, _validated = decode_local_push_row(
+                row, _validate_stored_plan_row,
+            )
+        except LocalPushStateError:
+            return 0
+        review_job = conn.execute(
+            "SELECT * FROM review_jobs WHERE job_id=?",
+            (record["review"]["job_id"],),
+        ).fetchone()
+        if review_job is None:
+            return 0
+        if review_job["state"] == "landing_prepared":
+            if (
+                review_job["prepared_consumer_plan_id"] != str(row["plan_id"])
+                or review_job["prepared_target_digest"]
+                != record["review"]["target_digest"]
+                or review_job["prepared_review_receipt_digest"]
+                != record["review"]["receipt_digest"]
+                or review_job["integration_oid"] != record["integration_oid"]
+                or review_job["check_receipt_digest"]
+                != record["check_set_digest"]
+                or not isinstance(review_job["owner_id"], str)
+                or not review_job["owner_id"]
+            ):
+                return 0
+            if conn.execute(
+                "UPDATE review_jobs SET state='landed' "
+                "WHERE job_id=? AND state='landing_prepared' "
+                "AND cancel_requested=0 AND prepared_consumer_plan_id=? "
+                "AND prepared_target_digest=? "
+                "AND prepared_review_receipt_digest=?",
+                (
+                    record["review"]["job_id"],
+                    str(row["plan_id"]),
+                    record["review"]["target_digest"],
+                    record["review"]["receipt_digest"],
+                ),
+            ).rowcount != 1:
+                return 0
+            ReviewStore._append_event_conn(
+                conn,
+                job_id=str(review_job["job_id"]),
+                generation=int(review_job["current_generation"]),
+                owner_id=str(review_job["owner_id"]),
+                fencing_token=int(review_job["fencing_token"]),
+                operation_id=f"landing-reconciled:{row['plan_id']}",
+                kind="landing_reconciled",
+                target_digest=str(record["review"]["target_digest"]),
+                payload={
+                    "consumer_plan_id": str(row["plan_id"]),
+                    "observed_local_main": "integration",
+                },
+            )
+        elif review_job["state"] != "landed":
+            return 0
 
         now = time.time()
         ProofLedger(self).append_advisory_in_transaction(
@@ -1657,16 +2524,27 @@ class BestplanStore:
         expected_target_oid: str,
         integration_oid: str,
         check_set_digest: str,
+        review_target: Any,
+        review_receipt_digest: str,
         target: Any,
         expires_at: int,
     ) -> Optional[dict[str, Any]]:
         """Durably bind one prompt before the checked local-main effect."""
 
         from agent.bestplan_local_git import LocalMainPushTarget
+        from agent.review_engine import (
+            ReviewStore,
+            ReviewStoreConflict,
+            ReviewTarget,
+            ReviewValidationError,
+        )
 
         now = time.time()
         if (
             not isinstance(target, LocalMainPushTarget)
+            or not isinstance(review_target, ReviewTarget)
+            or review_target.source_kind != "bestplan_integration"
+            or not isinstance(review_receipt_digest, str)
             or isinstance(expires_at, bool)
             or not isinstance(expires_at, int)
             or expires_at <= now
@@ -1701,6 +2579,14 @@ class BestplanStore:
                 or values.get("workspace") != expected_workspace
                 or expected_target_oid != snapshot.head_oid
                 or target.integration_oid != integration_oid
+                or review_target.plan_id != str(plan_id)
+                or review_target.base_oid != snapshot.head_oid
+                or review_target.local_target_oid != snapshot.head_oid
+                or review_target.integration_oid != integration_oid
+                or review_target.check_receipt_digest != check_set_digest
+                or review_target.approval_digest != values.get("approval_digest")
+                or review_target.contract_digest
+                != values.get("promotion_contract_digest")
                 or values.get("current_phase") != "captured"
                 or any(
                     values.get(name) is not None
@@ -1723,9 +2609,51 @@ class BestplanStore:
                 )
             ):
                 return None
+            existing_raw = values.get("local_push_json")
+            existing_state = values.get("local_push_state")
+            if existing_raw is not None or existing_state is not None:
+                try:
+                    existing_record, _existing_plan = decode_local_push_row(
+                        values, _validate_stored_plan_row,
+                    )
+                except LocalPushStateError:
+                    return None
+                if (
+                    existing_state == "prepared"
+                    and existing_record["expected_target_oid"]
+                    == expected_target_oid
+                    and existing_record["integration_oid"] == integration_oid
+                    and existing_record["check_set_digest"] == check_set_digest
+                    and existing_record["review"]["target_digest"]
+                    == review_target.target_digest
+                    and existing_record["review"]["receipt_digest"]
+                    == review_receipt_digest
+                ):
+                    return {**existing_record, "state": "prepared"}
+                return None
+            if any(
+                values.get(name) is not None
+                for name in (
+                    "review_job_id",
+                    "review_target_digest",
+                    "review_receipt_digest",
+                )
+            ):
+                return None
             try:
+                stored_pass = ReviewStore.latest_exact_pass_in_transaction(
+                    conn,
+                    target=review_target,
+                    review_receipt_digest=review_receipt_digest,
+                )
+                bound_values = {
+                    **values,
+                    "review_job_id": stored_pass.job_id,
+                    "review_target_digest": review_target.target_digest,
+                    "review_receipt_digest": review_receipt_digest,
+                }
                 record = build_local_push_record(
-                    row=values,
+                    row=bound_values,
                     plan=validated,
                     plan_id=str(plan_id),
                     session_id=str(session_id),
@@ -1734,33 +2662,51 @@ class BestplanStore:
                     expected_target_oid=expected_target_oid,
                     integration_oid=integration_oid,
                     check_set_digest=check_set_digest,
+                    review_job_id=stored_pass.job_id,
+                    review_target_digest=review_target.target_digest,
+                    review_receipt_digest=review_receipt_digest,
                     target=target,
                     expires_at=expires_at,
                 )
                 raw = canonical_local_push_json(record)
-            except LocalPushStateError:
+            except (
+                LocalPushStateError,
+                ReviewStoreConflict,
+                ReviewValidationError,
+            ):
                 return None
-            existing_raw = values.get("local_push_json")
-            existing_state = values.get("local_push_state")
-            if existing_raw is not None or existing_state is not None:
-                if existing_raw == raw and existing_state == "prepared":
-                    return {**record, "state": "prepared"}
-                return None
+            ReviewStore.consume_latest_pass_in_transaction(
+                conn,
+                target=review_target,
+                review_receipt_digest=review_receipt_digest,
+                consumer_plan_id=str(plan_id),
+            )
             changed = conn.execute(
                 """UPDATE bestplan_plans
                    SET local_push_json=?, local_push_state='prepared',
-                       local_push_updated_at=?
+                       local_push_updated_at=?, review_job_id=?,
+                       review_target_digest=?, review_receipt_digest=?
                    WHERE plan_id=? AND local_push_json IS NULL
-                     AND local_push_state IS NULL""",
-                (raw, now, str(plan_id)),
+                     AND local_push_state IS NULL AND review_job_id IS NULL
+                     AND review_target_digest IS NULL
+                     AND review_receipt_digest IS NULL""",
+                (
+                    raw,
+                    now,
+                    stored_pass.job_id,
+                    review_target.target_digest,
+                    review_receipt_digest,
+                    str(plan_id),
+                ),
             ).rowcount
-            return (
-                {**record, "state": "prepared"}
-                if changed == 1
-                else None
-            )
+            if changed != 1:
+                raise BestplanError("local push lost the review preparation race")
+            return {**record, "state": "prepared"}
 
-        return self._execute_write(prepare)
+        try:
+            return self._execute_write(prepare)
+        except (BestplanError, ReviewStoreConflict, ReviewValidationError):
+            return None
 
     def activate_local_push(
         self,
@@ -1793,11 +2739,412 @@ class BestplanStore:
                 or landing_receipt.new_oid != record["integration_oid"]
                 or landing_receipt.check_receipt_digest
                 != record["check_set_digest"]
+                or not isinstance(landing_receipt.authorization_digest, str)
+                or not landing_receipt.authorization_digest
             ):
                 return 0
-            return self._record_local_landing(conn, row)
+            review_job = conn.execute(
+                "SELECT state, landing_authorization_digest FROM review_jobs "
+                "WHERE job_id=?",
+                (record["review"]["job_id"],),
+            ).fetchone()
+            if (
+                review_job is None
+                or review_job["state"] != "landing_claimed"
+                or review_job["landing_authorization_digest"]
+                != landing_receipt.authorization_digest
+            ):
+                return 0
+            if conn.execute(
+                "UPDATE review_jobs SET state='landed' "
+                "WHERE job_id=? AND state='landing_claimed' "
+                "AND landing_authorization_digest=?",
+                (
+                    record["review"]["job_id"],
+                    landing_receipt.authorization_digest,
+                ),
+            ).rowcount != 1:
+                return 0
+            if self._record_local_landing(conn, row) != 1:
+                raise BestplanError("local landing activation lost its plan state")
+            return 1
 
-        return bool(self._execute_write(activate))
+        try:
+            return bool(self._execute_write(activate))
+        except BestplanError:
+            return False
+
+    def claim_landing(
+        self,
+        plan_id: str,
+        *,
+        owner_id: str,
+        fencing_token: int,
+        owner_pid: int,
+        owner_process_start_id: str,
+        operation_id: str,
+    ):
+        """Serialize cancellation with one process-bound local Git claim."""
+
+        from agent.review_engine import (
+            ReviewLeaseConflict,
+            ReviewStore,
+            ReviewValidationError,
+            _issue_landing_authorization,
+        )
+
+        if (
+            not isinstance(owner_id, str)
+            or not owner_id
+            or isinstance(fencing_token, bool)
+            or not isinstance(fencing_token, int)
+            or fencing_token < 0
+            or isinstance(owner_pid, bool)
+            or not isinstance(owner_pid, int)
+            or owner_pid < 1
+            or not isinstance(owner_process_start_id, str)
+            or not owner_process_start_id
+            or not isinstance(operation_id, str)
+            or not operation_id
+        ):
+            raise ReviewValidationError("landing claim identity is invalid")
+        lock_handle = None
+
+        def claim(conn):
+            nonlocal lock_handle
+            row = conn.execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=?", (str(plan_id),),
+            ).fetchone()
+            if row is None or row["local_push_state"] != "prepared":
+                raise ReviewLeaseConflict("landing is not prepared")
+            try:
+                record, validated = decode_local_push_row(
+                    row, _validate_stored_plan_row,
+                )
+            except LocalPushStateError as exc:
+                raise ReviewLeaseConflict("landing preparation is stale") from exc
+            review_job = conn.execute(
+                "SELECT * FROM review_jobs WHERE job_id=?",
+                (record["review"]["job_id"],),
+            ).fetchone()
+            if review_job is None:
+                raise ReviewLeaseConflict("landing review job is missing")
+            if review_job["state"] == "landing_claimed":
+                raise ReviewLeaseConflict("landing_already_claimed")
+            if bool(review_job["cancel_requested"]):
+                raise ReviewLeaseConflict("landing review is cancelled")
+            claim_now_ns = time.time_ns()
+            lease_expires_at_ns = review_job["lease_expires_at_ns"]
+            if (
+                lease_expires_at_ns is None
+                or claim_now_ns > int(lease_expires_at_ns)
+            ):
+                raise ReviewLeaseConflict("landing review owner lease has expired")
+            if (
+                review_job["state"] != "landing_prepared"
+                or review_job["owner_id"] != owner_id
+                or int(review_job["fencing_token"]) != fencing_token
+                or review_job["prepared_consumer_plan_id"] != str(plan_id)
+                or review_job["prepared_target_digest"]
+                != record["review"]["target_digest"]
+                or review_job["prepared_review_receipt_digest"]
+                != record["review"]["receipt_digest"]
+                or review_job["integration_oid"] != record["integration_oid"]
+                or review_job["check_receipt_digest"]
+                != record["check_set_digest"]
+            ):
+                raise ReviewLeaseConflict("landing review fencing token differs")
+            try:
+                lock_path, lock_handle = _open_repository_effect_lock(
+                    validated.source_snapshot.repo
+                )
+                fcntl.flock(
+                    lock_handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BaseException:
+                if lock_handle is not None:
+                    lock_handle.close()
+                lock_handle = None
+                raise ReviewLeaseConflict("repository landing effect is active") from None
+            values = {
+                "plan_id": str(plan_id),
+                "review_job_id": str(review_job["job_id"]),
+                "target_digest": str(record["review"]["target_digest"]),
+                "integration_oid": str(record["integration_oid"]),
+                "check_receipt_digest": str(record["check_set_digest"]),
+                "fencing_token": fencing_token,
+                "owner_pid": owner_pid,
+                "owner_process_start_id": owner_process_start_id,
+                "repository_id": validated.source_snapshot.repo.repository_id,
+                "repository_effect_lock_path": lock_path,
+            }
+            authorization = _issue_landing_authorization(
+                lock_handle=lock_handle, **values,
+            )
+            changed = conn.execute(
+                """
+                UPDATE review_jobs
+                SET state='landing_claimed', landing_owner_pid=?,
+                    landing_owner_process_start_id=?,
+                    landing_repository_effect_lock_path=?,
+                    landing_authorization_digest=?, landing_operation_active=1
+                WHERE job_id=? AND state='landing_prepared'
+                  AND cancel_requested=0 AND owner_id=? AND fencing_token=?
+                  AND lease_expires_at_ns IS NOT NULL
+                  AND lease_expires_at_ns>=?
+                """,
+                (
+                    owner_pid,
+                    owner_process_start_id,
+                    lock_path,
+                    authorization.authorization_digest,
+                    review_job["job_id"],
+                    owner_id,
+                    fencing_token,
+                    claim_now_ns,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise ReviewLeaseConflict("landing claim lost its compare-and-swap")
+            ReviewStore._append_event_conn(
+                conn,
+                job_id=str(review_job["job_id"]),
+                generation=int(review_job["current_generation"]),
+                owner_id=owner_id,
+                fencing_token=fencing_token,
+                operation_id=operation_id,
+                kind="landing_claimed",
+                target_digest=str(record["review"]["target_digest"]),
+                payload={
+                    "owner_pid": owner_pid,
+                    "owner_process_start_id": owner_process_start_id,
+                },
+            )
+            return authorization
+
+        try:
+            return self._execute_write(claim)
+        except BaseException:
+            if lock_handle is not None:
+                lock_handle.close()
+            raise
+
+    def recover_landing_claim(
+        self,
+        plan_id: str,
+        *,
+        owner_is_live: Callable[[int, str], bool],
+        observe_local_main: Callable[..., str],
+        now_ns: int,
+    ) -> LandingRecoveryResult:
+        """Observe a dead claimed effect under its repository lock."""
+
+        if (
+            not callable(owner_is_live)
+            or not callable(observe_local_main)
+            or isinstance(now_ns, bool)
+            or not isinstance(now_ns, int)
+            or now_ns < 0
+        ):
+            return LandingRecoveryResult("drifted")
+        with self._read_lock():
+            row = self._connection().execute(
+                "SELECT * FROM bestplan_plans WHERE plan_id=?", (str(plan_id),),
+            ).fetchone()
+            if row is None:
+                return LandingRecoveryResult("drifted")
+            try:
+                record, validated = decode_local_push_row(
+                    row, _validate_stored_plan_row,
+                )
+            except LocalPushStateError:
+                return LandingRecoveryResult("drifted")
+            review_job = self._connection().execute(
+                "SELECT * FROM review_jobs WHERE job_id=?",
+                (record["review"]["job_id"],),
+            ).fetchone()
+        if review_job is None or review_job["state"] != "landing_claimed":
+            return LandingRecoveryResult("drifted")
+        pid = review_job["landing_owner_pid"]
+        start_id = review_job["landing_owner_process_start_id"]
+        lock_path = review_job["landing_repository_effect_lock_path"]
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid < 1
+            or not isinstance(start_id, str)
+            or not start_id
+            or not isinstance(lock_path, str)
+            or not lock_path
+            or lock_path != validated.source_snapshot.repo.common_dir
+        ):
+            return LandingRecoveryResult("drifted")
+        # The process can outlive its exact Git child.  Only the repository
+        # effect lock proves that the mutating operation is still active; a
+        # live persisted PID must not prevent same-process reconciliation once
+        # that exact lock is free.
+        try:
+            _verified_path, lock_handle = _open_repository_effect_lock(
+                validated.source_snapshot.repo
+            )
+        except (BestplanError, OSError, ValueError):
+            return LandingRecoveryResult("drifted")
+        try:
+            fcntl.flock(
+                lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except (OSError, ValueError):
+            lock_handle.close()
+            return LandingRecoveryResult("owner_alive")
+        try:
+            with self._read_lock():
+                current = self._connection().execute(
+                    "SELECT state, landing_owner_pid, "
+                    "landing_owner_process_start_id, "
+                    "landing_authorization_digest FROM review_jobs "
+                    "WHERE job_id=?",
+                    (record["review"]["job_id"],),
+                ).fetchone()
+            if (
+                current is None
+                or current["state"] != "landing_claimed"
+                or current["landing_owner_pid"] != pid
+                or current["landing_owner_process_start_id"] != start_id
+                or current["landing_authorization_digest"]
+                != review_job["landing_authorization_digest"]
+            ):
+                return LandingRecoveryResult("drifted")
+            try:
+                observed = observe_local_main(
+                    snapshot=validated.source_snapshot,
+                    expected_target_oid=record["expected_target_oid"],
+                    integration_oid=record["integration_oid"],
+                    deadline=time.monotonic() + 10.0,
+                )
+            except Exception:
+                return LandingRecoveryResult("observation_unavailable")
+            if observed == "integration":
+                def land_recovered(conn):
+                    job_changed = conn.execute(
+                        "UPDATE review_jobs SET state='landed' "
+                        "WHERE job_id=? AND state='landing_claimed' "
+                        "AND landing_authorization_digest=?",
+                        (
+                            record["review"]["job_id"],
+                            review_job["landing_authorization_digest"],
+                        ),
+                    ).rowcount
+                    stored_row = conn.execute(
+                        "SELECT * FROM bestplan_plans WHERE plan_id=?",
+                        (str(plan_id),),
+                    ).fetchone()
+                    if job_changed != 1 or stored_row is None:
+                        return 0
+                    return self._record_local_landing(conn, stored_row)
+
+                if self._execute_write(land_recovered) == 1:
+                    return LandingRecoveryResult("landed")
+                return LandingRecoveryResult("drifted")
+            if observed == "expected":
+                from agent.review_engine import ReviewStore
+
+                def release_pre_effect(conn):
+                    current_job = conn.execute(
+                        "SELECT * FROM review_jobs WHERE job_id=?",
+                        (record["review"]["job_id"],),
+                    ).fetchone()
+                    if (
+                        current_job is None
+                        or current_job["state"] != "landing_claimed"
+                        or current_job["landing_owner_pid"] != pid
+                        or current_job["landing_owner_process_start_id"] != start_id
+                        or current_job["landing_authorization_digest"]
+                        != review_job["landing_authorization_digest"]
+                    ):
+                        return 0
+                    ReviewStore._append_event_conn(
+                        conn,
+                        job_id=str(current_job["job_id"]),
+                        generation=int(current_job["current_generation"]),
+                        owner_id=str(current_job["owner_id"]),
+                        fencing_token=int(current_job["fencing_token"]),
+                        operation_id=(
+                            f"landing-claim-released:{plan_id}:"
+                            f"{current_job['fencing_token']}"
+                        ),
+                        kind="landing_claim_released",
+                        target_digest=str(current_job["target_digest"]),
+                        payload={"observed_local_main": "expected"},
+                    )
+                    return conn.execute(
+                        """
+                        UPDATE review_jobs
+                        SET state='landing_prepared', owner_id=NULL,
+                            lease_expires_at_ns=NULL, landing_owner_pid=NULL,
+                            landing_owner_process_start_id=NULL,
+                            landing_repository_effect_lock_path=NULL,
+                            landing_authorization_digest=NULL,
+                            landing_operation_active=0
+                        WHERE job_id=? AND state='landing_claimed'
+                          AND landing_owner_pid=?
+                          AND landing_owner_process_start_id=?
+                          AND landing_authorization_digest=?
+                        """,
+                        (
+                            record["review"]["job_id"],
+                            pid,
+                            start_id,
+                            review_job["landing_authorization_digest"],
+                        ),
+                    ).rowcount
+
+                if self._execute_write(release_pre_effect) == 1:
+                    return LandingRecoveryResult("retry_pre_effect")
+            return LandingRecoveryResult("drifted")
+        finally:
+            lock_handle.close()
+
+    def mark_landing_observation_pending(
+        self,
+        plan_id: str,
+        *,
+        authorization: Any,
+    ) -> bool:
+        """Mark a finished effect operation for read-only reconciliation."""
+
+        validate = getattr(authorization, "validate_digest", None)
+        if not callable(validate) or not bool(validate()):
+            return False
+
+        def mark(conn):
+            row = conn.execute(
+                "SELECT review_job_id FROM bestplan_plans WHERE plan_id=?",
+                (str(plan_id),),
+            ).fetchone()
+            if row is None or row["review_job_id"] != authorization.review_job_id:
+                return 0
+            return conn.execute(
+                """
+                UPDATE review_jobs SET landing_operation_active=0
+                WHERE job_id=? AND state='landing_claimed'
+                  AND fencing_token=? AND landing_owner_pid=?
+                  AND landing_owner_process_start_id=?
+                  AND landing_authorization_digest=?
+                """,
+                (
+                    authorization.review_job_id,
+                    authorization.fencing_token,
+                    authorization.owner_pid,
+                    authorization.owner_process_start_id,
+                    authorization.authorization_digest,
+                ),
+            ).rowcount
+
+        changed = bool(self._execute_write(mark))
+        if changed:
+            authorization.release_effect_lock()
+        return changed
 
     def _set_local_push_state(
         self,
@@ -2629,11 +3976,16 @@ class BestplanStore:
                 return 1
             if row["state"] not in {PlanState.RUNNING, PlanState.WAITING}:
                 return 0
+            # Protocol 1 can retain candidate evidence, but candidate freezing
+            # is not implementation completion.  Keep the compatibility row
+            # nonterminal and close only its finished dispatch attempt.
             return conn.execute(
                 "UPDATE bestplan_plans SET state=?, dispatch_state='terminal', "
-                "evidence_json=?, completed_at=? WHERE plan_id=? AND state IN (?, ?)",
+                "dispatch_owner=NULL, evidence_json=?, completed_at=NULL, "
+                "dispatch_updated_at=?, error=NULL "
+                "WHERE plan_id=? AND state IN (?, ?)",
                 (
-                    PlanState.COMPLETED_UNVERIFIED,
+                    PlanState.RUNNING,
                     json.dumps(evidence, sort_keys=True),
                     time.time(),
                     plan_id,
@@ -2645,34 +3997,9 @@ class BestplanStore:
         return bool(self._execute_write(complete))
 
     def mark_completed_verified(self, plan_id: str) -> bool:
-        def complete(conn):
-            row = conn.execute(
-                "SELECT * FROM bestplan_plans WHERE plan_id=? AND state=?",
-                (plan_id, PlanState.COMPLETED_UNVERIFIED),
-            ).fetchone()
-            if row is None:
-                return 0
-            try:
-                validated = _validate_stored_plan_row(row)
-            except BestplanError:
-                return 0
-            # Task 3 introduces the authority receipt/final-event gate.  Until
-            # then V2 cannot use the legacy verified setter at all.
-            if validated.execution_protocol == 2:
-                return 0
-            return conn.execute(
-                "UPDATE bestplan_plans SET state=?, completed_at=?, verified_at=? "
-                "WHERE plan_id=? AND state=? AND execution_protocol=1",
-                (
-                    PlanState.COMPLETED_VERIFIED,
-                    time.time(),
-                    time.time(),
-                    plan_id,
-                    PlanState.COMPLETED_UNVERIFIED,
-                ),
-            ).rowcount
+        """Reject the obsolete state-only verified transition for every plan."""
 
-        return bool(self._execute_write(complete))
+        return False
 
 
 def capture_bestplan_response(
@@ -2680,6 +4007,7 @@ def capture_bestplan_response(
     *,
     session_id: str,
     workspace: str,
+    topic: str | None = None,
     profile: str = "",
     baseline_fingerprint: Optional[str] = None,
     store: Optional[BestplanStore] = None,
@@ -2687,8 +4015,16 @@ def capture_bestplan_response(
     config: Optional[dict[str, Any]] = None,
     authority_client: BestplanAuthorityClient | None = None,
     local_execution: bool = False,
+    host_receipt_metadata: Mapping[str, Any] | None = None,
+    host_receipt_warning: str | None = None,
 ) -> PlanCapture:
-    """Validate and persist the explicit envelope in a /bestplan response."""
+    """Validate and persist the explicit envelope in a /bestplan response.
+
+    ``host_receipt_metadata`` is produced by the host orchestration path.  It
+    is validated against the exact envelope body before any model identities
+    are shown to a human.  Model-visible receipt text is only stripped or
+    checked for consistency; it is never trusted as metadata input.
+    """
     try:
         raw_envelope, plan, manifest = _extract_envelope(response)
         _v1_plan_constraints(plan, workspace=workspace)
@@ -2697,12 +4033,15 @@ def capture_bestplan_response(
             "\n\n[Bestplan status: non-executable — the response did not contain "
             f"one valid machine envelope ({exc}).]"
         )
-        visible = _strip_bestplan_envelope(response)
-        return PlanCapture(False, visible + suffix, error=str(exc))
+        return PlanCapture(False, suffix.strip(), error=str(exc))
     try:
         store = store or BestplanStore()
         plan_id = store.create_plan(
-            "", plan, session_id=session_id, profile=profile, workspace=workspace,
+            _inline_text(topic),
+            plan,
+            session_id=session_id,
+            profile=profile,
+            workspace=workspace,
             baseline_fingerprint=baseline_fingerprint, raw_envelope=raw_envelope,
             provisional=provisional,
             config=config,
@@ -2714,26 +4053,26 @@ def capture_bestplan_response(
             raise BestplanError("persisted plan could not be read back")
         validated = _validate_stored_plan_row(row)
     except (BaselineFingerprintError, BestplanError) as exc:
-        visible = _strip_bestplan_envelope(response)
         suffix = f"\n\n[Bestplan status: non-executable — {exc}.]"
-        return PlanCapture(False, visible + suffix, error=str(exc))
+        return PlanCapture(False, suffix.strip(), error=str(exc))
     digest = validated.approval_digest
-    advisory = _strip_bestplan_envelope(response)
-    authority = _render_authoritative_manifest(
+    receipt_metadata = _bestplan_receipt_metadata(
+        host_receipt_metadata,
+        response,
+        raw_envelope,
+    )
+    human = _render_human_plan(
         validated.plan,
         workspace=row["workspace"],
-        digest=digest,
+        plan_id=plan_id,
         contract=validated.contract,
+        receipt_metadata=receipt_metadata,
+        topic=topic,
     )
-    parts = []
-    if advisory:
-        parts.append("Model commentary (advisory only):\n" + advisory)
-    parts.append(authority)
-    parts.append(
-        f"Bestplan executable receipt: {plan_id}. "
-        "Reply with bare `go` to approve and dispatch exactly this host-rendered manifest."
-    )
-    return PlanCapture(True, "\n\n".join(parts), plan_id=plan_id, digest=digest)
+    warning = _render_host_receipt_warning(host_receipt_warning)
+    if warning:
+        human += f"\n\n{warning}"
+    return PlanCapture(True, human, plan_id=plan_id, digest=digest)
 
 
 def is_executable_bestplan_invocation(message: Any) -> bool:
@@ -2820,12 +4159,11 @@ def unsupported_host_bestplan_after_model(
     """Remove executable authority from a /bestplan answer on unsupported hosts."""
     if not is_bestplan_invocation(invocation_message) or not isinstance(result, dict):
         return result
-    visible = _strip_bestplan_envelope(result.get("final_response"))
     suffix = (
         f"[BestPlan status: planning-only on {host_name}; no executable manifest "
         "was persisted and bare `go` cannot dispatch this plan here.]"
     )
-    response = "\n\n".join(part for part in (visible, suffix) if part)
+    response = suffix
     updated = dict(result)
     updated["final_response"] = response
     messages = [dict(item) if isinstance(item, dict) else item for item in (updated.get("messages") or [])]
@@ -2901,6 +4239,7 @@ def capture_bestplan_agent_result(
     result: dict[str, Any],
     *,
     invocation_message: Any,
+    topic: str | None = None,
     session_id: str,
     workspace: str,
     profile: str = "",
@@ -2923,12 +4262,35 @@ def capture_bestplan_agent_result(
         session_id=session_id,
         profile=profile,
         workspace=workspace,
+        topic=(
+            _inline_text(topic)
+            if topic is not None
+            else _bestplan_topic_from_invocation(invocation_message)
+        ),
         baseline_fingerprint=baseline_fingerprint,
         store=store,
         provisional=provisional,
         config=config if config is not None else _load_config(),
         authority_client=injected_client,
         local_execution=local_execution,
+        host_receipt_metadata=(
+            result.get("bestplan_receipt_metadata")
+            if isinstance(result.get("bestplan_receipt_metadata"), Mapping)
+            else (
+                getattr(host_agent, "_bestplan_receipt_metadata", None)
+                if host_agent is not None
+                else None
+            )
+        ),
+        host_receipt_warning=(
+            result.get("bestplan_receipt_warning")
+            if isinstance(result.get("bestplan_receipt_warning"), str)
+            else (
+                getattr(host_agent, "_bestplan_receipt_warning", None)
+                if host_agent is not None
+                else None
+            )
+        ),
     )
     updated = dict(result)
     updated["final_response"] = capture.response
@@ -3175,6 +4537,23 @@ def try_resolve_go(
     host_runtime_projection: dict[str, Any] = {}
     local_execution_runtime: Any = None
     authority_bindings: Any = None
+    review_authority_bindings: Any = None
+
+    def resolve_local_review_authorities() -> Any:
+        from agent.bestplan_local import build_local_review_authority_bindings
+
+        review_tasks = _local_review_runtime_tasks(expected_workspace)
+        if runtime_resolver is None:
+            from tools.delegate_tool import resolve_bestplan_runtime_specs
+
+            review_runtimes = resolve_bestplan_runtime_specs(
+                review_tasks,
+                parent_agent,
+                execution_protocol=2,
+            )
+        else:
+            review_runtimes = runtime_resolver(review_tasks, parent_agent)
+        return build_local_review_authority_bindings(review_runtimes)
     if local_contract and state_db_path is None:
         return ResolvedGo(
             True,
@@ -3282,6 +4661,9 @@ def try_resolve_go(
 
                     authority_bindings = build_local_authority_bindings(
                         resolved_runtimes
+                    )
+                    review_authority_bindings = (
+                        resolve_local_review_authorities()
                     )
                 resolved_runtimes = _bind_v2_candidate_toolsets(
                     resolved_runtimes, tasks,
@@ -3394,6 +4776,9 @@ def try_resolve_go(
 
                     authority_bindings = build_local_authority_bindings(
                         resolved_runtimes
+                    )
+                    review_authority_bindings = (
+                        resolve_local_review_authorities()
                     )
                 resolved_runtimes = _bind_v2_candidate_toolsets(
                     resolved_runtimes, tasks,
@@ -3532,6 +4917,10 @@ def try_resolve_go(
                 authority_bindings=(
                     authority_bindings if local_contract else None
                 ),
+                review_authority_bindings=(
+                    review_authority_bindings if local_contract else None
+                ),
+                raw_request=str(candidate.get("raw_request") or ""),
                 state_db_path=state_db_path,
             )
         result = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
