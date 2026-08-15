@@ -7467,6 +7467,8 @@ def _enqueue_prompt(
         and isinstance(text, str)
         and not existing.get("image_paths")
         and not image_paths
+        and "bestplan_config" not in existing
+        and bestplan_config is None
         and not session.get("queued_prompts")
     ):
         prev = existing["text"]

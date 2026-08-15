@@ -340,6 +340,44 @@ def test_busy_bestplan_is_queued_with_config_and_never_steered(monkeypatch):
     assert session["queued_prompt"]["bestplan_config"] == {"count": 2}
 
 
+def test_queued_ordinary_then_bestplan_stays_separate():
+    session = {}
+
+    server._enqueue_prompt(session, "ordinary", None)
+    server._enqueue_prompt(session, "plan", None, bestplan_config={"count": 2})
+
+    assert session["queued_prompt"] == {
+        "text": "ordinary",
+        "transport": None,
+    }
+    assert session["queued_prompts"] == [
+        {
+            "text": "plan",
+            "transport": None,
+            "bestplan_config": {"count": 2},
+        }
+    ]
+
+
+def test_queued_bestplan_then_ordinary_stays_separate():
+    session = {}
+
+    server._enqueue_prompt(session, "plan", None, bestplan_config={"count": 2})
+    server._enqueue_prompt(session, "ordinary", None)
+
+    assert session["queued_prompt"] == {
+        "text": "plan",
+        "transport": None,
+        "bestplan_config": {"count": 2},
+    }
+    assert session["queued_prompts"] == [
+        {
+            "text": "ordinary",
+            "transport": None,
+        }
+    ]
+
+
 def test_drain_queued_bestplan_forwards_config(monkeypatch):
     session = {
         "history_lock": threading.Lock(),
