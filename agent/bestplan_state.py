@@ -1030,6 +1030,15 @@ def render_bestplan_failure(outcome: Mapping[str, Any] | None) -> str:
     if not isinstance(outcome, Mapping):
         outcome = {}
     reason_code = str(outcome.get("reason_code") or "").casefold()
+    if reason_code == "no_in_scope_implementation":
+        return (
+            "BestPlan unavailable\n\n"
+            "- Reason: No executable implementation for this request fits "
+            "within the active workspace.\n"
+            "- Next step: Select the intended project workspace, or restate "
+            "the task so it applies to the active workspace.\n\n"
+            "- No plan was created or executed."
+        )
     error = {
         "quorum_unavailable": "There were not enough usable planning results.",
         "provider_error": "One or more planning services failed.",
@@ -3378,6 +3387,132 @@ class BestplanStore:
             ),
         ).rowcount))
 
+    @staticmethod
+    def _supersede_unstarted_rows(
+        conn: sqlite3.Connection,
+        *,
+        session_id: str,
+        profile: str,
+        workspace: str,
+        baseline_fingerprint: str,
+        before: float,
+        replacement_plan_id: str | None,
+        include_provisional: bool,
+        include_compression_lineage: bool,
+    ) -> int:
+        """Apply one ordered supersession policy inside the caller transaction."""
+        states = [PlanState.PENDING, PlanState.APPROVED]
+        if include_provisional:
+            states.insert(0, PlanState.PROVISIONAL)
+        state_placeholders = ", ".join("?" for _ in states)
+
+        direct_clauses = [
+            "session_id=?",
+            "profile=?",
+            "workspace=?",
+            "created_at<?",
+        ]
+        direct_params: list[Any] = [session_id, profile, workspace, before]
+        direct_clauses.append("baseline_fingerprint=?")
+        direct_params.append(baseline_fingerprint)
+        if replacement_plan_id is not None:
+            direct_clauses.append("plan_id!=?")
+            direct_params.append(replacement_plan_id)
+        direct_clauses.append(f"state IN ({state_placeholders})")
+        direct_params.extend(states)
+        changed = conn.execute(
+            "UPDATE bestplan_plans SET state=? WHERE "
+            + " AND ".join(direct_clauses),
+            (PlanState.REJECTED, *direct_params),
+        ).rowcount
+
+        has_sessions = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
+        ).fetchone()
+        if not include_compression_lineage or has_sessions is None:
+            return changed
+
+        lineage_clauses = [
+            "session_id IN (SELECT id FROM compression_lineage)",
+            "profile=?",
+            "workspace=?",
+            "execution_protocol=2",
+            "promotion_contract_version=1",
+            "promotion_mode='local_main'",
+            "created_at<?",
+        ]
+        lineage_params: list[Any] = [profile, workspace, before]
+        lineage_clauses.append("baseline_fingerprint=?")
+        lineage_params.append(baseline_fingerprint)
+        if replacement_plan_id is not None:
+            lineage_clauses.append("plan_id!=?")
+            lineage_params.append(replacement_plan_id)
+        lineage_clauses.append(f"state IN ({state_placeholders})")
+        lineage_params.extend(states)
+        conn.execute(
+            """WITH RECURSIVE compression_lineage(id) AS (
+                   SELECT ?
+                   UNION
+                   SELECT parent.id
+                   FROM compression_lineage AS lineage
+                   JOIN sessions AS child ON child.id=lineage.id
+                   JOIN sessions AS parent ON parent.id=child.parent_session_id
+                   WHERE parent.end_reason='compression'
+                     AND json_extract(
+                           COALESCE(child.model_config, '{}'), '$._branched_from'
+                         ) IS NULL
+                     AND json_extract(
+                           COALESCE(child.model_config, '{}'), '$._delegate_from'
+                         ) IS NULL
+                     AND COALESCE(child.source, '')!='tool'
+               )
+               UPDATE bestplan_plans SET state=? WHERE """
+            + " AND ".join(lineage_clauses),
+            (session_id, PlanState.REJECTED, *lineage_params),
+        )
+        changed += int(conn.execute("SELECT changes()").fetchone()[0])
+        return changed
+
+    def supersede_unstarted_plans(
+        self,
+        *,
+        session_id: str,
+        profile: str,
+        workspace: str,
+        baseline_fingerprint: str,
+        before: float,
+        local_execution: bool = False,
+    ) -> int:
+        """Reject older unstarted plans after a durable non-plan outcome."""
+        if type(local_execution) is not bool:
+            raise BestplanError("local_execution must be true or false")
+        expected_session = str(session_id)
+        expected_profile = str(profile)
+        expected_workspace = _canonical_workspace(workspace)
+        if baseline_fingerprint is None:
+            raise BestplanError("baseline_fingerprint must be non-empty")
+        expected_baseline = str(baseline_fingerprint).strip()
+        if not expected_baseline:
+            raise BestplanError("baseline_fingerprint must be non-empty")
+        cutoff = float(before)
+        if not math.isfinite(cutoff):
+            raise BestplanError("supersession cutoff must be finite")
+
+        def supersede(conn):
+            return self._supersede_unstarted_rows(
+                conn,
+                session_id=expected_session,
+                profile=expected_profile,
+                workspace=expected_workspace,
+                baseline_fingerprint=expected_baseline,
+                before=cutoff,
+                replacement_plan_id=None,
+                include_provisional=True,
+                include_compression_lineage=local_execution,
+            )
+
+        return int(self._execute_write(supersede))
+
     def commit_provisional_plan(self, plan_id: str) -> bool:
         """Expose one captured plan only after its transcript is durable."""
         def commit(conn):
@@ -3397,73 +3532,22 @@ class BestplanStore:
             ).rowcount
             if changed != 1:
                 return 0
-            conn.execute(
-                """UPDATE bestplan_plans SET state=?
-                   WHERE plan_id!=? AND session_id=? AND profile=? AND workspace=?
-                   AND baseline_fingerprint=? AND created_at<?
-                   AND state IN (?, ?)""",
-                (
-                    PlanState.REJECTED,
-                    plan_id,
-                    row["session_id"],
-                    row["profile"],
-                    row["workspace"],
-                    row["baseline_fingerprint"],
-                    row["created_at"],
-                    PlanState.PENDING,
-                    PlanState.APPROVED,
-                ),
-            )
             is_local_go = (
                 int(row["execution_protocol"] or 1) == 2
                 and int(row["promotion_contract_version"] or 0) == 1
                 and row["promotion_mode"] == "local_main"
             )
-            has_sessions = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
-            ).fetchone()
-            if is_local_go and has_sessions is not None:
-                conn.execute(
-                    """WITH RECURSIVE compression_lineage(id) AS (
-                           SELECT ?
-                           UNION
-                           SELECT parent.id
-                           FROM compression_lineage AS lineage
-                           JOIN sessions AS child ON child.id=lineage.id
-                           JOIN sessions AS parent
-                             ON parent.id=child.parent_session_id
-                           WHERE parent.end_reason='compression'
-                             AND json_extract(
-                                   COALESCE(child.model_config, '{}'),
-                                   '$._branched_from'
-                                 ) IS NULL
-                             AND json_extract(
-                                   COALESCE(child.model_config, '{}'),
-                                   '$._delegate_from'
-                                 ) IS NULL
-                             AND COALESCE(child.source, '')!='tool'
-                       )
-                       UPDATE bestplan_plans SET state=?
-                       WHERE plan_id!=?
-                         AND session_id IN (SELECT id FROM compression_lineage)
-                         AND profile=? AND workspace=? AND baseline_fingerprint=?
-                         AND execution_protocol=2
-                         AND promotion_contract_version=1
-                         AND promotion_mode='local_main'
-                         AND created_at<?
-                         AND state IN (?, ?)""",
-                    (
-                        row["session_id"],
-                        PlanState.REJECTED,
-                        plan_id,
-                        row["profile"],
-                        row["workspace"],
-                        row["baseline_fingerprint"],
-                        row["created_at"],
-                        PlanState.PENDING,
-                        PlanState.APPROVED,
-                    ),
-                )
+            self._supersede_unstarted_rows(
+                conn,
+                session_id=row["session_id"],
+                profile=row["profile"],
+                workspace=row["workspace"],
+                baseline_fingerprint=row["baseline_fingerprint"],
+                before=float(row["created_at"]),
+                replacement_plan_id=plan_id,
+                include_provisional=False,
+                include_compression_lineage=is_local_go,
+            )
             return changed
 
         return bool(self._execute_write(commit))
@@ -4235,6 +4319,29 @@ def bind_bestplan_delivery_context(
         reset_hermes_home_override(home_token)
 
 
+def _valid_no_scope_receipt_metadata(metadata: Mapping[str, Any]) -> bool:
+    """Require affirmative quorum authority before a failure can cancel plans."""
+    from agent.bestplan_orchestrator import _valid_v2_receipt_metadata
+
+    receipt = dict(metadata)
+    if not _valid_v2_receipt_metadata(receipt, ""):
+        return False
+    if (
+        receipt.get("status") != "failed"
+        or receipt.get("reason_code") != "no_in_scope_implementation"
+    ):
+        return False
+    attempts = receipt["attempts"]
+    successes = sum(item["status"] == "success" for item in attempts)
+    if successes < receipt["quorum_required"]:
+        return False
+    synthesizer = receipt["synthesizer"]
+    return (
+        synthesizer.get("status") == "success"
+        and synthesizer.get("reason_code") is None
+    )
+
+
 def capture_bestplan_agent_result(
     result: dict[str, Any],
     *,
@@ -4257,6 +4364,66 @@ def capture_bestplan_agent_result(
     injected_client = authority_client
     if injected_client is None and host_agent is not None:
         injected_client = getattr(host_agent, "bestplan_authority_client", None)
+    host_receipt_metadata = (
+        result.get("bestplan_receipt_metadata")
+        if isinstance(result.get("bestplan_receipt_metadata"), Mapping)
+        else (
+            getattr(host_agent, "_bestplan_receipt_metadata", None)
+            if host_agent is not None
+            else None
+        )
+    )
+    if (
+        result.get("failed") is True
+        and result.get("turn_exit_reason") == "bestplan"
+        and isinstance(host_receipt_metadata, Mapping)
+    ):
+        receipt_metadata = dict(host_receipt_metadata)
+        if _valid_no_scope_receipt_metadata(receipt_metadata):
+            if any(
+                str(item).startswith("persist_session:")
+                for item in (result.get("cleanup_errors") or [])
+            ):
+                raise RuntimeError(
+                    "BestPlan no-scope response persistence failed"
+                )
+            persist = getattr(host_agent, "_persist_session", None)
+            if not callable(persist) or persist(
+                list(result.get("messages") or []),
+                None,
+                rewrite=True,
+            ) is not True:
+                raise RuntimeError(
+                    "BestPlan no-scope response persistence unavailable"
+                )
+            cutoff = time.time()
+            expected_baseline = (
+                baseline_fingerprint
+                if baseline_fingerprint is not None
+                else compute_baseline_fingerprint(workspace)
+            )
+            owns_store = store is None
+            outcome_store = store or BestplanStore()
+            try:
+                outcome_store.supersede_unstarted_plans(
+                    session_id=session_id,
+                    profile=profile,
+                    workspace=workspace,
+                    baseline_fingerprint=expected_baseline,
+                    before=cutoff,
+                    local_execution=local_execution,
+                )
+            finally:
+                if owns_store:
+                    outcome_store.close()
+            updated = dict(result)
+            updated["bestplan_capture"] = {
+                "executable": False,
+                "plan_id": None,
+                "digest": None,
+                "error": "no_in_scope_implementation",
+            }
+            return updated
     capture = capture_bestplan_response(
         str(result.get("final_response") or ""),
         session_id=session_id,
@@ -4273,15 +4440,7 @@ def capture_bestplan_agent_result(
         config=config if config is not None else _load_config(),
         authority_client=injected_client,
         local_execution=local_execution,
-        host_receipt_metadata=(
-            result.get("bestplan_receipt_metadata")
-            if isinstance(result.get("bestplan_receipt_metadata"), Mapping)
-            else (
-                getattr(host_agent, "_bestplan_receipt_metadata", None)
-                if host_agent is not None
-                else None
-            )
-        ),
+        host_receipt_metadata=host_receipt_metadata,
         host_receipt_warning=(
             result.get("bestplan_receipt_warning")
             if isinstance(result.get("bestplan_receipt_warning"), str)

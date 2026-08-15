@@ -180,6 +180,17 @@ def _synth_plan_envelope(*, workspace="/tmp/work", review=False):
     )
 
 
+def _codex_synth_plan_output(*, workspace="/tmp/work"):
+    manifest = json.loads(_synth_plan_envelope(workspace=workspace).splitlines()[1])
+    return json.dumps(
+        {
+            "schema": "HERMES_BESTPLAN_SYNTHESIS_V1",
+            "outcome": "executable_plan",
+            "manifest": manifest,
+        }
+    )
+
+
 def _runtime_config(lanes, **overrides):
     explorers = [
         {key: lane[key] for key in _REQUIRED_LANE_KEYS}
@@ -799,7 +810,9 @@ def test_run_bestplan_omitted_count_executes_all_four_configured_lanes(
         def run_conversation(self, prompt):
             if "active BestPlan synthesizer" in prompt:
                 return {
-                    "final_response": _synth_plan_envelope(workspace=str(tmp_path))
+                    "final_response": _codex_synth_plan_output(
+                        workspace=str(tmp_path)
+                    )
                 }
             explorer_models.append(self.model)
             return {"final_response": _candidate_text(self.model)}
@@ -1495,14 +1508,29 @@ def test_codex_schema_copy_strips_unique_items_without_mutating_host_schema():
         return False
 
     assert contains_unique_items(EXECUTION_PLAN_GENERATION_SCHEMA) is True
+    original = json.loads(json.dumps(EXECUTION_PLAN_GENERATION_SCHEMA))
     compatible = orchestrator._codex_bestplan_output_schema()
 
     assert compatible is not EXECUTION_PLAN_GENERATION_SCHEMA
     assert contains_unique_items(compatible) is False
     assert contains_unique_items(EXECUTION_PLAN_GENERATION_SCHEMA) is True
-    assert compatible["properties"]["mode"]["enum"] == ["delegate"]
-    assert compatible["properties"]["slices"]["maxItems"] == 2
-    slice_properties = compatible["properties"]["slices"]["items"]["properties"]
+    assert EXECUTION_PLAN_GENERATION_SCHEMA == original
+    assert compatible["type"] == "object"
+    assert compatible["additionalProperties"] is False
+    assert compatible["required"] == ["schema", "outcome", "manifest"]
+    assert compatible["properties"]["schema"]["enum"] == [
+        "HERMES_BESTPLAN_SYNTHESIS_V1"
+    ]
+    assert compatible["properties"]["outcome"]["enum"] == [
+        "executable_plan",
+        "no_in_scope_implementation",
+    ]
+    manifest_options = compatible["properties"]["manifest"]["anyOf"]
+    assert manifest_options[1] == {"type": "null"}
+    plan_schema = manifest_options[0]
+    assert plan_schema["properties"]["mode"]["enum"] == ["delegate"]
+    assert plan_schema["properties"]["slices"]["maxItems"] == 2
+    slice_properties = plan_schema["properties"]["slices"]["items"]["properties"]
     assert slice_properties["kind"]["enum"] == ["implement"]
     assert slice_properties["capability"]["enum"] == ["fast_fallback"]
     assert slice_properties["read_only"]["const"] is False
@@ -1561,9 +1589,16 @@ def test_codex_explorers_and_synthesizer_get_their_own_output_schemas(
     explorer_prompts = []
     synth_schemas = []
     synth_prompts = []
-    raw_manifest = _synth_plan_envelope(
-        workspace=str(tmp_path)
-    ).splitlines()[1]
+    manifest = json.loads(
+        _synth_plan_envelope(workspace=str(tmp_path)).splitlines()[1]
+    )
+    structured_synthesis = json.dumps(
+        {
+            "schema": "HERMES_BESTPLAN_SYNTHESIS_V1",
+            "outcome": "executable_plan",
+            "manifest": manifest,
+        }
+    )
 
     class FakeAgent:
         def __init__(self, **_kwargs):
@@ -1575,7 +1610,7 @@ def test_codex_explorers_and_synthesizer_get_their_own_output_schemas(
             if "active BestPlan synthesizer" in prompt:
                 synth_schemas.append(schema)
                 synth_prompts.append(prompt)
-                return {"final_response": raw_manifest}
+                return {"final_response": structured_synthesis}
             explorer_schemas.append(schema)
             explorer_prompts.append(prompt)
             return {"final_response": _candidate_text()}
@@ -1649,7 +1684,8 @@ def test_codex_explorers_and_synthesizer_get_their_own_output_schemas(
     assert len(synth_schemas) == 1
     assert isinstance(synth_schemas[0], dict)
     assert len(synth_prompts) == 1
-    assert "raw JSON manifest" in synth_prompts[0]
+    assert "outcome=executable_plan" in synth_prompts[0]
+    assert "manifest=null" in synth_prompts[0]
     assert "literal markers" not in synth_prompts[0]
     assert result["body"].startswith("<<<HERMES_BESTPLAN_V1>>>\n")
     assert result["body"].endswith("\n<<<END_HERMES_BESTPLAN_V1>>>")
@@ -2459,7 +2495,7 @@ def test_non_claude_children_are_bound_to_request_workspace_and_read_only_tools(
                 )
             if "active BestPlan synthesizer" in prompt:
                 return {
-                    "final_response": _synth_plan_envelope(
+                    "final_response": _codex_synth_plan_output(
                         workspace=str(request_workspace.resolve())
                     )
                 }

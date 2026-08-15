@@ -105,10 +105,12 @@ def _plan(workspace: str) -> str:
         "stop_condition": "Acceptance passes.",
         "escalation_predicates": [],
     }
-    return (
-        "<<<HERMES_BESTPLAN_V1>>>\n"
-        + json.dumps(manifest, sort_keys=True)
-        + "\n<<<END_HERMES_BESTPLAN_V1>>>"
+    return json.dumps(
+        {
+            "schema": "HERMES_BESTPLAN_SYNTHESIS_V1",
+            "outcome": "executable_plan",
+            "manifest": manifest,
+        }
     )
 
 

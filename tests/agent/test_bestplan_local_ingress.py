@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
@@ -282,6 +284,74 @@ def test_new_local_capture_supersedes_unstarted_compression_ancestor(
     assert store.commit_provisional_plan(replacement.plan_id)
     assert store.get_plan(prior.plan_id)["state"] == PlanState.REJECTED
     assert store.get_plan(replacement.plan_id)["state"] == PlanState.PENDING
+
+
+@pytest.mark.parametrize(
+    ("barrier", "expected_state"),
+    [
+        (None, "rejected"),
+        ("branch", "pending"),
+        ("delegate", "pending"),
+        ("tool", "pending"),
+    ],
+)
+def test_no_scope_supersession_respects_compression_lineage_barriers(
+    tmp_path, monkeypatch, barrier, expected_state
+):
+    from agent import bestplan_local
+    from agent.bestplan_source import capture_source_snapshot, resolve_repo_identity
+    from agent.bestplan_state import BestplanStore, capture_bestplan_response
+    from hermes_state import SessionDB
+
+    repo = _repo(tmp_path)
+    snapshot = capture_source_snapshot(
+        resolve_repo_identity(str(repo)),
+        time.monotonic() + 20.0,
+    )
+    inputs = _local_inputs(snapshot, tmp_path)
+    monkeypatch.setattr(
+        bestplan_local,
+        "capture_local_execution_inputs",
+        lambda **_kwargs: inputs,
+    )
+    session_db = SessionDB(db_path=tmp_path / "state" / "state.db")
+    session_db.create_session("session-parent", source="cli")
+    session_db.end_session("session-parent", "compression")
+    model_config = None
+    child_source = "cli"
+    if barrier == "branch":
+        model_config = {"_branched_from": "session-parent"}
+    elif barrier == "delegate":
+        model_config = {"_delegate_from": "session-parent"}
+    elif barrier == "tool":
+        child_source = "tool"
+    session_db.create_session(
+        "session-child",
+        source=child_source,
+        parent_session_id="session-parent",
+        model_config=model_config,
+    )
+    store = BestplanStore(session_db=session_db)
+    prior = capture_bestplan_response(
+        _response(snapshot.repo.workspace),
+        session_id="session-parent",
+        profile="coder",
+        workspace=snapshot.repo.workspace,
+        store=store,
+        local_execution=True,
+    )
+
+    changed = store.supersede_unstarted_plans(
+        session_id="session-child",
+        profile="coder",
+        workspace=snapshot.repo.workspace,
+        baseline_fingerprint=snapshot.fingerprint,
+        before=time.time() + 1.0,
+        local_execution=True,
+    )
+
+    assert changed == (1 if barrier is None else 0)
+    assert store.get_plan(prior.plan_id)["state"] == expected_state
 
 
 def test_delayed_older_compression_child_commit_does_not_supersede_newer_ancestor(
