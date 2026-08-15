@@ -67,3 +67,54 @@ deployment. Everything runs inside the isolated worktree on one local branch.
 
 - Remove the worktree with `git worktree remove <path>` after the run is done.
 - The run dir stays outside git for Seb's review; never add it to a commit.
+
+---
+
+# Autonomous Improve Loop — Scheduling Addendum
+
+The improve loop reuses every gate above but runs **autonomously** (no human in
+the approval path; safety = automatic rollback, not approval pings). Two
+inputs feed it: session failures (harvest_failures; watermark-gated) and X
+bookmarks (harvest_x_bookmarks; cheap pre-filter before any LLM spend).
+
+## Ducted pipeline (scripts in `labs/scripts/`)
+
+```
+improve_cron_entry.py   <- scheduler invokes this (idempotent; always exit 0)
+  -> harvest_failures.extract_failures()     watermark-gated, structured-only
+  -> harvest_x_bookmarks.fetch_bookmarks()   read-only xurl; pre-filter
+  -> run_improve_loop.decide()               deterministic apply policy
+  -> apply_skill_candidate.apply()           .bak + manifest; auto-revert on fault
+  -> ledger_rollup.write_weekly_report()     longitudinal net-positive
+  -> notify_telegram.send()                  redacted {applied, halted, weekly}
+```
+
+## Cron registration (run ONCE, from a healthy live tree — after any
+concurrent update/merge thread has finished; do not register while the live
+CLI fails to import):
+
+```bash
+# improve loop: every 6h
+hermes cron add improve-loop \
+  --schedule "0 */6 * * *" \
+  --command "python3 <repo>/optional-skills/research/darwinian-evolver/labs/scripts/improve_cron_entry.py --report-out ~/.hermes/labs/bestplan-research/state/latest.json"
+# weekly net-positive rollup: Mondays 08:00
+hermes cron add improve-weekly-rollup \
+  --schedule "0 8 * * 1" \
+  --command "python3 <repo>/optional-skills/research/darwinian-evolver/labs/scripts/ledger_rollup.py --ledger ~/.hermes/labs/bestplan-research/state/change-ledger.jsonl --out ~/.hermes/labs/bestplan-research/state/weekly-report.md"
+```
+
+Idempotency contract: a double-fire of either job is harmless — watermarks make
+harvesting a no-op when nothing new exists, and all writes are atomic
+(tmp+rename). Never run GitNexus index-writers in parallel with these jobs
+(fleet contract: serialize index/registry mutations).
+
+## Autonomy floor
+
+- Skill-path changes that pass every gate (scorecard+replay+no-secrets) are
+  applied automatically with `.bak` + manifest and roll back automatically on
+  any fault.
+- Core-path classes (config.yaml / providers / cron / auth) are NEVER mutated
+  by this loop: they are parked + reported via Telegram instead. That is the
+  deliberate floor that keeps "no human gate" true without risking a live
+  service file.
