@@ -18,6 +18,7 @@ import pytest
 import agent.redact as redact_module
 from hermes_cli._scan_venv_blockers import (
     _is_pausable_gateway,
+    _probe_fail_json,
     _redact_sensitive_cmdline,
     main,
 )
@@ -164,6 +165,43 @@ def _run_main_with_detector(monkeypatch, capsys, matches):
     return excinfo.value.code, json.loads(out)
 
 
+def test_probe_fail_json_is_unambiguous_failure() -> None:
+    """A failed probe must not look like a clear scan (#83149).
+
+    Humans and naive callers used to read ``blocked: false`` as "no holders"
+    when psutil was missing after a gutted venv. The document must mark
+    ``probe_failed`` and keep ``ok`` false.
+    """
+    data = json.loads(_probe_fail_json("psutil is not available: No module named 'psutil'"))
+    assert data["ok"] is False
+    assert data["probe_failed"] is True
+    assert data["blocked"] is False
+    assert data["processes"] == []
+    assert "psutil" in data["error"]
+
+
+def test_main_psutil_missing_is_probe_failure_not_clear(monkeypatch, capsys):
+    """Missing psutil exits non-zero with probe_failed JSON — never a clear scan."""
+    real_import = builtins.__import__
+
+    def _no_psutil(name, *args, **kwargs):
+        if name == "psutil" or name.startswith("psutil."):
+            raise ImportError("No module named 'psutil'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_psutil)
+    monkeypatch.delitem(sys.modules, "psutil", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 1
+    data = json.loads(captured.out)
+    assert data["ok"] is False
+    assert data["probe_failed"] is True
+    assert "psutil" in captured.err.lower()
+
+
 def test_main_exempts_gateway_chain_but_keeps_other_holders(monkeypatch, capsys):
     """A gateway launcher/worker pair alone must scan clear; a non-gateway
     holder alongside it must still block (and be the only reported PID)."""
@@ -212,3 +250,34 @@ def test_main_desktop_serve_backend_still_blocks(monkeypatch, capsys):
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [78]
     assert data["pausable_gateways"] == 0
+
+def test_main_gateway_with_long_managed_runtime_path_is_exempt(monkeypatch, capsys):
+    """Regression: the detector must hand the FULL cmdline to the exemption.
+
+    Gateways launched via the managed-runtime interpreter carry a >120-char
+    exe path (`.hermes-runtime\python\generation-...\cpython-3.11-...`).
+    The old `cmdline_raw[:120]` truncation in the detector cut the cmdline
+    before `-m hermes_cli.main gateway run`, so the exemption never matched
+    and every Desktop update aborted with 'Update didn't finish'.
+    Here the detector returns full cmdlines (post-fix contract); the scan
+    must exempt the gateway and truncate only the *displayed* cmdline.
+    """
+    long_exe = (
+        r'"C:\Users\u\AppData\Local\hermes\hermes-agent\.hermes-runtime\python'
+        r"\generation-1785095035-66720-be29ea9c\cpython-3.11-windows-x86_64-none"
+        r'\python.exe"'
+    )
+    assert len(long_exe) > 120  # the truncation point was inside the exe path
+    gateway = (91, "python.exe", long_exe + "  -m hermes_cli.main gateway run --replace")
+    code, data = _run_main_with_detector(monkeypatch, capsys, [gateway])
+    assert code == 0
+    assert data["blocked"] is False
+    assert data["processes"] == []
+    assert data["pausable_gateways"] == 1
+
+    # A long-path NON-gateway holder still blocks, with cmdline truncated for display.
+    stray = (92, "python.exe", long_exe + "  -m some_other_module --serve-forever")
+    code, data = _run_main_with_detector(monkeypatch, capsys, [gateway, stray])
+    assert data["blocked"] is True
+    assert [p["pid"] for p in data["processes"]] == [92]
+    assert len(data["processes"][0]["cmdline"]) <= 120

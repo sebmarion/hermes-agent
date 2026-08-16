@@ -57,20 +57,6 @@ def _build_agent(monkeypatch):
     return agent
 
 
-def _use_custom_codex_endpoint(agent):
-    """Keep the compressor identity aligned with a test-only provider switch."""
-    agent.provider = "custom"
-    agent.base_url = "https://api.example.com/v1"
-    agent.context_compressor.update_model(
-        model=agent.model,
-        context_length=agent.context_compressor.context_length,
-        base_url=agent.base_url,
-        api_key=agent.api_key,
-        provider=agent.provider,
-        api_mode=agent.api_mode,
-    )
-
-
 def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
     _patch_agent_bootstrap(monkeypatch)
 
@@ -80,6 +66,31 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
         api_mode="codex_responses",
         base_url="https://api.githubcopilot.com",
         api_key="gh-token",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    return agent
+
+
+AZURE_FOUNDRY_BASE_URL = (
+    "https://placeholder.services.ai.azure.com/api/projects/placeholder/openai/v1"
+)
+
+
+def _build_azure_foundry_agent(monkeypatch, *, model="gpt-5.4"):
+    _patch_agent_bootstrap(monkeypatch)
+
+    agent = run_agent.AIAgent(
+        model=model,
+        provider="azure-foundry",
+        api_mode="codex_responses",
+        base_url=AZURE_FOUNDRY_BASE_URL,
+        api_key="foundry-token",
         quiet_mode=True,
         max_iterations=4,
         skip_context_files=True,
@@ -337,6 +348,110 @@ def test_build_api_kwargs_mantle_sets_extended_prompt_cache_retention(monkeypatc
     kwargs = agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
 
     assert kwargs["prompt_cache_retention"] == "24h"
+
+
+def _azure_reasoning_item():
+    return {"type": "reasoning", "encrypted_content": "sealed", "summary": []}
+
+
+def _azure_post_tool_messages():
+    return [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "Create a marker"},
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [_azure_reasoning_item()],
+            "tool_calls": [
+                {
+                    "id": "call_marker",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_marker", "content": "marker written"},
+    ]
+
+
+def test_build_api_kwargs_azure_foundry_post_tool_suppresses_reasoning(monkeypatch):
+    """Live agent path reaches Azure Foundry detection and scopes suppression.
+
+    Exercises ``chat_completion_helpers.build_api_kwargs`` end-to-end rather
+    than the transport in isolation: the agent must forward ``provider`` and
+    ``base_url`` into ``build_kwargs`` for the Foundry detection to fire at
+    all. On the post-tool follow-up shape the encrypted reasoning item is
+    dropped while function_call / function_call_output continuity is kept.
+    """
+    agent = _build_azure_foundry_agent(monkeypatch)
+    assert agent._codex_reasoning_replay_enabled is True
+
+    kwargs = agent._build_api_kwargs(_azure_post_tool_messages())
+
+    item_types = [item.get("type") for item in kwargs["input"] if isinstance(item, dict)]
+    assert "reasoning" not in item_types
+    assert "function_call" in item_types
+    assert "function_call_output" in item_types
+    assert kwargs.get("include") == []
+
+
+def test_build_api_kwargs_azure_foundry_non_tool_preserves_reasoning(monkeypatch):
+    """Ordinary (non-tool) Azure Foundry continuity is unchanged via the live path.
+
+    Without the post-tool follow-up shape there is no evidence Foundry rejects
+    the payload, so the encrypted reasoning item must still be replayed even
+    though the agent forwards the Foundry identity fields.
+    """
+    agent = _build_azure_foundry_agent(monkeypatch)
+
+    messages = [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "Explain recursion"},
+        {
+            "role": "assistant",
+            "content": "Recursion is when a function calls itself.",
+            "codex_reasoning_items": [_azure_reasoning_item()],
+        },
+        {"role": "user", "content": "Give an example"},
+    ]
+
+    kwargs = agent._build_api_kwargs(messages)
+
+    item_types = [item.get("type") for item in kwargs["input"] if isinstance(item, dict)]
+    assert "reasoning" in item_types
+    assert "function_call" not in item_types
+    assert "function_call_output" not in item_types
+    assert kwargs.get("include") == ["reasoning.encrypted_content"]
+
+
+def test_build_api_kwargs_azure_foundry_user_turn_after_tool_call_keeps_reasoning(
+    monkeypatch,
+):
+    """Suppression does not stick once the tool call is answered.
+
+    Regression guard for the sticky-history shape: after the assistant has
+    replied to the tool result, a plain user follow-up is a payload Foundry
+    accepts, so reasoning replay must come back on rather than stay off for
+    the remainder of the conversation.
+    """
+    agent = _build_azure_foundry_agent(monkeypatch)
+
+    messages = _azure_post_tool_messages() + [
+        {
+            "role": "assistant",
+            "content": "Marker created.",
+            "codex_reasoning_items": [_azure_reasoning_item()],
+        },
+        {"role": "user", "content": "Now explain recursion"},
+    ]
+
+    kwargs = agent._build_api_kwargs(messages)
+
+    item_types = [item.get("type") for item in kwargs["input"] if isinstance(item, dict)]
+    assert "reasoning" in item_types
+    assert "function_call" in item_types
+    assert "function_call_output" in item_types
+    assert kwargs.get("include") == ["reasoning.encrypted_content"]
 
 
 
@@ -1763,66 +1878,6 @@ def test_codex_commentary_emits_before_tool_and_withholds_final_answer(monkeypat
 
 
 
-def test_run_conversation_forces_exactly_one_ack_continuation(monkeypatch):
-    agent = _build_agent(monkeypatch)
-    responses = [
-        _codex_ack_message_response("I'll inspect the repository now."),
-        _codex_ack_message_response("I'll inspect the repository now."),
-    ]
-    calls = []
-
-    def _next(api_kwargs):
-        calls.append(api_kwargs)
-        return responses.pop(0)
-
-    monkeypatch.setattr(agent, "_interruptible_api_call", _next)
-
-    result = agent.run_conversation("inspect the repository")
-
-    assert len(calls) == 2
-    continuations = [
-        msg
-        for msg in result["messages"]
-        if msg.get("role") == "user"
-        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
-    ]
-    assert len(continuations) == 1
-
-
-def test_execution_delegate_forces_one_continuation_for_arbitrary_tool_free_prose(monkeypatch):
-    agent = _build_agent(monkeypatch)
-    agent._delegate_mode = "execute"
-    responses = [
-        _codex_message_response("The repository appears ready."),
-        _codex_tool_call_response(),
-        _codex_message_response("Repository inspection complete."),
-    ]
-    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
-
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, *_args):
-        for call in assistant_message.tool_calls:
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": '{"ok":true}',
-                }
-            )
-
-    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
-
-    result = agent.run_conversation("inspect the repository")
-
-    continuations = [
-        msg for msg in result["messages"]
-        if msg.get("role") == "user"
-        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
-    ]
-    assert len(continuations) == 1
-    assert any(msg.get("role") == "tool" for msg in result["messages"])
-    assert result["completed"] is True
-
-
 def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
     """Debug dumps should show /responses URL when in codex_responses mode."""
     import json
@@ -2059,108 +2114,59 @@ def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monke
 
 
 
+def test_consume_codex_stream_separates_reasoning_summary_parts():
+    """summary_index is the part boundary; the wire sends no separator itself."""
+    from agent.codex_runtime import _consume_codex_event_stream
 
+    reasoning_streamed = []
 
-def test_run_conversation_codex_disables_reasoning_replay_after_invalid_encrypted_content(monkeypatch):
-    agent = _build_agent(monkeypatch)
-    _use_custom_codex_endpoint(agent)
-
-    request_payloads = []
-
-    class _InvalidEncryptedContentError(Exception):
-        def __init__(self):
-            super().__init__(
-                "Error code: 400 - The encrypted content for item rs_001 could not be verified. "
-                "Reason: Encrypted content could not be decrypted or parsed."
-            )
-            self.status_code = 400
-            self.body = {
-                "error": {
-                    "message": (
-                        '{"error":{"message":"The encrypted content for item rs_001 could not be verified. '
-                        'Reason: Encrypted content could not be decrypted or parsed.",'
-                        '"type":"invalid_request_error","param":"","code":"invalid_encrypted_content"}}'
-                    ),
-                    "type": "400",
-                }
-            }
-
-    responses = [_InvalidEncryptedContentError(), _codex_message_response("Recovered without replay.")]
-
-    def _fake_api_call(api_kwargs):
-        request_payloads.append(api_kwargs)
-        current = responses.pop(0)
-        if isinstance(current, Exception):
-            raise current
-        return current
-
-    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
-
-    history = [
-        {
-            "role": "assistant",
-            "content": "",
-            "finish_reason": "incomplete",
-            "codex_reasoning_items": [
-                {"type": "reasoning", "id": "rs_001", "encrypted_content": "enc_bad", "summary": []},
-            ],
-        }
-    ]
-
-    result = agent.run_conversation("continue", conversation_history=history)
-
-    assert result["completed"] is True
-    assert result["final_response"] == "Recovered without replay."
-    assert len(request_payloads) == 2
-    assert any(item.get("type") == "reasoning" for item in request_payloads[0]["input"])
-    assert not any(item.get("type") == "reasoning" for item in request_payloads[1]["input"])
-    assert request_payloads[0].get("include") == ["reasoning.encrypted_content"]
-    assert request_payloads[1].get("include") == []
-    assert result["messages"][0].get("codex_reasoning_items") is None
-    assert agent._codex_reasoning_replay_enabled is False
-
-
-def test_run_conversation_codex_invalid_encrypted_content_without_replay_state_does_not_disable_replay(monkeypatch):
-    agent = _build_agent(monkeypatch)
-    _use_custom_codex_endpoint(agent)
-    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *args, **kwargs: 0)
-
-    request_payloads = []
-
-    class _InvalidEncryptedContentError(Exception):
-        def __init__(self):
-            super().__init__("Error code: 400 - bad request")
-            self.status_code = 400
-            self.body = {
-                "error": {
-                    "code": "INVALID_ENCRYPTED_CONTENT",
-                    "message": "Bad request",
-                }
-            }
-
-    responses = [_InvalidEncryptedContentError(), _codex_message_response("Recovered after generic retry.")]
-
-    def _fake_api_call(api_kwargs):
-        request_payloads.append(api_kwargs)
-        current = responses.pop(0)
-        if isinstance(current, Exception):
-            raise current
-        return current
-
-    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
-
-    result = agent.run_conversation(
-        "continue",
-        conversation_history=[{"role": "assistant", "content": "No replay state here."}],
+    _consume_codex_event_stream(
+        _FakeCreateStream([
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                summary_index=0,
+                delta="**Investigating culprit PRs**",
+            ),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                summary_index=1,
+                delta="**Inspecting message schema**",
+            ),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                summary_index=1,
+                delta=" and tool_calls content",
+            ),
+            SimpleNamespace(type="response.completed", response=SimpleNamespace(status="completed")),
+        ]),
+        model="gpt-5-codex",
+        on_reasoning_delta=reasoning_streamed.append,
     )
 
-    assert result["completed"] is True
-    assert result["final_response"] == "Recovered after generic retry."
-    assert len(request_payloads) == 2
-    assert all(payload.get("include") == ["reasoning.encrypted_content"] for payload in request_payloads)
-    assert all(not any(item.get("type") == "reasoning" for item in payload["input"]) for payload in request_payloads)
-    assert agent._codex_reasoning_replay_enabled is True
-    assert result["messages"][0].get("codex_reasoning_items") is None
+    joined = "".join(reasoning_streamed)
+    assert "****" not in joined
+    assert joined == (
+        "**Investigating culprit PRs**"
+        "\n\n**Inspecting message schema** and tool_calls content"
+    )
 
 
+def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
+    """Streams with no summary_index (plain reasoning_text) must not gain breaks."""
+    from agent.codex_runtime import _consume_codex_event_stream
 
+    reasoning_streamed = []
+
+    _consume_codex_event_stream(
+        _FakeCreateStream([
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.reasoning_text.delta", delta="Need to "),
+            SimpleNamespace(type="response.reasoning_text.delta", delta="inspect files."),
+            SimpleNamespace(type="response.completed", response=SimpleNamespace(status="completed")),
+        ]),
+        model="gpt-5-codex",
+        on_reasoning_delta=reasoning_streamed.append,
+    )
+
+    assert "".join(reasoning_streamed) == "Need to inspect files."

@@ -1,14 +1,22 @@
-import { useCallback, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 
-import { getCronJobs, listAllProfileSessions, type PaginatedSessions, type SessionInfo } from '@/hermes'
+import { getCronJobs, listAllProfileSessions, listSidebarSessions, type PaginatedSessions, type SessionInfo } from '@/hermes'
+import { sameCronSignature } from '@/lib/session-signatures'
 import {
   isMessagingSource,
   LOCAL_SESSION_SOURCE_IDS,
   MESSAGING_SESSION_SOURCE_IDS,
   normalizeSessionSource
 } from '@/lib/session-source'
-import { setCronJobs } from '@/store/cron'
-import { $pinnedSessionIds, $sessionsLimit, bumpSessionsLimit, SIDEBAR_SESSIONS_PAGE_SIZE } from '@/store/layout'
+import {
+  $pinnedSessionIds,
+  $sessionsLimit,
+  $sidebarFiltersActive,
+  bumpSessionsLimit,
+  raiseSessionsLimit,
+  SIDEBAR_FILTERED_PAGE_SIZE,
+  SIDEBAR_SESSIONS_PAGE_SIZE
+} from '@/store/layout'
 import { ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
 import {
   $messagingSessions,
@@ -21,15 +29,17 @@ import {
   setMessagingPlatformTotals,
   setMessagingSessions,
   setMessagingTruncated,
+  setSessionProfilesTruncated,
+  setSessionProfilesUsage,
   setSessions,
   setSessionsLoading
 } from '@/store/session'
 import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
 import { sameCronSignature } from '../../../lib/session-signatures'
+import { refreshCronJobs as refreshCronJobsStore } from '../../cron/cron-actions'
 
-// The recents list is local-only: cron rows have their own section, and each
-// kanban dispatcher workers are read on the board, and each messaging platform
+// The recents list is local-only: cron rows have their own section, kanban
 // (telegram, discord, …) is fetched separately into its own self-managed
 // sidebar section (refreshMessagingSessions). Excluding them here keeps
 // "Load more" paging through interactive local chats instead of
@@ -38,6 +48,22 @@ const SIDEBAR_EXCLUDED_SOURCES = ['cron', 'kanban', 'subagent', 'tool', ...MESSA
 // The messaging slice is the inverse: drop cron + every local source so only
 // external-platform conversations remain, then split per platform in the UI.
 const MESSAGING_EXCLUDED_SOURCES = ['cron', ...LOCAL_SESSION_SOURCE_IDS]
+
+// Drop rows the user just deleted/archived: ANY list fetch (full refresh,
+// "Load more" paging, a per-platform messaging page, the cron slice) can race
+// an in-flight delete RPC, and the backend page still carries the doomed row
+// until the DELETE commits — so it flashed back into the sidebar (#50928).
+// Honoring the optimistic tombstone at every ingestion point keeps the removal
+// stable; the tombstone self-clears once projects.tree confirms the delete,
+// and a failed delete untombstones immediately, so nothing is filtered on the
+// non-destructive paths.
+function dropTombstoned(sessions: SessionInfo[]): SessionInfo[] {
+  const tombstones = $removedSessionIds.get()
+
+  return tombstones.size
+    ? sessions.filter(s => !tombstones.has(s.id) && !(s._lineage_root_id && tombstones.has(s._lineage_root_id)))
+    : sessions
+}
 
 // Rows a session refresh must preserve even if the aggregator omits them:
 // in-flight first turns (message_count 0), pinned rows aged off the page, the
@@ -132,7 +158,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
   const applyMessagingSessions = useCallback((result: PaginatedSessions) => {
     // Drop any non-messaging source the broad exclude didn't catch (custom
     // sources) — those stay in local recents, not a platform section.
-    const rows = result.sessions.filter(s => isMessagingSource(s.source))
+    const rows = dropTombstoned(result.sessions.filter(s => isMessagingSource(s.source)))
 
     setMessagingSessions(prev => (sameCronSignature(prev, rows) ? prev : rows))
     // Hit the cap → at least one platform may have more on disk than loaded,
@@ -168,7 +194,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       source: platform
     })
 
-    const incoming = result.sessions.filter(s => normalizeSessionSource(s.source) === platform)
+    const incoming = dropTombstoned(result.sessions.filter(s => normalizeSessionSource(s.source) === platform))
 
     if (refreshMessagingSessionsRequestRef.current !== requestId) {
       return
@@ -189,13 +215,11 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
   // next-run/state fresh as the scheduler advances them.
   const refreshCronJobs = useCallback(async () => {
     try {
-      const jobs = await getCronJobs()
-
-      setCronJobs(jobs)
+      await refreshCronJobsStore(profileScope === ALL_PROFILES ? 'all' : profileScope)
     } catch {
       // Non-fatal: the cron section just keeps its last-known jobs.
     }
-  }, [])
+  }, [profileScope])
 
   const fetchCoreSessions = useCallback(async () => {
     const requestId = refreshSessionsRequestRef.current + 1
@@ -340,6 +364,36 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     // profile-total tracking was removed in a sidebar refactor; the paging
     // state machine still works correctly through mergeSessionPage + sessionsToKeep.
   }, [])
+
+  // A filter searches the loaded page, so switching one on has to deepen the
+  // page — otherwise "merged PRs" answers for the last 50 rows and reads as
+  // "you only have 6 merged PRs". Clearing the filters hands the window back:
+  // the list refreshes on every settled turn, and paying for 300 rows a turn
+  // once the view is unfiltered again buys nothing. Whatever the user had
+  // paged to by hand is what it returns to.
+  const unfilteredLimit = useRef<null | number>(null)
+
+  useEffect(
+    () =>
+      $sidebarFiltersActive.subscribe(active => {
+        if (active) {
+          unfilteredLimit.current ??= $sessionsLimit.get()
+
+          if (raiseSessionsLimit(SIDEBAR_FILTERED_PAGE_SIZE)) {
+            void refreshSessions()
+          }
+        } else if (unfilteredLimit.current !== null) {
+          const restored = unfilteredLimit.current
+          unfilteredLimit.current = null
+
+          if ($sessionsLimit.get() > restored) {
+            $sessionsLimit.set(restored)
+            void refreshSessions()
+          }
+        }
+      }),
+    [refreshSessions]
+  )
 
   return {
     loadMoreMessagingForPlatform,

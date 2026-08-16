@@ -26,6 +26,8 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from agent.message_metadata import append_message, stamp_message_timestamp
+from agent.message_sanitization import _sanitize_surrogates
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -417,7 +419,10 @@ def finalize_turn(
             if _tail_role != "assistant":
                 # Tail is not an assistant row — append the final response
                 # so the durable turn closes with the answer (#43849/#44100).
-                messages.append({"role": "assistant", "content": final_response})
+                append_message(
+                    messages,
+                    {"role": "assistant", "content": final_response},
+                )
             elif isinstance(_tail, dict) and _tail.get("content") != final_response and _is_pure_tool_call_tail(_tail):
                 # The tail IS an assistant row, but a *pure tool-call turn*:
                 # tool_calls with no text of its own. The role check alone
@@ -434,6 +439,10 @@ def finalize_turn(
                 # candidate collapse — the provisional answer was persisted and
                 # reused as the terminal response, #65919 §7).
                 _tail["content"] = final_response
+                # The normal assistant builder already stamps this row. Cover
+                # legacy/exceptional pure-tool tails before they become a
+                # delivered final response.
+                stamp_message_timestamp(_tail)
                 # The row may have already been flushed to SQLite by the
                 # incremental tool-call persist (conversation_loop.py:4990),
                 # which stamps ``_DB_PERSISTED_MARKER`` so subsequent flushes
@@ -514,6 +523,14 @@ def finalize_turn(
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+
+    # The gateway owns a separate in-memory history snapshot. Keep it current
+    # even when finalization reports a cleanup error: a later prompt must not be
+    # sent with the pre-turn snapshot while the durable DB already has this turn.
+    try:
+        agent._session_messages = messages
+    except Exception:
+        pass
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
@@ -633,7 +650,8 @@ def finalize_turn(
                     or _is_partial_stream_recovery
                 ):
                     _explanation = agent._format_turn_completion_explanation(
-                        _turn_exit_reason
+                        _turn_exit_reason,
+                        getattr(agent, "_last_persistence_error_cause", None),
                     )
                     if _explanation:
                         if _is_empty_terminal:
@@ -651,6 +669,7 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
+    _pre_transform_response = None
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
@@ -674,6 +693,7 @@ def finalize_turn(
             )
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
+                    _pre_transform_response = final_response
                     final_response = _hook_result
                     _response_transformed = True
                     break  # First non-empty string wins
@@ -746,6 +766,18 @@ def finalize_turn(
             last_reasoning = msg["reasoning"]
             break
 
+    # Class-level surrogate chokepoint (#80366, #55143, #55309, #19819):
+    # ``final_response`` is often the RAW SDK content
+    # (``assistant_message.content``), not the sanitized copy stored in
+    # history by ``build_assistant_message``. Any lone UTF-16 surrogate
+    # (U+D800–U+DFFF) in it crashes downstream consumers — oneshot stdout
+    # writes, Telegram's ``utf16_len`` length check, Signal formatting,
+    # JSON envelope encodes — on every provider (Ollama, NVIDIA NIM, …).
+    # Scrub once here, where model text leaves the conversation loop, so
+    # every delivery surface receives valid Unicode.
+    if isinstance(final_response, str):
+        final_response = _sanitize_surrogates(final_response)
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
@@ -758,6 +790,7 @@ def finalize_turn(
         "partial": iteration_limit_fallback,
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
+        "pre_transform_response": _pre_transform_response,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "bestplan_receipt_metadata": getattr(agent, "_bestplan_receipt_metadata", None),
         "bestplan_receipt_warning": getattr(agent, "_bestplan_receipt_warning", None),
@@ -793,11 +826,20 @@ def finalize_turn(
         result["required_policy"] = agent._required_policy_halt_block.to_result()
     # Persistence failures already set failed=True + an explanation in
     # final_response; also stamp `error` so gateway surfaces status="error"
-    # (and desktop can toast disk-full) instead of a quiet complete frame.
+    # (and desktop can toast the cause) instead of a quiet complete frame.
     if failed and str(_turn_exit_reason) == "session_persistence_failed":
         result["error"] = final_response or (
-            "session storage could not be written — free disk space and try again"
+            "session storage could not be written — check the state database "
+            "health (`hermes doctor`), then send your message again"
         )
+        # Machine-readable cause for the gateway/desktop: exactly
+        # 'session_persistence_failed:<locked|compression|turn_lease|disk|unknown>'.
+        # Never clobber a failure_reason another path already stamped.
+        if "failure_reason" not in result:
+            _cause = getattr(agent, "_last_persistence_error_cause", None)
+            result["failure_reason"] = (
+                "session_persistence_failed:" + (_cause or "unknown")
+            )
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).
@@ -841,10 +883,14 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
+    # Suppressed when skip_background_review=True (e.g. cron) — review forks
+    # spawn another AIAgent (~30K tokens / event) and cron sessions have no
+    # human-in-the-loop benefit from the review.
     if (
         final_response
         and not interrupted
         and not _required_policy_halt
+        and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
         try:

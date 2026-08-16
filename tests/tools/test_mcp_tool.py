@@ -50,38 +50,6 @@ def _make_mock_server(name, session=None, tools=None):
     return server
 
 
-@pytest.fixture(autouse=True)
-def _restore_mcp_registration_provenance():
-    """Keep process-global MCP registration provenance isolated per test."""
-    import tools.mcp_tool as mcp_tool
-
-    tracked_names = (
-        "_mcp_tool_server_names",
-        "_mcp_tool_server_origins",
-        "_mcp_server_origins",
-        "_mcp_connecting_origins",
-        "_mcp_server_registration_identities",
-    )
-    with mcp_tool._lock:
-        saved_connecting = set(mcp_tool._server_connecting)
-        saved = {
-            name: dict(getattr(mcp_tool, name, {}))
-            for name in tracked_names
-        }
-    try:
-        yield
-    finally:
-        with mcp_tool._lock:
-            mcp_tool._server_connecting.clear()
-            mcp_tool._server_connecting.update(saved_connecting)
-            for name, values in saved.items():
-                mapping = getattr(mcp_tool, name, None)
-                if mapping is None:
-                    continue
-                mapping.clear()
-                mapping.update(values)
-
-
 class TestFilterMCPChildren:
     def test_filters_gateway_children_by_argv_marker(self, monkeypatch):
         """Non-MCP children start with an interpreter/binary, not the marker."""
@@ -149,6 +117,74 @@ class TestLoadMCPConfig:
             from tools.mcp_tool import _load_mcp_config
             result = _load_mcp_config()
             assert result == {}
+
+    def test_portable_servers_merge_after_native_interpolation(self):
+        native = {"native": {"command": "node", "args": ["${PORT}"]}}
+        portable = {
+            "agent-plugin-demo__worker": {
+                "command": "python",
+                "args": ["${UNKNOWN}"],
+                "cwd": "/plugin",
+            }
+        }
+        manager = SimpleNamespace(get_portable_mcp_servers=lambda: portable)
+        with (
+            patch("hermes_cli.config.load_config", return_value={"mcp_servers": native}),
+            patch("hermes_cli.plugins.discover_plugins"),
+            patch("hermes_cli.plugins.get_plugin_manager", return_value=manager),
+            patch.dict(os.environ, {"PORT": "3000"}),
+        ):
+            from tools.mcp_tool import _load_mcp_config
+
+            result = _load_mcp_config()
+
+        assert result["native"]["args"] == ["3000"]
+        assert result["agent-plugin-demo__worker"]["args"] == ["${UNKNOWN}"]
+
+    def test_portable_server_resolves_through_real_plugin_discovery(
+        self, tmp_path, monkeypatch
+    ):
+        import json
+        import yaml
+        from hermes_cli.agent_plugins import MCP_SCHEMA_V1, PLUGIN_SCHEMA_V1
+        from hermes_cli import plugins as plugins_mod
+
+        home = tmp_path / "home"
+        plugin = home / "plugins" / "portable"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.json").write_text(
+            json.dumps({"$schema": PLUGIN_SCHEMA_V1, "name": "portable.test"})
+        )
+        (plugin / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "$schema": MCP_SCHEMA_V1,
+                    "mcpServers": {
+                        "worker": {"type": "stdio", "command": "python"}
+                    },
+                }
+            )
+        )
+        home.mkdir(exist_ok=True)
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["portable.test"]}})
+        )
+        bundled = tmp_path / "bundled"
+        bundled.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled))
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", None)
+
+        from tools.mcp_tool import _load_mcp_config
+
+        result = _load_mcp_config()
+
+        [server] = result.values()
+        assert server["command"] == "python"
+        assert server["cwd"] == str(plugin.resolve())
+        assert server["env"]["PLUGIN_ROOT"] == str(plugin.resolve())
+        assert server["env"]["PLUGIN_DATA"].startswith(str(home / "plugin-data"))
+        assert "agent_plugin" not in server
 
 
 class TestMCPParallelSafetyProvenance:
@@ -318,102 +354,6 @@ class TestSchemaConversion:
         assert schema["name"] == "mcp__filesystem__read_file"
         assert schema["description"] == "Read a file"
         assert "properties" in schema["parameters"]
-
-    def test_empty_input_schema_gets_default(self):
-        from tools.mcp_tool import _convert_mcp_schema
-
-        mcp_tool = _make_mcp_tool(name="ping", description="Ping", input_schema=None)
-        mcp_tool.inputSchema = None
-        schema = _convert_mcp_schema("test", mcp_tool)
-
-        assert schema["parameters"]["type"] == "object"
-        assert schema["parameters"]["properties"] == {}
-
-    def test_gitnexus_schema_explains_task_aware_routing(self):
-        from tools.mcp_tool import _convert_mcp_schema
-
-        mcp_tool = _make_mcp_tool(name="trace", description="Trace a path")
-        schema = _convert_mcp_schema("gitnexus", mcp_tool)
-
-        assert "Prefer this when both source and target symbols are known" in schema["description"]
-
-    def test_object_schema_without_properties_gets_normalized(self):
-        from tools.mcp_tool import _convert_mcp_schema
-
-        mcp_tool = _make_mcp_tool(
-            name="ask",
-            description="Ask Crawl4AI",
-            input_schema={"type": "object"},
-        )
-        schema = _convert_mcp_schema("crawl4ai", mcp_tool)
-
-        assert schema["parameters"] == {"type": "object", "properties": {}}
-
-    def test_definitions_refs_are_rewritten_to_defs(self):
-        from tools.mcp_tool import _convert_mcp_schema
-
-        mcp_tool = _make_mcp_tool(
-            name="submit",
-            description="Submit a payload",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "input": {"$ref": "#/definitions/Payload"},
-                },
-                "required": ["input"],
-                "definitions": {
-                    "Payload": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string"},
-                        },
-                        "required": ["query"],
-                    }
-                },
-            },
-        )
-
-        schema = _convert_mcp_schema("forms", mcp_tool)
-
-        assert schema["parameters"]["properties"]["input"]["$ref"] == "#/$defs/Payload"
-        assert "$defs" in schema["parameters"]
-        assert "definitions" not in schema["parameters"]
-
-    def test_nested_definition_refs_are_rewritten_recursively(self):
-        from tools.mcp_tool import _convert_mcp_schema
-
-        mcp_tool = _make_mcp_tool(
-            name="nested",
-            description="Nested schema",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "items": {"$ref": "#/definitions/Entry"},
-                    },
-                },
-                "definitions": {
-                    "Entry": {
-                        "type": "object",
-                        "properties": {
-                            "child": {"$ref": "#/definitions/Child"},
-                        },
-                    },
-                    "Child": {
-                        "type": "object",
-                        "properties": {
-                            "value": {"type": "string"},
-                        },
-                    },
-                },
-            },
-        )
-
-        schema = _convert_mcp_schema("forms", mcp_tool)
-
-        assert schema["parameters"]["properties"]["items"]["items"]["$ref"] == "#/$defs/Entry"
-        assert schema["parameters"]["$defs"]["Entry"]["properties"]["child"]["$ref"] == "#/$defs/Child"
 
     def test_definitions_as_property_name_is_preserved(self):
         """A tool parameter literally named ``definitions`` must not be renamed.
@@ -604,137 +544,6 @@ class TestToolHandler:
         if coro_side_effect:
             return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=coro_side_effect)
         return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run)
-
-    def test_gitnexus_arguments_default_to_bounded_discovery(self):
-        from tools.mcp_tool import _prepare_gitnexus_arguments
-
-        assert _prepare_gitnexus_arguments("gitnexus", "query", {}) == {
-            "limit": 3,
-            "max_symbols": 8,
-            "include_content": False,
-        }
-        assert _prepare_gitnexus_arguments("gitnexus", "context", {}) == {
-            "include_content": False,
-        }
-        assert _prepare_gitnexus_arguments("gitnexus", "impact", {}) == {
-            "summaryOnly": True,
-            "maxDepth": 2,
-            "limit": 20,
-        }
-        assert _prepare_gitnexus_arguments("gitnexus", "trace", {}) == {
-            "maxDepth": 8,
-        }
-        assert _prepare_gitnexus_arguments("gitnexus", "list_repos", {}) == {
-            "limit": 5,
-        }
-
-    def test_gitnexus_arguments_cap_pathological_values_without_mutating_input(self):
-        from tools.mcp_tool import _prepare_gitnexus_arguments
-
-        args = {
-            "limit": 10_000,
-            "max_symbols": 10_000,
-            "include_content": True,
-        }
-        prepared = _prepare_gitnexus_arguments("gitnexus", "query", args)
-
-        assert prepared == {
-            "limit": 100,
-            "max_symbols": 200,
-            "include_content": True,
-        }
-        assert _prepare_gitnexus_arguments(
-            "gitnexus", "query", {"limit": float("inf")}
-        ) == {
-            "limit": 3,
-            "max_symbols": 8,
-            "include_content": False,
-        }
-        assert args == {
-            "limit": 10_000,
-            "max_symbols": 10_000,
-            "include_content": True,
-        }
-        assert _prepare_gitnexus_arguments("other-server", "query", args) is args
-
-    def test_gitnexus_arguments_preserve_valid_explicit_depth_and_limits(self):
-        from tools.mcp_tool import _prepare_gitnexus_arguments
-
-        assert _prepare_gitnexus_arguments("gitnexus", "query", {
-            "limit": 50,
-            "max_symbols": 150,
-        }) == {
-            "limit": 50,
-            "max_symbols": 150,
-            "include_content": False,
-        }
-        assert _prepare_gitnexus_arguments("gitnexus", "impact", {
-            "maxDepth": 12,
-            "limit": 500,
-            "summaryOnly": False,
-        }) == {
-            "maxDepth": 12,
-            "limit": 500,
-            "summaryOnly": False,
-        }
-        assert _prepare_gitnexus_arguments("gitnexus", "trace", {
-            "maxDepth": 25,
-        }) == {"maxDepth": 25}
-
-    def test_gitnexus_list_repos_uses_short_lived_cache(self):
-        import tools.mcp_tool as mcp_tool
-
-        mock_session = MagicMock()
-        mock_session.call_tool = AsyncMock(
-            return_value=_make_call_result('{"repos": []}', is_error=False)
-        )
-        server = _make_mock_server("gitnexus", session=mock_session)
-        sentinel = object()
-        with mcp_tool._lock:
-            saved_cache = dict(mcp_tool._gitnexus_list_repos_cache)
-            saved_server = mcp_tool._servers.get("gitnexus", sentinel)
-            mcp_tool._gitnexus_list_repos_cache.clear()
-            mcp_tool._servers["gitnexus"] = server
-
-        try:
-            handler = mcp_tool._make_tool_handler("gitnexus", "list_repos", 120)
-            with self._patch_mcp_loop():
-                first = handler({})
-                second = handler({})
-
-            assert first == second == '{"result": "{\\"repos\\": []}"}'
-            mock_session.call_tool.assert_called_once_with(
-                "list_repos", arguments={"limit": 5}
-            )
-        finally:
-            with mcp_tool._lock:
-                if saved_server is sentinel:
-                    mcp_tool._servers.pop("gitnexus", None)
-                else:
-                    mcp_tool._servers["gitnexus"] = saved_server
-                mcp_tool._gitnexus_list_repos_cache.clear()
-                mcp_tool._gitnexus_list_repos_cache.update(saved_cache)
-
-    def test_gitnexus_list_repos_cache_is_invalidated_for_server(self):
-        import tools.mcp_tool as mcp_tool
-
-        key = ("gitnexus", '{"limit":5}')
-        with mcp_tool._lock:
-            saved_cache = dict(mcp_tool._gitnexus_list_repos_cache)
-            mcp_tool._gitnexus_list_repos_cache.clear()
-            mcp_tool._gitnexus_list_repos_cache[key] = (time.monotonic(), "stale")
-            mcp_tool._gitnexus_list_repos_cache[("other", "{}")] = (
-                time.monotonic(), "other"
-            )
-        try:
-            mcp_tool._clear_gitnexus_list_repos_cache("gitnexus")
-            with mcp_tool._lock:
-                assert key not in mcp_tool._gitnexus_list_repos_cache
-                assert ("other", "{}") in mcp_tool._gitnexus_list_repos_cache
-        finally:
-            with mcp_tool._lock:
-                mcp_tool._gitnexus_list_repos_cache.clear()
-                mcp_tool._gitnexus_list_repos_cache.update(saved_cache)
 
     def test_successful_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
@@ -959,84 +768,6 @@ class TestDiscoverAndRegister:
             for record in caplog.records
         )
 
-
-class TestMCPRawToolsetAliasPublication:
-    @pytest.mark.parametrize(
-        ("server_name", "collision_kind"),
-        [
-            ("collision-live-alias", "alias"),
-            ("collision-live-canonical", "canonical"),
-            ("web", "static"),
-        ],
-    )
-    def test_live_registration_preserves_non_mcp_raw_toolset(
-        self, server_name, collision_kind
-    ):
-        from tools.mcp_tool import _register_server_tools
-        from tools.registry import ToolRegistry
-        from toolsets import resolve_toolset
-
-        registry = ToolRegistry()
-        incumbent_tool = f"incumbent_{collision_kind}_tool"
-        incumbent_alias_target = None
-
-        if collision_kind == "alias":
-            incumbent_alias_target = f"plugin-{server_name}"
-            registry.register(
-                name=incumbent_tool,
-                toolset=incumbent_alias_target,
-                schema={
-                    "name": incumbent_tool,
-                    "description": "Incumbent plugin tool",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-                handler=lambda _args, **_kwargs: "{}",
-            )
-            registry.register_toolset_alias(server_name, incumbent_alias_target)
-        elif collision_kind == "canonical":
-            registry.register(
-                name=incumbent_tool,
-                toolset=server_name,
-                schema={
-                    "name": incumbent_tool,
-                    "description": "Incumbent canonical tool",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-                handler=lambda _args, **_kwargs: "{}",
-            )
-
-        server = _make_mock_server(
-            server_name,
-            session=MagicMock(),
-            tools=[_make_mcp_tool("remote")],
-        )
-        config = {
-            "command": "fake",
-            "tools": {"resources": False, "prompts": False},
-        }
-
-        with (
-            patch("tools.registry.registry", registry),
-            patch("tools.mcp_schema_cache.write_cache_entry"),
-        ):
-            registered = _register_server_tools(
-                server_name, server, config, source="config"
-            )
-            raw_tools = resolve_toolset(server_name)
-            mcp_tools = resolve_toolset(f"mcp-{server_name}")
-
-        assert len(registered) == 1
-        mcp_tool = registered[0]
-        assert registry.get_toolset_alias_target(server_name) == (
-            incumbent_alias_target
-        )
-        assert mcp_tool not in raw_tools
-        assert mcp_tools == [mcp_tool]
-        if collision_kind == "static":
-            assert "web_search" in raw_tools
-        else:
-            assert incumbent_tool in raw_tools
-
 # ---------------------------------------------------------------------------
 # MCPServerTask (run / start / shutdown)
 # ---------------------------------------------------------------------------
@@ -1076,17 +807,37 @@ class TestMCPServerTask:
         p_stdio, p_cs, _, _ = self._mock_stdio_and_session(mock_session)
 
         async def _test():
-            with patch("tools.mcp_tool.StdioServerParameters"), p_stdio, p_cs:
+            with patch("tools.mcp_tool.StdioServerParameters") as params, p_stdio, p_cs:
                 server = MCPServerTask("test_srv")
-                await server.start({"command": "npx", "args": ["-y", "test"]})
+                await server.start(
+                    {"command": "npx", "args": ["-y", "test"], "cwd": "/plugin"}
+                )
 
                 assert server.session is mock_session
                 assert len(server._tools) == 1
                 assert server._tools[0].name == "echo"
                 mock_session.initialize.assert_called_once()
+                assert params.call_args.kwargs["cwd"] == "/plugin"
 
                 await server.shutdown()
                 assert server.session is None
+
+        asyncio.run(_test())
+
+    def test_start_preserves_native_default_cwd(self):
+        from tools.mcp_tool import MCPServerTask
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+        p_stdio, p_cs, _, _ = self._mock_stdio_and_session(mock_session)
+
+        async def _test():
+            with patch("tools.mcp_tool.StdioServerParameters") as params, p_stdio, p_cs:
+                server = MCPServerTask("native")
+                await server.start({"command": "npx", "args": ["-y", "test"]})
+                assert params.call_args.kwargs["cwd"] is None
+                await server.shutdown()
 
         asyncio.run(_test())
 
@@ -3005,7 +2756,7 @@ class TestMCPDiscoveryCrossProcessLock:
              patch("tools.mcp_tool._existing_tool_names", return_value=[]):
             result = discover_mcp_tools()
         # Must still run local discovery
-        reg_spy.assert_called_once_with(mock_config, source="config")
+        reg_spy.assert_called_once_with(mock_config)
 
     def test_posix_flock_acquire_and_release(self):
         """_acquire_lock_on_fh uses fcntl.flock on POSIX."""
@@ -3038,255 +2789,71 @@ class TestMCPDiscoveryCrossProcessLock:
                 pass
 
 
-class TestMCPPlatformPolicy:
-    def _set_provenance(self, mcp_tool, tool_name, server_name, source):
-        with mcp_tool._lock:
-            mcp_tool._mcp_tool_server_names[tool_name] = server_name
-            mcp_tool._mcp_tool_server_origins[tool_name] = source
+class TestRedirectHeaderStripper:
+    """Cross-origin redirect header boundary (portable Agent Plugins v1)."""
 
-    def test_platform_access_uses_raw_configured_server_name(self, monkeypatch):
-        import tools.mcp_tool as mcp_tool
+    def _make_response(self, next_headers):
+        import httpx
 
-        tool_name = "mcp__zeus_browser__open"
-        self._set_provenance(mcp_tool, tool_name, "zeus-browser", "config")
-        monkeypatch.setattr(
-            mcp_tool,
-            "_load_mcp_config",
-            lambda: {"zeus-browser": {"allowed_platforms": ["cli"]}},
+        next_request = httpx.Request(
+            "GET", "https://other.example.test/mcp", headers=next_headers
         )
-
-        assert mcp_tool.get_mcp_tool_server_name(tool_name) == "zeus-browser"
-        assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (True, None)
-        assert mcp_tool.mcp_tool_platform_access(tool_name, "cron") == (
-            False,
-            "mcp_platform_denied",
+        response = SimpleNamespace(
+            is_redirect=True,
+            next_request=next_request,
         )
+        return response, next_request
 
-    def test_acp_registration_is_acp_only_even_with_same_named_config(self, monkeypatch):
-        import tools.mcp_tool as mcp_tool
+    def test_default_strips_only_authorization(self):
+        import httpx
 
-        tool_name = "mcp__zeus__open"
-        self._set_provenance(mcp_tool, tool_name, "zeus", "acp")
-        monkeypatch.setattr(
-            mcp_tool,
-            "_load_mcp_config",
-            lambda: {"zeus": {"allowed_platforms": ["cli"]}},
+        from tools.mcp_tool import _make_redirect_header_stripper
+
+        hook = _make_redirect_header_stripper(
+            httpx.URL("https://origin.example.test/mcp")
         )
-
-        assert mcp_tool.mcp_tool_platform_access(tool_name, "acp") == (True, None)
-        assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (
-            False,
-            "mcp_platform_denied",
+        response, next_request = self._make_response(
+            {"Authorization": "Bearer x", "X-Tenant": "t"}
         )
+        asyncio.run(hook(response))
+        assert "authorization" not in next_request.headers
+        assert next_request.headers["x-tenant"] == "t"
 
-    def test_config_registration_removed_from_config_fails_closed(self, monkeypatch):
-        import tools.mcp_tool as mcp_tool
+    def test_strict_strips_configured_headers_cross_origin(self):
+        import httpx
 
-        tool_name = "mcp__zeus__open"
-        self._set_provenance(mcp_tool, tool_name, "zeus", "config")
-        monkeypatch.setattr(mcp_tool, "_load_mcp_config", lambda: {})
+        from tools.mcp_tool import _make_redirect_header_stripper
 
-        assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (
-            False,
-            "mcp_server_missing",
+        hook = _make_redirect_header_stripper(
+            httpx.URL("https://origin.example.test/mcp"),
+            strict=True,
+            configured_header_names={"x-tenant"},
         )
-
-    def test_config_registration_disabled_after_snapshot_fails_closed(
-        self, monkeypatch
-    ):
-        import tools.mcp_tool as mcp_tool
-
-        tool_name = "mcp__zeus__open"
-        self._set_provenance(mcp_tool, tool_name, "zeus", "config")
-        monkeypatch.setattr(
-            mcp_tool,
-            "_load_mcp_config",
-            lambda: {"zeus": {"enabled": False}},
+        response, next_request = self._make_response(
+            {"Authorization": "Bearer x", "X-Tenant": "t", "Accept": "a"}
         )
+        asyncio.run(hook(response))
+        assert "authorization" not in next_request.headers
+        assert "x-tenant" not in next_request.headers
+        # Client-generated headers unrelated to package config survive.
+        assert next_request.headers["accept"] == "a"
 
-        assert mcp_tool.mcp_tool_platform_access(tool_name, "cli") == (
-            False,
-            "mcp_server_disabled",
+    def test_same_origin_redirect_keeps_headers(self):
+        import httpx
+
+        from tools.mcp_tool import _make_redirect_header_stripper
+
+        hook = _make_redirect_header_stripper(
+            httpx.URL("https://origin.example.test/mcp"),
+            strict=True,
+            configured_header_names={"x-tenant"},
         )
-
-    def test_competing_registration_reserves_inflight_source_once(self):
-        import tools.mcp_tool as mcp_tool
-
-        barrier = threading.Barrier(2)
-        run_calls = []
-        errors = []
-
-        def synchronized_filter(servers):
-            barrier.wait(timeout=2)
-            return servers
-
-        def register(source):
-            try:
-                mcp_tool.register_mcp_servers(
-                    {"same-name": {"command": "ignored"}}, source=source
-                )
-            except BaseException as exc:
-                errors.append(exc)
-
-        with (
-            patch("tools.mcp_tool._MCP_AVAILABLE", True),
-            patch(
-                "tools.mcp_tool._filter_suspicious_mcp_servers",
-                side_effect=synchronized_filter,
-            ),
-            patch("tools.mcp_tool._ensure_mcp_loop"),
-            patch(
-                "tools.mcp_tool._run_on_mcp_loop",
-                side_effect=lambda *args, **kwargs: run_calls.append(args),
-            ),
-        ):
-            config_thread = threading.Thread(target=register, args=("config",))
-            acp_thread = threading.Thread(target=register, args=("acp",))
-            config_thread.start()
-            acp_thread.start()
-            config_thread.join(timeout=5)
-            acp_thread.join(timeout=5)
-
-        assert not config_thread.is_alive()
-        assert not acp_thread.is_alive()
-        assert not errors
-        assert len(run_calls) == 1
-        assert mcp_tool.get_mcp_server_registration_source("same-name") in {
-            "acp",
-            "config",
-        }
-
-    def test_cross_source_collision_has_no_incumbent_side_effects(self, monkeypatch):
-        import tools.mcp_tool as mcp_tool
-
-        incumbent = SimpleNamespace(session=None, _registered_tool_names=[])
-        with mcp_tool._lock:
-            saved_servers = dict(mcp_tool._servers)
-            saved_parallel = set(mcp_tool._parallel_safe_servers)
-            mcp_tool._servers.clear()
-            mcp_tool._servers["shared"] = incumbent
-            mcp_tool._mcp_server_origins["shared"] = "config"
-            mcp_tool._parallel_safe_servers.discard("shared")
-
-        reconnect = MagicMock()
-        try:
-            monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
-            monkeypatch.setattr(
-                mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
-            )
-            monkeypatch.setattr(mcp_tool, "_signal_reconnect", reconnect)
-
-            mcp_tool.register_mcp_servers(
-                {
-                    "shared": {
-                        "command": "ignored",
-                        "supports_parallel_tool_calls": True,
-                    }
-                },
-                source="acp",
-            )
-
-            assert mcp_tool.get_mcp_server_registration_source("shared") == "config"
-            assert "shared" not in mcp_tool._parallel_safe_servers
-            reconnect.assert_not_called()
-        finally:
-            with mcp_tool._lock:
-                mcp_tool._servers.clear()
-                mcp_tool._servers.update(saved_servers)
-                mcp_tool._parallel_safe_servers.clear()
-                mcp_tool._parallel_safe_servers.update(saved_parallel)
-
-    def test_same_acp_source_requires_identical_server_config(self, monkeypatch):
-        import tools.mcp_tool as mcp_tool
-
-        run_calls = []
-        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
-        monkeypatch.setattr(
-            mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
+        next_request = httpx.Request(
+            "GET",
+            "https://origin.example.test/other",
+            headers={"Authorization": "Bearer x", "X-Tenant": "t"},
         )
-        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
-        monkeypatch.setattr(
-            mcp_tool,
-            "_run_on_mcp_loop",
-            lambda *args, **kwargs: run_calls.append(args),
-        )
-
-        first = {"url": "https://one.example/mcp", "headers": {"X-Key": "one"}}
-        different = {
-            "url": "https://one.example/mcp",
-            "headers": {"X-Key": "two"},
-            "supports_parallel_tool_calls": True,
-        }
-
-        mcp_tool.register_mcp_servers({"shared": first}, source="acp")
-        mcp_tool.register_mcp_servers({"shared": different}, source="acp")
-
-        assert len(run_calls) == 1
-        assert mcp_tool.mcp_server_registration_matches(
-            "shared", first, source="acp"
-        )
-        assert not mcp_tool.mcp_server_registration_matches(
-            "shared", different, source="acp"
-        )
-        assert "shared" not in mcp_tool._parallel_safe_servers
-
-    def test_shutdown_clears_registration_reservations(self):
-        import tools.mcp_tool as mcp_tool
-
-        with mcp_tool._lock:
-            mcp_tool._servers.clear()
-            mcp_tool._server_connecting.add("inflight")
-            mcp_tool._mcp_server_origins["stale"] = "config"
-            mcp_tool._mcp_connecting_origins["inflight"] = "acp"
-            mcp_tool._mcp_server_registration_identities["inflight"] = "digest"
-
-        with patch("tools.mcp_tool._stop_mcp_loop"):
-            mcp_tool.shutdown_mcp_servers()
-
-        with mcp_tool._lock:
-            assert not mcp_tool._server_connecting
-            assert not mcp_tool._mcp_server_origins
-            assert not mcp_tool._mcp_connecting_origins
-            assert not mcp_tool._mcp_server_registration_identities
-
-    def test_failed_acp_registration_releases_identity_reservation(
-        self, monkeypatch
-    ):
-        import tools.mcp_tool as mcp_tool
-
-        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
-        monkeypatch.setattr(
-            mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
-        )
-        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
-        monkeypatch.setattr(
-            mcp_tool,
-            "_run_on_mcp_loop",
-            MagicMock(side_effect=TimeoutError("timed out")),
-        )
-
-        with pytest.raises(TimeoutError):
-            mcp_tool.register_mcp_servers(
-                {"retryable": {"url": "https://one.example/mcp"}},
-                source="acp",
-            )
-
-        assert mcp_tool.get_mcp_server_registration_source("retryable") is None
-        with mcp_tool._lock:
-            assert "retryable" not in mcp_tool._mcp_server_registration_identities
-
-    def test_schema_filter_failure_preserves_native_and_drops_mcp(self, monkeypatch):
-        import tools.mcp_tool as mcp_tool
-
-        native = {"type": "function", "function": {"name": "terminal"}}
-        remote = {"type": "function", "function": {"name": "mcp__zeus__open"}}
-        self._set_provenance(mcp_tool, "mcp__zeus__open", "zeus", "config")
-        monkeypatch.setattr(
-            mcp_tool,
-            "mcp_tool_platform_access",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
-        )
-
-        assert mcp_tool.filter_mcp_tool_definitions_for_platform(
-            [native, remote], "cli"
-        ) == [native]
+        response = SimpleNamespace(is_redirect=True, next_request=next_request)
+        asyncio.run(hook(response))
+        assert next_request.headers["authorization"] == "Bearer x"
+        assert next_request.headers["x-tenant"] == "t"

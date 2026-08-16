@@ -221,7 +221,9 @@ class TestBatchMode:
             ]
             delegate_task(
                 tasks=[
-                    {"goal": "A"}, {"goal": "B"}, {"goal": "C"},
+                    {"goal": "Investigate module A"},
+                    {"goal": "Investigate module B"},
+                    {"goal": "Investigate module C"},
                 ],
                 parent_agent=_make_parent(),
             )
@@ -244,7 +246,10 @@ class TestBatchMode:
                  "_child_role": None},
             ]
             delegate_task(
-                tasks=[{"goal": "A"}, {"goal": "B"}],
+                tasks=[
+                    {"goal": "Investigate module A"},
+                    {"goal": "Investigate module B"},
+                ],
                 parent_agent=_make_parent(),
             )
 

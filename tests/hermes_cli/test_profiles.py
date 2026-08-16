@@ -45,7 +45,7 @@ from hermes_cli.profiles import (
     backfill_profile_envs,
     profiles_to_serve,
 )
-from hermes_cli.config import DEFAULT_CONFIG, read_effective_user_config_for_path
+from hermes_cli.config import DEFAULT_CONFIG
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +146,8 @@ class TestCreateProfile:
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
         cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
-        assert cloned_config["_profile"] == {"inherits": "default", "version": 1}
-        assert "model" not in cloned_config
-        assert read_effective_user_config_for_path(
-            profile_dir / "config.yaml"
-        )["model"] == "test"
+        assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert cloned_config["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
@@ -217,15 +214,13 @@ class TestNoSkillsOptOut:
 
 class TestBackfillProfileEnvs:
     """Tests for backfill_profile_envs() — the `hermes update` pass that
-    gives pre-#44792 profiles (created before .env seeding) a local override
-    file while omitting root-shared Novita assignments."""
+    gives pre-#44792 profiles (created before .env seeding) their own
+    .env, copied from the default install so credentials don't break."""
 
-    def test_excludes_inherited_keys_when_backfilling_envless_profiles(self, profile_env):
+    def test_copies_default_env_into_envless_profiles(self, profile_env):
         import stat
         tmp_path = profile_env
-        (tmp_path / ".hermes" / ".env").write_text(
-            "OPENROUTER_API_KEY=root-key\nNOVITA_API_KEY=shared-root-key\n"
-        )
+        (tmp_path / ".hermes" / ".env").write_text("OPENROUTER_API_KEY=root-key\n")
         p1 = create_profile("old1", no_alias=True)
         p2 = create_profile("old2", no_alias=True)
         # Simulate pre-#44792 profiles: no .env
@@ -236,9 +231,7 @@ class TestBackfillProfileEnvs:
 
         assert sorted(backfilled) == ["old1", "old2"]
         for p in (p1, p2):
-            content = (p / ".env").read_text(encoding="utf-8")
-            assert content == "OPENROUTER_API_KEY=root-key\n"
-            assert "NOVITA_API_KEY" not in content
+            assert (p / ".env").read_text() == "OPENROUTER_API_KEY=root-key\n"
             assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
 
 
@@ -410,8 +403,8 @@ class TestAliasCollision:
 
 
 
-    def test_windows_checks_bat_extension(self, profile_env, monkeypatch):
-        monkeypatch.setattr("sys.platform", "win32")
+    @pytest.mark.windows_only
+    def test_windows_checks_bat_extension(self, profile_env):
         wrapper_dir = profile_env / ".local" / "bin"
         wrapper_dir.mkdir(parents=True, exist_ok=True)
         bat_path = wrapper_dir / "mybot.bat"
@@ -440,7 +433,6 @@ class TestWrapperScript:
     """Tests for create_wrapper_script() and remove_wrapper_script()."""
 
     def test_creates_sh_on_posix(self, profile_env, monkeypatch):
-        monkeypatch.setattr("sys.platform", "darwin")
         monkeypatch.setattr("hermes_cli.profiles.shutil.which", lambda name: "/opt/hermes/bin/hermes")
         from hermes_cli.profiles import create_wrapper_script
         wrapper = create_wrapper_script("mybot")
@@ -451,8 +443,8 @@ class TestWrapperScript:
         assert "exec /opt/hermes/bin/hermes -p mybot" in content
 
 
-    def test_remove_finds_bat_on_windows(self, profile_env, monkeypatch):
-        monkeypatch.setattr("sys.platform", "win32")
+    @pytest.mark.windows_only
+    def test_remove_finds_bat_on_windows(self, profile_env):
         from hermes_cli.profiles import create_wrapper_script, remove_wrapper_script
         wrapper = create_wrapper_script("mybot")
         assert wrapper is not None
@@ -499,16 +491,14 @@ class TestWrapperScriptSecurity:
 class TestFindAliasForProfile:
     """Tests for find_alias_for_profile() and alias display in list/show."""
 
-    def test_profile_named_alias(self, profile_env, monkeypatch):
-        monkeypatch.setattr("sys.platform", "darwin")
+    def test_profile_named_alias(self, profile_env):
         from hermes_cli.profiles import create_wrapper_script, find_alias_for_profile
         create_wrapper_script("steve")
         assert find_alias_for_profile("steve") == "steve"
 
 
-    def test_ignores_unrelated_files(self, profile_env, monkeypatch):
+    def test_ignores_unrelated_files(self, profile_env):
         # ~/.local/bin commonly holds unrelated binaries; they must not match.
-        monkeypatch.setattr("sys.platform", "darwin")
         from hermes_cli.profiles import _get_wrapper_dir, find_alias_for_profile
         wrapper_dir = _get_wrapper_dir()
         wrapper_dir.mkdir(parents=True, exist_ok=True)
@@ -516,8 +506,7 @@ class TestFindAliasForProfile:
         assert find_alias_for_profile("steve") is None
 
 
-    def test_list_profiles_surfaces_custom_alias(self, profile_env, monkeypatch):
-        monkeypatch.setattr("sys.platform", "darwin")
+    def test_list_profiles_surfaces_custom_alias(self, profile_env):
         from hermes_cli.profiles import (
             create_profile,
             create_wrapper_script,
@@ -898,7 +887,7 @@ class TestEdgeCases:
             "target", clone_from="source", clone_config=True, no_alias=True,
         )
         cloned_config = yaml.safe_load((target_dir / "config.yaml").read_text())
-        assert cloned_config["_profile"] == {"inherits": "default", "version": 1}
+        assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert cloned_config["model"] == "cloned"
         assert (target_dir / ".env").read_text().strip() == "SECRET=yes"
 
@@ -925,3 +914,27 @@ class TestProfilesToServe:
         assert set(serve) == {"default", "coder", "writer"}
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
+
+    def test_empty_allowlist_serves_only_default(self, profile_env):
+        create_profile("worker", no_alias=True)
+
+        serve = dict(profiles_to_serve(multiplex=True, profile_allowlist=[]))
+
+        assert serve == {"default": _get_default_hermes_home()}
+
+    def test_allowlist_normalizes_deduplicates_and_keeps_default(self, profile_env):
+        create_profile("worker", no_alias=True)
+        create_profile("guest", no_alias=True)
+
+        serve = dict(
+            profiles_to_serve(
+                multiplex=True,
+                profile_allowlist=[" Worker ", "worker", "default", "missing"],
+            )
+        )
+
+        assert set(serve) == {"default", "worker"}
+        assert serve["worker"] == get_profile_dir("worker")
+
+
+

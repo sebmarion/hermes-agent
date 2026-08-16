@@ -331,6 +331,7 @@ export interface HermesConfig {
     personality?: string
     skin?: string
     interim_assistant_messages?: boolean
+    timestamps?: boolean
   }
   desktop?: {
     repo_scan_enabled?: boolean
@@ -486,6 +487,12 @@ export interface SessionInfo {
    *  pins so a pinned conversation survives auto-compression. */
   _lineage_root_id?: null | string
   input_tokens: number
+  /** Spend for the session, straight off the `sessions` row. `actual` is set
+   *  when the provider reported a price; `estimated` is our own pricing-table
+   *  math. Both are 0 on subscription auth that never quotes a price, which is
+   *  why the sidebar only offers a cost sort when some session has spend. */
+  actual_cost_usd?: null | number
+  estimated_cost_usd?: null | number
   is_active: boolean
   last_active: number
   message_count: number
@@ -500,6 +507,11 @@ export interface SessionInfo {
    *  elsewhere. Undefined against a backend predating the flag; treat that as
    *  "no opinion" and leave the local pin set alone. */
   pinned?: boolean
+  /** Derived read state (backend watermark: `last_read_at` vs `last_active`,
+   *  see `SessionDB.session_unread`). True when the conversation was
+   *  explicitly marked unread or a response arrived after it was last read.
+   *  Undefined against a backend predating the flag; treat as read. */
+  unread?: boolean
   preview: null | string
   source: null | string
   raw_source?: null | string
@@ -559,6 +571,12 @@ export interface MessageReaction {
 }
 
 export interface SessionMessage {
+  /**
+   * Full tool arguments for a gateway-projected tool row (`role: 'tool'`).
+   * `context` is an 80-char display preview. The expanded tool row rebuilds
+   * the full call from this field. Absent on a backend older than this app.
+   */
+  args?: unknown
   codex_reasoning_items?: unknown
   content: unknown
   context?: unknown
@@ -566,7 +584,8 @@ export interface SessionMessage {
   reasoning?: null | string
   reasoning_content?: null | string
   reasoning_details?: unknown
-  display_kind?: 'async_delegation_complete' | 'auto_continue' | 'hidden' | 'model_switch' | string
+  display_kind?:
+    'async_delegation_complete' | 'auto_continue' | 'hidden' | 'model_switch' | 'personality_switch' | string
   /**
    * A backend older than this app can still serve this as unparsed JSON text,
    * so readers must narrow before indexing into it.
@@ -593,6 +612,12 @@ export interface SessionMessage {
 
 export interface SessionMessagesResponse {
   messages: SessionMessage[]
+  pagination?: {
+    limit: number
+    offset: number
+    order: 'latest' | 'oldest'
+    returned: number
+  }
   session_id: string
 }
 
@@ -609,6 +634,12 @@ export interface SessionResumeResponse {
     /** Mid-turn redirect corrections, oldest first. The turn's original prompt
      *  stays in `user`; these are the follow-ups typed while it ran. */
     corrections?: string[]
+    /** Parallel to `corrections`: the length of `assistant` already streamed
+     *  when each correction was accepted. Lets a resume rebuild arrival order —
+     *  the correction bubble lands after the output the user had already seen
+     *  and before the output it redirected (#73793). Omitted by older
+     *  gateways. */
+    correction_offsets?: number[]
     /** Retained failed turn: the error the terminal frame carried (the frame
      *  itself may have been lost to a disconnect). */
     error?: string
@@ -620,6 +651,26 @@ export interface SessionResumeResponse {
   queued?: null | {
     user?: string
   }
+  // The oldest gateway approval still waiting for a response. This is returned
+  // on resume so a reconnect can restore a prompt whose original event was
+  // emitted while the client transport was detached.
+  pending_approval?: {
+    allow_permanent?: boolean
+    choices?: string[]
+    command?: string
+    description?: string
+    request_id?: string
+    smart_denied?: boolean
+  }
+  // The clarify question still blocking this session, if any. Same replay
+  // class as pending_approval: emitted-while-detached prompts are restored
+  // from the resume snapshot instead of being lost until server-side timeout.
+  pending_clarify?: {
+    choices?: null | string[]
+    multi_select?: boolean
+    question?: string
+    request_id?: string
+  }
   info?: SessionRuntimeInfo
   message_count: number
   messages: SessionMessage[]
@@ -630,6 +681,8 @@ export interface SessionResumeResponse {
   session_key?: string
   started_at?: number
   status?: string
+  /** Epoch seconds the current turn started, or null when idle. */
+  turn_started_at?: number | null
 }
 
 export interface SessionRuntimeInfo {
@@ -1272,6 +1325,22 @@ export interface StaleAuxAssignment {
   model: string
 }
 
+export type CronModelDriftAxis = 'model' | 'provider'
+
+export interface CronModelImpactJob {
+  id: string
+  name: string
+  drifted_axes: CronModelDriftAxis[]
+}
+
+export interface CronModelImpact {
+  available: boolean
+  guard_enabled: boolean
+  affected_count: number
+  truncated: boolean
+  jobs: CronModelImpactJob[]
+}
+
 /** One skill-hub source (official index, GitHub, skills.sh, …) as reported by
  *  `GET /api/skills/hub/sources`. */
 export interface SkillHubSource {
@@ -1384,6 +1453,10 @@ export interface McpCatalogEntry {
   bootstrap: string[]
   default_enabled: string[] | null
   post_install: string
+  /** Composer-suggestion triggers (present when the manifest declares a
+   *  `suggest` block; null/absent on entries without one and on older
+   *  backends that predate the field). */
+  suggest?: { keywords: string[]; hosts: string[] } | null
   needs_install: boolean
   installed: boolean
   enabled: boolean
@@ -1428,6 +1501,10 @@ export interface ModelAssignmentResponse {
    *  switching the main provider to Nous. Empty unless provider === 'nous'
    *  and the user is a paid subscriber with unconfigured tools. */
   gateway_tools?: string[]
+  /** Additive profile-local cron impact returned after a persisted main assignment. */
+  cron_model_impact?: CronModelImpact
+  confirm_message?: string
+  confirm_required?: boolean
   model?: string
   ok: boolean
   provider?: string

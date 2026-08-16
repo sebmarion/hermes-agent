@@ -28,14 +28,28 @@ _SENSITIVE_LONG_FLAGS: list[str] = [
 ]
 
 
-def _probe_fail_json() -> str:
-    """Return the standard probe-failure JSON document."""
-    return json.dumps({"ok": False, "blocked": False, "processes": []})
+def _probe_fail_json(diagnostic: str = "probe failed") -> str:
+    """Return the standard probe-failure JSON document.
+
+    ``ok: false`` plus ``probe_failed: true`` means the detector itself could
+    not run — this is *not* a clear scan. Callers must treat
+    ``ok is not True`` / non-zero exit as probe failure, never as
+    ``blocked: false`` "clear" (#83149).
+    """
+    return json.dumps(
+        {
+            "ok": False,
+            "probe_failed": True,
+            "blocked": False,
+            "processes": [],
+            "error": diagnostic,
+        }
+    )
 
 
 def _emit_probe_fail(diagnostic: str) -> NoReturn:
     """Print one JSON to stdout, diagnostic to stderr, exit non-zero."""
-    print(_probe_fail_json())
+    print(_probe_fail_json(diagnostic))
     print(diagnostic, file=sys.stderr)
     sys.exit(1)
 
@@ -144,7 +158,10 @@ def main() -> None:
         {
             "pid": pid,
             "name": name,
-            "cmdline": _redact_sensitive_cmdline(cmdline),
+            # Truncate for display AFTER the gateway exemption has seen the
+            # full cmdline (long managed-runtime interpreter paths would
+            # otherwise swallow the `gateway run` argv).
+            "cmdline": _redact_sensitive_cmdline(cmdline)[:120],
         }
         for pid, name, cmdline in matches
         if not _is_pausable_gateway(cmdline)
