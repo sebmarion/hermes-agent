@@ -4281,7 +4281,98 @@ def _resolve_child_credential_pool(
     return None
 
 
+# Versioned plugin-host seam: child-worker routing policy (migration bridge).
+# A plugin may register a callable that resolves a named lane to
+# (provider, model, api_mode, reasoning_effort) for subagent delegation.
+# Consulted ONLY when flat `delegation.provider`/`base_url` are NOT configured,
+# so default upstream behavior is unchanged when no policy is registered.
+_CHILD_WORKER_POLICIES: "list" = []  # list[Callable[[dict, int], dict|None]]
+
+
+def _policy_scrubbed_view(cfg):
+    """Return a routing-only view of the delegation config for policy callbacks.
+
+    Removes credential material (api_key / key-ish fields) so a policy can never
+    read a configured deployment key. Route/tier/mode/lane/provider/model/route
+    mapping keys are preserved for the resolver.
+    """
+    if not isinstance(cfg, dict):
+        return cfg
+    secret_keys = {"api_key", "apiKey", "key", "secret", "token", "credential"}
+    out = {}
+    for k, v in cfg.items():
+        if isinstance(k, str) and k.lower() in secret_keys:
+            continue
+        out[k] = v
+    return out
+
+
+def register_child_worker_policy(fn) -> None:
+    """Register a child-worker routing policy (idempotent by fn identity)."""
+    if fn not in _CHILD_WORKER_POLICIES:
+        _CHILD_WORKER_POLICIES.append(fn)
+
+
+def _consult_child_worker_policy(cfg: dict, parent_agent=None) -> dict:
+    """Return a lane override dict from the first policy that returns one, or {}."""
+    base = {
+        "model": None, "provider": None, "base_url": None,
+        "api_key": None, "api_mode": None,
+        "request_overrides": None, "max_output_tokens": None,
+    }
+    for fn in list(_CHILD_WORKER_POLICIES):
+        try:
+            out = fn(cfg, parent_agent)
+        except Exception:
+            continue
+        if not isinstance(out, dict) or not out.get("provider"):
+            continue
+        merged = dict(base)
+        merged.update({k: out.get(k) for k in base if out.get(k) is not None})
+        return merged
+    return {}
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+
+    # ── Plugin-host child-worker routing policy (migration seam) ─────────
+    # A registered policy (local-first route resolver) may map lanes / tier_routes
+    # / mode_routes / default_lane to an explicit provider:model override. When it
+    # returns an opinion it is authoritative (checked before flat config); core
+    # resolves + validates the credentials itself and the policy never receives
+    # API keys or mutable credential objects. A policy's base_url/api_key are
+    # ignored. No policy registered (or policy returns no provider) ⇒ behavior is
+    # byte-identical to upstream.
+    _policy = _consult_child_worker_policy(_policy_scrubbed_view(cfg), parent_agent)
+    if _policy.get("provider"):
+        _pmodel = _policy.get("model")
+        _pprov = _policy.get("provider")
+        _papi_mode = _policy.get("api_mode")
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            _rt = resolve_runtime_provider(requested=_pprov, target_model=_pmodel)
+        except Exception as _exc:
+            raise ValueError(
+                f"Cannot resolve delegation lane provider '{_pprov}': {_exc}. "
+                f"Check the provider is configured (API key set)."
+            ) from _exc
+        _pkey = _rt.get("api_key", "")
+        if not _pkey:
+            raise ValueError(
+                f"Delegation lane provider '{_pprov}' resolved but has no API key. "
+                f"Set the appropriate environment variable or run 'hermes auth'."
+            )
+        return {
+            "model": _pmodel or _rt.get("model") or None,
+            "provider": _pprov if _rt.get("provider") == _RUNTIME_PROVIDER_CUSTOM else _rt.get("provider"),
+            "base_url": _rt.get("base_url"),
+            "api_key": _pkey,
+            "api_mode": _papi_mode or _rt.get("api_mode"),
+            "request_overrides": dict(_rt.get("request_overrides") or {}),
+            "max_output_tokens": _rt.get("max_output_tokens"),
+        }
+
+
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct

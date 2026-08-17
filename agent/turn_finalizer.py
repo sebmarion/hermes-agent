@@ -833,4 +833,24 @@ def finalize_turn(
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
 
+    # ── Completion-arbiter seam (migration bridge, Phase 6 / Option A-lite) ──
+    # When a plugin claimed authoritative completion of this turn (via
+    # PluginContext.completion_arbiter), invoke its commit_fn with the fully
+    # finalized result so the plugin can persist proof/receipt. The finalizer
+    # path above is UNCHANGED and always runs; this is purely additive. No
+    # plugin claims the turn -> byte-identical to upstream.
+    try:
+        from hermes_cli.plugins import _completion_arbiter_for, _release_completion_arbiter
+        _claim = _completion_arbiter_for(str(turn_id))
+        if _claim is not None:
+            try:
+                _claim["commit_fn"](result, turn_id=str(turn_id))
+            except Exception as _exc:
+                logger.warning("completion arbiter commit failed for turn %s: %s", turn_id, _exc)
+            finally:
+                _release_completion_arbiter(str(turn_id))
+    except Exception:
+        # Registry import or delivery is best-effort; never break finalization.
+        pass
+
     return result
