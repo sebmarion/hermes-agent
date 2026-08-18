@@ -222,6 +222,10 @@ interface DiskRoot {
   /** Root-level enable posture, forwarded to the loader (see LoadOptions). */
   defaultEnabled?: boolean
   dir: string
+  /** Directory containing the candidate entry file. */
+  entryDir: (folderPath: string) => string
+  /** Basename of the candidate entry file. */
+  entryName: string
   /** Resolve a scanned folder to its candidate plugin entry file. */
   entry: (folderPath: string) => string
 }
@@ -240,7 +244,12 @@ async function diskRoots(): Promise<DiskRoot[]> {
   const standalone = await desktop.desktopPluginsRoot?.()
 
   if (standalone) {
-    roots.push({ dir: standalone, entry: folder => `${folder}/plugin.js` })
+    roots.push({
+      dir: standalone,
+      entry: folder => `${folder}/plugin.js`,
+      entryDir: folder => folder,
+      entryName: 'plugin.js'
+    })
   }
 
   const unified = await desktop.agentPluginsRoot?.()
@@ -250,7 +259,13 @@ async function diskRoots(): Promise<DiskRoot[]> {
     // user allowlists the Python half (plugins.enabled), so the desktop half
     // matches that posture — inventoried in Settings → Plugins, off until
     // toggled. The standalone desktop-plugins door keeps its default-on trust.
-    roots.push({ defaultEnabled: false, dir: unified, entry: folder => `${folder}/desktop/plugin.js` })
+    roots.push({
+      defaultEnabled: false,
+      dir: unified,
+      entry: folder => `${folder}/desktop/plugin.js`,
+      entryDir: folder => `${folder}/desktop`,
+      entryName: 'plugin.js'
+    })
   }
 
   return roots
@@ -352,6 +367,21 @@ async function scanDiskPlugins(): Promise<void> {
         seen.add(file)
 
         if (disk.has(file)) {
+          continue
+        }
+
+        // Unified agent-plugin packages are commonly Python-only. Check the
+        // optional desktop half by listing its parent directory first instead
+        // of rejecting an IPC read for every absent `desktop/plugin.js`.
+        let entryDir
+
+        try {
+          entryDir = await desktop.readDir(root.entryDir(dir.path))
+        } catch {
+          continue
+        }
+
+        if (entryDir.error || !entryDir.entries.some(entry => entry.name === root.entryName && !entry.isDirectory)) {
           continue
         }
 
