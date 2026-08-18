@@ -125,6 +125,7 @@ export function truncateSubmitParams(
 
   const hasMessageId =
     typeof truncateMessageId === 'string' && truncateMessageId.length > 0 && !isSyntheticRendererId(truncateMessageId)
+  const hasDurableAddress = hasMessageId || hasRowId
 
   if (!hasOrdinal && !hasMessageId && !hasRowId) {
     return {}
@@ -132,7 +133,11 @@ export function truncateSubmitParams(
 
   return {
     confirm_truncate: true,
-    ...(hasOrdinal ? { truncate_before_user_ordinal: truncateOrdinal } : {}),
+    // A durable id is authoritative. Renderer ordinals are positional UI
+    // coordinates and can drift after compression/reload; sending both lets a
+    // stale ordinal contradict the durable target and correctly trips the
+    // gateway's fail-closed 4030 guard.
+    ...(hasOrdinal && !hasDurableAddress ? { truncate_before_user_ordinal: truncateOrdinal } : {}),
     ...(hasMessageId ? { truncate_before_message_id: truncateMessageId } : {}),
     ...(hasRowId ? { truncate_before_row_id: truncateRowId } : {}),
     ...(truncateOrdinal === 0 ? { confirm_empty_truncate: true } : {})

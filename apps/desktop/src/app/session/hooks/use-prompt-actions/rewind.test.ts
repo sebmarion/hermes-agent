@@ -125,10 +125,9 @@ describe('truncateSubmitParams', () => {
     }
   })
 
-  it('includes truncate_before_row_id when passed', () => {
+  it('prefers durable ids over a potentially stale client ordinal', () => {
     expect(truncateSubmitParams(1, 'msg-123', 456)).toEqual({
       confirm_truncate: true,
-      truncate_before_user_ordinal: 1,
       truncate_before_message_id: 'msg-123',
       truncate_before_row_id: 456
     })
@@ -142,7 +141,6 @@ describe('truncateSubmitParams', () => {
     // chat-messages.ts: `${timestamp}-${index}-${role}`
     expect(truncateSubmitParams(1, '1723456789-0-user', 456)).toEqual({
       confirm_truncate: true,
-      truncate_before_user_ordinal: 1,
       truncate_before_row_id: 456
     })
     expect(truncateSubmitParams(0, 'user-1723456789-0', undefined)).toEqual({
@@ -475,7 +473,7 @@ describe('runRewindSubmit durable-address discipline (#87059)', () => {
     expect(submit?.params?.confirm_truncate).toBeUndefined()
   })
 
-  it('leaves a bound durable rowId untouched (no extra history call)', async () => {
+  it('uses a bound durable rowId alone (no stale ordinal or extra history call)', async () => {
     const calls: Call[] = []
 
     await runRewindSubmit(makeGateway(calls), 'sid', 'fixed prompt', 1, undefined, false, undefined, 13, 'typo prompt')
@@ -485,7 +483,7 @@ describe('runRewindSubmit durable-address discipline (#87059)', () => {
     const submit = calls.find(call => call.method === 'prompt.submit')
 
     expect(submit?.params?.truncate_before_row_id).toBe(13)
-    expect(submit?.params?.truncate_before_user_ordinal).toBe(1)
+    expect(submit?.params?.truncate_before_user_ordinal).toBeUndefined()
   })
 })
 
