@@ -7,8 +7,9 @@ Sequences the improve pipeline deterministically:
 
 The APPLY-DECISION policy lives in `decide()` — pure and deterministic, so the
 rulebook is pinned by tests without any live model or network dependency. The
-live Zeus/judge/apply wiring is not implemented in this script; non-dry CLI
-execution refuses to proceed rather than pretending to run it.
+The live Zeus/judge/apply wiring is implemented by `live_pipeline.py` and
+`improve_cron_entry.py`; this module keeps the pure decision policy used by
+that chain.
 
 Decision policy (fail-closed, autonomous):
   1. If ANY gate fails  -> action="block"  (nothing applied; reason names blocker).
@@ -45,6 +46,7 @@ class GateResult:
     replay_passes: bool = False
     has_secrets: bool = False
     change_class: str = "skill"
+    verdict: str | None = None
 
 
 def decide(gate: dict) -> dict:
@@ -60,6 +62,8 @@ def decide(gate: dict) -> dict:
     if g.scorecard_mean < g.threshold:
         blockers.append(f"score {g.scorecard_mean:.2f} below threshold {g.threshold}")
 
+    if g.verdict is not None and g.verdict not in {"better", "equal"}:
+        blockers.append(f"judge verdict {g.verdict!r} is not promotable")
     if blockers:
         return {"action": "block", "reason": "gate failed: " + ", ".join(blockers)}
 

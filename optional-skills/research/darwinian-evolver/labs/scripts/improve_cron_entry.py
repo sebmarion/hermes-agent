@@ -11,8 +11,10 @@ idempotent so a double-fire is harmless:
   - fetches + filters X bookmarks (cheap, no LLM),
   - writes a report describing the preflight result.
 
-The live Zeus/judge/apply chain is not wired here. After harvesting, the entry
-therefore still halts non-zero and never claims a successful improvement run.
+After harvesting, the bounded Zeus -> independent judge -> score -> apply
+chain runs for each new failure. Every candidate is append-only and is
+applied atomically with a backup; malformed model output halts that
+candidate without mutating the live skill.
 
 Transient network or state failures are captured into the report and surfaced
 as a non-zero result.
@@ -21,15 +23,51 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import harvest_failures as hf
+from live_pipeline import run_live_chain
 import pipeline_state as ps
+import apply_skill_candidate
+import propose_zeus_candidate
 
 # Where labs stores its per-run state (override with --state-dir in tests)
 DEFAULT_STATE_DIR = Path.home() / ".hermes" / "labs" / "bestplan-research" / "state"
+MAX_CANDIDATES_PER_RUN = 3
+_DEFAULT_SKILL_LINK = Path.home() / ".hermes" / "skills" / "software-development" / "bestplan" / "SKILL.md"
+DEFAULT_SKILL_PATH = _DEFAULT_SKILL_LINK.resolve()
+DEFAULT_LIVE_SKILLS = DEFAULT_SKILL_PATH.parents[2]
+
+
+def _load_pending(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError("pending failure row must be an object")
+        rows.append(row)
+    return rows
+
+
+def _merge_failures(pending: list[dict], new: list[dict]) -> list[dict]:
+    merged = []
+    seen = set()
+    for row in [*pending, *new]:
+        key = str(row.get("task_id") or row.get("session_seq") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    return merged
 
 
 def main(argv) -> int:
@@ -37,6 +75,12 @@ def main(argv) -> int:
     ap.add_argument("--state-dir", default=None)
     ap.add_argument("--report-out", default=None)
     ap.add_argument("--db-path", type=Path, default=None)
+    ap.add_argument("--live-skills", type=Path, default=DEFAULT_LIVE_SKILLS)
+    ap.add_argument(
+        "--skill-path",
+        type=Path,
+        default=DEFAULT_SKILL_PATH,
+    )
     args = ap.parse_args(argv[1:] if argv and not argv[0].startswith("-") else argv)
 
     state_dir = Path(args.state_dir) if args.state_dir else DEFAULT_STATE_DIR
@@ -50,26 +94,37 @@ def main(argv) -> int:
         "watermark_sessions": None,
         "watermark_bookmarks": None,
         "n_failures_new": 0,
+        "n_failures_pending": 0,
         "n_bookmarks_actionable": 0,
         "halted": False,
         "notes": [],
     }
+    pending_path = state_dir / "pending_failures.jsonl"
+    try:
+        pending = _load_pending(pending_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        report["notes"].append(f"pending failure queue unreadable: {exc}")
+        report["ok"] = False
+        report["halted"] = True
+        pending = []
 
     # Step 1: harvest session failures from the canonical Hermes state DB.
     wm = ps.read_watermark(state_dir, "sessions") or 0
     report["watermark_sessions"] = wm
     try:
         sessions = hf.load_hermes_sessions(args.db_path)
-        failures = hf.extract_failures(sessions, watermark_seq=wm)
+        new_failures = hf.extract_failures(sessions, watermark_seq=wm)
+        failures = _merge_failures(pending, new_failures)
         failures_path = state_dir / "failures.jsonl"
-        hf.write_facts(failures_path, failures)
+        hf.write_facts(failures_path, new_failures)
         max_seq = max((int(row["seq"]) for row in sessions), default=wm)
         ps.write_watermark(state_dir, "sessions", max(max_seq, wm))
         report["watermark_sessions"] = max(max_seq, wm)
-        report["n_failures_new"] = len(failures)
+        report["n_failures_new"] = len(new_failures)
+        report["n_failures_pending"] = len(failures)
         report["steps"].append(
             f"harvest_failures: {len(sessions)} completed sessions, "
-            f"{len(failures)} new failures"
+            f"{len(new_failures)} new failures, {len(failures)} queued"
         )
     except Exception as exc:  # noqa: BLE001 - state failures must halt closed
         report["steps"].append("harvest_failures: failed")
@@ -77,12 +132,88 @@ def main(argv) -> int:
         report["ok"] = False
         report["halted"] = True
 
-    # The live proposal/judge/apply chain remains intentionally fail-closed.
-    report["notes"].append("live Zeus/judge/apply chain is not wired; no candidate may be applied")
-    report["ok"] = False
-    report["halted"] = True
+    # Step 2: bounded live proposal -> independent judge -> score -> apply.
+    if report["ok"] and failures:
+        try:
+            selected_failures = failures[:MAX_CANDIDATES_PER_RUN]
+            def proposer(prompt: str) -> str:
+                return propose_zeus_candidate.call_zeus(
+                    os.environ.get("ZEUS_BASE_URL", "http://100.86.155.23:8080/v1"),
+                    os.environ.get("ZEUS_API_KEY", "local-no-auth-needed"),
+                    os.environ.get("ZEUS_MODEL", "qwen3.8-27b"),
+                    prompt,
+                )
 
-    # Step 2: bookmarks (read-only xurl, cheap filter).
+            def judge(prompt: str) -> str:
+                hermes = shutil.which("hermes")
+                if not hermes:
+                    fallback = Path.home() / ".local" / "bin" / "hermes"
+                    hermes = str(fallback) if fallback.is_file() else None
+                if not hermes:
+                    raise RuntimeError("Hermes CLI unavailable for non-Zeus judge")
+                completed = subprocess.run(
+                    [
+                        hermes,
+                        "-z",
+                        prompt,
+                        "--provider",
+                        "openai-codex",
+                        "--model",
+                        "gpt-5.6-sol",
+                        "--reasoning",
+                        "low",
+                        "--safe-mode",
+                        "--ignore-rules",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    check=False,
+                )
+                if completed.returncode != 0 or not completed.stdout.strip():
+                    raise RuntimeError(f"non-Zeus judge failed with exit {completed.returncode}")
+                return completed.stdout.strip()
+
+            chain = run_live_chain(
+                failures=selected_failures,
+                state_dir=state_dir,
+                live_skills=args.live_skills,
+                skill_path=args.skill_path,
+                proposer=proposer,
+                judge=judge,
+                applier=apply_skill_candidate.apply,
+                run_id=ts,
+            )
+            report["live_chain"] = chain
+            report["steps"].append(chain.get("summary", "live_chain: completed"))
+            if not chain.get("ok"):
+                report["ok"] = False
+                report["halted"] = True
+                report["notes"].extend(chain.get("notes", []))
+            processed_ids = {
+                str(task_id)
+                for task_id in [*chain.get("applied", []), *chain.get("blocked", [])]
+            }
+            if chain.get("ok") and not chain.get("blocked"):
+                processed_ids.update(str(row.get("task_id")) for row in selected_failures)
+            pending = [
+                row for row in failures if str(row.get("task_id")) not in processed_ids
+            ]
+            hf.write_facts(pending_path, pending)
+            report["n_failures_pending"] = len(pending)
+            if pending:
+                report["steps"].append(f"pending_failures: {len(pending)} remain queued")
+        except Exception as exc:  # noqa: BLE001 - model/runtime failure is fail-closed
+            report["notes"].append(f"live chain failed: {exc}")
+            report["ok"] = False
+            report["halted"] = True
+            try:
+                hf.write_facts(pending_path, failures)
+                report["n_failures_pending"] = len(failures)
+            except (OSError, TypeError, ValueError) as queue_exc:
+                report["notes"].append(f"pending failure queue could not be saved: {queue_exc}")
+
+    # Step 3: bookmarks (read-only xurl, cheap filter).
     try:
         import harvest_x_bookmarks as hx
 

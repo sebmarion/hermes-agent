@@ -68,6 +68,42 @@ deployment. Everything runs inside the isolated worktree on one local branch.
     `equal` is a valid, acceptable outcome: it means "no regression", not "win".
 11. **Commit** — one local commit of allowed files only (see invariant 4). No push.
 
+### Live cron wiring (implemented)
+
+The scheduler entry now executes the bounded chain for each newly harvested
+failure:
+
+```text
+canonical state.db
+  -> sanitized failure row
+  -> Zeus proposer (qwen3.8-27b)
+  -> append-only candidate materialization
+  -> non-Zeus headless reviewer (gpt-5.6-sol via openai-codex)
+  -> strict verdict/score validation + scorecard
+  -> fail-closed decision
+  -> atomic apply with .bak + manifest
+```
+
+The reviewer is launched with `hermes -z` in headless mode because the cron row
+is `--no-agent`; it is explicitly pinned to the non-Zeus `openai-codex`
+provider. Zeus output may be a fenced unified diff, but the pipeline extracts
+only added lines and rejects deletions, path changes, malformed judge JSON,
+secrets, low scores, and `worse` verdicts. A successful apply is recorded in
+the report under `live_chain`; an unavailable optional X bookmark source still
+reports a halt rather than claiming a completely green run. The scheduler
+caps live candidates at three per run and persists remaining sanitized rows in
+`state/pending_failures.jsonl`, so a large backlog cannot overrun the cron
+timeout or disappear after watermark advancement.
+
+The isolated smoke path is:
+
+```bash
+.venv/bin/python optional-skills/research/darwinian-evolver/labs/scripts/improve_cron_entry.py \
+  --state-dir <tmp>/state --db-path <tmp>/state.db \
+  --live-skills <tmp>/skills \
+  --skill-path <tmp>/skills/software-development/bestplan/SKILL.md
+```
+
 ## Cleanup
 
 - Remove the worktree with `git worktree remove <path>` after the run is done.
