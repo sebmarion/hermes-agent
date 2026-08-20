@@ -3,9 +3,11 @@
 
 This is deliberately NOT a blind ``git pull``. It builds a clean preview from
 ``origin/main`` and overlays only the edge paths owned by this system:
-``optional-skills/`` and ``tests/skills/``. Core Hermes code is never copied
-from the local fork into the preview; therefore the resulting core is exactly
-upstream's core, even when the fork histories have no merge-base.
+``optional-skills/``, ``tests/skills/``, and the explicitly owned scheduler
+paths ``cron/scheduler.py`` and ``tests/cron/test_cron_script.py``. Other core
+Hermes code is never copied from the local fork into the preview; therefore the
+resulting core is exactly upstream's core, even when the fork histories have no
+merge-base.
 
 State records the owned edge paths and their last applied hashes. On bootstrap,
 paths that are absent from upstream or differ from upstream are conservatively
@@ -31,6 +33,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 EDGE_PREFIXES = ("optional-skills/", "tests/skills/")
+OWNED_PATHS = ("cron/scheduler.py", "tests/cron/test_cron_script.py")
+SNAPSHOT_PATHS = (*EDGE_PREFIXES, *OWNED_PATHS)
 STATE_SCHEMA = 1
 
 
@@ -57,7 +61,7 @@ def is_edge_path(path: str) -> bool:
     parts = Path(path).parts
     if ".." in parts:
         return False
-    return path.startswith(EDGE_PREFIXES)
+    return path.startswith(EDGE_PREFIXES) or path in OWNED_PATHS
 
 
 def assert_edge_only(paths) -> None:
@@ -167,6 +171,10 @@ def snapshot_worktree(root: Path) -> dict[str, str]:
         for file_path in directory.rglob("*"):
             if file_path.is_file() and ".git" not in file_path.parts:
                 result[file_path.relative_to(root).as_posix()] = _sha(file_path.read_bytes())
+    for path in OWNED_PATHS:
+        file_path = root / path
+        if file_path.is_file():
+            result[path] = _sha(file_path.read_bytes())
     return result
 
 
@@ -175,7 +183,7 @@ def snapshot(repo: Path, ref: str | None = None) -> dict[str, str]:
     if ref is not None and Path(ref).is_dir():
         return snapshot_worktree(Path(ref))
     if ref is None:
-        raw = _run(repo, "ls-files", "--", *EDGE_PREFIXES)
+        raw = _run(repo, "ls-files", "--", *SNAPSHOT_PATHS)
         paths = [p for p in raw.splitlines() if p]
         result = {}
         for path in paths:
@@ -183,7 +191,7 @@ def snapshot(repo: Path, ref: str | None = None) -> dict[str, str]:
             if file_path.is_file():
                 result[path] = _sha(file_path.read_bytes())
         return result
-    raw = _run(repo, "ls-tree", "-r", "--name-only", ref, "--", *EDGE_PREFIXES)
+    raw = _run(repo, "ls-tree", "-r", "--name-only", ref, "--", *SNAPSHOT_PATHS)
     result = {}
     for path in raw.splitlines():
         data = _blob(repo, ref, path)

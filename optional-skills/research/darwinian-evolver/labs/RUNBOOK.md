@@ -135,7 +135,8 @@ live checkout + sebmarion/main (apply/publish mode)
 Safety contract:
 
 - Core Hermes is never copied from the local fork into the candidate; the
-  candidate core is byte-for-byte `origin/main`.
+  candidate core is byte-for-byte `origin/main`, except for the explicitly
+  owned scheduler paths `cron/scheduler.py` and `tests/cron/test_cron_script.py`.
 - First bootstrap conservatively classifies local edge differences as owned;
   subsequent runs use `~/.hermes/labs/bestplan-research/state/upstream-sync.json`
   to detect newly edited edge files and preserve them.

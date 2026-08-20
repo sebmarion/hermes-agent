@@ -15,19 +15,21 @@ import improve_cron_entry as entry  # noqa: E402
 from hermes_state import SessionDB
 
 
-def test_bookmark_failure_halts_and_reports_failure(tmp_path: Path, monkeypatch) -> None:
+def test_bookmark_failure_is_skipped_without_failing_cron(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(entry, "DEFAULT_STATE_DIR", tmp_path)
 
     def unavailable(_n):
         raise RuntimeError("xurl unavailable")
 
     monkeypatch.setattr(hx, "fetch_bookmarks", unavailable)
-    assert entry.main(["entry"]) != 0
+    monkeypatch.setattr(entry.hf, "load_hermes_sessions", lambda _db_path=None: [])
+    assert entry.main(["entry"]) == 0
     reports = list(tmp_path.glob("report-*.json"))
     assert len(reports) == 1
     report = json.loads(reports[0].read_text())
-    assert report["ok"] is False
-    assert report["halted"] is True
+    assert report["ok"] is True
+    assert report["halted"] is False
+    assert report["steps"][-1] == "harvest_x: skipped"
 
 
 def test_cron_harvests_real_session_rows_before_halting_live_chain(

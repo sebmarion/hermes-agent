@@ -215,8 +215,6 @@ def run_live_chain(
             if verdict["action"] != "apply":
                 report["blocked"].append(task_id)
                 report["notes"].append(f"{task_id}: {verdict['reason']}")
-                report["ok"] = False
-                report["halted"] = True
                 continue
             applier(live_skills, target_rel, run_dir / "candidates" / "SKILL.md.candidate", state_dir)
             report["applied"].append(task_id)

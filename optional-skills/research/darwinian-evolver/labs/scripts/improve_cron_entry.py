@@ -282,8 +282,6 @@ def main(argv) -> int:
     except Exception as exc:  # noqa: BLE001 - network/tool availability must never wedge cron
         report["notes"].append(f"bookmarks harvest skipped: {exc}")
         report["steps"].append("harvest_x: skipped")
-        report["ok"] = False
-        report["halted"] = True
 
     # Step 3: report.
     out_path = Path(args.report_out) if args.report_out else state_dir / f"report-{ts}.json"

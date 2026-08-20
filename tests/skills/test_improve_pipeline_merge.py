@@ -23,6 +23,8 @@ def test_edge_path_allowlist_is_narrow() -> None:
     assert mu.is_edge_path("optional-skills/research/darwinian-evolver/SKILL.md")
     assert mu.is_edge_path("optional-skills/research/darwinian-evolver/labs/scripts/merge_upstream.py")
     assert mu.is_edge_path("tests/skills/test_improve_pipeline_merge.py")
+    assert mu.is_edge_path("cron/scheduler.py")
+    assert mu.is_edge_path("tests/cron/test_cron_script.py")
     assert not mu.is_edge_path("agent/run_agent.py")
     assert not mu.is_edge_path("hermes_cli/main.py")
     assert not mu.is_edge_path("package-lock.json")
@@ -125,8 +127,12 @@ def test_build_preview_starts_from_upstream_and_overlays_owned_edge(tmp_path: Pa
     _git(repo, "config", "user.name", "test")
     _git(repo, "config", "user.email", "test@example.invalid")
     (repo / "agent").mkdir()
+    (repo / "cron").mkdir()
+    (repo / "tests/cron").mkdir(parents=True)
     (repo / "optional-skills").mkdir()
     (repo / "agent/core.py").write_text("base-core")
+    (repo / "cron/scheduler.py").write_text("base-scheduler")
+    (repo / "tests/cron/test_cron_script.py").write_text("base-scheduler-test")
     (repo / "optional-skills/own.md").write_text("local-edge")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "base")
@@ -134,6 +140,8 @@ def test_build_preview_starts_from_upstream_and_overlays_owned_edge(tmp_path: Pa
 
     # Upstream advances core and leaves its edge file at a different value.
     (repo / "agent/core.py").write_text("upstream-core")
+    (repo / "cron/scheduler.py").write_text("upstream-scheduler")
+    (repo / "tests/cron/test_cron_script.py").write_text("upstream-scheduler-test")
     (repo / "optional-skills/own.md").write_text("upstream-edge")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "upstream")
@@ -142,6 +150,8 @@ def test_build_preview_starts_from_upstream_and_overlays_owned_edge(tmp_path: Pa
     # Local line diverges from the same base with an owned edge change.
     _git(repo, "checkout", "-q", base)
     (repo / "optional-skills/own.md").write_text("local-owned-edge")
+    (repo / "cron/scheduler.py").write_text("local-scheduler-fix")
+    (repo / "tests/cron/test_cron_script.py").write_text("local-scheduler-test")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "local edge")
     local = _git(repo, "rev-parse", "HEAD")
@@ -151,5 +161,7 @@ def test_build_preview_starts_from_upstream_and_overlays_owned_edge(tmp_path: Pa
     report = mu.build_preview(repo, upstream, local, state, preview)
     assert (preview / "agent/core.py").read_text() == "upstream-core"
     assert (preview / "optional-skills/own.md").read_text() == "local-owned-edge"
+    assert (preview / "cron/scheduler.py").read_text() == "local-scheduler-fix"
+    assert (preview / "tests/cron/test_cron_script.py").read_text() == "local-scheduler-test"
     assert "optional-skills/own.md" in report["owned_paths"]
     _git(repo, "worktree", "remove", "--force", str(preview))
