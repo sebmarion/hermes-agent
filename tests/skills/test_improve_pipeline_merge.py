@@ -1,0 +1,137 @@
+"""TDD contract for the daily upstream merge planner.
+
+The updater must preserve only the edge surfaces owned by this system and must
+fail closed when the local line contains unknown/core changes. These tests use
+small temporary git repositories and inject the command runner where practical;
+no remote or live checkout is touched.
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+SCRIPTS = Path(__file__).resolve().parents[2] / "optional-skills/research/darwinian-evolver/labs/scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+import merge_upstream as mu  # noqa: E402
+
+
+def test_edge_path_allowlist_is_narrow() -> None:
+    assert mu.is_edge_path("optional-skills/research/darwinian-evolver/SKILL.md")
+    assert mu.is_edge_path("optional-skills/research/darwinian-evolver/labs/scripts/merge_upstream.py")
+    assert mu.is_edge_path("tests/skills/test_improve_pipeline_merge.py")
+    assert not mu.is_edge_path("agent/run_agent.py")
+    assert not mu.is_edge_path("hermes_cli/main.py")
+    assert not mu.is_edge_path("package-lock.json")
+
+
+def test_core_changes_are_rejected() -> None:
+    with pytest.raises(mu.ScopeViolation, match="hermes_cli/main.py"):
+        mu.assert_edge_only(["optional-skills/foo/SKILL.md", "hermes_cli/main.py"])
+
+
+def test_diff_status_preserves_add_modify_delete_operations() -> None:
+    raw = "A\toptional-skills/a/SKILL.md\nM\ttests/skills/test_a.py\nD\toptional-skills/b/SKILL.md\n"
+    assert mu.parse_name_status(raw) == [
+        ("A", "optional-skills/a/SKILL.md"),
+        ("M", "tests/skills/test_a.py"),
+        ("D", "optional-skills/b/SKILL.md"),
+    ]
+
+
+def test_overlay_operations_are_edge_only() -> None:
+    ops = mu.overlay_operations(
+        [("A", "optional-skills/a/SKILL.md"), ("D", "optional-skills/b/SKILL.md")]
+    )
+    assert ops == [("copy", "optional-skills/a/SKILL.md"), ("delete", "optional-skills/b/SKILL.md")]
+
+
+def test_conservation_detects_missing_edge_content() -> None:
+    with pytest.raises(mu.ConservationError, match="optional-skills/a/SKILL.md"):
+        mu.assert_conserved(
+            expected={"optional-skills/a/SKILL.md": "sha256:abc"},
+            actual={"optional-skills/a/SKILL.md": "sha256:def"},
+        )
+
+
+def test_conservation_accepts_exact_edge_content() -> None:
+    expected = {"optional-skills/a/SKILL.md": "sha256:abc"}
+    assert mu.assert_conserved(expected=expected, actual=dict(expected)) is None
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.check_output(["git", *args], cwd=repo, text=True).strip()
+
+
+def test_temp_repo_overlay_carries_edge_delta_and_not_core(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    (repo / "agent").mkdir()
+    (repo / "agent/core.py").write_text("upstream-core")
+    (repo / "optional-skills").mkdir()
+    (repo / "optional-skills/own.md").write_text("edge-v1")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "optional-skills/own.md").write_text("edge-v2")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "edge change")
+    head = _git(repo, "rev-parse", "HEAD")
+    assert mu.changed_name_status(repo, base, head) == [("M", "optional-skills/own.md")]
+
+
+def test_remote_url_guard_rejects_unknown_push_target() -> None:
+    with pytest.raises(mu.RemoteGuardError):
+        mu.assert_fork_remote("https://github.com/NousResearch/hermes-agent.git")
+    mu.assert_fork_remote("git@github.com:sebmarion/hermes-agent.git")
+
+
+def test_https_fork_remote_is_converted_to_ssh_for_push(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "remote", "add", "sebmarion", "https://github.com/sebmarion/hermes-agent.git")
+    assert mu._ssh_push_url(repo, "sebmarion") == "git@github.com:sebmarion/hermes-agent.git"
+
+
+def test_build_preview_starts_from_upstream_and_overlays_owned_edge(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    (repo / "agent").mkdir()
+    (repo / "optional-skills").mkdir()
+    (repo / "agent/core.py").write_text("base-core")
+    (repo / "optional-skills/own.md").write_text("local-edge")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+
+    # Upstream advances core and leaves its edge file at a different value.
+    (repo / "agent/core.py").write_text("upstream-core")
+    (repo / "optional-skills/own.md").write_text("upstream-edge")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "upstream")
+    upstream = _git(repo, "rev-parse", "HEAD")
+
+    # Local line diverges from the same base with an owned edge change.
+    _git(repo, "checkout", "-q", base)
+    (repo / "optional-skills/own.md").write_text("local-owned-edge")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "local edge")
+    local = _git(repo, "rev-parse", "HEAD")
+    state = tmp_path / "state" / "upstream-sync.json"
+    preview = tmp_path / "preview"
+
+    report = mu.build_preview(repo, upstream, local, state, preview)
+    assert (preview / "agent/core.py").read_text() == "upstream-core"
+    assert (preview / "optional-skills/own.md").read_text() == "local-owned-edge"
+    assert "optional-skills/own.md" in report["owned_paths"]
+    _git(repo, "worktree", "remove", "--force", str(preview))

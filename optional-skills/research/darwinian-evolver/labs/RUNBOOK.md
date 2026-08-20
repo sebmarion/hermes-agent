@@ -67,3 +67,50 @@ deployment. Everything runs inside the isolated worktree on one local branch.
 
 - Remove the worktree with `git worktree remove <path>` after the run is done.
 - The run dir stays outside git for Seb's review; never add it to a commit.
+
+## Daily upstream sync — core stays upstream, edge functionality is conserved
+
+`merge_upstream.py` is the daily pull/upgrade path. It does **not** run a blind
+`git pull` or merge arbitrary fork code. It builds a temporary candidate from
+`origin/main`, overlays only `optional-skills/` and `tests/skills/` paths that
+are locally owned, verifies conservation, runs the skills suite, and only then
+can apply/publish.
+
+```text
+origin/main
+    ↓ clean temporary worktree
+owned edge paths only  ←  local edge manifest/state
+    ↓ tests/skills green
+live checkout + sebmarion/main (apply/publish mode)
+```
+
+Safety contract:
+
+- Core Hermes is never copied from the local fork into the candidate; the
+  candidate core is byte-for-byte `origin/main`.
+- First bootstrap conservatively classifies local edge differences as owned;
+  subsequent runs use `~/.hermes/labs/bestplan-research/state/upstream-sync.json`
+  to detect newly edited edge files and preserve them.
+- A dirty live checkout halts. No stash, reset, or implicit conflict choice.
+- Publishing uses `--force-with-lease` only after verifying the push URL is the
+  `sebmarion/hermes-agent` fork; `origin` is fetch-only.
+- A separate `flock` wrapper prevents overlapping daily runs. Success and halt
+  summaries go through the redacting Telegram notifier.
+
+The registered job invokes:
+
+```bash
+hermes cron create --name hermes-upstream-sync "30 4 * * *" \
+  --no-agent --script upstream_merge_wrapper.py --deliver local
+```
+
+Manual preview (no live mutation):
+
+```bash
+.venv/bin/python optional-skills/research/darwinian-evolver/labs/scripts/merge_upstream.py \
+  --repo /home/seb/projects/hermes-agent --state-dir ~/.hermes/labs/bestplan-research/state
+```
+
+The wrapper's apply/publish mode will safely halt while another checkout has
+uncommitted work; it resumes on the next daily run after that work is committed
+or discarded by its owner.
