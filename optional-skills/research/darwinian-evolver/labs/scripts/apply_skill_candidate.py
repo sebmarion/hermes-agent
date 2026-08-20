@@ -5,8 +5,8 @@ Contract with the improve loop: the orchestrator approves an edit (all gates
 green, skill-path class) and hands us (live_skills_dir, skill_relpath,
 candidate_path, state_dir). Steps:
 
-  1. Snapshot the CURRENT live file to <target>.bak (only the first time;
-     an existing .bak stays untouched as the older known-good).
+  1. Snapshot the CURRENT live file to <state>/backups/<target>.bak (only the
+     first time; an existing backup stays untouched as the older known-good).
   2. Atomically copy candidate → live target (tmp file + os.replace).
   3. Record the change in the apply manifest so a torn or later-deemed-bad
      change can be restored from the .bak deterministically.
@@ -77,7 +77,8 @@ def apply(live: Path, target: str, candidate: Path, state_dir: Path, _copy=None)
     cpy = _copy or _atomic_copy
     bak_path = None
     if live_path.is_file():
-        bak_path = live_path.with_name(live_path.name + ".bak")
+        bak_path = Path(state_dir) / "backups" / target_path
+        bak_path = bak_path.with_name(bak_path.name + ".bak")
         if not bak_path.is_file():
             cpy(live_path, bak_path)
 

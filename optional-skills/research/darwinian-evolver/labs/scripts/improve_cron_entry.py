@@ -22,6 +22,7 @@ as a non-zero result.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -35,6 +36,7 @@ from live_pipeline import run_live_chain
 import pipeline_state as ps
 import apply_skill_candidate
 import propose_zeus_candidate
+import promote_skill
 
 # Where labs stores its per-run state (override with --state-dir in tests)
 DEFAULT_STATE_DIR = Path.home() / ".hermes" / "labs" / "bestplan-research" / "state"
@@ -68,6 +70,42 @@ def _merge_failures(pending: list[dict], new: list[dict]) -> list[dict]:
         seen.add(key)
         merged.append(row)
     return merged
+
+
+def _verify_skill_for_promotion(skill_path: Path, session_id: str) -> dict:
+    """Run the skill validator and the real OCR gate before Git promotion."""
+    validator = skill_path.parent / "scripts" / "validate_bestplan.py"
+    if not validator.is_file():
+        return {"status": "failed", "reason": f"validator missing: {validator}"}
+    completed = subprocess.run(
+        [sys.executable, str(validator)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return {
+            "status": "failed",
+            "reason": "BestPlan validator failed",
+            "stdout": completed.stdout[-1000:],
+            "stderr": completed.stderr[-1000:],
+        }
+
+    plugin_path = Path(__file__).resolve().parents[5] / "plugins" / "hermes-bestplan" / "bestplan_ocr.py"
+    spec = importlib.util.spec_from_file_location("hermes_bestplan_ocr_promotion", plugin_path)
+    if spec is None or spec.loader is None:
+        return {"status": "failed", "reason": f"OCR plugin could not load: {plugin_path}"}
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    receipt = module.verify_ocr_for_turn(session_id=session_id, changed_paths=[str(skill_path)])
+    if receipt.get("status") != "passed":
+        return {"status": "failed", "reason": "OCR gate failed", "ocr": receipt}
+    return {
+        "status": "passed",
+        "validator": "passed",
+        "ocr": receipt,
+    }
 
 
 def main(argv) -> int:
@@ -203,6 +241,26 @@ def main(argv) -> int:
             report["n_failures_pending"] = len(pending)
             if pending:
                 report["steps"].append(f"pending_failures: {len(pending)} remain queued")
+            if chain.get("applied"):
+                try:
+                    repo = promote_skill.repository_root(args.skill_path)
+                    target_rel = promote_skill.relative_path(repo, args.skill_path)
+                    promotion = promote_skill.promote(
+                        repo=repo,
+                        changed_paths=[target_rel],
+                        verify=lambda paths: _verify_skill_for_promotion(
+                            args.skill_path, f"improve-promotion-{ts}"
+                        ),
+                    )
+                    report["promotion"] = promotion
+                    report["steps"].append(
+                        f"promotion: pushed {promotion['commit'][:12]} to "
+                        f"{promotion['remote']}/{promotion['branch']}"
+                    )
+                except Exception as exc:  # noqa: BLE001 - promotion is fail-closed
+                    report["notes"].append(f"skill promotion failed: {exc}")
+                    report["ok"] = False
+                    report["halted"] = True
         except Exception as exc:  # noqa: BLE001 - model/runtime failure is fail-closed
             report["notes"].append(f"live chain failed: {exc}")
             report["ok"] = False

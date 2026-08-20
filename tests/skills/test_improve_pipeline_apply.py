@@ -42,9 +42,10 @@ def test_apply_writes_bak_and_new_content(tmp_path: Path) -> None:
 
     result = ap.apply(live=live, target="SKILL.md", candidate=candidate, state_dir=tmp_path / "state")
     assert result["ok"] is True
-    bak = live / "SKILL.md.bak"
-    assert bak.is_file(), "original must be preserved to SKILL.md.bak"
+    bak = tmp_path / "state" / "backups" / "SKILL.md.bak"
+    assert bak.is_file(), "original must be preserved outside the skill root"
     assert bak.read_text() == "ORIGINAL CONTENT v1"
+    assert not (live / "SKILL.md.bak").exists()
     assert (live / "SKILL.md").read_text() == "CANDIDATE CONTENT v2"
 
 

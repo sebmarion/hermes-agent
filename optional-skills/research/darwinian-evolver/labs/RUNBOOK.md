@@ -15,7 +15,8 @@ deployment. Everything runs inside the isolated worktree on one local branch.
 4. Only the target `SKILL.md`, contracts, tests, runbook, and scripts may be
    committed. Run directories, transcripts, judge JSONL, scorecards, and raw
    diffs are **never** committed.
-5. At most **one local commit** at the end, only if every gate passes. Never push.
+5. At most **one promotion commit** at the end, only after validation and OCR pass.
+   Push is fast-forward-only, and the remote SHA must be read back into the report.
 
 ## Directory layout (run dir)
 
@@ -42,6 +43,7 @@ deployment. Everything runs inside the isolated worktree on one local branch.
 | G5 | Independent (non-Zeus) review of diff scope/safety | `delegate_task(mode="review")` | Do not promote |
 | G6 | GitNexus risk review of affected symbols | gitnexus impact/trace | Do not commit |
 | G7 | Full repo validation green | `scripts/run_tests.sh` (full) | Fix before any commit |
+| G8 | BestPlan validator + OCR receipt passed | `validate_bestplan.py` + live OCR plugin | Do not commit or push |
 
 ## Steps
 
@@ -66,7 +68,10 @@ deployment. Everything runs inside the isolated worktree on one local branch.
 9. **Full validation** — G7 in the worktree.
 10. **Decision** — promote only on a *consistent* blind win **and** clean reviews.
     `equal` is a valid, acceptable outcome: it means "no regression", not "win".
-11. **Commit** — one local commit of allowed files only (see invariant 4). No push.
+11. **Promote** — validate the target, stage only the accepted SKILL.md, create one
+    commit, push `HEAD:main` fast-forward-only, and verify `git ls-remote` matches
+    the commit. Pre-existing staged work aborts promotion; unrelated unstaged work
+    remains untouched.
 
 ### Live cron wiring (implemented)
 
@@ -81,7 +86,9 @@ canonical state.db
   -> non-Zeus headless reviewer (gpt-5.6-sol via openai-codex)
   -> strict verdict/score validation + scorecard
   -> fail-closed decision
-  -> atomic apply with .bak + manifest
+  -> atomic apply with state/backups + manifest
+  -> BestPlan validator + OCR
+  -> target-only commit + fast-forward push + remote read-back
 ```
 
 The reviewer is launched with `hermes -z` in headless mode because the cron row
