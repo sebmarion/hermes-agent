@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import sys
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Same conservative credential scan so a failure body can never carry a secret
 # into a candidate prompt or on-disk file.
@@ -58,6 +60,32 @@ PROPOSER_TEMPLATE = (
     "runnable checks over generic advice. Never include secrets.\n\n"
     "HARVESTED FAILURE:\ntitle: {title}\nsignature: {signature}\nevidence:\n{instructions}\n"
 )
+
+
+def _validate_base_url(base_url: str) -> str:
+    """Reject credential-bearing URLs and plain HTTP to public hosts."""
+    parsed = urlsplit(str(base_url).strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Zeus base URL must include an http(s) scheme and host")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Zeus base URL must not contain credentials or URL suffixes")
+    if parsed.scheme == "http":
+        host = parsed.hostname.lower().rstrip(".")
+        local = host in {"localhost", "localhost.localdomain"}
+        if not local:
+            try:
+                address = ipaddress.ip_address(host)
+                local = (
+                    address.is_private
+                    or address.is_loopback
+                    or address.is_link_local
+                    or address in ipaddress.ip_network("100.64.0.0/10")
+                )
+            except ValueError:
+                local = False
+        if not local:
+            raise ValueError("HTTPS is required for public Zeus endpoints")
+    return str(base_url).strip().rstrip("/")
 
 
 def build_proposer_prompt(failure: dict, skill_path: str) -> str:
@@ -92,6 +120,15 @@ def stage_run(run_dir, task, baseline_text, candidate_text, researcher_id,
     if not (candidate_text and len(candidate_text.strip()) >= 1):
         raise ValueError("candidate_text must be non-empty")
 
+    # G2 requires real session evidence. Never fabricate a placeholder id that
+    # merely satisfies the JSON schema; the caller must resolve real ids first.
+    sess = task.get("before_session_ids") or []
+    if not isinstance(sess, list):
+        raise ValueError("real session evidence must be a list")
+    sess = [str(x) for x in sess if isinstance(x, str) and len(x) >= 10]
+    if not sess:
+        raise ValueError("real session evidence required before staging")
+
     rdir = Path(run_dir)
     bdir = rdir / "baseline"
     cdir = rdir / "candidates"
@@ -104,23 +141,13 @@ def stage_run(run_dir, task, baseline_text, candidate_text, researcher_id,
     blind = seed_blind or _BLIND_SWITCH.get(seed_blind, "A")
     candidate_sha = hashlib.sha256(_scrub(candidate_text).encode()).hexdigest()
 
-    # before_session_ids must satisfy the schema (items minLength>=10) and be
-    # *real* when available. Never emit a sub-minLength fake; when the caller
-    # didn't supply real session ids, derive a stable schema-conformant
-    # placeholder rather than writing a too-short string (fail-closed).
-    sess = task.get("before_session_ids") or []
-    if not any(isinstance(x, str) and len(x) >= 10 for x in sess):
-        sess = ["session_" + hashlib.sha256(task["task_id"].encode()).hexdigest()[:20]]
-    elif isinstance(sess, list):
-        sess = [str(x) for x in sess]
-
     row = {
         "schema_version": 1,
         "researcher_id": researcher_id,
         "task_id": task["task_id"],
         "task_title": task.get("task_title", "harvested failure")[:200],
         "task_instructions": _scrub(task.get("task_instructions", ""))[:2000],
-        "skill_path": task.get("skill_path", "skills/research/bestplan/SKILL.md"),
+        "skill_path": task.get("skill_path", "~/.hermes/skills/software-development/bestplan/SKILL.md"),
         "before_session_ids": sess,
         "after_session_ids": [],
         "blind_id": blind,
@@ -144,7 +171,7 @@ def call_zeus(base_url: str, api_key: str, model: str, prompt: str, timeout: flo
 
     Raises RuntimeError on transport/auth/HTTP error; caller treats a raise as
     'Zeus unavailable' (fail-closed => skip, do not fabricate a candidate)."""
-    url = base_url.rstrip("/") + "/chat/completions"
+    url = _validate_base_url(base_url) + "/chat/completions"
     body = json.dumps(
         {
             "model": model,
@@ -179,7 +206,7 @@ def main(argv) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run-dir", required=True, help="Run directory (runs/<id>)")
     ap.add_argument("--failures-jsonl", required=True, help="Harvested failures JSONL")
-    ap.add_argument("--skill-path", default="skills/research/bestplan/SKILL.md")
+    ap.add_argument("--skill-path", default="~/.hermes/skills/software-development/bestplan/SKILL.md")
     ap.add_argument("--base-url", default=os.environ.get("ZEUS_BASE_URL", "http://100.86.155.23:8080/v1"))
     ap.add_argument("--api-key", default=os.environ.get("ZEUS_API_KEY", "local-no-auth-needed"))
     ap.add_argument("--model", default=os.environ.get("ZEUS_MODEL", "qwen3.8-27b"))
@@ -210,10 +237,11 @@ def main(argv) -> int:
     # read current baseline from the skill path so a change is genuinely additive
     baseline_text = "# Operator-owned bestplan skill\n## Pitfalls\n"
     try:
-        if args.skill_path.startswith(("~/", "/Users/")):
-            bp = Path(args.skill_path).expanduser() if args.skill_path.startswith("~") else Path(args.skill_path)
-            if bp.is_file():
-                baseline_text = bp.read_text()
+        bp = Path(args.skill_path).expanduser()
+        if not bp.is_absolute():
+            bp = Path.cwd() / bp
+        if bp.is_file():
+            baseline_text = bp.read_text()
     except OSError:
         pass
 

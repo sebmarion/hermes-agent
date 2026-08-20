@@ -38,9 +38,8 @@ def load_ledger(path: Path):
             entries.append(row)
         else:
             bad += 1
-    # fail-closed-ish: corrupt rows are surfaced but do not abort aggregation
     if bad:
-        print(f"note: {bad} malformed ledger line(s) skipped", file=sys.stderr)
+        raise ValueError(f"{bad} malformed ledger line(s); refusing to aggregate partial evidence")
     return entries
 
 
@@ -100,8 +99,12 @@ def main(argv) -> int:
     ap.add_argument("--out", required=True, help="Weekly report markdown output path")
     args = ap.parse_args(argv[1:] if argv and not argv[0].startswith("-") else argv)
 
-    entries = load_ledger(Path(args.ledger))
-    n = write_weekly_report(Path(args.out), entries)
+    try:
+        entries = load_ledger(Path(args.ledger))
+        n = write_weekly_report(Path(args.out), entries)
+    except (OSError, ValueError) as exc:
+        print(f"RESULT: HALT — {exc}", file=sys.stderr)
+        return 1
     print(f"RESULT: OK ({n} applied changes aggregated -> {args.out})")
     return 0
 

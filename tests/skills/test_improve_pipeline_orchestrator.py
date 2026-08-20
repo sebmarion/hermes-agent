@@ -7,6 +7,7 @@ judge) are stubbed here; the real wiring lives in __main__ / runbook.
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 
 sys.path.insert(
@@ -93,3 +94,22 @@ def test_no_failures_is_noop() -> None:
     assert outcome["actions"] == []
     assert outcome["applied"] == []
     assert outcome["skipped"] == []
+
+
+def test_cli_help_starts_without_runtime_name_error() -> None:
+    script = Path(rl.__file__).resolve()
+    proc = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "usage:" in proc.stdout.lower()
+
+
+def test_cli_refuses_unwired_live_mode(tmp_path: Path) -> None:
+    failures = tmp_path / "failures.jsonl"
+    failures.write_text('{"task_id":"task_1234"}\n')
+    proc = subprocess.run(
+        [sys.executable, str(Path(rl.__file__).resolve()), "--failures-jsonl", str(failures)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "dry-run" in proc.stderr.lower()

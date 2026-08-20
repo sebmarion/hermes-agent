@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Autonomous improve-loop orchestrator.
+"""Fail-closed improve-loop decision core.
 
 Sequences the improve pipeline deterministically:
     harvest_failures -> validate -> (live) qualify_zeus -> Zeus propose ->
     blind judge -> scorecard -> reality-replay/outcome-eval -> apply decision.
 
 The APPLY-DECISION policy lives in `decide()` — pure and deterministic, so the
-rulebook is pinned by tests without any live model or network dependency.
+rulebook is pinned by tests without any live model or network dependency. The
+live Zeus/judge/apply wiring is not implemented in this script; non-dry CLI
+execution refuses to proceed rather than pretending to run it.
 
 Decision policy (fail-closed, autonomous):
   1. If ANY gate fails  -> action="block"  (nothing applied; reason names blocker).
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sys
+import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -95,7 +98,7 @@ def run_once(failures=None, bookmarks=None, gates=None, state_dir=None) -> dict:
             verdict = {"action": "skip", "reason": "no gate produced"}
         report["actions"].append({"target": tid, **verdict})
         act = verdict.get("action", "block")
-        report[act].append(tid)
+        report["skipped" if act == "skip" else act].append(tid)
         if act == "apply":
             n_applied += 1
 
@@ -127,9 +130,13 @@ def main(argv) -> int:
             if line.strip():
                 failures.append(json.loads(line))
 
-    # Without --dry-run we would run the full live chain; for now, in CLI mode
-    # we require --dry-run OR a precomputed gates file. Live network wiring is
-    # owned by the runbook/operator and guarded by the existing qualifier.
+    if not args.dry_run:
+        print(
+            "error: live Zeus/judge/apply wiring is not available; pass --dry-run explicitly",
+            file=sys.stderr,
+        )
+        return 2
+
     report = run_once(failures=failures, bookmarks=[], gates=None)
     if args.report_out:
         Path(args.report_out).parent.mkdir(parents=True, exist_ok=True)

@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import sys
 
 sys.path.insert(
@@ -92,3 +94,29 @@ def test_recover_from_backup(tmp_path: Path) -> None:
     # explicit: recover restores from .bak when told a change is bad
     ap.restore_from_bak(live / "SKILL.md.bak", live / "SKILL.md")
     assert (live / "SKILL.md").read_text() == "ORIGINAL CONTENT v1"
+
+
+def test_manifest_failure_rolls_live_file_back(tmp_path: Path, monkeypatch) -> None:
+    live, staging = _stage(tmp_path)
+    candidate = staging / "SKILL.md"
+    candidate.write_text("CANDIDATE v2")
+
+    def fail_manifest(*args, **kwargs):
+        raise OSError("state disk unavailable")
+
+    monkeypatch.setattr(ps, "write_manifest", fail_manifest)
+    try:
+        ap.apply(live=live, target="SKILL.md", candidate=candidate, state_dir=tmp_path / "state")
+    except OSError as exc:
+        assert "state disk unavailable" in str(exc)
+    else:
+        raise AssertionError("manifest failure must abort apply")
+    assert (live / "SKILL.md").read_text() == "ORIGINAL CONTENT v1"
+
+
+def test_nested_traversal_target_rejected(tmp_path: Path) -> None:
+    live, staging = _stage(tmp_path)
+    candidate = staging / "SKILL.md"
+    candidate.write_text("CANDIDATE v2")
+    with pytest.raises(ValueError, match="unsafe target"):
+        ap.apply(live=live, target="nested/../../outside.md", candidate=candidate, state_dir=tmp_path / "state")

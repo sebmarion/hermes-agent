@@ -83,7 +83,7 @@ def partition(actionable, bookmarks):
     for b in bookmarks:
         bid = b.get("id")
         digest.append({"id": bid, "full_text": _scrub(str(b.get("full_text", "")))[:400],
-                       "url": b.get("url", "")})
+                       "url": _scrub(str(b.get("url", "")))})
         if bid in seen:
             continue
         seen.add(bid)
@@ -103,7 +103,7 @@ def build_sidecar(bookmarks: list[dict]) -> list[dict]:
             {
                 "bookmark_id": str(b.get("id")),
                 "text_snippet": text[:300],
-                "url": str(b.get("url", "")),
+                "url": _scrub(str(b.get("url", ""))),
                 "extracted_idea": text[:120],
             }
         )
@@ -122,27 +122,28 @@ def write_sidecar(path: Path, records: list[dict]) -> int:
 
 def fetch_bookmarks(n: int = 50) -> list[dict]:
     """Read-only fetch via `xurl bookmarks -n N --json`. Never touches ~/.xurl.
-    Returns [] on any nonzero/parse failure (fail-closed to no-op, caller logs)."""
+    Raises RuntimeError on command, parse, or response-shape failure so callers
+    cannot confuse an unavailable X API with a valid empty result."""
     try:
         proc = subprocess.run(
             ["xurl", "bookmarks", "-n", str(n), "--json"],
             capture_output=True, text=True, timeout=60,
         )
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return []
+    except (subprocess.SubprocessError, FileNotFoundError) as exc:
+        raise RuntimeError("xurl unavailable") from exc
     if proc.returncode != 0:
-        return []
+        raise RuntimeError(f"xurl bookmarks failed with exit {proc.returncode}")
     try:
         data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("xurl returned invalid JSON") from exc
     if isinstance(data, list):
         return data
     # some versions nest under .bookmarks / .data
     for key in ("bookmarks", "data"):
         if isinstance(data, dict) and isinstance(data.get(key), list):
             return data[key]
-    return []
+    raise RuntimeError("xurl returned an unsupported bookmarks response")
 
 
 def main(argv) -> int:
@@ -152,9 +153,13 @@ def main(argv) -> int:
     ap.add_argument("-n", type=int, default=50, help="Number of bookmarks to review")
     args = ap.parse_args(argv[1:] if argv and not argv[0].startswith("-") else argv)
 
-    bms = fetch_bookmarks(args.n)
+    try:
+        bms = fetch_bookmarks(args.n)
+    except RuntimeError as exc:
+        print(f"RESULT: HALT — {exc}", file=sys.stderr)
+        return 1
     if not bms:
-        print("RESULT: SKIPPED — no bookmarks fetched (xurl unavailable/offline). No state change.")
+        print("RESULT: SKIPPED — no bookmarks returned. No state change.")
         return 0
 
     kept, digest = partition(actionable=is_actionable, bookmarks=bms)

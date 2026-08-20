@@ -46,6 +46,8 @@ def test_command_is_arglist_no_shell() -> None:
     args = nt.build_send_args("upgrade", "Telegram message content")
     assert isinstance(args, list)
     assert all(isinstance(a, str) for a in args)
+    assert args[:3] == ["hermes", "send", "--to"]
+    assert args[3] == "telegram"
     # channel/platform comes from config; a message with shell metachars must
     # survive as ONE arg (never re-split)
     evil = "x; rm -rf /"

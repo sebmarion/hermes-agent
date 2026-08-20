@@ -46,8 +46,13 @@ deployment. Everything runs inside the isolated worktree on one local branch.
 ## Steps
 
 1. **Preflight** — confirm G0; run baseline skill tests in the worktree.
-2. **Harvest** (primary=Zeus) — `session_search` for completed tasks touching the
-   chosen `skill_path`. Select up to 5. Record session ids → `before_session_ids`.
+2. **Harvest** (primary=Zeus) — `improve_cron_entry.py` reads completed
+   conversations from Hermes' canonical `~/.hermes/state.db` through the
+   read-only `SessionDB` adapter, preserving the real session ids and the
+   highest message id as the watermark. Manual `session_search` remains the
+   G2 evidence check for selected rows. Use `harvest_failures.py --sessions-json`
+   only for offline fixtures; production uses `--db-path` or the canonical
+   Hermes home by default.
 3. **Candidate** — draft a single unified-diff patch to the target SKILL.md.
    Write it to `<run>/candidate.patch`; compute its sha256 → dataset row.
 4. **Validate dataset** — run G1; every row must carry a resolvable session id (G2).

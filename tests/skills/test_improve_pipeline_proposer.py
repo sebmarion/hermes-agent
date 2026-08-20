@@ -11,6 +11,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 import sys
 
 sys.path.insert(
@@ -22,7 +24,13 @@ import propose_zeus_candidate as pzc  # noqa: E402
 
 
 def _failure(task_id="task_a1b2", sig="timeout", inst="gateway refused the connection repeatedly") -> dict:
-    return {"task_id": task_id, "task_title": "x", "task_instructions": inst, "failure_signature": sig}
+    return {
+        "task_id": task_id,
+        "task_title": "x",
+        "task_instructions": inst,
+        "failure_signature": sig,
+        "before_session_ids": ["session_fixture_123"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +99,51 @@ def test_stage_assigns_blind_b_when_seed_A_used_first(tmp_path: Path) -> None:
                   researcher_id="z", judge_model="m/x", judge_prompt_hash="sha256:" + "b" * 64, seed_blind=None)
     rows = [json.loads(l) for l in (run / "dataset.jsonl").read_text().splitlines()]
     assert {r["task_id"]: r["blind_id"] for r in rows} == {"task_c3d4": "B", "task_e5f6": "A"}
+
+
+def test_dry_run_uses_linux_absolute_skill_baseline(tmp_path: Path) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("REAL BASELINE CONTENT")
+    failures = tmp_path / "failures.jsonl"
+    failures.write_text(
+        json.dumps({
+            "task_id": "task_1234",
+            "task_title": "failure",
+            "task_instructions": "reproduce this failure",
+            "failure_signature": "error",
+            "before_session_ids": ["session_123456"],
+            "skill_path": str(skill),
+        }) + "\n"
+    )
+    run_dir = tmp_path / "run"
+    assert pzc.main([
+        "propose_zeus_candidate.py",
+        "--run-dir", str(run_dir),
+        "--failures-jsonl", str(failures),
+        "--skill-path", str(skill),
+        "--dry-run",
+    ]) == 0
+    assert (run_dir / "baseline" / "SKILL.md").read_text() == "REAL BASELINE CONTENT"
+
+
+def test_stage_rejects_missing_real_session_evidence(tmp_path: Path) -> None:
+    task = _failure()
+    task.pop("before_session_ids")
+    with pytest.raises(ValueError, match="real session"):
+        pzc.stage_run(
+            run_dir=tmp_path / "run",
+            task=task,
+            baseline_text="baseline",
+            candidate_text="candidate",
+            researcher_id="qwen-zeus",
+            judge_model="deepseek/model",
+            judge_prompt_hash="sha256:" + "a" * 64,
+        )
+
+
+def test_call_zeus_rejects_plain_http_public_endpoint() -> None:
+    with pytest.raises(ValueError, match="HTTPS"):
+        pzc._validate_base_url("http://evil.example/v1")
 
 
 # ---------------------------------------------------------------------------

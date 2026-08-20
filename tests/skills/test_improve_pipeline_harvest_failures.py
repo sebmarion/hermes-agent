@@ -105,3 +105,40 @@ def test_credentials_redacted_from_instructions(tmp_path: Path) -> None:
     raw = out_path.read_text()
     assert "abcdef0123456789XYZ" not in raw, "credential leaked into failure file"
     assert "apikey" in raw or "redacted" in raw.lower()
+
+
+def test_load_hermes_sessions_projects_completed_db_rows() -> None:
+    class FakeDB:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def search_sessions(self, **kwargs):
+            assert kwargs == {"limit": -1, "offset": 0}
+            return [
+                {"id": "real-session-0001", "title": "finished task", "ended_at": 20},
+                {"id": "active-session-0002", "title": "still running", "ended_at": None},
+            ]
+
+        def get_messages(self, session_id, include_compacted):
+            assert include_compacted is True
+            if session_id == "real-session-0001":
+                return [
+                    {"id": 41, "role": "user", "content": "repair the skill"},
+                    {"id": 42, "role": "assistant", "content": "ERROR: the check failed"},
+                ]
+            raise AssertionError("active sessions must not be read")
+
+        def close(self):
+            self.closed = True
+
+    db = FakeDB()
+    rows = hf.load_hermes_sessions(db_factory=lambda **_: db)
+    assert rows == [
+        {
+            "id": "real-session-0001",
+            "seq": 42,
+            "title": "finished task",
+            "body": "user: repair the skill\nassistant: ERROR: the check failed",
+        }
+    ]
+    assert db.closed is True

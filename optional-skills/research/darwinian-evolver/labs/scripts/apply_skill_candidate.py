@@ -53,9 +53,21 @@ def apply(live: Path, target: str, candidate: Path, state_dir: Path, _copy=None)
     Returns {"ok": True, "bak": str, "applied": str, "candidate_sha": str}.
     Raises on any failure — callers must treat a raise as 'do not advance the
     watermark / do not report success'."""
-    if not target or target.startswith(("/", "..")) or "\x00" in target:
+    target_path = Path(target) if isinstance(target, str) else Path("")
+    if (
+        not target
+        or target_path.is_absolute()
+        or "\\" in target
+        or ".." in target_path.parts
+        or "\x00" in target
+    ):
         raise ValueError(f"unsafe target path: {target!r}")
-    live_path = Path(live) / target
+    live_root = Path(live).resolve()
+    live_path = (live_root / target_path).resolve(strict=False)
+    try:
+        live_path.relative_to(live_root)
+    except ValueError as exc:
+        raise ValueError(f"unsafe target path: {target!r}") from exc
     candidate_path = Path(candidate)
     if not candidate_path.is_file():
         raise FileNotFoundError(f"candidate not found: {candidate_path}")
@@ -69,18 +81,34 @@ def apply(live: Path, target: str, candidate: Path, state_dir: Path, _copy=None)
         if not bak_path.is_file():
             cpy(live_path, bak_path)
 
-    cpy(candidate_path, live_path)
+    rollback_path = None
+    if live_path.is_file():
+        fd, rollback_name = tempfile.mkstemp(dir=str(live_path.parent), prefix=live_path.name + ".rollback-")
+        os.close(fd)
+        rollback_path = Path(rollback_name)
+        _atomic_copy(live_path, rollback_path)
+    try:
+        cpy(candidate_path, live_path)
 
-    manifest = ps.read_manifest(state_dir) or {"targets": []}
-    manifest["targets"].append(
-        {
-            "path": target,
-            "target_abs": str(live_path),
-            "bak": str(bak_path) if bak_path else None,
-            "candidate_sha": _sha256(candidate_path),
-        }
-    )
-    ps.write_manifest(state_dir, manifest)
+        manifest = ps.read_manifest(state_dir) or {"targets": []}
+        manifest["targets"].append(
+            {
+                "path": target,
+                "target_abs": str(live_path),
+                "bak": str(bak_path) if bak_path else None,
+                "candidate_sha": _sha256(candidate_path),
+            }
+        )
+        ps.write_manifest(state_dir, manifest)
+    except BaseException:
+        if rollback_path is not None and rollback_path.is_file():
+            _atomic_copy(rollback_path, live_path)
+        elif live_path.exists():
+            live_path.unlink()
+        raise
+    finally:
+        if rollback_path is not None:
+            rollback_path.unlink(missing_ok=True)
     return {
         "ok": True,
         "bak": str(bak_path) if bak_path else None,

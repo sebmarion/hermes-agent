@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import sys
 
 sys.path.insert(
@@ -91,3 +93,10 @@ def test_write_report(tmp_path: Path) -> None:
     content = out.read_text()
     assert "Weekly net-positive report" in content
     assert "timeout" in content
+
+
+def test_corrupt_ledger_is_not_treated_as_clean(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text('{"action":"apply"}\nnot-json\n')
+    with pytest.raises(ValueError, match="malformed"):
+        lr.load_ledger(ledger)

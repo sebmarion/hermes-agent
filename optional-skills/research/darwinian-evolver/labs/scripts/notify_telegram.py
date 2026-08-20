@@ -49,7 +49,7 @@ def build_send_args(event: str, message: str) -> list[str]:
     cleaned = redact(message)
     # Prefix the event label so the receiver can triage at a glance, then
     # `hermes send <platform> <text>` — text stays a single argv element.
-    return ["hermes", "send", "telegram", f"[{event}] {cleaned}"]
+    return ["hermes", "send", "--to", "telegram", f"[{event}] {cleaned}"]
 
 
 def send(event: str, message: str, dry_run: bool = False) -> dict:

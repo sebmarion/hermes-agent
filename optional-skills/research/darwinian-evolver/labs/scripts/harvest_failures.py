@@ -50,6 +50,87 @@ _SIGNATURES = [
 TASK_ID_ALPHABET = "0123456789abcdef"
 
 
+def load_hermes_sessions(db_path: Path | None = None, db_factory=None) -> list[dict]:
+    """Read completed Hermes conversations from the canonical ``state.db``.
+
+    ``seq`` is the highest persisted message row id in each conversation. It
+    is therefore a durable, monotonic watermark shared by all Hermes writers,
+    unlike a timestamp or a synthetic session counter. Raw transcript text is
+    kept in memory only; callers must pass it through :func:`extract_failures`
+    before writing anything to disk.
+
+    ``db_factory`` is an offline-test seam. Production opens Hermes' real
+    ``SessionDB`` read-only and closes it in ``finally``. Any malformed row or
+    database failure raises so cron halts without advancing the watermark.
+    """
+    if db_factory is None:
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_factory = SessionDB
+        db_path = Path(db_path) if db_path is not None else get_hermes_home() / "state.db"
+    elif db_path is not None:
+        db_path = Path(db_path)
+
+    db_kwargs = {"read_only": True}
+    if db_path is not None:
+        db_kwargs["db_path"] = db_path
+    db = db_factory(**db_kwargs)
+    try:
+        sessions = db.search_sessions(limit=-1, offset=0)
+        if not isinstance(sessions, list):
+            raise ValueError("SessionDB.search_sessions returned a non-list")
+
+        projected = []
+        for session in sessions:
+            if not isinstance(session, dict):
+                raise ValueError("SessionDB returned a malformed session row")
+            if session.get("ended_at") is None:
+                continue
+            session_id = session.get("id")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("completed session is missing a real session id")
+
+            messages = db.get_messages(session_id, include_compacted=True)
+            if not isinstance(messages, list):
+                raise ValueError(f"messages for {session_id} are not a list")
+            if not messages:
+                continue
+
+            rendered = []
+            message_ids = []
+            seen_message_ids = set()
+            for message in messages:
+                if not isinstance(message, dict) or "id" not in message:
+                    raise ValueError(f"malformed message row in session {session_id}")
+                try:
+                    message_id = int(message["id"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"malformed message id in session {session_id}") from exc
+                if message_id in seen_message_ids:
+                    continue
+                seen_message_ids.add(message_id)
+                message_ids.append(message_id)
+                role = str(message.get("role") or "unknown")
+                content = message.get("content")
+                if content is not None:
+                    rendered.append(f"{role}: {content}")
+
+            if not rendered:
+                continue
+            projected.append(
+                {
+                    "id": session_id,
+                    "seq": max(message_ids),
+                    "title": str(session.get("title") or "harvested failure"),
+                    "body": "\n".join(rendered),
+                }
+            )
+        return projected
+    finally:
+        db.close()
+
+
 def _scrub(text: str) -> str:
     """Redact credential-shaped substrings in a body before it can be written."""
     out = text
@@ -130,33 +211,46 @@ def write_failures(path, records):
 
 def main(argv) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--sessions-json", required=True, help="Path to a JSON array of session rows")
+    source = ap.add_mutually_exclusive_group()
+    source.add_argument("--sessions-json", help="Path to a JSON array of session rows (offline fixture)")
+    source.add_argument("--db-path", type=Path, help="Hermes state.db path (default: canonical Hermes home)")
     ap.add_argument("--out", required=True, help="Failures JSONL output path")
     ap.add_argument("--state-dir", required=True, help="Where the session watermark lives")
     ap.add_argument("--watermark-key", default="sessions")
     ap.add_argument("--researcher-id", default="zeusresearch")
     args = ap.parse_args(argv[1:] if argv and not argv[0].startswith("-") else argv)
 
-    sessions_path, out_path, state_dir = Path(args.sessions_json), Path(args.out), Path(args.state_dir)
-    if not sessions_path.is_file():
-        print(f"error: sessions file not found: {sessions_path}", file=sys.stderr)
-        return 2
-
+    out_path, state_dir = Path(args.out), Path(args.state_dir)
     try:
-        sessions = json.loads(sessions_path.read_text())
-    except json.JSONDecodeError as exc:
-        print(f"error: sessions file corrupt: {exc}", file=sys.stderr)
-        return 2
-    if not isinstance(sessions, list):
-        print("error: sessions file must be a JSON array", file=sys.stderr)
+        watermark = ps.read_watermark(state_dir, args.watermark_key) or 0
+        if args.sessions_json:
+            sessions_path = Path(args.sessions_json)
+            if not sessions_path.is_file():
+                print(f"error: sessions file not found: {sessions_path}", file=sys.stderr)
+                return 2
+            sessions = json.loads(sessions_path.read_text())
+            if not isinstance(sessions, list):
+                print("error: sessions file must be a JSON array", file=sys.stderr)
+                return 2
+        else:
+            sessions = load_hermes_sessions(args.db_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: session source unavailable: {exc}", file=sys.stderr)
         return 2
 
-    watermark = ps.read_watermark(state_dir, args.watermark_key) or 0
-    records = extract_failures(sessions, watermark_seq=watermark, researcher_id=args.researcher_id)
-    n = write_facts(out_path, records)
-    # advance the watermark only to the max seq we actually consumed
-    max_seq = max((int(s["seq"]) for s in sessions if isinstance(s, dict) and "seq" in s), default=watermark)
-    ps.write_watermark(state_dir, args.watermark_key, max(max_seq, watermark))
+        records = extract_failures(
+            sessions, watermark_seq=watermark, researcher_id=args.researcher_id
+        )
+        n = write_facts(out_path, records)
+        # Advance the watermark only after the sanitized output is durable.
+        max_seq = max(
+            (int(s["seq"]) for s in sessions if isinstance(s, dict) and "seq" in s),
+            default=watermark,
+        )
+        ps.write_watermark(state_dir, args.watermark_key, max(max_seq, watermark))
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"error: failure harvest could not be persisted: {exc}", file=sys.stderr)
+        return 2
     print(f"RESULT: OK ({n} new failures harvested, watermark -> {max(max_seq, watermark)})")
     return 0
 

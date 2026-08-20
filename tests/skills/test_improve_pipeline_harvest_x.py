@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import sys
 
 sys.path.insert(
@@ -68,6 +70,12 @@ def test_credentials_redacted_in_sidecar(tmp_path: Path) -> None:
     assert "apikey" in raw or "redacted" in raw.lower()
 
 
+def test_credentials_redacted_from_bookmark_urls() -> None:
+    bm = _bm(6, "Hermes tool", "https://x.example/?apikey=abcdef0123456789XYZ")
+    raw = json.dumps(hx.build_sidecar([bm]))
+    assert "abcdef0123456789XYZ" not in raw
+
+
 def test_sidecar_has_extracted_fields() -> None:
     bm = _bm(4, "Hermes plugin idea: add a kanban view to the dashboard")
     rec = hx.build_sidecar([bm])[0]
@@ -87,3 +95,12 @@ def test_write_sidecar_roundtrip(tmp_path: Path) -> None:
     assert n == 1
     lines = [json.loads(l) for l in out_path.read_text().splitlines() if l.strip()]
     assert lines[0]["bookmark_id"] == "B5"
+
+
+def test_bookmark_fetch_failure_is_not_misreported_as_empty(monkeypatch) -> None:
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError("xurl")
+
+    monkeypatch.setattr(hx.subprocess, "run", unavailable)
+    with pytest.raises(RuntimeError, match="xurl unavailable"):
+        hx.fetch_bookmarks()
