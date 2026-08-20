@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 EDGE_PREFIXES = ("optional-skills/", "tests/skills/")
 STATE_SCHEMA = 1
@@ -104,13 +105,34 @@ def assert_conserved(*, expected: dict[str, str | None], actual: dict[str, str])
 
 
 def assert_fork_remote(url: str) -> None:
-    normalized = (url or "").lower().rstrip("/")
-    allowed = (
-        "github.com:sebmarion/hermes-agent",
-        "github.com/sebmarion/hermes-agent",
-    )
-    if not any(token in normalized for token in allowed):
-        raise RemoteGuardError(f"refusing push remote outside sebmarion/hermes-agent: {url!r}")
+    """Require an exact GitHub host/path for the protected fork remote."""
+    raw = (url or "").strip()
+    try:
+        if "://" not in raw and ":" in raw:
+            # SCP-style Git URL, e.g. git@github.com:sebmarion/hermes-agent.git.
+            host_part, path = raw.split(":", 1)
+            host = host_part.rsplit("@", 1)[-1]
+            query = fragment = ""
+        else:
+            parsed = urlsplit(raw)
+            if parsed.scheme.lower() not in {"https", "ssh"}:
+                raise ValueError("unsupported remote scheme")
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise ValueError("credentials or URL suffix are not allowed")
+            host = parsed.hostname or ""
+            path = parsed.path
+            query = parsed.query
+            fragment = parsed.fragment
+    except (ValueError, IndexError):
+        host = ""
+        path = ""
+        query = fragment = ""
+
+    identity = path.strip("/").removesuffix(".git").lower()
+    if host.lower() != "github.com" or query or fragment or identity != "sebmarion/hermes-agent":
+        raise RemoteGuardError(
+            f"refusing push remote outside sebmarion/hermes-agent: {url!r}"
+        )
 
 
 def _run(repo: Path, *args: str, check: bool = True) -> str:
@@ -216,12 +238,18 @@ def _write_overlay(repo: Path, preview: Path, current_ref: str, path: str) -> No
     os.replace(tmp, destination)
 
 
-def _clean_checkout(repo: Path) -> None:
+def _clean_checkout(repo: Path, expected_head: str | None = None) -> None:
     status = subprocess.check_output(
         ["git", "status", "--porcelain", "--untracked-files=all"], cwd=repo, text=True
     ).strip()
     if status:
         raise MergeUpstreamError("live checkout is dirty; refusing autonomous upstream apply")
+    if expected_head is not None:
+        actual_head = _run(repo, "rev-parse", "HEAD").strip()
+        if actual_head != expected_head:
+            raise MergeUpstreamError(
+                "live checkout changed after preview; refusing autonomous upstream apply"
+            )
 
 
 def build_preview(repo: Path, upstream_ref: str, current_ref: str, state_path: Path, preview: Path) -> dict:
@@ -255,8 +283,8 @@ def commit_preview(preview: Path, message: str) -> str:
     return _run(preview, "rev-parse", "HEAD").strip()
 
 
-def apply_candidate(repo: Path, candidate_sha: str) -> None:
-    _clean_checkout(repo)
+def apply_candidate(repo: Path, candidate_sha: str, expected_head: str | None = None) -> None:
+    _clean_checkout(repo, expected_head)
     _run(repo, "reset", "--hard", candidate_sha)
 
 
@@ -301,14 +329,15 @@ def main(argv: list[str] | None = None) -> int:
         _run(repo, "fetch", "origin", "main")
         if args.publish and not args.apply:
             raise MergeUpstreamError("--publish requires --apply")
-        report = build_preview(repo, args.upstream, "HEAD", state_path, preview)
+        source_head = _run(repo, "rev-parse", "HEAD").strip()
+        report = build_preview(repo, args.upstream, source_head, state_path, preview)
         if args.test_argv:
             proc = subprocess.run(args.test_argv, cwd=preview, text=True)
             if proc.returncode:
                 raise MergeUpstreamError(f"preview tests failed with exit {proc.returncode}")
         sha = commit_preview(preview, "chore(update): sync upstream while preserving edge changes")
         if args.apply:
-            apply_candidate(repo, sha)
+            apply_candidate(repo, sha, source_head)
         if args.publish:
             remote_sha = _run(repo, "ls-remote", args.remote, "refs/heads/main").split()[0]
             publish_candidate(repo, args.remote, sha, remote_sha)

@@ -89,7 +89,25 @@ def test_temp_repo_overlay_carries_edge_delta_and_not_core(tmp_path: Path) -> No
 def test_remote_url_guard_rejects_unknown_push_target() -> None:
     with pytest.raises(mu.RemoteGuardError):
         mu.assert_fork_remote("https://github.com/NousResearch/hermes-agent.git")
+    with pytest.raises(mu.RemoteGuardError):
+        mu.assert_fork_remote("https://evil.example/github.com/sebmarion/hermes-agent")
+    with pytest.raises(mu.RemoteGuardError):
+        mu.assert_fork_remote("git@github.com:sebmarion/hermes-agent.evil")
     mu.assert_fork_remote("git@github.com:sebmarion/hermes-agent.git")
+    mu.assert_fork_remote("https://github.com/sebmarion/hermes-agent.git")
+
+
+def test_apply_rejects_clean_checkout_head_changed_after_preview(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    (repo / "file.txt").write_text("base")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    with pytest.raises(mu.MergeUpstreamError, match="changed after preview"):
+        mu.apply_candidate(repo, "not-a-real-candidate", expected_head="different-head")
 
 
 def test_https_fork_remote_is_converted_to_ssh_for_push(tmp_path: Path) -> None:
