@@ -154,15 +154,38 @@ def _run(
     return completed.returncode, stdout, stderr
 
 
-def _repo_for_path(raw_path: str) -> Path | None:
+def _path_candidates(raw_path: str) -> tuple[Path, ...]:
     candidate = Path(str(raw_path)).expanduser()
-    if not candidate.is_absolute():
-        candidate = Path.cwd() / candidate
-    candidate = candidate if candidate.is_dir() else candidate.parent
-    try:
-        candidate = candidate.resolve(strict=False)
-    except OSError:
-        return None
+    if candidate.is_absolute():
+        return (candidate,)
+    roots = [Path.cwd()]
+    hermes_home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+    roots.extend((hermes_home / "skills", Path.home() / ".hermes" / "skills"))
+    seen: set[str] = set()
+    candidates = []
+    for root in roots:
+        value = root / candidate
+        key = str(value)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(value)
+    return tuple(candidates)
+
+
+def _repo_for_path(raw_path: str) -> Path | None:
+    for raw_candidate in _path_candidates(raw_path):
+        try:
+            resolved_candidate = raw_candidate.resolve(strict=False)
+        except OSError:
+            continue
+        candidate = resolved_candidate if resolved_candidate.is_dir() else resolved_candidate.parent
+        root = _git_root_for_directory(candidate)
+        if root is not None:
+            return root
+    return None
+
+
+def _git_root_for_directory(candidate: Path) -> Path | None:
     try:
         result = subprocess.run(
             ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
