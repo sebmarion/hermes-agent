@@ -555,6 +555,31 @@ class TestScriptPathContainment:
         sys.platform == "win32",
         reason="Symlinks require elevated privileges on Windows",
     )
+    def test_symlink_to_trusted_source_script_allowed(self, cron_env, tmp_path, monkeypatch):
+        """A symlink may target the tracked Hermes source scripts directory."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        trusted = tmp_path / "hermes-source" / "scripts"
+        trusted.mkdir(parents=True)
+        (trusted / "trusted.py").write_text('print("trusted")\n')
+        link = cron_env / "scripts" / "trusted.py"
+        link.symlink_to(trusted / "trusted.py")
+        monkeypatch.setattr(
+            sched_mod,
+            "_trusted_script_dirs",
+            lambda scripts_dir: (scripts_dir.resolve(), trusted.resolve()),
+            raising=False,
+        )
+
+        success, output = _run_job_script("trusted.py")
+        assert success is True
+        assert output == "trusted"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Symlinks require elevated privileges on Windows",
+    )
     def test_symlink_escape_blocked(self, cron_env, tmp_path):
         """Symlinks pointing outside scripts/ must be rejected."""
         from cron.scheduler import _run_job_script

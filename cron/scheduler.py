@@ -3479,6 +3479,15 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _trusted_script_dirs(scripts_dir: Path) -> tuple[Path, ...]:
+    """Return cron scripts plus the tracked Hermes source scripts directory."""
+    roots = [scripts_dir.resolve()]
+    source_scripts = Path(__file__).resolve().parents[1] / "scripts"
+    if source_scripts.is_dir():
+        roots.append(source_scripts.resolve())
+    return tuple(dict.fromkeys(roots))
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -3522,7 +3531,7 @@ def _run_job_script(
     """
     scripts_dir = _get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
-    scripts_dir_resolved = scripts_dir.resolve()
+    trusted_script_dirs = _trusted_script_dirs(scripts_dir)
 
     # Same ingestion contract as cron.lifecycle_guard._expand_candidate_path:
     # a NUL-bearing value can never name a real script, and on Windows the
@@ -3551,14 +3560,16 @@ def _run_job_script(
     else:
         path = (scripts_dir / raw).resolve()
 
-    # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
+    # Guard against path traversal and absolute path injection. Symlinks may
+    # resolve into the tracked Hermes source scripts directory, but nowhere
+    # else outside HERMES_HOME/scripts/.
+    if not any(
+        path == trusted_root or trusted_root in path.parents
+        for trusted_root in trusted_script_dirs
+    ):
         return False, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
+            f"Blocked: script path resolves outside trusted scripts directories "
+            f"({', '.join(map(str, trusted_script_dirs))}): {script_path!r}"
         )
 
     if not path.exists():
