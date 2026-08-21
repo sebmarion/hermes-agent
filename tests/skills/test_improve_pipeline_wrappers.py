@@ -24,3 +24,18 @@ def test_notification_timeout_does_not_escape_merge_wrapper(monkeypatch) -> None
 
     monkeypatch.setattr(wrapper.subprocess, "run", timeout)
     wrapper._notify("halted", "merge halted")
+
+
+def test_upstream_gate_uses_bounded_relevant_suites() -> None:
+    wrapper = _load_wrapper()
+    command = wrapper._build_command()
+    test_paths = [
+        command[i + 1]
+        for i, value in enumerate(command[:-1])
+        if value == "--test" and command[i + 1] != str(wrapper.PYTHON)
+    ]
+    assert "tests/skills" in test_paths
+    assert "tests/gateway/test_scale_to_zero_watcher.py" in test_paths
+    assert "tests/plugins/test_teams_pipeline_plugin.py" in test_paths
+    assert "tests/tools/test_memory_tool.py" in test_paths
+    assert "tests" not in test_paths

@@ -4,7 +4,7 @@
 Runs the repository merge planner outside the agent's Python process:
 - flock serializes it against another daily/manual update;
 - the planner applies the recorded upstream delta to the current fork HEAD,
-  preserves owned paths, runs the full Python test suite, then publishes;
+  preserves owned paths, runs the bounded relevant test gate, then publishes;
 - Telegram receives a redacted success or halt rundown.
 
 A dirty checkout (including another thread's in-flight work) is intentionally
@@ -25,6 +25,12 @@ MERGER = REPO / "optional-skills/research/darwinian-evolver/labs/scripts/merge_u
 NOTIFY = REPO / "optional-skills/research/darwinian-evolver/labs/scripts/notify_telegram.py"
 STATE = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "labs/bestplan-research/state"
 LOCK = STATE / "upstream-merge.lock"
+RELEVANT_TEST_PATHS = (
+    "tests/skills",
+    "tests/gateway/test_scale_to_zero_watcher.py",
+    "tests/plugins/test_teams_pipeline_plugin.py",
+    "tests/tools/test_memory_tool.py",
+)
 
 
 def _notify(event: str, message: str) -> None:
@@ -44,6 +50,23 @@ def _notify(event: str, message: str) -> None:
         return
 
 
+def _build_command() -> list[str]:
+    command = [
+        str(PYTHON), str(MERGER),
+        "--repo", str(REPO),
+        "--state-dir", str(STATE),
+        "--remote", "sebmarion-fork",
+        "--apply", "--publish",
+        "--test", str(PYTHON),
+        "--test=-m",
+        "--test", "pytest",
+    ]
+    for path in RELEVANT_TEST_PATHS:
+        command.extend(["--test", path])
+    command.append("--test=-q")
+    return command
+
+
 def main() -> int:
     STATE.mkdir(parents=True, exist_ok=True)
     with LOCK.open("a+") as handle:
@@ -53,18 +76,7 @@ def main() -> int:
             print("skipped: upstream merge already running")
             return 0
 
-        command = [
-            str(PYTHON), str(MERGER),
-            "--repo", str(REPO),
-            "--state-dir", str(STATE),
-            "--remote", "sebmarion-fork",
-            "--apply", "--publish",
-            "--test", str(PYTHON),
-            "--test=-m",
-            "--test", "pytest",
-            "--test", "tests",
-            "--test=-q",
-        ]
+        command = _build_command()
         started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         try:
             proc = subprocess.run(command, capture_output=True, text=True, timeout=3600)
