@@ -5,7 +5,7 @@ import importlib.util
 from pathlib import Path
 
 
-WRAPPER = Path.home() / ".hermes/scripts/upstream_merge_wrapper.py"
+WRAPPER = Path(__file__).resolve().parents[2] / "scripts/upstream_merge_wrapper.py"
 
 
 def _load_wrapper():

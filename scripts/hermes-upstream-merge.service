@@ -1,0 +1,21 @@
+# Daily upstream merge service (root-owned oneshot).
+# The updater runs as seb; only the fixed activation verifier runs as root.
+# Install scripts/verify_upstream_activation.sh as root-owned
+# /usr/local/libexec/hermes-verify-upstream-activation before enabling this unit.
+
+[Unit]
+Description=Daily Hermes upstream merge (autoresearch)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/runuser -u seb -- /usr/bin/env HOME=/home/seb HERMES_HOME=/home/seb/.hermes /home/seb/projects/hermes-agent/.venv/bin/python /home/seb/projects/hermes-agent/scripts/upstream_merge_wrapper.py
+# ExecStartPost runs only after a successful updater and therefore owns the
+# privileged gateway reload and verification.
+ExecStartPost=/usr/local/libexec/hermes-verify-upstream-activation
+TimeoutStartSec=3600
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

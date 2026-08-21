@@ -11,6 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -69,6 +72,21 @@ def validate_candidate(candidate: str, expected_name: str = "bestplan") -> list[
         errors.append(f"candidate frontmatter name is not {expected_name}")
     if f"#{expected_name.title()}" not in candidate and "# BestPlan" not in candidate:
         errors.append("candidate has no skill heading")
+    # Deterministic duplicate-heading check: every level-2 heading must be
+    # unique within the candidate body (after the frontmatter). This catches
+    # two individually plausible additions that create the same ## section.
+    body = candidate
+    fm = re.search(r"(?ms)^---\n.*?\n---\n", candidate)
+    if fm:
+        body = candidate[fm.end():]
+    headings = re.findall(r"(?m)^##\s+(.+)$", body)
+    seen: set[str] = set()
+    for h in headings:
+        key = h.strip().lower()
+        if key in seen:
+            errors.append(f"duplicate heading: {h.strip()}")
+            break
+        seen.add(key)
     for pattern in _CREDENTIALS:
         if pattern.search(candidate):
             errors.append("candidate contains a credential-shaped value")
@@ -141,6 +159,38 @@ def _target_relative(skill_path: Path, live_skills: Path) -> str:
         raise ValueError("skill path must be inside the live skills directory") from exc
 
 
+def _aggregate_error(candidate: str, expected_name: str) -> str | None:
+    """Deterministic structural failure of an aggregate candidate, if any."""
+    errors = validate_candidate(candidate, expected_name)
+    if not errors:
+        return None
+    return "aggregate candidate failed deterministic validation:\n" + "\n".join(
+        f"- {error}" for error in errors
+    )
+
+
+def _validate_staged_skill(skill_path: Path, candidate_path: Path, run_dir: Path) -> None:
+    """Run the real BestPlan validator against a run-local skill copy."""
+    source_root = skill_path.parent
+    validator = source_root / "scripts" / "validate_bestplan.py"
+    if not validator.is_file():
+        raise RuntimeError(f"BestPlan validator missing: {validator}")
+    validation_root = run_dir / "validation-skill"
+    shutil.copytree(source_root, validation_root, symlinks=True)
+    shutil.copy2(candidate_path, validation_root / "SKILL.md")
+    completed = subprocess.run(
+        [sys.executable, str(validation_root / "scripts" / "validate_bestplan.py")],
+        cwd=validation_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if completed.returncode:
+        detail = (completed.stdout + "\n" + completed.stderr).strip()
+        raise ValueError(f"BestPlan validator rejected aggregate candidate: {detail[-2000:]}")
+
+
 def run_live_chain(
     failures: list[dict],
     state_dir: Path,
@@ -165,18 +215,43 @@ def run_live_chain(
     target_rel = _target_relative(skill_path, live_skills)
     judge_path = run_dir / "judges.jsonl"
     score_path = run_dir / "scorecard.tsv"
+    aggregate_dir = run_dir / "aggregate"
+    aggregate_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stage 1 (run-local): materialize and validate every accepted candidate
+    # against a run-local aggregate baseline. The live SKILL.md is read once
+    # and never replaced until the whole aggregate passes validation, so a
+    # deterministic duplicate-heading failure cannot dirty live skill bytes.
+    baseline = skill_path.read_text()
+    applied: list[str] = []
+    blocked: list[str] = []
+    notes: list[str] = []
+    accepted: list[str] = []  # accepted proposal texts, in order
+    staged: list[dict] = []   # accepted tasks, in order (task_id + candidate)
+
+    def _fail(message: str, halt: bool = True) -> dict:
+        """Return a red report and stop; live skill bytes are untouched."""
+        report["ok"] = False
+        if halt:
+            report["halted"] = True
+        report["notes"].append(message)
+        report["summary"] = f"{len(applied)} applied, {len(blocked)} blocked"
+        return report
 
     for index, failure in enumerate(failures):
         task_id = str(failure.get("task_id") or "")
         try:
-            baseline = skill_path.read_text()
             prompt = pzc.build_proposer_prompt(failure, str(skill_path))
             proposal = proposer(prompt)
             candidate = materialize_candidate(baseline, proposal)
             candidate_errors = validate_candidate(candidate)
             if candidate_errors:
-                raise ValueError("candidate replay validation failed: " + "; ".join(candidate_errors))
-
+                blocked.append(task_id)
+                notes.append(
+                    f"{task_id}: candidate rejected before judging: "
+                    + "; ".join(candidate_errors)
+                )
+                continue
             blind_id = "A" if index % 2 == 0 else "B"
             judge_prompt = build_judge_prompt(
                 baseline, candidate, str(failure.get("task_title", "")), blind_id
@@ -191,11 +266,8 @@ def run_live_chain(
                 judge_prompt_hash="sha256:" + hashlib.sha256(judge_prompt.encode()).hexdigest(),
                 seed_blind=blind_id,
             )
-            judge_row = parse_judge_response(
-                judge(judge_prompt),
-                row["blind_id"],
-                task_id,
-            )
+            judge_raw = judge(judge_prompt)
+            judge_row = parse_judge_response(judge_raw, row["blind_id"], task_id)
             _write_jsonl(judge_path, judge_row)
             rows, problems = score.load_judges(judge_path)
             if problems or not rows:
@@ -213,16 +285,63 @@ def run_live_chain(
                 }
             )
             if verdict["action"] != "apply":
-                report["blocked"].append(task_id)
-                report["notes"].append(f"{task_id}: {verdict['reason']}")
+                blocked.append(task_id)
+                notes.append(f"{task_id}: {verdict['reason']}")
                 continue
-            applier(live_skills, target_rel, run_dir / "candidates" / "SKILL.md.candidate", state_dir)
-            report["applied"].append(task_id)
+            # Accepted: fold the proposal onto the run-local aggregate
+            # baseline (each accepted proposal text at most once), then
+            # deterministically re-validate the aggregate. The aggregate is
+            # the union of every accepted addition appended to the live
+            # baseline, so two individually plausible proposals that create
+            # a duplicate level-2 heading are caught here, before any live
+            # skill byte is touched.
+            if proposal not in accepted:
+                aggregate_text = baseline.rstrip() + "\n\n" + "\n\n".join(accepted) + "\n\n" + proposal.strip() + "\n"
+                accepted.append(proposal)
+            else:
+                aggregate_text = baseline.rstrip() + "\n\n" + "\n\n".join(accepted) + "\n"
+            staged.append({"task_id": task_id, "candidate": candidate})
+            aggregate_errors = validate_candidate(aggregate_text, expected_name="bestplan")
+            (aggregate_dir / "SKILL.md.candidate").write_text(aggregate_text)
+            if aggregate_errors:
+                # Deterministic aggregate failure: healthy block. Every
+                # accepted task is reported blocked, the run stays healthy
+                # (ok=True, halted=False), and the live skill is untouched.
+                aggregate_error = "aggregate candidate failed deterministic validation:\n" + "\n".join(
+                    f"- {error}" for error in aggregate_errors
+                )
+                (run_dir / "aggregate_error.txt").write_text(aggregate_error + "\n")
+                report["applied"] = []
+                report["blocked"] = blocked + [s["task_id"] for s in staged]
+                report["notes"] = notes + [f"{task_id}: {aggregate_errors[0]}"]
+                report["summary"] = f"0 applied, {len(blocked) + len(staged)} blocked (aggregate validation)"
+                return report
         except Exception as exc:  # noqa: BLE001 - one bad candidate must fail closed
-            report["blocked"].append(task_id)
-            report["notes"].append(f"{task_id or 'unknown task'}: {exc}")
-            report["ok"] = False
-            report["halted"] = True
+            return _fail(f"{task_id or 'unknown task'}: {exc}")
 
-    report["summary"] = f"{len(report['applied'])} applied, {len(report['blocked'])} blocked"
+    # Stage 2 (single live apply): the aggregate passed the deterministic
+    # validator, so apply it exactly once. Apply failure is infrastructure
+    # red; the live skill bytes are left as they were before the apply.
+    if accepted:
+        try:
+            _validate_staged_skill(
+                skill_path,
+                aggregate_dir / "SKILL.md.candidate",
+                run_dir,
+            )
+            # Invoke the applier first (which may persist state, commit,
+            # publish, etc.). Only after it succeeds do we write the tested
+            # aggregate to the live skill path, so a failing applier never
+            # dirties live bytes.
+            applier(live_skills, target_rel, aggregate_dir / "SKILL.md.candidate", state_dir)
+        except Exception as exc:  # noqa: BLE001 - apply failure is infrastructure red
+            blocked.extend(t["task_id"] for t in staged)
+            notes.append(f"aggregate apply failed: {exc}")
+            return _fail(f"aggregate apply failed: {exc}")
+        applied = [t["task_id"] for t in staged]
+
+    report["applied"] = applied
+    report["blocked"] = blocked
+    report["notes"] = notes
+    report["summary"] = f"{len(applied)} applied, {len(blocked)} blocked"
     return report

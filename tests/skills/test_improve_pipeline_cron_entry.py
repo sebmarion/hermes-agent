@@ -50,6 +50,8 @@ def test_cron_harvests_real_session_rows_before_halting_live_chain(
     reports = list(tmp_path.glob("report-*.json"))
     assert len(reports) == 1
     report = json.loads(reports[0].read_text())
+    assert report["ok"] is False
+    assert report["halted"] is True
     assert report["n_failures_new"] == 1
     assert isinstance(report["watermark_sessions"], int)
     assert report["watermark_sessions"] > 0

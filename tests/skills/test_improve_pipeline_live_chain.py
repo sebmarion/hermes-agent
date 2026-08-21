@@ -22,6 +22,12 @@ def _failure() -> dict:
     }
 
 
+def _install_validator(target: Path) -> None:
+    validator = target.parent / "scripts" / "validate_bestplan.py"
+    validator.parent.mkdir(parents=True, exist_ok=True)
+    validator.write_text("raise SystemExit(0)\n")
+
+
 def test_worse_judge_verdict_blocks_apply() -> None:
     verdict = rl.decide(
         {
@@ -83,6 +89,7 @@ def test_live_chain_scores_and_applies_only_green_candidate(tmp_path: Path) -> N
     target.parent.mkdir(parents=True)
     baseline = "---\nname: bestplan\ndescription: test\n---\n\n# BestPlan\n"
     target.write_text(baseline)
+    _install_validator(target)
 
     calls: list[str] = []
 
@@ -149,6 +156,7 @@ def test_live_chain_records_expected_block_without_failing_run(tmp_path: Path) -
     target.parent.mkdir(parents=True)
     baseline = "---\nname: bestplan\ndescription: test\n---\n\n# BestPlan\n"
     target.write_text(baseline)
+    _install_validator(target)
     failures = [{**_failure(), "task_id": "task_blocked"}, {**_failure(), "task_id": "task_applied"}]
     judgments = iter([
         json.dumps({"verdict": "worse", "score": 0.9, "rationale": "regression"}),
@@ -172,3 +180,32 @@ def test_live_chain_records_expected_block_without_failing_run(tmp_path: Path) -
     assert report["blocked"] == ["task_blocked"]
     assert report["applied"] == ["task_applied"]
     assert len(applied) == 1
+
+
+def test_live_chain_blocks_duplicate_heading_without_dirtying_live_skill(tmp_path: Path) -> None:
+    live = tmp_path / "skills"
+    target = live / "software-development" / "bestplan" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    baseline = "---\nname: bestplan\ndescription: test\n---\n\n# BestPlan\n\n## Existing\n\nKeep this section.\n"
+    target.write_text(baseline)
+    applied = []
+
+    report = lp.run_live_chain(
+        failures=[_failure()],
+        state_dir=tmp_path / "state",
+        live_skills=live,
+        skill_path=target,
+        proposer=lambda _prompt: "## Existing\n\nDo not duplicate this section.",
+        judge=lambda _prompt: json.dumps(
+            {"verdict": "better", "score": 0.99, "rationale": "clear"}
+        ),
+        applier=lambda *args: applied.append(args),
+        run_id="R-duplicate",
+    )
+
+    assert report["ok"] is True
+    assert report["halted"] is False
+    assert report["applied"] == []
+    assert report["blocked"] == ["task_1234abcd"]
+    assert applied == []
+    assert target.read_text() == baseline
