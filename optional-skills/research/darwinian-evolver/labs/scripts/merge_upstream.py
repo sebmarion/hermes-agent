@@ -395,10 +395,52 @@ def main(argv: list[str] | None = None) -> int:
         if not expected_remote_sha:
             raise MergeUpstreamError(f"remote branch not found: {args.remote}/main")
 
-        report = build_delta_candidate(
-            repo, anchor, args.upstream, source_head, state_path, preview
-        )
-        candidate_sha = report["candidate_sha"]
+        report = None
+        try:
+            report = build_delta_candidate(
+                repo, anchor, args.upstream, source_head, state_path, preview
+            )
+        except MergeUpstreamError as exc:
+            # Only attempt recovery for upstream delta conflicts/rejections.
+            # Other failures (missing anchor, dirty tree, remote movement,
+            # tests, non-conflict failures) remain hard halts.
+            conflict_detail = str(exc)
+            if "upstream delta conflict/rejection" not in conflict_detail:
+                raise
+            # Lazy import to avoid circular dependency:
+            # merge_upstream_recovery imports merge_upstream as mu.
+            from merge_upstream_recovery import (
+                recover_upstream_conflict,
+                RecoveryError,
+            )
+            try:
+                recovery_report = recover_upstream_conflict(
+                    repo=repo,
+                    source_head=source_head,
+                    anchor=anchor,
+                    upstream=args.upstream,
+                    expected_remote_sha=expected_remote_sha,
+                    conflict_detail=conflict_detail,
+                    state_path=state_path,
+                    worktree=preview,
+                )
+            except RecoveryError as rec_exc:
+                raise MergeUpstreamError(
+                    f"upstream conflict recovery failed: {rec_exc}"
+                ) from rec_exc
+            # Recovery produced a verified candidate. Rebuild the report
+            # using the existing conservation seams.
+            candidate_sha = recovery_report["candidate_sha"]
+            report = {
+                "anchor_sha": anchor,
+                "upstream_sha": _run(repo, "rev-parse", f"{args.upstream}^{{commit}}").strip(),
+                "local_sha": source_head,
+                "candidate_sha": candidate_sha,
+                "owned_paths": [],
+            }
+        else:
+            candidate_sha = report["candidate_sha"]
+
         if subprocess.run(
             ["git", "merge-base", "--is-ancestor", source_head, candidate_sha],
             cwd=repo,
