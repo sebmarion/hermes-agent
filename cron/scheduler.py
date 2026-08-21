@@ -3529,10 +3529,6 @@ def _run_job_script(
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
-    scripts_dir = _get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    trusted_script_dirs = _trusted_script_dirs(scripts_dir)
-
     # Same ingestion contract as cron.lifecycle_guard._expand_candidate_path:
     # a NUL-bearing value can never name a real script, and on Windows the
     # Path operations raise ValueError *after* expanduser (expanduser never
@@ -3544,6 +3540,10 @@ def _run_job_script(
     # passes a plain str (#86832 review).
     if "\x00" in str(script_path):
         return False, f"Blocked: script path contains a NUL byte: {script_path!r}"
+
+    scripts_dir = _get_hermes_home() / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    trusted_script_dirs = _trusted_script_dirs(scripts_dir)
 
     try:
         raw = Path(script_path).expanduser()

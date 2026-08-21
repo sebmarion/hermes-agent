@@ -82,7 +82,14 @@ def main(argv=None) -> int:
         cmd.extend(str(a) for a in argv)
         ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1200,
+            )
         except (subprocess.SubprocessError, OSError) as exc:
             print(f"ERROR: improve loop failed to run: {exc}", file=sys.stderr)
             return 1
@@ -94,7 +101,7 @@ def main(argv=None) -> int:
             "exit_code": proc.returncode,
         }
         report_path = STATE_DIR / f"cron-report-{ts}.json"
-        report_path.write_text(json.dumps(report, indent=2))
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(proc.stdout)
         if proc.stderr:
             print(proc.stderr, file=sys.stderr)
