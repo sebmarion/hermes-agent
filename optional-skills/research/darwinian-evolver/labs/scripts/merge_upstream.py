@@ -3,11 +3,10 @@
 
 This is deliberately NOT a blind ``git pull``. It builds a clean preview from
 ``origin/main`` and overlays only the edge paths owned by this system:
-``optional-skills/``, ``tests/skills/``, and the explicitly owned scheduler
-paths ``cron/scheduler.py`` and ``tests/cron/test_cron_script.py``. Other core
-Hermes code is never copied from the local fork into the preview; therefore the
-resulting core is exactly upstream's core, even when the fork histories have no
-merge-base.
+``optional-skills/``, ``tests/skills/``, the BestPlan Hermes runtime, and the
+explicitly owned scheduler paths. Before doing that, it compares the complete
+tracked trees and refuses to proceed if upstream would replace any unowned
+local Hermes path. A sync must never silently discard core code.
 
 State records the owned edge paths and their last applied hashes. On bootstrap,
 paths that are absent from upstream or differ from upstream are conservatively
@@ -33,8 +32,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 EDGE_PREFIXES = ("optional-skills/", "tests/skills/")
+PRESERVED_PREFIXES = ("plugins/hermes-bestplan/",)
 OWNED_PATHS = ("cron/scheduler.py", "tests/cron/test_cron_script.py")
-SNAPSHOT_PATHS = (*EDGE_PREFIXES, *OWNED_PATHS)
+OWNED_PATHS += ("scripts/improve_loop_wrapper.py",)
+REQUIRED_RUNTIME_PATHS = (
+    "plugins/hermes-bestplan/bestplan_ocr.py",
+    "scripts/improve_loop_wrapper.py",
+)
+SNAPSHOT_PATHS = (*EDGE_PREFIXES, *PRESERVED_PREFIXES, *OWNED_PATHS)
 STATE_SCHEMA = 1
 
 
@@ -61,7 +66,7 @@ def is_edge_path(path: str) -> bool:
     parts = Path(path).parts
     if ".." in parts:
         return False
-    return path.startswith(EDGE_PREFIXES) or path in OWNED_PATHS
+    return path.startswith(EDGE_PREFIXES + PRESERVED_PREFIXES) or path in OWNED_PATHS
 
 
 def assert_edge_only(paths) -> None:
@@ -164,7 +169,7 @@ def _blob(repo: Path, ref: str, path: str) -> bytes | None:
 def snapshot_worktree(root: Path) -> dict[str, str]:
     result = {}
     root = Path(root)
-    for prefix in EDGE_PREFIXES:
+    for prefix in (*EDGE_PREFIXES, *PRESERVED_PREFIXES):
         directory = root / prefix
         if not directory.is_dir():
             continue
@@ -176,6 +181,42 @@ def snapshot_worktree(root: Path) -> dict[str, str]:
         if file_path.is_file():
             result[path] = _sha(file_path.read_bytes())
     return result
+
+
+def full_snapshot(repo: Path, ref: str) -> dict[str, str]:
+    """Return tracked path identities, including mode, for a complete tree."""
+    result = {}
+    raw = _run(repo, "ls-tree", "-r", ref, "--")
+    for line in raw.splitlines():
+        metadata, path = line.split("\t", 1)
+        mode, kind, object_id = metadata.split(" ", 2)
+        result[path] = f"{mode} {kind} {object_id}"
+    return result
+
+
+def assert_core_conserved(current: dict[str, str], upstream: dict[str, str]) -> None:
+    """Refuse any preview that would replace or delete unowned local code."""
+    replaced = sorted(
+        path
+        for path, identity in current.items()
+        if not is_edge_path(path) and upstream.get(path) != identity
+    )
+    if replaced:
+        raise ScopeViolation(
+            "upstream sync would replace unowned local Hermes paths: "
+            + ", ".join(replaced[:8])
+            + (f" (and {len(replaced) - 8} more)" if len(replaced) > 8 else "")
+        )
+
+
+def assert_required_runtime_paths(current: dict[str, str]) -> None:
+    """Refuse to sync when the local BestPlan runtime has already disappeared."""
+    missing = [path for path in REQUIRED_RUNTIME_PATHS if path not in current]
+    if missing:
+        raise ConservationError(
+            "required BestPlan runtime path(s) missing from local checkout: "
+            + ", ".join(missing)
+        )
 
 
 def snapshot(repo: Path, ref: str | None = None) -> dict[str, str]:
@@ -261,8 +302,12 @@ def _clean_checkout(repo: Path, expected_head: str | None = None) -> None:
 
 
 def build_preview(repo: Path, upstream_ref: str, current_ref: str, state_path: Path, preview: Path) -> dict:
-    """Build an upstream-based preview and return its conservation report."""
+    """Build a guarded upstream-based preview and return its conservation report."""
+    current_tree = full_snapshot(repo, current_ref)
+    upstream_tree = full_snapshot(repo, upstream_ref)
+    assert_core_conserved(current_tree, upstream_tree)
     current = snapshot(repo, current_ref)
+    assert_required_runtime_paths(current)
     upstream = snapshot(repo, upstream_ref)
     state = _load_state(state_path)
     owned = discover_owned_paths(current, upstream, state)

@@ -25,6 +25,9 @@ def test_edge_path_allowlist_is_narrow() -> None:
     assert mu.is_edge_path("tests/skills/test_improve_pipeline_merge.py")
     assert mu.is_edge_path("cron/scheduler.py")
     assert mu.is_edge_path("tests/cron/test_cron_script.py")
+    assert mu.is_edge_path("plugins/hermes-bestplan/bestplan_ocr.py")
+    assert mu.is_edge_path("plugins/hermes-bestplan/future_runtime.py")
+    assert mu.is_edge_path("scripts/improve_loop_wrapper.py")
     assert not mu.is_edge_path("agent/run_agent.py")
     assert not mu.is_edge_path("hermes_cli/main.py")
     assert not mu.is_edge_path("package-lock.json")
@@ -33,6 +36,11 @@ def test_edge_path_allowlist_is_narrow() -> None:
 def test_core_changes_are_rejected() -> None:
     with pytest.raises(mu.ScopeViolation, match="hermes_cli/main.py"):
         mu.assert_edge_only(["optional-skills/foo/SKILL.md", "hermes_cli/main.py"])
+
+
+def test_required_bestplan_runtime_paths_are_fail_closed() -> None:
+    with pytest.raises(mu.ConservationError, match="bestplan_ocr.py"):
+        mu.assert_required_runtime_paths({"scripts/improve_loop_wrapper.py": "sha256:abc"})
 
 
 def test_diff_status_preserves_add_modify_delete_operations() -> None:
@@ -129,19 +137,25 @@ def test_build_preview_starts_from_upstream_and_overlays_owned_edge(tmp_path: Pa
     (repo / "agent").mkdir()
     (repo / "cron").mkdir()
     (repo / "tests/cron").mkdir(parents=True)
+    (repo / "plugins/hermes-bestplan").mkdir(parents=True)
+    (repo / "scripts").mkdir()
     (repo / "optional-skills").mkdir()
     (repo / "agent/core.py").write_text("base-core")
     (repo / "cron/scheduler.py").write_text("base-scheduler")
     (repo / "tests/cron/test_cron_script.py").write_text("base-scheduler-test")
+    (repo / "plugins/hermes-bestplan/bestplan_ocr.py").write_text("base-ocr")
+    (repo / "scripts/improve_loop_wrapper.py").write_text("base-wrapper")
     (repo / "optional-skills/own.md").write_text("local-edge")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "base")
     base = _git(repo, "rev-parse", "HEAD")
 
-    # Upstream advances core and leaves its edge file at a different value.
-    (repo / "agent/core.py").write_text("upstream-core")
+    # Upstream advances only its core-independent edge files.
+    (repo / "agent/core.py").write_text("base-core")
     (repo / "cron/scheduler.py").write_text("upstream-scheduler")
     (repo / "tests/cron/test_cron_script.py").write_text("upstream-scheduler-test")
+    (repo / "plugins/hermes-bestplan/bestplan_ocr.py").write_text("upstream-ocr")
+    (repo / "scripts/improve_loop_wrapper.py").write_text("upstream-wrapper")
     (repo / "optional-skills/own.md").write_text("upstream-edge")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "upstream")
@@ -152,6 +166,8 @@ def test_build_preview_starts_from_upstream_and_overlays_owned_edge(tmp_path: Pa
     (repo / "optional-skills/own.md").write_text("local-owned-edge")
     (repo / "cron/scheduler.py").write_text("local-scheduler-fix")
     (repo / "tests/cron/test_cron_script.py").write_text("local-scheduler-test")
+    (repo / "plugins/hermes-bestplan/bestplan_ocr.py").write_text("local-ocr-fix")
+    (repo / "scripts/improve_loop_wrapper.py").write_text("local-wrapper-fix")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "local edge")
     local = _git(repo, "rev-parse", "HEAD")
@@ -159,9 +175,37 @@ def test_build_preview_starts_from_upstream_and_overlays_owned_edge(tmp_path: Pa
     preview = tmp_path / "preview"
 
     report = mu.build_preview(repo, upstream, local, state, preview)
-    assert (preview / "agent/core.py").read_text() == "upstream-core"
+    assert (preview / "agent/core.py").read_text() == "base-core"
     assert (preview / "optional-skills/own.md").read_text() == "local-owned-edge"
     assert (preview / "cron/scheduler.py").read_text() == "local-scheduler-fix"
     assert (preview / "tests/cron/test_cron_script.py").read_text() == "local-scheduler-test"
+    assert (preview / "plugins/hermes-bestplan/bestplan_ocr.py").read_text() == "local-ocr-fix"
+    assert (preview / "scripts/improve_loop_wrapper.py").read_text() == "local-wrapper-fix"
     assert "optional-skills/own.md" in report["owned_paths"]
+    assert "plugins/hermes-bestplan/bestplan_ocr.py" in report["owned_paths"]
+    assert "scripts/improve_loop_wrapper.py" in report["owned_paths"]
     _git(repo, "worktree", "remove", "--force", str(preview))
+
+
+def test_build_preview_rejects_unowned_core_replacement(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    (repo / "agent").mkdir()
+    (repo / "plugins/hermes-bestplan").mkdir(parents=True)
+    (repo / "scripts").mkdir()
+    (repo / "agent/core.py").write_text("local-core")
+    (repo / "plugins/hermes-bestplan/bestplan_ocr.py").write_text("local-ocr")
+    (repo / "scripts/improve_loop_wrapper.py").write_text("local-wrapper")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "local")
+    local = _git(repo, "rev-parse", "HEAD")
+    (repo / "agent/core.py").write_text("upstream-core")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "upstream")
+    upstream = _git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(mu.ScopeViolation, match="agent/core.py"):
+        mu.build_preview(repo, upstream, local, tmp_path / "state" / "sync.json", tmp_path / "preview")
