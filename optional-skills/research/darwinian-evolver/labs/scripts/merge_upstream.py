@@ -395,10 +395,57 @@ def main(argv: list[str] | None = None) -> int:
         if not expected_remote_sha:
             raise MergeUpstreamError(f"remote branch not found: {args.remote}/main")
 
-        report = build_delta_candidate(
-            repo, anchor, args.upstream, source_head, state_path, preview
-        )
-        candidate_sha = report["candidate_sha"]
+        report = None
+        recovery_verified = False
+        try:
+            report = build_delta_candidate(
+                repo, anchor, args.upstream, source_head, state_path, preview
+            )
+        except MergeUpstreamError as exc:
+            # Only attempt recovery for upstream delta conflicts/rejections.
+            # Other failures (missing anchor, dirty tree, remote movement,
+            # tests, non-conflict failures) remain hard halts.
+            conflict_detail = str(exc)
+            if "upstream delta conflict/rejection" not in conflict_detail:
+                raise
+            # Lazy import to avoid circular dependency:
+            # merge_upstream_recovery imports merge_upstream as mu.
+            from merge_upstream_recovery import (
+                recover_upstream_conflict,
+                RecoveryError,
+            )
+            try:
+                recovery_report = recover_upstream_conflict(
+                    repo=repo,
+                    source_head=source_head,
+                    anchor=anchor,
+                    upstream=args.upstream,
+                    expected_remote_sha=expected_remote_sha,
+                    remote_name=args.remote,
+                    conflict_detail=conflict_detail,
+                    state_path=state_path,
+                    worktree=preview,
+                    test_argv=args.test_argv,
+                )
+            except RecoveryError as rec_exc:
+                raise MergeUpstreamError(
+                    f"upstream conflict recovery failed: {rec_exc}"
+                ) from rec_exc
+            # Recovery produced a verified candidate. Rebuild the report
+            # using the existing conservation seams.
+            candidate_sha = recovery_report["candidate_sha"]
+            recovery_verified = True
+            state_owned = set((state or {}).get("owned_paths", []))
+            state_owned.update(REQUIRED_RUNTIME_PATHS)
+            report = {
+                "anchor_sha": anchor,
+                "upstream_sha": _run(repo, "rev-parse", f"{args.upstream}^{{commit}}").strip(),
+                "local_sha": source_head,
+                "candidate_sha": candidate_sha,
+                "owned_paths": sorted(state_owned),
+            }
+        else:
+            candidate_sha = report["candidate_sha"]
         if subprocess.run(
             ["git", "merge-base", "--is-ancestor", source_head, candidate_sha],
             cwd=repo,
@@ -406,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
         ).returncode:
             raise MergeUpstreamError("candidate is not a descendant of current fork HEAD")
 
-        if args.test_argv:
+        if args.test_argv and not recovery_verified:
             proc = subprocess.run(args.test_argv, cwd=preview, text=True)
             if proc.returncode:
                 raise MergeUpstreamError(
@@ -506,7 +553,7 @@ def build_delta_candidate(
         if apply_proc.returncode:
             detail = (apply_proc.stdout + "\n" + apply_proc.stderr).strip()
             raise MergeUpstreamError(
-                f"upstream delta conflict/rejection: {detail[-2000:]}"
+                f"upstream delta conflict/rejection: {detail[-12000:]}"
             )
 
         # Restore every path recorded as fork-owned, plus the required runtime
