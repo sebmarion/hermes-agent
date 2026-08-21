@@ -470,3 +470,34 @@ def test_milestone_events_use_allowed_labels(tmp_path: Path) -> None:
         reason="model exited 1: some error",
     )
     assert isinstance(failure, dict)
+
+
+def test_recovery_receipt_does_not_overwrite_upstream_sync_state(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo, {"core.py": "base\n"})
+    fake = tmp_path / "hermes"
+    _write_fake_hermes(fake, "commit")
+    sync_state = tmp_path / "state" / "upstream-sync.json"
+    sync_state.parent.mkdir(parents=True)
+    sync_state.write_text(json.dumps({"schema": 1, "upstream_sha": "a" * 40}))
+    old_env = os.environ.get("PATH")
+    os.environ["PATH"] = f"{tmp_path}{os.pathsep}{old_env}"
+    try:
+        result = mur.recover_upstream_conflict(
+            repo=repo,
+            source_head=_git(repo, "rev-parse", "HEAD"),
+            anchor=_git(repo, "rev-parse", "HEAD"),
+            upstream=_git(repo, "rev-parse", "HEAD"),
+            expected_remote_sha="",
+            conflict_detail="Applied patch to 'a.py' with conflicts.",
+            state_path=sync_state,
+            worktree=tmp_path / "recovery-wt",
+            model_argv=["hermes", "-z"],
+            required_paths=[],
+            notify=False,
+        )
+    finally:
+        os.environ["PATH"] = old_env
+    assert result["outcome"] == "ok"
+    assert json.loads(sync_state.read_text())["upstream_sha"] == "a" * 40
+    assert (sync_state.parent / "upstream-recovery.json").is_file()

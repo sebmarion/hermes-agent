@@ -348,6 +348,14 @@ def _write_receipt(state_path: Path, receipt: dict) -> None:
         pass
 
 
+def _receipt_path(state_path: Path) -> Path:
+    """Keep recovery receipts separate from the updater's sync state."""
+    state_path = Path(state_path)
+    if state_path.name == "upstream-sync.json":
+        return state_path.with_name("upstream-recovery.json")
+    return state_path
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -380,6 +388,7 @@ def recover_upstream_conflict(
     repo = Path(repo)
     worktree = Path(worktree)
     state_path = Path(state_path)
+    receipt_path = _receipt_path(state_path)
     anchor = anchor.strip()
     upstream = upstream.strip()
     source_head = source_head.strip()
@@ -430,7 +439,7 @@ def recover_upstream_conflict(
         receipt["candidate_sha"] = verified["candidate_sha"]
         receipt["test_result"] = "pass"
         receipt["outcome"] = "ok"
-        _write_receipt(state_path, receipt)
+        _write_receipt(receipt_path, receipt)
         if notify:
             try:
                 _notify_success(
@@ -443,7 +452,7 @@ def recover_upstream_conflict(
     except Exception as exc:
         receipt["outcome"] = "halt"
         receipt["error"] = str(exc)[-500:]
-        _write_receipt(state_path, receipt)
+        _write_receipt(receipt_path, receipt)
         if notify:
             try:
                 _notify_failure(
