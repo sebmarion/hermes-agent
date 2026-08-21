@@ -227,8 +227,10 @@ def test_non_conflict_failure_does_not_trigger_recovery(tmp_path: Path) -> None:
 def test_model_failure_halts(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo, {"core.py": "base\n"})
-    _, record, state_path, worktree = _recover_direct(tmp_path, repo, behavior="fail")
-    # The function must have raised; we re-assert the receipt outcome.
+    with pytest.raises(mur.RecoveryError, match="model exited"):
+        _recover_direct(tmp_path, repo, behavior="fail")
+    # Re-assert the receipt outcome.
+    state_path = tmp_path / "state" / "recovery-receipt.json"
     receipt = json.loads(state_path.read_text())
     assert receipt["outcome"] == "halt"
     assert not receipt.get("candidate_sha")
@@ -281,7 +283,13 @@ def test_clean_candidate_is_applied_via_existing_seams(tmp_path: Path) -> None:
     base = _init_repo(repo, {"core.py": "base\n"})
     result, record, state_path, worktree = _recover(tmp_path, repo)
     candidate = result["candidate_sha"]
-    assert _git(repo, "rev-parse", f"{candidate}{{commit}}") == candidate
+    # Verify the candidate commit exists
+    proc = subprocess.run(
+        ["git", "rev-parse", candidate + "^{commit}"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"candidate commit does not exist: {proc.stderr}"
+    # Verify it's a descendant of base
     proc = subprocess.run(
         ["git", "merge-base", "--is-ancestor", base, candidate],
         cwd=repo, capture_output=True,
@@ -397,6 +405,7 @@ def test_notification_failure_is_advisory(tmp_path: Path) -> None:
             state_path=state_path,
             worktree=worktree,
             model_argv=["hermes", "-z"],
+            required_paths=[],  # Override to empty for test repos
         )
         assert result["outcome"] == "ok"
     finally:
@@ -434,6 +443,7 @@ def test_notification_failure_is_advisory_on_halt(tmp_path: Path) -> None:
                 state_path=state_path,
                 worktree=worktree,
                 model_argv=["hermes", "-z"],
+                required_paths=[],  # Override to empty for test repos
             )
     finally:
         mur._notify = old_notify
