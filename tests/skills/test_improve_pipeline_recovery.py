@@ -157,6 +157,7 @@ def _recover_direct(tmp_path: Path, repo: Path, *, behavior: str,
             state_path=state_path,
             worktree=worktree,
             model_argv=["hermes", "-z"],
+            required_paths=[],  # Override to empty for test repos
             test_argv=test_argv,
         )
     finally:
