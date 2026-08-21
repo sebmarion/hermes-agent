@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPTS = Path(__file__).resolve().parents[2] / "optional-skills/research/darwinian-evolver/labs/scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -81,6 +83,32 @@ def test_materialize_candidate_accepts_fenced_unified_diff_additions() -> None:
 
     assert candidate.startswith(baseline)
     assert "## Timeout rule" in candidate
+
+
+def test_materialize_candidate_rejects_nested_diff_payload() -> None:
+    baseline = "---\nname: bestplan\n---\n# BestPlan\n"
+    proposal = """```diff
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -1 +1,4 @@
++```diff
++--- a/SKILL.md
++++ b/SKILL.md
++@@ -1 +1,2 @@
+++# Nested Patch
++```
+```"""
+
+    with pytest.raises(ValueError, match="nested diff"):
+        lp.materialize_candidate(baseline, proposal)
+
+
+def test_materialize_candidate_strips_trailing_whitespace_from_addition() -> None:
+    baseline = "---\nname: bestplan\n---\n# BestPlan\n"
+    candidate = lp.materialize_candidate(baseline, "## Clean Section   \nbody   ")
+
+    assert "## Clean Section\nbody\n" in candidate
+    assert not any(line.endswith(" ") for line in candidate.splitlines())
 
 
 def test_live_chain_scores_and_applies_only_green_candidate(tmp_path: Path) -> None:

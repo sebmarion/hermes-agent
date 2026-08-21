@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -172,3 +173,68 @@ def test_cron_promotes_accepted_skill_changes(tmp_path: Path, monkeypatch) -> No
     report = json.loads(next(tmp_path.glob("report-*.json")).read_text())
     assert report["promotion"]["status"] == "pushed"
     assert report["promotion"]["commit"] == "abc123"
+
+
+def test_failed_promotion_restores_skill_and_keeps_task_queued(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(hx, "fetch_bookmarks", lambda _n: [])
+    state_dir = tmp_path / "state"
+    repo = tmp_path / "skills-repo"
+    skill = repo / "software-development" / "bestplan" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    baseline = "---\nname: bestplan\ndescription: test\n---\n# BestPlan\n"
+    skill.write_text(baseline)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.create_session("real-session-0004", source="cli", model="test")
+    db.append_message("real-session-0004", role="user", content="repair the skill")
+    db.append_message("real-session-0004", role="assistant", content="ERROR: check failed")
+    db.end_session("real-session-0004", "done")
+    db.close()
+
+    seen = {}
+
+    def fake_chain(**kwargs):
+        task_id = kwargs["failures"][0]["task_id"]
+        seen["task_id"] = task_id
+        skill.write_text(baseline + "\n## Bad Candidate\n")
+        return {
+            "ok": True,
+            "halted": False,
+            "applied": [task_id],
+            "blocked": [],
+            "notes": [],
+            "summary": "1 applied, 0 blocked",
+        }
+
+    monkeypatch.setattr(entry, "run_live_chain", fake_chain)
+    monkeypatch.setattr(
+        entry.promote_skill,
+        "promote",
+        lambda **_kwargs: (_ for _ in ()).throw(entry.promote_skill.PromotionError("OCR failed")),
+    )
+
+    assert entry.main([
+        "entry",
+        "--state-dir", str(state_dir),
+        "--db-path", str(db_path),
+        "--live-skills", str(repo),
+        "--skill-path", str(skill),
+    ]) == 1
+
+    assert skill.read_text() == baseline
+    assert subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=repo, text=True
+    ).strip() == ""
+    pending = [
+        json.loads(line)
+        for line in (state_dir / "pending_failures.jsonl").read_text().splitlines()
+    ]
+    assert [row["task_id"] for row in pending] == [seen["task_id"]]

@@ -19,6 +19,14 @@ actual_sha="$(git -C "$REPO" rev-parse HEAD)"
 remote_sha="$(git -C "$REPO" ls-remote sebmarion-fork refs/heads/main | awk 'NR==1 {print $1}')"
 [[ -n "$remote_sha" && "$actual_sha" == "$remote_sha" ]] || fail "local/remote SHA mismatch: $actual_sha != $remote_sha"
 
+if [[ -f "$REPORT" ]]; then
+    activated_sha="$(awk -F= '$1 == "sha" {print $2; exit}' "$REPORT")"
+    if [[ -n "$activated_sha" && "$activated_sha" == "$actual_sha" ]]; then
+        log "SHA $actual_sha is already activated; no Hermes reload required"
+        exit 0
+    fi
+fi
+
 log "reloading gateway from verified SHA $actual_sha"
 systemctl reload hermes-gateway.service
 

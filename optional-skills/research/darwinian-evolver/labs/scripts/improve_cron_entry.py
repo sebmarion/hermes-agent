@@ -108,6 +108,19 @@ def _verify_skill_for_promotion(skill_path: Path, session_id: str) -> dict:
     }
 
 
+def _restore_unpromoted_skill(repo: Path, target_rel: str) -> None:
+    """Restore one failed-promotion skill without touching history or siblings."""
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "restore", "--worktree", "--", target_rel],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(f"failed to restore unpromoted skill: {detail[:400]}")
+
+
 def main(argv) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--state-dir", default=None)
@@ -228,20 +241,13 @@ def main(argv) -> int:
                 report["ok"] = False
                 report["halted"] = True
                 report["notes"].extend(chain.get("notes", []))
-            processed_ids = {
-                str(task_id)
-                for task_id in [*chain.get("applied", []), *chain.get("blocked", [])]
-            }
-            if chain.get("ok") and not chain.get("blocked"):
+            processed_ids = {str(task_id) for task_id in chain.get("blocked", [])}
+            applied_ids = {str(task_id) for task_id in chain.get("applied", [])}
+            if chain.get("ok") and not applied_ids and not chain.get("blocked"):
                 processed_ids.update(str(row.get("task_id")) for row in selected_failures)
-            pending = [
-                row for row in failures if str(row.get("task_id")) not in processed_ids
-            ]
-            hf.write_facts(pending_path, pending)
-            report["n_failures_pending"] = len(pending)
-            if pending:
-                report["steps"].append(f"pending_failures: {len(pending)} remain queued")
             if chain.get("applied"):
+                repo = None
+                target_rel = None
                 try:
                     repo = promote_skill.repository_root(args.skill_path)
                     target_rel = promote_skill.relative_path(repo, args.skill_path)
@@ -257,10 +263,26 @@ def main(argv) -> int:
                         f"promotion: pushed {promotion['commit'][:12]} to "
                         f"{promotion['remote']}/{promotion['branch']}"
                     )
+                    processed_ids.update(applied_ids)
                 except Exception as exc:  # noqa: BLE001 - promotion is fail-closed
                     report["notes"].append(f"skill promotion failed: {exc}")
                     report["ok"] = False
                     report["halted"] = True
+                    if repo is not None and target_rel is not None:
+                        try:
+                            _restore_unpromoted_skill(repo, target_rel)
+                            report["notes"].append(
+                                "unpromoted skill restored; applied task remains queued"
+                            )
+                        except Exception as restore_exc:  # noqa: BLE001
+                            report["notes"].append(str(restore_exc))
+            pending = [
+                row for row in failures if str(row.get("task_id")) not in processed_ids
+            ]
+            hf.write_facts(pending_path, pending)
+            report["n_failures_pending"] = len(pending)
+            if pending:
+                report["steps"].append(f"pending_failures: {len(pending)} remain queued")
         except Exception as exc:  # noqa: BLE001 - model/runtime failure is fail-closed
             report["notes"].append(f"live chain failed: {exc}")
             report["ok"] = False

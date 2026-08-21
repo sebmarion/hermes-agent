@@ -120,6 +120,69 @@ def test_apply_rejects_clean_checkout_head_changed_after_preview(tmp_path: Path)
         mu.apply_candidate(repo, "not-a-real-candidate", expected_head="different-head")
 
 
+def test_apply_candidate_uses_fast_forward_only_and_never_reset(monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(mu, "_clean_checkout", lambda *_args, **_kwargs: None)
+
+    def record(_repo, *args, **_kwargs):
+        calls.append(tuple(args))
+        return ""
+
+    monkeypatch.setattr(mu, "_run", record)
+    mu.apply_candidate(Path("/tmp/repo"), "candidate-sha", expected_head="source-sha")
+
+    assert ("merge", "--ff-only", "candidate-sha") in calls
+    assert not any(call and call[0] == "reset" for call in calls)
+
+
+def test_apply_candidate_fast_forwards_detached_clone(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    (repo / "file.txt").write_text("base\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "file.txt").write_text("candidate\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "candidate")
+    candidate = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "switch", "--detach", base)
+
+    mu.apply_candidate(repo, candidate, expected_head=base)
+
+    assert _git(repo, "rev-parse", "HEAD") == candidate
+    assert _git(repo, "status", "--porcelain") == ""
+
+
+def test_publish_and_verify_uses_normal_push_without_force(monkeypatch) -> None:
+    expected = "a" * 40
+    candidate = "b" * 40
+    calls: list[tuple[str, ...]] = []
+    remote_reads = iter((expected, candidate))
+
+    monkeypatch.setattr(
+        mu,
+        "_ssh_push_url",
+        lambda *_args: "git@github.com:sebmarion/hermes-agent.git",
+    )
+
+    def record(_repo, *args, **_kwargs):
+        calls.append(tuple(args))
+        if args and args[0] == "ls-remote":
+            return next(remote_reads)
+        return ""
+
+    monkeypatch.setattr(mu, "_run", record)
+    assert mu.publish_and_verify(Path("/tmp/repo"), "fork", candidate, expected) == candidate
+
+    push = next(call for call in calls if call and call[0] == "push")
+    assert not any(part.startswith("--force") for part in push)
+    assert push[-1] == f"{candidate}:main"
+
+
 def test_https_fork_remote_is_converted_to_ssh_for_push(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

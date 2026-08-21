@@ -1,36 +1,210 @@
 #!/usr/bin/env python3
 """Daily safe upstream-delta sync wrapper.
 
-Runs the repository merge planner outside the agent's Python process:
-- flock serializes it against another daily/manual update;
-- the planner applies the recorded upstream delta to the current fork HEAD,
-  preserves owned paths, runs the bounded relevant test gate, then publishes;
+The live Hermes checkout is deployment state, never a scratch workspace:
+- flock serializes daily/manual updates;
+- every run creates a separate disposable clone with independent refs/index;
+- delta application, bounded Zeus-Qwen recovery, and tests run only there;
+- a tested candidate is published by normal fast-forward push;
+- canonical main advances only via guarded ``git merge --ff-only``;
 - Telegram receives a redacted success or halt rundown.
 
-A dirty checkout (including another thread's in-flight work) is intentionally
-a halt, never an implicit stash/reset.
+A dirty or moved canonical checkout is always a halt. No reset, stash, force
+checkout, or force push is permitted by this wrapper.
 """
 from __future__ import annotations
 
 import fcntl
+import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 REPO = Path("/home/seb/projects/hermes-agent")
 PYTHON = REPO / ".venv" / "bin" / "python"
-MERGER = REPO / "optional-skills/research/darwinian-evolver/labs/scripts/merge_upstream.py"
 NOTIFY = REPO / "optional-skills/research/darwinian-evolver/labs/scripts/notify_telegram.py"
 STATE = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "labs/bestplan-research/state"
 LOCK = STATE / "upstream-merge.lock"
+RUN_ROOT = STATE / "updater-runs"
+UPSTREAM_URL = "https://github.com/NousResearch/hermes-agent.git"
+FORK_URL = "git@github.com:sebmarion/hermes-agent.git"
 RELEVANT_TEST_PATHS = (
     "tests/skills",
     "tests/gateway/test_scale_to_zero_watcher.py",
     "tests/plugins/test_teams_pipeline_plugin.py",
     "tests/tools/test_memory_tool.py",
 )
+
+
+class WrapperError(RuntimeError):
+    """Fail-closed updater wrapper error."""
+
+
+def _git(repo: Path, *args: str, check: bool = True) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    if check and proc.returncode:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise WrapperError(f"git {args[0]} failed: {detail[-2000:]}")
+    return proc.stdout.strip()
+
+
+def _is_clean(repo: Path) -> bool:
+    return not _git(repo, "status", "--porcelain", "--untracked-files=all").strip()
+
+
+def _remote_main_sha(repo: Path) -> str:
+    output = _git(repo, "ls-remote", "sebmarion-fork", "refs/heads/main")
+    return output.split()[0] if output.split() else ""
+
+
+def _load_sync_state() -> dict:
+    path = STATE / "upstream-sync.json"
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _assert_canonical(expected_head: str | None = None) -> str:
+    if not _is_clean(REPO):
+        raise WrapperError("canonical Hermes checkout is dirty; refusing updater run")
+    head = _git(REPO, "rev-parse", "HEAD")
+    if expected_head and head != expected_head:
+        raise WrapperError(
+            f"canonical HEAD moved: expected {expected_head[:12]}, got {head[:12]}"
+        )
+    return head
+
+
+def _recover_published_activation() -> str:
+    """Fast-forward a clean canonical checkout only from a matching receipt.
+
+    This covers a crash after publish but before canonical promotion/reload.
+    Unknown remote movement remains a hard halt.
+    """
+    head = _assert_canonical()
+    _git(REPO, "fetch", "sebmarion-fork", "main")
+    remote = _remote_main_sha(REPO)
+    if not remote:
+        raise WrapperError("fork remote main is unavailable")
+    if head == remote:
+        return head
+
+    state = _load_sync_state()
+    if state.get("published_sha") != remote:
+        raise WrapperError(
+            f"canonical/remote mismatch has no matching updater receipt: "
+            f"local {head[:12]} remote {remote[:12]}"
+        )
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", head, remote],
+        cwd=REPO,
+        capture_output=True,
+    )
+    if ancestor.returncode:
+        raise WrapperError("receipt remote is not a fast-forward of canonical HEAD")
+    _git(REPO, "merge", "--ff-only", remote)
+    return _assert_canonical(remote)
+
+
+def _create_isolated_repo(
+    source_head: str,
+    *,
+    source_repo: Path = REPO,
+    run_root: Path = RUN_ROOT,
+    upstream_url: str = UPSTREAM_URL,
+    fork_url: str = FORK_URL,
+) -> tuple[Path, Path]:
+    """Create a disposable clone with refs/index independent from canonical."""
+    run_root.mkdir(parents=True, exist_ok=True)
+    run_parent = Path(tempfile.mkdtemp(prefix="run-", dir=run_root))
+    run_repo = run_parent / "repo"
+    try:
+        proc = subprocess.run(
+            ["git", "clone", "--no-checkout", str(source_repo), str(run_repo)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode:
+            raise WrapperError(f"isolated clone failed: {proc.stderr[-2000:]}")
+        _git(run_repo, "remote", "set-url", "origin", upstream_url)
+        _git(run_repo, "remote", "remove", "sebmarion-fork", check=False)
+        _git(run_repo, "remote", "add", "sebmarion-fork", fork_url)
+        _git(run_repo, "fetch", "origin", "main")
+        _git(run_repo, "fetch", "sebmarion-fork", "main")
+        fork_head = _git(run_repo, "rev-parse", "sebmarion-fork/main")
+        if fork_head != source_head:
+            raise WrapperError(
+                f"fork remote moved before isolated run: "
+                f"expected {source_head[:12]}, got {fork_head[:12]}"
+            )
+        _git(run_repo, "switch", "--detach", fork_head)
+        if not _is_clean(run_repo):
+            raise WrapperError("isolated updater clone is unexpectedly dirty")
+        return run_parent, run_repo
+    except BaseException:
+        shutil.rmtree(run_parent, ignore_errors=True)
+        raise
+
+
+def _prune_stale_runs(max_age_seconds: int = 86_400) -> None:
+    if not RUN_ROOT.is_dir():
+        return
+    cutoff = time.time() - max_age_seconds
+    for child in RUN_ROOT.iterdir():
+        try:
+            if child.is_dir() and not child.is_symlink() and child.stat().st_mtime < cutoff:
+                shutil.rmtree(child, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _build_command(repo: Path = REPO) -> list[str]:
+    merger = repo / "optional-skills/research/darwinian-evolver/labs/scripts/merge_upstream.py"
+    command = [
+        str(PYTHON), str(merger),
+        "--repo", str(repo),
+        "--state-dir", str(STATE),
+        "--remote", "sebmarion-fork",
+        "--apply", "--publish",
+        "--test", str(PYTHON),
+        "--test=-m",
+        "--test", "pytest",
+    ]
+    for path in RELEVANT_TEST_PATHS:
+        command.extend(["--test", path])
+    command.append("--test=-q")
+    return command
+
+
+def _promote_canonical(expected_head: str, published_sha: str) -> str:
+    _assert_canonical(expected_head)
+    _git(REPO, "fetch", "sebmarion-fork", "main")
+    remote = _remote_main_sha(REPO)
+    if remote != published_sha:
+        raise WrapperError(
+            f"published SHA moved before canonical promotion: "
+            f"expected {published_sha[:12]}, got {remote[:12]}"
+        )
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", expected_head, published_sha],
+        cwd=REPO,
+        capture_output=True,
+    )
+    if ancestor.returncode:
+        raise WrapperError("tested candidate is not a fast-forward of canonical HEAD")
+    _git(REPO, "merge", "--ff-only", published_sha)
+    return _assert_canonical(published_sha)
 
 
 def _notify(event: str, message: str) -> None:
@@ -45,26 +219,7 @@ def _notify(event: str, message: str) -> None:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        # Notification is advisory; never turn a completed merge into a
-        # wrapper failure because Telegram/Hermes is unavailable.
         return
-
-
-def _build_command() -> list[str]:
-    command = [
-        str(PYTHON), str(MERGER),
-        "--repo", str(REPO),
-        "--state-dir", str(STATE),
-        "--remote", "sebmarion-fork",
-        "--apply", "--publish",
-        "--test", str(PYTHON),
-        "--test=-m",
-        "--test", "pytest",
-    ]
-    for path in RELEVANT_TEST_PATHS:
-        command.extend(["--test", path])
-    command.append("--test=-q")
-    return command
 
 
 def main() -> int:
@@ -76,34 +231,55 @@ def main() -> int:
             print("skipped: upstream merge already running")
             return 0
 
-        command = _build_command()
         started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        run_parent: Path | None = None
         try:
-            proc = subprocess.run(command, capture_output=True, text=True, timeout=3600)
-        except (OSError, subprocess.SubprocessError) as exc:
-            summary = f"Daily Hermes upstream sync failed to start: {type(exc).__name__}"
-            _notify("halted", summary)
-            print(summary, file=sys.stderr)
-            return 1
-
-        output = (proc.stdout + "\n" + proc.stderr).strip()
-        report = STATE / "last-upstream-merge.txt"
-        report.write_text(f"started={started}\nexit_code={proc.returncode}\n{output[-12000:]}\n")
-        if proc.returncode == 0:
-            _notify(
-                "upgrade",
-                "Daily Hermes upstream sync succeeded. "
-                f"The tested upstream-based candidate was applied and published to sebmarion/main. "
-                f"Run started {started}. Result: {proc.stdout[-2000:]}",
+            _prune_stale_runs()
+            source_head = _recover_published_activation()
+            run_parent, run_repo = _create_isolated_repo(source_head)
+            proc = subprocess.run(
+                _build_command(run_repo),
+                capture_output=True,
+                text=True,
+                timeout=3600,
             )
-        else:
+            output = (proc.stdout + "\n" + proc.stderr).strip()
+            if proc.returncode:
+                raise WrapperError(output[-12_000:] or f"merger exited {proc.returncode}")
+
+            published_sha = str(_load_sync_state().get("published_sha") or "")
+            if len(published_sha) != 40:
+                raise WrapperError("successful merger did not persist a published SHA receipt")
+            _promote_canonical(source_head, published_sha)
+        except (WrapperError, OSError, subprocess.SubprocessError) as exc:
+            output = f"RESULT: HALT — {exc}"
+            report = STATE / "last-upstream-merge.txt"
+            report.write_text(f"started={started}\nexit_code=1\n{output[-12000:]}\n")
             _notify(
                 "halted",
-                "Daily Hermes upstream sync halted safely; live checkout was not applied. "
+                "Daily Hermes upstream sync halted safely; canonical checkout was not mutated. "
                 f"Run started {started}. Reason: {output[-2500:]}",
             )
+            print(output, file=sys.stderr)
+            return 1
+        finally:
+            if run_parent is not None:
+                shutil.rmtree(run_parent, ignore_errors=True)
+
+        output = (
+            "RESULT: OK — tested candidate published and canonical main advanced "
+            f"via fast-forward to {published_sha}"
+        )
+        report = STATE / "last-upstream-merge.txt"
+        report.write_text(f"started={started}\nexit_code=0\n{output}\n")
+        _notify(
+            "upgrade",
+            "Daily Hermes upstream sync succeeded. The isolated tested candidate was "
+            f"published and canonical main fast-forwarded to {published_sha}. "
+            f"Run started {started}.",
+        )
         print(output)
-        return proc.returncode
+        return 0
 
 
 if __name__ == "__main__":

@@ -66,6 +66,11 @@ record = os.environ.get("FAKE_HERMES_RECORD")
 if record:
     with open(record, "w") as f:
         json.dump({"argv": args}, f)
+# The fake also receives advisory `hermes send` notification calls. Those are
+# not model invocations and must never execute candidate/dirty/orphan behavior
+# in pytest's project working directory.
+if "-z" not in args:
+    sys.exit(0)
 wt = Path(worktree) if worktree else Path(".")
 behavior = ''' + "BEHAVIOR" + '''
 def git(*a):
@@ -470,6 +475,22 @@ def test_milestone_events_use_allowed_labels(tmp_path: Path) -> None:
         reason="model exited 1: some error",
     )
     assert isinstance(failure, dict)
+
+
+def test_fake_notification_invocation_cannot_mutate_repository(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    before = _init_repo(repo, {"core.py": "base\n"})
+    fake = tmp_path / "hermes"
+    _write_fake_hermes(fake, "dirty")
+
+    subprocess.run(
+        [str(fake), "send", "--to", "telegram", "test"],
+        cwd=repo,
+        check=True,
+    )
+
+    assert _git(repo, "rev-parse", "HEAD") == before
+    assert _git(repo, "status", "--porcelain", "--untracked-files=all") == ""
 
 
 def test_recovery_receipt_does_not_overwrite_upstream_sync_state(tmp_path: Path) -> None:

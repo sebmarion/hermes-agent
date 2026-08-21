@@ -13,10 +13,10 @@ paths that are absent from upstream or differ from upstream are conservatively
 classified as local-owned. On later runs, edits to any tracked edge path are
 added to the owned set; upstream-only edge changes win for paths not owned.
 
-Default mode is preview-only. ``--apply`` requires a clean live checkout and
-moves it to the tested preview commit. ``--publish`` additionally updates the
-fork remote using ``--force-with-lease`` when histories are unrelated. The
-push remote must resolve to sebmarion; origin is fetch-only by policy.
+Default mode is preview-only. ``--apply`` requires a clean checkout whose HEAD
+still matches the pinned source and advances it with ``git merge --ff-only``.
+``--publish`` additionally performs a normal fast-forward push. The push remote
+must resolve to sebmarion; origin is fetch-only by policy.
 """
 from __future__ import annotations
 
@@ -338,7 +338,7 @@ def commit_preview(preview: Path, message: str) -> str:
 
 def apply_candidate(repo: Path, candidate_sha: str, expected_head: str | None = None) -> None:
     _clean_checkout(repo, expected_head)
-    _run(repo, "reset", "--hard", candidate_sha)
+    _run(repo, "merge", "--ff-only", candidate_sha)
 
 
 def _ssh_push_url(repo: Path, remote: str) -> str:
@@ -356,7 +356,6 @@ def publish_candidate(repo: Path, remote: str, candidate_sha: str, expected_remo
     _run(
         repo,
         "push",
-        f"--force-with-lease=main:{expected_remote_sha}",
         url,
         f"{candidate_sha}:main",
     )
@@ -659,7 +658,6 @@ def publish_and_verify(
     _run(
         repo,
         "push",
-        f"--force-with-lease=main:{expected_remote_sha}",
         url,
         f"{candidate_sha}:main",
     )

@@ -118,40 +118,49 @@ The isolated smoke path is:
 
 ## Daily upstream sync — core stays upstream, edge functionality is conserved
 
-`merge_upstream.py` is the daily pull/upgrade path. It does **not** run a blind
-`git pull` or merge arbitrary fork code. It builds a temporary candidate from
-`origin/main`, overlays only `optional-skills/` and `tests/skills/` paths that
-are locally owned, verifies conservation, runs the skills suite, and only then
-can apply/publish.
+`merge_upstream.py` is the daily pull/upgrade engine. It does **not** run a
+blind `git pull` or merge arbitrary fork code. `upstream_merge_wrapper.py`
+creates a disposable **separate clone** (independent refs/index), then the
+engine applies the saved upstream delta there, conserves owned paths, runs the
+bounded relevant test gate, and publishes only a fast-forward candidate.
 
 ```text
-origin/main
-    ↓ clean temporary worktree
-owned edge paths only  ←  local edge manifest/state
-    ↓ tests/skills green
-live checkout + sebmarion/main (apply/publish mode)
+canonical main (read-only source, clean + pinned)
+    ↓ separate disposable clone
+origin delta + owned-path conservation
+    ↓ bounded relevant tests / optional Zeus-Qwen conflict recovery
+normal fast-forward push to sebmarion/main
+    ↓ guarded `git merge --ff-only`
+canonical main
+    ↓ root verifier only after wrapper success
+Hermes gateway reload + PID/SHA verification
 ```
 
 Safety contract:
 
 - Core Hermes is never copied from the local fork into the candidate; the
-  candidate core is byte-for-byte `origin/main`, except for the explicitly
-  owned scheduler paths `cron/scheduler.py` and `tests/cron/test_cron_script.py`.
+  candidate starts from fork HEAD and applies only the recorded
+  anchor-to-upstream delta, while explicitly owned runtime/edge paths remain
+  byte-identical to fork HEAD.
 - First bootstrap conservatively classifies local edge differences as owned;
   subsequent runs use `~/.hermes/labs/bestplan-research/state/upstream-sync.json`
   to detect newly edited edge files and preserve them.
-- A dirty live checkout halts. No stash, reset, or implicit conflict choice.
-- Publishing uses `--force-with-lease` only after verifying the push URL is the
-  `sebmarion/hermes-agent` fork; `origin` is fetch-only.
-- A separate `flock` wrapper prevents overlapping daily runs. Success and halt
-  summaries go through the redacting Telegram notifier.
+- Qwen, Git delta application, and pytest operate only inside the disposable
+  clone. An OOM/kill may leave a stale run directory, but cannot alter canonical
+  refs, index, or worktree; the next run prunes old disposable directories.
+- A dirty or moved canonical checkout halts. No stash, reset, force checkout,
+  implicit conflict choice, or force push is permitted.
+- Publishing is a normal fast-forward push after exact remote-SHA and fork-URL
+  verification. Canonical promotion is `git merge --ff-only` after rechecking
+  its pinned HEAD and cleanliness.
+- A separate `flock` prevents overlapping runs. Recovery receipts never
+  overwrite sync state. Success/halt summaries use the redacting Telegram
+  notifier.
 
-The registered job invokes:
-
-```bash
-hermes cron create --name hermes-upstream-sync "30 4 * * *" \
-  --no-agent --script upstream_merge_wrapper.py --deliver local
-```
+The root-owned `hermes-upstream-merge.timer` invokes the wrapper as user `seb`.
+Only its fixed `ExecStartPost` verifier runs as root, and only after wrapper
+success, to reload **Hermes** and verify the new PID/SHA. The old internal
+`hermes-upstream-sync` cron job remains paused to prevent duplicate updaters.
 
 Manual preview (no live mutation):
 
@@ -160,6 +169,6 @@ Manual preview (no live mutation):
   --repo /home/seb/projects/hermes-agent --state-dir ~/.hermes/labs/bestplan-research/state
 ```
 
-The wrapper's apply/publish mode will safely halt while another checkout has
-uncommitted work; it resumes on the next daily run after that work is committed
-or discarded by its owner.
+The wrapper halts whenever canonical is dirty, its HEAD moves during a run, or
+the fork remote differs without a matching published-SHA receipt. After the
+checkout owner resolves that state, the next isolated run may retry safely.

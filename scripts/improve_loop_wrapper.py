@@ -37,6 +37,19 @@ ENTRY = (
 )
 
 STATE_DIR = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "labs" / "bestplan-research" / "state"
+TOOL_PATHS = (
+    REPO / ".venv" / "bin",
+    Path.home() / ".local" / "bin",
+    Path.home() / "tools" / "node-v22.23.2-linux-x64" / "bin",
+)
+
+
+def _child_env() -> dict[str, str]:
+    env = os.environ.copy()
+    current = [part for part in env.get("PATH", "").split(os.pathsep) if part]
+    preferred = [str(path) for path in TOOL_PATHS if path.is_dir()]
+    env["PATH"] = os.pathsep.join(dict.fromkeys(preferred + current))
+    return env
 
 
 def main(argv=None) -> int:
@@ -88,6 +101,7 @@ def main(argv=None) -> int:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=_child_env(),
                 timeout=1200,
             )
         except (subprocess.SubprocessError, OSError) as exc:

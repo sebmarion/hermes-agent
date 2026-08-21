@@ -51,8 +51,13 @@ def materialize_candidate(baseline: str, proposal: str) -> str:
         addition = "\n".join(additions).strip()
         if not addition:
             raise ValueError("diff proposal contains no additions")
-    if addition.startswith("diff --git"):
-        raise ValueError("proposal must be an append-only Markdown addition, not a diff")
+    nested_lines = addition.splitlines()
+    if addition.startswith("```diff") or any(
+        line.startswith(("diff --git ", "--- ", "+++ ", "@@ "))
+        for line in nested_lines
+    ):
+        raise ValueError("proposal contains a nested diff instead of Markdown content")
+    addition = "\n".join(line.rstrip() for line in nested_lines).strip()
     if any(pattern.search(addition) for pattern in _CREDENTIALS):
         raise ValueError("proposal contains a credential-shaped value")
     return baseline.rstrip() + "\n\n" + addition + "\n"
