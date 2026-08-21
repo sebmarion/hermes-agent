@@ -192,11 +192,17 @@ def _run_hermes(model_argv: list[str], prompt: str, worktree: Path,
     """Invoke the headless model.  Returns (exit_code, bounded output)."""
     cmd = list(model_argv)
     if not any(str(a) == "-z" for a in cmd):
-        cmd = ["hermes", "-z"] + list(cmd)
-    cmd = list(cmd) + ["--in", str(worktree)]
-    # The prompt is passed as a single argument so shell metacharacters are
-    # never interpreted.  (No shell involved.)
-    cmd = cmd + [prompt]
+        cmd = ["hermes", "-z"] + cmd
+    oneshot_index = next(i for i, arg in enumerate(cmd) if str(arg) == "-z")
+    # Hermes parses -z/--oneshot as an option with one required argument, so
+    # the prompt must be the immediate next argv element. Keep it a single
+    # argument and avoid a shell entirely.
+    cmd = (
+        cmd[:oneshot_index + 1]
+        + [prompt]
+        + cmd[oneshot_index + 1:]
+        + ["--in", str(worktree)]
+    )
     try:
         proc = subprocess.run(
             cmd, cwd=worktree, text=True, capture_output=True, timeout=timeout

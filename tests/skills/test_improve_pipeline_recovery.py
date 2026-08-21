@@ -183,7 +183,7 @@ def test_conflict_triggers_resolver(tmp_path: Path) -> None:
     assert "--in" in argv
     idx = argv.index("--in")
     assert str(worktree) == argv[idx + 1]
-    prompt = argv[-1]
+    prompt = argv[argv.index("-z") + 1]
     assert "tools/memory_tool.py" in prompt
     assert "->" in prompt
     receipt = json.loads(state_path.read_text())
