@@ -1385,7 +1385,39 @@ class PluginState:
             atomic_json_write(self.path, data, mode=0o600)
 
 
+# --- Completion-arbiter seam (migration bridge, Phase 6 / Option A-lite) ----
+# A plugin may claim authoritative completion of a turn and commit a final
+# response that is finalized through the canonical host finalizer (upstream
+# agent.turn_finalizer.finalize_turn). Exactly one owner per turn. When no
+# plugin claims a turn (the default), behavior is byte-identical to upstream.
+# Plugins never see credentials or mutate history directly.
+_COMPLETION_ARBITER: "dict" = {}  # turn_id -> dict(plugin_id, commit_fn)
+_COMPLETION_ARBITER_LOCK = __import__("threading").RLock()
+
+
+def _register_completion_arbiter(turn_id, plugin_id, commit_fn) -> bool:
+    with _COMPLETION_ARBITER_LOCK:
+        if turn_id in _COMPLETION_ARBITER:
+            return False  # already claimed (atomic under lock)
+        _COMPLETION_ARBITER[turn_id] = {"plugin_id": plugin_id, "commit_fn": commit_fn}
+        return True
+
+
+def _release_completion_arbiter(turn_id) -> None:
+    with _COMPLETION_ARBITER_LOCK:
+        _COMPLETION_ARBITER.pop(turn_id, None)
+
+
+def _release_completion_arbiter(turn_id) -> None:
+    _COMPLETION_ARBITER.pop(turn_id, None)
+
+
+def _completion_arbiter_for(turn_id):
+    return _COMPLETION_ARBITER.get(turn_id)
+
+
 class PluginContext:
+
     """Facade given to plugins so they can register tools and hooks."""
 
     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
@@ -1805,6 +1837,17 @@ class PluginContext:
             return True
         plugin_id = self.manifest.key or self.manifest.name
         return plugin_capability_granted(plugin_id, capability)
+
+    def completion_arbiter(self, turn_id: str, commit_fn):
+        """Claim authoritative completion of *turn_id* for this plugin.
+
+        ``commit_fn(result, *, turn_id=...)`` is invoked by the host after the
+        canonical finalizer runs, with the fully finalized ``result`` dict (the
+        plugin's proof/receipt). Returns True on claim, False if another owner
+        already claimed the turn. If ``commit_fn`` raises, the claim is released
+        and the error is surfaced (finalization itself is never interrupted).
+        """
+        return _register_completion_arbiter(turn_id, self.plugin_id, commit_fn)
 
     # -- capability-gated MCP access ----------------------------------------
 
