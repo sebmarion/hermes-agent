@@ -192,11 +192,17 @@ def _run_hermes(model_argv: list[str], prompt: str, worktree: Path,
     """Invoke the headless model.  Returns (exit_code, bounded output)."""
     cmd = list(model_argv)
     if not any(str(a) == "-z" for a in cmd):
-        cmd = ["hermes", "-z"] + list(cmd)
-    cmd = list(cmd) + ["--in", str(worktree)]
-    # The prompt is passed as a single argument so shell metacharacters are
-    # never interpreted.  (No shell involved.)
-    cmd = cmd + [prompt]
+        cmd = ["hermes", "-z"] + cmd
+    oneshot_index = next(i for i, arg in enumerate(cmd) if str(arg) == "-z")
+    # Hermes parses -z/--oneshot as an option with one required argument, so
+    # the prompt must be the immediate next argv element. Keep it a single
+    # argument and avoid a shell entirely.
+    cmd = (
+        cmd[:oneshot_index + 1]
+        + [prompt]
+        + cmd[oneshot_index + 1:]
+        + ["--in", str(worktree)]
+    )
     try:
         proc = subprocess.run(
             cmd, cwd=worktree, text=True, capture_output=True, timeout=timeout
@@ -348,6 +354,14 @@ def _write_receipt(state_path: Path, receipt: dict) -> None:
         pass
 
 
+def _receipt_path(state_path: Path) -> Path:
+    """Keep recovery receipts separate from the updater's sync state."""
+    state_path = Path(state_path)
+    if state_path.name == "upstream-sync.json":
+        return state_path.with_name("upstream-recovery.json")
+    return state_path
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -380,6 +394,7 @@ def recover_upstream_conflict(
     repo = Path(repo)
     worktree = Path(worktree)
     state_path = Path(state_path)
+    receipt_path = _receipt_path(state_path)
     anchor = anchor.strip()
     upstream = upstream.strip()
     source_head = source_head.strip()
@@ -430,7 +445,7 @@ def recover_upstream_conflict(
         receipt["candidate_sha"] = verified["candidate_sha"]
         receipt["test_result"] = "pass"
         receipt["outcome"] = "ok"
-        _write_receipt(state_path, receipt)
+        _write_receipt(receipt_path, receipt)
         if notify:
             try:
                 _notify_success(
@@ -443,7 +458,7 @@ def recover_upstream_conflict(
     except Exception as exc:
         receipt["outcome"] = "halt"
         receipt["error"] = str(exc)[-500:]
-        _write_receipt(state_path, receipt)
+        _write_receipt(receipt_path, receipt)
         if notify:
             try:
                 _notify_failure(
