@@ -585,12 +585,11 @@ _HANDLERS = {
 def register_tools(ctx) -> None:
     """Register the client tools in the ``a2a`` toolset."""
     for name, schema in _SCHEMAS.items():
-        function_schema = schema["function"]
         ctx.register_tool(
             name=name,
             toolset="a2a",
-            schema=function_schema,
+            schema=schema,
             handler=_HANDLERS[name],
-            description=function_schema["description"],
+            description=schema["function"]["description"],
             emoji="\U0001f9e9",  # puzzle piece
         )

@@ -1,7 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { type FC, useMemo } from 'react'
 
-import { useComposerScope } from '@/app/chat/composer/scope'
 import { useSessionView } from '@/app/chat/session-view'
 import { deriveChangedFiles } from '@/components/assistant-ui/thread/changed-files'
 import { WIDGET_SHELL_CLASS } from '@/components/chat/widget-shell'
@@ -34,7 +33,6 @@ export const ChangedFilesCard: FC<{ parts: readonly unknown[] }> = ({ parts }) =
   const view = useSessionView()
   const viewCwd = useStore(view.$cwd)
   const scopeCwd = view.kind === 'primary' ? null : viewCwd || null
-  const composerScope = useComposerScope()
 
   if (files.length === 0) {
     return null
@@ -49,7 +47,7 @@ export const ChangedFilesCard: FC<{ parts: readonly unknown[] }> = ({ parts }) =
         <span className="min-w-0 flex-1 truncate text-(--ui-text-primary)">{copy.filesChanged(files.length)}</span>
         <button
           className="shrink-0 cursor-pointer text-(--ui-text-tertiary) transition-colors hover:text-(--ui-text-primary)"
-          onClick={() => revealReview(scopeCwd, composerScope.target)}
+          onClick={() => revealReview(scopeCwd)}
           type="button"
         >
           {copy.reviewChanges}
@@ -60,7 +58,7 @@ export const ChangedFilesCard: FC<{ parts: readonly unknown[] }> = ({ parts }) =
           <button
             className="row-hover flex shrink-0 items-center gap-2 rounded-md px-1.5 py-1 text-left"
             key={file.path}
-            onClick={() => void openReviewForPath(file.path, scopeCwd, composerScope.target)}
+            onClick={() => void openReviewForPath(file.path, scopeCwd)}
             title={displayPath(file.path)}
             type="button"
           >

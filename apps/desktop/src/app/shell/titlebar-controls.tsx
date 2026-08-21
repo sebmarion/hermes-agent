@@ -5,11 +5,9 @@ import { useLocation, useNavigate } from 'react-router'
 import { hudTargetSessionId } from '@/app/hud/handoff'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
 import { resetLayoutTree } from '@/components/pane-shell/tree/store'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
-import { compactNumber } from '@/lib/format'
 import { triggerHaptic } from '@/lib/haptics'
 import { formatModifierToken } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
@@ -17,13 +15,11 @@ import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
 import { toggleHud } from '@/store/hud'
 import {
   $fileBrowserOpen,
-  $panesFlipped,
   $sidebarOpen,
   toggleFileBrowserOpen,
   togglePanesFlipped,
   toggleSidebarOpen
 } from '@/store/layout'
-import { $unreadSessionCount } from '@/store/session-dot-state'
 
 import { appViewForPath, isOverlayView } from '../routes'
 
@@ -47,8 +43,6 @@ export interface TitlebarTool {
   onSelect?: (event?: MouseEvent) => void
   /** Keybind action id — when set, the tooltip shows the label + keybind hint. */
   actionId?: string
-  /** Overlay count on the glyph (unread sessions). Hidden when 0/undefined. */
-  badge?: number
   title?: string
   to?: string
 }
@@ -85,24 +79,6 @@ function LayoutGlyph({ modHeld }: { modHeld: boolean }) {
   )
 }
 
-/** Overlay count on a titlebar glyph. Hidden when count is 0/undefined. */
-function withCountBadge(icon: ReactNode, count: number | undefined): ReactNode {
-  if (!count) {
-    return icon
-  }
-
-  return (
-    <span className="relative inline-flex">
-      {icon}
-      <span className="pointer-events-none absolute -top-2.5 -right-1.5 z-1">
-        <Badge aria-hidden size="overlay" variant="solid">
-          {compactNumber(count)}
-        </Badge>
-      </span>
-    </span>
-  )
-}
-
 /** Live ⌘/Ctrl tracking — mod-click affordances telegraph themselves (the
  *  layout button morphs into its reset form while the modifier is down). */
 function useModifierHeld(): boolean {
@@ -133,11 +109,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   const modHeld = useModifierHeld()
   const hapticsMuted = useStore($hapticsMuted)
   const fileBrowserOpen = useStore($fileBrowserOpen)
-  const panesFlipped = useStore($panesFlipped)
   const sidebarOpen = useStore($sidebarOpen)
-  const unreadCount = useStore($unreadSessionCount)
-  const unreadBadge = unreadCount > 0 ? unreadCount : undefined
-  const unreadHint = unreadBadge ? ` · ${t.titlebar.unreadSessions(unreadBadge)}` : ''
 
   const toggleHaptics = () => {
     if (!hapticsMuted) {
@@ -158,16 +130,13 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   // show/hide affordances.
   const leftEdge = { open: sidebarOpen, toggle: toggleSidebarOpen }
   const rightEdge = { open: fileBrowserOpen, toggle: toggleFileBrowserOpen }
-  const leftLabel = leftEdge.open ? t.titlebar.hideSidebar : t.titlebar.showSidebar
-  const rightLabel = rightEdge.open ? t.titlebar.hideRightSidebar : t.titlebar.showRightSidebar
 
   const leftToolbarTools: TitlebarTool[] = [
     {
       actionId: 'view.toggleSidebar',
-      badge: panesFlipped ? undefined : unreadBadge,
       icon: <TitlebarIcon name="layout-sidebar-left" />,
       id: 'sidebar',
-      label: `${leftLabel}${panesFlipped ? '' : unreadHint}`,
+      label: leftEdge.open ? t.titlebar.hideSidebar : t.titlebar.showSidebar,
       onSelect: () => {
         triggerHaptic('tap')
         leftEdge.toggle()
@@ -188,10 +157,9 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
 
   const rightSidebarTool: TitlebarTool = {
     actionId: 'view.toggleRightSidebar',
-    badge: panesFlipped ? unreadBadge : undefined,
     icon: <TitlebarIcon name="layout-sidebar-right" />,
     id: 'right-sidebar',
-    label: `${rightLabel}${panesFlipped ? unreadHint : ''}`,
+    label: rightEdge.open ? t.titlebar.hideRightSidebar : t.titlebar.showRightSidebar,
     onSelect: () => {
       triggerHaptic('tap')
       rightEdge.toggle()
@@ -338,7 +306,7 @@ function TitlebarToolButton({ navigate, tool }: { navigate: ReturnType<typeof us
             rel="noreferrer"
             target="_blank"
           >
-            {withCountBadge(tool.icon, tool.badge)}
+            {tool.icon}
           </a>
         </Button>
       </Tip>
@@ -364,7 +332,7 @@ function TitlebarToolButton({ navigate, tool }: { navigate: ReturnType<typeof us
         type="button"
         variant="ghost"
       >
-        {withCountBadge(tool.icon, tool.badge)}
+        {tool.icon}
       </Button>
     </Tip>
   )

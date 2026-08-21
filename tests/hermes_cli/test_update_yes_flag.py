@@ -12,6 +12,8 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
 
 
@@ -45,6 +47,18 @@ def _make_run_side_effect(
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     return side_effect
+
+
+@pytest.fixture(autouse=True)
+def _no_live_gateways_during_update_tests(monkeypatch):
+    """Keep simulated updates from discovering or signalling the real gateway."""
+    import hermes_cli.gateway as gateway
+
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        gateway, "find_profile_gateway_processes", lambda *args, **kwargs: []
+    )
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda *args, **kwargs: set())
 
 
 class TestUpdateYesConfigMigration:

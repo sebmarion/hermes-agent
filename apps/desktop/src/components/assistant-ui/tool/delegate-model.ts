@@ -1,7 +1,7 @@
-import { firstStringField, normalize } from '@/lib/text'
+import { normalize } from '@/lib/text'
 import type { SubagentProgress, SubagentStatus } from '@/store/subagents'
 
-import { numberValue, parseMaybeObject } from './fallback-model'
+import { firstStringField, numberValue, parseMaybeObject } from './fallback-model'
 
 /**
  * A delegation runs somewhere the transcript can't see: the tool call carries

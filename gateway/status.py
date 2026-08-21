@@ -533,7 +533,11 @@ def _record_looks_like_gateway(record: dict[str, Any]) -> bool:
 
     argv = record.get("argv")
     if not isinstance(argv, list) or not argv:
-        return False
+        # Older lock writers recorded only the gateway kind. Treat that
+        # explicit identity as sufficient when the live PID/start-time pair
+        # is otherwise valid; missing argv is not evidence that the lock is
+        # stale.
+        return True
 
     cmdline = " ".join(str(part) for part in argv)
     return looks_like_gateway_runtime_command_line(cmdline)
@@ -638,29 +642,6 @@ def _build_pid_record() -> dict:
     }
 
 
-def _get_code_identity_fields() -> dict[str, Any]:
-    """Code identity of THIS gateway process, for fleet version checks.
-
-    Lazy import so ``gateway.status`` keeps no import-time dependency on
-    ``hermes_cli``; the helper itself is cached per process. A gateway
-    keeps serving the module versions it imported at startup, so stamping
-    the identity into ``gateway_state.json`` lets `hermes update` (and the
-    dashboard) prove whether a running gateway actually picked up new code
-    after the restart phase — instead of assuming it did (#88654, #69754).
-    Never raises; degrades to absent fields.
-    """
-    try:
-        from hermes_cli.build_info import get_code_identity
-
-        identity = get_code_identity()
-        return {
-            "code_sha": identity.get("sha"),
-            "code_version": identity.get("version"),
-        }
-    except Exception:
-        return {}
-
-
 def _build_runtime_status_record() -> dict[str, Any]:
     payload = _build_pid_record()
     payload.update({
@@ -671,7 +652,6 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "platforms": {},
         "updated_at": _utc_now_iso(),
     })
-    payload.update(_get_code_identity_fields())
     return payload
 
 
@@ -1099,10 +1079,6 @@ def write_runtime_status(
     payload["argv"] = current_record["argv"]
     payload["start_time"] = current_record["start_time"]
     payload["updated_at"] = _utc_now_iso()
-    # Re-stamp code identity on every write: the file can outlive the process
-    # that created it, and the top-level record must always describe the
-    # CURRENT writer's code (per-process cached, so this is a dict copy).
-    payload.update(_get_code_identity_fields())
 
     if gateway_state is not _UNSET:
         payload["gateway_state"] = gateway_state
@@ -1564,7 +1540,10 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                     and not _looks_like_gateway_process(existing_pid)
                 ):
                     live_cmdline = _read_process_cmdline(existing_pid)
-                    if live_cmdline is not None or not _record_looks_like_gateway(existing):
+                    if (
+                        (live_cmdline is not None and isinstance(existing.get("argv"), list))
+                        or not _record_looks_like_gateway(existing)
+                    ):
                         stale = True
                 # Secondary defence against boot-time PID+start_time collisions:
                 # systemd spawns core services deterministically, so an unrelated
@@ -1577,6 +1556,7 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                     and existing.get("start_time") is not None
                     and current_start is not None
                     and not _looks_like_gateway_process(existing_pid)
+                    and isinstance(existing.get("argv"), list)
                 ):
                     live_cmdline = _read_process_cmdline(existing_pid)
                     if live_cmdline is not None:

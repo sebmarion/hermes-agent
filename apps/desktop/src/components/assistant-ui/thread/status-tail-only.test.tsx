@@ -3,16 +3,32 @@
 // there (missed settle event, steer race, upstream state bug) — must render
 // its content with no spinner: a live indicator above a later user message
 // reads as the agent answering out of order.
-import { type ThreadMessage } from '@assistant-ui/react'
+import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
 import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
-
-import { stubThreadEnvironment, ThreadRuntime, userMessage } from '../test-utils'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { Thread } from '.'
 
 const createdAt = new Date('2026-05-01T00:00:00.000Z')
-stubThreadEnvironment()
+
+class TestResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+vi.stubGlobal('ResizeObserver', TestResizeObserver)
+vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
+  window.setTimeout(() => callback(performance.now()), 0)
+)
+vi.stubGlobal('cancelAnimationFrame', (id: number) => window.clearTimeout(id))
+vi.stubGlobal('CSS', { escape: (str: string) => str })
+
+Element.prototype.scrollTo = function scrollTo() {}
+
+// Enter animation fires for running messages; jsdom has no WAAPI.
+Element.prototype.animate = function animate() {
+  return { cancel() {}, finished: Promise.resolve() } as unknown as Animation
+}
 
 afterEach(() => {
   cleanup()
@@ -26,6 +42,17 @@ const assistantMetadata = {
   custom: {}
 }
 
+function user(id: string, text: string): ThreadMessage {
+  return {
+    id,
+    role: 'user',
+    content: [{ type: 'text', text }],
+    attachments: [],
+    createdAt,
+    metadata: { custom: {} }
+  } as ThreadMessage
+}
+
 function assistant(id: string, text: string, running: boolean): ThreadMessage {
   return {
     id,
@@ -37,15 +64,23 @@ function assistant(id: string, text: string, running: boolean): ThreadMessage {
   } as ThreadMessage
 }
 
-const Harness = ({ messages }: { messages: ThreadMessage[] }) => (
-  <ThreadRuntime messages={messages}>
-    <Thread />
-  </ThreadRuntime>
-)
+function Harness({ messages }: { messages: ThreadMessage[] }) {
+  const runtime = useExternalStoreRuntime<ThreadMessage>({
+    messages,
+    isRunning: messages.at(-1)?.status?.type === 'running',
+    onNew: async () => {}
+  })
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread />
+    </AssistantRuntimeProvider>
+  )
+}
 
 describe('thinking indicator is tail-only', () => {
   it('shows the loading indicator on a running placeholder at the tail', async () => {
-    const { container } = render(<Harness messages={[userMessage('u1', 'question'), assistant('a1', '', true)]} />)
+    const { container } = render(<Harness messages={[user('u1', 'question'), assistant('a1', '', true)]} />)
 
     expect(await screen.findByRole('status', { name: 'Hermes is loading a response' })).toBeTruthy()
     expect(container.querySelector('[data-slot="aui_response-loading"]')).toBeTruthy()
@@ -56,9 +91,9 @@ describe('thinking indicator is tail-only', () => {
     const { container } = render(
       <Harness
         messages={[
-          userMessage('u1', 'first question'),
+          user('u1', 'first question'),
           assistant('a1', '', true),
-          userMessage('u2', 'second question'),
+          user('u2', 'second question'),
           assistant('a2', 'answered', false)
         ]}
       />
@@ -67,6 +102,6 @@ describe('thinking indicator is tail-only', () => {
     await screen.findByText('answered')
 
     expect(container.querySelector('[data-slot="aui_response-loading"]')).toBeNull()
-    expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
+    expect(container.querySelector('[data-slot="aui_stream-stall"]')).toBeNull()
   })
 })

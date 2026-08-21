@@ -201,15 +201,13 @@ export async function desktopFileDiff(repoRoot: string, filePath: string): Promi
 
 export async function selectDesktopPaths(options?: HermesSelectPathsOptions): Promise<string[]> {
   const desktop = bridge()
-  const profile = desktopFsProfile()
-  const localOptions = profile ? { ...options, profile } : options
 
   if (!isDesktopFsRemoteMode()) {
-    return desktop.selectPaths(localOptions)
+    return desktop.selectPaths(options)
   }
 
   if (!options?.directories) {
-    return desktop.selectPaths(localOptions)
+    return desktop.selectPaths(options)
   }
 
   return remotePicker ? remotePicker.selectPaths({ ...options, multiple: false }) : []

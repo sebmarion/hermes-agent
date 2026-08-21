@@ -182,12 +182,6 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         "uninstall", help="Remove a hub-installed skill"
     )
     skills_uninstall.add_argument("name", help="Skill name to remove")
-    skills_uninstall.add_argument(
-        "--yes",
-        "-y",
-        action="store_true",
-        help="Skip confirmation prompt",
-    )
 
     skills_reset = skills_subparsers.add_parser(
         "reset",

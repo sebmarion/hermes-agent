@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import * as notifications from '@/store/notifications'
-import { makeOAuthProvider } from '@/test/oauth-provider'
 import type { OAuthProvider } from '@/types/hermes'
 
 import {
@@ -13,6 +12,17 @@ import {
   saveOnboardingLocalEndpoint,
   submitOnboardingCode
 } from './onboarding'
+
+function provider(id: string, name = id): OAuthProvider {
+  return {
+    cli_command: `hermes login ${id}`,
+    docs_url: `https://example.com/${id}`,
+    flow: 'pkce',
+    id,
+    name,
+    status: { logged_in: false }
+  }
+}
 
 function baseState(overrides: Partial<DesktopOnboardingState> = {}): DesktopOnboardingState {
   return {
@@ -93,14 +103,14 @@ describe('refreshOnboarding', () => {
   it('refreshes OAuth providers again when onboarding was explicitly requested', async () => {
     const api = vi.fn(async ({ path }: { path: string }) => {
       if (path === '/api/providers/oauth') {
-        return { providers: [makeOAuthProvider('fresh')] }
+        return { providers: [provider('fresh')] }
       }
 
       throw new Error(`unexpected api path: ${path}`)
     })
 
     installApiMock(api)
-    $desktopOnboarding.set(baseState({ providers: [makeOAuthProvider('cached')] }))
+    $desktopOnboarding.set(baseState({ providers: [provider('cached')] }))
     requestDesktopOnboarding('Need provider setup')
 
     const ready = await refreshOnboarding(onboardingContext(emptyOpenRouterGateway()))
@@ -115,14 +125,14 @@ describe('refreshOnboarding', () => {
   it('keeps cached providers when onboarding was not re-requested', async () => {
     const api = vi.fn(async ({ path }: { path: string }) => {
       if (path === '/api/providers/oauth') {
-        return { providers: [makeOAuthProvider('fresh')] }
+        return { providers: [provider('fresh')] }
       }
 
       throw new Error(`unexpected api path: ${path}`)
     })
 
     installApiMock(api)
-    $desktopOnboarding.set(baseState({ providers: [makeOAuthProvider('cached')] }))
+    $desktopOnboarding.set(baseState({ providers: [provider('cached')] }))
 
     const ready = await refreshOnboarding(onboardingContext(emptyOpenRouterGateway()))
 
@@ -134,7 +144,7 @@ describe('refreshOnboarding', () => {
   it('does not downgrade configured=true on fallback-only readiness failures', async () => {
     const api = vi.fn(async ({ path }: { path: string }) => {
       if (path === '/api/providers/oauth') {
-        return { providers: [makeOAuthProvider('fresh')] }
+        return { providers: [provider('fresh')] }
       }
 
       throw new Error(`unexpected api path: ${path}`)
@@ -146,7 +156,7 @@ describe('refreshOnboarding', () => {
     $desktopOnboarding.set(
       baseState({
         configured: true,
-        providers: [makeOAuthProvider('cached')],
+        providers: [provider('cached')],
         reason: null,
         requested: false
       })
@@ -169,7 +179,7 @@ describe('refreshOnboarding', () => {
     $desktopOnboarding.set(
       baseState({
         configured: true,
-        providers: [makeOAuthProvider('cached')],
+        providers: [provider('cached')],
         reason: null,
         requested: false
       })
@@ -192,7 +202,7 @@ describe('refreshOnboarding', () => {
     $desktopOnboarding.set(
       baseState({
         configured: true,
-        providers: [makeOAuthProvider('cached')],
+        providers: [provider('cached')],
         reason: null,
         requested: false
       })
@@ -226,7 +236,7 @@ describe('refreshOnboarding', () => {
   it('does not preserve configured when onboarding was explicitly requested', async () => {
     const api = vi.fn(async ({ path }: { path: string }) => {
       if (path === '/api/providers/oauth') {
-        return { providers: [makeOAuthProvider('fresh')] }
+        return { providers: [provider('fresh')] }
       }
 
       throw new Error(`unexpected api path: ${path}`)
@@ -236,7 +246,7 @@ describe('refreshOnboarding', () => {
     $desktopOnboarding.set(
       baseState({
         configured: true,
-        providers: [makeOAuthProvider('cached')],
+        providers: [provider('cached')],
         reason: null,
         requested: true
       })
@@ -253,7 +263,7 @@ describe('refreshOnboarding', () => {
   it('still surfaces onboarding when fallback failure happens before configured state', async () => {
     const api = vi.fn(async ({ path }: { path: string }) => {
       if (path === '/api/providers/oauth') {
-        return { providers: [makeOAuthProvider('fresh')] }
+        return { providers: [provider('fresh')] }
       }
 
       throw new Error(`unexpected api path: ${path}`)
@@ -295,7 +305,7 @@ describe('refreshOnboarding', () => {
 
     await vi.waitFor(() => expect(api).toHaveBeenCalledTimes(1))
 
-    resolveProviders({ providers: [makeOAuthProvider('shared')] })
+    resolveProviders({ providers: [provider('shared')] })
     await Promise.all([first, second])
 
     expect($desktopOnboarding.get().providers?.map(p => p.id)).toEqual(['shared'])
@@ -370,7 +380,7 @@ describe('OAuth onboarding', () => {
       baseState({
         flow: {
           status: 'awaiting_user',
-          provider: makeOAuthProvider('nous', 'Nous Portal'),
+          provider: provider('nous', 'Nous Portal'),
           start: {
             auth_url: 'https://portal.example/auth',
             expires_in: 600,
@@ -448,7 +458,7 @@ describe('OAuth onboarding', () => {
       baseState({
         flow: {
           status: 'awaiting_user',
-          provider: makeOAuthProvider('nous', 'Nous Portal'),
+          provider: provider('nous', 'Nous Portal'),
           start: {
             auth_url: 'https://portal.example/auth',
             expires_in: 600,

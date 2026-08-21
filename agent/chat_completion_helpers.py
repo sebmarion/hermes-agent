@@ -2652,10 +2652,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
-        # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
-        # Read from the fallback entry so the flag travels with the active
-        # provider; restore_primary_runtime will revert it from the snapshot.
-        agent._reasoning_echo_flag = bool(fb.get("reasoning_echo", False))
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
@@ -4144,9 +4140,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 agent._fire_reasoning_delta(reasoning_text)
 
             # Accumulate text content — fire callback only when no tool calls
-            delta_content = getattr(delta, "content", None)
-            if delta_content:
-                content_parts.append(delta_content)
+            if delta and delta.content:
+                content_parts.append(delta.content)
                 if not tool_calls_acc:
                     if pending_text_parts or _provider_stream_text_may_be_sse(delta.content):
                         pending_text_parts.append(delta.content)
@@ -4156,7 +4151,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         _flush_pending_stream_text()
                         continue
                     _fire_first_delta()
-                    agent._fire_stream_delta(delta_content)
+                    agent._fire_stream_delta(delta.content)
                     deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
@@ -4171,19 +4166,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
                     try:
-                        agent.stream_delta_callback(delta_content)
-                        agent._record_streamed_assistant_text(delta_content)
+                        agent.stream_delta_callback(delta.content)
+                        agent._record_streamed_assistant_text(delta.content)
                     except Exception:
                         pass
 
             # Accumulate tool call deltas — notify display on first name
-            delta_tool_calls = getattr(delta, "tool_calls", None)
-            if delta_tool_calls:
+            if delta and delta.tool_calls:
                 _flush_pending_stream_text()
-                for tc_delta in delta_tool_calls:
-                    raw_index = getattr(tc_delta, "index", None)
-                    raw_idx = raw_index if raw_index is not None else 0
-                    delta_id = getattr(tc_delta, "id", None) or ""
+                for tc_delta in delta.tool_calls:
+                    raw_idx = tc_delta.index if tc_delta.index is not None else 0
+                    delta_id = tc_delta.id or ""
 
                     # Ollama fix: detect a new tool call reusing the same
                     # raw index (different id) and redirect to a fresh slot.
@@ -4202,7 +4195,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
                     if idx not in tool_calls_acc:
                         # Poolside may send integer id instead of string
-                        _tc_id = getattr(tc_delta, "id", None)
+                        _tc_id = tc_delta.id
                         if isinstance(_tc_id, int):
                             _tc_id = str(_tc_id)
                         tool_calls_acc[idx] = {
@@ -4212,17 +4205,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             "extra_content": None,
                         }
                     entry = tool_calls_acc[idx]
-                    tc_id = getattr(tc_delta, "id", None)
-                    if tc_id is not None:
-                        _new_id = tc_id
+                    if tc_delta.id is not None:
+                        _new_id = tc_delta.id
                         if isinstance(_new_id, int):
                             _new_id = str(_new_id)
                         if _new_id:
                             entry["id"] = _new_id
-                    tc_function = getattr(tc_delta, "function", None)
-                    if tc_function:
-                        function_name = getattr(tc_function, "name", None)
-                        if function_name:
+                    if tc_delta.function:
+                        if tc_delta.function.name:
                             # Use assignment, not +=.  Function names are
                             # atomic identifiers delivered complete in the
                             # first chunk (OpenAI spec).  Some providers
@@ -4231,10 +4221,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # produce "read_fileread_file".  Assignment
                             # (matching the OpenAI Node SDK / LiteLLM /
                             # Vercel AI patterns) is immune to this.
-                            entry["function"]["name"] = function_name
-                        function_arguments = getattr(tc_function, "arguments", None)
-                        if function_arguments:
-                            entry["function"]["arguments"] += function_arguments
+                            entry["function"]["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            entry["function"]["arguments"] += tc_delta.function.arguments
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")
@@ -4260,9 +4249,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # discarding the attempted action.
                         result["partial_tool_names"].append(name)
 
-            chunk_finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-            if chunk_finish_reason:
-                finish_reason = chunk_finish_reason
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
 
             # Usage in the final chunk
             if hasattr(chunk, "usage") and chunk.usage:
@@ -5349,3 +5337,205 @@ __all__ = [
     "cleanup_task_resources",
     "interruptible_streaming_api_call",
 ]
+
+
+# ==== Provider request admission seam (migration bridge, Phase 7) ====
+###
+
+_PROVIDER_REQUEST_METADATA_KEYS = frozenset(
+    {
+        "model",
+        "modelId",
+        "stream",
+        "stream_options",
+        "extra_headers",
+        "headers",
+        "timeout",
+        "api_key",
+        "base_url",
+        "client",
+        "http_client",
+        "request_id",
+        "user",
+        "metadata",
+    }
+)
+
+
+def _provider_payload_token_estimate(value: Any) -> int:
+    """Return a conservative, tokenizer-independent token estimate.
+
+    Provider tokenizers differ, and the admission guard runs before transport
+    selection. Compact JSON accounts for role/content wrappers, multimodal
+    parts, tool schemas, and provider-specific nesting. ASCII text normally
+    tokenizes at roughly four bytes per token; non-ASCII bytes get a tighter
+    two-bytes-per-token bound so CJK/emoji content cannot slip through the
+    legacy character/4 estimate while ordinary compacted prompts are not
+    rejected four times too early.
+    """
+    if value is None or value == "" or value == [] or value == {}:
+        return 0
+    try:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception:
+        serialized = str(value)
+    encoded = serialized.encode("utf-8")
+    ascii_bytes = sum(byte < 128 for byte in encoded)
+    non_ascii_bytes = len(encoded) - ascii_bytes
+    return math.ceil(ascii_bytes / 4 + non_ascii_bytes / 2)
+
+
+def estimate_provider_request_context_tokens(api_payload: Any) -> int:
+    """Conservatively estimate all context-bearing fields in a final request.
+
+    The legacy ``estimate_request_context_tokens`` remains intentionally cheap
+    for stale-timeout heuristics. Admission must account for every provider
+    request body shape, including top-level ``system`` and native Bedrock
+    ``toolConfig``/``inferenceConfig`` fields, so it uses this bounded JSON
+    serialization instead.
+    """
+    if not isinstance(api_payload, dict):
+        return _provider_payload_token_estimate(api_payload)
+    context_payload = {
+        key: value
+        for key, value in api_payload.items()
+        if key not in _PROVIDER_REQUEST_METADATA_KEYS
+    }
+    return _provider_payload_token_estimate(context_payload)
+
+
+def build_provider_request_admission_receipt(agent, api_kwargs: Any) -> Dict[str, Any]:
+    """Build a content-free admission decision for a provider-ready request."""
+    payload = api_kwargs if isinstance(api_kwargs, dict) else {}
+    estimated_input_tokens = estimate_provider_request_context_tokens(api_kwargs)
+    margin_tokens = max(1_024, math.ceil(estimated_input_tokens * 0.05))
+
+    category_keys = (
+        "messages",
+        "input",
+        "instructions",
+        "system",
+        "tools",
+        "toolConfig",
+        "inferenceConfig",
+        "extra_body",
+    )
+    category_estimated_tokens = {
+        category: (
+            _provider_payload_token_estimate(payload[category])
+            if category in payload
+            else 0
+        )
+        for category in category_keys
+    }
+    category_estimated_tokens["total"] = estimated_input_tokens
+
+    compressor = getattr(agent, "context_compressor", None)
+
+    def _identity(value: Any) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    resolved_model = _identity(getattr(agent, "model", ""))
+    resolved_provider = _identity(getattr(agent, "provider", ""))
+    compressor_model = _identity(getattr(compressor, "model", ""))
+    compressor_provider = _identity(getattr(compressor, "provider", ""))
+
+    raw_context_length = getattr(compressor, "context_length", None)
+    raw_threshold_tokens = getattr(compressor, "threshold_tokens", None)
+    context_length = raw_context_length if type(raw_context_length) is int else None
+    threshold_tokens = raw_threshold_tokens if type(raw_threshold_tokens) is int else None
+
+    output_cap_keys = (
+        "max_output_tokens",
+        "max_completion_tokens",
+        "max_tokens",
+        "maxTokens",
+    )
+    present_output_caps = [payload[key] for key in output_cap_keys if key in payload]
+    for config_key in ("inferenceConfig", "inference_config"):
+        config = payload.get(config_key)
+        if isinstance(config, dict):
+            present_output_caps.extend(
+                config[key]
+                for key in output_cap_keys
+                if key in config
+            )
+    invalid_output_cap = any(
+        type(raw_output_tokens) is not int or raw_output_tokens <= 0
+        for raw_output_tokens in present_output_caps
+    )
+    explicit_output_tokens = (
+        max(present_output_caps)
+        if present_output_caps and not invalid_output_cap
+        else 0
+    )
+
+    window_input_ceiling = (
+        context_length - explicit_output_tokens
+        if context_length is not None
+        else None
+    )
+    effective_input_ceiling = None
+    if threshold_tokens is not None and window_input_ceiling is not None:
+        effective_input_ceiling = min(threshold_tokens, window_input_ceiling)
+
+    receipt: Dict[str, Any] = {
+        "resolved_model": resolved_model,
+        "resolved_provider": resolved_provider,
+        "compressor_model": compressor_model,
+        "compressor_provider": compressor_provider,
+        "context_length": context_length,
+        "threshold_tokens": threshold_tokens,
+        "estimated_input_tokens": estimated_input_tokens,
+        "margin_tokens": margin_tokens,
+        "estimated_input_with_margin_tokens": estimated_input_tokens + margin_tokens,
+        "explicit_output_tokens": explicit_output_tokens,
+        "window_input_ceiling": window_input_ceiling,
+        "effective_input_ceiling": effective_input_ceiling,
+        "category_estimated_tokens": category_estimated_tokens,
+    }
+
+    # Explicitly disabled compression is a legacy opt-out used by lightweight
+    # callers (and by agents that supply their own bounded context). In that
+    # mode there may be no resolved model/provider identity to compare against
+    # the compressor; retain the size checks but do not reject solely on those
+    # absent identity fields. Normal managed agents keep the fail-closed
+    # identity checks below.
+    identity_optional = getattr(agent, "compression_enabled", True) is False
+
+    if context_length is None or context_length <= 0:
+        decision, reason = "reject", "invalid_compressor_context_length"
+    elif threshold_tokens is None or threshold_tokens <= 0:
+        decision, reason = "reject", "invalid_compressor_threshold_tokens"
+    elif invalid_output_cap:
+        decision, reason = "reject", "invalid_explicit_output_tokens"
+    elif not resolved_model and not identity_optional:
+        decision, reason = "reject", "unresolved_agent_model"
+    elif not resolved_provider and not identity_optional:
+        decision, reason = "reject", "unresolved_agent_provider"
+    elif (
+        not identity_optional
+        and compressor_model.casefold() != resolved_model.casefold()
+    ):
+        decision, reason = "reject", "compressor_model_mismatch"
+    elif (
+        not identity_optional
+        and compressor_provider.casefold() != resolved_provider.casefold()
+    ):
+        decision, reason = "reject", "compressor_provider_mismatch"
+    elif explicit_output_tokens > 0 and window_input_ceiling <= 0:
+        decision, reason = "reject", "non_positive_window_input_ceiling"
+    elif estimated_input_tokens + margin_tokens <= effective_input_ceiling:
+        decision, reason = "admit", "within_effective_input_ceiling"
+    else:
+        decision = "reject"
+        reason = "estimated_input_plus_margin_exceeds_ceiling"
+
+    receipt["decision"] = decision
+    receipt["reason"] = reason
+    return receipt

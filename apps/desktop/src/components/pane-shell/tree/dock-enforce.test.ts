@@ -44,8 +44,8 @@ describe('enforced dock (stacked Bots pane → sessions-zone tab, every boot)', 
     vi.resetModules()
   })
 
-  async function setupTree(initialTree: object, options: { routines?: boolean } = {}) {
-    window.localStorage.setItem(TREE_KEY, JSON.stringify(initialTree))
+  async function setup() {
+    window.localStorage.setItem(TREE_KEY, JSON.stringify(stackedTree))
 
     const tree = await import('@/components/pane-shell/tree/store')
     const model = await import('@/components/pane-shell/tree/model')
@@ -76,21 +76,7 @@ describe('enforced dock (stacked Bots pane → sessions-zone tab, every boot)', 
       render: () => null
     })
 
-    if (options.routines) {
-      registry.register({
-        id: 'hermes-bots:routines',
-        area: 'panes',
-        title: 'Cronjobs',
-        data: { placement: 'main', dock: { pane: 'workspace', pos: 'right', enforce: true } },
-        render: () => null
-      })
-    }
-
     return { model, registry, tree }
-  }
-
-  async function setup() {
-    return setupTree(stackedTree)
   }
 
   it('re-homes a stacked bots pane into the sessions tab strip, keeping sessions active', async () => {
@@ -202,7 +188,33 @@ describe('enforced dock (stacked Bots pane → sessions-zone tab, every boot)', 
       ]
     }
 
-    const { model, tree } = await setupTree(hiddenStackedTree)
+    window.localStorage.setItem(TREE_KEY, JSON.stringify(hiddenStackedTree))
+
+    const tree = await import('@/components/pane-shell/tree/store')
+    const model = await import('@/components/pane-shell/tree/model')
+    const { registry } = await import('@/contrib/registry')
+
+    registry.register({
+      id: 'workspace',
+      area: 'panes',
+      title: 'chat',
+      data: { placement: 'main' },
+      render: () => null
+    })
+    registry.register({
+      id: 'sessions',
+      area: 'panes',
+      title: 'sessions',
+      data: { placement: 'left' },
+      render: () => null
+    })
+    registry.register({
+      id: 'hermes-bots:pane',
+      area: 'panes',
+      title: 'Bots',
+      data: { placement: 'left', dock: { pane: 'sessions', pos: 'center', enforce: true } },
+      render: () => null
+    })
 
     tree.watchContributedPanes()
 
@@ -212,65 +224,5 @@ describe('enforced dock (stacked Bots pane → sessions-zone tab, every boot)', 
     // reachable again. The active tab is NOT stolen mid-boot.
     expect(group.panes).toEqual(['sessions', 'hermes-bots:pane'])
     expect(group.headerHidden).not.toBe(true)
-  })
-
-  it('re-homes an edge-enforced pane stranded in the sessions tab strip', async () => {
-    const staleRoutinesTree = {
-      type: 'split',
-      id: 'root',
-      orientation: 'row',
-      weights: [1, 3],
-      children: [
-        {
-          type: 'group',
-          id: 'g-sessions',
-          panes: ['sessions', 'hermes-bots:pane', 'hermes-bots:routines'],
-          active: 'hermes-bots:pane'
-        },
-        { type: 'group', id: 'g-main', panes: ['workspace'], active: 'workspace' }
-      ]
-    }
-
-    const { model, tree } = await setupTree(staleRoutinesTree, { routines: true })
-
-    tree.watchContributedPanes()
-
-    const botsGroup = model.findGroupOfPane(tree.$layoutTree.get()!, 'hermes-bots:pane')!
-    const routinesGroup = model.findGroupOfPane(tree.$layoutTree.get()!, 'hermes-bots:routines')!
-
-    expect(botsGroup.panes).toEqual(['sessions', 'hermes-bots:pane'])
-    expect(botsGroup.active).toBe('hermes-bots:pane')
-    expect(routinesGroup.panes).toEqual(['hermes-bots:routines'])
-    expect(routinesGroup.id).not.toBe(botsGroup.id)
-  })
-
-  it('leaves an edge-enforced pane alone when it already occupies the declared split', async () => {
-    const dockedRoutinesTree = {
-      type: 'split',
-      id: 'root',
-      orientation: 'row',
-      weights: [1, 3, 1],
-      children: [
-        {
-          type: 'group',
-          id: 'g-sessions',
-          panes: ['sessions', 'hermes-bots:pane'],
-          active: 'hermes-bots:pane'
-        },
-        { type: 'group', id: 'g-main', panes: ['workspace'], active: 'workspace' },
-        {
-          type: 'group',
-          id: 'g-routines',
-          panes: ['hermes-bots:routines'],
-          active: 'hermes-bots:routines'
-        }
-      ]
-    }
-
-    const { tree } = await setupTree(dockedRoutinesTree, { routines: true })
-
-    tree.watchContributedPanes()
-
-    expect(tree.$layoutTree.get()).toEqual(dockedRoutinesTree)
   })
 })

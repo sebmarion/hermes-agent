@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HermesReadDirResult } from '@/global'
 import type * as HermesModule from '@/hermes'
 
-import { $pluginRecords, publishPlugin, setPluginEnabled } from './plugins-store'
-import { discoverRuntimePlugins, loadRuntimePlugin, watchRuntimePlugins } from './runtime-loader'
+import { $pluginRecords, setPluginEnabled } from './plugins-store'
+import { discoverRuntimePlugins, watchRuntimePlugins } from './runtime-loader'
 
 // getStatus would supply the connected backend's hermes_home — a REMOTE path in
 // remote mode. The disk scanner must NOT derive the plugin root from it (#66899).
@@ -72,7 +72,7 @@ describe('scanDiskPlugins (#66899)', () => {
     expect(readDir).not.toHaveBeenCalled()
   })
 
-  it('probes desktop/plugin.js inside agent-plugin packages (unified packaging)', async () => {
+  it('skips agent-plugin packages without a desktop/plugin.js entry', async () => {
     desktopPluginsRoot.mockResolvedValue('/local/.hermes/desktop-plugins')
     agentPluginsRoot.mockResolvedValue('/local/.hermes/plugins')
     readDir.mockImplementation(async dir =>
@@ -80,14 +80,13 @@ describe('scanDiskPlugins (#66899)', () => {
         ? { entries: [{ isDirectory: true, name: 'my-feature', path: '/local/.hermes/plugins/my-feature' }] }
         : { entries: [] }
     )
-    // No desktop half in this package — probe must target desktop/plugin.js.
-    readFileText.mockRejectedValue(new Error('ENOENT'))
 
     await discoverRuntimePlugins()
 
-    expect(readFileText).toHaveBeenCalledWith('/local/.hermes/plugins/my-feature/desktop/plugin.js')
-    // The Python half's files must never be probed as a desktop entry.
-    expect(readFileText).not.toHaveBeenCalledWith('/local/.hermes/plugins/my-feature/plugin.js')
+    expect(readDir).toHaveBeenCalledWith('/local/.hermes/plugins/my-feature/desktop')
+    // The Python-only package must not trigger a rejected IPC read just to
+    // discover that its optional desktop half is absent.
+    expect(readFileText).not.toHaveBeenCalled()
   })
 
   it('still scans the standalone root when agentPluginsRoot is absent (older shell)', async () => {
@@ -107,6 +106,8 @@ describe('scanDiskPlugins (#66899)', () => {
     readDir.mockImplementation(async dir =>
       dir === '/local/.hermes/plugins'
         ? { entries: [{ isDirectory: true, name: 'uni', path: '/local/.hermes/plugins/uni' }] }
+        : dir === '/local/.hermes/plugins/uni/desktop'
+          ? { entries: [{ isDirectory: false, name: 'plugin.js', path: '/local/.hermes/plugins/uni/desktop/plugin.js' }] }
         : { entries: [] }
     )
 
@@ -176,56 +177,5 @@ describe('watchRuntimePlugins dir watch (#66899)', () => {
     expect(watchDirectory).toHaveBeenCalledWith('/local/.hermes/plugins')
     expect(watchDirectory).not.toHaveBeenCalledWith('/remote/box/.hermes/desktop-plugins')
     expect(getStatus).not.toHaveBeenCalled()
-  })
-})
-
-describe('bundled-shadowed disk copies', () => {
-  it('skips a disk copy of a bundled plugin but publishes a visible inventory row', async () => {
-    // The bundled twin is already registered (build-time glob).
-    publishPlugin({ id: 'hermes-bots', name: 'Bot Mode', kind: 'bundled', status: 'loaded' })
-
-    // Same blob→data: URL reroute as the opt-in test above.
-    const createObjectURL = vi
-      .spyOn(URL, 'createObjectURL')
-      .mockImplementation(
-        blob =>
-          `data:text/javascript;base64,${Buffer.from((blob as unknown as { parts: string[] }).parts.join('')).toString('base64')}`
-      )
-
-    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
-    const RealBlob = globalThis.Blob
-    vi.stubGlobal(
-      'Blob',
-      class {
-        parts: string[]
-        constructor(parts: string[]) {
-          this.parts = parts
-        }
-      }
-    )
-
-    try {
-      const id = await loadRuntimePlugin(
-        'export default { id: "hermes-bots", name: "Bot Mode", register() {} }',
-        'hermes-bots',
-        { file: '/local/.hermes/desktop-plugins/hermes-bots/plugin.js' }
-      )
-
-      // Skipped — the bundled copy stays the only live registration...
-      expect(id).toBeNull()
-      expect($pluginRecords.get()['hermes-bots']).toMatchObject({ kind: 'bundled', status: 'loaded' })
-
-      // ...but the stale folder is DISCOVERABLE: an inventory row names it,
-      // carries its path (reveal/delete affordance), and can never activate.
-      expect($pluginRecords.get()['hermes-bots:disk-shadowed']).toMatchObject({
-        kind: 'disk',
-        status: 'disabled',
-        file: '/local/.hermes/desktop-plugins/hermes-bots/plugin.js'
-      })
-    } finally {
-      createObjectURL.mockRestore()
-      revokeObjectURL.mockRestore()
-      vi.stubGlobal('Blob', RealBlob)
-    }
   })
 })

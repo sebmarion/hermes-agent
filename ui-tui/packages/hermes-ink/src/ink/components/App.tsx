@@ -28,7 +28,6 @@ import {
   setTerminalBackgroundHex,
   setTerminalForegroundHex,
   setXtversionName,
-  skipKittyKeyboardProtocol,
   supportsExtendedKeys
 } from '../terminal.js'
 import {
@@ -334,14 +333,9 @@ export default class App extends PureComponent<Props, State> {
         // distinguishable from ctrl+<letter>. We write both the kitty stack
         // push (CSI >1u) and xterm modifyOtherKeys level 2 (CSI >4;2m) —
         // terminals honor whichever they implement (tmux only accepts the
-        // latter). Ghostty gets only modifyOtherKeys — its kitty
-        // disambiguate mode strips Alt from Backspace (see
-        // skipKittyKeyboardProtocol).
+        // latter).
         if (supportsExtendedKeys()) {
-          if (!skipKittyKeyboardProtocol()) {
-            this.props.stdout.write(ENABLE_KITTY_KEYBOARD)
-          }
-
+          this.props.stdout.write(ENABLE_KITTY_KEYBOARD)
           this.props.stdout.write(ENABLE_MODIFY_OTHER_KEYS)
         }
 

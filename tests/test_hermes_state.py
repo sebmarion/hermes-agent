@@ -823,6 +823,9 @@ class TestFTS5Search:
         read_conn = db._get_read_conn() or db._conn
         traced_connections = [db._conn]
         if read_conn is not db._conn:
+            # _get_read_conn() opens a fresh connection; return it to the
+            # bounded pool so _read_ctx() reuses the traced connection.
+            db._read_pool.put_nowait(read_conn)
             traced_connections.append(read_conn)
         for conn in traced_connections:
             conn.set_trace_callback(statements.append)

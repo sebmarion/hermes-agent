@@ -159,39 +159,33 @@ def _format_extra_metadata_lines(extra: Dict[str, Any]) -> list[str]:
 
 
 def _resolve_source_meta_and_bundle(identifier: str, sources):
-    """Resolve metadata and bundle from a single source adapter.
-
-    Meta and bundle must come from the same adapter. Keeping catalog
-    metadata from skills.sh while taking a ClawHub zip of a same-named
-    skill is how ``hermes skills inspect owner/repo/skills/foo`` showed
-    the requested identifier and the wrong SKILL.md.
-    """
-    first_meta = None
-    first_meta_source = None
+    """Resolve metadata and bundle for a specific identifier."""
+    meta = None
+    bundle = None
+    matched_source = None
 
     for src in sources:
-        meta = None
-        bundle = None
-        try:
-            meta = src.inspect(identifier)
-        except Exception:
-            meta = None
+        if meta is None:
+            try:
+                meta = src.inspect(identifier)
+                if meta:
+                    matched_source = src
+            except Exception:
+                meta = None
         try:
             bundle = src.fetch(identifier)
         except Exception:
             bundle = None
         if bundle:
+            matched_source = src
             if meta is None:
                 try:
                     meta = src.inspect(identifier)
                 except Exception:
                     meta = None
-            return meta, bundle, src
-        if first_meta is None and meta:
-            first_meta = meta
-            first_meta_source = src
+            break
 
-    return first_meta, None, first_meta_source
+    return meta, bundle, matched_source
 
 
 def _derive_category_from_install_path(install_path: str) -> str:
@@ -252,10 +246,8 @@ def _prompt_for_skill_name(c: Console, url: str, default: str = "") -> Optional[
         f"[bold]Enter a skill name{default_hint}:[/] "
         f"[dim](lowercase letters, digits, hyphens, underscores; starts with a letter)[/]"
     )
-    from hermes_cli.cli_output import line_input
-
     try:
-        answer = line_input("Name: ").strip()
+        answer = input("Name: ").strip()
     except (EOFError, KeyboardInterrupt):
         return None
     if not answer and default:
@@ -279,10 +271,8 @@ def _prompt_for_category(c: Console, existing: List[str]) -> str:
         c.print(
             "[bold]Category[/] [dim](optional — press Enter to install flat at ~/.hermes/skills/<name>/)[/]"
         )
-    from hermes_cli.cli_output import line_input
-
     try:
-        answer = line_input("Category: ").strip()
+        answer = input("Category: ").strip()
     except (EOFError, KeyboardInterrupt):
         return ""
     if not answer:
@@ -1839,7 +1829,7 @@ def skills_command(args) -> None:
         do_audit(name=getattr(args, "name", None),
                  deep=getattr(args, "deep", False))
     elif action == "uninstall":
-        do_uninstall(args.name, skip_confirm=getattr(args, "yes", False))
+        do_uninstall(args.name)
     elif action == "reset":
         do_reset(args.name, restore=getattr(args, "restore", False),
                  skip_confirm=getattr(args, "yes", False))

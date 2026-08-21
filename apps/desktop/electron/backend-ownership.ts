@@ -16,10 +16,6 @@ export interface BackendOwnershipEntry extends BackendIdentity {
 export interface BackendOwnershipStore {
   read: () => string | null
   write: (contents: string) => void
-  /** Move an unreadable ownership file aside (e.g. rename to `.corrupt`) so
-   *  its contents survive for inspection instead of being rewritten away.
-   *  Optional: stores that can't quarantine simply skip the sweep. */
-  quarantine?: () => void
 }
 
 export interface BackendOwnershipDeps {
@@ -66,30 +62,12 @@ function identitiesMatch(left: BackendIdentity, right: BackendIdentity): boolean
 }
 
 export function parseBackendOwnership(contents: unknown): BackendOwnershipEntry[] {
-  return parseBackendOwnershipDetailed(contents).entries
-}
-
-/** Parse result that distinguishes "empty/valid" from "unreadable". A corrupt
- *  ownership file must NOT read as an empty roster: `reapOrphans` rewrites the
- *  file with its survivors, so treating garbage as `[]` permanently erased the
- *  records of still-running backends — the exact shape of the #89298 report
- *  (ownership file gone, 28 leaked serve processes nothing will ever reap). */
-export function parseBackendOwnershipDetailed(contents: unknown): {
-  corrupt: boolean
-  entries: BackendOwnershipEntry[]
-} {
-  const text = String(contents ?? '')
-
-  if (!text.trim()) {
-    return { corrupt: false, entries: [] }
-  }
-
   let parsed: unknown
 
   try {
-    parsed = JSON.parse(text)
+    parsed = JSON.parse(String(contents ?? ''))
   } catch {
-    return { corrupt: true, entries: [] }
+    return []
   }
 
   const values = Array.isArray(parsed)
@@ -131,7 +109,7 @@ export function parseBackendOwnershipDetailed(contents: unknown): {
     }
   }
 
-  return { corrupt: false, entries }
+  return entries
 }
 
 export function serializeBackendOwnership(entries: BackendOwnershipEntry[]): string {
@@ -145,8 +123,7 @@ export function serializeBackendOwnership(entries: BackendOwnershipEntry[]): str
  * cleanup before reporting failure to the caller.
  */
 export function createBackendOwnership(deps: BackendOwnershipDeps) {
-  const readDetailed = () => parseBackendOwnershipDetailed(deps.store.read())
-  const read = () => readDetailed().entries
+  const read = () => parseBackendOwnership(deps.store.read())
   const write = (entries: BackendOwnershipEntry[]) => deps.store.write(serializeBackendOwnership(entries))
 
   return {
@@ -204,22 +181,7 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
     },
 
     async reapOrphans(): Promise<number[]> {
-      const { corrupt, entries } = readDetailed()
-
-      // An unreadable ownership file yields zero parsed entries — rewriting
-      // survivors ([]) here would DESTROY the only record of any backends the
-      // corrupt file described, guaranteeing they leak forever (#89298).
-      // Preserve the evidence for inspection and skip the sweep.
-      if (corrupt) {
-        try {
-          deps.store.quarantine?.()
-        } catch {
-          // Quarantine is best-effort; the important part is not rewriting.
-        }
-
-        return []
-      }
-
+      const entries = read()
       const survivors: BackendOwnershipEntry[] = []
       const reaped: number[] = []
 

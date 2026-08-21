@@ -493,10 +493,7 @@ class TestCallbackPortReservation:
         import threading
         import tools.mcp_oauth as mod
 
-        # cimd: false keeps this on the ephemeral branch. A CIMD-eligible
-        # config would take a pinned port instead, and this test would pass
-        # while never exercising _reserve_callback_port at all.
-        cfg: dict = {"cimd": False}
+        cfg: dict = {}
         port = mod._configure_callback_port(cfg)
         monkeypatch.setattr(mod, "_is_interactive", lambda: False)
         # Bypass the non-interactive guard — this test drives the flow directly.
@@ -534,14 +531,11 @@ class TestCallbackPortReservation:
         monkeypatch.setattr(mod, "_is_interactive", lambda: False)
         monkeypatch.setattr(mod, "_raise_if_non_interactive", lambda lead: None)
 
-        # cimd: false keeps both flows on ephemeral ports, which is where the
-        # #34260 clobbering happens; the pinned range has its own coverage in
-        # tests/tools/test_mcp_cimd.py.
-        cfg_a: dict = {"cimd": False}
+        cfg_a: dict = {}
         port_a = mod._configure_callback_port(cfg_a)
         waiter_a = mod._make_callback_waiter(port_a)
         # Flow B configures afterwards — overwrites mod._oauth_port.
-        cfg_b: dict = {"cimd": False}
+        cfg_b: dict = {}
         port_b = mod._configure_callback_port(cfg_b)
         assert mod._oauth_port == port_b != port_a
 
@@ -866,7 +860,7 @@ _PROXY_REDIRECT = "https://oauth.example.ts.net/callback"
 
 
 @pytest.mark.parametrize("cfg, expected_auth", [
-    ({"cimd": False}, "none"),                       # public client
+    ({}, "none"),                                    # public client
     ({"client_secret": "shh"}, "client_secret_post"),  # confidential client
 ])
 def test_build_client_metadata_token_endpoint_auth(cfg, expected_auth):

@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useI18n } from '@/i18n'
 import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
-import { markAssistantIdSpoken, resolveSpokenReply } from '@/lib/spoken-reply'
 import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
 import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
@@ -63,6 +62,7 @@ export function useComposerVoice({
   // A tile's composer speaks ITS transcript, not the primary chat's.
   const { $messages } = useComposerScope()
   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
+  const lastSpokenIdRef = useRef<string | null>(null)
   const ownsWakeIndicatorRef = useRef(false)
   const voiceStartRequest = useStore($voiceConversationStartRequest)
 
@@ -77,9 +77,8 @@ export function useComposerVoice({
   const pendingResponse = () => {
     const messages = $messages.get()
     const last = messages.findLast(m => m.role === 'assistant' && !m.hidden)
-    const spoken = resolveSpokenReply(sessionId, messages)
 
-    if (!last || last.id === spoken?.id) {
+    if (!last || last.id === lastSpokenIdRef.current) {
       return null
     }
 
@@ -101,18 +100,14 @@ export function useComposerVoice({
    * in order — narration interims AND the final answer, not just whichever
    * bubble happens to be last. See `collectUnspokenTurnSpeech`.
    */
-  const pendingTurnResponse = () => {
-    const messages = $messages.get()
-
-    return collectUnspokenTurnSpeech(messages, resolveSpokenReply(sessionId, messages)?.id ?? null)
-  }
+  const pendingTurnResponse = () => collectUnspokenTurnSpeech($messages.get(), lastSpokenIdRef.current)
 
   const consumePendingResponse = () => {
     const messages = $messages.get()
     const last = messages.findLast(m => m.role === 'assistant' && !m.hidden)
 
     if (last) {
-      markAssistantIdSpoken(sessionId, messages, last.id)
+      lastSpokenIdRef.current = last.id
     }
   }
 

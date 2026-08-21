@@ -232,21 +232,12 @@ async def test_stale_finalize_does_not_suppress_complete_response(
     assert any(FULL_RESPONSE in payload for payload in all_payloads), (
         f"complete response never reached the platform; payloads: {all_payloads!r}"
     )
-    # The recovery must not duplicate: when the gateway suppressed its normal
-    # final send (already_sent), the complete response must have been the
-    # payload of the message that finalized on screen — either an in-place
-    # reconciliation/finalize edit, or (consumer-declared final contract,
-    # 2026-08-16) the primary send itself when the authoritative final was
-    # adopted before the first flush. Both shapes are single-message.
+    # The preferred recovery is an in-place reconciliation edit of the
+    # streamed message (single corrected message, no duplicate).
     if result.get("already_sent"):
-        _edit_carried = any(
+        assert any(
             e["content"] == FULL_RESPONSE and e["finalize"] for e in adapter.edits
-        )
-        _send_carried = any(c["content"] == FULL_RESPONSE for c in adapter.sent)
-        assert _edit_carried or _send_carried, (
-            "already_sent=True but neither an edit nor the primary send "
-            "carried the complete response"
-        )
+        ), "already_sent=True but no edit carried the complete response"
 
 
 @pytest.mark.asyncio

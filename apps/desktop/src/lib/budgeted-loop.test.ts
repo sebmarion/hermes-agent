@@ -1,10 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { installWindowStateBridge, type WindowStateBridge } from '../test/window-state'
-
 import { createBudgetedLoop } from './budgeted-loop'
 
-let windowState: WindowStateBridge
+let windowStateCallback: ((payload: { isMinimized?: boolean; isVisible?: boolean }) => void) | null = null
 
 function installRaf() {
   let nextId = 1
@@ -40,10 +38,28 @@ function installRaf() {
   }
 }
 
+function installWindowStateBridge() {
+  windowStateCallback = null
+  Object.defineProperty(window, 'hermesDesktop', {
+    configurable: true,
+    value: {
+      onWindowStateChanged: vi.fn((callback: typeof windowStateCallback) => {
+        windowStateCallback = callback
+
+        return () => {
+          if (windowStateCallback === callback) {
+            windowStateCallback = null
+          }
+        }
+      })
+    }
+  })
+}
+
 describe('createBudgetedLoop', () => {
   beforeEach(() => {
     vi.spyOn(document, 'hasFocus').mockReturnValue(true)
-    windowState = installWindowStateBridge()
+    installWindowStateBridge()
   })
 
   afterEach(() => {
@@ -84,10 +100,10 @@ describe('createBudgetedLoop', () => {
     window.dispatchEvent(new Event('focus'))
     expect(raf.pending()).toBe(1)
 
-    windowState.emit({ isMinimized: true, isVisible: false })
+    windowStateCallback?.({ isMinimized: true, isVisible: false })
     expect(raf.pending()).toBe(0)
 
-    windowState.emit({ isMinimized: false, isVisible: true })
+    windowStateCallback?.({ isMinimized: false, isVisible: true })
     expect(raf.pending()).toBe(1)
 
     loop.dispose()
