@@ -59,10 +59,6 @@ export function resolveFastControl(
 }
 
 interface ModelEditSubmenuProps {
-  /** Whether this model can turn thinking off. False on reasoning-mandatory
-   *  routes, whose upstream rejects a disable — the toggle is hidden rather
-   *  than offered as a control that silently does nothing. */
-  canDisableReasoning?: boolean
   /** The profile's configured default effort — what an unset row inherits.
    *  Passed in (not read from a store) so this submenu stays pure. */
   defaultEffort: string
@@ -102,7 +98,6 @@ export function ModelEditSubmenu(props: ModelEditSubmenuProps) {
 }
 
 function ModelEditSubmenuBody({
-  canDisableReasoning,
   defaultEffort,
   effort,
   fastControl,
@@ -116,7 +111,6 @@ function ModelEditSubmenuBody({
 
   const effortValue = resolveReasoningEffort(effort, defaultEffort)
   const thinkingOn = isThinkingEnabled(effort, defaultEffort)
-  const showThinkingToggle = reasoning && canDisableReasoning !== false
 
   const setFast = (enabled: boolean) => {
     if (fastControl.kind === 'variant') {
@@ -145,7 +139,7 @@ function ModelEditSubmenuBody({
   ) : (
     <>
       <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.options}</DropdownMenuLabel>
-      {showThinkingToggle ? (
+      {reasoning ? (
         <DropdownMenuItem className={dropdownMenuRow} onSelect={event => event.preventDefault()}>
           {copy.thinking}
           <Switch

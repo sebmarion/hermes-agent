@@ -71,11 +71,6 @@ from hermes_cli.plugin_capabilities import (  # noqa: F401 — re-exported
 from hermes_cli.plugin_capabilities import (
     parse_declared_capabilities as _parse_declared_capabilities,
 )
-from hermes_cli.relay_plugin_cutover import (
-    LEGACY_RELAY_PLUGIN_KEYS,
-    RELAY_PLUGINS_CONFIG_ENV,
-    legacy_relay_plugin_keys,
-)
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -1390,7 +1385,39 @@ class PluginState:
             atomic_json_write(self.path, data, mode=0o600)
 
 
+# --- Completion-arbiter seam (migration bridge, Phase 6 / Option A-lite) ----
+# A plugin may claim authoritative completion of a turn and commit a final
+# response that is finalized through the canonical host finalizer (upstream
+# agent.turn_finalizer.finalize_turn). Exactly one owner per turn. When no
+# plugin claims a turn (the default), behavior is byte-identical to upstream.
+# Plugins never see credentials or mutate history directly.
+_COMPLETION_ARBITER: "dict" = {}  # turn_id -> dict(plugin_id, commit_fn)
+_COMPLETION_ARBITER_LOCK = __import__("threading").RLock()
+
+
+def _register_completion_arbiter(turn_id, plugin_id, commit_fn) -> bool:
+    with _COMPLETION_ARBITER_LOCK:
+        if turn_id in _COMPLETION_ARBITER:
+            return False  # already claimed (atomic under lock)
+        _COMPLETION_ARBITER[turn_id] = {"plugin_id": plugin_id, "commit_fn": commit_fn}
+        return True
+
+
+def _release_completion_arbiter(turn_id) -> None:
+    with _COMPLETION_ARBITER_LOCK:
+        _COMPLETION_ARBITER.pop(turn_id, None)
+
+
+def _release_completion_arbiter(turn_id) -> None:
+    _COMPLETION_ARBITER.pop(turn_id, None)
+
+
+def _completion_arbiter_for(turn_id):
+    return _COMPLETION_ARBITER.get(turn_id)
+
+
 class PluginContext:
+
     """Facade given to plugins so they can register tools and hooks."""
 
     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
@@ -1810,6 +1837,17 @@ class PluginContext:
             return True
         plugin_id = self.manifest.key or self.manifest.name
         return plugin_capability_granted(plugin_id, capability)
+
+    def completion_arbiter(self, turn_id: str, commit_fn):
+        """Claim authoritative completion of *turn_id* for this plugin.
+
+        ``commit_fn(result, *, turn_id=...)`` is invoked by the host after the
+        canonical finalizer runs, with the fully finalized ``result`` dict (the
+        plugin's proof/receipt). Returns True on claim, False if another owner
+        already claimed the turn. If ``commit_fn`` raises, the claim is released
+        and the error is surfaced (finalization itself is never interrupted).
+        """
+        return _register_completion_arbiter(turn_id, self.plugin_id, commit_fn)
 
     # -- capability-gated MCP access ----------------------------------------
 
@@ -3897,14 +3935,6 @@ class PluginManager:
         # don't collide even when both manifests say ``name: openai``.
         disabled = _get_disabled_plugins()
         enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
-        stale_relay_keys = legacy_relay_plugin_keys(enabled)
-        if stale_relay_keys:
-            logger.warning(
-                "Removed Hermes plugin %s is still listed in plugins.enabled; "
-                "remove it and configure native Relay plugins with %s",
-                ", ".join(stale_relay_keys),
-                RELAY_PLUGINS_CONFIG_ENV,
-            )
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
@@ -3914,26 +3944,6 @@ class PluginManager:
         to_load: Dict[str, PluginManifest] = {}
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
-
-            # Relay lifecycle ownership now lives in the Hermes core. Loading
-            # an old user or entry-point copy would let plugin.initialize()
-            # compete for the same process-global Relay registries.
-            if (
-                lookup_key in LEGACY_RELAY_PLUGIN_KEYS
-                or manifest.name in LEGACY_RELAY_PLUGIN_KEYS
-            ):
-                loaded = LoadedPlugin(manifest=manifest, enabled=False)
-                loaded.error = (
-                    "removed — Relay lifecycle is owned by Hermes core; configure "
-                    f"{RELAY_PLUGINS_CONFIG_ENV} instead"
-                )
-                self._plugins[lookup_key] = loaded
-                logger.warning(
-                    "Refusing to load removed Hermes Relay plugin '%s'; %s",
-                    lookup_key,
-                    loaded.error,
-                )
-                continue
 
             # Explicit disable always wins (matches on key or on legacy
             # bare name for back-compat with existing user configs).

@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import re
-import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -25,10 +24,6 @@ logger = logging.getLogger(__name__)
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_home: Optional[str] = None
-# Guards the (map, platform-tag, home-tag) triple so publication and the
-# freshness lookup always see a consistent snapshot. Scanning itself stays
-# outside this lock.
-_publish_lock = threading.Lock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -428,15 +423,9 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform, _skill_commands_home
-    platform = _resolve_skill_commands_platform()
-    home = _resolve_skill_commands_home()
-    # Build into a local map and publish once, at the end. Writing straight
-    # into the global made a scan's partial results visible to everything
-    # else in the process: a second, overlapping scan deduped against its own
-    # (empty) ``seen_names`` but collided against the first scan's already-
-    # published slugs, logging one bogus "already claimed" warning per skill —
-    # each naming the same skill as its own incumbent (#74574).
-    commands: Dict[str, Dict[str, Any]] = {}
+    _skill_commands_platform = _resolve_skill_commands_platform()
+    _skill_commands_home = _resolve_skill_commands_home()
+    _skill_commands = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import (
@@ -516,14 +505,14 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # slug (e.g. "git_helper" vs "git-helper"). First-wins
                     # preserves local-before-external precedence.
                     cmd_key = f"/{cmd_name}"
-                    if cmd_key in commands:
+                    if cmd_key in _skill_commands:
                         logger.warning(
                             "Skill %r maps to slash command %s already claimed "
                             "by %r; keeping the first and skipping this one.",
-                            name, cmd_key, commands[cmd_key]["name"],
+                            name, cmd_key, _skill_commands[cmd_key]["name"],
                         )
                         continue
-                    commands[cmd_key] = {
+                    _skill_commands[cmd_key] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
@@ -533,18 +522,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
     except Exception:
         pass
-    # Publish the finished map and the platform/home it was scanned for as
-    # ONE step. Bare assignments are not atomic together: a reader landing
-    # between them sees the NEW map still carrying the OLD platform tag, and
-    # if that stale tag happens to match its own platform it accepts the map
-    # without rescanning — serving another platform's disabled-skill view,
-    # exactly the leak #14536 closed. Only the publish/lookup pair is locked;
-    # the scan above (file I/O, deferred imports) stays outside it.
-    with _publish_lock:
-        _skill_commands = commands
-        _skill_commands_platform = platform
-        _skill_commands_home = home
-    return commands
+    return _skill_commands
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
@@ -556,22 +534,13 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     active profile's Hermes home changes (e.g. Desktop switching profiles
     mid-session) so each profile sees its own ``skills.external_dirs`` (#88023).
     """
-    current_platform = _resolve_skill_commands_platform()
-    current_home = _resolve_skill_commands_home()
-    # Read the map and its tags under the same lock that publishes them, so
-    # the freshness decision is made against a consistent snapshot.
-    with _publish_lock:
-        commands = _skill_commands
-        is_fresh = (
-            bool(commands)
-            and _skill_commands_platform == current_platform
-            and _skill_commands_home == current_home
-        )
-    if is_fresh:
-        return commands
-    # Scan outside the lock — it does file I/O and deferred imports, and
-    # concurrent scans are already safe (each builds its own map).
-    return scan_skill_commands()
+    if (
+        not _skill_commands
+        or _skill_commands_platform != _resolve_skill_commands_platform()
+        or _skill_commands_home != _resolve_skill_commands_home()
+    ):
+        scan_skill_commands()
+    return _skill_commands
 
 
 def reload_skills() -> Dict[str, Any]:

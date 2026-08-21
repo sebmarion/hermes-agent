@@ -25,11 +25,11 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    from hermes_cli import goals
+    from hermes_cli import loops
 
-    goals._DB_CACHE.clear()
+    loops._DB_CACHE.clear()
     yield home
-    goals._DB_CACHE.clear()
+    loops._DB_CACHE.clear()
 
 
 @pytest.fixture()

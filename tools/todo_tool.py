@@ -296,8 +296,6 @@ TODO_SCHEMA = {
     "description": (
         "Manage your task list for the current session. Use for complex tasks "
         "with 3+ steps or when the user provides multiple tasks. "
-        "For 'all N items' tasks, enumerate every instance as its own checklist "
-        "item so none are silently dropped. "
         "Call with no parameters to read the current list.\n\n"
         "Writing:\n"
         "- Provide 'todos' array to create/update items\n"
@@ -306,8 +304,7 @@ TODO_SCHEMA = {
         "Each item: {id: string, content: string, "
         "status: pending|in_progress|completed|cancelled}\n"
         "List order is priority. Only ONE item in_progress at a time.\n"
-        "Mark an item completed only after the work is verified done, never "
-        "based on intent. If something fails, "
+        "Mark items completed immediately when done. If something fails, "
         "cancel it and add a revised item.\n\n"
         "Always returns the full current list."
     ),

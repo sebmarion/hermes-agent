@@ -703,13 +703,7 @@ export type GatewayEvent =
       type: 'tool.complete'
     }
   | {
-      payload: {
-        answers?: Record<string, string>
-        choices?: string[] | null
-        question?: string
-        questions?: { choices?: string[] | null; multi_select?: boolean; qid: string; question: string }[]
-        request_id: string
-      }
+      payload: { choices: string[] | null; question: string; request_id: string }
       session_id?: string
       type: 'clarify.request'
     }

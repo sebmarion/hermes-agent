@@ -1342,47 +1342,6 @@ while the agent is blocked (e.g. approval prompts) MUST bypass BOTH
 guards and be dispatched inline, not via `_process_message_background()`
 (which races session lifecycle).
 
-### Streaming delivery contract (stream-is-the-message adapters) — duplicate-final class
-Adapters with `draft_stream_is_message = True` (relay Slack native streaming)
-keep ONE cumulative native stream per turn; the stream IS the final message.
-Four invariants, each learned from a live duplicate-final incident (NS-658
-canary ledger, hermes#85796 / gateway-gateway#210). Violating any of them
-re-creates a duplicate or a frozen stream:
-
-1. **Draft frames must be prefix-stable.** The connector computes append-only
-   deltas: frame N must be a string prefix of frame N+1. NEVER mutate draft
-   frames per-tick — no fence-closing (`ensure_closed_code_fences`), no cursor
-   suffix, no segment-state resets at tool boundaries, no mrkdwn conversion.
-   Any non-prefix frame triggers a whole-snapshot re-append on the platform
-   ("stacked copies"). The finalize path may still transform the real final.
-2. **The consumer declares the final; the adapter never guesses.**
-   `finish(final_text)` carries the completed `final_response` (verifier
-   footer, completion explainer included) as the authoritative finalize
-   payload. New post-stream response augmentation MUST ride this payload —
-   if it mutates `final_response` after the stream sealed, it re-opens the
-   #11 bug (`delivered_final_matches` mismatch → corrective duplicate send).
-3. **Interim sends must carry `_interim_send` metadata.** Any consumer-side
-   `adapter.send()` that is NOT the turn-final (commentary, segment-tail
-   flushes) must set `metadata["_interim_send"] = True`, or the relay
-   adapter's seal-interception will seal the live stream with interim text.
-   Seal-interception exists at BOTH egress doors (`send()` AND
-   `send_for_platform()`); a new egress door needs the same two checks.
-4. **Reconcile by edit, never by plain send.** Any lane that delivers a final
-   beside an already-sealed stream (queued follow-ups, media-accompanied
-   finals, future lanes) must first try `edit_message` on the consumer's
-   `message_id`; plain `send()` is the fallback only when no editable message
-   exists. A sealed native stream is a regular message — `chat.update` on it
-   works (live-verified).
-
-Contract tests: `tests/gateway/test_stream_final_contract.py` (all four
-invariants, mutation-checked). Slack streaming API ground truth (live-probed,
-also encoded in connector comments/tests): `chat.*Stream` speaks STANDARD
-markdown, not mrkdwn; `stopStream.markdown_text` APPENDS (never replaces);
-`startStream`/`stopStream` are rate-limit Tier 2 (~20/min).
-
-Guard style note: check `draft_stream_is_message` with `is True` — MagicMock
-adapters in older tests auto-create truthy attributes.
-
 ### Squash merges from stale branches silently revert recent fixes
 Before squash-merging a PR, ensure the branch is up to date with `main`
 (`git fetch origin main && git reset --hard origin/main` in the worktree,
@@ -1606,3 +1565,48 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **hermes-agent** (185151 symbols, 347668 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
+- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
+- NEVER commit changes without running `detect_changes()` to check affected scope.
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/hermes-agent/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/hermes-agent/clusters` | All functional areas |
+| `gitnexus://repo/hermes-agent/processes` | All execution flows |
+| `gitnexus://repo/hermes-agent/process/{name}` | Step-by-step execution trace |
+
+## CLI
+
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+
+<!-- gitnexus:end -->

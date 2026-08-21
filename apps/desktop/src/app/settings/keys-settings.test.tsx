@@ -2,13 +2,17 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter, useNavigate } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { stubResizeObserver } from '@/test/jsdom'
-
-import { envVar } from './test-utils'
+import type { EnvVarInfo } from '@/types/hermes'
 
 const getEnvVars = vi.fn()
 
-stubResizeObserver()
+class TestResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+vi.stubGlobal('ResizeObserver', TestResizeObserver)
 
 vi.mock('@/hermes', () => ({
   deleteEnvVar: vi.fn(),
@@ -17,6 +21,20 @@ vi.mock('@/hermes', () => ({
   setApiRequestProfile: () => undefined,
   setEnvVar: vi.fn()
 }))
+
+function envVar(category: string, patch: Partial<EnvVarInfo> = {}): EnvVarInfo {
+  return {
+    advanced: false,
+    category,
+    description: '',
+    is_password: true,
+    is_set: false,
+    redacted_value: null,
+    tools: [],
+    url: '',
+    ...patch
+  }
+}
 
 beforeEach(() => {
   getEnvVars.mockResolvedValue({})

@@ -1,7 +1,6 @@
 """Credential-pool auth subcommands."""
 
 from __future__ import annotations
-from hermes_cli.cli_output import line_input
 
 import math
 import sys
@@ -205,7 +204,7 @@ def auth_add_command(args) -> None:
         label = (getattr(args, "label", None) or "").strip()
         if not label:
             if sys.stdin.isatty():
-                label = line_input(f"Label (optional, default: {default_label}): ").strip() or default_label
+                label = input(f"Label (optional, default: {default_label}): ").strip() or default_label
             else:
                 label = default_label
         entry = PooledCredential(
@@ -664,7 +663,7 @@ def _pick_provider(prompt: str = "Provider") -> str:
     else:
         print(f"\nKnown providers: {', '.join(known)}")
     try:
-        raw = line_input(f"{prompt}: ").strip()
+        raw = input(f"{prompt}: ").strip()
     except (EOFError, KeyboardInterrupt):
         raise SystemExit()
     return _normalize_provider(raw)
@@ -693,7 +692,7 @@ def _interactive_add() -> None:
 
     label = None
     try:
-        typed_label = line_input("Label / account name (optional): ").strip()
+        typed_label = input("Label / account name (optional): ").strip()
     except (EOFError, KeyboardInterrupt):
         return
     if typed_label:
@@ -719,7 +718,7 @@ def _interactive_remove() -> None:
         print(f"  #{i}  {e.label:25s} {e.auth_type:10s} {e.source}{exhausted} [id:{e.id}]")
 
     try:
-        raw = line_input("Remove #, id, or label (blank to cancel): ").strip()
+        raw = input("Remove #, id, or label (blank to cancel): ").strip()
     except (EOFError, KeyboardInterrupt):
         return
     if not raw:

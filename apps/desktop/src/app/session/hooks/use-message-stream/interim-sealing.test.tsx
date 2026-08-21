@@ -1,41 +1,72 @@
-import { act, cleanup } from '@testing-library/react'
+import { QueryClient } from '@tanstack/react-query'
+import { act, cleanup, render, waitFor } from '@testing-library/react'
+import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { chatMessageText } from '@/lib/chat-messages'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionTodos } from '@/store/todos'
 import type { RpcEvent } from '@/types/hermes'
 
-import { type MessageStreamHarness, renderMessageStream } from './test-harness'
+import { useMessageStream } from './index'
 
 const SID = 'session-1'
 
-let stream: MessageStreamHarness
+let handleEvent: ((event: RpcEvent) => void) | null = null
+let sessionStates: Map<string, ClientSessionState>
 let mockCompleteSound: ReturnType<typeof vi.fn>
 let mockHaptic: ReturnType<typeof vi.fn>
 
-function mountStream() {
-  stream = renderMessageStream(SID)
+function Harness() {
+  const activeSessionIdRef = useRef<string | null>(SID)
+  const sessionStateByRuntimeIdRef = useRef(new Map<string, ClientSessionState>())
+  const queryClientRef = useRef(new QueryClient())
+
+  const stream = useMessageStream({
+    activeSessionIdRef,
+    hydrateFromStoredSession: vi.fn(async () => undefined),
+    queryClient: queryClientRef.current,
+    refreshHermesConfig: vi.fn(async () => undefined),
+    refreshSessions: vi.fn(async () => undefined),
+    sessionStateByRuntimeIdRef,
+    updateSessionState: (sessionId, updater) => {
+      const current = sessionStateByRuntimeIdRef.current.get(sessionId) ?? createClientSessionState()
+      const next = updater(current)
+      sessionStateByRuntimeIdRef.current.set(sessionId, next)
+      sessionStates.set(sessionId, next)
+
+      return next
+    }
+  })
+
+  useEffect(() => {
+    handleEvent = stream.handleGatewayEvent
+  }, [stream.handleGatewayEvent])
+
+  return null
 }
 
-const start = () => act(() => stream.handleEvent({ payload: {}, session_id: SID, type: 'message.start' }))
+async function mountStream() {
+  sessionStates = new Map()
+  render(<Harness />)
+  await waitFor(() => expect(handleEvent).not.toBeNull())
+}
 
-const delta = (text: string) =>
-  act(() => stream.handleEvent({ payload: { text }, session_id: SID, type: 'message.delta' }))
+const start = () => act(() => handleEvent!({ payload: {}, session_id: SID, type: 'message.start' }))
+const delta = (text: string) => act(() => handleEvent!({ payload: { text }, session_id: SID, type: 'message.delta' }))
 
 const interim = (text: string) =>
-  act(() => stream.handleEvent({ payload: { text, already_streamed: true }, session_id: SID, type: 'message.interim' }))
+  act(() => handleEvent!({ payload: { text, already_streamed: true }, session_id: SID, type: 'message.interim' }))
 
 const complete = (text: string) =>
-  act(() => stream.handleEvent({ payload: { text }, session_id: SID, type: 'message.complete' }))
+  act(() => handleEvent!({ payload: { text }, session_id: SID, type: 'message.complete' }))
 
 const completePreviewed = (text: string) =>
-  act(() =>
-    stream.handleEvent({ payload: { text, response_previewed: true }, session_id: SID, type: 'message.complete' })
-  )
+  act(() => handleEvent!({ payload: { text, response_previewed: true }, session_id: SID, type: 'message.complete' }))
 
 function getState(): ClientSessionState {
-  return stream.state()
+  return sessionStates.get(SID) ?? createClientSessionState()
 }
 
 function assistantText(): string {
@@ -56,6 +87,7 @@ function assistantMessages(): string[] {
 
 describe('useMessageStream interim text sealing', () => {
   beforeEach(() => {
+    handleEvent = null
     clearSessionTodos(SID)
   })
 
@@ -66,7 +98,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('preserves interim text that the final response does not include', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     await delta('awaaaaa clean!! tsc zero errors')
@@ -80,7 +112,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('marks sealed interim bubbles interim and leaves the final reply unmarked', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     await delta('Let me check the files.')
@@ -98,7 +130,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('clears the interim mark when a previewed final settles onto the interim bubble', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     await interim('same reply')
@@ -110,7 +142,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('dedupes interim text when the final response includes it', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     await delta('Let me check the files.')
@@ -124,7 +156,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('clears interimBoundaryPending at turn end so the next turn starts clean', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     await delta('interim text')
@@ -143,7 +175,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('finalizes an interim segment without settling the turn', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     await delta('streaming text')
@@ -155,7 +187,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('settles an identical final onto a non-previewed interim (tool-call turn) instead of duplicating (#63679)', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     // A plain tool-call turn: the streamed text is sealed as an interim at the
@@ -171,7 +203,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('settles a prefix-extended final onto a non-previewed interim (streamed + trailing delta)', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     // The stream dropped/settled early at the tool boundary; the final adds a
@@ -186,7 +218,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('settles final onto interim even after message.start reset the boundary flag (#74560)', async () => {
-    mountStream()
+    await mountStream()
     await start()
     await delta('partial')
     await interim('partial')
@@ -203,12 +235,12 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('appends a distinct previewed final after a message.start reset instead of overwriting the interim', async () => {
-    mountStream()
+    await mountStream()
     await start()
     await interim('old interim text')
     // A genuinely new turn begins — message.start resets interimBoundaryPending.
     // Production ordering: mid-turn compaction-resume events do NOT include
-    // message.start (COMPACTION_RESUME_EVENT_TYPES in gateway-event/index.ts), and
+    // message.start (COMPACTION_RESUME_EVENT_TYPES in gateway-event.ts), and
     // the TUI gateway emits message.complete BEFORE goal-followup starts
     // (tui_gateway/server.py), so a previewed final arriving after the reset
     // is a DISTINCT reply, not a rewrite of the interim. It must append its
@@ -223,7 +255,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('appends a genuinely different final as its own bubble (two real assistant segments)', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     // The interim is one segment (pre-tool commentary); the final is different
@@ -239,7 +271,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('settles an identical final completion onto the interim when response_previewed', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     await interim('same reply')
@@ -253,7 +285,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('settles a prefix-matched final onto the interim when response_previewed', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     // Interim text is a PREFIX of the final — the model streamed part of
@@ -270,7 +302,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('dedupes partial-stream-then-nudge: streamed prefix + interim + previewed final settles to one bubble', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     // The model streamed part of its answer via message.delta, then the
@@ -287,16 +319,16 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('ignores malformed message.interim payload', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     // No payload at all
-    await act(() => stream.handleEvent({ type: 'message.interim' } as RpcEvent))
+    await act(() => handleEvent!({ type: 'message.interim' } as RpcEvent))
     // Empty text
-    await act(() => stream.handleEvent({ payload: { text: '' }, session_id: SID, type: 'message.interim' } as RpcEvent))
+    await act(() => handleEvent!({ payload: { text: '' }, session_id: SID, type: 'message.interim' } as RpcEvent))
     // Undefined text
     await act(() =>
-      stream.handleEvent({ payload: { text: undefined }, session_id: SID, type: 'message.interim' } as RpcEvent)
+      handleEvent!({ payload: { text: undefined }, session_id: SID, type: 'message.interim' } as RpcEvent)
     )
 
     // Turn continues without finalizing or throwing
@@ -305,7 +337,7 @@ describe('useMessageStream interim text sealing', () => {
   })
 
   it('clears interimBoundaryPending on message.start', async () => {
-    mountStream()
+    await mountStream()
     await start()
 
     await delta('interim text')

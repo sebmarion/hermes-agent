@@ -4,21 +4,56 @@
 // mid-transcript — the dither block anywhere but the tail. session.info
 // running=false is the turn's finally-block signal and the only settle edge
 // those paths still emit, so it must finalize the bubble.
-import { act, cleanup } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { QueryClient } from '@tanstack/react-query'
+import { act, cleanup, render } from '@testing-library/react'
+import { useEffect, useRef } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { ClientSessionState } from '@/app/types'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import type { RpcEvent } from '@/types/hermes'
 
-import { type MessageStreamHarness, renderMessageStream } from './test-harness'
 import { STREAM_DELTA_FLUSH_MS } from './utils'
+
+import { useMessageStream } from './index'
 
 const SID = 'stale-pending-session'
 
-let stream: MessageStreamHarness
+let handleEvent: ((event: RpcEvent) => void) | null = null
+let states: Map<string, ClientSessionState>
+
+function Harness() {
+  const activeSessionIdRef = useRef<string | null>(SID)
+  const sessionStateByRuntimeIdRef = useRef(new Map<string, ClientSessionState>())
+  const queryClientRef = useRef(new QueryClient())
+
+  const stream = useMessageStream({
+    activeSessionIdRef,
+    hydrateFromStoredSession: vi.fn(async () => undefined),
+    queryClient: queryClientRef.current,
+    refreshHermesConfig: vi.fn(async () => undefined),
+    refreshSessions: vi.fn(async () => undefined),
+    sessionStateByRuntimeIdRef,
+    updateSessionState: (sessionId, updater) => {
+      const current = sessionStateByRuntimeIdRef.current.get(sessionId) ?? createClientSessionState()
+      const next = updater(current)
+      sessionStateByRuntimeIdRef.current.set(sessionId, next)
+
+      return next
+    }
+  })
+
+  useEffect(() => {
+    handleEvent = stream.handleGatewayEvent
+    states = sessionStateByRuntimeIdRef.current
+  }, [stream.handleGatewayEvent])
+
+  return null
+}
 
 async function mountHarness() {
   vi.useFakeTimers()
-  stream = renderMessageStream(SID)
+  render(<Harness />)
   await act(async () => {
     await Promise.resolve()
   })
@@ -30,9 +65,14 @@ const flushDeltas = async () => {
   })
 }
 
-const emit = (event: RpcEvent) => act(() => stream.handleEvent(event))
+const emit = (event: RpcEvent) => act(() => handleEvent?.(event))
 
 describe('turn end without message.complete (session.info running=false)', () => {
+  beforeEach(() => {
+    handleEvent = null
+    states = new Map()
+  })
+
   afterEach(() => {
     cleanup()
     vi.useRealTimers()
@@ -46,11 +86,11 @@ describe('turn end without message.complete (session.info running=false)', () =>
     emit({ payload: { text: 'partial answer' }, session_id: SID, type: 'message.delta' })
     await flushDeltas()
 
-    expect(stream.state()?.messages.at(-1)?.pending).toBe(true)
+    expect(states.get(SID)?.messages.at(-1)?.pending).toBe(true)
 
     emit({ payload: { running: false }, session_id: SID, type: 'session.info' })
 
-    const state = stream.state()
+    const state = states.get(SID)
     const tail = state?.messages.at(-1)
 
     expect(tail?.role).toBe('assistant')
@@ -78,7 +118,7 @@ describe('turn end without message.complete (session.info running=false)', () =>
 
     emit({ payload: { running: false }, session_id: SID, type: 'session.info' })
 
-    const state = stream.state()
+    const state = states.get(SID)
 
     // Same math as Stop: an empty-text placeholder is dropped, nothing stays
     // pending, and the stream binding is released.

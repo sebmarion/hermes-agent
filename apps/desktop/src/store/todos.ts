@@ -1,6 +1,5 @@
 import { atom, computed } from 'nanostores'
 
-import { keyedTimeouts } from '@/lib/keyed-timeouts'
 import { stableRecord } from '@/lib/stable-array'
 import type { TodoItem } from '@/lib/todos'
 
@@ -67,23 +66,38 @@ export function todosForHydration(todos: readonly TodoItem[] | null): TodoItem[]
 // lingers just long enough to see the last checkmark land, then the group
 // drops out of the stack on its own.
 const FINISHED_LINGER_MS = 4_000
-const clearTimers = keyedTimeouts()
+const clearTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+function cancelScheduledClear(sid: string) {
+  const timer = clearTimers.get(sid)
+
+  if (timer !== undefined) {
+    clearTimeout(timer)
+    clearTimers.delete(sid)
+  }
+}
 
 export function setSessionTodos(sid: string, todos: TodoItem[]) {
   if (!sid) {
     return
   }
 
-  clearTimers.cancel(sid)
+  cancelScheduledClear(sid)
   $todosBySession.set({ ...$todosBySession.get(), [sid]: todos })
 
   if (!todoListActive(todos)) {
-    clearTimers.schedule(sid, FINISHED_LINGER_MS, () => clearSessionTodos(sid))
+    clearTimers.set(
+      sid,
+      setTimeout(() => {
+        clearTimers.delete(sid)
+        clearSessionTodos(sid)
+      }, FINISHED_LINGER_MS)
+    )
   }
 }
 
 export function clearSessionTodos(sid: string) {
-  clearTimers.cancel(sid)
+  cancelScheduledClear(sid)
 
   const map = $todosBySession.get()
 

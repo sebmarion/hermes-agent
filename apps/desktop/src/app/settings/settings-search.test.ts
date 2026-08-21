@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { Settings2, Wrench } from '@/lib/icons'
-import type { ConfigFieldSchema, HermesConfigRecord } from '@/types/hermes'
+import type { ConfigFieldSchema, EnvVarInfo, HermesConfigRecord } from '@/types/hermes'
 
 import {
   buildConfigSearchEntries,
@@ -9,7 +9,20 @@ import {
   credentialSettingsView,
   filterSettingsSearchEntries
 } from './settings-search'
-import { envVar } from './test-utils'
+
+function envVar(category: string, patch: Partial<EnvVarInfo> = {}): EnvVarInfo {
+  return {
+    advanced: false,
+    category,
+    description: '',
+    is_password: true,
+    is_set: false,
+    redacted_value: null,
+    tools: [],
+    url: '',
+    ...patch
+  }
+}
 
 const searchCopy = {
   fieldDescriptions: {

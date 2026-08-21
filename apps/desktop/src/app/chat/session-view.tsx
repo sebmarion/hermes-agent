@@ -13,8 +13,7 @@ import {
   $currentProvider,
   $currentReasoningEffort,
   $messages,
-  $selectedStoredSessionId,
-  $turnStartedAt
+  $selectedStoredSessionId
 } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
 
@@ -49,10 +48,6 @@ export interface SessionView {
   $awaitingResponse: ReadableAtom<boolean>
   $messagesEmpty: ReadableAtom<boolean>
   $lastVisibleIsUser: ReadableAtom<boolean>
-  /** Epoch ms this surface's current turn began, null when idle. Per-surface
-   *  for the same reason $busy is: a tile's activity timer must count its own
-   *  turn, not whichever session the global mirror last reflected. */
-  $turnStartedAt: ReadableAtom<number | null>
   $cwd: ReadableAtom<string>
   $model: ReadableAtom<string>
   $provider: ReadableAtom<string>
@@ -105,8 +100,7 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $provider: primaryField<string>(state => state.provider, $currentProvider),
   $reasoningEffort: primaryField<string>(state => state.reasoningEffort, $currentReasoningEffort),
   $runtimeId: $activeSessionId,
-  $storedId: $selectedStoredSessionId,
-  $turnStartedAt: primaryField<number | null>(state => state.turnStartedAt, $turnStartedAt)
+  $storedId: $selectedStoredSessionId
 }
 
 const SessionViewContext = createContext<SessionView>(PRIMARY_SESSION_VIEW)

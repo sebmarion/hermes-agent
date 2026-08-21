@@ -3,8 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesConnection } from '@/global'
 
-import { deferred } from '../test/deferred'
-
 // Registry-agent activation (ensureGatewayAgent — the SDK ensureAgent door).
 // Two regressions pinned here:
 //  1. Activating an ALREADY-OPEN registry agent must still resync
@@ -48,6 +46,16 @@ const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnectio
 
 const getConnectionFor =
   vi.fn<(payload: { connectionId?: null | string; profile?: null | string }) => Promise<HermesConnection>>()
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+
+  const promise = new Promise<void>(r => {
+    resolve = r
+  })
+
+  return { promise, resolve }
+}
 
 beforeEach(() => {
   getConnection.mockReset()
@@ -97,11 +105,7 @@ describe('ensureGatewayAgent → $connection / $activeGatewayProfile sync', () =
 
     expect($activeGatewayProfile.get()).toBe('default')
     expect($connection.get()?.mode).toBe('local')
-    // The descriptor lookup DOES run: it is issued concurrently with the dial
-    // so nothing awaits between the activation verdict and the publication
-    // frame. The invariant that matters — nothing is PUBLISHED for a dead
-    // target — is asserted above; the lookup itself is a read-only probe.
-    expect(getConnectionFor).toHaveBeenCalledTimes(1)
+    expect(getConnectionFor).not.toHaveBeenCalled()
   })
 
   it('falls through to the profile path for a null connectionId', async () => {

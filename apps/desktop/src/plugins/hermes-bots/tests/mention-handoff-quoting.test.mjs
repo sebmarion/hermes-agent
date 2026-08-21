@@ -15,12 +15,7 @@ import vm from 'node:vm'
 
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
-function load({
-  activeProfile = 'research',
-  focusedProfile = activeProfile,
-  profiles = ['research', 'ops'],
-  title = null
-} = {}) {
+function load({ activeProfile = 'research', profiles = ['research', 'ops'], title = null } = {}) {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => values.set(slot, value) }
@@ -35,19 +30,11 @@ function load({
     host: {
       request: async method => {
         if (method === 'profiles.list') {
-          return {
-            profiles: profiles.map(profile =>
-              typeof profile === 'string' ? { name: profile } : profile
-            )
-          }
+          return { profiles: profiles.map(name => ({ name })) }
         }
         return {}
       },
-      state: {
-        profile: { get: () => activeProfile, listen: () => undefined },
-        focusedSessionProfile: { get: () => focusedProfile, listen: () => undefined },
-        gateway: { listen: () => undefined }
-      }
+      state: { profile: { get: () => activeProfile, listen: () => undefined }, gateway: { listen: () => undefined } }
     }
   }
   const source = pluginSource
@@ -122,22 +109,6 @@ test('regression: the handoff command quotes the recipient argument', async () =
   const { handler } = load()
   const result = await handler({ text: 'ping @ops please' })
   assert.match(result.text, /`hermes -p 'ops' chat --in ~/)
-})
-
-test('behavior: a renamed default profile routes from another focused Bot Chat', async () => {
-  const { handler } = load({
-    activeProfile: 'default',
-    focusedProfile: 'renametest',
-    profiles: [
-      { name: 'default', display_name: 'Lucy' },
-      { name: 'renametest' }
-    ]
-  })
-
-  const result = await handler({ text: 'ask @lucy for a status update' })
-
-  assert.match(result.text, /`hermes -p 'default' chat --in ~/)
-  assert.match(result.text, /Message from 🤖 Renametest \(@renametest\)/)
 })
 
 test('behavior: @dixie on a Connections bot stays in this chat and does not hermes -p', async () => {

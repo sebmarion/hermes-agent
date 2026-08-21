@@ -1,7 +1,5 @@
 import { atom } from 'nanostores'
 
-import { keyedTimeouts } from '@/lib/keyed-timeouts'
-
 import { $gateway } from './gateway'
 
 export type GoalStatus = 'active' | 'done' | 'paused' | 'waiting'
@@ -16,23 +14,38 @@ export interface SessionGoal {
 export const $goalsBySession = atom<Record<string, SessionGoal>>({})
 
 const DONE_LINGER_MS = 8_000
-const clearTimers = keyedTimeouts()
+const clearTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+function cancelScheduledClear(sid: string) {
+  const timer = clearTimers.get(sid)
+
+  if (timer !== undefined) {
+    clearTimeout(timer)
+    clearTimers.delete(sid)
+  }
+}
 
 export function setSessionGoal(sid: string, goal: SessionGoal) {
   if (!sid) {
     return
   }
 
-  clearTimers.cancel(sid)
+  cancelScheduledClear(sid)
   $goalsBySession.set({ ...$goalsBySession.get(), [sid]: goal })
 
   if (goal.status === 'done') {
-    clearTimers.schedule(sid, DONE_LINGER_MS, () => clearSessionGoal(sid))
+    clearTimers.set(
+      sid,
+      setTimeout(() => {
+        clearTimers.delete(sid)
+        clearSessionGoal(sid)
+      }, DONE_LINGER_MS)
+    )
   }
 }
 
 export function clearSessionGoal(sid: string) {
-  clearTimers.cancel(sid)
+  cancelScheduledClear(sid)
 
   const map = $goalsBySession.get()
 

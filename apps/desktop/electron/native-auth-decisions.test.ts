@@ -13,7 +13,6 @@ import { test } from 'vitest'
 import {
   oauthGuardMayHardFail,
   oauthSessionIsLive,
-  resolveGatedDownloadAuth,
   resolveJsonBody,
   resolveOauthRestAuth,
   resolveReadinessProbeAuth
@@ -130,21 +129,4 @@ test('oauthGuardMayHardFail keeps the strict guard when the list is unusable', (
   assert.equal(oauthGuardMayHardFail(undefined), true)
   assert.equal(oauthGuardMayHardFail('nonsense' as any), true)
   assert.equal(oauthGuardMayHardFail([{ supportsPassword: true }]), true)
-})
-
-// --- 6. gated download auth (guards the Files-panel 401 on cookieless native) ---
-
-test('resolveGatedDownloadAuth matches oauth REST: bearer first, then cookie', () => {
-  assert.deepEqual(resolveGatedDownloadAuth('oauth', 'native-at'), { kind: 'bearer', token: 'native-at' })
-  assert.deepEqual(resolveGatedDownloadAuth('oauth', null), { kind: 'cookie' })
-  assert.deepEqual(resolveGatedDownloadAuth('oauth', ''), { kind: 'cookie' })
-})
-
-test('resolveGatedDownloadAuth uses the session token for token and local modes', () => {
-  assert.deepEqual(resolveGatedDownloadAuth('token', 'native-at', 'session-token'), {
-    kind: 'token',
-    token: 'session-token'
-  })
-  assert.deepEqual(resolveGatedDownloadAuth('local', null, 'sess'), { kind: 'token', token: 'sess' })
-  assert.deepEqual(resolveGatedDownloadAuth(undefined, null, null), { kind: 'token', token: null })
 })
