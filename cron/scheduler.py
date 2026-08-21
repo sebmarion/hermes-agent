@@ -391,6 +391,49 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     return disabled
 
 
+def _resolve_cron_surface_mode(pconfig, logical_platform_name: str) -> str:
+    """Resolve the continuable-cron delivery surface for a platform config.
+
+    Returns ``"in_channel"`` or ``"thread"`` (default). Two config shapes:
+
+    - Native adapter: the flat key ``platforms.<p>.extra.cron_continuable_surface``
+      (shipped shape, unchanged).
+    - Relay-fronted: ``platforms.relay.extra.<logical>.cron_continuable_surface``
+      — the same per-logical-platform sub-block the relay's documented Slack
+      knobs use (``reply_in_thread``, ``dm_top_level_threads_as_sessions``;
+      see RelayAdapter._relay_slack_extra). The sub-block wins over a flat
+      key when both exist, matching _relay_slack_extra precedence, and is
+      scoped to its logical platform so a ``slack:`` block cannot leak onto
+      another fronted platform.
+
+    Precedence nuance vs _relay_slack_extra: that helper is all-or-nothing
+    (a sub-dict REPLACES the flat extra entirely), while this one falls back
+    to the flat key when the sub-block exists but omits the knob. The
+    difference is deliberate — the flat key is the legacy staging shape and
+    must keep working — but note a flat ``cron_continuable_surface`` then
+    applies to EVERY platform this relay fronts; only the per-platform D6
+    capability gate contains it. Scope the knob under the sub-block on
+    multi-platform relays.
+
+    Field gap (2026-08-18): the scheduler read only the flat key, so on the
+    relay lane — where pconfig is platforms.relay — operators had NO working
+    location for the knob and briefs always threaded.
+    """
+    try:
+        extra = getattr(pconfig, "extra", None) or {}
+        sub = extra.get(str(logical_platform_name or "").lower())
+        if isinstance(sub, dict) and sub.get("cron_continuable_surface") is not None:
+            raw = sub.get("cron_continuable_surface")
+        else:
+            raw = extra.get("cron_continuable_surface")
+        if raw is not None and str(raw).strip().lower() == "in_channel":
+            return "in_channel"
+    except Exception:
+        pass
+    return "thread"
+
+
+
 def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
     """Layer enabled MCP servers onto a per-job ``enabled_toolsets`` allowlist.
 
