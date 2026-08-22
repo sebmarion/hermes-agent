@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -119,17 +120,32 @@ def _verify_skill_for_promotion(skill_path: Path, session_id: str) -> dict:
     }
 
 
-def _request_live_activation(reason: str) -> str:
+def _request_live_activation(reason: str, evidence: dict, state_dir: Path) -> str:
     """Queue an external root-owned reload after a successful Git promotion."""
     if not ACTIVATION_REQUEST_SCRIPT.is_file():
         raise RuntimeError(f"activation request script missing: {ACTIVATION_REQUEST_SCRIPT}")
-    completed = subprocess.run(
-        [sys.executable, str(ACTIVATION_REQUEST_SCRIPT), "--reason", reason],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
+    state_dir.mkdir(parents=True, exist_ok=True)
+    fd, raw_path = tempfile.mkstemp(prefix="activation-evidence-", suffix=".json", dir=state_dir)
+    evidence_path = Path(raw_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(evidence, handle, sort_keys=True)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ACTIVATION_REQUEST_SCRIPT),
+                "--reason",
+                reason,
+                "--evidence-file",
+                str(evidence_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        evidence_path.unlink(missing_ok=True)
     if completed.returncode != 0 or not completed.stdout.strip():
         detail = (completed.stderr or completed.stdout).strip()
         raise RuntimeError(f"activation request failed: {detail[:800]}")
@@ -288,7 +304,14 @@ def main(argv) -> int:
                     )
                     report["promotion"] = promotion
                     request_path = _request_live_activation(
-                        f"autoresearch skill promotion {promotion['commit'][:12]}"
+                        f"autoresearch skill promotion {promotion['commit'][:12]}",
+                        {
+                            "kind": "skills-promotion",
+                            "status": promotion["verification"]["status"],
+                            "commit": promotion["commit"],
+                            "verification": promotion["verification"],
+                        },
+                        state_dir,
                     )
                     report["activation_request"] = request_path
                     report["steps"].append(

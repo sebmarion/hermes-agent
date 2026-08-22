@@ -190,9 +190,9 @@ def test_improve_loop_child_path_contains_ocr_and_hermes_tool_dirs() -> None:
     assert shutil.which("ocr", path=child_env["PATH"])
 
 
-def test_activation_verifier_skips_reload_for_already_activated_sha() -> None:
+def test_activation_verifier_delegates_to_dual_repo_coordinator() -> None:
     script = ACTIVATION_VERIFIER.read_text()
 
-    assert 'activated_sha="$(awk -F=' in script
-    assert 'activated_sha" == "$actual_sha' in script
-    assert "already activated; no Hermes reload required" in script
+    assert "exec /usr/local/libexec/hermes-deployment-coordinator.py" in script
+    assert "--activate --reason upstream-merge" in script
+    assert "systemctl reload hermes-gateway.service" not in script
