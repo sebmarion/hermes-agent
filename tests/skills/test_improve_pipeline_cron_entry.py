@@ -86,6 +86,7 @@ def test_cron_hands_harvested_failures_to_live_chain(tmp_path: Path, monkeypatch
         "promote",
         lambda **_kwargs: {"status": "pushed", "commit": "test", "remote_head": "test", "remote": "origin", "branch": "main"},
     )
+    monkeypatch.setattr(entry, "_request_live_activation", lambda _reason: "request.json")
     assert entry.main(["entry", "--db-path", str(db_path)]) == 0
     assert len(seen["failures"]) == 1
     assert seen["failures"][0]["before_session_ids"] == ["real-session-0002"]
@@ -124,6 +125,7 @@ def test_cron_caps_live_candidates_and_persists_remaining_queue(tmp_path: Path, 
         "promote",
         lambda **_kwargs: {"status": "pushed", "commit": "test", "remote_head": "test", "remote": "origin", "branch": "main"},
     )
+    monkeypatch.setattr(entry, "_request_live_activation", lambda _reason: "request.json")
     assert entry.main(["entry", "--db-path", str(db_path)]) == 0
     assert len(seen["failures"]) == 1
     pending = [json.loads(line) for line in (tmp_path / "pending_failures.jsonl").read_text().splitlines()]
@@ -168,6 +170,7 @@ def test_cron_promotes_accepted_skill_changes(tmp_path: Path, monkeypatch) -> No
         }
 
     monkeypatch.setattr(entry.promote_skill, "promote", fake_promote)
+    monkeypatch.setattr(entry, "_request_live_activation", lambda _reason: "request.json")
     assert entry.main(["entry", "--db-path", str(db_path)]) == 0
     assert seen["changed_paths"] == ["software-development/bestplan/SKILL.md"]
     report = json.loads(next(tmp_path.glob("report-*.json")).read_text())

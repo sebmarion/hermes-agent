@@ -44,6 +44,11 @@ MAX_CANDIDATES_PER_RUN = 3
 _DEFAULT_SKILL_LINK = Path.home() / ".hermes" / "skills" / "software-development" / "bestplan" / "SKILL.md"
 DEFAULT_SKILL_PATH = _DEFAULT_SKILL_LINK.resolve()
 DEFAULT_LIVE_SKILLS = DEFAULT_SKILL_PATH.parents[2]
+ACTIVATION_REQUEST_SCRIPT = (
+    Path(os.environ.get("HERMES_AUTO_RESEARCH_ROOT", "/home/seb/projects/hermes-auto-research"))
+    / "scripts"
+    / "request_hermes_activation.py"
+)
 
 
 def _load_pending(path: Path) -> list[dict]:
@@ -112,6 +117,23 @@ def _verify_skill_for_promotion(skill_path: Path, session_id: str) -> dict:
         "validator": "passed",
         "ocr": receipt,
     }
+
+
+def _request_live_activation(reason: str) -> str:
+    """Queue an external root-owned reload after a successful Git promotion."""
+    if not ACTIVATION_REQUEST_SCRIPT.is_file():
+        raise RuntimeError(f"activation request script missing: {ACTIVATION_REQUEST_SCRIPT}")
+    completed = subprocess.run(
+        [sys.executable, str(ACTIVATION_REQUEST_SCRIPT), "--reason", reason],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(f"activation request failed: {detail[:800]}")
+    return completed.stdout.strip().splitlines()[-1]
 
 
 def _restore_unpromoted_skill(repo: Path, target_rel: str) -> None:
@@ -265,10 +287,15 @@ def main(argv) -> int:
                         ),
                     )
                     report["promotion"] = promotion
+                    request_path = _request_live_activation(
+                        f"autoresearch skill promotion {promotion['commit'][:12]}"
+                    )
+                    report["activation_request"] = request_path
                     report["steps"].append(
                         f"promotion: pushed {promotion['commit'][:12]} to "
                         f"{promotion['remote']}/{promotion['branch']}"
                     )
+                    report["steps"].append(f"activation: queued {request_path}")
                     processed_ids.update(applied_ids)
                 except Exception as exc:  # noqa: BLE001 - promotion is fail-closed
                     report["notes"].append(f"skill promotion failed: {exc}")
