@@ -107,8 +107,10 @@ describe('scanDiskPlugins (#66899)', () => {
       dir === '/local/.hermes/plugins'
         ? { entries: [{ isDirectory: true, name: 'uni', path: '/local/.hermes/plugins/uni' }] }
         : dir === '/local/.hermes/plugins/uni/desktop'
-          ? { entries: [{ isDirectory: false, name: 'plugin.js', path: '/local/.hermes/plugins/uni/desktop/plugin.js' }] }
-        : { entries: [] }
+          ? {
+              entries: [{ isDirectory: false, name: 'plugin.js', path: '/local/.hermes/plugins/uni/desktop/plugin.js' }]
+            }
+          : { entries: [] }
     )
 
     const register = vi.fn()
