@@ -72,6 +72,12 @@ def _merge_failures(pending: list[dict], new: list[dict]) -> list[dict]:
     return merged
 
 
+def _bestplan_ocr_path(skill_path: Path) -> Path:
+    """Load OCR from the repository that owns the promoted skill."""
+    repo = promote_skill.repository_root(skill_path)
+    return repo / "plugins" / "hermes-bestplan" / "bestplan_ocr.py"
+
+
 def _verify_skill_for_promotion(skill_path: Path, session_id: str) -> dict:
     """Run the skill validator and the real OCR gate before Git promotion."""
     validator = skill_path.parent / "scripts" / "validate_bestplan.py"
@@ -92,7 +98,7 @@ def _verify_skill_for_promotion(skill_path: Path, session_id: str) -> dict:
             "stderr": completed.stderr[-1000:],
         }
 
-    plugin_path = Path(__file__).resolve().parents[5] / "plugins" / "hermes-bestplan" / "bestplan_ocr.py"
+    plugin_path = _bestplan_ocr_path(skill_path)
     spec = importlib.util.spec_from_file_location("hermes_bestplan_ocr_promotion", plugin_path)
     if spec is None or spec.loader is None:
         return {"status": "failed", "reason": f"OCR plugin could not load: {plugin_path}"}

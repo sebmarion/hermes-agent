@@ -238,3 +238,16 @@ def test_failed_promotion_restores_skill_and_keeps_task_queued(
         for line in (state_dir / "pending_failures.jsonl").read_text().splitlines()
     ]
     assert [row["task_id"] for row in pending] == [seen["task_id"]]
+
+
+def test_ocr_gate_path_follows_resolved_skills_repository(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "skills-repo"
+    skill = repo / "software-development" / "bestplan" / "SKILL.md"
+    ocr = repo / "plugins" / "hermes-bestplan" / "bestplan_ocr.py"
+    skill.parent.mkdir(parents=True)
+    ocr.parent.mkdir(parents=True)
+    skill.write_text("---\nname: bestplan\ndescription: test\n---\n")
+    ocr.write_text("# canonical skills-repo OCR\n")
+    monkeypatch.setattr(entry.promote_skill, "repository_root", lambda _path: repo)
+
+    assert entry._bestplan_ocr_path(skill) == ocr
