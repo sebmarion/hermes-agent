@@ -3405,10 +3405,13 @@ def _finalize_child_results(
     task_list: List[Dict[str, Any]],
     children: List[tuple[int, Dict[str, Any], Any]],
     parent_agent,
+    *,
+    apply_summary_budget: bool = True,
 ) -> None:
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
-        _apply_summary_budget(results, parent_agent)
+        if apply_summary_budget:
+            _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
 
         if parent_agent and getattr(parent_agent, "_memory_manager", None):
@@ -3493,6 +3496,8 @@ def _run_child_lifecycle(
     goal: str,
     child=None,
     parent_agent=None,
+    *,
+    apply_summary_budget: bool = True,
 ) -> Dict[str, Any]:
     """Run one child and apply the same host lifecycle used by delegate_task."""
     result = _run_single_child(task_index, goal, child, parent_agent)
@@ -3503,6 +3508,7 @@ def _run_child_lifecycle(
         [{"goal": ""} for _ in range(task_index)] + [task],
         [(task_index, task, child)],
         parent_agent,
+        apply_summary_budget=apply_summary_budget,
     )
     return result
 

@@ -414,7 +414,17 @@ class SubagentLifecycleService:
         try:
             from tools.delegate_tool import _run_child_lifecycle
 
-            raw = _run_child_lifecycle(0, goal, record.agent, parent)
+            # Lifecycle results are consumed by plugin code and already capped
+            # by ``_MAX_RESULT_CHARS`` below.  The delegate-task summary budget
+            # is for text inserted into a parent model turn; applying it here
+            # corrupts strict machine payloads before the plugin can parse them.
+            raw = _run_child_lifecycle(
+                0,
+                goal,
+                record.agent,
+                parent,
+                apply_summary_budget=False,
+            )
             status = (
                 str(raw.get("status", "error")) if isinstance(raw, dict) else "error"
             )

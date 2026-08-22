@@ -155,6 +155,38 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     assert parent.session_cost_status == "estimated"
 
 
+def test_public_lifecycle_preserves_machine_summary_above_delegate_budget(monkeypatch):
+    parent = SimpleNamespace(
+        session_id="parent-machine-result",
+        enabled_toolsets=["file"],
+    )
+    child = FakeChild("sa-machine-result")
+    machine_result = '{"schema":"machine","payload":"' + ("x" * 10_000) + '"}'
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda *_args, **_kwargs: {
+            "task_index": 0,
+            "status": "completed",
+            "summary": machine_result,
+            "api_calls": 1,
+            "duration_seconds": 0.25,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._load_config",
+        lambda: {"max_summary_chars": 100},
+    )
+
+    service = SubagentLifecycleService(lambda: parent)
+    handle = service.launch(SubagentLaunchRequest(goal="return machine payload"))
+    assert service.wait(handle, timeout_seconds=1).state is SubagentState.SUCCEEDED
+
+    result = service.result(handle)
+    assert result.summary == machine_result
+
+
 
 
 def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
