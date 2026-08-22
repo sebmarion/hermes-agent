@@ -2153,23 +2153,65 @@ def _mark_verification_stale(
         from agent.coding_context import project_facts_for
         from agent.verification_evidence import mark_workspace_edited
 
-        cwd = None
+        groups: dict[str, tuple[str, list[str]]] = {}
+        workspace_checked = False
+        workspace_path = None
+        workspace_facts = None
+
+        def resolve_workspace_fallback() -> None:
+            nonlocal workspace_checked, workspace_path, workspace_facts
+            if workspace_checked:
+                return
+            workspace_checked = True
+            try:
+                workspace = _authoritative_workspace_root(task_id)
+                if not workspace:
+                    return
+                workspace_path = Path(workspace).resolve(strict=False)
+                workspace_facts = project_facts_for(str(workspace_path))
+            except Exception:
+                workspace_path = None
+                workspace_facts = None
+
         for path in paths:
             try:
-                candidate = str(Path(path).parent)
+                resolved_path = Path(path).resolve(strict=False)
+                candidate = str(resolved_path.parent)
             except Exception:
                 continue
-            if project_facts_for(candidate):
-                cwd = candidate
-                break
-        if cwd is None:
-            cwd = _authoritative_workspace_root(task_id)
-        if cwd is None:
             try:
-                cwd = str(Path(paths[0]).parent)
+                facts = project_facts_for(candidate)
             except Exception:
-                cwd = None
-        mark_workspace_edited(session_id=session_id or task_id, cwd=cwd, paths=paths)
+                facts = None
+            marker_cwd = candidate
+            if not facts:
+                resolve_workspace_fallback()
+                if workspace_path is None or not workspace_facts:
+                    continue
+                try:
+                    resolved_path.relative_to(workspace_path)
+                except ValueError:
+                    continue
+                facts = workspace_facts
+                marker_cwd = str(workspace_path)
+            root = str(facts.get("root") or marker_cwd)
+            if root not in groups:
+                groups[root] = (marker_cwd, [])
+            groups[root][1].append(path)
+
+        for marker_cwd, grouped_paths in groups.values():
+            try:
+                mark_workspace_edited(
+                    session_id=session_id or task_id,
+                    cwd=marker_cwd,
+                    paths=grouped_paths,
+                )
+            except Exception:
+                logger.debug(
+                    "verification stale marker failed for workspace %s",
+                    marker_cwd,
+                    exc_info=True,
+                )
     except Exception:
         logger.debug("verification stale marker failed", exc_info=True)
 
