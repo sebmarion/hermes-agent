@@ -413,19 +413,25 @@ def main(argv: list[str] | None = None) -> int:
         ).returncode:
             raise MergeUpstreamError("candidate is not a descendant of current fork HEAD")
 
-        if args.test_argv:
-            proc = subprocess.run(args.test_argv, cwd=preview, text=True)
-            if proc.returncode:
-                raise MergeUpstreamError(
-                    f"candidate tests failed with exit {proc.returncode}"
+        if not report.get("noop"):
+            # Real delta: test/apply/publish inside the candidate preview.
+            # (No-op syncs skip all of it — the preview worktree was never
+            # created because there is nothing to build.)
+            if args.test_argv:
+                proc = subprocess.run(args.test_argv, cwd=preview, text=True)
+                if proc.returncode:
+                    raise MergeUpstreamError(
+                        f"candidate tests failed with exit {proc.returncode}"
+                    )
+            if args.apply:
+                apply_candidate(repo, candidate_sha, source_head)
+            published_sha = None
+            if args.publish:
+                published_sha = publish_and_verify(
+                    repo, args.remote, candidate_sha, expected_remote_sha
                 )
-        if args.apply:
-            apply_candidate(repo, candidate_sha, source_head)
-        published_sha = None
-        if args.publish:
-            published_sha = publish_and_verify(
-                repo, args.remote, candidate_sha, expected_remote_sha
-            )
+        else:
+            published_sha = None
         next_state = {
             "schema": STATE_SCHEMA,
             "upstream_ref": args.upstream,
