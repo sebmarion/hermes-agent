@@ -146,8 +146,11 @@ Safety contract:
   subsequent runs use `~/.hermes/labs/bestplan-research/state/upstream-sync.json`
   to detect newly edited edge files and preserve them.
 - Qwen, Git delta application, and pytest operate only inside the disposable
-  clone. An OOM/kill may leave a stale run directory, but cannot alter canonical
-  refs, index, or worktree; the next run prunes old disposable directories.
+  clone. Conflict recovery invokes Qwen with the no-file/no-terminal `safe`
+  toolset; Qwen returns a bounded patch and the parent applies it only inside
+  that clone. An OOM/kill may leave a stale run directory, but cannot alter
+  canonical refs, index, or worktree; the next run prunes old disposable
+  directories.
 - A dirty or moved canonical checkout halts. No stash, reset, force checkout,
   implicit conflict choice, or force push is permitted.
 - Publishing is a normal fast-forward push after exact remote-SHA and fork-URL

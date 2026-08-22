@@ -185,6 +185,8 @@ def test_conflict_triggers_resolver(tmp_path: Path) -> None:
     assert "-z" in argv
     assert "--provider" in argv
     assert "custom:zeus" in argv
+    assert "--toolsets" in argv
+    assert argv[argv.index("--toolsets") + 1] == "safe"
     assert "--in" in argv
     idx = argv.index("--in")
     assert str(worktree) == argv[idx + 1]
@@ -522,3 +524,22 @@ def test_recovery_receipt_does_not_overwrite_upstream_sync_state(tmp_path: Path)
     assert result["outcome"] == "ok"
     assert json.loads(sync_state.read_text())["upstream_sha"] == "a" * 40
     assert (sync_state.parent / "upstream-recovery.json").is_file()
+
+
+def test_safe_model_patch_applies_only_inside_candidate_worktree(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo, {"core.py": "base\n", "other.py": "other\n"})
+    worktree = tmp_path / "worktree"
+    _git(repo, "worktree", "add", "--detach", str(worktree), base)
+    (worktree / "core.py").write_text("resolved\n")
+    patch = _git(worktree, "diff")
+    _git(worktree, "restore", "--worktree", "--", "core.py")
+
+    try:
+        mur._apply_model_patch(repo, worktree, patch, base, ["core.py"])
+        mur._commit_candidate(worktree)
+        assert (worktree / "core.py").read_text() == "resolved\n"
+        assert (repo / "core.py").read_text() == "base\n"
+        assert _git(worktree, "status", "--porcelain") == ""
+    finally:
+        _git(repo, "worktree", "remove", "--force", str(worktree))

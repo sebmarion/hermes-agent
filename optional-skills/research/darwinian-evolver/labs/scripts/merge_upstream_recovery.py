@@ -43,6 +43,7 @@ HERMES_FIXED_ARGV = (
     "--model", "qwen3.8-27b",
     "--safe-mode", "--ignore-rules",
     "--accept-hooks",
+    "--toolsets", "safe",
 )
 
 #: Git conflict-marker line starts that a successful resolution must not
@@ -106,34 +107,28 @@ def _notify_failure(*, source_head: str, anchor: str, upstream: str,
 # ---------------------------------------------------------------------------
 
 def build_repair_prompt(*, anchor: str, upstream: str, source_head: str,
-                        conflict_paths: list[str]) -> str:
-    """Return the bounded repair prompt for the one-time delta."""
+                        conflict_paths: list[str], evidence: str = "") -> str:
+    """Return a bounded no-tool patch-generation prompt for the delta."""
     return (
-        "You are resolving a single upstream Git merge conflict for a fork of "
-        "Hermes Agent. Work in the current directory (an isolated Git "
-        "worktree pinned at the fork HEAD). Do not run any command outside "
-        "this directory. Do not push, pull, fetch, or touch any remote. Do "
-        "not edit files outside the listed conflict paths.\n\n"
-        f"Upstream delta to apply: {anchor} -> {upstream}\n"
+        "You are resolving a single upstream Git conflict. You have NO file, "
+        "terminal, process, or network tools. Return ONLY a unified git diff "
+        "that resolves the listed conflict paths; do not return prose or a "
+        "markdown fence. The parent process will apply and verify your patch "
+        "inside a disposable worktree.\n\n"
+        f"Upstream delta: {anchor} -> {upstream}\n"
         f"Source (fork) HEAD: {source_head}\n"
-        f"Conflicted paths:\n"
+        f"Conflict paths:\n"
         + "".join(f"  - {p}\n" for p in conflict_paths)
         + "\n"
         "Rules:\n"
-        "1. Apply exactly the anchor->upstream delta to the listed conflict "
-        "paths. Do not apply any other upstream change.\n"
-        "2. For each conflict path, inspect the anchor version, the local "
-        "version, and the upstream version before resolving.\n"
-        "3. Resolve only the conflict paths. Preserve local fork behavior "
-        "(local edits, owned runtime paths, edge paths) unless the upstream "
-        "delta explicitly supersedes them.\n"
-        "4. Never use union, take-ours, or take-theirs heuristics. Reason "
-        "about the content on a per-file basis.\n"
-        "5. Do not alter unrelated files. Do not add new files unless the "
-        "upstream delta adds them on a conflict path.\n"
-        "6. Commit the resolution with message "
-        "'chore(update): apply upstream delta (auto-resolved)'. Leave the "
-        "worktree clean (no uncommitted or untracked files).\n"
+        "1. Produce a patch from Source HEAD to the resolved candidate for "
+        "conflict paths only.\n"
+        "2. Use the supplied anchor/local/upstream evidence; reason per file.\n"
+        "3. Preserve local fork behavior and never use take-ours, take-theirs, "
+        "or union heuristics.\n"
+        "4. Do not change unrelated paths, execute commands, push, or fetch.\n"
+        "5. Output starts with `diff --git` and contains no explanation.\n\n"
+        "EVIDENCE:\n" + evidence[:80000]
     )
 
 
@@ -233,6 +228,111 @@ def _conflict_paths_from_detail(detail: str) -> list[str]:
             seen.add(p)
             out.append(p)
     return out
+
+
+def _show_excerpt(repo: Path, revision: str, path: str, limit: int = 5000) -> str:
+    proc = subprocess.run(
+        ["git", "show", f"{revision}:{path}"],
+        cwd=repo, text=True, capture_output=True,
+    )
+    if proc.returncode:
+        return "<absent>"
+    text = proc.stdout
+    if len(text) <= limit:
+        return text
+    half = limit // 2
+    return text[:half] + "\n...<excerpt truncated>...\n" + text[-half:]
+
+
+def _build_evidence(repo: Path, anchor: str, source_head: str,
+                    upstream: str, conflict_paths: list[str]) -> str:
+    chunks: list[str] = []
+    for path in conflict_paths:
+        chunks.append(
+            f"=== PATH: {path} ===\n"
+            f"--- ANCHOR {anchor}\n{_show_excerpt(repo, anchor, path)}\n"
+            f"--- LOCAL {source_head}\n{_show_excerpt(repo, source_head, path)}\n"
+            f"--- UPSTREAM {upstream}\n{_show_excerpt(repo, upstream, path)}\n"
+        )
+        if sum(len(chunk) for chunk in chunks) >= 80000:
+            break
+    return "\n".join(chunks)[:80000]
+
+
+def _prepare_conflicted_worktree(repo: Path, worktree: Path,
+                                 anchor: str, upstream: str,
+                                 conflict_paths: list[str]) -> str:
+    """Apply the full delta, then reset only conflicted paths to source HEAD."""
+    diff_output = _git(repo, "diff", "--binary", "--full-index", anchor, upstream, "--")
+    proc = subprocess.run(
+        ["git", "apply", "--3way", "--index", "-"],
+        cwd=worktree, input=diff_output, text=True, capture_output=True,
+    )
+    detail = (proc.stdout + "\n" + proc.stderr).strip()
+    if proc.returncode == 0:
+        return ""
+    for path in conflict_paths:
+        source_blob = subprocess.run(
+            ["git", "cat-file", "-e", f"HEAD:{path}"],
+            cwd=worktree, capture_output=True,
+        )
+        if source_blob.returncode == 0:
+            _git(worktree, "restore", "--source=HEAD", "--staged", "--worktree", "--", path)
+        else:
+            subprocess.run(["git", "rm", "-f", "--cached", "--", path], cwd=worktree,
+                           capture_output=True, check=False)
+            target = worktree / path
+            if target.exists():
+                target.unlink()
+    return detail
+
+
+def _extract_patch(output: str) -> str:
+    text = output.strip()
+    if "```" in text:
+        match = re.search(r"```(?:diff|patch)?\s*(diff --git[\\s\\S]*?)```", text)
+        if match:
+            text = match.group(1).strip()
+    marker = text.find("diff --git")
+    if marker >= 0:
+        text = text[marker:]
+    if not text.startswith("diff --git"):
+        raise RecoveryError("safe Qwen resolver returned no unified diff")
+    return text.rstrip("\n") + "\n"
+
+
+def _apply_model_patch(repo: Path, worktree: Path, output: str,
+                       source_head: str, conflict_paths: list[str]) -> None:
+    patch = _extract_patch(output)
+    before = set(_git(worktree, "diff", "--name-only", source_head).splitlines())
+    proc = subprocess.run(
+        ["git", "apply", "--3way", "--index", "-"],
+        cwd=worktree, input=patch, text=True, capture_output=True,
+    )
+    if proc.returncode:
+        raise RecoveryError(
+            "safe Qwen patch could not be applied: "
+            + ((proc.stderr or proc.stdout).strip()[-2000:])
+        )
+    after = set(_git(worktree, "diff", "--name-only", source_head).splitlines())
+    added = sorted(after - before)
+    unexpected = sorted(set(added) - set(conflict_paths))
+    if unexpected:
+        raise RecoveryError(
+            "safe Qwen patch changed paths outside conflicts: " + ", ".join(unexpected)
+        )
+
+
+def _commit_candidate(worktree: Path) -> None:
+    unmerged = _git(worktree, "diff", "--name-only", "--diff-filter=U", "--cached")
+    if unmerged.strip():
+        raise RecoveryError("safe Qwen resolution left unmerged index entries")
+    status = _git(worktree, "status", "--porcelain", "--untracked-files=all")
+    if status.strip():
+        lines = status.splitlines()
+        if any(line.startswith("??") or len(line) < 2 or line[1] != " " for line in lines):
+            raise RecoveryError("candidate worktree is not clean after safe Qwen patch")
+        _git(worktree, "commit", "-m", "chore(update): apply upstream delta (auto-resolved)")
 
 
 # ---------------------------------------------------------------------------
@@ -425,9 +525,21 @@ def recover_upstream_conflict(
 
     try:
         _worktree_add(repo, worktree)
+        apply_detail = (
+            _prepare_conflicted_worktree(repo, worktree, anchor, upstream, conflict_paths)
+            if anchor != upstream
+            else ""
+        )
+        applied_paths = _conflict_paths_from_detail(apply_detail)
+        if applied_paths:
+            conflict_paths = sorted(set(conflict_paths) | set(applied_paths))
+            receipt["conflict_paths"] = conflict_paths
+        evidence = _build_evidence(
+            repo, anchor, source_head, upstream, conflict_paths
+        )
         prompt = build_repair_prompt(
             anchor=anchor, upstream=upstream, source_head=source_head,
-            conflict_paths=conflict_paths,
+            conflict_paths=conflict_paths, evidence=evidence,
         )
         exit_code, output = _run_hermes(
             route, prompt, worktree, model_timeout
@@ -436,6 +548,11 @@ def recover_upstream_conflict(
             raise RecoveryError(
                 f"model exited {exit_code}: {output[-1000:]}"
             )
+        if apply_detail or "diff --git" in output:
+            _apply_model_patch(
+                repo, worktree, output, source_head, conflict_paths
+            )
+        _commit_candidate(worktree)
         verified = _verify_candidate(
             repo=repo, worktree=worktree, source_head=source_head,
             anchor=anchor, upstream=upstream, remote_name=remote_name,
