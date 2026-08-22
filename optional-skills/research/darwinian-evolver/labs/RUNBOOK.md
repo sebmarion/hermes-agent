@@ -151,8 +151,11 @@ Safety contract:
   that clone. An OOM/kill may leave a stale run directory, but cannot alter
   canonical refs, index, or worktree; the next run prunes old disposable
   directories.
-- A dirty or moved canonical checkout halts. No stash, reset, force checkout,
-  implicit conflict choice, or force push is permitted.
+- A dirty or moved canonical checkout halts. The one explicit exception is the
+  deployment-only untracked `plugins/hermes-bestplan/` subtree, which is
+  runtime-installed and not part of the fork Git history. No other untracked
+  path, stash, reset, force checkout, implicit conflict choice, or force push is
+  permitted.
 - Publishing is a normal fast-forward push after exact remote-SHA and fork-URL
   verification. Canonical promotion is `git merge --ff-only` after rechecking
   its pinned HEAD and cleanliness.

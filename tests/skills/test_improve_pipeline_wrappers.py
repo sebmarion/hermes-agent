@@ -78,6 +78,19 @@ def test_build_command_targets_supplied_isolated_repo(tmp_path: Path) -> None:
     assert str(isolated / "optional-skills/research/darwinian-evolver/labs/scripts/merge_upstream.py") in command
 
 
+def test_canonical_clean_guard_ignores_only_deployment_plugin_untracked_files(tmp_path: Path) -> None:
+    wrapper = _load_wrapper()
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    deployment_file = repo / "plugins/hermes-bestplan/plugin.yaml"
+    deployment_file.parent.mkdir(parents=True)
+    deployment_file.write_text("deployment-only\n")
+    assert wrapper._is_clean(repo)
+
+    (repo / "unexpected.txt").write_text("unexpected\n")
+    assert not wrapper._is_clean(repo)
+
+
 def test_isolated_clone_has_independent_refs_and_leaves_source_unchanged(tmp_path: Path) -> None:
     wrapper = _load_wrapper()
     source = tmp_path / "source"

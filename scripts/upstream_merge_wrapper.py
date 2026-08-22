@@ -32,6 +32,7 @@ LOCK = STATE / "upstream-merge.lock"
 RUN_ROOT = STATE / "updater-runs"
 UPSTREAM_URL = "https://github.com/NousResearch/hermes-agent.git"
 FORK_URL = "git@github.com:sebmarion/hermes-agent.git"
+DEPLOYMENT_ONLY_UNTRACKED_PREFIX = "plugins/hermes-bestplan/"
 RELEVANT_TEST_PATHS = (
     "tests/skills",
     "tests/gateway/test_scale_to_zero_watcher.py",
@@ -58,7 +59,14 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
 
 
 def _is_clean(repo: Path) -> bool:
-    return not _git(repo, "status", "--porcelain", "--untracked-files=all").strip()
+    status = _git(repo, "status", "--porcelain", "--untracked-files=all")
+    for line in status.splitlines():
+        if not line:
+            continue
+        if line.startswith("?? ") and line[3:].startswith(DEPLOYMENT_ONLY_UNTRACKED_PREFIX):
+            continue
+        return False
+    return True
 
 
 def _remote_main_sha(repo: Path) -> str:
