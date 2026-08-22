@@ -23,6 +23,11 @@ import score_hermes_skill_run as score
 
 _ALLOWED_VERDICTS = {"better", "equal", "worse"}
 _CREDENTIALS = tuple(pattern for pattern, _label in pzc.CRED_PATTERNS)
+_PATCH_SYNTAX = re.compile(
+    r"(?im)^(?:[ \t]*(?:`{3,}|~{3,})[ \t]*(?:diff|patch)\b.*$|"
+    r"[ \t]*diff --git\s+|[ \t]*---\s+\S|[ \t]*\+\+\+\s+\S|"
+    r"[ \t]*@@\s+.*?@@\s*)"
+)
 
 
 def materialize_candidate(baseline: str, proposal: str) -> str:
@@ -84,6 +89,8 @@ def validate_candidate(candidate: str, expected_name: str = "bestplan") -> list[
     fm = re.search(r"(?ms)^---\n.*?\n---\n", candidate)
     if fm:
         body = candidate[fm.end():]
+    if _PATCH_SYNTAX.search(body):
+        errors.append("candidate contains patch syntax")
     headings = re.findall(r"(?m)^##\s+(.+)$", body)
     seen: set[str] = set()
     for h in headings:

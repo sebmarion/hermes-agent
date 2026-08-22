@@ -103,6 +103,39 @@ def test_materialize_candidate_rejects_nested_diff_payload() -> None:
         lp.materialize_candidate(baseline, proposal)
 
 
+def test_validate_candidate_rejects_patch_syntax_in_final_aggregate() -> None:
+    candidate = """---
+name: bestplan
+---
+# BestPlan
+
+```diff
+--- a/software-development/bestplan/SKILL.md
++++ b/software-development/bestplan/SKILL.md
+@@ -1 +1,2 @@
++## Injected Patch
+```
+"""
+
+    assert "candidate contains patch syntax" in lp.validate_candidate(candidate)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "--- SKILL.md\n+++ SKILL.md",
+        "~~~DIFF generated patch\nordinary text\n~~~",
+        "   ```PATCH optional-info\nordinary text\n```",
+        "    ````dIfF generated patch\nordinary text\n````",
+        "\t~~~~PaTcH generated patch\nordinary text\n~~~~",
+    ],
+)
+def test_validate_candidate_rejects_patch_syntax_variants(payload: str) -> None:
+    candidate = f"---\nname: bestplan\n---\n# BestPlan\n\n{payload}\n"
+
+    assert "candidate contains patch syntax" in lp.validate_candidate(candidate)
+
+
 def test_materialize_candidate_strips_trailing_whitespace_from_addition() -> None:
     baseline = "---\nname: bestplan\n---\n# BestPlan\n"
     candidate = lp.materialize_candidate(baseline, "## Clean Section   \nbody   ")
