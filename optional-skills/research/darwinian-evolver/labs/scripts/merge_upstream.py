@@ -431,7 +431,15 @@ def main(argv: list[str] | None = None) -> int:
                     repo, args.remote, candidate_sha, expected_remote_sha
                 )
         else:
-            published_sha = None
+            # No-op: nothing new upstream. The receipt SHA is the unchanged
+            # HEAD itself, but only when it truly is what the fork remote
+            # serves — otherwise we'd be certifying an unpublished state.
+            if candidate_sha != expected_remote_sha:
+                raise MergeUpstreamError(
+                    "no-op sync but fork remote differs from local HEAD: "
+                    f"{expected_remote_sha[:12]} != {candidate_sha[:12]}"
+                )
+            published_sha = candidate_sha
         next_state = {
             "schema": STATE_SCHEMA,
             "upstream_ref": args.upstream,
