@@ -111,17 +111,15 @@ def test_delta_halts_on_overlapping_change(tmp_path: Path) -> None:
 
 
 def test_delta_preserves_owned_paths_byte_identical(tmp_path: Path) -> None:
-    """Contract 3: explicit owned runtime/plugin paths remain byte-identical."""
+    """Contract 3: explicit owned runtime paths remain byte-identical."""
     repo = tmp_path / "repo"
     base = _init_repo(repo, {
-        "plugins/hermes-bestplan/bestplan_ocr.py": "original-ocr\n",
         "scripts/improve_loop_wrapper.py": "original-wrapper\n",
         "core.py": "core\n",
     })
 
     # Upstream changes core.py and owned paths
     (repo / "core.py").write_text("core-upstream\n")
-    (repo / "plugins/hermes-bestplan/bestplan_ocr.py").write_text("upstream-ocr\n")
     (repo / "scripts/improve_loop_wrapper.py").write_text("upstream-wrapper\n")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "upstream")
@@ -135,7 +133,6 @@ def test_delta_preserves_owned_paths_byte_identical(tmp_path: Path) -> None:
     mu.build_delta_candidate(repo, base, upstream_sha, local_sha, state_path, preview)
 
     # Owned paths should be byte-identical to local (base) versions
-    assert (preview / "plugins/hermes-bestplan/bestplan_ocr.py").read_text() == "original-ocr\n"
     assert (preview / "scripts/improve_loop_wrapper.py").read_text() == "original-wrapper\n"
     # Core should be upstream
     assert (preview / "core.py").read_text() == "core-upstream\n"

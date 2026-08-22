@@ -32,11 +32,12 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 EDGE_PREFIXES = ("optional-skills/", "tests/skills/")
-PRESERVED_PREFIXES = ("plugins/hermes-bestplan/",)
+# BestPlan plugin moved out of core (canonical copy: sebmarion/hermes-skills);
+# no longer snapshotted or required here.
+PRESERVED_PREFIXES = ()
 OWNED_PATHS = ("cron/scheduler.py", "tests/cron/test_cron_script.py")
 OWNED_PATHS += ("scripts/improve_loop_wrapper.py",)
 REQUIRED_RUNTIME_PATHS = (
-    "plugins/hermes-bestplan/bestplan_ocr.py",
     "scripts/improve_loop_wrapper.py",
 )
 SNAPSHOT_PATHS = (*EDGE_PREFIXES, *PRESERVED_PREFIXES, *OWNED_PATHS)
@@ -480,6 +481,20 @@ def build_delta_candidate(
     anchor_sha = _run(repo, "rev-parse", f"{anchor}^{{commit}}").strip()
     upstream_sha = _run(repo, "rev-parse", f"{upstream_ref}^{{commit}}").strip()
     local_sha = _run(repo, "rev-parse", f"{local_ref}^{{commit}}").strip()
+
+    # No-op sync: already at the pinned upstream tip. Report without building
+    # a candidate (git apply --3way rejects an empty patch stream).
+    if anchor_sha == upstream_sha:
+        state = _load_state(state_path)
+        return {
+            "candidate_sha": local_sha,
+            "anchor_sha": anchor_sha,
+            "upstream_sha": upstream_sha,
+            "owned_paths": sorted(
+                str(p) for p in (state or {}).get("owned_paths", [])
+            ),
+            "noop": True,
+        }
 
     # Validate anchor is an ancestor of upstream (the delta must be forward)
     proc = subprocess.run(
