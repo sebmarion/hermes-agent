@@ -51,6 +51,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
+    _DETACHED_DELEGATE_ROOT_SQL,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
@@ -8741,6 +8742,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             #      marker existed.
             where_clauses.append(_LISTABLE_CHILD_SQL)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+            where_clauses.append(_DETACHED_DELEGATE_ROOT_SQL)
 
         include_sources = [source] if source else list(sources or [])
         if include_sources:

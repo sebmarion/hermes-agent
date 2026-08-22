@@ -2303,6 +2303,60 @@ class TestListSessionsRich:
         assert "delegate" not in ids, "Delegate sub-agent should not appear in default list"
         assert "root" in ids
 
+    def test_parentless_desktop_delegate_prompt_is_hidden(self, db):
+        """Detached delegated workers must not leak into the global picker."""
+        worker_prompts = [
+            "You are resolving a single upstream Git conflict. Return only a patch.",
+            "You are an independent code reviewer. Review this diff.",
+            "You are an independent, non-Zeus blind reviewer. Compare these arms.",
+        ]
+        worker_ids = []
+        for index, prompt in enumerate(worker_prompts):
+            worker_id = f"worker-{index}"
+            worker_ids.append(worker_id)
+            db.create_session(
+                worker_id,
+                "desktop",
+                model_config={"max_iterations": 90, "reasoning_config": None},
+            )
+            db.append_message(worker_id, "user", prompt)
+            db.set_session_title(worker_id, prompt[:60])
+            db.set_session_title_source(worker_id, "derived")
+
+        human_prompts = {
+            "human": "You are helping me understand this merge.",
+            "lowercase": "you are resolving a single upstream Git conflict.",
+            "indented": "  You are an independent code reviewer.",
+        }
+        for human_id, prompt in human_prompts.items():
+            db.create_session(
+                human_id,
+                "desktop",
+                model_config={"max_iterations": 90, "reasoning_config": None},
+            )
+            db.append_message(human_id, "user", prompt)
+            db.set_session_title(human_id, prompt[:60])
+            db.set_session_title_source(human_id, "derived")
+        db.append_message(
+            "human",
+            "user",
+            "You are resolving a single upstream Git conflict. This is quoted text.",
+        )
+
+        ids = [s["id"] for s in db.list_sessions_rich(min_message_count=1)]
+        assert not set(worker_ids) & set(ids)
+        assert set(human_prompts) <= set(ids)
+
+        all_ids = [
+            s["id"]
+            for s in db.list_sessions_rich(
+                min_message_count=1,
+                include_children=True,
+            )
+        ]
+        assert set(worker_ids) <= set(all_ids)
+        assert set(human_prompts) <= set(all_ids)
+
 
 
 class TestCompressionChainProjection:

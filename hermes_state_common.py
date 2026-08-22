@@ -153,6 +153,43 @@ _LISTABLE_CHILD_SQL = (
 )
 
 
+# A detached delegated worker can arrive without ``parent_session_id`` when a
+# separate Hermes process is launched by the desktop orchestration layer. Such
+# workers inherit ``source=desktop`` and otherwise look like ordinary roots.
+# Keep this compatibility heuristic narrow: only a derived-title desktop root
+# with the exact opening contract of a known detached worker is hidden.  A
+# generic ``You are ...`` match would also hide legitimate human chats whose
+# first prompt happens to use that phrasing.
+_DETACHED_DELEGATE_ROOT_SQL = (
+    "NOT ("
+    "COALESCE(s.source, '') = 'desktop' "
+    "AND s.parent_session_id IS NULL "
+    "AND COALESCE(s.title_source, '') = 'derived' "
+    "AND json_extract(COALESCE(s.model_config, '{}'), '$.model') IS NULL "
+    "AND json_extract(COALESCE(s.model_config, '{}'), '$.provider') IS NULL "
+    "AND EXISTS ("
+    "SELECT 1 FROM messages dm "
+    "WHERE dm.session_id = s.id AND dm.role = 'user' "
+    "AND dm.id = ("
+    "SELECT MIN(first_dm.id) FROM messages first_dm "
+    "WHERE first_dm.session_id = s.id AND first_dm.role = 'user'"
+    ") "
+    "AND ("
+    "substr(COALESCE(dm.content, ''), 1, "
+    "length('You are resolving a single upstream Git conflict.')) = "
+    "'You are resolving a single upstream Git conflict.' COLLATE BINARY "
+    "OR substr(COALESCE(dm.content, ''), 1, "
+    "length('You are an independent code reviewer.')) = "
+    "'You are an independent code reviewer.' COLLATE BINARY "
+    "OR substr(COALESCE(dm.content, ''), 1, "
+    "length('You are an independent, non-Zeus blind reviewer.')) = "
+    "'You are an independent, non-Zeus blind reviewer.' COLLATE BINARY"
+    ")"
+    ")"
+    ")"
+)
+
+
 def _ephemeral_child_sql(alias: str = "s") -> str:
     """Subagent runs, not branch, reset, or compression children."""
     branch = _BRANCH_CHILD_SQL.format(a=alias)
