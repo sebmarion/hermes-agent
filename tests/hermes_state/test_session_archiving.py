@@ -1,4 +1,6 @@
+import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -159,3 +161,69 @@ def test_creation_time_marker_covers_children_of_already_ended_parent(db):
     db.reopen_session("root")
     assert db.set_session_archived("late", True) is True
     assert db.get_session("root")["archived"] == 1
+
+
+def _stamp_compression_marker(db: SessionDB, parent: str, child: str):
+    """Drive the real rotation path so ``$._compression_from`` lands on *child*."""
+    db.create_session(parent, source="cli")
+    db.publish_compression_child(
+        parent_session_id=parent,
+        child_session_id=child,
+        source="cli",
+        messages=[{"role": "user", "content": "hello"}],
+        require_compression_lease=False,
+    )
+
+
+class TestReservedModelConfigKeysSurviveMetaOverwrite:
+    """Review of #92533 point 1: update_session_meta wholesale replacement must
+    preserve ``_``-prefixed lineage markers."""
+
+    def test_compression_marker_survives_acp_style_meta_overwrite(self, db):
+        _stamp_compression_marker(db, "root", "tip")
+
+        # acp_adapter/session.py replaces model_config wholesale on every persist.
+        db.update_session_meta("tip", '{"cwd": "/y", "provider": "openrouter"}')
+
+        stored = json.loads(db.get_session("tip")["model_config"])
+        assert stored["cwd"] == "/y"
+        assert stored["_compression_from"] == "root"
+
+    def test_reset_from_marker_also_survives(self, db):
+        db.create_session("s1", source="cli", model_config={"cwd": "/a"})
+        db._conn.execute(
+            "UPDATE sessions SET model_config = ? WHERE id = 's1'",
+            (json.dumps({"cwd": "/a", "_reset_from": "old-root"}),),
+        )
+        db._conn.commit()
+
+        db.update_session_meta("s1", '{"cwd": "/c"}')
+
+        stored = json.loads(db.get_session("s1")["model_config"])
+        assert stored["_reset_from"] == "old-root"
+        assert stored["cwd"] == "/c"
+
+
+class TestSharedMarkerEdgeConstants:
+    """Review of #92533 point 2: walker SQL interpolates shared constants."""
+
+    def test_no_pasted_marker_arms_in_hermes_state(self):
+        src = (
+            Path(__file__).resolve().parents[2] / "hermes_state.py"
+        ).read_text(encoding="utf-8")
+        assert (
+            "OR json_extract(COALESCE(child.model_config" not in src
+        ), "pasted OR-arm still present in walker SQL"
+
+    def test_marker_edge_constants_render_valid_sql(self):
+        from hermes_state_common import (
+            _COMPRESSION_MARKER_CHILD_EDGE_SQL,
+            _COMPRESSION_MARKER_PARENT_EDGE_SQL,
+        )
+
+        parent_edge = _COMPRESSION_MARKER_PARENT_EDGE_SQL.format(a="child")
+        child_edge = _COMPRESSION_MARKER_CHILD_EDGE_SQL.format(a="parent")
+        assert "child.parent_session_id" in parent_edge
+        assert "'$._compression_from'" in parent_edge
+        assert "parent.id" in child_edge
+        assert "'$._compression_from'" in child_edge
