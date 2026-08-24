@@ -105,6 +105,78 @@ def test_cancel_uses_explicit_hard_interrupt(lifecycle):
 
 
 
+def test_public_lifecycle_forwards_lane_provider_and_api_mode(monkeypatch):
+    """A lane pinning provider+api_mode must reach the child builder, not
+    fall through to the parent session's provider (404 'model not found')."""
+    parent = SimpleNamespace(session_id="parent-lanes")
+    captured = {}
+
+    def build(**kwargs):
+        captured.update(kwargs)
+        return FakeChild("sa-lane-provider")
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolve_delegation_credentials",
+        lambda _cfg, _parent: {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "api_mode": "responses",
+            "base_url": "https://example.invalid/v1",
+            "api_key": None,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda *_args, **_kwargs: {
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.0,
+        },
+    )
+
+    service = SubagentLifecycleService(lambda: parent)
+    request = SubagentLaunchRequest(
+        goal="lane pinned provider",
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        api_mode="responses",
+    )
+    service.launch(request)
+    assert captured["override_provider"] == "openai-codex"
+    assert captured["model"] == "gpt-5.6-sol"
+    assert captured["override_api_mode"] == "responses"
+    assert captured["override_api_key"] is None
+
+
+def test_public_lifecycle_ignores_blank_provider_pin(monkeypatch):
+    """Blank/None provider/model pins mean 'inherit parent'; pass no override."""
+    parent = SimpleNamespace(session_id="parent-inherit")
+    captured = {}
+
+    def build(**kwargs):
+        captured.update(kwargs)
+        return FakeChild("sa-inherit")
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda *_args, **_kwargs: {
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.0,
+        },
+    )
+
+    service = SubagentLifecycleService(lambda: parent)
+    service.launch(SubagentLaunchRequest(goal="inherit provider"))
+    assert captured.get("override_provider") is None
+    assert captured.get("override_model") is None
+    assert captured.get("override_api_mode") is None
+
+
 def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     memory = Mock()
     parent = SimpleNamespace(

@@ -53,6 +53,8 @@ class SubagentLaunchRequest:
     context: Optional[str] = None
     role: str = "leaf"
     model: Optional[str] = None
+    provider: Optional[str] = None
+    api_mode: Optional[str] = None
     allowed_toolsets: Optional[tuple[str, ...]] = None
     blocked_tools: tuple[str, ...] = ()
     working_directory: Optional[str] = None
@@ -202,6 +204,23 @@ class SubagentLifecycleService:
                 "No active Hermes parent session is available."
             )
         self._validate_request(request, parent)
+        # A lane may pin an explicit provider (BestPlan multi-lane quorum:
+        # each lane keeps its own credentials even when the parent session
+        # runs on a different provider).  Blank pins inherit the parent.
+        provider = (request.provider or "").strip() or None
+        api_mode = (request.api_mode or "").strip() or None
+        model = request.model
+        base_url = None
+        api_key = None
+        if provider:
+            creds = self._resolve_lane_credentials(
+                provider, model=model, api_mode=api_mode, parent=parent
+            )
+            provider = creds.get("provider") or provider
+            model = creds.get("model") or model
+            api_mode = creds.get("api_mode") or api_mode
+            base_url = creds.get("base_url")
+            api_key = creds.get("api_key")
         parent_session_id = str(getattr(parent, "session_id", "") or "") or None
         if request.parent_session_id and request.parent_session_id != parent_session_id:
             raise SubagentLifecycleError(
@@ -229,7 +248,11 @@ class SubagentLifecycleService:
             toolsets=list(request.allowed_toolsets)
             if request.allowed_toolsets
             else None,
-            model=request.model,
+            model=model,
+            override_provider=provider,
+            override_api_mode=api_mode,
+            override_base_url=base_url,
+            override_api_key=api_key,
             max_iterations=DEFAULT_MAX_ITERATIONS,
             task_count=1,
             parent_agent=parent,
@@ -258,6 +281,29 @@ class SubagentLifecycleService:
                 _REGISTRY.correlations[correlation_key] = subagent_id
         record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
         return handle
+
+    @staticmethod
+    def _resolve_lane_credentials(
+        provider: str,
+        *,
+        model: Optional[str],
+        api_mode: Optional[str],
+        parent: Any,
+    ) -> dict[str, Any]:
+        """Resolve a pinned lane through Hermes' existing provider resolver.
+
+        The lifecycle API never accepts or exposes credentials itself.  It
+        delegates resolution to the same host-owned path used by
+        ``delegate_task`` and forwards only the resulting runtime fields to
+        child construction.  This keeps provider selection explicit without
+        duplicating credential/config logic in the public API.
+        """
+        from tools.delegate_tool import _resolve_delegation_credentials
+
+        return _resolve_delegation_credentials(
+            {"provider": provider, "model": model, "api_mode": api_mode},
+            parent,
+        )
 
     def status(self, handle: SubagentHandle) -> SubagentStatus:
         record = self._record(handle)
