@@ -16,6 +16,26 @@ import improve_cron_entry as entry  # noqa: E402
 from hermes_state import SessionDB
 
 
+def test_merge_failures_deduplicates_exact_failure_class_but_preserves_distinct_titles() -> None:
+    first = {"task_id": "a", "failure_signature": "error", "task_title": "Timeout", "task_instructions": "gateway failed"}
+    duplicate = {"task_id": "b", "failure_signature": "error", "task_title": "Timeout", "task_instructions": "gateway failed"}
+    distinct = {"task_id": "c", "failure_signature": "error", "task_title": "Parser", "task_instructions": "invalid JSON"}
+
+    merged = entry._merge_failures([first, duplicate], [distinct])
+
+    assert [row["task_id"] for row in merged] == ["a", "c"]
+
+
+def test_merge_failures_does_not_collapse_distinct_long_instructions() -> None:
+    prefix = "same " * 250
+    first = {"task_id": "a", "failure_signature": "error", "task_title": "Same", "task_instructions": prefix + " first"}
+    second = {"task_id": "b", "failure_signature": "error", "task_title": "Same", "task_instructions": prefix + " second"}
+
+    merged = entry._merge_failures([], [first, second])
+
+    assert [row["task_id"] for row in merged] == ["a", "b"]
+
+
 def test_bookmark_failure_is_skipped_without_failing_cron(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(entry, "DEFAULT_STATE_DIR", tmp_path)
 
@@ -47,6 +67,7 @@ def test_cron_harvests_real_session_rows_before_halting_live_chain(
     db.end_session("real-session-0001", "done")
     db.close()
 
+    monkeypatch.setattr(entry, "run_live_chain", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("live chain unavailable")))
     assert entry.main(["entry", "--db-path", str(db_path)]) != 0
     reports = list(tmp_path.glob("report-*.json"))
     assert len(reports) == 1

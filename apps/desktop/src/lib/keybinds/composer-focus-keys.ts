@@ -60,11 +60,10 @@ export function isActivateOnEnterTarget(target: EventTarget | null): boolean {
  *
  * The card owns Enter plus the shortcuts it actually renders — `1..N+1` and
  * `A..` for its N choices and the trailing "Other" row. It does NOT own the
- * rest of the alphabet: typing a real message instead of picking an option is a
- * legitimate answer ("none of these"), and blanket-blocking every printable
- * left the user unable to start that message at all — the first letter vanished
- * and the composer never focused. Out-of-range keys fall through to the
- * composer, which skips the question on send.
+ * rest of the alphabet: typing a real message is allowed and gets queued
+ * while the question remains pending. It is not an implicit answer, and
+ * blanket-blocking every printable key would still make composing that message
+ * awkward. Out-of-range keys fall through to the composer.
  *
  * The choice count rides in the attribute's value, so this stays a DOM read
  * with no store coupling.

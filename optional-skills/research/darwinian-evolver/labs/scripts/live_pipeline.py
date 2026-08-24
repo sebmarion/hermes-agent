@@ -30,6 +30,14 @@ _PATCH_SYNTAX = re.compile(
 )
 
 
+def _canonical_heading(value: str) -> str:
+    return re.sub(r"\s+#+\s*$", "", value.strip()).casefold()
+
+
+def _display_heading(value: str) -> str:
+    return re.sub(r"\s+#+\s*$", "", value.strip())
+
+
 def materialize_candidate(baseline: str, proposal: str) -> str:
     """Turn a proposer addition into a complete, append-only skill file."""
     if not isinstance(baseline, str) or not baseline.strip():
@@ -62,7 +70,22 @@ def materialize_candidate(baseline: str, proposal: str) -> str:
         for line in nested_lines
     ):
         raise ValueError("proposal contains a nested diff instead of Markdown content")
-    addition = "\n".join(line.rstrip() for line in nested_lines).strip()
+    baseline_headings = {
+        _canonical_heading(heading)
+        for heading in re.findall(r"(?m)^##\s+(.+?)\s*$", baseline)
+    }
+    normalized_lines = []
+    for line in nested_lines:
+        match = re.match(r"^##\s+(.+?)\s*$", line)
+        heading_text = (
+            re.sub(r"\s+#+\s*$", "", match.group(1).strip())
+            if match
+            else ""
+        )
+        if match and _canonical_heading(heading_text) in baseline_headings:
+            line = f"### {heading_text}"
+        normalized_lines.append(line.rstrip())
+    addition = "\n".join(normalized_lines).strip()
     if any(pattern.search(addition) for pattern in _CREDENTIALS):
         raise ValueError("proposal contains a credential-shaped value")
     return baseline.rstrip() + "\n\n" + addition + "\n"
@@ -94,7 +117,7 @@ def validate_candidate(candidate: str, expected_name: str = "bestplan") -> list[
     headings = re.findall(r"(?m)^##\s+(.+)$", body)
     seen: set[str] = set()
     for h in headings:
-        key = h.strip().lower()
+        key = _canonical_heading(h)
         if key in seen:
             errors.append(f"duplicate heading: {h.strip()}")
             break
@@ -300,18 +323,24 @@ def run_live_chain(
                 blocked.append(task_id)
                 notes.append(f"{task_id}: {verdict['reason']}")
                 continue
-            # Accepted: fold the proposal onto the run-local aggregate
-            # baseline (each accepted proposal text at most once), then
-            # deterministically re-validate the aggregate. The aggregate is
-            # the union of every accepted addition appended to the live
-            # baseline, so two individually plausible proposals that create
-            # a duplicate level-2 heading are caught here, before any live
-            # skill byte is touched.
-            if proposal not in accepted:
-                aggregate_text = baseline.rstrip() + "\n\n" + "\n\n".join(accepted) + "\n\n" + proposal.strip() + "\n"
-                accepted.append(proposal)
-            else:
-                aggregate_text = baseline.rstrip() + "\n\n" + "\n\n".join(accepted) + "\n"
+            # Accepted: fold the normalized candidate onto the run-local
+            # aggregate baseline. `candidate` is used instead of the raw
+            # proposal so materialization's structural normalization (such as
+            # demoting a repeated baseline heading) is what gets validated and
+            # staged.
+            baseline_prefix = baseline.rstrip()
+            if not candidate.startswith(baseline_prefix):
+                raise ValueError("materialized candidate does not preserve baseline")
+            candidate_addition = candidate[len(baseline_prefix):].strip()
+            if candidate_addition in accepted:
+                continue
+            trial_aggregate = baseline_prefix + "\n\n" + "\n\n".join(accepted + [candidate_addition]) + "\n"
+            if len(trial_aggregate) > 30_000:
+                blocked.append(task_id)
+                notes.append(f"{task_id}: aggregate exceeds 30,000-character core budget")
+                continue
+            accepted.append(candidate_addition)
+            aggregate_text = trial_aggregate
             staged.append({"task_id": task_id, "candidate": candidate})
             aggregate_errors = validate_candidate(aggregate_text, expected_name="bestplan")
             (aggregate_dir / "SKILL.md.candidate").write_text(aggregate_text)

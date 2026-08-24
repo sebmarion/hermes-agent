@@ -54,12 +54,25 @@ def _scrub(text: str) -> str:
 
 PROPOSER_TEMPLATE = (
     "You are a careful editor improving an operator-owned Hermes skill.\n"
-    "Fix the concrete failure below. Produce ONLY a self-contained diff-style\n"
-    "addition to {skill_path}. Stay within that single skill's scope. Do NOT add\n"
-    "new apps, providers, daemons, or external services. Prefer exact,\n"
-    "runnable checks over generic advice. Never include secrets.\n\n"
+    "Fix the concrete failure below. Produce ONLY raw Markdown content as a\n"
+    "self-contained addition to {skill_path}; do not return patch syntax or a\n"
+    "diff. Stay within that single skill's scope. Do NOT add new apps,\n"
+    "providers, daemons, or external services. Prefer exact, runnable checks\n"
+    "over generic advice. Never include secrets.\n\n"
+    "EXISTING LEVEL-2 HEADINGS in the current skill:\n{headings}\n"
+    "To extend an existing section, prefer an existing heading; do not create a duplicate heading.\n\n"
     "HARVESTED FAILURE:\ntitle: {title}\nsignature: {signature}\nevidence:\n{instructions}\n"
 )
+
+
+def _existing_level_two_headings(skill_path: str) -> str:
+    """Return deterministic current ## headings without failing prompt creation."""
+    try:
+        text = Path(skill_path).expanduser().read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return "(unavailable — preserve the existing document structure)"
+    headings = re.findall(r"(?m)^##\s+.+$", text)
+    return "\n".join(headings) if headings else "(none — do not add a heading unless required)"
 
 
 def _validate_base_url(base_url: str) -> str:
@@ -95,6 +108,7 @@ def build_proposer_prompt(failure: dict, skill_path: str) -> str:
     inst = _scrub(str(failure.get("task_instructions") or failure.get("body") or ""))
     return PROPOSER_TEMPLATE.format(
         skill_path=skill_path,
+        headings=_existing_level_two_headings(skill_path),
         title=_scrub(str(failure.get("task_title") or "harvested failure")),
         signature=str(failure.get("failure_signature") or "unclassified"),
         instructions=inst[:2000],

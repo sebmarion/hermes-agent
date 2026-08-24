@@ -3,7 +3,7 @@ import { type RefObject, useLayoutEffect, useRef } from 'react'
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
-import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
+import { hasClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, type ComposerAttachment } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
@@ -158,23 +158,20 @@ export function useComposerSubmit({
     const text = pathifyRefs(draftRef.current)
     const payloadPresent = text.trim().length > 0 || attachments.length > 0
 
-    // A clarify card parked on this session owns the turn: the agent is blocked
-    // inside its tool batch waiting on `clarify.respond`, so a follow-up routed
-    // through steer/queue sits undelivered until the clarify's own timeout
-    // (default 5 min) — the message looks sent and nothing happens. Typing a
-    // real message instead of picking an option IS the answer "none of these":
-    // skip the question so the tool returns, then route the words normally.
-    //
-    // Fire-and-forget, not awaited: the skip clears the card synchronously and
-    // both RPCs ride the same socket in call order, so the gateway resolves the
-    // clarify before it sees the follow-up. Awaiting first would leave the draft
-    // live for a tick — long enough for a second Enter to send it twice.
+    // A clarify card owns the turn. A typed message is not an answer to the
+    // question and must never clear it implicitly: queue the message until the
+    // user explicitly answers or skips the card. This is deliberately stricter
+    // than the MCP setup card, where typed text is an explicit decline.
     if (payloadPresent && !queueEdit && hasClarifyRequest(sessionId)) {
-      void skipClarifyRequest(sessionId)
+      queueCurrentDraft()
+      focusInput()
+      return
     }
 
-    // Same deal for a pending MCP setup card: the agent is blocked on
-    // mcp.setup.respond, so a typed message declines the card and rides on.
+    // A pending MCP setup card can be explicitly declined by typing a message;
+    // the agent is blocked on mcp.setup.respond, so skip it before routing the
+    // follow-up. Clarify is handled separately above because an empty clarify
+    // response can otherwise be mistaken for an answer/default.
     if (payloadPresent && !queueEdit && hasMcpSetupRequest(sessionId)) {
       void skipMcpSetupRequest(sessionId)
     }

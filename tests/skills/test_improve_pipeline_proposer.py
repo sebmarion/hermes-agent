@@ -53,9 +53,37 @@ def test_build_prompt_is_stable_for_same_input() -> None:
     assert len(sha) == 64
 
 
-# ---------------------------------------------------------------------------
-# staging layout + schema mapping
-# ---------------------------------------------------------------------------
+def test_build_prompt_lists_existing_level_two_headings(tmp_path: Path) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("# BestPlan\n\n## Procedure\nsteps\n\n## Pitfalls\nrisks\n")
+
+    prompt = pzc.build_proposer_prompt(_failure(), skill_path=str(skill))
+
+    assert "EXISTING LEVEL-2 HEADINGS" in prompt
+    assert "## Procedure" in prompt
+    assert "## Pitfalls" in prompt
+    assert "extend an existing section" in prompt
+
+
+def test_build_prompt_requests_markdown_not_patch_syntax() -> None:
+    prompt = pzc.build_proposer_prompt(_failure(), skill_path="skills/x/SKILL.md")
+
+    assert "raw Markdown content" in prompt
+    assert "patch syntax" in prompt
+    assert "diff-style" not in prompt
+
+
+def test_build_prompt_expands_tilde_skill_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    skill = tmp_path / "skill.md"
+    skill.write_text("# BestPlan\n\n## Existing\n")
+
+    prompt = pzc.build_proposer_prompt(_failure(), skill_path="~/skill.md")
+
+    assert "## Existing" in prompt
+
+
+
 
 def test_stage_writes_baseline_candidate_dataset(tmp_path: Path) -> None:
     base_text = "# Baseline skill\n\n## Pitfalls\n1. old rule"

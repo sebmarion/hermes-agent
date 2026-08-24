@@ -443,7 +443,9 @@ interface ProjectTreePayload {
   scoped_session_ids: string[]
 }
 
-const PROJECT_TREE_PREVIEW_LIMIT = 3
+// Preview sessions per project in the sidebar overview. Purely a display cap —
+// drill-in always shows every session.
+const PROJECT_TREE_PREVIEW_LIMIT = 10
 // The all-profiles fan-out reads one database per profile, so it is allowed the
 // same headroom as the cross-profile session list rather than the interactive
 // default.

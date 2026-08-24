@@ -16,6 +16,7 @@ import {
 } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
+import { $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
 import { requestGatewayForAgent } from '@/store/gateway'
 import { $activeGatewayProfile, $newChatProfile, $newChatRoute, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
@@ -56,7 +57,7 @@ import { deferred } from '../../../test/deferred'
 import { sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
-import { useSessionActions } from './use-session-actions'
+import { restorePendingClarify, useSessionActions } from './use-session-actions'
 import { useSessionStateCache } from './use-session-state-cache'
 
 vi.mock('@/hermes', async importOriginal => ({
@@ -153,6 +154,34 @@ function Harness({
 
   return null
 }
+
+describe('pending clarify resume restoration', () => {
+  afterEach(() => clearClarifyRequest())
+
+  it('restores a batch question when the reconnect snapshot has no top-level question', () => {
+    const response = {
+      pending_clarify: {
+        answers: { q0: 'yes' },
+        questions: [
+          { choices: ['yes', 'no'], multi_select: false, qid: 'q0', question: 'Ship it?' },
+          { choices: null, multi_select: false, qid: 'q1', question: 'Anything else?' }
+        ],
+        request_id: 'req-batch-resume'
+      }
+    } as unknown as SessionResumeResponse
+
+    expect(restorePendingClarify(response, 'runtime-resume')).toBe(true)
+    expect($clarifyRequests.get()['runtime-resume']).toMatchObject({
+      lockedAnswers: { q0: 'yes' },
+      requestId: 'req-batch-resume',
+      questions: [
+        { choices: ['yes', 'no'], qid: 'q0', question: 'Ship it?' },
+        { choices: null, qid: 'q1', question: 'Anything else?' }
+      ],
+      sessionId: 'runtime-resume'
+    })
+  })
+})
 
 describe('connection-qualified session deletion', () => {
   afterEach(() => {

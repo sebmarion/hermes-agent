@@ -664,9 +664,16 @@ export interface SessionResumeResponse {
   // class as pending_approval: emitted-while-detached prompts are restored
   // from the resume snapshot instead of being lost until server-side timeout.
   pending_clarify?: {
+    answers?: Record<string, string>
     choices?: null | string[]
     multi_select?: boolean
     question?: string
+    questions?: Array<{
+      choices?: null | string[]
+      multi_select?: boolean
+      qid?: string
+      question?: string
+    }>
     request_id?: string
   }
   info?: SessionRuntimeInfo

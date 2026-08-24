@@ -66,6 +66,27 @@ def test_materialize_candidate_is_append_only_and_keeps_frontmatter() -> None:
     assert lp.validate_candidate(candidate, expected_name="bestplan") == []
 
 
+def test_materialize_candidate_demotes_duplicate_baseline_heading() -> None:
+    baseline = "---\nname: bestplan\n---\n# BestPlan\n\n## Pitfalls\nold rule\n"
+    proposal = "## Pitfalls\n\nAdd a concrete recovery check."
+
+    candidate = lp.materialize_candidate(baseline, proposal)
+
+    assert "### Pitfalls" in candidate.splitlines()
+    assert candidate.splitlines().count("## Pitfalls") == 1
+    assert lp.validate_candidate(candidate, expected_name="bestplan") == []
+
+
+def test_materialize_candidate_demotes_heading_with_closing_hashes() -> None:
+    baseline = "---\nname: bestplan\n---\n# BestPlan\n\n## Pitfalls ##\nold\n"
+    proposal = "## Pitfalls\nnew"
+
+    candidate = lp.materialize_candidate(baseline, proposal)
+
+    assert "### Pitfalls" in candidate.splitlines()
+    assert lp.validate_candidate(candidate, expected_name="bestplan") == []
+
+
 def test_materialize_candidate_accepts_fenced_unified_diff_additions() -> None:
     baseline = "---\nname: bestplan\ndescription: test\n---\n\n# BestPlan\n"
     proposal = """```diff
@@ -243,12 +264,42 @@ def test_live_chain_records_expected_block_without_failing_run(tmp_path: Path) -
     assert len(applied) == 1
 
 
+def test_live_chain_stops_batch_before_core_budget_overflow(tmp_path: Path) -> None:
+    live = tmp_path / "skills"
+    target = live / "software-development" / "bestplan" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    baseline = "---\nname: bestplan\ndescription: test\n---\n\n# BestPlan\n\n" + "x" * 29450
+    target.write_text(baseline)
+    _install_validator(target)
+    applied = []
+
+    report = lp.run_live_chain(
+        failures=[_failure()],
+        state_dir=tmp_path / "state",
+        live_skills=live,
+        skill_path=target,
+        proposer=lambda _prompt: "## Safe\n\n" + "y" * 600,
+        judge=lambda _prompt: json.dumps(
+            {"verdict": "better", "score": 0.99, "rationale": "clear"}
+        ),
+        applier=lambda *args: applied.append(args),
+        run_id="R-budget",
+    )
+
+    assert report["ok"] is True
+    assert report["halted"] is False
+    assert report["applied"] == []
+    assert report["blocked"] == ["task_1234abcd"]
+    assert applied == []
+
+
 def test_live_chain_blocks_duplicate_heading_without_dirtying_live_skill(tmp_path: Path) -> None:
     live = tmp_path / "skills"
     target = live / "software-development" / "bestplan" / "SKILL.md"
     target.parent.mkdir(parents=True)
     baseline = "---\nname: bestplan\ndescription: test\n---\n\n# BestPlan\n\n## Existing\n\nKeep this section.\n"
     target.write_text(baseline)
+    _install_validator(target)
     applied = []
 
     report = lp.run_live_chain(
@@ -266,7 +317,8 @@ def test_live_chain_blocks_duplicate_heading_without_dirtying_live_skill(tmp_pat
 
     assert report["ok"] is True
     assert report["halted"] is False
-    assert report["applied"] == []
-    assert report["blocked"] == ["task_1234abcd"]
-    assert applied == []
+    assert report["applied"] == ["task_1234abcd"]
+    assert report["blocked"] == []
+    assert len(applied) == 1
+    assert "### Existing" in Path(applied[0][2]).read_text()
     assert target.read_text() == baseline

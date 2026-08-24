@@ -549,10 +549,10 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
       return
     }
 
-    // Otherwise act on the highlighted row: a choice responds immediately, and
-    // the trailing "Other" row focuses the free-text field.
+    // Otherwise stage the highlighted choice; Enter is never implicit consent.
+    // A second Enter (or Continue) submits the now-explicit selection.
     if (choice) {
-      void respond(choice)
+      selectChoice(choice, activeIndex)
 
       return
     }

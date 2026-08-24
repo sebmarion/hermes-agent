@@ -22,6 +22,7 @@ as a non-zero result.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -41,7 +42,7 @@ import promote_skill
 
 # Where labs stores its per-run state (override with --state-dir in tests)
 DEFAULT_STATE_DIR = Path.home() / ".hermes" / "labs" / "bestplan-research" / "state"
-MAX_CANDIDATES_PER_RUN = 3
+MAX_CANDIDATES_PER_RUN = 8
 _DEFAULT_SKILL_LINK = Path.home() / ".hermes" / "skills" / "software-development" / "bestplan" / "SKILL.md"
 DEFAULT_SKILL_PATH = _DEFAULT_SKILL_LINK.resolve()
 DEFAULT_LIVE_SKILLS = DEFAULT_SKILL_PATH.parents[2]
@@ -66,12 +67,28 @@ def _load_pending(path: Path) -> list[dict]:
     return rows
 
 
+def _failure_class_key(row: dict) -> tuple[str, str, str]:
+    """Identify duplicate evidence without merging different titled defects."""
+    def normalize(value: object, limit: int | None = None) -> str:
+        normalized = " ".join(str(value or "").split()).strip().lower()
+        return normalized[:limit] if limit is not None else normalized
+
+    instructions = normalize(row.get("task_instructions") or row.get("body"))
+    return (
+        normalize(row.get("failure_signature"), 120),
+        normalize(row.get("task_title"), 240),
+        hashlib.sha256(instructions.encode("utf-8")).hexdigest(),
+    )
+
+
 def _merge_failures(pending: list[dict], new: list[dict]) -> list[dict]:
     merged = []
     seen = set()
     for row in [*pending, *new]:
-        key = str(row.get("task_id") or row.get("session_seq") or "")
-        if not key or key in seen:
+        if not isinstance(row, dict):
+            continue
+        key = _failure_class_key(row)
+        if not any(key) or key in seen:
             continue
         seen.add(key)
         merged.append(row)

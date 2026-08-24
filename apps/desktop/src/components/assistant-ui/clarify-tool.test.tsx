@@ -309,6 +309,17 @@ describe('ClarifyTool keyboard navigation', () => {
     expect(other.closest('label')?.getAttribute('data-highlighted')).toBe('true')
   })
 
+  it('does not submit the highlighted recommendation without an explicit selection', async () => {
+    const request = renderLiveClarify()
+
+    fireEvent.keyDown(window, { key: 'Enter' })
+
+    // A visual highlight is navigation state, not consent. The user must click
+    // a choice (or pick it with its shortcut) before Enter can submit it.
+    expect(request).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+  })
+
   it('selects by number and confirms the answer with Enter', async () => {
     const request = renderLiveClarify()
 

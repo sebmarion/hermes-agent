@@ -11,7 +11,7 @@ import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
-import { normalizeChoices, setClarifyRequest } from '@/store/clarify'
+import { normalizeChoices, normalizeQuestions, setClarifyRequest } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { openGatewayForAgent, openGatewayForProfile, requestGatewayForAgent } from '@/store/gateway'
@@ -263,13 +263,39 @@ function restorePendingApproval(response: SessionResumeResponse, sessionId: stri
   return true
 }
 
-function restorePendingClarify(response: SessionResumeResponse, sessionId: string): boolean {
+export function restorePendingClarify(response: SessionResumeResponse, sessionId: string): boolean {
   // Same replay class as pending_approval: the clarify.request event was
   // emitted while this client's transport was detached, so without the resume
   // snapshot the question stays invisible until it times out server-side.
   const pending = response.pending_clarify
 
-  if (!pending || typeof pending.request_id !== 'string' || typeof pending.question !== 'string') {
+  if (!pending || typeof pending.request_id !== 'string') {
+    return false
+  }
+
+  // Batch snapshots intentionally have no top-level question. Restore the
+  // complete form and any answers already locked before the reconnect.
+  const questions = normalizeQuestions(pending.questions)
+
+  if (questions.length > 0) {
+    const lockedAnswers = pending.answers
+      ? Object.fromEntries(Object.entries(pending.answers).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+      : undefined
+
+    setClarifyRequest({
+      choices: null,
+      lockedAnswers,
+      multiSelect: false,
+      question: '',
+      questions,
+      requestId: pending.request_id,
+      sessionId
+    })
+
+    return true
+  }
+
+  if (typeof pending.question !== 'string') {
     return false
   }
 

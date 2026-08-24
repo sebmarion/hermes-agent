@@ -618,8 +618,12 @@ def _merge_profile_tree(
 
 
 @sessions_router.get("/api/profiles/projects/tree")
-def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000):
+def get_profiles_projects_tree(preview_limit: int = 10, session_limit: int = 2000):
     """Project tree for every profile at once, for the all-profiles sidebar.
+
+    ``preview_limit`` is clamped up to at least 10: the bundled desktop
+    renderer requests 3, and the all-profiles view should match the
+    single-profile overview's floor (see projects.tree).
 
     ``projects.tree`` over JSON-RPC answers for the backend's own profile, so
     the grouped sidebar had nothing to draw once the user asked for all of
@@ -641,6 +645,10 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
     from hermes_cli import profiles as profiles_mod
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tui_gateway import server as gateway_server
+
+    # Older bundled desktop renderers request preview_limit=3. Keep the
+    # server-side floor at 10 so the result does not depend on client version.
+    preview_limit = max(10, int(preview_limit or 10))
 
     try:
         targets: List[Tuple[str, Path]] = [

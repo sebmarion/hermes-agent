@@ -176,17 +176,15 @@ export const hasClarifyRequest = (sessionId: string | null | undefined): boolean
   Boolean($clarifyRequests.get()[keyFor(sessionId)])
 
 /**
- * Answer `sessionId`'s pending clarify with an empty answer (a skip) and drop it
+ * Explicitly skip `sessionId`'s pending clarify with an empty answer and drop it
  * locally, resolving to whether there was one to skip.
  *
- * The composer uses this when the user types a real message instead of picking
- * an option: a clarify blocks the agent inside its tool batch, so leaving it
- * unanswered would park the follow-up until the server-side clarify timeout
- * (default 5 min) — the message looks sent and nothing happens. Skipping lets
- * the tool return and the turn carry on with the user's actual words.
+ * This is reserved for the card's Skip action. Typed composer messages must not
+ * call it: a follow-up is queued while the question remains pending, so an
+ * empty answer can never become an implicit default/acceptance.
  *
- * An empty answer is the same thing the card's own Skip button sends, and
- * `clarify.respond` is `allow_expired`, so racing the timeout is harmless.
+ * An empty answer is sent through `clarify.respond`, which is `allow_expired`,
+ * so racing the timeout is harmless.
  */
 export async function skipClarifyRequest(sessionId: string | null | undefined): Promise<boolean> {
   const request = $clarifyRequests.get()[keyFor(sessionId)]

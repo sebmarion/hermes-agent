@@ -13629,11 +13629,14 @@ def _discover_repos_payload(
     return out
 
 
-# Sources excluded from the project tree: cron runs, and kanban dispatcher
-# workers, are not user conversations. Subagent/compression children are
-# already dropped by list_sessions_rich(include_children=False); cron has its
-# own section, and kanban runs are read on the board.
-_PROJECT_TREE_EXCLUDED_SOURCES = ["cron", "kanban"]
+# Sources excluded from the project tree: cron runs, kanban dispatcher
+# workers, and delegated subagent children are not user conversations.
+# Delegate children carry source=subagent; compression/branch children stay
+# listed via their markers. Cron has its own section, and kanban runs are read
+# on the board. NOTE: list_sessions_rich(include_children=False) already hides
+# parented delegate rows — the explicit 'subagent' here also covers detached
+# workers that arrive without a parent link.
+_PROJECT_TREE_EXCLUDED_SOURCES = ["cron", "kanban", "subagent"]
 
 
 def _project_tree_row(r: dict) -> dict:

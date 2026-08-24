@@ -409,36 +409,32 @@ describe('useComposerSubmit with a clarify parked on the session', () => {
     vi.restoreAllMocks()
   })
 
-  it('skips the question and still sends the typed message on an idle session', async () => {
+  it('queues the typed message and leaves the question pending on an idle session', async () => {
     parkClarify('runtime-session')
-    const { hook, onSubmit } = renderSubmitHook({ text: 'actually do this instead' })
+    const { hook, onSubmit, queueCurrentDraft } = renderSubmitHook({ text: 'actually do this instead' })
 
     act(() => {
       hook.result.current.submitDraft()
     })
 
-    await waitFor(() =>
-      expect(gatewayRequest).toHaveBeenCalledWith('clarify.respond', {
-        request_id: 'req-runtime-session',
-        answer: ''
-      })
-    )
-    await waitFor(() =>
-      expect(onSubmit).toHaveBeenCalledWith('actually do this instead', expect.objectContaining({ attachments: [] }))
-    )
-    expect($clarifyRequests.get()['runtime-session']).toBeUndefined()
+    await waitFor(() => expect(queueCurrentDraft).toHaveBeenCalledTimes(1))
+    expect(gatewayRequest).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect($clarifyRequests.get()['runtime-session']).toBeDefined()
   })
 
-  it('skips the question before steering a busy turn', async () => {
+  it('queues the typed message instead of steering past a pending question', async () => {
     parkClarify('runtime-session')
-    const { hook, onSteer } = renderSubmitHook({ busy: true, text: 'change course' })
+    const { hook, onSteer, queueCurrentDraft } = renderSubmitHook({ busy: true, text: 'change course' })
 
     act(() => {
       hook.result.current.submitDraft()
     })
 
-    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course'))
-    expect(gatewayRequest).toHaveBeenCalledWith('clarify.respond', { request_id: 'req-runtime-session', answer: '' })
+    await waitFor(() => expect(queueCurrentDraft).toHaveBeenCalledTimes(1))
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(gatewayRequest).not.toHaveBeenCalled()
+    expect($clarifyRequests.get()['runtime-session']).toBeDefined()
   })
 
   it('leaves the question alone for an empty Enter (Stop, not an answer)', () => {
