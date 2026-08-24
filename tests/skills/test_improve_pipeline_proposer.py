@@ -85,6 +85,17 @@ def test_build_prompt_expands_tilde_skill_path(tmp_path: Path, monkeypatch) -> N
 
 
 
+def test_main_fails_closed_when_skill_path_is_missing(tmp_path: Path) -> None:
+    failures = tmp_path / "failures.jsonl"
+    failures.write_text(json.dumps(_failure()) + "\n")
+
+    result = pzc.main([
+        "entry", "--run-dir", str(tmp_path / "run"),
+        "--failures-jsonl", str(failures),
+        "--skill-path", str(tmp_path / "missing"), "--dry-run",
+    ])
+
+    assert result != 0
 def test_stage_writes_baseline_candidate_dataset(tmp_path: Path) -> None:
     base_text = "# Baseline skill\n\n## Pitfalls\n1. old rule"
     cand_text = "# Baseline skill\n\n## Pitfalls\n1. old rule\n2. NEW anti-timeout check: retry-with-backoff\n"

@@ -232,6 +232,30 @@ def test_live_chain_rejects_malformed_judge_without_apply(tmp_path: Path) -> Non
     assert any("judge" in note.lower() for note in report["notes"])
 
 
+def test_live_chain_restores_live_bytes_when_applier_fails_after_mutation(tmp_path: Path) -> None:
+    live = tmp_path / "skills"
+    target = live / "software-development" / "bestplan" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    baseline = "---\nname: bestplan\ndescription: test\n---\n\n# BestPlan\n"
+    target.write_text(baseline)
+    _install_validator(target)
+
+    def broken_applier(*_args):
+        target.write_text("partially written")
+        raise RuntimeError("post-write fail")
+
+    report = lp.run_live_chain(
+        failures=[_failure()], state_dir=tmp_path / "state", live_skills=live,
+        skill_path=target, proposer=lambda _prompt: "## Addition\n\nUse it.",
+        judge=lambda _prompt: json.dumps({"verdict": "better", "score": 0.99, "rationale": "clear"}),
+        applier=broken_applier, run_id="R-rollback",
+    )
+
+    assert report["halted"] is True
+    assert report["blocked"] == ["task_1234abcd"]
+    assert target.read_text() == baseline
+
+
 def test_live_chain_records_expected_block_without_failing_run(tmp_path: Path) -> None:
     live = tmp_path / "skills"
     target = live / "software-development" / "bestplan" / "SKILL.md"
@@ -322,3 +346,33 @@ def test_live_chain_blocks_duplicate_heading_without_dirtying_live_skill(tmp_pat
     assert len(applied) == 1
     assert "### Existing" in Path(applied[0][2]).read_text()
     assert target.read_text() == baseline
+
+
+def test_live_chain_marks_equivalent_second_task_as_applied(tmp_path: Path) -> None:
+    live = tmp_path / "skills"
+    target = live / "software-development" / "bestplan" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    baseline = "---\nname: bestplan\ndescription: test\n---\n\n# BestPlan\n"
+    target.write_text(baseline)
+    _install_validator(target)
+    failures = [{**_failure(), "task_id": "task_first"}, {**_failure(), "task_id": "task_second"}]
+    applied = []
+    judgments = iter([
+        json.dumps({"verdict": "better", "score": 0.99, "rationale": "clear"}),
+        json.dumps({"verdict": "worse", "score": 0.99, "rationale": "clear"}),
+    ])
+
+    report = lp.run_live_chain(
+        failures=failures,
+        state_dir=tmp_path / "state",
+        live_skills=live,
+        skill_path=target,
+        proposer=lambda _prompt: "## Addition\n\nUse the bounded retry check.",
+        judge=lambda _prompt: next(judgments),
+        applier=lambda *args: applied.append(args),
+        run_id="R-equivalent",
+    )
+
+    assert report["ok"] is True
+    assert report["applied"] == ["task_first", "task_second"]
+    assert len(applied) == 1

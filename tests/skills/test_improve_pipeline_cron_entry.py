@@ -36,6 +36,19 @@ def test_merge_failures_does_not_collapse_distinct_long_instructions() -> None:
     assert [row["task_id"] for row in merged] == ["a", "b"]
 
 
+def test_merge_failures_skips_empty_objects_but_keeps_valid_rows() -> None:
+    valid = {
+        "task_id": "task_valid",
+        "failure_signature": "error",
+        "task_title": "Timeout",
+        "task_instructions": "gateway failed",
+    }
+
+    merged = entry._merge_failures([{}, {"task_id": "empty"}], [valid])
+
+    assert [row["task_id"] for row in merged] == [valid["task_id"]]
+
+
 def test_bookmark_failure_is_skipped_without_failing_cron(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(entry, "DEFAULT_STATE_DIR", tmp_path)
 
@@ -51,6 +64,28 @@ def test_bookmark_failure_is_skipped_without_failing_cron(tmp_path: Path, monkey
     assert report["ok"] is True
     assert report["halted"] is False
     assert report["steps"][-1] == "harvest_x: skipped"
+
+
+def test_unreadable_pending_queue_does_not_advance_session_watermark(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(entry, "DEFAULT_STATE_DIR", tmp_path)
+    monkeypatch.setattr(hx, "fetch_bookmarks", lambda _n: [])
+    (tmp_path / "pending_failures.jsonl").write_text("not-json\n")
+    writes = []
+    monkeypatch.setattr(entry.ps, "write_watermark", lambda *args: writes.append(args))
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.create_session("unreadable-queue-session", source="cli", model="test")
+    db.append_message("unreadable-queue-session", role="user", content="repair")
+    db.append_message("unreadable-queue-session", role="assistant", content="ERROR: failed")
+    db.end_session("unreadable-queue-session", "done")
+    db.close()
+
+    assert entry.main(["entry", "--db-path", str(db_path)]) != 0
+    report = json.loads(next(tmp_path.glob("report-*.json")).read_text())
+    assert report["watermark_sessions"] == 0
+    assert report["n_failures_new"] == 0
+    assert writes == []
 
 
 def test_cron_harvests_real_session_rows_before_halting_live_chain(
@@ -263,6 +298,51 @@ def test_failed_promotion_restores_skill_and_keeps_task_queued(
         for line in (state_dir / "pending_failures.jsonl").read_text().splitlines()
     ]
     assert [row["task_id"] for row in pending] == [seen["task_id"]]
+
+
+def test_activation_failure_does_not_requeue_successfully_promoted_task(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(hx, "fetch_bookmarks", lambda _n: [])
+    state_dir = tmp_path / "state"
+    repo = tmp_path / "skills-repo"
+    skill = repo / "software-development" / "bestplan" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: bestplan\ndescription: test\n---\n# BestPlan\n")
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.create_session("real-session-0005", source="cli", model="test")
+    db.append_message("real-session-0005", role="user", content="repair the skill")
+    db.append_message("real-session-0005", role="assistant", content="ERROR: check failed")
+    db.end_session("real-session-0005", "done")
+    db.close()
+
+    def fake_chain(**kwargs):
+        task_id = kwargs["failures"][0]["task_id"]
+        return {"ok": True, "halted": False, "applied": [task_id], "blocked": [], "notes": []}
+
+    monkeypatch.setattr(entry, "run_live_chain", fake_chain)
+    monkeypatch.setattr(
+        entry.promote_skill,
+        "promote",
+        lambda **_kwargs: {"status": "pushed", "commit": "abc123", "remote": "origin", "branch": "main", "verification": {"status": "passed"}},
+    )
+    monkeypatch.setattr(entry, "_request_live_activation", lambda *_args: (_ for _ in ()).throw(RuntimeError("activation unavailable")))
+
+    assert entry.main([
+        "entry", "--state-dir", str(state_dir), "--db-path", str(db_path),
+        "--live-skills", str(repo), "--skill-path", str(skill),
+    ]) == 1
+    pending = [json.loads(line) for line in (state_dir / "pending_failures.jsonl").read_text().splitlines()]
+    assert pending == []
+    report = json.loads(next(state_dir.glob("report-*.json")).read_text())
+    assert report["promotion"]["status"] == "pushed"
 
 
 def test_ocr_gate_path_follows_resolved_skills_repository(tmp_path: Path, monkeypatch) -> None:

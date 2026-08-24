@@ -269,7 +269,9 @@ def run_live_chain(
         report["ok"] = False
         if halt:
             report["halted"] = True
-        report["notes"].append(message)
+        report["applied"] = applied
+        report["blocked"] = blocked
+        report["notes"] = [*notes, message]
         report["summary"] = f"{len(applied)} applied, {len(blocked)} blocked"
         return report
 
@@ -333,6 +335,7 @@ def run_live_chain(
                 raise ValueError("materialized candidate does not preserve baseline")
             candidate_addition = candidate[len(baseline_prefix):].strip()
             if candidate_addition in accepted:
+                staged.append({"task_id": task_id, "candidate": candidate})
                 continue
             trial_aggregate = baseline_prefix + "\n\n" + "\n\n".join(accepted + [candidate_addition]) + "\n"
             if len(trial_aggregate) > 30_000:
@@ -364,6 +367,8 @@ def run_live_chain(
     # validator, so apply it exactly once. Apply failure is infrastructure
     # red; the live skill bytes are left as they were before the apply.
     if accepted:
+        live_target = live_skills / target_rel
+        before_live = live_target.read_bytes() if live_target.is_file() else None
         try:
             _validate_staged_skill(
                 skill_path,
@@ -376,8 +381,11 @@ def run_live_chain(
             # dirties live bytes.
             applier(live_skills, target_rel, aggregate_dir / "SKILL.md.candidate", state_dir)
         except Exception as exc:  # noqa: BLE001 - apply failure is infrastructure red
+            if before_live is not None:
+                live_target.write_bytes(before_live)
+            elif live_target.exists():
+                live_target.unlink()
             blocked.extend(t["task_id"] for t in staged)
-            notes.append(f"aggregate apply failed: {exc}")
             return _fail(f"aggregate apply failed: {exc}")
         applied = [t["task_id"] for t in staged]
 

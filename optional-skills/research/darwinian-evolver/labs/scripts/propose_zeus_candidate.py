@@ -248,16 +248,18 @@ def main(argv) -> int:
         "improve-loop-judge-v1-bounded-pilot".encode()
     ).hexdigest()
 
-    # read current baseline from the skill path so a change is genuinely additive
-    baseline_text = "# Operator-owned bestplan skill\n## Pitfalls\n"
+    # Read current baseline from the skill path so a change is genuinely additive.
+    bp = Path(args.skill_path).expanduser()
+    if not bp.is_absolute():
+        bp = Path.cwd() / bp
+    if not bp.is_file():
+        print(f"error: skill file not found: {bp}", file=sys.stderr)
+        return 2
     try:
-        bp = Path(args.skill_path).expanduser()
-        if not bp.is_absolute():
-            bp = Path.cwd() / bp
-        if bp.is_file():
-            baseline_text = bp.read_text()
-    except OSError:
-        pass
+        baseline_text = bp.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        print(f"error: skill file unreadable: {bp}: {exc}", file=sys.stderr)
+        return 2
 
     blind_acc = {}
     n_ok = 0

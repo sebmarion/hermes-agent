@@ -87,8 +87,12 @@ def _merge_failures(pending: list[dict], new: list[dict]) -> list[dict]:
     for row in [*pending, *new]:
         if not isinstance(row, dict):
             continue
+        if not any(str(row.get(field) or "").strip() for field in (
+            "failure_signature", "task_title", "task_instructions", "body"
+        )):
+            continue
         key = _failure_class_key(row)
-        if not any(key) or key in seen:
+        if key in seen:
             continue
         seen.add(key)
         merged.append(row)
@@ -224,13 +228,14 @@ def main(argv) -> int:
     wm = ps.read_watermark(state_dir, "sessions") or 0
     report["watermark_sessions"] = wm
     try:
-        sessions = hf.load_hermes_sessions(args.db_path)
+        sessions = [] if report["halted"] else hf.load_hermes_sessions(args.db_path)
         new_failures = hf.extract_failures(sessions, watermark_seq=wm)
         failures = _merge_failures(pending, new_failures)
         failures_path = state_dir / "failures.jsonl"
         hf.write_facts(failures_path, new_failures)
         max_seq = max((int(row["seq"]) for row in sessions), default=wm)
-        ps.write_watermark(state_dir, "sessions", max(max_seq, wm))
+        if not report["halted"]:
+            ps.write_watermark(state_dir, "sessions", max(max_seq, wm))
         report["watermark_sessions"] = max(max_seq, wm)
         report["n_failures_new"] = len(new_failures)
         report["n_failures_pending"] = len(failures)
@@ -309,6 +314,7 @@ def main(argv) -> int:
             if chain.get("applied"):
                 repo = None
                 target_rel = None
+                promotion_succeeded = False
                 try:
                     repo = promote_skill.repository_root(args.skill_path)
                     target_rel = promote_skill.relative_path(repo, args.skill_path)
@@ -319,6 +325,8 @@ def main(argv) -> int:
                             args.skill_path, f"improve-promotion-{ts}"
                         ),
                     )
+                    promotion_succeeded = True
+                    processed_ids.update(applied_ids)
                     report["promotion"] = promotion
                     request_path = _request_live_activation(
                         f"autoresearch skill promotion {promotion['commit'][:12]}",
@@ -336,12 +344,12 @@ def main(argv) -> int:
                         f"{promotion['remote']}/{promotion['branch']}"
                     )
                     report["steps"].append(f"activation: queued {request_path}")
-                    processed_ids.update(applied_ids)
                 except Exception as exc:  # noqa: BLE001 - promotion is fail-closed
-                    report["notes"].append(f"skill promotion failed: {exc}")
+                    phase = "activation request failed after promotion" if promotion_succeeded else "skill promotion failed"
+                    report["notes"].append(f"{phase}: {exc}")
                     report["ok"] = False
                     report["halted"] = True
-                    if repo is not None and target_rel is not None:
+                    if not promotion_succeeded and repo is not None and target_rel is not None:
                         try:
                             _restore_unpromoted_skill(repo, target_rel)
                             report["notes"].append(
