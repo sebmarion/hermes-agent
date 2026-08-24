@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
+from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
 from agent.turn_context import TurnContext, build_turn_context
 from hermes_state import SessionDB
 
@@ -208,6 +209,31 @@ def test_returns_turn_context_with_user_message_appended():
     assert isinstance(ctx.messages[-1]["timestamp"], float)
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_turn_start_live_config_disables_stale_guardrail_block():
+    agent = _FakeAgent()
+    agent._tool_guardrails = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True)
+    )
+    agent._tool_guardrail_config_loader = lambda: {
+        "tool_loop_guardrails": {"hard_stop_enabled": False}
+    }
+
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"tool_loop_guardrails": {"hard_stop_enabled": True}},
+    ):
+        _build(agent)
+
+    assert agent._tool_guardrails.config.hard_stop_enabled is False
+    args = {"command": "false"}
+    for _ in range(3):
+        assert agent._tool_guardrails.before_call("terminal", args).action == "allow"
+        agent._tool_guardrails.after_call(
+            "terminal", args, '{"exit_code": 1}', failed=True
+        )
+    assert agent._tool_guardrails.before_call("terminal", args).action == "allow"
 
 
 def test_user_message_preserves_platform_event_timestamp():

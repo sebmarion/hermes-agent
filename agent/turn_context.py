@@ -585,6 +585,21 @@ def build_turn_context(
     from agent.agent_runtime_helpers import note_turn_start
     note_turn_start(agent, turn_id)
 
+    # Long-lived CLI/TUI sessions retain their AIAgent between turns. Refresh
+    # guardrail policy before resetting its counters so config changes apply to
+    # the next turn instead of requiring the process/session to be recreated.
+    try:
+        from agent.tool_guardrails import ToolCallGuardrailConfig
+
+        _config_loader = getattr(agent, "_tool_guardrail_config_loader", None)
+        if callable(_config_loader):
+            _live_config = _config_loader()
+            agent._tool_guardrails.config = ToolCallGuardrailConfig.from_mapping(
+                _live_config.get("tool_loop_guardrails", {})
+            )
+    except Exception:
+        logger.debug("tool guardrail config refresh skipped", exc_info=True)
+
     # Reset retry counters and iteration budget at the start of each turn.
     agent._invalid_tool_retries = 0
     agent._invalid_json_retries = 0

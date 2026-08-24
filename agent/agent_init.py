@@ -1767,7 +1767,9 @@ def init_agent(
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
     
-    # Load config once for memory, skills, and compression sections
+    # Load config once for memory, skills, and compression sections. Retain the
+    # profile-aware loader so turn-scoped settings can refresh safely later.
+    _load_agent_config = None
     try:
         from hermes_cli.config import load_config_readonly as _load_agent_config
         _agent_cfg = _load_agent_config()
@@ -1813,6 +1815,7 @@ def init_agent(
                 _agent_cfg.get("tool_loop_guardrails", {})
             )
         )
+        agent._tool_guardrail_config_loader = _load_agent_config
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
     # Cache only the derived auxiliary compression context override that is
