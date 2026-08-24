@@ -4,7 +4,8 @@
 The live Hermes checkout is deployment state, never a scratch workspace:
 - flock serializes daily/manual updates;
 - every run creates a separate disposable clone with independent refs/index;
-- delta application, bounded Zeus-Qwen recovery, and tests run only there;
+- delta application and tests run only there; semantic conflicts halt for
+  intent-based resolution instead of accepting an AI-authored core patch;
 - a tested candidate is published by normal fast-forward push;
 - canonical main advances only via guarded ``git merge --ff-only``;
 - Telegram receives a redacted success or halt rundown.

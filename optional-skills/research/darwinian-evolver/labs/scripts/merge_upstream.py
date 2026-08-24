@@ -167,6 +167,22 @@ def _blob(repo: Path, ref: str, path: str) -> bytes | None:
     return proc.stdout
 
 
+def summarize_apply_failure(stdout: str, stderr: str) -> str:
+    """Return the actionable reason from verbose ``git apply --3way`` output."""
+    lines = [line.strip() for line in f"{stdout}\n{stderr}".splitlines() if line.strip()]
+    conflicts = sorted({line[2:].strip() for line in lines if line.startswith("U ")})
+    warnings = [line for line in lines if line.lower().startswith("warning:")]
+    if conflicts:
+        detail = "conflicting paths: " + ", ".join(conflicts)
+        if warnings:
+            detail += "; " + warnings[-1]
+        return detail
+
+    noise_prefixes = ("Applied patch to ", "Falling back to direct application")
+    actionable = [line for line in lines if not line.startswith(noise_prefixes)]
+    return "\n".join(actionable[-20:])[-2000:] or "git apply failed without diagnostics"
+
+
 def snapshot_worktree(root: Path) -> dict[str, str]:
     result = {}
     root = Path(root)
@@ -539,9 +555,9 @@ def build_delta_candidate(
             text=True,
         )
         if apply_proc.returncode:
-            detail = (apply_proc.stdout + "\n" + apply_proc.stderr).strip()
+            detail = summarize_apply_failure(apply_proc.stdout, apply_proc.stderr)
             raise MergeUpstreamError(
-                f"upstream delta conflict/rejection: {detail[-12000:]}"
+                f"upstream delta conflict/rejection: {detail}"
             )
 
         # Restore every path recorded as fork-owned, plus the required runtime
