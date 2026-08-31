@@ -136,6 +136,7 @@ def test_browser_fallback_rejects_malformed_loopback_port(monkeypatch) -> None:
     assert calls == []
 
 
+@pytest.mark.live_system_guard_bypass
 def test_bounded_subprocess_stops_oversized_stdout() -> None:
     with pytest.raises(OutputLimitExceeded, match="stdout exceeded"):
         run_text_bounded(
