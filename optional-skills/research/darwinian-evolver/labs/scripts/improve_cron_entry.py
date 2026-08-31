@@ -55,7 +55,7 @@ ACTIVATION_REQUEST_SCRIPT = (
 
 _JUDGE_TASK = "moa_reference"
 _LUNA_MODEL = "gpt-5.6-luna"
-JUDGE_TIMEOUT_SECONDS = 90
+JUDGE_TIMEOUT_SECONDS = 30
 _TASK_ID_RE = re.compile(r"^task_[0-9a-f]{8}$")
 _JUDGE_RESPONSE_FORMAT = {
     "response_format": {
