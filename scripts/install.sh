@@ -882,20 +882,22 @@ check_cxx_compiler() {
     return 1
 }
 
-# The dependency tree's real Node floor is >=22.22.0, set by react-router 8.3.0
-# (`engines.node`), with Vite ^8 next at `^20.19 || >=22.12`. Keep this in sync
-# with the root package.json — a gate looser than the manifest lets an install
-# proceed to a `npm ci` that then dies with EBADENGINE, and a gate stricter than
-# the manifest replaces a working user toolchain for nothing. Returns 0 when the
-# given `node --version` string clears the floor; anything below it is replaced
-# with the Hermes-managed Node $NODE_VERSION.
+# The dependency tree supports Node 22.22+, 24.11+, and 26+. nanoid 6 excludes
+# Node 23 and 25 while its >=26 arm accepts later releases, and @babel/* 8.x
+# requires ^22.18.0 || >=24.11.0 — so accepting 23/25 or an early Node 24
+# here only defers the failure to `npm ci` under engine-strict. Keep this in
+# sync with the root package.json. Anything outside the supported lines is
+# replaced with the Hermes-managed Node $NODE_VERSION.
 node_satisfies_build() {
     local ver="${1#v}"
+    case "$ver" in *-*) return 1 ;; esac
     local major="${ver%%.*}"
     local minor="${ver#*.}"; minor="${minor%%.*}"
     case "$major" in ''|*[!0-9]*) return 1 ;; esac
     case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
-    if [ "$major" -ge 22 ] && { [ "$major" -gt 22 ] || [ "$minor" -ge 22 ]; }; then return 0; fi
+    if [ "$major" -eq 22 ] && [ "$minor" -ge 22 ]; then return 0; fi
+    if [ "$major" -eq 24 ] && [ "$minor" -ge 11 ]; then return 0; fi
+    if [ "$major" -ge 26 ]; then return 0; fi
     return 1
 }
 
@@ -963,7 +965,7 @@ check_node() {
     if command -v node &> /dev/null && ! command -v npm &> /dev/null; then
         log_warn "node found but npm is not on PATH (stray node symlink?) — installing Hermes-managed Node $NODE_VERSION LTS..."
     elif command -v node &> /dev/null; then
-        log_warn "Node.js $(node --version) is too old (Hermes requires Node >=26) — installing Hermes-managed Node $NODE_VERSION..."
+        log_warn "Node.js $(node --version) is unsupported (Hermes requires Node 22.22+, 24.11+, or 26+) — installing Hermes-managed Node $NODE_VERSION..."
     elif [ "$DISTRO" = "termux" ]; then
         log_info "Node.js not found — installing Node.js via pkg..."
     else
@@ -977,9 +979,18 @@ install_node() {
         log_info "Installing Node.js via pkg..."
         if pkg install -y nodejs >/dev/null; then
             local installed_ver
-            installed_ver=$(node --version 2>/dev/null)
-            log_success "Node.js $installed_ver installed via pkg"
-            HAS_NODE=true
+            installed_ver=$(node --version 2>/dev/null || true)
+            if [ -n "$installed_ver" ]; then
+                log_success "Node.js $installed_ver installed via pkg"
+                HAS_NODE=true
+            else
+                # pkg succeeded but the binary cannot start — the same
+                # silent-success class the managed-download probe guards
+                # against (#87460). Degrade instead of claiming success.
+                log_error "Node.js installed via pkg failed to start:"
+                node --version >&2 || true
+                HAS_NODE=false
+            fi
         else
             log_warn "Failed to install Node.js via pkg"
             HAS_NODE=false
@@ -1070,6 +1081,21 @@ install_node() {
     mv "$extracted_dir" "$HERMES_HOME/node"
     rm -rf "$tmp_dir"
 
+    # Node's official linux-x64 builds (observed: v26.7.0) link
+    # libatomic.so.1, which minimal Debian/Ubuntu images do not ship —
+    # the freshly downloaded binary then fails to start. Install the
+    # library up front, best-effort; the version probe below reports
+    # clearly if the binary still cannot run (#87460).
+    if [ "$OS" = "linux" ] && { [ "$DISTRO" = "ubuntu" ] || [ "$DISTRO" = "debian" ]; }; then
+        if command -v apt-get >/dev/null 2>&1; then
+            local sudo_cmd=""
+            if [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ]; then
+                command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+            fi
+            $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libatomic1 >/dev/null 2>&1 || true
+        fi
+    fi
+
     local node_link_dir
     node_link_dir="$(get_command_link_dir)"
     mkdir -p "$node_link_dir"
@@ -1082,7 +1108,24 @@ install_node() {
     export PATH="$HERMES_HOME/node/bin:$PATH"
 
     local installed_ver
-    installed_ver=$("$HERMES_HOME/node/bin/node" --version 2>/dev/null)
+    if ! installed_ver=$("$HERMES_HOME/node/bin/node" --version 2>&1); then
+        # The downloaded Node exists but cannot start (observed: Node 26
+        # linux-x64 binaries link libatomic.so.1, missing on minimal
+        # Debian/Ubuntu). Under set -e this assignment used to abort the
+        # whole installer at exit 127 with the loader's explanation
+        # discarded by 2>/dev/null — installs died mid-sentence with no
+        # output at all (#87460). Degrade instead, and surface the real
+        # error the loader printed. Remove the broken tree and the bin
+        # links so later steps and retry runs start clean instead of
+        # resolving `node` to a binary that cannot start.
+        log_error "Downloaded Node.js failed to start:"
+        printf '%s\n' "$installed_ver" >&2
+        log_info "On Debian/Ubuntu the usual fix is: sudo apt-get install -y libatomic1"
+        rm -rf "$HERMES_HOME/node"
+        rm -f "$node_link_dir/node" "$node_link_dir/npm" "$node_link_dir/npx"
+        HAS_NODE=false
+        return 0
+    fi
     log_success "Node.js $installed_ver installed to ~/.hermes/node/"
     HAS_NODE=true
 }
@@ -1468,7 +1511,57 @@ EOF
         else
             rm -rf "$INSTALL_DIR" 2>/dev/null  # Clean up partial SSH clone
             log_info "SSH failed, trying HTTPS..."
-            if git clone --depth 1 --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
+            # GitHub throttles packfile generation for large repos (this one:
+            # ~9.6k files at HEAD plus thousands of auto-generated branches)
+            # with repo-scoped HTTP 429s that are NOT client IP rate limits —
+            # an anonymous clone of a small repo succeeds and the API quota
+            # is untouched, but the single big pack behind `--depth 1` dies
+            # mid-transfer with "RPC failed; HTTP 429 / expected 'packfile'"
+            # (#89624, same throttle as the update path in #89287). Retry
+            # with backoff, then degrade to a blobless partial clone + fetch
+            # (many small packs instead of one big one — what gets past the
+            # throttle). Fully materialize the tree afterwards so the rest of
+            # the installer sees the normal files.
+            local clone_ok=false
+            local attempt=0
+            local max_attempts=4
+            for attempt in $(seq 1 "$max_attempts"); do
+                [ "$attempt" -gt 1 ] && log_info "Retrying HTTPS clone (attempt $attempt/$max_attempts)..."
+                if git clone --depth 1 --single-branch --branch "$BRANCH" \
+                     "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
+                    clone_ok=true
+                    break
+                fi
+                rm -rf "$INSTALL_DIR" 2>/dev/null  # partial clone is unusable
+                [ "$attempt" -lt "$max_attempts" ] && sleep $((attempt * 5))
+            done
+            if [ "$clone_ok" != true ]; then
+                log_info "Direct clone throttled — trying blobless partial clone..."
+                # --no-checkout keeps the clone itself to commits+trees (small,
+                # gets past the pack throttle). Without it the blob fetch runs
+                # inside `git clone`'s own checkout step, the throttle kills
+                # the whole clone, and this fallback degrades to one more
+                # failed clone. The blobs are fetched by the reset below — a
+                # separate request the retry can actually wrap.
+                if git clone --depth 1 --single-branch --filter=blob:none \
+                     --no-checkout --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
+                    # Materialize the working tree: on a --no-checkout clone
+                    # this reset is the step that fetches the blobs (several
+                    # small packs instead of one big one). Fail closed — a
+                    # half-materialized checkout must not report success and
+                    # hand the rest of the installer an unusable tree.
+                    if (cd "$INSTALL_DIR" \
+                        && (git reset --hard HEAD >/dev/null 2>&1 \
+                            || { sleep 5; git reset --hard HEAD >/dev/null 2>&1; })); then
+                        clone_ok=true
+                    else
+                        rm -rf "$INSTALL_DIR" 2>/dev/null  # unusable checkout
+                    fi
+                else
+                    rm -rf "$INSTALL_DIR" 2>/dev/null
+                fi
+            fi
+            if [ "$clone_ok" = true ]; then
                 log_success "Cloned via HTTPS"
             else
                 log_error "Failed to clone repository"
@@ -1569,6 +1662,30 @@ setup_venv() {
     fi
 
     log_success "Virtual environment ready (Python $PYTHON_VERSION)"
+}
+
+run_locked_uv_sync() {
+    # Bootstrap uv calls stay isolated from ambient config via UV_NO_CONFIG
+    # (#21269). A locked project sync is different: uv.lock records resolver
+    # settings from this checkout's [tool.uv], so hiding pyproject.toml makes
+    # uv 0.12+ reject the valid lock. Re-enable project discovery only for
+    # this subprocess while redirecting user/system config lookups to an empty
+    # directory. Keep HOME unchanged so caches, credentials, and git continue
+    # to work normally.
+    local project_env="$1"
+    local isolated_uv_config
+    local sync_rc
+    isolated_uv_config="$(mktemp -d)" || return 1
+
+    (
+        unset UV_NO_CONFIG UV_CONFIG_FILE
+        export XDG_CONFIG_HOME="$isolated_uv_config"
+        export XDG_CONFIG_DIRS="$isolated_uv_config"
+        UV_PROJECT_ENVIRONMENT="$project_env" $UV_CMD sync --extra all --locked
+    )
+    sync_rc=$?
+    rmdir "$isolated_uv_config" 2>/dev/null || true
+    return "$sync_rc"
 }
 
 install_deps() {
@@ -1709,7 +1826,20 @@ install_deps() {
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
+        #
+        # Run the Tier-0 locked sync via run_locked_uv_sync: the global
+        # UV_NO_CONFIG export at script start (the #21269 sudo -u hygiene
+        # guard) also hides the project's own [tool.uv] policy —
+        # exclude-newer, its package exemptions, and override-dependencies —
+        # from uv. The resolver then runs under a different policy than the
+        # one uv.lock was resolved under, and --locked turns that mismatch
+        # fatal, so every fresh install fell through to the non-hash-verified
+        # PyPI tiers. The helper re-enables project config discovery for this
+        # one subprocess while keeping ambient user/system uv config hidden
+        # (redirected to an empty XDG dir), preserving the #21269 guarantee.
+        # Runtime code does the same before its locked syncs
+        # (hermes_cli/managed_uv.py).
+        if run_locked_uv_sync "$INSTALL_DIR/venv"; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
@@ -2089,7 +2219,7 @@ copy_config_templates() {
     # here is self-healing, but keep them in sync to avoid a churn on first run.
     if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
         cat > "$HERMES_HOME/SOUL.md" << 'SOUL_EOF'
-You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.
+You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of the ask — a one-line question gets a one-line answer, and finished work gets a short report of what changed, what's verified, and what's left, never a replay of the process. No filler ("Great question," "I'd be happy to"), no restating the request back, no re-summarizing what you already said, no narrating tool calls the user can see. Plain claims over adjectives; when unsure, say so plainly. Agree because it's right, not because the user said it. Depth is earned — give it when the user asks for detail, teaches, or the stakes demand it, not by default.
 SOUL_EOF
         log_success "Created ~/.hermes/SOUL.md (edit to customize personality)"
     fi
@@ -2401,6 +2531,36 @@ configure_browser_env_from_system_browser() {
     log_success "Configured browser tools to use $browser_path"
 }
 
+# Select the npm workspaces a CLI install actually needs, into the
+# NODE_DEPS_WORKSPACE_ARGS array.
+#
+# A bare `npm install` at the repo root resolves package.json's `apps/*`
+# glob, which materializes apps/desktop — and with it node-pty, which ships
+# no Linux prebuild and falls back to `node-gyp rebuild`. On a host without
+# make/gcc that rebuild fails, and since #85297 made a failed npm install
+# fatal it aborts the whole install of a machine that will never launch
+# Electron or a PTY addon (#38311, #38772). Desktop dependencies are
+# installed by install_desktop(), reachable only via --include-desktop.
+#
+# Naming ui-tui/web excludes the unnamed apps/* workspaces, and
+# --include-workspace-root keeps the root's own devDependencies (the shared
+# ESLint flat config each workspace imports) from being pruned by the scoped
+# install — the same closure `hermes update` installs
+# (hermes_cli/main.py::_update_node_dependencies). Prebuilt/partial checkouts
+# can lack a workspace, and naming a missing one makes npm fail hard, so fall
+# back to a root-only install that still skips apps/*.
+node_deps_workspace_args() {
+    local install_dir="$1"
+    NODE_DEPS_WORKSPACE_ARGS=()
+    [ -f "$install_dir/ui-tui/package.json" ] && NODE_DEPS_WORKSPACE_ARGS+=(--workspace ui-tui)
+    [ -f "$install_dir/web/package.json" ] && NODE_DEPS_WORKSPACE_ARGS+=(--workspace web)
+    if [ "${#NODE_DEPS_WORKSPACE_ARGS[@]}" -eq 0 ]; then
+        NODE_DEPS_WORKSPACE_ARGS=(--workspaces=false)
+        return 0
+    fi
+    NODE_DEPS_WORKSPACE_ARGS+=(--include-workspace-root)
+}
+
 install_node_deps() {
     if [ "$HAS_NODE" = false ]; then
         log_info "Skipping Node.js dependencies (Node not installed)"
@@ -2423,9 +2583,12 @@ install_node_deps() {
         # installed", hiding the degradation from the user (#77003). Now it
         # fails the install outright instead of burying the warning (#85297).
         # Capture npm output so failures are diagnosable (#87340).
+        # Scoped to the workspaces a CLI install needs so apps/desktop's
+        # node-pty is never built here — see node_deps_workspace_args().
+        node_deps_workspace_args "$INSTALL_DIR"
         local npm_log
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install "${NODE_DEPS_WORKSPACE_ARGS[@]}" --silent \
                 >"$npm_log" 2>&1; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then
@@ -3219,8 +3382,8 @@ install_desktop() {
     # failure, not a silent skip — a silent skip yields a "complete" install
     # with no app and a confusing "couldn't find a built desktop" at launch.
     # Always re-resolve Node here. Stages run in separate processes, so we can't
-    # trust an earlier check; more importantly check_node now enforces the build
-    # floor (Node >=26) and prepends the Hermes-managed Node to PATH, so
+    # trust an earlier check; more importantly check_node now enforces the
+    # supported Node lines and prepends the Hermes-managed Node to PATH, so
     # the build never runs on a too-old system Node — the cause of the opaque
     # "Build desktop app … exit code 1" failure (Vite crashes on old Node).
     check_node
