@@ -22,8 +22,8 @@ import run_improve_loop as rl
 import score_hermes_skill_run as score
 
 _ALLOWED_VERDICTS = {"better", "equal", "worse"}
-MAX_PROPOSAL_CHARS = 30_000
-MAX_CANDIDATE_CHARS = 30_000
+MAX_PROPOSAL_CHARS = 8_000
+MAX_CANDIDATE_CHARS = 50_000
 _CREDENTIALS = tuple(pattern for pattern, _label in pzc.CRED_PATTERNS)
 _PATCH_SYNTAX = re.compile(
     r"(?im)^(?:[ \t]*(?:`{3,}|~{3,})[ \t]*(?:diff|patch)\b.*$|"

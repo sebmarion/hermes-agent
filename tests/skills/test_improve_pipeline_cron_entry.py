@@ -102,6 +102,7 @@ def test_unreadable_pending_queue_does_not_advance_session_watermark(tmp_path: P
     assert report["watermark_sessions"] == 0
     assert report["n_failures_new"] == 0
     assert writes == []
+    assert (tmp_path / "pending_failures.jsonl").read_text() == "not-json\n"
 
 
 def test_cron_harvests_real_session_rows_before_halting_live_chain(
@@ -113,6 +114,7 @@ def test_cron_harvests_real_session_rows_before_halting_live_chain(
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path=db_path)
     db.create_session("real-session-0001", source="cli", model="test")
+    db.set_session_title("real-session-0001", "BestPlan repair")
     db.append_message("real-session-0001", role="user", content="repair the skill")
     db.append_message("real-session-0001", role="assistant", content="ERROR: the check failed")
     db.end_session("real-session-0001", "done")
@@ -141,6 +143,7 @@ def test_cron_hands_harvested_failures_to_live_chain(tmp_path: Path, monkeypatch
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path=db_path)
     db.create_session("real-session-0002", source="cli", model="test")
+    db.set_session_title("real-session-0002", "BestPlan repair")
     db.append_message("real-session-0002", role="user", content="repair the skill")
     db.append_message("real-session-0002", role="assistant", content="ERROR: the check failed")
     db.end_session("real-session-0002", "done")
@@ -200,7 +203,7 @@ def test_cron_includes_actionable_bookmarks_in_luna_research_context(
             {
                 "id": "real-session-bookmark-context",
                 "seq": 1,
-                "title": "repair",
+                "title": "BestPlan repair",
                 "body": "ERROR: the check failed",
             }
         ],
@@ -355,6 +358,7 @@ def test_cron_caps_live_candidates_and_persists_remaining_queue(tmp_path: Path, 
     for index in (1, 2):
         sid = f"real-session-00{index:02d}"
         db.create_session(sid, source="cli", model="test")
+        db.set_session_title(sid, f"BestPlan repair {index}")
         db.append_message(sid, role="user", content="repair the skill")
         db.append_message(sid, role="assistant", content=f"ERROR: check {index} failed")
         db.end_session(sid, "done")
@@ -385,6 +389,179 @@ def test_cron_caps_live_candidates_and_persists_remaining_queue(tmp_path: Path, 
     assert len(pending) == 1
 
 
+def test_failure_scope_gate_uses_title_not_untrusted_transcript() -> None:
+    assert entry._failure_targets_skill(
+        {"task_title": "BestPlan timeout", "task_instructions": "ordinary failure"},
+        "bestplan",
+    )
+    assert not entry._failure_targets_skill(
+        {
+            "task_title": "Comandero timeout",
+            "task_instructions": "system context mentions BestPlan repeatedly",
+        },
+        "bestplan",
+    )
+    assert not entry._failure_targets_skill(
+        {"task_title": "BestPlanner timeout", "task_instructions": "ordinary failure"},
+        "bestplan",
+    )
+
+
+def test_scope_partition_keeps_targeted_rows_and_returns_safe_dispositions() -> None:
+    targeted, dispositions = entry._partition_failures_for_skill(
+        [
+            {
+                "task_id": "task_deadbeef",
+                "task_title": "BestPlan timeout",
+                "task_instructions": "failure evidence",
+            },
+            {
+                "task_id": "task_cafebabe",
+                "task_title": "Comandero timeout",
+                "task_instructions": "sensitive transcript body",
+            },
+        ],
+        "bestplan",
+    )
+
+    assert [row["task_id"] for row in targeted] == ["task_deadbeef"]
+    assert dispositions == [
+        {
+            "schema_version": 1,
+            "task_id": "task_cafebabe",
+            "disposition": "out_of_scope",
+            "target_skill": "bestplan",
+            "reason": "task title does not explicitly target the skill",
+        }
+    ]
+    assert "task_instructions" not in dispositions[0]
+
+
+def test_scope_partition_rejects_missing_task_id() -> None:
+    with pytest.raises(ValueError, match="task_id"):
+        entry._partition_failures_for_skill(
+            [{"task_title": "BestPlan timeout", "task_instructions": "failure"}],
+            "bestplan",
+        )
+
+
+def test_atomic_queue_write_preserves_original_when_writer_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    queue = tmp_path / "pending_failures.jsonl"
+    queue.write_text("original\n")
+
+    def torn_write(path, _rows):
+        path.write_text("partial\n")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(entry.hf, "write_facts", torn_write)
+
+    with pytest.raises(OSError, match="disk full"):
+        entry._write_facts_atomic(queue, [])
+
+    assert queue.read_text() == "original\n"
+    assert list(tmp_path.glob("pending_failures.jsonl.*.tmp")) == []
+
+
+def test_cron_disposes_out_of_scope_backlog_and_drains_targeted_block(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    pending = [
+        {
+            "task_id": "task_deadbeef",
+            "task_title": "BestPlan timeout",
+            "task_instructions": "failure evidence",
+            "failure_signature": "timeout",
+            "before_session_ids": ["real-session-bestplan"],
+        },
+        {
+            "task_id": "task_cafebabe",
+            "task_title": "Comandero timeout",
+            "task_instructions": "other failure evidence",
+            "failure_signature": "timeout",
+            "before_session_ids": ["real-session-other"],
+        },
+    ]
+    entry.hf.write_facts(state_dir / "pending_failures.jsonl", pending)
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path=db_path).close()
+    skill = tmp_path / "skills" / "software-development" / "bestplan" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: bestplan\ndescription: test\n---\n# BestPlan\n")
+    monkeypatch.setattr(hx, "fetch_bookmarks", lambda _n: [])
+    monkeypatch.setattr(
+        entry,
+        "run_live_chain",
+        lambda **kwargs: {
+            "ok": True,
+            "halted": False,
+            "applied": [],
+            "blocked": [kwargs["failures"][0]["task_id"]],
+            "notes": [],
+            "summary": "0 applied, 1 blocked",
+        },
+    )
+
+    assert entry.main(
+        [
+            "entry",
+            "--state-dir",
+            str(state_dir),
+            "--db-path",
+            str(db_path),
+            "--live-skills",
+            str(tmp_path / "skills"),
+            "--skill-path",
+            str(skill),
+        ]
+    ) == 0
+
+    assert (state_dir / "pending_failures.jsonl").read_text() == ""
+    dispositions = [
+        json.loads(line)
+        for line in (state_dir / "failure-dispositions.jsonl").read_text().splitlines()
+    ]
+    assert [row["task_id"] for row in dispositions] == ["task_cafebabe"]
+    report = json.loads(next(state_dir.glob("report-*.json")).read_text())
+    assert report["n_failures_out_of_scope"] == 1
+    assert report["n_failures_pending"] == 0
+
+
+def test_red_live_chain_keeps_every_selected_task_queued(
+    tmp_path: Path, monkeypatch
+) -> None:
+    pending_path = tmp_path / "pending_failures.jsonl"
+    row = {
+        "task_id": "task_deadbeef",
+        "task_title": "BestPlan timeout",
+        "task_instructions": "failure evidence",
+        "failure_signature": "timeout",
+        "before_session_ids": ["real-session-bestplan"],
+    }
+    entry.hf.write_facts(pending_path, [row])
+    monkeypatch.setattr(entry.hf, "load_hermes_sessions", lambda _db_path=None: [])
+    monkeypatch.setattr(hx, "fetch_bookmarks", lambda _n: [])
+    monkeypatch.setattr(
+        entry,
+        "run_live_chain",
+        lambda **_kwargs: {
+            "ok": False,
+            "halted": True,
+            "applied": [],
+            "blocked": [row["task_id"]],
+            "notes": ["aggregate apply failed"],
+            "summary": "0 applied, 1 blocked",
+        },
+    )
+
+    assert entry.main(["entry", "--state-dir", str(tmp_path)]) == 1
+    queued = [json.loads(line) for line in pending_path.read_text().splitlines()]
+    assert [item["task_id"] for item in queued] == [row["task_id"]]
+
+
 def test_cron_promotes_accepted_skill_changes(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(entry, "DEFAULT_STATE_DIR", tmp_path)
     monkeypatch.setattr(hx, "fetch_bookmarks", lambda _n: [])
@@ -392,6 +569,7 @@ def test_cron_promotes_accepted_skill_changes(tmp_path: Path, monkeypatch) -> No
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path=db_path)
     db.create_session("real-session-0003", source="cli", model="test")
+    db.set_session_title("real-session-0003", "BestPlan repair")
     db.append_message("real-session-0003", role="user", content="repair the skill")
     db.append_message("real-session-0003", role="assistant", content="ERROR: check failed")
     db.end_session("real-session-0003", "done")
@@ -451,6 +629,7 @@ def test_failed_promotion_restores_skill_and_keeps_task_queued(
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path=db_path)
     db.create_session("real-session-0004", source="cli", model="test")
+    db.set_session_title("real-session-0004", "BestPlan repair")
     db.append_message("real-session-0004", role="user", content="repair the skill")
     db.append_message("real-session-0004", role="assistant", content="ERROR: check failed")
     db.end_session("real-session-0004", "done")
@@ -515,6 +694,7 @@ def test_activation_failure_does_not_requeue_successfully_promoted_task(
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path=db_path)
     db.create_session("real-session-0005", source="cli", model="test")
+    db.set_session_title("real-session-0005", "BestPlan repair")
     db.append_message("real-session-0005", role="user", content="repair the skill")
     db.append_message("real-session-0005", role="assistant", content="ERROR: check failed")
     db.end_session("real-session-0005", "done")

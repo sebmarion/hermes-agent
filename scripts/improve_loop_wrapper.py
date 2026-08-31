@@ -42,6 +42,7 @@ TOOL_PATHS = (
     Path.home() / ".local" / "bin",
     Path.home() / "tools" / "node-v22.23.2-linux-x64" / "bin",
 )
+IMPROVE_TIMEOUT_SECONDS = 3600
 
 
 def _child_env() -> dict[str, str]:
@@ -102,7 +103,7 @@ def main(argv=None) -> int:
                 encoding="utf-8",
                 errors="replace",
                 env=_child_env(),
-                timeout=1200,
+                timeout=IMPROVE_TIMEOUT_SECONDS,
             )
         except (subprocess.SubprocessError, OSError) as exc:
             print(f"ERROR: improve loop failed to run: {exc}", file=sys.stderr)

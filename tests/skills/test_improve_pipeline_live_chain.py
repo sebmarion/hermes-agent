@@ -414,7 +414,7 @@ def test_live_chain_blocks_empty_proposal_and_continues_batch(tmp_path: Path) ->
     assert len(applied) == 1
 
 
-def test_live_chain_stops_batch_before_core_budget_overflow(tmp_path: Path) -> None:
+def test_live_chain_allows_bounded_addition_to_large_valid_baseline(tmp_path: Path) -> None:
     live = tmp_path / "skills"
     target = live / "software-development" / "bestplan" / "SKILL.md"
     target.parent.mkdir(parents=True)
@@ -443,10 +443,10 @@ def test_live_chain_stops_batch_before_core_budget_overflow(tmp_path: Path) -> N
 
     assert report["ok"] is True
     assert report["halted"] is False
-    assert report["applied"] == []
-    assert report["blocked"] == ["task_1234abcd"]
-    assert applied == []
-    assert judge_calls == []
+    assert report["applied"] == ["task_1234abcd"]
+    assert report["blocked"] == []
+    assert len(applied) == 1
+    assert len(judge_calls) == 1
 
 
 def test_live_chain_blocks_oversized_proposal_before_judging(tmp_path: Path) -> None:

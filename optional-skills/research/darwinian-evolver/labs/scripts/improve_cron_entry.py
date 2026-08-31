@@ -26,6 +26,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,7 @@ ACTIVATION_REQUEST_SCRIPT = (
 
 _JUDGE_TASK = "moa_reference"
 _LUNA_MODEL = "gpt-5.6-luna"
+_TASK_ID_RE = re.compile(r"^task_[0-9a-f]{8}$")
 _JUDGE_RESPONSE_FORMAT = {
     "response_format": {
         "type": "json_schema",
@@ -157,6 +159,73 @@ def _failure_class_key(row: dict) -> tuple[str, str, str]:
         normalize(row.get("task_title"), 240),
         hashlib.sha256(instructions.encode("utf-8")).hexdigest(),
     )
+
+
+def _failure_targets_skill(row: dict, skill_name: str) -> bool:
+    """Require explicit title evidence before editing one named skill."""
+    title = str(row.get("task_title") or "").casefold()
+    normalized_name = str(skill_name or "").strip().casefold()
+    if not normalized_name:
+        return False
+    return re.search(
+        rf"(?<![a-z0-9]){re.escape(normalized_name)}(?![a-z0-9])", title
+    ) is not None
+
+
+def _partition_failures_for_skill(
+    rows: list[dict], skill_name: str
+) -> tuple[list[dict], list[dict]]:
+    """Separate actionable rows from auditable, transcript-free dispositions."""
+    targeted = []
+    dispositions = []
+    for row in rows:
+        task_id = row.get("task_id")
+        if not isinstance(task_id, str) or not _TASK_ID_RE.fullmatch(task_id):
+            raise ValueError("pending failure row has malformed task_id")
+        if _failure_targets_skill(row, skill_name):
+            targeted.append(row)
+            continue
+        dispositions.append(
+            {
+                "schema_version": 1,
+                "task_id": task_id,
+                "disposition": "out_of_scope",
+                "target_skill": skill_name,
+                "reason": "task title does not explicitly target the skill",
+            }
+        )
+    return targeted, dispositions
+
+
+def _write_facts_atomic(path: Path, rows: list[dict]) -> None:
+    """Replace one JSONL state file only after its complete rewrite succeeds."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=path.parent
+    )
+    os.close(fd)
+    tmp = Path(raw_tmp)
+    try:
+        hf.write_facts(tmp, rows)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _record_dispositions(path: Path, rows: list[dict]) -> None:
+    """Atomically extend the disposition ledger without duplicate task rows."""
+    existing = _load_pending(path)
+    seen = {
+        (row.get("task_id"), row.get("disposition"), row.get("target_skill"))
+        for row in existing
+    }
+    merged = list(existing)
+    for row in rows:
+        key = (row.get("task_id"), row.get("disposition"), row.get("target_skill"))
+        if key not in seen:
+            seen.add(key)
+            merged.append(row)
+    _write_facts_atomic(path, merged)
 
 
 def _merge_failures(pending: list[dict], new: list[dict]) -> list[dict]:
@@ -289,6 +358,7 @@ def main(argv) -> int:
         "watermark_bookmarks": None,
         "n_failures_new": 0,
         "n_failures_pending": 0,
+        "n_failures_out_of_scope": 0,
         "n_bookmarks_actionable": 0,
         "halted": False,
         "notes": [],
@@ -305,22 +375,37 @@ def main(argv) -> int:
     # Step 1: harvest session failures from the canonical Hermes state DB.
     wm = ps.read_watermark(state_dir, "sessions") or 0
     report["watermark_sessions"] = wm
+    failures = list(pending)
     try:
-        sessions = [] if report["halted"] else hf.load_hermes_sessions(args.db_path)
+        if report["halted"]:
+            raise RuntimeError("pending failure queue is unavailable")
+        sessions = hf.load_hermes_sessions(args.db_path)
         new_failures = hf.extract_failures(sessions, watermark_seq=wm)
         failures = _merge_failures(pending, new_failures)
         failures_path = state_dir / "failures.jsonl"
         hf.write_facts(failures_path, new_failures)
+        skill_name = args.skill_path.parent.name
+        failures, dispositions = _partition_failures_for_skill(failures, skill_name)
+        if dispositions:
+            _record_dispositions(
+                state_dir / "failure-dispositions.jsonl", dispositions
+            )
+        _write_facts_atomic(pending_path, failures)
         max_seq = max((int(row["seq"]) for row in sessions), default=wm)
         if not report["halted"]:
             ps.write_watermark(state_dir, "sessions", max(max_seq, wm))
         report["watermark_sessions"] = max(max_seq, wm)
         report["n_failures_new"] = len(new_failures)
         report["n_failures_pending"] = len(failures)
+        report["n_failures_out_of_scope"] = len(dispositions)
         report["steps"].append(
             f"harvest_failures: {len(sessions)} completed sessions, "
             f"{len(new_failures)} new failures, {len(failures)} queued"
         )
+        if dispositions:
+            report["steps"].append(
+                f"scope_gate: {len(dispositions)} failures recorded out of scope"
+            )
     except Exception as exc:  # noqa: BLE001 - state failures must halt closed
         report["steps"].append("harvest_failures: failed")
         report["notes"].append(f"session DB harvest failed: {exc}")
@@ -382,11 +467,19 @@ def main(argv) -> int:
                 report["ok"] = False
                 report["halted"] = True
                 report["notes"].extend(chain.get("notes", []))
-            processed_ids = {str(task_id) for task_id in chain.get("blocked", [])}
-            applied_ids = {str(task_id) for task_id in chain.get("applied", [])}
+            processed_ids = (
+                {str(task_id) for task_id in chain.get("blocked", [])}
+                if chain.get("ok")
+                else set()
+            )
+            applied_ids = (
+                {str(task_id) for task_id in chain.get("applied", [])}
+                if chain.get("ok")
+                else set()
+            )
             if chain.get("ok") and not applied_ids and not chain.get("blocked"):
                 processed_ids.update(str(row.get("task_id")) for row in selected_failures)
-            if chain.get("applied"):
+            if applied_ids:
                 repo = None
                 target_rel = None
                 promotion_succeeded = False
@@ -435,7 +528,7 @@ def main(argv) -> int:
             pending = [
                 row for row in failures if str(row.get("task_id")) not in processed_ids
             ]
-            hf.write_facts(pending_path, pending)
+            _write_facts_atomic(pending_path, pending)
             report["n_failures_pending"] = len(pending)
             if pending:
                 report["steps"].append(f"pending_failures: {len(pending)} remain queued")
@@ -444,7 +537,7 @@ def main(argv) -> int:
             report["ok"] = False
             report["halted"] = True
             try:
-                hf.write_facts(pending_path, failures)
+                _write_facts_atomic(pending_path, failures)
                 report["n_failures_pending"] = len(failures)
             except (OSError, TypeError, ValueError) as queue_exc:
                 report["notes"].append(f"pending failure queue could not be saved: {queue_exc}")

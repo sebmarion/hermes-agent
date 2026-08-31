@@ -190,6 +190,12 @@ def test_improve_loop_child_path_contains_ocr_and_hermes_tool_dirs() -> None:
     assert shutil.which("ocr", path=child_env["PATH"])
 
 
+def test_improve_loop_allows_one_full_bounded_model_batch() -> None:
+    wrapper = _load_improve_wrapper()
+
+    assert wrapper.IMPROVE_TIMEOUT_SECONDS >= 3600
+
+
 def test_activation_verifier_delegates_to_dual_repo_coordinator() -> None:
     script = ACTIVATION_VERIFIER.read_text()
 
