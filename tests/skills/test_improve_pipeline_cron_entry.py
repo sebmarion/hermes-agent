@@ -295,6 +295,7 @@ def test_independent_judge_uses_auxiliary_moa_reference_and_returns_actual_model
     assert calls[0]["task"] == "moa_reference"
     assert calls[0]["provider"] == "openrouter"
     assert calls[0]["model"] == "deepseek/deepseek-v4-flash-0731"
+    assert calls[0]["timeout"] == entry.JUDGE_TIMEOUT_SECONDS
     response_format = calls[0]["extra_body"]["response_format"]
     assert response_format["type"] == "json_schema"
     schema = response_format["json_schema"]["schema"]

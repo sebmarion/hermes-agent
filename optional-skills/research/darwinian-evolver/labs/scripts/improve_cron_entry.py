@@ -55,6 +55,7 @@ ACTIVATION_REQUEST_SCRIPT = (
 
 _JUDGE_TASK = "moa_reference"
 _LUNA_MODEL = "gpt-5.6-luna"
+JUDGE_TIMEOUT_SECONDS = 90
 _TASK_ID_RE = re.compile(r"^task_[0-9a-f]{8}$")
 _JUDGE_RESPONSE_FORMAT = {
     "response_format": {
@@ -114,6 +115,7 @@ def _call_independent_judge(prompt: str, provider: str, model: str) -> tuple[str
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
+        timeout=JUDGE_TIMEOUT_SECONDS,
         extra_body=_JUDGE_RESPONSE_FORMAT,
     )
     choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
