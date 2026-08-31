@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -183,6 +184,58 @@ def test_stage_rejects_missing_real_session_evidence(tmp_path: Path) -> None:
 def test_call_zeus_rejects_plain_http_public_endpoint() -> None:
     with pytest.raises(ValueError, match="HTTPS"):
         pzc._validate_base_url("http://evil.example/v1")
+
+
+def test_call_luna_uses_existing_openai_codex_route(monkeypatch) -> None:
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="## Candidate\n", stderr="")
+
+    monkeypatch.setattr(pzc.shutil, "which", lambda _name: "hermes")
+    monkeypatch.setattr(pzc.subprocess, "run", fake_run)
+
+    result = pzc.call_luna("repair the concrete failure")
+
+    assert result == "## Candidate"
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert argv == [
+        "hermes",
+        "-z",
+        "repair the concrete failure",
+        "--provider",
+        "openai-codex",
+        "--model",
+        "gpt-5.6-luna",
+        "--reasoning",
+        "low",
+        "--toolsets",
+        "search",
+        "--safe-mode",
+        "--ignore-rules",
+        "--in",
+        "/tmp",
+    ]
+    assert kwargs["timeout"] == 180
+    assert kwargs["capture_output"] is True
+    assert kwargs["text"] is True
+    assert kwargs["check"] is False
+
+
+def test_call_luna_fails_closed_on_empty_or_failed_output(monkeypatch) -> None:
+    monkeypatch.setattr(pzc.shutil, "which", lambda _name: "hermes")
+    monkeypatch.setattr(
+        pzc.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout="", stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Luna proposal failed"):
+        pzc.call_luna("repair the concrete failure")
 
 
 # ---------------------------------------------------------------------------

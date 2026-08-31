@@ -4,19 +4,19 @@
 This closes the gap between "we found a failure" and "here is a candidate SKILL
 edit". It REUSES the existing pilot conventions:
 
-  - Qualify Zeus first (reuse qualify_zeus_researcher's endpoint/credential
-    posture), fail-closed.
-  - Send each harvested failure to Zeus (OpenAI-compatible chat/completions) as
-    the proposer prompt -> returns a candidate improvement for the target skill.
+  - Qualify the configured proposer route first, fail-closed.
+  - Send each harvested failure to the proposer as a prompt -> returns a
+    candidate improvement for the target skill. The scheduled improve loop uses
+    Hermes' existing Luna route; the standalone CLI retains the Zeus route.
   - Stage baseline + candidate + frozen judge-prompt hash under runs/<id>/,
     exactly like the pilot run layout, and emit dataset.jsonl rows conforming to
     hermes_skill_dataset.schema.json with deterministic blind_id assignment.
 
 The PURE core (`build_proposer_prompt`, `stage_run`) is fully offline-tested.
-Only `call_zeus()` touches the network; it is never called during tests and is
-behind a guarded code path / subprocess boundary. The A/B judge itself is still
-dispatched by Hermes (delegate_task mode=review) per the runbook — this script
-produces everything the judge needs but does not itself invoke another model.
+The model calls are guarded network/subprocess boundaries and are never called
+during unit tests. The A/B judge itself is still dispatched by Hermes
+(delegate_task mode=review) per the runbook — this script produces everything
+the judge needs but does not itself invoke another model.
 """
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ import ipaddress
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
@@ -210,6 +212,43 @@ def call_zeus(base_url: str, api_key: str, model: str, prompt: str, timeout: flo
         return payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"unexpected chat response shape: {exc}")
+
+
+def call_luna(prompt: str, timeout: float = 180.0) -> str:
+    """Run one proposal through Hermes' existing OpenAI Codex Luna route."""
+    hermes = shutil.which("hermes")
+    if not hermes:
+        fallback = Path.home() / ".local" / "bin" / "hermes"
+        hermes = str(fallback) if fallback.is_file() else None
+    if not hermes:
+        raise RuntimeError("Hermes CLI unavailable for Luna proposal")
+
+    completed = subprocess.run(
+        [
+            hermes,
+            "-z",
+            prompt,
+            "--provider",
+            "openai-codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--reasoning",
+            "low",
+            "--toolsets",
+            "search",
+            "--safe-mode",
+            "--ignore-rules",
+            "--in",
+            "/tmp",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise RuntimeError(f"Luna proposal failed with exit {completed.returncode}")
+    return completed.stdout.strip()
 
 
 # ---------------------------------------------------------------------------

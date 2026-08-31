@@ -13,17 +13,20 @@ run offline on fixture dicts shaped like xurl bookmark records:
     {id, full_text, url}
 
 Safety: credential-shaped substrings are redacted before a bookmark can be
-written to disk. The CLI runs only `xurl bookmarks` as a read subprocess and
-never reads or writes ~/.xurl credentials.
+written to disk. The CLI first tries `xurl bookmarks` as a read subprocess,
+then uses a bounded read-only browser session if xurl is unavailable; neither
+path reads ~/.xurl credentials or writes to X.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Cheap actionability keywords: present => likely Hermes-actionable.
 # Deliberately narrow + lowercase so noise rarely passes the gate.
@@ -120,30 +123,215 @@ def write_sidecar(path: Path, records: list[dict]) -> int:
     return n
 
 
-def fetch_bookmarks(n: int = 50) -> list[dict]:
-    """Read-only fetch via `xurl bookmarks -n N --json`. Never touches ~/.xurl.
-    Raises RuntimeError on command, parse, or response-shape failure so callers
-    cannot confuse an unavailable X API with a valid empty result."""
+DEFAULT_X_CDP_URL = "http://127.0.0.1:9333"
+DEFAULT_X_PUBLISHER_ROOT = "/home/seb/.local/share/hermes-x-publisher"
+_BROWSER_TIMEOUT_SECONDS = 60
+_BROWSER_SCRIPT = r'''
+"use strict";
+
+const path = require("node:path");
+const cdpUrl = process.env.X_BOOKMARKS_CDP_URL;
+const publisherRoot = process.env.X_PUBLISHER_ROOT;
+const limit = Number.parseInt(process.env.X_BOOKMARKS_LIMIT || "", 10);
+
+if (!cdpUrl || !publisherRoot || !Number.isInteger(limit) || limit < 0) {
+  throw new Error("invalid browser harvest configuration");
+}
+
+function writeOutput(value) {
+  return new Promise((resolve, reject) => {
+    process.stdout.write(value, (error) => error ? reject(error) : resolve());
+  });
+}
+
+function recordsFromArticles(articles) {
+  return articles.map((article) => {
+    for (const node of article.querySelectorAll("a[href]")) {
+      let link;
+      try {
+        link = new URL(node.getAttribute("href"), "https://x.com");
+      } catch {
+        continue;
+      }
+      if (!["x.com", "www.x.com"].includes(link.hostname.toLowerCase())) continue;
+      const match = link.pathname.match(/^\/([^/]+)\/status\/([0-9]+)\/?$/);
+      if (!match) continue;
+      const tweetText = article.querySelector('[data-testid="tweetText"]');
+      return {
+        id: match[2],
+        full_text: (tweetText?.innerText || article.innerText || "").trim(),
+        url: `https://x.com/${match[1]}/status/${match[2]}`,
+      };
+    }
+    return null;
+  }).filter(Boolean);
+}
+
+async function run() {
+  if (limit === 0) {
+    await writeOutput("[]");
+    return;
+  }
+
+  const { chromium } = require(path.join(publisherRoot, "node_modules", "playwright-core"));
+  const browser = await chromium.connectOverCDP(cdpUrl);
+  const context = browser.contexts()[0];
+  if (!context) throw new Error("persistent browser has no default context");
+
+  const page = await context.newPage();
+  try {
+    await page.goto("https://x.com/i/bookmarks", {
+      waitUntil: "domcontentloaded",
+      timeout: 30_000,
+    });
+    await page.locator("article").first().waitFor({ state: "visible", timeout: 15_000 });
+
+    const records = new Map();
+    for (let round = 0; round < 24 && records.size < limit; round += 1) {
+      const batch = await page.locator("article").evaluateAll(recordsFromArticles);
+      for (const record of batch) {
+        if (!records.has(record.id)) records.set(record.id, record);
+      }
+      if (records.size >= limit) break;
+      await page.evaluate(() => window.scrollBy(0, Math.max(window.innerHeight * 0.8, 700)));
+      await page.waitForTimeout(750);
+    }
+    if (records.size === 0) throw new Error("no bookmark records found");
+    await writeOutput(JSON.stringify([...records.values()].slice(0, limit)));
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+run().then(
+  () => process.exit(0),
+  () => process.exit(1),
+);
+'''
+
+
+def _first_env(*names: str, default: str) -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return default
+
+
+def _validate_loopback_cdp_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise RuntimeError("browser CDP URL must be a loopback HTTP endpoint")
+    return value.rstrip("/")
+
+
+def _strict_bookmark_records(data, source: str, *, exact: bool = False) -> list[dict]:
+    if not isinstance(data, list) or not all(isinstance(record, dict) for record in data):
+        raise RuntimeError(f"{source} returned an unsupported bookmarks response")
+    for record in data:
+        bookmark_id = record.get("id")
+        if (
+            (exact and set(record) != {"id", "full_text", "url"})
+            or isinstance(bookmark_id, bool)
+            or not isinstance(bookmark_id, (int, str))
+            or not str(bookmark_id)
+            or not isinstance(record.get("full_text"), str)
+            or not isinstance(record.get("url"), str)
+        ):
+            raise RuntimeError(f"{source} returned an invalid bookmark record")
+    return data
+
+
+def _fetch_xurl_bookmarks(n: int) -> list[dict]:
     try:
         proc = subprocess.run(
-            ["xurl", "bookmarks", "-n", str(n), "--json"],
+            ["xurl", "bookmarks", "-n", str(n)],
             capture_output=True, text=True, timeout=60,
         )
-    except (subprocess.SubprocessError, FileNotFoundError) as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError("xurl unavailable") from exc
     if proc.returncode != 0:
         raise RuntimeError(f"xurl bookmarks failed with exit {proc.returncode}")
     try:
         data = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         raise RuntimeError("xurl returned invalid JSON") from exc
-    if isinstance(data, list):
-        return data
+    records = data if isinstance(data, list) else None
     # some versions nest under .bookmarks / .data
-    for key in ("bookmarks", "data"):
-        if isinstance(data, dict) and isinstance(data.get(key), list):
-            return data[key]
-    raise RuntimeError("xurl returned an unsupported bookmarks response")
+    if records is None:
+        for key in ("bookmarks", "data"):
+            if isinstance(data, dict) and isinstance(data.get(key), list):
+                records = data[key]
+                break
+    return _strict_bookmark_records(records, "xurl")
+
+
+def _fetch_browser_bookmarks(n: int) -> list[dict]:
+    cdp_url = _validate_loopback_cdp_url(
+        _first_env(
+            "X_BOOKMARKS_CDP_URL",
+            "HERMES_X_BOOKMARKS_CDP_URL",
+            "HERMES_X_CDP_URL",
+            "BROWSER_CDP_URL",
+            default=DEFAULT_X_CDP_URL,
+        )
+    )
+    publisher_root = _first_env(
+        "X_PUBLISHER_ROOT",
+        "HERMES_X_PUBLISHER_ROOT",
+        default=DEFAULT_X_PUBLISHER_ROOT,
+    )
+    # Keep the child environment narrow: no cookies, tokens, or unrelated
+    # process secrets are needed to connect to the already-authenticated page.
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "X_BOOKMARKS_CDP_URL": cdp_url,
+        "X_PUBLISHER_ROOT": publisher_root,
+        "X_BOOKMARKS_LIMIT": str(max(0, n)),
+    }
+    try:
+        proc = subprocess.run(
+            ["node", "-e", _BROWSER_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=_BROWSER_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("browser session unavailable") from exc
+    if proc.returncode != 0:
+        raise RuntimeError("browser session harvest failed")
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("browser session returned invalid JSON") from exc
+    return _strict_bookmark_records(data, "browser session", exact=True)
+
+
+def fetch_bookmarks(n: int = 50) -> list[dict]:
+    """Read bookmarks via xurl, then a read-only signed-in browser session.
+
+    xurl is always attempted first. Any xurl command, auth, parse, or shape
+    failure falls back to bounded Node/Playwright CDP extraction. Neither path
+    reads browser cookies/tokens or performs an X write. Errors intentionally
+    omit subprocess output so credentials cannot reach logs.
+    """
+    try:
+        return _fetch_xurl_bookmarks(n)
+    except RuntimeError as xurl_error:
+        try:
+            return _fetch_browser_bookmarks(n)
+        except RuntimeError as browser_error:
+            raise RuntimeError(f"{xurl_error}; browser session fallback failed") from browser_error
 
 
 def main(argv) -> int:

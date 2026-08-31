@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,21 @@ sys.path.insert(0, str(SCRIPTS))
 import harvest_x_bookmarks as hx  # noqa: E402
 import improve_cron_entry as entry  # noqa: E402
 from hermes_state import SessionDB
+
+
+@pytest.fixture(autouse=True)
+def _configured_auxiliary_judge(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "moa_reference": {
+                    "provider": "openrouter",
+                    "model": "deepseek/deepseek-v4-flash-0731",
+                }
+            }
+        },
+    )
 
 
 def test_merge_failures_deduplicates_exact_failure_class_but_preserves_distinct_titles() -> None:
@@ -63,7 +79,7 @@ def test_bookmark_failure_is_skipped_without_failing_cron(tmp_path: Path, monkey
     report = json.loads(reports[0].read_text())
     assert report["ok"] is True
     assert report["halted"] is False
-    assert report["steps"][-1] == "harvest_x: skipped"
+    assert "harvest_x: skipped" in report["steps"]
 
 
 def test_unreadable_pending_queue_does_not_advance_session_watermark(tmp_path: Path, monkeypatch) -> None:
@@ -131,9 +147,17 @@ def test_cron_hands_harvested_failures_to_live_chain(tmp_path: Path, monkeypatch
     db.close()
 
     seen = {}
+    luna_prompts = []
+
+    monkeypatch.setattr(
+        entry.propose_zeus_candidate,
+        "call_luna",
+        lambda prompt: luna_prompts.append(prompt) or "proposal",
+    )
 
     def fake_chain(**kwargs):
         seen.update(kwargs)
+        assert kwargs["proposer"]("failure prompt") == "proposal"
         return {"ok": True, "halted": False, "applied": ["task_x"], "blocked": [], "notes": []}
 
     monkeypatch.setattr(entry, "run_live_chain", fake_chain)
@@ -146,6 +170,179 @@ def test_cron_hands_harvested_failures_to_live_chain(tmp_path: Path, monkeypatch
     assert entry.main(["entry", "--db-path", str(db_path)]) == 0
     assert len(seen["failures"]) == 1
     assert seen["failures"][0]["before_session_ids"] == ["real-session-0002"]
+    assert luna_prompts == ["failure prompt"]
+
+
+def test_cron_includes_actionable_bookmarks_in_luna_research_context(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(entry, "DEFAULT_STATE_DIR", tmp_path)
+    monkeypatch.setattr(
+        hx,
+        "fetch_bookmarks",
+        lambda _n: [
+            {
+                "id": "22",
+                "full_text": "Hermes hook idea api_key=abcdefghijklmnop",
+                "url": "https://x.com/u/status/22",
+            },
+            {
+                "id": "23",
+                "full_text": "football result",
+                "url": "https://x.com/u/status/23",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        entry.hf,
+        "load_hermes_sessions",
+        lambda _db_path=None: [
+            {
+                "id": "real-session-bookmark-context",
+                "seq": 1,
+                "title": "repair",
+                "body": "ERROR: the check failed",
+            }
+        ],
+    )
+    luna_prompts = []
+    monkeypatch.setattr(
+        entry.propose_zeus_candidate,
+        "call_luna",
+        lambda prompt: luna_prompts.append(prompt) or "proposal",
+    )
+
+    def fake_chain(**kwargs):
+        assert kwargs["proposer"]("failure prompt") == "proposal"
+        return {
+            "ok": True,
+            "halted": False,
+            "applied": [],
+            "blocked": [kwargs["failures"][0]["task_id"]],
+            "notes": [],
+        }
+
+    monkeypatch.setattr(entry, "run_live_chain", fake_chain)
+
+    assert entry.main(["entry"]) == 0
+    assert len(luna_prompts) == 1
+    assert "X BOOKMARK RESEARCH CONTEXT" in luna_prompts[0]
+    assert "Hermes hook idea" in luna_prompts[0]
+    assert "https://x.com/u/status/22" in luna_prompts[0]
+    assert "football result" not in luna_prompts[0]
+    assert "abcdefghijklmnop" not in luna_prompts[0]
+
+
+def test_configured_judge_route_is_explicit_and_independent_from_luna() -> None:
+    route = entry._configured_judge_route(
+        {
+            "auxiliary": {
+                "moa_reference": {
+                    "provider": "openrouter",
+                    "model": "deepseek/deepseek-v4-flash-0731",
+                }
+            }
+        }
+    )
+
+    assert route == ("openrouter", "deepseek/deepseek-v4-flash-0731")
+
+
+@pytest.mark.parametrize(
+    "task_config",
+    [
+        {"provider": "auto", "model": ""},
+        {"provider": "openrouter", "model": ""},
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        {"provider": "openrouter", "model": "openrouter/gpt-5.6-luna"},
+        {"provider": ["openrouter"], "model": "deepseek/deepseek-v4-flash-0731"},
+        {"provider": "openrouter", "model": ["deepseek/deepseek-v4-flash-0731"]},
+        {"provider": "openrouter", "model": {"name": "deepseek/deepseek-v4-flash-0731"}},
+    ],
+)
+def test_configured_judge_route_fails_closed_when_not_explicitly_independent(task_config) -> None:
+    with pytest.raises(RuntimeError, match="independent judge"):
+        entry._configured_judge_route({"auxiliary": {"moa_reference": task_config}})
+
+
+def test_independent_judge_uses_auxiliary_moa_reference_and_returns_actual_model(monkeypatch) -> None:
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            model="deepseek/deepseek-v4-flash-0731",
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"verdict":"equal","score":0.8,"rationale":"steady"}'
+                    )
+                )
+            ],
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+
+    raw, actual_model = entry._call_independent_judge(
+        "judge this", "openrouter", "deepseek/deepseek-v4-flash-0731"
+    )
+
+    assert raw.startswith("{")
+    assert actual_model == "deepseek/deepseek-v4-flash-0731"
+    assert calls[0]["task"] == "moa_reference"
+    assert calls[0]["provider"] == "openrouter"
+    assert calls[0]["model"] == "deepseek/deepseek-v4-flash-0731"
+    response_format = calls[0]["extra_body"]["response_format"]
+    assert response_format["type"] == "json_schema"
+    schema = response_format["json_schema"]["schema"]
+    assert schema["required"] == ["verdict", "score", "rationale"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["rationale"]["minLength"] == 10
+
+
+def test_independent_judge_rejects_luna_fallback_response(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            model="openai/gpt-5.6-luna",
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"verdict":"equal"}'))],
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="independent judge"):
+        entry._call_independent_judge(
+            "judge this", "openrouter", "deepseek/deepseek-v4-flash-0731"
+        )
+
+
+def test_independent_judge_requires_actual_model_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"verdict":"equal"}'))],
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="model metadata"):
+        entry._call_independent_judge(
+            "judge this", "openrouter", "deepseek/deepseek-v4-flash-0731"
+        )
+
+
+@pytest.mark.parametrize("bad_model", [["gpt-5.6-luna"], {"name": "gpt-5.6-luna"}])
+def test_independent_judge_rejects_non_string_model_metadata(monkeypatch, bad_model) -> None:
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            model=bad_model,
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"verdict":"equal"}'))],
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="model metadata"):
+        entry._call_independent_judge(
+            "judge this", "openrouter", "deepseek/deepseek-v4-flash-0731"
+        )
 
 
 def test_cron_caps_live_candidates_and_persists_remaining_queue(tmp_path: Path, monkeypatch) -> None:

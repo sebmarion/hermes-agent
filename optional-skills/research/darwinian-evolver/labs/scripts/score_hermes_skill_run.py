@@ -25,12 +25,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 ALLOWED_VERDICTS = ("better", "equal", "worse")
 SCHEMA_VERSION = 1
+_REQUIRED_KEYS = {
+    "schema_version",
+    "task_id",
+    "blind_candidate",
+    "judge_model",
+    "score",
+    "verdict",
+    "reasoning",
+}
+_TASK_ID_RE = re.compile(r"^task_[0-9a-f]{4,}$")
 
 
 def parse_args(argv):
@@ -51,8 +62,34 @@ def load_judges(path: Path):
         except json.JSONDecodeError as exc:
             problems.append((lineno, f"invalid JSON: {exc}"))
             continue
-        if row.get("schema_version") != SCHEMA_VERSION:
+        if not isinstance(row, dict):
+            problems.append((lineno, "judge row must be a JSON object"))
+            continue
+        missing = sorted(_REQUIRED_KEYS - set(row))
+        extra = sorted(set(row) - _REQUIRED_KEYS)
+        if missing or extra:
+            detail = []
+            if missing:
+                detail.append("missing " + ", ".join(missing))
+            if extra:
+                detail.append("unexpected " + ", ".join(extra))
+            problems.append((lineno, "judge row keys violate schema: " + "; ".join(detail)))
+            continue
+        schema_version = row.get("schema_version")
+        if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
             problems.append((lineno, "schema_version must be 1"))
+            continue
+        task_id = row.get("task_id")
+        if not isinstance(task_id, str) or _TASK_ID_RE.fullmatch(task_id) is None:
+            problems.append((lineno, "task_id must match ^task_[0-9a-f]{4,}$"))
+            continue
+        judge_model = row.get("judge_model")
+        if not isinstance(judge_model, str) or len(judge_model) < 5:
+            problems.append((lineno, "judge_model must be a string of at least 5 characters"))
+            continue
+        reasoning = row.get("reasoning")
+        if not isinstance(reasoning, str) or not 10 <= len(reasoning) <= 2000:
+            problems.append((lineno, "reasoning must be a string of 10 to 2000 characters"))
             continue
         verdict = row.get("verdict")
         if verdict not in ALLOWED_VERDICTS:

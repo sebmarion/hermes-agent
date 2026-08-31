@@ -306,10 +306,10 @@ def test_scorecard_refuses_empty_judges(tmp_path: Path) -> None:
 
 def test_scorecard_produces_deterministic_output(tmp_path: Path) -> None:
     judge_rows = [
-        {"schema_version": 1, "task_id": "t1", "blind_candidate": "A",
-         "judge_model": "m", "score": 0.8, "verdict": "better", "reasoning": "clearer"},
-        {"schema_version": 1, "task_id": "t2", "blind_candidate": "B",
-         "judge_model": "m", "score": 0.3, "verdict": "worse", "reasoning": "confusing"},
+        {"schema_version": 1, "task_id": "task_1111aaaa", "blind_candidate": "A",
+         "judge_model": "model/test", "score": 0.8, "verdict": "better", "reasoning": "clearer result"},
+        {"schema_version": 1, "task_id": "task_2222bbbb", "blind_candidate": "B",
+         "judge_model": "model/test", "score": 0.3, "verdict": "worse", "reasoning": "confusing result"},
     ]
     judges = tmp_path / "judges.jsonl"
     judges.write_text("\n".join(json.dumps(r) for r in judge_rows) + "\n")
@@ -327,8 +327,8 @@ def test_scorecard_never_fabricates_verdict(tmp_path: Path) -> None:
     # A judge row with a verdict outside the allowed enum must be rejected,
     # not silently coerced to 'equal'.
     judge_rows = [
-        {"schema_version": 1, "task_id": "t1", "blind_candidate": "A",
-         "judge_model": "m", "score": 0.5, "verdict": "meh", "reasoning": "?"},
+        {"schema_version": 1, "task_id": "task_1111aaaa", "blind_candidate": "A",
+         "judge_model": "model/test", "score": 0.5, "verdict": "meh", "reasoning": "unclear result"},
     ]
     judges = tmp_path / "judges.jsonl"
     judges.write_text(json.dumps(judge_rows[0]) + "\n")
@@ -344,10 +344,10 @@ def test_scorecard_aborts_on_partial_invalid(tmp_path: Path) -> None:
     # F1: a judge file with BOTH valid and invalid rows must abort the whole
     # run (rc=1, no scorecard emitted), not silently score only the good rows.
     judges = tmp_path / "judges.jsonl"
-    good = {"schema_version": 1, "task_id": "t_good", "blind_candidate": "A",
-            "judge_model": "m", "score": 0.9, "verdict": "better", "reasoning": "clear"}
-    bad = {"schema_version": 1, "task_id": "t_bad", "blind_candidate": "A",
-           "judge_model": "m", "score": 0.7, "verdict": "totally-fine", "reasoning": "?"}
+    good = {"schema_version": 1, "task_id": "task_a1b2c3d4", "blind_candidate": "A",
+            "judge_model": "model/test", "score": 0.9, "verdict": "better", "reasoning": "clear result"}
+    bad = {"schema_version": 1, "task_id": "task_b1c2d3e4", "blind_candidate": "A",
+           "judge_model": "model/test", "score": 0.7, "verdict": "totally-fine", "reasoning": "unclear result"}
     judges.write_text(json.dumps(good) + "\n" + json.dumps(bad) + "\n")
     out = tmp_path / "s.tsv"
     proc = subprocess.run(
@@ -358,6 +358,63 @@ def test_scorecard_aborts_on_partial_invalid(tmp_path: Path) -> None:
     assert not out.exists() or out.stat().st_size == 0, (
         "scorecard must NOT emit partial output when any row is invalid"
     )
+
+
+def test_scorecard_rejects_row_that_violates_declared_artifact_schema(tmp_path: Path) -> None:
+    judges = tmp_path / "judges.jsonl"
+    judges.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_id": "task_1234abcd",
+                "blind_candidate": "A",
+                "score": 0.9,
+                "verdict": "better",
+                "reasoning": "clear improvement",
+            }
+        )
+        + "\n"
+    )
+    out = tmp_path / "s.tsv"
+
+    proc = subprocess.run(
+        [sys.executable, str(SCORECARD), "--judge-file", str(judges), "--out", str(out)],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+    )
+
+    assert proc.returncode != 0
+    assert "judge_model" in proc.stderr
+
+
+def test_scorecard_rejects_boolean_schema_version(tmp_path: Path) -> None:
+    judges = tmp_path / "judges.jsonl"
+    judges.write_text(
+        json.dumps(
+            {
+                "schema_version": True,
+                "task_id": "task_1234abcd",
+                "blind_candidate": "A",
+                "judge_model": "model/test",
+                "score": 0.9,
+                "verdict": "better",
+                "reasoning": "clear improvement",
+            }
+        )
+        + "\n"
+    )
+    out = tmp_path / "s.tsv"
+
+    proc = subprocess.run(
+        [sys.executable, str(SCORECARD), "--judge-file", str(judges), "--out", str(out)],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+    )
+
+    assert proc.returncode != 0
+    assert "schema_version" in proc.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -404,10 +461,10 @@ def test_end_to_end_offline_fixture(tmp_path: Path) -> None:
 
     judges = tmp_path / "judges.jsonl"
     judge_rows = [
-        {"schema_version": 1, "task_id": "t1", "blind_candidate": "A",
+        {"schema_version": 1, "task_id": "task_1111aaaa", "blind_candidate": "A",
          "judge_model": "anthropic/claude-sonnet-4.6",
          "score": 0.9, "verdict": "better", "reasoning": "sharper instructions"},
-        {"schema_version": 1, "task_id": "t2", "blind_candidate": "B",
+        {"schema_version": 1, "task_id": "task_2222bbbb", "blind_candidate": "B",
          "judge_model": "anthropic/claude-sonnet-4.6",
          "score": 0.6, "verdict": "equal", "reasoning": "no measurable delta"},
     ]
