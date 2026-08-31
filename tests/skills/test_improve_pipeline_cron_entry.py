@@ -72,7 +72,9 @@ def test_bookmark_failure_is_skipped_without_failing_cron(tmp_path: Path, monkey
         raise RuntimeError("xurl unavailable")
 
     monkeypatch.setattr(hx, "fetch_bookmarks", unavailable)
-    monkeypatch.setattr(entry.hf, "load_hermes_sessions", lambda _db_path=None: [])
+    monkeypatch.setattr(
+        entry.hf, "load_hermes_sessions", lambda _db_path=None, **_kwargs: []
+    )
     assert entry.main(["entry"]) == 0
     reports = list(tmp_path.glob("report-*.json"))
     assert len(reports) == 1
@@ -155,7 +157,7 @@ def test_cron_hands_harvested_failures_to_live_chain(tmp_path: Path, monkeypatch
     monkeypatch.setattr(
         entry.propose_zeus_candidate,
         "call_luna",
-        lambda prompt: luna_prompts.append(prompt) or "proposal",
+        lambda prompt, **kwargs: luna_prompts.append((prompt, kwargs)) or "proposal",
     )
 
     def fake_chain(**kwargs):
@@ -173,7 +175,10 @@ def test_cron_hands_harvested_failures_to_live_chain(tmp_path: Path, monkeypatch
     assert entry.main(["entry", "--db-path", str(db_path)]) == 0
     assert len(seen["failures"]) == 1
     assert seen["failures"][0]["before_session_ids"] == ["real-session-0002"]
-    assert luna_prompts == ["failure prompt"]
+    assert luna_prompts[0][0] == "failure prompt"
+    assert luna_prompts[0][1]["session_ids_path"] == (
+        tmp_path / "autoresearch-session-ids.json"
+    )
 
 
 def test_cron_includes_actionable_bookmarks_in_luna_research_context(
@@ -199,7 +204,7 @@ def test_cron_includes_actionable_bookmarks_in_luna_research_context(
     monkeypatch.setattr(
         entry.hf,
         "load_hermes_sessions",
-        lambda _db_path=None: [
+        lambda _db_path=None, **_kwargs: [
             {
                 "id": "real-session-bookmark-context",
                 "seq": 1,
@@ -212,7 +217,7 @@ def test_cron_includes_actionable_bookmarks_in_luna_research_context(
     monkeypatch.setattr(
         entry.propose_zeus_candidate,
         "call_luna",
-        lambda prompt: luna_prompts.append(prompt) or "proposal",
+        lambda prompt, **_kwargs: luna_prompts.append(prompt) or "proposal",
     )
 
     def fake_chain(**kwargs):
@@ -421,8 +426,15 @@ def test_scope_partition_keeps_targeted_rows_and_returns_safe_dispositions() -> 
                 "task_title": "Comandero timeout",
                 "task_instructions": "sensitive transcript body",
             },
+            {
+                "task_id": "task_1234abcd",
+                "task_title": "BestPlan editor failure",
+                "task_instructions": "self-generated failure evidence",
+                "before_session_ids": ["20260831_120000_abcdef"],
+            },
         ],
         "bestplan",
+        ignored_session_ids={"20260831_120000_abcdef"},
     )
 
     assert [row["task_id"] for row in targeted] == ["task_deadbeef"]
@@ -433,7 +445,14 @@ def test_scope_partition_keeps_targeted_rows_and_returns_safe_dispositions() -> 
             "disposition": "out_of_scope",
             "target_skill": "bestplan",
             "reason": "task title does not explicitly target the skill",
-        }
+        },
+        {
+            "schema_version": 1,
+            "task_id": "task_1234abcd",
+            "disposition": "self_generated",
+            "target_skill": "bestplan",
+            "reason": "failure came from an autoresearch proposer session",
+        },
     ]
     assert "task_instructions" not in dispositions[0]
 
@@ -543,7 +562,9 @@ def test_red_live_chain_keeps_every_selected_task_queued(
         "before_session_ids": ["real-session-bestplan"],
     }
     entry.hf.write_facts(pending_path, [row])
-    monkeypatch.setattr(entry.hf, "load_hermes_sessions", lambda _db_path=None: [])
+    monkeypatch.setattr(
+        entry.hf, "load_hermes_sessions", lambda _db_path=None, **_kwargs: []
+    )
     monkeypatch.setattr(hx, "fetch_bookmarks", lambda _n: [])
     monkeypatch.setattr(
         entry,

@@ -175,15 +175,32 @@ def _failure_targets_skill(row: dict, skill_name: str) -> bool:
 
 
 def _partition_failures_for_skill(
-    rows: list[dict], skill_name: str
+    rows: list[dict],
+    skill_name: str,
+    ignored_session_ids: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Separate actionable rows from auditable, transcript-free dispositions."""
+    ignored_session_ids = set(ignored_session_ids or ())
     targeted = []
     dispositions = []
     for row in rows:
         task_id = row.get("task_id")
         if not isinstance(task_id, str) or not _TASK_ID_RE.fullmatch(task_id):
             raise ValueError("pending failure row has malformed task_id")
+        before_session_ids = row.get("before_session_ids") or []
+        if not isinstance(before_session_ids, list):
+            raise ValueError("pending failure row has malformed before_session_ids")
+        if any(session_id in ignored_session_ids for session_id in before_session_ids):
+            dispositions.append(
+                {
+                    "schema_version": 1,
+                    "task_id": task_id,
+                    "disposition": "self_generated",
+                    "target_skill": skill_name,
+                    "reason": "failure came from an autoresearch proposer session",
+                }
+            )
+            continue
         if _failure_targets_skill(row, skill_name):
             targeted.append(row)
             continue
@@ -366,6 +383,7 @@ def main(argv) -> int:
         "notes": [],
     }
     pending_path = state_dir / "pending_failures.jsonl"
+    session_ids_path = state_dir / "autoresearch-session-ids.json"
     try:
         pending = _load_pending(pending_path)
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -381,13 +399,22 @@ def main(argv) -> int:
     try:
         if report["halted"]:
             raise RuntimeError("pending failure queue is unavailable")
-        sessions = hf.load_hermes_sessions(args.db_path)
+        ignored_session_ids = propose_zeus_candidate.load_recorded_session_ids(
+            session_ids_path
+        )
+        sessions = hf.load_hermes_sessions(
+            args.db_path, ignored_session_ids=ignored_session_ids
+        )
         new_failures = hf.extract_failures(sessions, watermark_seq=wm)
         failures = _merge_failures(pending, new_failures)
         failures_path = state_dir / "failures.jsonl"
         hf.write_facts(failures_path, new_failures)
         skill_name = args.skill_path.parent.name
-        failures, dispositions = _partition_failures_for_skill(failures, skill_name)
+        failures, dispositions = _partition_failures_for_skill(
+            failures,
+            skill_name,
+            ignored_session_ids=ignored_session_ids,
+        )
         if dispositions:
             _record_dispositions(
                 state_dir / "failure-dispositions.jsonl", dispositions
@@ -441,7 +468,10 @@ def main(argv) -> int:
             judge_provider, configured_judge_model = _configured_judge_route()
 
             def proposer(prompt: str) -> str:
-                return propose_zeus_candidate.call_luna(prompt + bookmark_context)
+                return propose_zeus_candidate.call_luna(
+                    prompt + bookmark_context,
+                    session_ids_path=session_ids_path,
+                )
 
             def judge(prompt: str) -> str:
                 raw, actual_model = _call_independent_judge(

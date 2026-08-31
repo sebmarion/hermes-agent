@@ -117,6 +117,12 @@ def test_load_hermes_sessions_projects_completed_db_rows() -> None:
             return [
                 {"id": "real-session-0001", "title": "finished task", "ended_at": 20},
                 {"id": "active-session-0002", "title": "still running", "ended_at": None},
+                {
+                    "id": "autoresearch-session-0003",
+                    "title": "BestPlan editor",
+                    "ended_at": 30,
+                    "source": "desktop",
+                },
             ]
 
         def get_messages(self, session_id, include_compacted):
@@ -126,19 +132,60 @@ def test_load_hermes_sessions_projects_completed_db_rows() -> None:
                     {"id": 41, "role": "user", "content": "repair the skill"},
                     {"id": 42, "role": "assistant", "content": "ERROR: the check failed"},
                 ]
+            if session_id == "autoresearch-session-0003":
+                return [
+                    {"id": 52, "role": "assistant", "content": "ERROR: proposer failed"}
+                ]
             raise AssertionError("active sessions must not be read")
 
         def close(self):
             self.closed = True
 
     db = FakeDB()
-    rows = hf.load_hermes_sessions(db_factory=lambda **_: db)
+    rows = hf.load_hermes_sessions(
+        db_factory=lambda **_: db,
+        ignored_session_ids={"autoresearch-session-0003"},
+    )
     assert rows == [
         {
             "id": "real-session-0001",
             "seq": 42,
             "title": "finished task",
             "body": "user: repair the skill\nassistant: ERROR: the check failed",
-        }
+        },
+        {
+            "id": "autoresearch-session-0003",
+            "seq": 52,
+            "title": "BestPlan editor",
+            "body": "",
+            "ignored": True,
+        },
+    ]
+    assert [row["before_session_ids"] for row in hf.extract_failures(rows)] == [
+        ["real-session-0001"]
     ]
     assert db.closed is True
+
+
+def test_cli_harvests_fixture_and_advances_watermark(tmp_path: Path) -> None:
+    sessions_path = tmp_path / "sessions.json"
+    sessions_path.write_text(
+        json.dumps([_session(7, "ERROR: bounded failure", "BestPlan repair")])
+    )
+    out_path = tmp_path / "failures.jsonl"
+    state_dir = tmp_path / "state"
+
+    assert hf.main(
+        [
+            "harvest_failures.py",
+            "--sessions-json",
+            str(sessions_path),
+            "--out",
+            str(out_path),
+            "--state-dir",
+            str(state_dir),
+        ]
+    ) == 0
+
+    assert len(out_path.read_text().splitlines()) == 1
+    assert ps.read_watermark(state_dir, "sessions") == 7

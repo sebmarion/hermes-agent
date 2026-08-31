@@ -210,17 +210,24 @@ def test_call_zeus_rejects_content_above_candidate_budget(monkeypatch) -> None:
         pzc.call_zeus("http://127.0.0.1:8080/v1", "local", "model", "prompt")
 
 
-def test_call_luna_uses_existing_openai_codex_route(monkeypatch) -> None:
+def test_call_luna_uses_existing_openai_codex_route(
+    tmp_path: Path, monkeypatch
+) -> None:
     calls = []
 
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
+        usage_path = Path(argv[argv.index("--usage-file") + 1])
+        usage_path.write_text(json.dumps({"session_id": "20260831_120000_abcdef"}))
         return subprocess.CompletedProcess(argv, 0, stdout="## Candidate\n", stderr="")
 
     monkeypatch.setattr(pzc.shutil, "which", lambda _name: "hermes")
     monkeypatch.setattr(pzc, "run_text_bounded", fake_run)
 
-    result = pzc.call_luna("repair the concrete failure")
+    session_ids_path = tmp_path / "autoresearch-session-ids.json"
+    result = pzc.call_luna(
+        "repair the concrete failure", session_ids_path=session_ids_path
+    )
 
     assert result == "## Candidate"
     assert len(calls) == 1
@@ -241,9 +248,43 @@ def test_call_luna_uses_existing_openai_codex_route(monkeypatch) -> None:
         "--ignore-rules",
         "--in",
         "/tmp",
+        "--usage-file",
+        argv[-1],
     ]
     assert kwargs["timeout"] == 180
     assert kwargs["max_stdout_bytes"] == pzc.MAX_LUNA_STDOUT_BYTES
+    assert kwargs["env"]["HERMES_SESSION_SOURCE"] == "autoresearch"
+    assert json.loads(session_ids_path.read_text()) == ["20260831_120000_abcdef"]
+
+
+def test_session_id_ledger_keeps_newest_by_insertion_order(tmp_path: Path) -> None:
+    ledger = tmp_path / "autoresearch-session-ids.json"
+    existing = [
+        f"20260831_120000_{index:06x}"
+        for index in range(pzc.MAX_RECORDED_AUTORESEARCH_SESSIONS)
+    ]
+    ledger.write_text(json.dumps(existing))
+
+    newest = "20200101_000000_000000"
+    pzc._record_session_id(ledger, newest)
+    rows = json.loads(ledger.read_text())
+
+    assert len(rows) == pzc.MAX_RECORDED_AUTORESEARCH_SESSIONS
+    assert rows[-1] == newest
+    assert existing[0] not in rows
+
+
+def test_session_id_ledger_rejects_oversized_or_malformed_rows(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "autoresearch-session-ids.json"
+    ledger.write_text(" " * (pzc.MAX_SESSION_LEDGER_BYTES + 1))
+    with pytest.raises(RuntimeError, match="too large"):
+        pzc.load_recorded_session_ids(ledger)
+
+    ledger.write_text(json.dumps(["not-a-real-session-id"]))
+    with pytest.raises(RuntimeError, match="malformed"):
+        pzc.load_recorded_session_ids(ledger)
 
 
 def test_call_luna_rejects_output_above_candidate_budget(monkeypatch) -> None:

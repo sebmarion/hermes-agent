@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -45,6 +46,9 @@ CRED_PATTERNS = [
 
 MAX_LUNA_OUTPUT_CHARS = 30_000
 MAX_LUNA_STDOUT_BYTES = 64 * 1024
+MAX_RECORDED_AUTORESEARCH_SESSIONS = 10_000
+MAX_SESSION_LEDGER_BYTES = 1_000_000
+_SESSION_ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6,8}$")
 
 
 def _scrub(text: str) -> str:
@@ -52,6 +56,61 @@ def _scrub(text: str) -> str:
     for pat, label in CRED_PATTERNS:
         out = pat.sub(f"[redacted:{label}]", out)
     return out
+
+
+def _load_recorded_session_id_rows(path: Path) -> list[str]:
+    path = Path(path)
+    if not path.is_file():
+        return []
+    if path.stat().st_size > MAX_SESSION_LEDGER_BYTES:
+        raise RuntimeError("autoresearch session-id ledger is too large")
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("autoresearch session-id ledger is unreadable") from exc
+    if (
+        not isinstance(rows, list)
+        or len(rows) > MAX_RECORDED_AUTORESEARCH_SESSIONS
+        or any(
+            not isinstance(row, str) or not _SESSION_ID_RE.fullmatch(row)
+            for row in rows
+        )
+    ):
+        raise RuntimeError("autoresearch session-id ledger is malformed")
+    return rows
+
+
+def load_recorded_session_ids(path: Path) -> set[str]:
+    """Load exact proposer session IDs from the atomic provenance ledger."""
+    rows = _load_recorded_session_id_rows(path)
+    return set(rows)
+
+
+def _record_session_id(path: Path, session_id: str) -> None:
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(
+        session_id.strip()
+    ):
+        raise RuntimeError("Luna usage report is missing a real session id")
+    path = Path(path)
+    session_id = session_id.strip()
+    rows = _load_recorded_session_id_rows(path)
+    if session_id in rows:
+        rows.remove(session_id)
+    rows.append(session_id)
+    rows = rows[-MAX_RECORDED_AUTORESEARCH_SESSIONS:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=path.parent
+    )
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(rows, handle)
+            handle.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +285,12 @@ def call_zeus(base_url: str, api_key: str, model: str, prompt: str, timeout: flo
     return content
 
 
-def call_luna(prompt: str, timeout: float = 180.0) -> str:
-    """Run one proposal through Hermes' existing OpenAI Codex Luna route."""
+def call_luna(
+    prompt: str,
+    timeout: float = 180.0,
+    session_ids_path: Path | None = None,
+) -> str:
+    """Run one proposal and record its exact Hermes session identity."""
     hermes = shutil.which("hermes")
     if not hermes:
         fallback = Path.home() / ".local" / "bin" / "hermes"
@@ -235,30 +298,56 @@ def call_luna(prompt: str, timeout: float = 180.0) -> str:
     if not hermes:
         raise RuntimeError("Hermes CLI unavailable for Luna proposal")
 
+    child_env = os.environ.copy()
+    child_env["HERMES_SESSION_SOURCE"] = "autoresearch"
+    argv = [
+        hermes,
+        "-z",
+        prompt,
+        "--provider",
+        "openai-codex",
+        "--model",
+        "gpt-5.6-luna",
+        "--reasoning",
+        "low",
+        "--toolsets",
+        "search",
+        "--safe-mode",
+        "--ignore-rules",
+        "--in",
+        "/tmp",
+    ]
+    usage_path = None
+    recorded_session = False
+    if session_ids_path is not None:
+        session_ids_path = Path(session_ids_path)
+        session_ids_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw_usage = tempfile.mkstemp(
+            prefix="luna-usage-", suffix=".json", dir=session_ids_path.parent
+        )
+        os.close(fd)
+        usage_path = Path(raw_usage)
+        argv.extend(["--usage-file", str(usage_path)])
     try:
         completed = run_text_bounded(
-            [
-                hermes,
-                "-z",
-                prompt,
-                "--provider",
-                "openai-codex",
-                "--model",
-                "gpt-5.6-luna",
-                "--reasoning",
-                "low",
-                "--toolsets",
-                "search",
-                "--safe-mode",
-                "--ignore-rules",
-                "--in",
-                "/tmp",
-            ],
+            argv,
             timeout=timeout,
             max_stdout_bytes=MAX_LUNA_STDOUT_BYTES,
+            env=child_env,
         )
     except OutputLimitExceeded as exc:
         raise RuntimeError("Luna proposal output limit exceeded") from exc
+    finally:
+        if usage_path is not None:
+            try:
+                if usage_path.is_file() and usage_path.stat().st_size:
+                    usage = json.loads(usage_path.read_text(encoding="utf-8"))
+                    _record_session_id(session_ids_path, usage.get("session_id"))
+                    recorded_session = True
+            finally:
+                usage_path.unlink(missing_ok=True)
+    if session_ids_path is not None and not recorded_session:
+        raise RuntimeError("Luna usage report did not record a session id")
     if completed.returncode != 0 or not completed.stdout.strip():
         raise RuntimeError(f"Luna proposal failed with exit {completed.returncode}")
     output = completed.stdout.strip()

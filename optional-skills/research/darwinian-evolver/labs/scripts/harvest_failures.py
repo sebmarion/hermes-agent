@@ -50,7 +50,11 @@ _SIGNATURES = [
 TASK_ID_ALPHABET = "0123456789abcdef"
 
 
-def load_hermes_sessions(db_path: Path | None = None, db_factory=None) -> list[dict]:
+def load_hermes_sessions(
+    db_path: Path | None = None,
+    db_factory=None,
+    ignored_session_ids: set[str] | None = None,
+) -> list[dict]:
     """Read completed Hermes conversations from the canonical ``state.db``.
 
     ``seq`` is the highest persisted message row id in each conversation. It
@@ -63,6 +67,7 @@ def load_hermes_sessions(db_path: Path | None = None, db_factory=None) -> list[d
     ``SessionDB`` read-only and closes it in ``finally``. Any malformed row or
     database failure raises so cron halts without advancing the watermark.
     """
+    ignored_session_ids = set(ignored_session_ids or ())
     if db_factory is None:
         from hermes_constants import get_hermes_home
         from hermes_state import SessionDB
@@ -90,6 +95,7 @@ def load_hermes_sessions(db_path: Path | None = None, db_factory=None) -> list[d
             session_id = session.get("id")
             if not isinstance(session_id, str) or not session_id.strip():
                 raise ValueError("completed session is missing a real session id")
+            ignored_session = session_id in ignored_session_ids
 
             messages = db.get_messages(session_id, include_compacted=True)
             if not isinstance(messages, list):
@@ -111,11 +117,23 @@ def load_hermes_sessions(db_path: Path | None = None, db_factory=None) -> list[d
                     continue
                 seen_message_ids.add(message_id)
                 message_ids.append(message_id)
-                role = str(message.get("role") or "unknown")
-                content = message.get("content")
-                if content is not None:
-                    rendered.append(f"{role}: {content}")
+                if not ignored_session:
+                    role = str(message.get("role") or "unknown")
+                    content = message.get("content")
+                    if content is not None:
+                        rendered.append(f"{role}: {content}")
 
+            if ignored_session:
+                projected.append(
+                    {
+                        "id": session_id,
+                        "seq": max(message_ids),
+                        "title": str(session.get("title") or "harvested failure"),
+                        "body": "",
+                        "ignored": True,
+                    }
+                )
+                continue
             if not rendered:
                 continue
             projected.append(
@@ -238,6 +256,7 @@ def main(argv) -> int:
         print(f"error: session source unavailable: {exc}", file=sys.stderr)
         return 2
 
+    try:
         records = extract_failures(
             sessions, watermark_seq=watermark, researcher_id=args.researcher_id
         )
