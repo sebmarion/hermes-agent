@@ -1656,6 +1656,25 @@ class _CodexCompletionsAdapter:
         # same behavior as the main agent's Codex transport.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
+            # Fast mode / Priority Processing is a top-level Responses field.
+            # Auxiliary callers express provider controls through
+            # auxiliary.<task>.extra_body, so project service_tier here just as
+            # the main Codex transport projects request_overrides. xAI's
+            # Responses endpoint rejects this field; keep the same xAI-only
+            # guard as agent/transports/codex.py.
+            service_tier = extra_body.get("service_tier")
+            client_base_url = str(getattr(self._client, "base_url", "") or "")
+            is_xai_responses = (
+                base_url_host_matches(client_base_url, "x.ai")
+                or base_url_host_matches(client_base_url, "api.x.ai")
+            )
+            if (
+                isinstance(service_tier, str)
+                and service_tier.strip()
+                and not is_xai_responses
+            ):
+                resp_kwargs["service_tier"] = service_tier.strip()
+
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:
@@ -1815,6 +1834,10 @@ class _CodexCompletionsAdapter:
         progress_deadline = [_start_monotonic + no_progress_timeout]
         saw_content = threading.Event()
         timed_out = threading.Event()
+        # Set only when the timeout WON the attempt (not when the owner
+        # hard-cancelled first): tells the owning thread's ``finally`` that
+        # the shared client's FDs still need a real close (#29507).
+        timeout_release_pending = threading.Event()
         stream_finished = threading.Event()
         timeout_timer: List[Optional[threading.Timer]] = [None]
         # A protected provider call may outlive its owning compression attempt:
@@ -1827,6 +1850,9 @@ class _CodexCompletionsAdapter:
         )
         attempt_stream_lock = threading.Lock()
         attempt_stream: List[Any] = []
+        # The thread driving this request owns its transport's file
+        # descriptors — see the FD-ownership note in _close_client_on_timeout.
+        owner_tid = threading.get_ident()
 
         def _effective_deadline() -> float:
             with deadline_lock:
@@ -1890,12 +1916,58 @@ class _CodexCompletionsAdapter:
                             exc_info=True,
                         )
                 return
-            close = getattr(self._client, "close", None)
-            if callable(close):
+            # FD-ownership contract (#29507 / #67142 / #70773): only the
+            # thread driving the request may RELEASE this client's file
+            # descriptors. This callback has two callers — ``_check_cancelled``
+            # on the owning thread, and the daemon watchdog ``threading.Timer``,
+            # which is a stranger thread. From a stranger thread we may only
+            # ``shutdown()`` the pooled sockets: ``close()`` releases the raw
+            # TLS fd while the owner's OpenSSL BIO still caches that integer,
+            # the kernel recycles it into the next ``open()`` in this process
+            # (a SessionDB / kanban.db handle), and the owner's unwinding TLS
+            # flush writes an application-data record into that database file.
+            # ``shutdown()`` from any thread is FD-safe; ``close()`` is not.
+            # The owning thread performs the real close in the ``finally``
+            # below, which is where the FD release belongs.
+            timeout_release_pending.set()
+            if threading.get_ident() == owner_tid:
+                close = getattr(self._client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
+            else:
                 try:
-                    close()
+                    from agent.agent_runtime_helpers import force_close_tcp_sockets
+
+                    shutdown_count = force_close_tcp_sockets(self._client)
+                    logger.info(
+                        "Codex auxiliary client aborted (timeout, tcp_force_closed=%d, "
+                        "deferred_close=stranger_thread)",
+                        shutdown_count,
+                    )
                 except Exception:
-                    logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
+                    logger.debug("Codex auxiliary: client abort during timeout failed", exc_info=True)
+                # Socket shutdown wakes a reader blocked on a REAL transport,
+                # but the owner may be blocked inside the SDK's event stream
+                # (or a test double with no sockets). Closing the attempt-
+                # owned stream is the same attempt-scoped wake the hard-cancel
+                # branch above performs from this Timer thread — it releases
+                # the owner without touching the shared client's FDs; the
+                # owner then does the real close in its ``finally``.
+                with attempt_stream_lock:
+                    stream = attempt_stream[0] if attempt_stream else None
+                close_stream = getattr(stream, "close", None)
+                if callable(close_stream):
+                    try:
+                        close_stream()
+                    except Exception:
+                        logger.debug(
+                            "Codex auxiliary: attempt stream close during "
+                            "stranger-thread timeout failed",
+                            exc_info=True,
+                        )
             # The cached auxiliary client wraps this same ``self._client``
             # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
             # this instance).  After we close the httpx transport above, the
@@ -2090,6 +2162,22 @@ class _CodexCompletionsAdapter:
             _t = timeout_timer[0]
             if _t is not None:
                 _t.cancel()
+            # A stranger-thread timeout only shut the sockets down; the FDs
+            # are still open and this — the owning thread, now unwound — is
+            # the one context that may release them (#29507). Gated on
+            # timeout_release_pending, NOT timed_out: in the hard-cancel
+            # branch (timeout_won=False) the shared client must stay usable
+            # for other sessions.
+            if timeout_release_pending.is_set():
+                close = getattr(self._client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.debug(
+                            "Codex auxiliary: owner-thread close after timeout failed",
+                            exc_info=True,
+                        )
 
         content = "".join(text_parts).strip() or None
 
@@ -9048,12 +9136,23 @@ def _build_call_kwargs(
             from hermes_cli.providers import nous_api_mode
 
             _nous_on_messages = nous_api_mode(model) == "anthropic_messages"
+        # OpenRouter budgets credit against the requested output cap; when the
+        # param is omitted it assumes the model's FULL output window (e.g.
+        # 65,536), so low-credit accounts 402 ("can only afford N") even
+        # though the actual summary would cost far less. Preserving the
+        # caller's cap keeps the request affordable (#41035, PR #41055 by
+        # @liuhao1024).
+        _is_openrouter = (
+            _provider_norm == "openrouter"
+            or base_url_host_matches(_effective_base, "openrouter.ai")
+        )
         if (
             _is_anthropic_compat_endpoint(provider, _effective_base)
             or _nous_on_messages
             or _is_nvidia_nim
             or _is_moa
             or _is_gemini_native
+            or _is_openrouter
         ):
             # Use auxiliary_max_tokens_param() so models that require
             # max_completion_tokens (GPT-5 family, Copilot) get the right
@@ -9435,7 +9534,94 @@ def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:
     return False
 
 
+_AFFORDABLE_TOKENS_RE = re.compile(
+    r"can only afford\s+([0-9][0-9,]*)", re.IGNORECASE
+)
+
+# Below this, the affordable budget can't fit a useful auxiliary output
+# (summaries, titles, vision descriptions) — treat as genuine exhaustion.
+_AFFORDABLE_RETRY_FLOOR_TOKENS = 512
+# Headroom under the provider's stated budget so token-count rounding on
+# their side can't 402 the retry (same margin PR #49785 used).
+_AFFORDABLE_RETRY_MARGIN_TOKENS = 64
+
+
+def _affordable_max_tokens_from_error(exc: Exception) -> Optional[int]:
+    """Extract the affordable output budget from a credit-limited 402.
+
+    OpenRouter's insufficient-credit rejection states the budget explicitly:
+    ``402 - This request requires more credits, or fewer max_tokens. You
+    requested up to 65536 tokens, but can only afford 7117.`` The account
+    HAS usable credit — the request just asked for (or defaulted to) an
+    output cap larger than the balance covers. Returns the retryable cap
+    (affordable minus a safety margin), or ``None`` when the error carries
+    no affordable count or the budget is too small to be useful.
+    """
+    if not _is_payment_error(exc):
+        return None
+    match = _AFFORDABLE_TOKENS_RE.search(str(exc))
+    if not match:
+        return None
+    try:
+        affordable = int(match.group(1).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    capped = affordable - _AFFORDABLE_RETRY_MARGIN_TOKENS
+    if capped < _AFFORDABLE_RETRY_FLOOR_TOKENS:
+        return None
+    return capped
+
+
 def _create_with_progress(
+    client: Any,
+    kwargs: Dict[str, Any],
+    task: Optional[str] = None,
+    *,
+    force_stream: bool = False,
+) -> Any:
+    """Credit-aware wrapper over :func:`_create_with_progress_once`.
+
+    A 402 that names an affordable output budget ("can only afford N
+    tokens") is NOT terminal billing exhaustion — the account can pay for
+    the call at a lower ``max_tokens``. Retry ONCE with the provider-stated
+    cap (masoria debug bundle, Aug 2026: compression fell back to
+    OpenRouter, which defaulted the omitted cap to the model's full 65,536
+    window and 402'd three times in a row on an account that could afford
+    7,117 tokens — plenty for a summary). Only lowers, never raises, an
+    existing cap; anything else re-raises for the normal recovery chains.
+    """
+    try:
+        return _create_with_progress_once(
+            client, kwargs, task, force_stream=force_stream,
+        )
+    except Exception as exc:
+        affordable = _affordable_max_tokens_from_error(exc)
+        if affordable is None:
+            raise
+        existing_cap = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
+        if isinstance(existing_cap, (int, float)) and 0 < existing_cap <= affordable:
+            # The request was already within the stated budget — the error
+            # is something else (e.g. prompt-side cost). Don't spin.
+            raise
+        retry_kwargs = dict(kwargs)
+        retry_kwargs.pop("max_tokens", None)
+        retry_kwargs.pop("max_completion_tokens", None)
+        retry_kwargs.update(
+            auxiliary_max_tokens_param(
+                affordable, model=str(kwargs.get("model") or "") or None,
+            )
+        )
+        logger.info(
+            "Auxiliary %s: credit-limited 402 (affordable=%d tokens); "
+            "retrying once with a clamped output cap instead of failing: %s",
+            task or "call", affordable, exc,
+        )
+        return _create_with_progress_once(
+            client, retry_kwargs, task, force_stream=force_stream,
+        )
+
+
+def _create_with_progress_once(
     client: Any,
     kwargs: Dict[str, Any],
     task: Optional[str] = None,
