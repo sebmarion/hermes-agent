@@ -4660,9 +4660,20 @@ def _resolve_child_credential_pool(
 # Versioned plugin-host seam: child-worker routing policy (migration bridge).
 # A plugin may register a callable that resolves a named lane to
 # (provider, model, api_mode, reasoning_effort) for subagent delegation.
-# Consulted ONLY when flat `delegation.provider`/`base_url` are NOT configured,
-# so default upstream behavior is unchanged when no policy is registered.
-_CHILD_WORKER_POLICIES: "list" = []  # list[Callable[[dict, int], dict|None]]
+# A registered policy is authoritative and is consulted before the legacy flat
+# provider/base_url fallback. Default behavior is unchanged when none registers.
+_CHILD_WORKER_POLICIES: "list" = []  # list[Callable[[dict, None], dict|None]]
+
+_POLICY_SECRET_KEY_SUFFIXES = ("key", "secret", "token", "credential", "password")
+_POLICY_SECRET_CONTAINER_KEYS = {
+    "auth",
+    "authorization",
+    "cookie",
+    "cookies",
+    "header",
+    "headers",
+    "extraheaders",
+}
 
 
 def _policy_scrubbed_view(cfg):
@@ -4672,15 +4683,25 @@ def _policy_scrubbed_view(cfg):
     read a configured deployment key. Route/tier/mode/lane/provider/model/route
     mapping keys are preserved for the resolver.
     """
-    if not isinstance(cfg, dict):
-        return cfg
-    secret_keys = {"api_key", "apiKey", "key", "secret", "token", "credential"}
-    out = {}
-    for k, v in cfg.items():
-        if isinstance(k, str) and k.lower() in secret_keys:
-            continue
-        out[k] = v
-    return out
+    if isinstance(cfg, dict):
+        out = {}
+        for key, value in cfg.items():
+            normalized = (
+                "".join(ch for ch in key.casefold() if ch.isalnum())
+                if isinstance(key, str)
+                else ""
+            )
+            if normalized in _POLICY_SECRET_CONTAINER_KEYS or normalized.endswith(
+                _POLICY_SECRET_KEY_SUFFIXES
+            ):
+                continue
+            out[key] = _policy_scrubbed_view(value)
+        return out
+    if isinstance(cfg, list):
+        return [_policy_scrubbed_view(value) for value in cfg]
+    if isinstance(cfg, tuple):
+        return tuple(_policy_scrubbed_view(value) for value in cfg)
+    return cfg
 
 
 def register_child_worker_policy(fn) -> None:
@@ -4698,7 +4719,9 @@ def _consult_child_worker_policy(cfg: dict, parent_agent=None) -> dict:
     }
     for fn in list(_CHILD_WORKER_POLICIES):
         try:
-            out = fn(cfg, parent_agent)
+            # A routing plugin receives declarative route data only. Passing
+            # the live parent object would expose provider clients and keys.
+            out = fn(cfg, None)
         except Exception:
             continue
         if not isinstance(out, dict) or not out.get("provider"):

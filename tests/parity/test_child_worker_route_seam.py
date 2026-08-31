@@ -75,12 +75,53 @@ def test_policy_ignored_when_no_opinion(_clean_registry, _fake_runtime):
     assert res["provider"] is None
 
 
+def test_policy_never_receives_credentials_or_live_parent(_clean_registry):
+    captured = {}
+
+    def pol(cfg, parent=None):
+        captured["cfg"] = cfg
+        captured["parent"] = parent
+        return None
+
+    parent = _FakeParent()
+    parent.api_key = "parent-secret"
+    _dt.register_child_worker_policy(pol)
+    _dt._resolve_delegation_credentials(
+        _cfg(
+            provider=None,
+            api_key="direct-secret",
+            apiKey="camel-secret",
+            access_token="access-secret",
+            api_secret="api-secret",
+            secret_key="secret-key",
+            auth="auth-secret",
+            authorization="Bearer auth-secret",
+            headers={"Authorization": "Bearer nested-secret"},
+            nested={"API_KEY": "nested-secret", "lane": "fast"},
+        ),
+        parent,
+    )
+
+    assert captured == {
+        "cfg": {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_mode": None,
+            "nested": {"lane": "fast"},
+        },
+        "parent": None,
+    }
+
+
 def test_policy_opinion_is_authoritative(_clean_registry, _fake_runtime):
     def pol(cfg, parent=None):
         return {"provider": "zeus", "model": "qwen3.8-27b", "api_mode": "chat_completions"}
     _dt.register_child_worker_policy(pol)
     captured = _fake_runtime(resolvable=True)
-    res = _dt._resolve_delegation_credentials(_cfg(provider=None), _FakeParent())
+    res = _dt._resolve_delegation_credentials(
+        _cfg(provider="openrouter", model="legacy-flat-model"), _FakeParent()
+    )
     assert captured["requested"] == "zeus"
     assert res["provider"] in ("zeus", "custom")
     assert res["model"] == "qwen3.8-27b"
