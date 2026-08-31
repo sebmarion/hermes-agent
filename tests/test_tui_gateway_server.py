@@ -496,6 +496,134 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
         server._sessions.pop("iso-sid", None)
 
 
+def test_compute_host_clarify_snapshot_replays_and_proxies_batch_answers(monkeypatch):
+    """A host-owned clarify survives activation and receives its UI answers."""
+    class _Supervisor:
+        def __init__(self):
+            self.responses = []
+
+        def respond(self, sid, params, *, timeout=15.0):
+            self.responses.append((sid, dict(params), timeout))
+            remaining = ["q1"] if params.get("question_id") == "q0" else []
+            return {"type": "respond.ack", "response": {"result": {"status": "ok", "remaining": remaining}}}
+
+    sid = "host-clarify"
+    supervisor = _Supervisor()
+    session = _session(agent=None, agent_ready=threading.Event(), _compute_host_active=True)
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: supervisor)
+    monkeypatch.setattr(server, "write_json", lambda _message: True)
+
+    try:
+        server._relay_compute_host_rpc(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "clarify.request",
+                    "session_id": sid,
+                    "payload": {
+                        "request_id": "host-request",
+                        "questions": [
+                            {"qid": "q0", "question": "First?", "choices": ["a"]},
+                            {"qid": "q1", "question": "Second?", "choices": ["b"]},
+                        ],
+                    },
+                },
+            }
+        )
+
+        activated = server._live_session_payload(sid, session)
+        assert activated["pending_clarify"]["request_id"] == "host-request"
+
+        response = server.handle_request(
+            {
+                "id": "clarify-q0",
+                "method": "clarify.respond",
+                "params": {"request_id": "host-request", "question_id": "q0", "answer": "a"},
+            }
+        )
+
+        assert response["result"] == {"status": "ok", "remaining": ["q1"]}
+        assert supervisor.responses == [
+            (sid, {"request_id": "host-request", "question_id": "q0", "answer": "a"}, 15.0)
+        ]
+        replayed = server._live_session_payload(sid, session)["pending_clarify"]
+        assert replayed["answers"] == {"q0": "a"}
+
+        final_response = server.handle_request(
+            {
+                "id": "clarify-q1",
+                "method": "clarify.respond",
+                "params": {"request_id": "host-request", "question_id": "q1", "answer": "b"},
+            }
+        )
+
+        assert final_response["result"] == {"status": "ok", "remaining": []}
+        assert "pending_clarify" not in server._live_session_payload(sid, session)
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_compute_host_interrupt_forwards_when_parent_running_mirror_is_stale(monkeypatch):
+    """The host, not the parent's mirrored running flag, owns interruption."""
+    interrupted = []
+
+    class _Supervisor:
+        def interrupt(self, sid, *, request_id=None):
+            interrupted.append((sid, request_id))
+
+    sid = "host-stale-running"
+    server._sessions[sid] = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        _compute_host_active=True,
+        running=False,
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+
+    try:
+        response = server.handle_request(
+            {"id": "interrupt", "method": "session.interrupt", "params": {"session_id": sid}}
+        )
+        assert response["result"] == {"status": "interrupted", "turn_isolation": True}
+        assert interrupted == [(sid, "interrupt-interrupt")]
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_compute_host_interrupt_skips_lazy_session_with_no_hosted_turn(monkeypatch):
+    """A lazy session that never submitted a hosted turn must not spawn a host.
+
+    ``HostSupervisor.interrupt()`` calls ``start()``, so forwarding the
+    interrupt unconditionally would launch a compute-host child just to
+    deliver an interrupt for a session with no work in it.
+    """
+    class _Supervisor:
+        def interrupt(self, sid, *, request_id=None):  # pragma: no cover - must not run
+            raise AssertionError("interrupt must not be forwarded for idle lazy sessions")
+
+    sid = "lazy-idle"
+    session = _session(
+        agent_ready=threading.Event(),
+        running=False,
+    )
+    session["agent"] = None  # _session() substitutes a namespace for None
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+
+    try:
+        response = server.handle_request(
+            {"id": "interrupt", "method": "session.interrupt", "params": {"session_id": sid}}
+        )
+        assert response["result"] == {"status": "interrupted", "turn_isolation": True}
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_slash_exec_compress_flag_on_applies_host_control_mirror(monkeypatch):
     class _ExplodingWorker:
         def __init__(self, *args, **kwargs):
@@ -12859,6 +12987,11 @@ def test_prompt_submit_row_id_accepts_full_lineage_ordinal(monkeypatch):
         assert resp.get("error") is None, f"got error: {resp.get('error')}"
         assert sess["history"] == tip_history[:2]
     finally:
+        # Release the slot the first turn claimed, as _finalize_session does in
+        # production. Popping alone leaks the lease, and the second session below
+        # uses the same session_key -- so without this the test fences itself out
+        # of its own key and never reaches the mismatch it is checking.
+        server._release_active_session_slot(sess)
         server._sessions.pop("lineage-row-sid", None)
 
     # A genuinely stale ordinal (matches neither the tip space nor the
@@ -12885,6 +13018,7 @@ def test_prompt_submit_row_id_accepts_full_lineage_ordinal(monkeypatch):
         assert resp.get("error") is not None
         assert resp["error"]["code"] == 4030
     finally:
+        server._release_active_session_slot(sess2)
         server._sessions.pop("lineage-row-sid-2", None)
 
 

@@ -3033,13 +3033,16 @@ from gateway.shutdown_watchdog import (
 )
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
+    DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_cron_drain_timeout,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
+    parse_signal_interrupt_grace_timeout,
     resolve_cron_drain_budget,
 )
 
@@ -6960,6 +6963,14 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            # Thread the platform-side inbound message id onto the persisted
+            # user turn so a turn interrupted by a gateway restart is durably
+            # recorded WITH its id — restart drain-window recovery dedups
+            # against has_platform_message_id, and without this the
+            # interrupted turn is invisible to that check. Uses the raw
+            # inbound id (NOT event_message_id, which is the reply anchor).
+            if ctx.inbound_message_id is not None:
+                _conversation_kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -7298,6 +7309,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _restart_after_turn_timeout: float = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
     _cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
+    _signal_interrupt_grace_timeout: float = (
+        DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
+    )
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
@@ -7447,6 +7461,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
         self._cron_drain_timeout = self._load_cron_drain_timeout()
+        self._signal_interrupt_grace_timeout = (
+            self._load_signal_interrupt_grace_timeout()
+        )
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
@@ -10420,6 +10437,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return value
 
     @staticmethod
+    def _load_signal_interrupt_grace_timeout() -> float:
+        """Load the unexpected-signal post-interrupt grace in seconds."""
+        cfg = _load_gateway_runtime_config()
+        raw = cfg_get(
+            cfg,
+            "gateway",
+            "signal_interrupt_grace_timeout",
+            default=None,
+        )
+        value = parse_signal_interrupt_grace_timeout(raw)
+        if raw is not None and raw != "":
+            try:
+                float(raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid signal_interrupt_grace_timeout '%s', using default %.0fs",
+                    raw,
+                    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
+                )
+        return value
+
+    def _post_interrupt_grace_timeout(self) -> float:
+        """Return the grace before teardown after forcibly interrupting agents."""
+        if (
+            getattr(self, "_signal_initiated_shutdown", False)
+            and not getattr(self, "_restart_requested", False)
+        ):
+            return max(
+                0.0,
+                float(
+                    getattr(
+                        self,
+                        "_signal_interrupt_grace_timeout",
+                        DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
+                    )
+                ),
+            )
+        return DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT
+
+    @staticmethod
     def _load_background_notifications_mode() -> str:
         """Load background process notification mode from config or env var.
 
@@ -10616,6 +10673,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "platform": platform,
                     "chat_id": getattr(source, "chat_id", "") or "",
                     "user_id": getattr(source, "user_id", "") or "",
+                    # Writer identity for re-entrancy (#94595): if this
+                    # process leaks a lease for this session (exception path
+                    # skipped release), the next turn re-acquires its own
+                    # entry instead of being fenced out of it forever —
+                    # pruning only reclaims entries whose PROCESS died.
+                    "live_session_id": str(session_key),
                 },
             )
         except Exception as exc:
@@ -16173,7 +16236,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
-                interrupt_deadline = asyncio.get_running_loop().time() + 5.0
+                interrupt_grace_timeout = (
+                    GatewayRunner._post_interrupt_grace_timeout(self)
+                )
+                interrupt_deadline = (
+                    asyncio.get_running_loop().time() + interrupt_grace_timeout
+                )
+                logger.info(
+                    "Shutdown phase: allowing %.1fs for interrupted agents to unwind",
+                    interrupt_grace_timeout,
+                )
                 # Wait on API-server work too. The interrupt is cooperative:
                 # without this the settle window closes the instant
                 # _running_agents is empty, and an API turn that was just asked
@@ -18494,26 +18566,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # immediately evict them, racing with the setup path.
             _stale_idle = float("inf")  # assume idle if we can't check
             _stale_detail = ""
+            _activity_summary_valid = False
             if _stale_agent and hasattr(_stale_agent, "get_activity_summary"):
                 try:
                     _sa = _stale_agent.get_activity_summary()
-                    _stale_idle = _sa.get("seconds_since_activity", float("inf"))
+                    from gateway.session_stall import (
+                        resolve_session_idle_seconds_from_activity,
+                    )
+
+                    _resolved_idle = resolve_session_idle_seconds_from_activity(
+                        _sa if isinstance(_sa, dict) else None,
+                        now=time.time(),
+                    )
+                    if _resolved_idle is not None:
+                        _stale_idle = _resolved_idle
+                        _activity_summary_valid = True
                     _stale_detail = (
-                        f" | last_activity={_sa.get('last_activity_desc', 'unknown')} "
+                        f" | last_activity={_sa.get('last_activity_desc', 'unknown') if isinstance(_sa, dict) else 'unknown'} "
                         f"({_stale_idle:.0f}s ago) "
-                        f"| iteration={_sa.get('api_call_count', 0)}/{_sa.get('max_iterations', 0)}"
+                        f"| iteration={_sa.get('api_call_count', 0) if isinstance(_sa, dict) else 0}/{_sa.get('max_iterations', 0) if isinstance(_sa, dict) else 0}"
                     )
                 except Exception:
                     pass
-            # Evict if: agent is idle beyond timeout, OR wall-clock age is
-            # extreme (10x timeout or 2h, whichever is larger — catches
-            # cases where the agent object was garbage-collected).
+            # A valid activity clock is authoritative: total age alone never
+            # makes an actively progressing turn stale. The emergency wall TTL
+            # is only a fallback when the agent cannot report usable activity.
             _wall_ttl = max(_raw_stale_timeout * 10, 7200) if _raw_stale_timeout > 0 else float("inf")
             _should_evict = (
                 _stale_agent is not _AGENT_PENDING_SENTINEL
                 and (
-                    (_raw_stale_timeout > 0 and _stale_idle >= _raw_stale_timeout)
-                    or _stale_age > _wall_ttl
+                    (
+                        _activity_summary_valid
+                        and _raw_stale_timeout > 0
+                        and _stale_idle >= _raw_stale_timeout
+                    )
+                    or (
+                        not _activity_summary_valid
+                        and _stale_age > _wall_ttl
+                    )
                 )
             )
             if _should_evict:
@@ -22096,6 +22186,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
+                inbound_message_id=(
+                    str(event.message_id) if event.message_id else None
+                ),
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
@@ -29876,6 +29969,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        inbound_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
@@ -29897,6 +29991,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                inbound_message_id=inbound_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -29910,6 +30005,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                inbound_message_id=inbound_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -30052,6 +30148,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        inbound_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
@@ -30363,6 +30460,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation=run_generation,
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
+            inbound_message_id=inbound_message_id,
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
@@ -32264,6 +32362,45 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+async def _shutdown_mcp_servers_nonblocking(timeout: float = 5.0) -> bool:
+    """Close MCP servers off-loop with a bounded wait (#82874).
+
+    ``shutdown_mcp_servers()`` is synchronous and can block for its full
+    internal 15s future wait when the MCP loop and its stdio children are
+    torn down concurrently (every process in the tree gets SIGTERM at once
+    under a container/supervisor stop). Calling it directly from the gateway
+    event-loop thread freezes the loop for that whole window, so supervisors
+    with a shorter kill grace (s6-overlay defaults to 3s) SIGKILL the gateway
+    before ``lifecycle_ledger.mark_exited()`` runs and every subsequent boot
+    reports a phantom unclean death.
+
+    Run it on a daemon thread instead and poll with ``_await_thread_exit`` so
+    the loop keeps servicing teardown. If it does not finish within
+    ``timeout`` we proceed with shutdown; the daemon thread is left to finish
+    (or die with the process) in the background. Returns True when the MCP
+    shutdown completed within the budget.
+    """
+
+    def _do() -> None:
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+
+            shutdown_mcp_servers()
+        except Exception:
+            logger.debug("MCP shutdown raised", exc_info=True)
+
+    thread = threading.Thread(target=_do, name="mcp-shutdown", daemon=True)
+    thread.start()
+    done = await _await_thread_exit(thread, timeout=timeout)
+    if not done:
+        logger.warning(
+            "MCP shutdown did not finish within %.1fs; continuing gateway "
+            "teardown (background thread will be reaped at process exit)",
+            timeout,
+        )
+    return done
+
+
 def _shutdown_gateway_health_export(runner: Any) -> None:
     """Idempotently drain and detach Gateway Health OTLP export."""
     runtime = getattr(runner, "_gateway_health_export_runtime", None)
@@ -33053,8 +33190,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     logger.error("Gateway exiting with failure: %s", runner.exit_reason)
                 return False
             try:
-                from tools.mcp_tool import shutdown_mcp_servers
-                shutdown_mcp_servers()
+                await _shutdown_mcp_servers_nonblocking()
             except Exception:
                 pass
             if runner.exit_code is not None:
@@ -33234,10 +33370,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
 
-    # Close MCP server connections
+    # Close MCP server connections (off-loop, bounded — #82874)
     try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
+        await _shutdown_mcp_servers_nonblocking()
     except Exception:
         pass
 

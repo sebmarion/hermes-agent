@@ -4034,6 +4034,7 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+Environment="HERMES_SUPERVISED_CHILD=1"
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -4072,6 +4073,7 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+Environment="HERMES_SUPERVISED_CHILD=1"
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -5358,6 +5360,8 @@ def generate_launchd_plist() -> str:
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
+        <key>HERMES_SUPERVISED_CHILD</key>
+        <string>1</string>
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -6320,6 +6324,24 @@ def _guard_existing_gateway_process_conflict(replace: bool = False) -> None:
         logger.debug("Existing-gateway process probe failed", exc_info=True)
         return
     if pid is None:
+        # get_running_pid() now filters records by the current profile's
+        # HERMES_HOME (via _pid_record_belongs_to_current_profile). When no
+        # match was found, check whether a stale PID file from a different
+        # profile exists — the user may have switched profiles while the old
+        # gateway is still running.
+        try:
+            from gateway.status import _read_pid_record, _pid_record_belongs_to_current_profile
+
+            stale = _read_pid_record()
+            if stale is not None and not _pid_record_belongs_to_current_profile(stale):
+                stale_home = stale.get("hermes_home", "<unknown>")
+                logger.warning(
+                    "PID file belongs to another profile (hermes_home=%s). "
+                    "The old gateway may still be running under that profile.",
+                    stale_home,
+                )
+        except Exception:
+            pass
         return
 
     print_error(

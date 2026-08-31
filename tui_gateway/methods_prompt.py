@@ -424,7 +424,24 @@ def _(rid, params: dict) -> dict:
                             + "Update Hermes Desktop to continue it.",
                         )
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
-        return _err(rid, 4090, limit_message)
+        # The refusal reason travels as machine-readable data, not as prose.
+        #
+        # An automated client has to tell "the machine is at capacity, retry later"
+        # from "this session has a live owner, and your write would interleave with
+        # theirs". Those call for different behaviour, and a client that had to
+        # distinguish them by matching the message text would silently change
+        # behaviour the next time the wording improved.
+        #
+        # Refused HERE, before the busy-queue check, before _ensure_session_db_row
+        # and before _start_agent_build: no user row is persisted and no model turn
+        # begins, so a refusal leaves the session exactly as it was.
+        reason = getattr(limit_message, "reason", None)
+        return _err(
+            rid,
+            4090,
+            str(limit_message),
+            {"reason": reason} if reason else None,
+        )
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
@@ -1704,6 +1721,8 @@ def _(rid, params: dict) -> dict:
     # from _pending) while the card is still visible — common when a WebSocket
     # reconnect during the wait drops tool.complete. A late answer must resolve
     # gracefully instead of hitting the raw 4009 "no pending answer request".
+    if proxied := _respond_compute_host_clarify(rid, params):
+        return proxied
     return _respond(rid, params, "answer", allow_expired=True)
 
 

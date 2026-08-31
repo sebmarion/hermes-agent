@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import venv_python_path
+from hermes_constants import get_default_hermes_root, venv_python_path
 
 logger = logging.getLogger(__name__)
 
@@ -4997,7 +4997,12 @@ def _detect_venv_python_processes(
 
     matches: list[tuple[int, str, str]] = []
     try:
-        proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
+        # On Windows, prefetching cmdline and cwd performs two expensive
+        # per-process queries. A busy workstation can have 500+ processes, so
+        # querying those fields for every unrelated process can exceed the
+        # Desktop preflight watchdog. First collect only cheap identity fields;
+        # fetch cmdline/cwd lazily for plausible Python/uv/Hermes candidates.
+        proc_iter = psutil.process_iter(["pid", "exe", "name"])
     except Exception:
         return []
     for proc in proc_iter:
@@ -5013,13 +5018,23 @@ def _detect_venv_python_processes(
             exe_norm = str(Path(exe).resolve()).lower()
         except (OSError, ValueError):
             exe_norm = str(exe).lower()
-        cmdline_raw = " ".join(info.get("cmdline") or [])
-        cmdline_low = cmdline_raw.lower()
-        cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
-
         # Primary match: the executable itself lives under this venv
         # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
         is_holder = exe_norm.startswith(venv_prefix)
+        name = str(info.get("name") or Path(exe).name)
+        name_low = name.lower()
+
+        if not is_holder and not (
+            name_low.startswith(("python", "pypy"))
+            or name_low in {"uv.exe", "uvx.exe", "hermes.exe"}
+        ):
+            continue
+
+        try:
+            cmdline_raw = " ".join(proc.cmdline() or [])
+        except Exception:
+            cmdline_raw = ""
+        cmdline_low = cmdline_raw.lower()
         # Fallback: uv/base-interpreter trampolines run a python whose exe is
         # OUTSIDE the venv but which still imports from it and holds its .pyd
         # files. Catch those by what they're running: a cmdline that references
@@ -5028,6 +5043,10 @@ def _detect_venv_python_processes(
         if not is_holder and venv_prefix in cmdline_low:
             is_holder = True
         if not is_holder and "hermes_cli.main" in cmdline_low:
+            try:
+                cwd_low = str(proc.cwd() or "").lower().rstrip(os.sep) + os.sep
+            except Exception:
+                cwd_low = os.sep
             if root_prefix in cmdline_low or cwd_low.startswith(root_prefix):
                 is_holder = True
         if not is_holder:
@@ -7241,6 +7260,114 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
             f"  ✓ Restarting {unmapped_relaunched} unmapped Windows gateway process(es)"
         )
 
+def _git_is_trampoline(git_cmd: list) -> bool:
+    """Whether *git_cmd* resolves to a Git-for-Windows trampoline launcher.
+
+    Git for Windows ships two ~46KB shims (``bin\\git.exe``, ``cmd\\git.exe``)
+    that re-exec the real ``mingw64\\libexec\\git-core\\git.exe``. When the
+    shim's re-exec target is missing or PATH resolves to the shim in a
+    context where it cannot find git-core, every git call dies with the
+    launcher's own guard message instead of running — a broken PATH entry,
+    not a network or filesystem problem (#87876). Never raises; unknown
+    states report False so a probe failure can't block an update.
+    """
+    try:
+        result = subprocess.run(
+            git_cmd + ["--version"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+    except Exception:
+        return False
+    output = ((result.stdout or "") + (result.stderr or "")).lower()
+    return "fork bomb" in output
+
+
+def _portable_git_candidates() -> list:
+    """PortableGit candidate paths: shared root first, then profile home.
+
+    The Hermes-managed PortableGit tree lives under the SHARED root
+    (``<root>/git/...``), not the profile-scoped HERMES_HOME
+    (``<root>/profiles/<name>``), so a profile-scoped ``hermes update`` must
+    look there (monerostar review, #87876). The profile-home candidate is
+    kept as a fallback for custom layouts that place it there.
+    """
+    candidates = []
+    try:
+        for root in (get_default_hermes_root(), Path(get_hermes_home())):
+            candidates.append(
+                root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
+            )
+    except Exception:
+        pass
+    return candidates
+
+
+def _locate_real_git() -> Optional[Path]:
+    """Find a real Git-for-Windows binary that is not a broken trampoline.
+
+    The trampoline symptom is PATH-level: ``bin\\git.exe`` / ``cmd\\git.exe``
+    (both ~46KB shims) fail to re-exec git-core, while the real binary at
+    ``mingw64\\libexec\\git-core\\git.exe`` (≈4.4MB) works when invoked
+    directly (#87876). Check the standard Git for Windows locations plus the
+    Hermes-managed PortableGit copy; accept the first candidate that runs and
+    does NOT print the trampoline guard. Returns None when nothing suitable
+    is found — callers then keep the broken command and let the existing
+    fetch-failure ZIP fallback handle it.
+    """
+    candidates = [
+        Path(r"C:\Program Files\Git\mingw64\libexec\git-core\git.exe"),
+        Path(r"C:\Program Files (x86)\Git\mingw64\libexec\git-core\git.exe"),
+    ] + _portable_git_candidates()
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            result = subprocess.run(
+                [str(candidate), "--version"],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=15,
+            )
+        except Exception:
+            continue
+        output = ((result.stdout or "") + (result.stderr or "")).lower()
+        if "fork bomb" in output:
+            continue
+        return candidate
+    return None
+
+
+def _ensure_non_trampoline_git(git_cmd: list) -> list:
+    """Swap a broken Git-for-Windows trampoline for a real git binary.
+
+    Runs up front, right after the git command is built. When the resolved
+    ``git`` is a broken trampoline, locate the real binary and rebuild the
+    command with it so fetch/pull/checkout keep working with a real git
+    instead of degrading to the ZIP fallback. When no real binary can be
+    found, leave the command untouched — the existing fetch-failure handler
+    already falls back to the ZIP path on Windows. No-op off Windows (the
+    trampoline is a Git-for-Windows artifact) and when git is healthy.
+    """
+    if sys.platform != "win32":
+        return git_cmd
+    if not _git_is_trampoline(git_cmd):
+        return git_cmd
+    real_git = _locate_real_git()
+    if real_git is None:
+        print(
+            "⚠ Detected a broken git trampoline and could not locate a real "
+            "git binary — the update will fall back to the ZIP path."
+        )
+        return git_cmd
+    print(
+        f"⚠ Detected a broken git trampoline; switching to real git at "
+        f"{real_git}"
+    )
+    return [str(real_git)] + list(git_cmd[1:])
+
+
 def _discard_lockfile_churn(git_cmd, repo_root):
     """Restore tracked ``package-lock.json`` files that npm dirtied locally.
 
@@ -7949,6 +8076,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
     git_cmd = ["git"]
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+    # A broken Git-for-Windows trampoline refuses every git call with a
+    # "BUG (fork bomb)" guard instead of running; swap in a real binary up
+    # front so the normal git path survives instead of degrading to ZIP
+    # (#87876).
+    git_cmd = _ensure_non_trampoline_git(git_cmd)
 
     # Discard npm lockfile churn before any stash/branch logic. npm rewrites
     # tracked package-lock.json files non-deterministically at install/build

@@ -665,11 +665,12 @@ def _claim_active_session_slot(
         )
     except Exception as exc:
         logger.warning("Failed to claim active session slot: %s", exc)
-        return (
-            (None, _SESSION_OWNERSHIP_UNAVAILABLE)
-            if track_liveness
-            else (None, None)
-        )
+        # Fail CLOSED regardless of surface: per-session exclusivity is a
+        # correctness guarantee (see PER_SESSION_EXCLUSIVE_SUBMIT), and a
+        # claim that errors out has NOT proven the session is unowned.
+        # Proceeding without a lease here is the silent double-writer hole
+        # flagged in the #94595 review (blocker 2).
+        return (None, _SESSION_OWNERSHIP_UNAVAILABLE)
 
 
 def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
@@ -1245,7 +1246,16 @@ def _interrupt_session_turn(
     run_thread_alive = False
 
     if use_compute_host:
-        if should_interrupt:
+        # The host owns the live turn. Parent `running` is only a mirror and
+        # can lag behind a blocked interactive tool (a clarify parked on its
+        # Event keeps the host turn alive after the parent flag went stale),
+        # so let the host decide whether there is work to interrupt.
+        # Gate on `_compute_host_active` too: `_session_uses_compute_host`
+        # is also true for lazy sessions that never ran a hosted turn, and
+        # `HostSupervisor.interrupt()` calls `start()` — forwarding
+        # unconditionally would spawn a compute-host child just to deliver
+        # an interrupt no session ever submitted work to.
+        if should_interrupt or session.get("_compute_host_active"):
             _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
     else:
         run_thread = session.get("_run_thread")
@@ -2599,7 +2609,7 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
             from tui_gateway.host_supervisor import HostSupervisor
 
             _compute_host_supervisor = HostSupervisor(
-                rpc_sink=write_json,
+                rpc_sink=_relay_compute_host_rpc,
                 heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
                 respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3),
             )
@@ -2648,6 +2658,87 @@ def _compute_host_turn_frame(
 def _metadata_mirror(session: dict | None) -> dict:
     mirror = (session or {}).get("_metadata_mirror")
     return mirror if isinstance(mirror, dict) else {}
+
+
+def _relay_compute_host_rpc(message: dict) -> bool:
+    """Relay host events while retaining the clarify snapshot needed on resume."""
+    params = message.get("params") if isinstance(message, dict) else None
+    if isinstance(params, dict) and params.get("type") == "clarify.request":
+        sid = str(params.get("session_id") or "")
+        payload = params.get("payload")
+        session = _sessions.get(sid)
+        if session is not None and isinstance(payload, dict) and payload.get("request_id"):
+            with session.get("history_lock", threading.Lock()):
+                session["_compute_host_pending_clarify"] = dict(payload)
+    elif isinstance(params, dict) and params.get("type") == "clarify.expire":
+        sid = str(params.get("session_id") or "")
+        payload = params.get("payload")
+        session = _sessions.get(sid)
+        request_id = payload.get("request_id") if isinstance(payload, dict) else None
+        if session is not None and request_id:
+            with session.get("history_lock", threading.Lock()):
+                pending = session.get("_compute_host_pending_clarify")
+                if isinstance(pending, dict) and pending.get("request_id") == request_id:
+                    session.pop("_compute_host_pending_clarify", None)
+    return write_json(message)
+
+
+def _compute_host_clarify_session(request_id: str) -> tuple[str, dict] | None:
+    """Find the parent mirror for one host-owned clarify request."""
+    if not request_id:
+        return None
+    for sid, session in list(_sessions.items()):
+        with session.get("history_lock", threading.Lock()):
+            pending = session.get("_compute_host_pending_clarify")
+            if isinstance(pending, dict) and pending.get("request_id") == request_id:
+                return sid, session
+    return None
+
+
+def _update_compute_host_clarify_snapshot(sid: str, session: dict, params: dict, result: dict) -> None:
+    """Keep reconnect snapshots accurate while a batch clarify is answered."""
+    request_id = str(params.get("request_id") or "")
+    with session.get("history_lock", threading.Lock()):
+        pending = session.get("_compute_host_pending_clarify")
+        if not isinstance(pending, dict) or pending.get("request_id") != request_id:
+            return
+        if result.get("status") == "expired" or not result.get("remaining") and not params.get("question_id"):
+            session.pop("_compute_host_pending_clarify", None)
+            return
+        question_id = str(params.get("question_id") or "")
+        if question_id and isinstance(result.get("remaining"), list):
+            answers = dict(pending.get("answers") or {})
+            answers[question_id] = str(params.get("answer") or "")
+            pending["answers"] = answers
+            if not result["remaining"]:
+                session.pop("_compute_host_pending_clarify", None)
+
+
+def _respond_compute_host_clarify(rid: str, params: dict) -> dict | None:
+    """Proxy a clarify answer into the process that owns its pending Event."""
+    located = _compute_host_clarify_session(str(params.get("request_id") or ""))
+    if located is None:
+        return None
+    sid, session = located
+    if not _session_uses_compute_host(session):
+        return None
+    try:
+        ack = _get_compute_host_supervisor().respond(sid, params)
+    except Exception as exc:
+        return _err(rid, 5019, f"compute-host clarify response failed: {exc}")
+    if ack.get("type") == "respond.error":
+        return _err(rid, 5019, str(ack.get("message") or "compute-host clarify response failed"))
+    response = ack.get("response")
+    if not isinstance(response, dict):
+        return _err(rid, 5019, "compute-host clarify response returned an invalid response")
+    if "error" in response:
+        error = response["error"] if isinstance(response["error"], dict) else {}
+        return _err(rid, int(error.get("code") or 5000), str(error.get("message") or "clarify response failed"))
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return _err(rid, 5019, "compute-host clarify response returned an invalid result")
+    _update_compute_host_clarify_snapshot(sid, session, params, result)
+    return _ok(rid, result)
 
 
 def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> None:
@@ -2699,6 +2790,7 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session["running"] = False
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
+        session.pop("_compute_host_pending_clarify", None)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
@@ -2818,6 +2910,12 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
                 if batch is not None and batch["answers"]:
                     snapshot["answers"] = dict(batch["answers"])
                 return snapshot
+    session = _sessions.get(sid)
+    if session is not None:
+        with session.get("history_lock", threading.Lock()):
+            pending = session.get("_compute_host_pending_clarify")
+            if isinstance(pending, dict):
+                return dict(pending)
     return None
 
 
@@ -9893,6 +9991,23 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 return
             session["running"] = True
             session["last_active"] = time.time()
+        # Ownership admission BEFORE message.start: the interrupted-turn
+        # marker this continuation is recovering may have been written by a
+        # sibling backend that is still alive and mid-turn (#94778 — two
+        # backends share one HERMES_HOME; B resumes S while A runs it and
+        # sees A's fresh marker). Running the continuation anyway would be
+        # the double-writer this fence exists to prevent. Leave the marker:
+        # once the owner finishes or dies, a later resume retries.
+        if _ensure_active_session_slot(sid, session) is not None:
+            logger.info(
+                "auto-continue for %s refused: session has another live owner",
+                session_key,
+            )
+            with session["history_lock"]:
+                session["running"] = False
+                session["_auto_continue_scheduled"] = False
+            return
+        with session["history_lock"]:
             # Hand this turn its own marker inputs (read back by
             # _run_prompt_submit): count the attempt so a crash during the
             # continuation trips the breaker, and re-record the ORIGINAL
@@ -12643,6 +12758,22 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> bool:
+    # Ownership admission at the ONE chokepoint every fresh turn source must
+    # cross. prompt.submit already claims the slot in its RPC handler (so this
+    # is a no-op re-check there), but crash auto-continue, wake-ups and other
+    # synthesized turns call _run_prompt_submit directly — the exact bypass
+    # that let a second backend run a duplicate turn in #94778. When the
+    # session already holds its lease this is a cheap dict check.
+    if (ownership_refusal := _ensure_active_session_slot(sid, session)) is not None:
+        logger.info(
+            "Refusing turn for session %s at _run_prompt_submit: %s",
+            session.get("session_key") or sid,
+            getattr(ownership_refusal, "reason", None) or "refused",
+        )
+        with session["history_lock"]:
+            session["running"] = False
+        _emit("error", sid, {"message": str(ownership_refusal)})
+        return False
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -16879,6 +17010,25 @@ def _persist_wake_enabled(enabled: bool) -> bool:
     except Exception as e:
         logger.warning("wake: failed to persist wake_word.enabled=%s: %s", enabled, e)
         return False
+
+
+@method("gateway.capabilities")
+def _(rid, params: dict) -> dict:
+    """What guarantees THIS BUILD enforces, for a client that must not assume.
+
+    An automated client cannot tell a gateway that fences concurrent writers to
+    one session from one that silently allows them -- both accept the same calls
+    and both answer prompt.submit the same way. It only finds out by corrupting a
+    conversation. So the guarantee is advertised, and a client that does not see
+    it advertised is expected to withhold rather than hope.
+
+    Sourced from the module that performs the enforcement, never from config: a
+    capability an operator can switch on without also having the mechanism is
+    worse than no capability at all, because it is believed.
+    """
+    from hermes_cli.active_sessions import PER_SESSION_EXCLUSIVE_SUBMIT
+
+    return _ok(rid, {"per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT)})
 
 
 @method("ping")
