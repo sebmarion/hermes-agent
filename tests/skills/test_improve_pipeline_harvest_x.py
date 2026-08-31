@@ -101,6 +101,6 @@ def test_bookmark_fetch_failure_is_not_misreported_as_empty(monkeypatch) -> None
     def unavailable(*args, **kwargs):
         raise FileNotFoundError("xurl")
 
-    monkeypatch.setattr(hx.subprocess, "run", unavailable)
+    monkeypatch.setattr(hx, "run_text_bounded", unavailable)
     with pytest.raises(RuntimeError, match="xurl unavailable"):
         hx.fetch_bookmarks()

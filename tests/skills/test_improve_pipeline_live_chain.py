@@ -422,6 +422,13 @@ def test_live_chain_stops_batch_before_core_budget_overflow(tmp_path: Path) -> N
     target.write_text(baseline)
     _install_validator(target)
     applied = []
+    judge_calls = []
+
+    def judge(prompt: str) -> str:
+        judge_calls.append(prompt)
+        return json.dumps(
+            {"verdict": "better", "score": 0.99, "rationale": "clear outcome"}
+        )
 
     report = lp.run_live_chain(
         failures=[_failure()],
@@ -429,9 +436,7 @@ def test_live_chain_stops_batch_before_core_budget_overflow(tmp_path: Path) -> N
         live_skills=live,
         skill_path=target,
         proposer=lambda _prompt: "## Safe\n\n" + "y" * 600,
-        judge=lambda _prompt: json.dumps(
-            {"verdict": "better", "score": 0.99, "rationale": "clear outcome"}
-        ),
+        judge=judge,
         applier=lambda *args: applied.append(args),
         run_id="R-budget",
     )
@@ -441,6 +446,32 @@ def test_live_chain_stops_batch_before_core_budget_overflow(tmp_path: Path) -> N
     assert report["applied"] == []
     assert report["blocked"] == ["task_1234abcd"]
     assert applied == []
+    assert judge_calls == []
+
+
+def test_live_chain_blocks_oversized_proposal_before_judging(tmp_path: Path) -> None:
+    live = tmp_path / "skills"
+    target = live / "software-development" / "bestplan" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("---\nname: bestplan\ndescription: test\n---\n\n# BestPlan\n")
+    judge_calls = []
+
+    report = lp.run_live_chain(
+        failures=[_failure()],
+        state_dir=tmp_path / "state",
+        live_skills=live,
+        skill_path=target,
+        proposer=lambda _prompt: "x" * (lp.MAX_PROPOSAL_CHARS + 1),
+        judge=lambda prompt: judge_calls.append(prompt),
+        applier=lambda *args: None,
+        run_id="R-oversized-proposal",
+    )
+
+    assert report["ok"] is True
+    assert report["halted"] is False
+    assert report["blocked"] == [_failure()["task_id"]]
+    assert "before judging" in report["notes"][0]
+    assert judge_calls == []
 
 
 def test_live_chain_blocks_duplicate_heading_without_dirtying_live_skill(tmp_path: Path) -> None:

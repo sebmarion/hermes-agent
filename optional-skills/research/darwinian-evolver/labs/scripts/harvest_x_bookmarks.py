@@ -28,6 +28,8 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from bounded_subprocess import OutputLimitExceeded, run_text_bounded
+
 # Cheap actionability keywords: present => likely Hermes-actionable.
 # Deliberately narrow + lowercase so noise rarely passes the gate.
 _ACTION_KEYWORDS = (
@@ -126,6 +128,11 @@ def write_sidecar(path: Path, records: list[dict]) -> int:
 DEFAULT_X_CDP_URL = "http://127.0.0.1:9333"
 DEFAULT_X_PUBLISHER_ROOT = "/home/seb/.local/share/hermes-x-publisher"
 _BROWSER_TIMEOUT_SECONDS = 60
+_MAX_BOOKMARK_RECORDS = 100
+_MAX_BOOKMARK_TEXT_CHARS = 4_000
+_MAX_BOOKMARK_URL_CHARS = 512
+_MAX_BOOKMARK_ID_CHARS = 128
+_MAX_BOOKMARK_STDOUT_BYTES = 512 * 1024
 _BROWSER_SCRIPT = r'''
 "use strict";
 
@@ -133,8 +140,14 @@ const path = require("node:path");
 const cdpUrl = process.env.X_BOOKMARKS_CDP_URL;
 const publisherRoot = process.env.X_PUBLISHER_ROOT;
 const limit = Number.parseInt(process.env.X_BOOKMARKS_LIMIT || "", 10);
+const maxTextChars = Number.parseInt(process.env.X_BOOKMARKS_MAX_TEXT_CHARS || "", 10);
+const maxUrlChars = Number.parseInt(process.env.X_BOOKMARKS_MAX_URL_CHARS || "", 10);
+const maxIdChars = Number.parseInt(process.env.X_BOOKMARKS_MAX_ID_CHARS || "", 10);
 
-if (!cdpUrl || !publisherRoot || !Number.isInteger(limit) || limit < 0) {
+if (!cdpUrl || !publisherRoot || !Number.isInteger(limit) || limit < 0 ||
+    !Number.isInteger(maxTextChars) || maxTextChars < 1 ||
+    !Number.isInteger(maxUrlChars) || maxUrlChars < 1 ||
+    !Number.isInteger(maxIdChars) || maxIdChars < 1) {
   throw new Error("invalid browser harvest configuration");
 }
 
@@ -144,8 +157,24 @@ function writeOutput(value) {
   });
 }
 
-function recordsFromArticles(articles) {
-  return articles.map((article) => {
+function recordsFromArticles(articles, limits) {
+  function boundedText(root, maxChars) {
+    if (!root?.ownerDocument) return "";
+    const showText = root.ownerDocument.defaultView?.NodeFilter?.SHOW_TEXT ?? 4;
+    const walker = root.ownerDocument.createTreeWalker(root, showText);
+    let text = "";
+    while (text.length < maxChars) {
+      const node = walker.nextNode();
+      if (!node) break;
+      const value = typeof node.nodeValue === "string" ? node.nodeValue : "";
+      text += value.slice(0, maxChars - text.length);
+    }
+    return text.trim();
+  }
+
+  const output = [];
+  for (const article of articles) {
+    if (output.length >= limits.limit) break;
     for (const node of article.querySelectorAll("a[href]")) {
       let link;
       try {
@@ -157,14 +186,16 @@ function recordsFromArticles(articles) {
       const match = link.pathname.match(/^\/([^/]+)\/status\/([0-9]+)\/?$/);
       if (!match) continue;
       const tweetText = article.querySelector('[data-testid="tweetText"]');
-      return {
-        id: match[2],
-        full_text: (tweetText?.innerText || article.innerText || "").trim(),
-        url: `https://x.com/${match[1]}/status/${match[2]}`,
-      };
+      const id = match[2].slice(0, limits.maxIdChars);
+      output.push({
+        id,
+        full_text: boundedText(tweetText || article, limits.maxTextChars),
+        url: `https://x.com/${match[1]}/status/${id}`.slice(0, limits.maxUrlChars),
+      });
+      break;
     }
-    return null;
-  }).filter(Boolean);
+  }
+  return output;
 }
 
 async function run() {
@@ -188,7 +219,12 @@ async function run() {
 
     const records = new Map();
     for (let round = 0; round < 24 && records.size < limit; round += 1) {
-      const batch = await page.locator("article").evaluateAll(recordsFromArticles);
+      const batch = await page.locator("article").evaluateAll(recordsFromArticles, {
+        limit: limit - records.size,
+        maxTextChars,
+        maxUrlChars,
+        maxIdChars,
+      });
       for (const record of batch) {
         if (!records.has(record.id)) records.set(record.id, record);
       }
@@ -219,11 +255,15 @@ def _first_env(*names: str, default: str) -> str:
 
 
 def _validate_loopback_cdp_url(value: str) -> str:
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("browser CDP URL must be a loopback HTTP endpoint") from exc
     if (
         parsed.scheme != "http"
         or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or parsed.port is None
+        or port is None
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -235,7 +275,11 @@ def _validate_loopback_cdp_url(value: str) -> str:
 
 
 def _strict_bookmark_records(data, source: str, *, exact: bool = False) -> list[dict]:
-    if not isinstance(data, list) or not all(isinstance(record, dict) for record in data):
+    if (
+        not isinstance(data, list)
+        or len(data) > _MAX_BOOKMARK_RECORDS
+        or not all(isinstance(record, dict) for record in data)
+    ):
         raise RuntimeError(f"{source} returned an unsupported bookmarks response")
     for record in data:
         bookmark_id = record.get("id")
@@ -244,8 +288,11 @@ def _strict_bookmark_records(data, source: str, *, exact: bool = False) -> list[
             or isinstance(bookmark_id, bool)
             or not isinstance(bookmark_id, (int, str))
             or not str(bookmark_id)
+            or len(str(bookmark_id)) > _MAX_BOOKMARK_ID_CHARS
             or not isinstance(record.get("full_text"), str)
+            or len(record.get("full_text", "")) > _MAX_BOOKMARK_TEXT_CHARS
             or not isinstance(record.get("url"), str)
+            or len(record.get("url", "")) > _MAX_BOOKMARK_URL_CHARS
         ):
             raise RuntimeError(f"{source} returned an invalid bookmark record")
     return data
@@ -253,11 +300,12 @@ def _strict_bookmark_records(data, source: str, *, exact: bool = False) -> list[
 
 def _fetch_xurl_bookmarks(n: int) -> list[dict]:
     try:
-        proc = subprocess.run(
+        proc = run_text_bounded(
             ["xurl", "bookmarks", "-n", str(n)],
-            capture_output=True, text=True, timeout=60,
+            timeout=60,
+            max_stdout_bytes=_MAX_BOOKMARK_STDOUT_BYTES,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, OutputLimitExceeded) as exc:
         raise RuntimeError("xurl unavailable") from exc
     if proc.returncode != 0:
         raise RuntimeError(f"xurl bookmarks failed with exit {proc.returncode}")
@@ -272,7 +320,7 @@ def _fetch_xurl_bookmarks(n: int) -> list[dict]:
             if isinstance(data, dict) and isinstance(data.get(key), list):
                 records = data[key]
                 break
-    return _strict_bookmark_records(records, "xurl")
+    return _strict_bookmark_records(records, "xurl")[:n]
 
 
 def _fetch_browser_bookmarks(n: int) -> list[dict]:
@@ -297,16 +345,18 @@ def _fetch_browser_bookmarks(n: int) -> list[dict]:
         "X_BOOKMARKS_CDP_URL": cdp_url,
         "X_PUBLISHER_ROOT": publisher_root,
         "X_BOOKMARKS_LIMIT": str(max(0, n)),
+        "X_BOOKMARKS_MAX_TEXT_CHARS": str(_MAX_BOOKMARK_TEXT_CHARS),
+        "X_BOOKMARKS_MAX_URL_CHARS": str(_MAX_BOOKMARK_URL_CHARS),
+        "X_BOOKMARKS_MAX_ID_CHARS": str(_MAX_BOOKMARK_ID_CHARS),
     }
     try:
-        proc = subprocess.run(
+        proc = run_text_bounded(
             ["node", "-e", _BROWSER_SCRIPT],
-            capture_output=True,
-            text=True,
             timeout=_BROWSER_TIMEOUT_SECONDS,
             env=env,
+            max_stdout_bytes=_MAX_BOOKMARK_STDOUT_BYTES,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, OutputLimitExceeded) as exc:
         raise RuntimeError("browser session unavailable") from exc
     if proc.returncode != 0:
         raise RuntimeError("browser session harvest failed")
@@ -325,6 +375,8 @@ def fetch_bookmarks(n: int = 50) -> list[dict]:
     reads browser cookies/tokens or performs an X write. Errors intentionally
     omit subprocess output so credentials cannot reach logs.
     """
+    if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= _MAX_BOOKMARK_RECORDS:
+        raise RuntimeError(f"bookmark limit must be between 0 and {_MAX_BOOKMARK_RECORDS}")
     try:
         return _fetch_xurl_bookmarks(n)
     except RuntimeError as xurl_error:

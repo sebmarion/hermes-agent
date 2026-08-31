@@ -186,6 +186,30 @@ def test_call_zeus_rejects_plain_http_public_endpoint() -> None:
         pzc._validate_base_url("http://evil.example/v1")
 
 
+def test_call_zeus_rejects_content_above_candidate_budget(monkeypatch) -> None:
+    body = json.dumps(
+        {"choices": [{"message": {"content": "x" * (pzc.MAX_LUNA_OUTPUT_CHARS + 1)}}]}
+    ).encode()
+
+    class Response:
+        status = 200
+
+        def read(self, limit: int) -> bytes:
+            assert limit == pzc.MAX_LUNA_STDOUT_BYTES + 1
+            return body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(pzc.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(RuntimeError, match="output limit"):
+        pzc.call_zeus("http://127.0.0.1:8080/v1", "local", "model", "prompt")
+
+
 def test_call_luna_uses_existing_openai_codex_route(monkeypatch) -> None:
     calls = []
 
@@ -194,7 +218,7 @@ def test_call_luna_uses_existing_openai_codex_route(monkeypatch) -> None:
         return subprocess.CompletedProcess(argv, 0, stdout="## Candidate\n", stderr="")
 
     monkeypatch.setattr(pzc.shutil, "which", lambda _name: "hermes")
-    monkeypatch.setattr(pzc.subprocess, "run", fake_run)
+    monkeypatch.setattr(pzc, "run_text_bounded", fake_run)
 
     result = pzc.call_luna("repair the concrete failure")
 
@@ -219,16 +243,28 @@ def test_call_luna_uses_existing_openai_codex_route(monkeypatch) -> None:
         "/tmp",
     ]
     assert kwargs["timeout"] == 180
-    assert kwargs["capture_output"] is True
-    assert kwargs["text"] is True
-    assert kwargs["check"] is False
+    assert kwargs["max_stdout_bytes"] == pzc.MAX_LUNA_STDOUT_BYTES
+
+
+def test_call_luna_rejects_output_above_candidate_budget(monkeypatch) -> None:
+    monkeypatch.setattr(pzc.shutil, "which", lambda _name: "hermes")
+    monkeypatch.setattr(
+        pzc,
+        "run_text_bounded",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout="x" * (pzc.MAX_LUNA_OUTPUT_CHARS + 1), stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="output limit"):
+        pzc.call_luna("repair the concrete failure")
 
 
 def test_call_luna_fails_closed_on_empty_or_failed_output(monkeypatch) -> None:
     monkeypatch.setattr(pzc.shutil, "which", lambda _name: "hermes")
     monkeypatch.setattr(
-        pzc.subprocess,
-        "run",
+        pzc,
+        "run_text_bounded",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             args[0], 0, stdout="", stderr=""
         ),

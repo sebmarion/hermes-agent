@@ -27,11 +27,12 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from bounded_subprocess import OutputLimitExceeded, run_text_bounded
 
 # Same conservative credential scan so a failure body can never carry a secret
 # into a candidate prompt or on-disk file.
@@ -41,6 +42,9 @@ CRED_PATTERNS = [
     (re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"), "github token"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"), "JWT"),
 ]
+
+MAX_LUNA_OUTPUT_CHARS = 30_000
+MAX_LUNA_STDOUT_BYTES = 64 * 1024
 
 
 def _scrub(text: str) -> str:
@@ -207,11 +211,19 @@ def call_zeus(base_url: str, api_key: str, model: str, prompt: str, timeout: flo
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         if resp.status != 200:
             raise RuntimeError(f"HTTPS {resp.status} from {url}")
-        payload = json.loads(resp.read().decode())
+        raw = resp.read(MAX_LUNA_STDOUT_BYTES + 1)
+        if len(raw) > MAX_LUNA_STDOUT_BYTES:
+            raise RuntimeError("Zeus proposal output limit exceeded")
+        payload = json.loads(raw.decode())
     try:
-        return payload["choices"][0]["message"]["content"]
+        content = payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"unexpected chat response shape: {exc}")
+    if not isinstance(content, str):
+        raise RuntimeError("unexpected chat response shape: content must be text")
+    if len(content) > MAX_LUNA_OUTPUT_CHARS:
+        raise RuntimeError("Zeus proposal output limit exceeded")
+    return content
 
 
 def call_luna(prompt: str, timeout: float = 180.0) -> str:
@@ -223,32 +235,36 @@ def call_luna(prompt: str, timeout: float = 180.0) -> str:
     if not hermes:
         raise RuntimeError("Hermes CLI unavailable for Luna proposal")
 
-    completed = subprocess.run(
-        [
-            hermes,
-            "-z",
-            prompt,
-            "--provider",
-            "openai-codex",
-            "--model",
-            "gpt-5.6-luna",
-            "--reasoning",
-            "low",
-            "--toolsets",
-            "search",
-            "--safe-mode",
-            "--ignore-rules",
-            "--in",
-            "/tmp",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        completed = run_text_bounded(
+            [
+                hermes,
+                "-z",
+                prompt,
+                "--provider",
+                "openai-codex",
+                "--model",
+                "gpt-5.6-luna",
+                "--reasoning",
+                "low",
+                "--toolsets",
+                "search",
+                "--safe-mode",
+                "--ignore-rules",
+                "--in",
+                "/tmp",
+            ],
+            timeout=timeout,
+            max_stdout_bytes=MAX_LUNA_STDOUT_BYTES,
+        )
+    except OutputLimitExceeded as exc:
+        raise RuntimeError("Luna proposal output limit exceeded") from exc
     if completed.returncode != 0 or not completed.stdout.strip():
         raise RuntimeError(f"Luna proposal failed with exit {completed.returncode}")
-    return completed.stdout.strip()
+    output = completed.stdout.strip()
+    if len(output) > MAX_LUNA_OUTPUT_CHARS:
+        raise RuntimeError("Luna proposal output limit exceeded")
+    return output
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,8 @@ import run_improve_loop as rl
 import score_hermes_skill_run as score
 
 _ALLOWED_VERDICTS = {"better", "equal", "worse"}
+MAX_PROPOSAL_CHARS = 30_000
+MAX_CANDIDATE_CHARS = 30_000
 _CREDENTIALS = tuple(pattern for pattern, _label in pzc.CRED_PATTERNS)
 _PATCH_SYNTAX = re.compile(
     r"(?im)^(?:[ \t]*(?:`{3,}|~{3,})[ \t]*(?:diff|patch)\b.*$|"
@@ -289,7 +291,15 @@ def run_live_chain(
             prompt = pzc.build_proposer_prompt(failure, str(skill_path))
             proposal = proposer(prompt)
             try:
+                if not isinstance(proposal, str) or len(proposal) > MAX_PROPOSAL_CHARS:
+                    raise ValueError(
+                        f"proposal must be text no longer than {MAX_PROPOSAL_CHARS} characters"
+                    )
                 candidate = materialize_candidate(baseline, proposal)
+                if len(candidate) > MAX_CANDIDATE_CHARS:
+                    raise ValueError(
+                        f"candidate exceeds {MAX_CANDIDATE_CHARS}-character core budget"
+                    )
             except ValueError as exc:
                 # A malformed or empty model proposal is a candidate-level
                 # rejection. Do not let one bad harvested failure wedge the
@@ -364,9 +374,11 @@ def run_live_chain(
                 staged.append({"task_id": task_id, "candidate": candidate})
                 continue
             trial_aggregate = baseline_prefix + "\n\n" + "\n\n".join(accepted + [candidate_addition]) + "\n"
-            if len(trial_aggregate) > 30_000:
+            if len(trial_aggregate) > MAX_CANDIDATE_CHARS:
                 blocked.append(task_id)
-                notes.append(f"{task_id}: aggregate exceeds 30,000-character core budget")
+                notes.append(
+                    f"{task_id}: aggregate exceeds {MAX_CANDIDATE_CHARS:,}-character core budget"
+                )
                 continue
             accepted.append(candidate_addition)
             aggregate_text = trial_aggregate
