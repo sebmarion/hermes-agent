@@ -152,11 +152,21 @@ def test_canonical_promotion_is_fast_forward_only(tmp_path: Path, monkeypatch) -
 def test_canonical_install_sync_uses_locked_project(tmp_path: Path, monkeypatch) -> None:
     wrapper = _load_wrapper()
     calls = []
+    probe_snapshot = {}
 
     assert "CronTickYielded" in wrapper.INSTALLED_IMPORT_PROBE
+    assert "is_relative_to" in wrapper.INSTALLED_IMPORT_PROBE
 
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
+        if argv[0] == str(wrapper.PYTHON):
+            probe_snapshot.update(
+                {
+                    "mode": kwargs["cwd"].stat().st_mode & 0o777,
+                    "env": kwargs["env"],
+                    "cwd": kwargs["cwd"],
+                }
+            )
         return subprocess.CompletedProcess(argv, 0, stdout="synced", stderr="")
 
     monkeypatch.setattr(wrapper.subprocess, "run", fake_run)
@@ -182,15 +192,20 @@ def test_canonical_install_sync_uses_locked_project(tmp_path: Path, monkeypatch)
             },
         ),
         (
-            [str(wrapper.PYTHON), "-c", wrapper.INSTALLED_IMPORT_PROBE],
+            [str(wrapper.PYTHON), "-I", "-c", wrapper.INSTALLED_IMPORT_PROBE],
             {
-                "cwd": Path("/tmp"),
+                "cwd": probe_snapshot["cwd"],
                 "capture_output": True,
+                "env": probe_snapshot["env"],
                 "text": True,
                 "timeout": 60,
             },
         ),
     ]
+    assert probe_snapshot["mode"] == 0o700
+    assert probe_snapshot["cwd"] != Path("/tmp")
+    assert "PYTHONPATH" not in probe_snapshot["env"]
+    assert "PYTHONHOME" not in probe_snapshot["env"]
 
 
 def test_canonical_install_sync_fails_closed_on_import_probe(
@@ -229,6 +244,149 @@ def test_canonical_promotion_syncs_install_before_returning(monkeypatch) -> None
         ("promote", "old", "new"),
         ("sync", wrapper.REPO),
     ]
+
+
+def test_recovery_retries_install_sync_before_starting_a_new_merge(
+    tmp_path: Path, monkeypatch
+) -> None:
+    wrapper = _load_wrapper()
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(wrapper, "STATE", state)
+    monkeypatch.setattr(wrapper, "LOCK", state / "lock")
+    monkeypatch.setattr(wrapper, "_prune_stale_runs", lambda: None)
+    monkeypatch.setattr(wrapper, "_assert_canonical", lambda: "0" * 40)
+    monkeypatch.setattr(wrapper, "_recover_published_activation", lambda: "0" * 40)
+    monkeypatch.setattr(wrapper, "_git", lambda *_a, **_k: "0" * 40)
+    monkeypatch.setattr(
+        wrapper,
+        "_sync_canonical_install",
+        lambda _repo: (_ for _ in ()).throw(wrapper.WrapperError("sync retry failed")),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_create_isolated_repo",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("merge must not start before recovery sync succeeds")
+        ),
+    )
+    monkeypatch.setattr(wrapper, "_notify", lambda *_a, **_k: None)
+
+    assert wrapper.main() == 1
+    report = (state / "last-upstream-merge.txt").read_text()
+    assert "sync retry failed" in report
+    assert "canonical checkout was not mutated" in report
+
+
+def test_post_promotion_sync_failure_reports_canonical_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    wrapper = _load_wrapper()
+    state = tmp_path / "state"
+    run_parent = tmp_path / "run"
+    run_repo = run_parent / "repo"
+    run_repo.mkdir(parents=True)
+    state.mkdir()
+    sync_calls = []
+    monkeypatch.setattr(wrapper, "STATE", state)
+    monkeypatch.setattr(wrapper, "LOCK", state / "lock")
+    monkeypatch.setattr(wrapper, "_prune_stale_runs", lambda: None)
+    monkeypatch.setattr(wrapper, "_assert_canonical", lambda: "old")
+    monkeypatch.setattr(wrapper, "_recover_published_activation", lambda: "old")
+
+    def sync(_repo):
+        sync_calls.append(1)
+        if len(sync_calls) == 2:
+            raise wrapper.WrapperError("post-promotion sync failed")
+
+    monkeypatch.setattr(wrapper, "_sync_canonical_install", sync)
+    monkeypatch.setattr(
+        wrapper, "_create_isolated_repo", lambda *_a, **_k: (run_parent, run_repo)
+    )
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess([], 0, stdout="ok", stderr=""),
+    )
+    monkeypatch.setattr(wrapper, "_load_sync_state", lambda: {"published_sha": "a" * 40})
+    monkeypatch.setattr(wrapper, "_promote_canonical", lambda *_a, **_k: "a" * 40)
+    monkeypatch.setattr(wrapper, "_notify", lambda *_a, **_k: None)
+
+    assert wrapper.main() == 1
+    report = (state / "last-upstream-merge.txt").read_text()
+    assert "post-promotion sync failed" in report
+    assert "canonical checkout advanced" in report
+    assert "activation was withheld" in report
+
+
+def test_recovery_failure_after_fast_forward_reports_actual_canonical_head(
+    tmp_path: Path, monkeypatch
+) -> None:
+    wrapper = _load_wrapper()
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(wrapper, "STATE", state)
+    monkeypatch.setattr(wrapper, "LOCK", state / "lock")
+    monkeypatch.setattr(wrapper, "_prune_stale_runs", lambda: None)
+    monkeypatch.setattr(wrapper, "_assert_canonical", lambda: "0" * 40)
+    monkeypatch.setattr(
+        wrapper,
+        "_recover_published_activation",
+        lambda: (_ for _ in ()).throw(wrapper.WrapperError("post-ff verification failed")),
+    )
+    monkeypatch.setattr(wrapper, "_git", lambda *_a, **_k: "a" * 40)
+    monkeypatch.setattr(wrapper, "_notify", lambda *_a, **_k: None)
+
+    assert wrapper.main() == 1
+    report = (state / "last-upstream-merge.txt").read_text()
+    assert "post-ff verification failed" in report
+    assert f"canonical checkout advanced to {'a' * 40}" in report
+    assert "activation was withheld" in report
+
+
+@pytest.mark.parametrize("actual_head", ["", "z" * 40])
+def test_failure_with_invalid_canonical_head_reports_mutation_unknown(
+    tmp_path: Path, monkeypatch, actual_head: str
+) -> None:
+    wrapper = _load_wrapper()
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(wrapper, "STATE", state)
+    monkeypatch.setattr(wrapper, "LOCK", state / "lock")
+    monkeypatch.setattr(wrapper, "_prune_stale_runs", lambda: None)
+    monkeypatch.setattr(wrapper, "_assert_canonical", lambda: "0" * 40)
+    monkeypatch.setattr(
+        wrapper,
+        "_recover_published_activation",
+        lambda: (_ for _ in ()).throw(wrapper.WrapperError("recovery failed")),
+    )
+    monkeypatch.setattr(wrapper, "_git", lambda *_a, **_k: actual_head)
+    monkeypatch.setattr(wrapper, "_notify", lambda *_a, **_k: None)
+
+    assert wrapper.main() == 1
+    report = (state / "last-upstream-merge.txt").read_text()
+    assert "canonical checkout mutation status is unknown" in report
+    assert "activation was withheld" in report
+    assert "canonical checkout was not mutated" not in report
+
+
+def test_updater_timeouts_leave_systemd_activation_headroom() -> None:
+    wrapper = _load_wrapper()
+    service = WRAPPER.parents[1] / "scripts/hermes-upstream-merge.service"
+    timeout_line = next(
+        line for line in service.read_text().splitlines() if line.startswith("TimeoutStartSec=")
+    )
+    service_timeout = int(timeout_line.split("=", 1)[1])
+
+    assert wrapper.ACTIVATION_HEADROOM_SECONDS >= 1500
+    assert wrapper.SYSTEMD_TIMEOUT_SECONDS == service_timeout
+    assert (
+        wrapper.MERGER_TIMEOUT_SECONDS
+        + (2 * wrapper.INSTALL_SYNC_TIMEOUT_SECONDS)
+        + wrapper.NOTIFY_TIMEOUT_SECONDS
+        + wrapper.ACTIVATION_HEADROOM_SECONDS
+        <= wrapper.SYSTEMD_TIMEOUT_SECONDS
+    )
 
 
 def test_crash_after_publish_recovers_only_from_matching_receipt(

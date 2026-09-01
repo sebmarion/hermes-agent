@@ -50,6 +50,12 @@ def _gate_mocks(monkeypatch, *, owns: bool, active: bool, skew=SKEW):
     monkeypatch.setattr(scheduler_mod, "_detect_gateway_code_skew", lambda: skew)
     monkeypatch.setattr(gateway_status, "owns_gateway_runtime_lock", lambda: owns)
     monkeypatch.setattr(
+        scheduler_mod,
+        "_verified_fresh_foreign_gateway",
+        lambda _disk_rev: active,
+        raising=False,
+    )
+    monkeypatch.setattr(
         gateway_status, "is_gateway_runtime_lock_active", lambda lock_path=None: active
     )
 
@@ -111,6 +117,65 @@ class TestTickYieldGate:
 
         monkeypatch.setattr(gateway_status, "is_gateway_runtime_lock_active", _boom)
         assert scheduler_mod.tick(verbose=False) == 0
+
+    @pytest.mark.parametrize(
+        "identity",
+        [
+            {"kind": "worker", "pid": 4321, "start_time": 123.5, "code_sha": SKEW[1]},
+            {
+                "kind": "hermes-gateway",
+                "pid": 9999,
+                "start_time": 123.5,
+                "code_sha": SKEW[1],
+            },
+            {
+                "kind": "hermes-gateway",
+                "pid": 4321,
+                "start_time": 123.5,
+                "code_sha": "stale00000",
+            },
+        ],
+    )
+    def test_foreign_lock_without_matching_fresh_gateway_does_not_yield(
+        self, monkeypatch, identity
+    ):
+        from gateway import control_socket
+        from gateway import status as gateway_status
+
+        monkeypatch.setattr(
+            gateway_status,
+            "get_running_pid_identity_strict",
+            lambda _path: (4321, 123.5),
+        )
+        monkeypatch.setattr(gateway_status, "_get_pid_path", lambda: object())
+        monkeypatch.setattr(
+            control_socket, "identify_gateway", lambda _home: dict(identity)
+        )
+
+        assert scheduler_mod._verified_fresh_foreign_gateway(SKEW[1]) is False
+
+    def test_matching_live_gateway_identity_allows_yield(self, monkeypatch):
+        from gateway import control_socket
+        from gateway import status as gateway_status
+
+        monkeypatch.setattr(
+            gateway_status,
+            "get_running_pid_identity_strict",
+            lambda _path: (4321, 123.5),
+        )
+        monkeypatch.setattr(gateway_status, "_get_pid_path", lambda: object())
+        monkeypatch.setattr(
+            control_socket,
+            "identify_gateway",
+            lambda _home: {
+                "kind": "hermes-gateway",
+                "pid": 4321,
+                "start_time": 123.5,
+                "code_sha": f"{SKEW[1]}0123456789",
+            },
+        )
+
+        assert scheduler_mod._verified_fresh_foreign_gateway(SKEW[1]) is True
 
     def test_yield_logs_once_per_episode(self, monkeypatch, caplog):
         """The yield log is throttled: repeated yields with the same skew

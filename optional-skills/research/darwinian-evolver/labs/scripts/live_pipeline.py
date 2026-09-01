@@ -288,12 +288,30 @@ def run_live_chain(
     for index, failure in enumerate(failures):
         task_id = str(failure.get("task_id") or "")
         try:
-            prompt = pzc.build_proposer_prompt(failure, str(skill_path))
+            proposal_budget = min(
+                MAX_PROPOSAL_CHARS,
+                MAX_CANDIDATE_CHARS - len(baseline.rstrip()) - 3,
+            )
+            if proposal_budget < 1:
+                blocked.append(task_id)
+                notes.append(
+                    f"{task_id}: candidate rejected before judging: core budget has no remaining capacity"
+                )
+                continue
+            prompt = pzc.build_proposer_prompt(
+                failure,
+                str(skill_path),
+                max_addition_chars=proposal_budget,
+            )
             proposal = proposer(prompt)
             try:
                 if not isinstance(proposal, str) or len(proposal) > MAX_PROPOSAL_CHARS:
                     raise ValueError(
                         f"proposal must be text no longer than {MAX_PROPOSAL_CHARS} characters"
+                    )
+                if len(proposal.strip()) > proposal_budget:
+                    raise ValueError(
+                        f"proposal exceeds remaining {proposal_budget}-character core budget"
                     )
                 candidate = materialize_candidate(baseline, proposal)
                 if len(candidate) > MAX_CANDIDATE_CHARS:

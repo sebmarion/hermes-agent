@@ -18,6 +18,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,11 +29,23 @@ from pathlib import Path
 REPO = Path("/home/seb/projects/hermes-agent")
 PYTHON = REPO / ".venv" / "bin" / "python"
 UV = Path("/home/seb/.local/bin/uv")
-INSTALL_SYNC_TIMEOUT_SECONDS = 900
-INSTALLED_IMPORT_PROBE = (
-    "import hermes_startup_watchdog, hermes_state, hermes_cli.main; "
-    "from cron.scheduler import CronTickYielded"
-)
+SYSTEMD_TIMEOUT_SECONDS = 6000
+ACTIVATION_HEADROOM_SECONDS = 1500
+MERGER_TIMEOUT_SECONDS = 3300
+INSTALL_SYNC_TIMEOUT_SECONDS = 300
+NOTIFY_TIMEOUT_SECONDS = 90
+INSTALLED_IMPORT_PROBE = """\
+import importlib
+from pathlib import Path
+
+repo = Path('/home/seb/projects/hermes-agent').resolve()
+for name in ('hermes_startup_watchdog', 'hermes_state', 'hermes_cli.main', 'cron.scheduler'):
+    module = importlib.import_module(name)
+    origin = Path(module.__file__).resolve()
+    if not origin.is_relative_to(repo):
+        raise RuntimeError(f'{name} imported outside canonical repository: {origin}')
+from cron.scheduler import CronTickYielded
+"""
 NOTIFY = REPO / "optional-skills/research/darwinian-evolver/labs/scripts/notify_telegram.py"
 STATE = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "labs/bestplan-research/state"
 LOCK = STATE / "upstream-merge.lock"
@@ -244,13 +257,22 @@ def _sync_canonical_install(repo: Path = REPO) -> None:
     if completed.returncode:
         detail = (completed.stderr or completed.stdout).strip()
         raise WrapperError(f"canonical install sync failed: {detail[-2000:]}")
-    probe = subprocess.run(
-        [str(PYTHON), "-c", INSTALLED_IMPORT_PROBE],
-        cwd=Path(tempfile.gettempdir()),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    probe_env = {
+        key: value
+        for key in ("HOME", "HERMES_HOME", "PATH", "LANG", "LC_ALL", "TZ")
+        if (value := os.environ.get(key)) is not None
+    }
+    with tempfile.TemporaryDirectory(prefix="hermes-import-probe-") as probe_dir_raw:
+        probe_dir = Path(probe_dir_raw)
+        probe_dir.chmod(0o700)
+        probe = subprocess.run(
+            [str(PYTHON), "-I", "-c", INSTALLED_IMPORT_PROBE],
+            cwd=probe_dir,
+            capture_output=True,
+            env=probe_env,
+            text=True,
+            timeout=60,
+        )
     if probe.returncode:
         detail = (probe.stderr or probe.stdout).strip()
         raise WrapperError(f"installed import probe failed: {detail[-2000:]}")
@@ -270,7 +292,7 @@ def _notify(event: str, message: str) -> None:
             [str(PYTHON), str(NOTIFY), "--event", event, "--message", message],
             capture_output=True,
             text=True,
-            timeout=90,
+            timeout=NOTIFY_TIMEOUT_SECONDS,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -288,15 +310,25 @@ def main() -> int:
 
         started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         run_parent: Path | None = None
+        canonical_before: str | None = None
+        canonical_advanced_to: str | None = None
+        canonical_mutation_unknown = False
         try:
             _prune_stale_runs()
+            canonical_before = _assert_canonical()
             source_head = _recover_published_activation()
+            if source_head != canonical_before:
+                canonical_advanced_to = source_head
+            # Recovery includes the case where the prior run published and
+            # promoted source but died before synchronizing the live venv.
+            # Prove the current canonical install before starting new work.
+            _sync_canonical_install(REPO)
             run_parent, run_repo = _create_isolated_repo(source_head)
             proc = subprocess.run(
                 _build_command(run_repo),
                 capture_output=True,
                 text=True,
-                timeout=3600,
+                timeout=MERGER_TIMEOUT_SECONDS,
             )
             output = (proc.stdout + "\n" + proc.stderr).strip()
             if proc.returncode:
@@ -305,14 +337,38 @@ def main() -> int:
             published_sha = str(_load_sync_state().get("published_sha") or "")
             if len(published_sha) != 40:
                 raise WrapperError("successful merger did not persist a published SHA receipt")
-            _promote_and_sync_canonical(source_head, published_sha)
+            canonical_advanced_to = _promote_canonical(source_head, published_sha)
+            _sync_canonical_install(REPO)
         except (WrapperError, OSError, subprocess.SubprocessError) as exc:
             output = f"RESULT: HALT — {exc}"
+            if canonical_before is not None and canonical_advanced_to is None:
+                try:
+                    actual_head = _git(REPO, "rev-parse", "HEAD", check=False)
+                except OSError:
+                    actual_head = ""
+                actual_head_is_oid = re.fullmatch(r"[0-9a-f]{40}", actual_head) is not None
+                if actual_head_is_oid and actual_head != canonical_before:
+                    canonical_advanced_to = actual_head
+                elif not actual_head_is_oid:
+                    canonical_mutation_unknown = True
             report = STATE / "last-upstream-merge.txt"
-            report.write_text(f"started={started}\nexit_code=1\n{output[-12000:]}\n")
+            if canonical_advanced_to:
+                mutation_status = (
+                    f"canonical checkout advanced to {canonical_advanced_to}; "
+                    "activation was withheld"
+                )
+            elif canonical_mutation_unknown:
+                mutation_status = (
+                    "canonical checkout mutation status is unknown; activation was withheld"
+                )
+            else:
+                mutation_status = "canonical checkout was not mutated"
+            report.write_text(
+                f"started={started}\nexit_code=1\n{mutation_status}\n{output[-12000:]}\n"
+            )
             _notify(
                 "halted",
-                "Daily Hermes upstream sync halted safely; canonical checkout was not mutated. "
+                f"Daily Hermes upstream sync halted safely; {mutation_status}. "
                 f"Run started {started}. Reason: {output[-2500:]}",
             )
             print(output, file=sys.stderr)

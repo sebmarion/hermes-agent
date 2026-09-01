@@ -123,7 +123,7 @@ PROPOSER_TEMPLATE = (
     "self-contained addition to {skill_path}; do not return patch syntax or a\n"
     "diff. Stay within that single skill's scope. Do NOT add new apps,\n"
     "providers, daemons, or external services. Prefer exact, runnable checks\n"
-    "over generic advice. Never include secrets.\n\n"
+    "over generic advice. Never include secrets.\n{budget_rule}\n"
     "EXISTING LEVEL-2 HEADINGS in the current skill:\n{headings}\n"
     "To extend an existing section, prefer an existing heading; do not create a duplicate heading.\n\n"
     "HARVESTED FAILURE:\ntitle: {title}\nsignature: {signature}\nevidence:\n{instructions}\n"
@@ -166,13 +166,28 @@ def _validate_base_url(base_url: str) -> str:
     return str(base_url).strip().rstrip("/")
 
 
-def build_proposer_prompt(failure: dict, skill_path: str) -> str:
+def build_proposer_prompt(
+    failure: dict,
+    skill_path: str,
+    max_addition_chars: int | None = None,
+) -> str:
     """Byte-stable proposer prompt from a structured failure row."""
     if not isinstance(skill_path, str) or not skill_path.strip():
         raise ValueError("skill_path required")
+    if max_addition_chars is not None and (
+        isinstance(max_addition_chars, bool)
+        or not isinstance(max_addition_chars, int)
+        or max_addition_chars < 1
+    ):
+        raise ValueError("max_addition_chars must be a positive integer")
     inst = _scrub(str(failure.get("task_instructions") or failure.get("body") or ""))
     return PROPOSER_TEMPLATE.format(
         skill_path=skill_path,
+        budget_rule=(
+            f"Your complete addition must be at most {max_addition_chars} characters.\n"
+            if max_addition_chars is not None
+            else ""
+        ),
         headings=_existing_level_two_headings(skill_path),
         title=_scrub(str(failure.get("task_title") or "harvested failure")),
         signature=str(failure.get("failure_signature") or "unclassified"),

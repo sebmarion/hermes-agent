@@ -449,6 +449,38 @@ def test_live_chain_allows_bounded_addition_to_large_valid_baseline(tmp_path: Pa
     assert len(judge_calls) == 1
 
 
+def test_live_chain_tells_proposer_the_remaining_core_budget(tmp_path: Path) -> None:
+    live = tmp_path / "skills"
+    target = live / "software-development" / "bestplan" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    prefix = "---\nname: bestplan\ndescription: test\n---\n\n# BestPlan\n\n"
+    baseline = prefix + ("x" * (lp.MAX_CANDIDATE_CHARS - len(prefix) - 100))
+    target.write_text(baseline)
+    prompts: list[str] = []
+
+    def proposer(prompt: str) -> str:
+        prompts.append(prompt)
+        return "### Timeout\n\nRetry once."
+
+    report = lp.run_live_chain(
+        failures=[_failure()],
+        state_dir=tmp_path / "state",
+        live_skills=live,
+        skill_path=target,
+        proposer=proposer,
+        judge=lambda _prompt: json.dumps(
+            {"verdict": "equal", "score": 0.5, "rationale": "No verified improvement."}
+        ),
+        applier=lambda *_args: pytest.fail("equal candidate must not apply"),
+        run_id="R-remaining-budget",
+    )
+
+    remaining = lp.MAX_CANDIDATE_CHARS - len(baseline.rstrip()) - 3
+    assert f"at most {remaining} characters" in prompts[0]
+    assert report["ok"] is True
+    assert report["blocked"] == ["task_1234abcd"]
+
+
 def test_live_chain_blocks_oversized_proposal_before_judging(tmp_path: Path) -> None:
     live = tmp_path / "skills"
     target = live / "software-development" / "bestplan" / "SKILL.md"

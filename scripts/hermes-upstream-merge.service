@@ -11,7 +11,7 @@ Type=oneshot
 ExecStart=/usr/sbin/runuser -u seb -- /usr/bin/env HOME=/home/seb HERMES_HOME=/home/seb/.hermes PATH=/home/seb/.local/bin:/home/seb/projects/hermes-agent/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /home/seb/projects/hermes-agent/.venv/bin/python /home/seb/projects/hermes-agent/scripts/upstream_merge_wrapper.py
 ExecStartPost=/usr/local/libexec/hermes-deployment-coordinator.py --activate --reason upstream-merge
 ExecStartPost=/usr/local/libexec/hermes-backend-autoreload.py
-TimeoutStartSec=4500
+TimeoutStartSec=6000
 SuccessExitStatus=0
 
 [Install]

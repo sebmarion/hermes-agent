@@ -217,6 +217,34 @@ _YIELD_LOG_INTERVAL_SECONDS = 3600.0
 _last_yield_log: dict[str, object] = {}
 
 
+def _verified_fresh_foreign_gateway(disk_rev: str) -> bool:
+    """Prove the runtime lock owner is a live gateway booted from ``disk_rev``."""
+    try:
+        from gateway import control_socket as _gateway_control
+        from gateway import status as _gateway_status
+
+        owner = _gateway_status.get_running_pid_identity_strict(
+            _gateway_status._get_pid_path()
+        )
+        if owner is None:
+            return False
+        owner_pid, owner_started = owner
+        if owner_pid == os.getpid():
+            return False
+        identity = _gateway_control.identify_gateway(get_hermes_home())
+        if not isinstance(identity, dict) or identity.get("kind") != "hermes-gateway":
+            return False
+        if identity.get("pid") != owner_pid:
+            return False
+        identified_started = float(identity.get("start_time"))
+        if abs(identified_started - float(owner_started)) > 0.001:
+            return False
+        code_sha = identity.get("code_sha")
+        return isinstance(code_sha, str) and code_sha.startswith(disk_rev)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _should_yield_tick_to_fresh_gateway() -> tuple[str, str] | None:
     """Return code skew only when a separate fresh gateway can run the tick."""
     skew = _detect_gateway_code_skew()
@@ -227,7 +255,7 @@ def _should_yield_tick_to_fresh_gateway() -> tuple[str, str] | None:
 
         if _gateway_status.owns_gateway_runtime_lock():
             return None
-        if not _gateway_status.is_gateway_runtime_lock_active():
+        if not _verified_fresh_foreign_gateway(skew[1]):
             return None
     except Exception:
         return None
