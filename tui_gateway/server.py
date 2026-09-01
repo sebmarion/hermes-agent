@@ -11953,6 +11953,49 @@ _KANBAN_NOTIFY_KINDS = (
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
+_HEARTBEAT_POLL_SECONDS = 5.0
+
+
+def _maybe_fire_tui_heartbeat(sid: str, session: dict) -> None:
+    """Fire a persisted heartbeat for an idle TUI/Desktop session."""
+    try:
+        from hermes_cli.heartbeat import HeartbeatManager
+    except Exception:
+        return
+
+    session_key = session.get("session_key") or ""
+    if not session_key:
+        return
+    manager = HeartbeatManager(session_id=session_key)
+    state = manager.state
+    if state is None or not state.is_due():
+        return
+
+    with session["history_lock"]:
+        if session.get("running"):
+            return
+        session["running"] = True
+
+    # Reload after claiming the idle session so a concurrent pause/clear wins.
+    manager = HeartbeatManager(session_id=session_key)
+    prompt = manager.due_prompt()
+    if not prompt:
+        with session["history_lock"]:
+            session["running"] = False
+        return
+
+    rid = f"__heartbeat__{int(time.time() * 1000)}"
+    try:
+        _emit("message.start", sid)
+        _run_prompt_submit(rid, sid, session, prompt)
+    except Exception as exc:
+        print(
+            f"[tui_gateway] heartbeat dispatch failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        with session["history_lock"]:
+            session["running"] = False
 
 
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
@@ -12227,8 +12270,22 @@ def _notification_poller_loop(
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
+    _last_heartbeat_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
+        # Heartbeat state is durable. Poll it from the server-owned session
+        # driver so Desktop resumes automatically after a backend restart;
+        # the slash-worker's private input queue has no conversation reader.
+        if _now - _last_heartbeat_poll >= _HEARTBEAT_POLL_SECONDS:
+            _last_heartbeat_poll = _now
+            try:
+                _maybe_fire_tui_heartbeat(sid, session)
+            except Exception as _heartbeat_exc:
+                print(
+                    f"[tui_gateway] heartbeat poll failed: "
+                    f"{type(_heartbeat_exc).__name__}: {_heartbeat_exc}",
+                    file=sys.stderr,
+                )
         # ── /loop wakeup driver ──────────────────────────────────────
         # Fire a due /loop tick for THIS session while it's idle. Same
         # claim-under-lock pattern as the kanban dispatch below. Active
