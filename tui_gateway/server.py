@@ -11966,34 +11966,37 @@ def _maybe_fire_tui_heartbeat(sid: str, session: dict) -> None:
     session_key = session.get("session_key") or ""
     if not session_key:
         return
-    manager = HeartbeatManager(session_id=session_key)
-    state = manager.state
-    if state is None or not state.is_due():
-        return
 
-    with session["history_lock"]:
-        if session.get("running"):
+    with _session_profile_runtime_scope(session):
+        manager = HeartbeatManager(session_id=session_key)
+        state = manager.state
+        if state is None or not state.is_due():
             return
-        session["running"] = True
 
-    # Reload after claiming the idle session so a concurrent pause/clear wins.
-    manager = HeartbeatManager(session_id=session_key)
-    prompt = manager.due_prompt()
-    if not prompt:
         with session["history_lock"]:
-            session["running"] = False
-        return
+            if session.get("running"):
+                return
+            session["running"] = True
+            prompt = manager.claim_due_prompt()
 
-    rid = f"__heartbeat__{int(time.time() * 1000)}"
-    try:
-        _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, prompt)
-    except Exception as exc:
-        print(
-            f"[tui_gateway] heartbeat dispatch failed: "
-            f"{type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
+        if not prompt:
+            with session["history_lock"]:
+                session["running"] = False
+            return
+
+        rid = f"__heartbeat__{int(time.time() * 1000)}"
+        try:
+            accepted = _run_prompt_submit(rid, sid, session, prompt)
+        except Exception as exc:
+            accepted = False
+            print(
+                f"[tui_gateway] heartbeat dispatch failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        if accepted is not False:
+            return
+        manager.abandon_prompt()
         with session["history_lock"]:
             session["running"] = False
 

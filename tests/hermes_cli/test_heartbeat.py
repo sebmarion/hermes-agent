@@ -157,6 +157,19 @@ def test_missed_ticks_coalesce():
     assert mgr.state.fire_count == 1
 
 
+def test_claim_due_prompt_does_not_overwrite_a_concurrent_pause():
+    session_id = "hb-atomic-claim-sid"
+    mgr = HeartbeatManager(session_id=session_id)
+    state = mgr.set("tick", 600)
+    state.created_at = time.time() - 700
+    save_heartbeat(session_id, state)
+    stale = HeartbeatManager(session_id=session_id)
+    HeartbeatManager(session_id=session_id).pause()
+
+    assert stale.claim_due_prompt() is None
+    assert HeartbeatManager(session_id=session_id).state.status == "paused"
+
+
 def test_resume_reanchors_instead_of_instant_fire():
     mgr = HeartbeatManager(session_id="hb-resume-sid")
     mgr.set("tick", 600)

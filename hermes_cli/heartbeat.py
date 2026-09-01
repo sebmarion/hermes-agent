@@ -211,6 +211,7 @@ class HeartbeatManager:
     def __init__(self, session_id: str):
         self.session_id = session_id
         self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
+        self._claimed_previous_state: Optional[HeartbeatState] = None
 
     @property
     def state(self) -> Optional[HeartbeatState]:
@@ -280,6 +281,78 @@ class HeartbeatManager:
         return True
 
     # --- driver entry point --------------------------------------------
+
+    def claim_due_prompt(self, now: Optional[float] = None) -> Optional[str]:
+        """Atomically claim a due heartbeat and return its injection prompt.
+
+        The conditional update prevents a stale poller from overwriting a
+        pause, clear, or replacement heartbeat written by another process.
+        """
+        db = _get_session_db()
+        if db is None:
+            return None
+        now = now if now is not None else time.time()
+        key = _meta_key(self.session_id)
+
+        def _claim(conn: Any) -> Optional[tuple[HeartbeatState, HeartbeatState]]:
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+            if not row:
+                return None
+            try:
+                before = HeartbeatState.from_json(row[0])
+            except Exception:
+                return None
+            if not before.is_due(now):
+                return None
+            claimed = HeartbeatState.from_json(row[0])
+            claimed.last_fired_at = now
+            claimed.fire_count += 1
+            cursor = conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                (claimed.to_json(), key, row[0]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return before, claimed
+
+        try:
+            result = db._execute_write(_claim)
+        except Exception as exc:
+            logger.debug("HeartbeatManager: atomic claim failed: %s", exc)
+            return None
+        if result is None:
+            return None
+        before, claimed = result
+        self._claimed_previous_state = before
+        self._state = claimed
+        return claimed.render_prompt()
+
+    def abandon_prompt(self) -> bool:
+        """Undo this manager's claim when prompt dispatch was not admitted."""
+        before = self._claimed_previous_state
+        current = self._state
+        if before is None or current is None:
+            return False
+        db = _get_session_db()
+        if db is None:
+            return False
+        key = _meta_key(self.session_id)
+        try:
+            def _restore(conn: Any) -> int:
+                cursor = conn.execute(
+                    "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                    (before.to_json(), key, current.to_json()),
+                )
+                return cursor.rowcount
+            restored = db._execute_write(_restore)
+        except Exception as exc:
+            logger.debug("HeartbeatManager: claim rollback failed: %s", exc)
+            return False
+        if restored != 1:
+            return False
+        self._state = before
+        self._claimed_previous_state = None
+        return True
 
     def due_prompt(self, now: Optional[float] = None) -> Optional[str]:
         """Return the injection prompt if the heartbeat is due, else None.

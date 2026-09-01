@@ -108,3 +108,70 @@ def test_session_notification_poller_drives_heartbeat_after_restart(
         thread.join(timeout=1)
 
     assert observed is True
+
+
+def test_named_profile_heartbeat_uses_profile_database(server, resumed_session, tmp_path):
+    sid, session_key, session = resumed_session
+    profile_home = tmp_path / "profile-home"
+    profile_home.mkdir()
+    session["profile_home"] = str(profile_home)
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.heartbeat import HeartbeatManager, save_heartbeat
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        state = HeartbeatManager(session_key).set("profile check", 60)
+        state.created_at = time.time() - 61
+        save_heartbeat(session_key, state)
+    finally:
+        reset_hermes_home_override(token)
+
+    fired = {}
+    with patch.object(
+        server,
+        "_run_prompt_submit",
+        side_effect=lambda rid, sid_, session_, text, **kwargs: fired.update(text=text) or True,
+    ), patch.object(server, "_emit"):
+        server._maybe_fire_tui_heartbeat(sid, session)
+
+    assert "profile check" in fired["text"]
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        assert HeartbeatManager(session_key).state.fire_count == 1
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_failed_heartbeat_dispatch_is_retryable(server, resumed_session):
+    sid, session_key, session = resumed_session
+    from hermes_cli.heartbeat import HeartbeatManager, save_heartbeat
+
+    state = HeartbeatManager(session_key).set("retry check", 60)
+    state.created_at = time.time() - 61
+    save_heartbeat(session_key, state)
+
+    with patch.object(server, "_run_prompt_submit", return_value=False), patch.object(
+        server, "_emit"
+    ):
+        server._maybe_fire_tui_heartbeat(sid, session)
+
+    reloaded = HeartbeatManager(session_key).state
+    assert reloaded is not None
+    assert reloaded.fire_count == 0
+    assert reloaded.last_fired_at == 0.0
+    assert session["running"] is False
+
+
+def test_heartbeat_does_not_emit_duplicate_message_start(server, resumed_session):
+    sid, session_key, session = resumed_session
+    from hermes_cli.heartbeat import HeartbeatManager, save_heartbeat
+
+    state = HeartbeatManager(session_key).set("single start", 60)
+    state.created_at = time.time() - 61
+    save_heartbeat(session_key, state)
+    events = []
+    with patch.object(server, "_run_prompt_submit", return_value=True), patch.object(
+        server, "_emit", side_effect=lambda event, *args: events.append(event)
+    ):
+        server._maybe_fire_tui_heartbeat(sid, session)
+    assert events.count("message.start") == 0
