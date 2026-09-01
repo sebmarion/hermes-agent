@@ -259,6 +259,49 @@ class TestStripBlockedTools(unittest.TestCase):
         )
 
 
+class TestChildRunBudget(unittest.TestCase):
+    def test_explicit_run_budget_reaches_child_agent(self):
+        parent = _make_mock_parent()
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Finish before the host deadline",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+                run_budget_seconds=360.0,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["run_budget_seconds"], 360.0)
+
+    def test_omitted_run_budget_preserves_unbounded_child_default(self):
+        parent = _make_mock_parent()
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Use ordinary delegation defaults",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertNotIn("run_budget_seconds", kwargs)
+
+
 class TestDelegateTask(unittest.TestCase):
     def test_no_parent_agent(self):
         result = json.loads(delegate_task(goal="test"))

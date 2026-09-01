@@ -177,6 +177,48 @@ def test_public_lifecycle_ignores_blank_provider_pin(monkeypatch):
     assert captured.get("override_api_mode") is None
 
 
+def test_public_lifecycle_forwards_finite_timeout_as_child_run_budget(monkeypatch):
+    parent = SimpleNamespace(session_id="parent-budget")
+    captured = {}
+
+    def build(**kwargs):
+        captured.update(kwargs)
+        return FakeChild("sa-budget")
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda *_args, **_kwargs: {
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.0,
+        },
+    )
+
+    service = SubagentLifecycleService(lambda: parent)
+    service.launch(SubagentLaunchRequest(goal="bounded", timeout_seconds=360.0))
+
+    assert captured["run_budget_seconds"] == 360.0
+
+
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    [True, False, 0, -1, float("nan"), float("inf"), float("-inf"), "360"],
+)
+def test_public_lifecycle_rejects_invalid_timeout(invalid_timeout):
+    parent = SimpleNamespace(session_id="parent-invalid-budget")
+    service = SubagentLifecycleService(lambda: parent)
+
+    with pytest.raises(
+        SubagentLifecycleError,
+        match="timeout_seconds must be a finite positive number",
+    ):
+        service.launch(
+            SubagentLaunchRequest(goal="bounded", timeout_seconds=invalid_timeout)
+        )
+
+
 def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     memory = Mock()
     parent = SimpleNamespace(

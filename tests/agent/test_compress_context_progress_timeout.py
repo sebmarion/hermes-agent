@@ -146,6 +146,39 @@ class TestResolveContextCompressionTimeouts:
         assert idle == 90.0
         assert ceiling == 90.0
 
+    def test_bounded_child_caps_idle_and_ceiling_before_wrapup(self):
+        idle, ceiling = resolve_context_compression_timeouts(
+            {},
+            run_budget_seconds=360.0,
+            run_budget_started_at=100.0,
+            now=330.0,
+        )
+
+        assert idle == pytest.approx(58.0)
+        assert ceiling == pytest.approx(58.0)
+
+    def test_bounded_child_enables_wrapper_when_config_disables_idle_timeout(self):
+        idle, ceiling = resolve_context_compression_timeouts(
+            {"context_timeout_seconds": 0},
+            run_budget_seconds=360.0,
+            run_budget_started_at=100.0,
+            now=330.0,
+        )
+
+        assert idle == pytest.approx(58.0)
+        assert ceiling == pytest.approx(58.0)
+
+    def test_expired_pre_wrapup_budget_fails_closed(self):
+        idle, ceiling = resolve_context_compression_timeouts(
+            {},
+            run_budget_seconds=360.0,
+            run_budget_started_at=100.0,
+            now=388.0,
+        )
+
+        assert idle == 0.0
+        assert ceiling == 0.0
+
 
 class TestRunCompressContextWithProgressTimeout:
     def test_deadline_before_worker_start_uses_timeout_fallback(self, monkeypatch):

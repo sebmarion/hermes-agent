@@ -960,6 +960,7 @@ class CompressionCommitFence:
 # Mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys of the same name.
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
+RUN_BUDGET_WRAPUP_FRACTION = 0.8
 
 # Distinct from ``explicit_interrupt``: a /stop that arrived after the summary
 # stream had already crossed the no-progress stall window (#96775). Ordinary
@@ -1088,6 +1089,10 @@ def _get_compress_timeout_executor():
 
 def resolve_context_compression_timeouts(
     compression_cfg: Optional[dict] = None,
+    *,
+    run_budget_seconds: Optional[float] = None,
+    run_budget_started_at: Optional[float] = None,
+    now: Optional[float] = None,
 ) -> Tuple[float, float]:
     """Return ``(idle_timeout_seconds, total_ceiling_seconds)``.
 
@@ -1126,6 +1131,25 @@ def resolve_context_compression_timeouts(
                 pass
     if idle > 0:
         ceiling = max(ceiling, idle)
+    if (
+        isinstance(run_budget_seconds, (int, float))
+        and not isinstance(run_budget_seconds, bool)
+        and math.isfinite(run_budget_seconds)
+        and run_budget_seconds > 0
+        and isinstance(run_budget_started_at, (int, float))
+        and not isinstance(run_budget_started_at, bool)
+        and math.isfinite(run_budget_started_at)
+    ):
+        current = time.time() if now is None else float(now)
+        wrapup_deadline = (
+            float(run_budget_started_at)
+            + RUN_BUDGET_WRAPUP_FRACTION * float(run_budget_seconds)
+        )
+        remaining = max(0.0, wrapup_deadline - current)
+        if remaining <= 0:
+            return 0.0, 0.0
+        idle = min(idle, remaining) if idle > 0 else remaining
+        ceiling = min(ceiling, remaining)
     return idle, ceiling
 
 

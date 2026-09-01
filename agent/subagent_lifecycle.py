@@ -257,6 +257,7 @@ class SubagentLifecycleService:
             task_count=1,
             parent_agent=parent,
             role=request.role,
+            run_budget_seconds=request.timeout_seconds,
         )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
@@ -561,9 +562,14 @@ class SubagentLifecycleService:
             )
         if request.role not in {"leaf", "orchestrator"}:
             raise SubagentLifecycleError("role must be 'leaf' or 'orchestrator'.")
-        if request.timeout_seconds is not None:
+        if request.timeout_seconds is not None and (
+            isinstance(request.timeout_seconds, bool)
+            or not isinstance(request.timeout_seconds, (int, float))
+            or not math.isfinite(request.timeout_seconds)
+            or request.timeout_seconds <= 0
+        ):
             raise SubagentLifecycleError(
-                "Per-launch timeout is not supported; configure delegation timeout explicitly."
+                "timeout_seconds must be a finite positive number."
             )
         if request.working_directory is not None:
             raise SubagentLifecycleError(

@@ -33,6 +33,7 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    RUN_BUDGET_WRAPUP_FRACTION,
     compression_blocked_transiently,
     compression_skipped_due_to_lock,
     context_compression_timed_out,
@@ -215,7 +216,7 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
     started = getattr(agent, "_run_budget_started_at", None)
     if not started:
         return False
-    if (time.time() - started) < 0.8 * float(budget):
+    if (time.time() - started) < RUN_BUDGET_WRAPUP_FRACTION * float(budget):
         return False
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]

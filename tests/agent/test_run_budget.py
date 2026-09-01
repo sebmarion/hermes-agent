@@ -197,6 +197,100 @@ def test_budget_without_started_clock_is_inert(monkeypatch, tmp_path):
     assert agent._compute_non_stream_stale_timeout({"input": "hi"}) == 600.0
 
 
+def test_automatic_compression_forwards_active_run_budget(monkeypatch, tmp_path):
+    import agent.conversation_compression as cc
+
+    agent = _make_agent(tmp_path, monkeypatch, run_budget_seconds=360)
+    agent._run_budget_started_at = 123.0
+    captured = {}
+    captured_runner = {}
+
+    def resolve(_cfg=None, **kwargs):
+        captured.update(kwargs)
+        return 120.0, 120.0
+
+    def run_compression(**kwargs):
+        captured_runner.update(kwargs)
+        return kwargs["messages"], "sys"
+
+    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", resolve)
+    monkeypatch.setattr(
+        cc,
+        "run_compress_context_with_progress_timeout",
+        run_compression,
+    )
+    messages = [{"role": "user", "content": "compress me"}]
+
+    result_messages, _ = agent._compress_context(messages, "sys")
+
+    assert result_messages is messages
+    assert captured == {
+        "run_budget_seconds": 360.0,
+        "run_budget_started_at": 123.0,
+    }
+    assert captured_runner["stall_fallback"] is False
+
+
+def test_automatic_compression_fails_closed_after_wrapup_boundary(
+    monkeypatch, tmp_path
+):
+    import agent.conversation_compression as cc
+
+    agent = _make_agent(tmp_path, monkeypatch, run_budget_seconds=360)
+    agent._run_budget_started_at = time.time() - 300
+    messages = [{"role": "user", "content": "too late to compress"}]
+
+    monkeypatch.setattr(
+        cc,
+        "compress_context",
+        lambda *_args, **_kwargs: pytest.fail(
+            "expired automatic compression must not start"
+        ),
+    )
+    monkeypatch.setattr(
+        cc,
+        "run_compress_context_with_progress_timeout",
+        lambda **_kwargs: pytest.fail(
+            "expired automatic compression must not enter the worker wrapper"
+        ),
+    )
+
+    result_messages, result_prompt = agent._compress_context(messages, "sys")
+
+    assert result_messages is messages
+    assert result_prompt == "sys"
+    assert cc.context_compression_timed_out(agent) is True
+
+
+def test_manual_compression_retains_configured_timeout_resolution(
+    monkeypatch, tmp_path
+):
+    import agent.conversation_compression as cc
+
+    agent = _make_agent(tmp_path, monkeypatch, run_budget_seconds=360)
+    agent._run_budget_started_at = 123.0
+    captured = {}
+
+    def resolve(_cfg=None, **kwargs):
+        captured.update(kwargs)
+        return 120.0, 600.0
+
+    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", resolve)
+    monkeypatch.setattr(
+        cc,
+        "run_compress_context_with_progress_timeout",
+        lambda **kwargs: (kwargs["messages"], "sys"),
+    )
+
+    agent._compress_context(
+        [{"role": "user", "content": "manual"}],
+        "sys",
+        force=True,
+    )
+
+    assert captured == {}
+
+
 # ── wrap-up injection one-time-ness ────────────────────────────────────────
 
 

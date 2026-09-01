@@ -1722,6 +1722,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    run_budget_seconds: Optional[float] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -2030,6 +2031,8 @@ def _build_child_agent(
     child_optional_kwargs: Dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
+    if run_budget_seconds is not None:
+        child_optional_kwargs["run_budget_seconds"] = run_budget_seconds
 
     # Each child gets a DEDICATED SessionDB connection instead of the parent's
     # live object. The parent's handle is owned by the parent's lifecycle

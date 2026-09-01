@@ -8434,12 +8434,43 @@ class AIAgent:
             # hygiene) pass commit_fence and must not be double-wrapped.
             direct_path = commit_fence is not None
             idle_timeout = total_ceiling = None
+            bounded_automatic = False
             if not direct_path:
-                idle_timeout, total_ceiling = resolve_context_compression_timeouts()
-                if idle_timeout <= 0:
+                compression_budget = {}
+                if not force:
+                    run_budget_seconds = getattr(
+                        self, "run_budget_seconds", None
+                    )
+                    run_budget_started_at = getattr(
+                        self, "_run_budget_started_at", None
+                    )
+                    if (
+                        run_budget_seconds is not None
+                        and run_budget_started_at is not None
+                    ):
+                        compression_budget = {
+                            "run_budget_seconds": run_budget_seconds,
+                            "run_budget_started_at": run_budget_started_at,
+                        }
+                idle_timeout, total_ceiling = resolve_context_compression_timeouts(
+                    **compression_budget
+                )
+                bounded_automatic = bool(
+                    compression_budget.get("run_budget_seconds")
+                    and compression_budget.get("run_budget_started_at")
+                )
+                if bounded_automatic and total_ceiling <= 0:
+                    mark_context_compression_timed_out(self)
+                    result = (
+                        messages,
+                        self._cached_system_prompt or system_message,
+                    )
+                elif idle_timeout <= 0:
                     direct_path = True
 
-            if direct_path:
+            if bounded_automatic and total_ceiling <= 0:
+                pass
+            elif direct_path:
                 result = _run(active_fence)
             else:
                 def _snapshot_worker(fence=None):
@@ -8616,6 +8647,7 @@ class AIAgent:
                     fence=active_fence,
                     telemetry_agent=self,
                     new_fence=_publish_new_fence,
+                    stall_fallback=False if bounded_automatic else True,
                 )
             # _DB_PERSISTED_MARKER lives at module level in
             # agent.context_compressor; conversation_compression only
