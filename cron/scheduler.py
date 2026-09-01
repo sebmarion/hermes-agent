@@ -191,6 +191,65 @@ def _failure_streak_nudge(job: dict) -> str:
     )
 
 
+def _detect_gateway_code_skew() -> tuple[str, str] | None:
+    """Boot-vs-disk revision skew for this process, or ``None``."""
+    try:
+        from gateway.code_skew import detect_code_skew
+
+        return detect_code_skew()
+    except Exception:
+        return None
+
+
+class CronTickYielded(RuntimeError):
+    """A stale-code ticker yielded this tick to a fresh gateway."""
+
+    def __init__(self, boot_rev: str, disk_rev: str) -> None:
+        self.boot_rev = boot_rev
+        self.disk_rev = disk_rev
+        super().__init__(
+            "Cron tick yielded to a fresh gateway process "
+            f"(stale code: booted on {boot_rev}, disk is at {disk_rev})"
+        )
+
+
+_YIELD_LOG_INTERVAL_SECONDS = 3600.0
+_last_yield_log: dict[str, object] = {}
+
+
+def _should_yield_tick_to_fresh_gateway() -> tuple[str, str] | None:
+    """Return code skew only when a separate fresh gateway can run the tick."""
+    skew = _detect_gateway_code_skew()
+    if skew is None:
+        return None
+    try:
+        from gateway import status as _gateway_status
+
+        if _gateway_status.owns_gateway_runtime_lock():
+            return None
+        if not _gateway_status.is_gateway_runtime_lock_active():
+            return None
+    except Exception:
+        return None
+    return skew
+
+
+def _log_tick_yield_once(reason: str) -> None:
+    """Log a repeated stale-ticker yield at most once per hour."""
+    global _last_yield_log
+    now = time.monotonic()
+    last_reason = _last_yield_log.get("reason")
+    last_at = _last_yield_log.get("at", 0.0)
+    if last_reason != reason or (now - float(last_at)) >= _YIELD_LOG_INTERVAL_SECONDS:
+        logger.error(
+            "Cron tick yielded: this process is running stale code (%s) and a "
+            "fresher gateway owns the runtime lock — jobs will fire from that "
+            "process. Restart this one to reclaim its ticks.",
+            reason,
+        )
+    _last_yield_log = {"reason": reason, "at": now}
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -7231,6 +7290,13 @@ def tick(
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
+    # A process that is provably stale must not win the tick lock while a
+    # separate fresh gateway is available to dispatch the same due jobs.
+    _skew = _should_yield_tick_to_fresh_gateway()
+    if _skew is not None:
+        _log_tick_yield_once(f"boot={_skew[0]} disk={_skew[1]}")
+        raise CronTickYielded(_skew[0], _skew[1])
+
     lock_dir, lock_file = _get_lock_paths()
     lock_dir.mkdir(parents=True, exist_ok=True)
 

@@ -27,6 +27,12 @@ from pathlib import Path
 
 REPO = Path("/home/seb/projects/hermes-agent")
 PYTHON = REPO / ".venv" / "bin" / "python"
+UV = Path("/home/seb/.local/bin/uv")
+INSTALL_SYNC_TIMEOUT_SECONDS = 900
+INSTALLED_IMPORT_PROBE = (
+    "import hermes_startup_watchdog, hermes_state, hermes_cli.main; "
+    "from cron.scheduler import CronTickYielded"
+)
 NOTIFY = REPO / "optional-skills/research/darwinian-evolver/labs/scripts/notify_telegram.py"
 STATE = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "labs/bestplan-research/state"
 LOCK = STATE / "upstream-merge.lock"
@@ -216,6 +222,46 @@ def _promote_canonical(expected_head: str, published_sha: str) -> str:
     return _assert_canonical(published_sha)
 
 
+def _sync_canonical_install(repo: Path = REPO) -> None:
+    """Refresh the live venv and prove top-level modules import off-checkout."""
+    if not UV.is_file():
+        raise WrapperError(f"uv executable is unavailable: {UV}")
+    completed = subprocess.run(
+        [
+            str(UV),
+            "sync",
+            "--locked",
+            "--extra",
+            "dev",
+            "--extra",
+            "messaging",
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=INSTALL_SYNC_TIMEOUT_SECONDS,
+    )
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise WrapperError(f"canonical install sync failed: {detail[-2000:]}")
+    probe = subprocess.run(
+        [str(PYTHON), "-c", INSTALLED_IMPORT_PROBE],
+        cwd=Path(tempfile.gettempdir()),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if probe.returncode:
+        detail = (probe.stderr or probe.stdout).strip()
+        raise WrapperError(f"installed import probe failed: {detail[-2000:]}")
+
+
+def _promote_and_sync_canonical(expected_head: str, published_sha: str) -> str:
+    promoted = _promote_canonical(expected_head, published_sha)
+    _sync_canonical_install(REPO)
+    return promoted
+
+
 def _notify(event: str, message: str) -> None:
     if not NOTIFY.is_file():
         return
@@ -259,7 +305,7 @@ def main() -> int:
             published_sha = str(_load_sync_state().get("published_sha") or "")
             if len(published_sha) != 40:
                 raise WrapperError("successful merger did not persist a published SHA receipt")
-            _promote_canonical(source_head, published_sha)
+            _promote_and_sync_canonical(source_head, published_sha)
         except (WrapperError, OSError, subprocess.SubprocessError) as exc:
             output = f"RESULT: HALT — {exc}"
             report = STATE / "last-upstream-merge.txt"

@@ -7,6 +7,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 WRAPPER = Path(__file__).resolve().parents[2] / "scripts/upstream_merge_wrapper.py"
 IMPROVE_WRAPPER = Path(__file__).resolve().parents[2] / "scripts/improve_loop_wrapper.py"
@@ -145,6 +147,88 @@ def test_canonical_promotion_is_fast_forward_only(tmp_path: Path, monkeypatch) -
     assert wrapper._promote_canonical(base, candidate) == candidate
     assert _git(canonical, "rev-parse", "HEAD") == candidate
     assert _git(canonical, "status", "--porcelain") == ""
+
+
+def test_canonical_install_sync_uses_locked_project(tmp_path: Path, monkeypatch) -> None:
+    wrapper = _load_wrapper()
+    calls = []
+
+    assert "CronTickYielded" in wrapper.INSTALLED_IMPORT_PROBE
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="synced", stderr="")
+
+    monkeypatch.setattr(wrapper.subprocess, "run", fake_run)
+
+    wrapper._sync_canonical_install(tmp_path)
+
+    assert calls == [
+        (
+            [
+                str(wrapper.UV),
+                "sync",
+                "--locked",
+                "--extra",
+                "dev",
+                "--extra",
+                "messaging",
+            ],
+            {
+                "cwd": tmp_path,
+                "capture_output": True,
+                "text": True,
+                "timeout": wrapper.INSTALL_SYNC_TIMEOUT_SECONDS,
+            },
+        ),
+        (
+            [str(wrapper.PYTHON), "-c", wrapper.INSTALLED_IMPORT_PROBE],
+            {
+                "cwd": Path("/tmp"),
+                "capture_output": True,
+                "text": True,
+                "timeout": 60,
+            },
+        ),
+    ]
+
+
+def test_canonical_install_sync_fails_closed_on_import_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    wrapper = _load_wrapper()
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout="synced", stderr=""),
+            subprocess.CompletedProcess([], 1, stdout="", stderr="missing watchdog"),
+        ]
+    )
+    monkeypatch.setattr(wrapper.subprocess, "run", lambda *_a, **_k: next(results))
+
+    with pytest.raises(wrapper.WrapperError, match="installed import probe failed"):
+        wrapper._sync_canonical_install(tmp_path)
+
+
+def test_canonical_promotion_syncs_install_before_returning(monkeypatch) -> None:
+    wrapper = _load_wrapper()
+    order = []
+    monkeypatch.setattr(
+        wrapper,
+        "_promote_canonical",
+        lambda expected, published: order.append(("promote", expected, published))
+        or published,
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_sync_canonical_install",
+        lambda repo: order.append(("sync", repo)),
+    )
+
+    assert wrapper._promote_and_sync_canonical("old", "new") == "new"
+    assert order == [
+        ("promote", "old", "new"),
+        ("sync", wrapper.REPO),
+    ]
 
 
 def test_crash_after_publish_recovers_only_from_matching_receipt(
