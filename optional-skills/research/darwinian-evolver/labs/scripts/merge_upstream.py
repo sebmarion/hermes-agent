@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """Conservative daily upstream sync for the Hermes fork.
 
-This is deliberately NOT a blind ``git pull``. It builds a clean preview from
-``origin/main`` and overlays only the edge paths owned by this system:
-``optional-skills/``, ``tests/skills/``, the BestPlan Hermes runtime, and the
-explicitly owned scheduler paths. Before doing that, it compares the complete
-tracked trees and refuses to proceed if upstream would replace any unowned
-local Hermes path. A sync must never silently discard core code.
+This is deliberately NOT a blind ``git pull``. It applies the binary/full-index
+diff from the last accepted upstream anchor to the exact fetched upstream tip
+onto a clean worktree based on the fork. It then restores explicitly owned
+paths and records the accepted tree as a two-parent merge commit: fork first,
+tested upstream tip second. A sync must never silently discard local code or
+claim untested upstream ancestry.
 
-State records the owned edge paths and their last applied hashes. On bootstrap,
-paths that are absent from upstream or differ from upstream are conservatively
-classified as local-owned. On later runs, edits to any tracked edge path are
-added to the owned set; upstream-only edge changes win for paths not owned.
+State records the owned edge paths, their last applied hashes, the exact
+upstream tip, and the tested candidate SHA.
 
 Default mode is preview-only. ``--apply`` requires a clean checkout whose HEAD
 still matches the pinned source and advances it with ``git merge --ff-only``.
@@ -487,6 +485,33 @@ def main(argv: list[str] | None = None) -> int:
             _run(repo, "worktree", "remove", "--force", str(preview), check=False)
         shutil.rmtree(preview_parent, ignore_errors=True)
 
+def assert_candidate_lineage(
+    repo: Path,
+    *,
+    candidate_sha: str,
+    expected_tree_sha: str,
+    local_sha: str,
+    upstream_sha: str,
+) -> None:
+    """Require the candidate to record the exact tested tree and parents."""
+    fields = _run(
+        repo, "rev-list", "--parents", "-n", "1", candidate_sha
+    ).split()
+    actual_parents = fields[1:]
+    expected_parents = [local_sha, upstream_sha]
+    if actual_parents != expected_parents:
+        raise MergeUpstreamError(
+            "candidate parents do not match tested refs: "
+            f"expected {expected_parents}, got {actual_parents}"
+        )
+    actual_tree_sha = _run(repo, "rev-parse", f"{candidate_sha}^{{tree}}").strip()
+    if actual_tree_sha != expected_tree_sha:
+        raise MergeUpstreamError(
+            "candidate tree does not match tested tree: "
+            f"expected {expected_tree_sha}, got {actual_tree_sha}"
+        )
+
+
 def build_delta_candidate(
     repo: Path,
     anchor: str,
@@ -500,7 +525,9 @@ def build_delta_candidate(
     The candidate worktree is created from the current fork HEAD (local_ref).
     Only the binary/full-index delta from anchor..upstream_ref is applied with
     three-way semantics. Owned paths are restored from local_ref and asserted
-    byte-identical. Any conflict, rejected patch, or missing path halts.
+    byte-identical. The accepted tree is committed with local_ref and the exact
+    upstream ref as its ordered parents. Any conflict, rejected patch, missing
+    path, or lineage mismatch halts.
 
     Returns a conservation report dict.
     """
@@ -518,6 +545,10 @@ def build_delta_candidate(
         state = _load_state(state_path)
         return {
             "candidate_sha": local_sha,
+            "candidate_tree_sha": _run(
+                repo, "rev-parse", f"{local_sha}^{{tree}}"
+            ).strip(),
+            "merge_parents": [],
             "anchor_sha": anchor_sha,
             "upstream_sha": upstream_sha,
             "owned_paths": sorted(
@@ -603,25 +634,51 @@ def build_delta_candidate(
                             f"content differs from local HEAD"
                         )
 
-        # Stage all changes and commit as child of local HEAD
+        # Stage the tested tree and record both the fork and exact upstream
+        # tip as parents. This preserves upstream ancestry without replaying
+        # its individual commits onto the fork.
         _run(preview, "add", "-A")
-        # Check if there are any changes to commit
-        status = subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=preview, text=True
-        ).strip()
-        if status:
-            _run(
-                preview,
-                "commit",
-                "-m",
-                f"chore(update): apply upstream delta {anchor_sha[:8]}..{upstream_sha[:8]}",
+        tree_sha = _run(preview, "write-tree").strip()
+        message = (
+            f"chore(update): merge upstream delta "
+            f"{anchor_sha[:8]}..{upstream_sha[:8]}"
+        )
+        commit_proc = subprocess.run(
+            [
+                "git",
+                "commit-tree",
+                tree_sha,
+                "-p",
+                local_sha,
+                "-p",
+                upstream_sha,
+            ],
+            cwd=preview,
+            input=message + "\n",
+            capture_output=True,
+            text=True,
+        )
+        if commit_proc.returncode:
+            raise MergeUpstreamError(
+                commit_proc.stderr.strip() or "git commit-tree failed"
             )
+        candidate_sha = commit_proc.stdout.strip()
+        assert_candidate_lineage(
+            preview,
+            candidate_sha=candidate_sha,
+            expected_tree_sha=tree_sha,
+            local_sha=local_sha,
+            upstream_sha=upstream_sha,
+        )
+        _run(preview, "reset", "--hard", candidate_sha)
 
         return {
             "anchor_sha": anchor_sha,
             "upstream_sha": upstream_sha,
             "local_sha": local_sha,
-            "candidate_sha": _run(preview, "rev-parse", "HEAD").strip(),
+            "candidate_sha": candidate_sha,
+            "candidate_tree_sha": tree_sha,
+            "merge_parents": [local_sha, upstream_sha],
             "owned_paths": sorted(owned_paths),
         }
     except BaseException:

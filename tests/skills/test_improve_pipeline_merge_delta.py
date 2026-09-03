@@ -179,6 +179,100 @@ def test_delta_candidate_is_descendant_of_local_head(tmp_path: Path) -> None:
     assert merge_base == local_sha  # local is an ancestor of candidate
 
 
+def test_delta_candidate_records_exact_local_and_upstream_parents(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo, {"core.py": "core\n"})
+
+    (repo / "core.py").write_text("core-upstream\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "upstream")
+    upstream_sha = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "checkout", "-q", base)
+    (repo / "optional-skills/own.md").parent.mkdir(parents=True, exist_ok=True)
+    (repo / "optional-skills/own.md").write_text("local\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "local")
+    local_sha = _git(repo, "rev-parse", "HEAD")
+
+    state_path = tmp_path / "state" / "upstream-sync.json"
+    preview = tmp_path / "preview"
+    report = mu.build_delta_candidate(
+        repo, base, upstream_sha, local_sha, state_path, preview
+    )
+
+    commit_and_parents = _git(
+        preview, "rev-list", "--parents", "-n", "1", report["candidate_sha"]
+    ).split()
+    assert commit_and_parents[1:] == [local_sha, upstream_sha]
+    assert report["merge_parents"] == [local_sha, upstream_sha]
+    assert report["candidate_tree_sha"] == _git(
+        preview, "rev-parse", f"{report['candidate_sha']}^{{tree}}"
+    )
+
+
+def test_candidate_lineage_guard_rejects_missing_upstream_parent(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    local_sha = _init_repo(repo, {"core.py": "local\n"})
+    tree_sha = _git(repo, "rev-parse", f"{local_sha}^{{tree}}")
+
+    with pytest.raises(mu.MergeUpstreamError, match="parents"):
+        mu.assert_candidate_lineage(
+            repo,
+            candidate_sha=local_sha,
+            expected_tree_sha=tree_sha,
+            local_sha=local_sha,
+            upstream_sha="f" * 40,
+        )
+
+
+def test_candidate_lineage_guard_rejects_untested_tree(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo, {"core.py": "base\n"})
+
+    (repo / "upstream.txt").write_text("upstream\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "upstream")
+    upstream_sha = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "checkout", "-q", base)
+    (repo / "local.txt").write_text("local\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "local")
+    local_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "merge", "--no-ff", "-qm", "candidate", upstream_sha)
+    candidate_sha = _git(repo, "rev-parse", "HEAD")
+    untested_tree_sha = _git(repo, "rev-parse", f"{base}^{{tree}}")
+
+    with pytest.raises(mu.MergeUpstreamError, match="tree"):
+        mu.assert_candidate_lineage(
+            repo,
+            candidate_sha=candidate_sha,
+            expected_tree_sha=untested_tree_sha,
+            local_sha=local_sha,
+            upstream_sha=upstream_sha,
+        )
+
+
+def test_noop_candidate_reports_no_merge_parents(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    local_sha = _init_repo(repo, {"core.py": "current\n"})
+    report = mu.build_delta_candidate(
+        repo,
+        local_sha,
+        local_sha,
+        local_sha,
+        tmp_path / "state" / "upstream-sync.json",
+        tmp_path / "preview",
+    )
+
+    assert report["noop"] is True
+    assert report["merge_parents"] == []
+    assert report["candidate_tree_sha"] == _git(
+        repo, "rev-parse", f"{local_sha}^{{tree}}"
+    )
+
+
 def test_delta_halts_on_remote_movement(tmp_path: Path) -> None:
     """Contract 6: remote movement between preview and publish halts."""
     # This test requires mocking the remote SHA check
