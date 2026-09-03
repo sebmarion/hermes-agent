@@ -3813,18 +3813,20 @@ class BasePlatformAdapter(ABC):
                 )
 
     async def _start_plugin_lifecycle(self, native: Any) -> None:
+        import asyncio
         import inspect
         for owner, lifecycle in getattr(self, "_plugin_lifecycle_handles", []):
             if owner is not native or not callable(lifecycle.get("on_ready")):
                 continue
-            result = lifecycle["on_ready"](native)
-            if inspect.isawaitable(result):
-                try:
-                    await result
-                except Exception:
-                    logger.exception("platform plugin ready hook failed")
+            try:
+                result = lifecycle["on_ready"](native)
+                if inspect.isawaitable(result):
+                    await asyncio.wait_for(result, timeout=5.0)
+            except Exception:
+                logger.exception("platform plugin ready hook failed")
 
     async def _stop_plugin_lifecycle(self, native: Any) -> None:
+        import asyncio
         import inspect
         kept = []
         for owner, lifecycle in getattr(self, "_plugin_lifecycle_handles", []):
@@ -3832,13 +3834,13 @@ class BasePlatformAdapter(ABC):
                 kept.append((owner, lifecycle))
                 continue
             callback = lifecycle.get("on_stop")
-            if callable(callback):
-                result = callback(native)
-                if inspect.isawaitable(result):
-                    try:
-                        await result
-                    except Exception:
-                        logger.exception("platform plugin stop hook failed")
+            try:
+                if callable(callback):
+                    result = callback(native)
+                    if inspect.isawaitable(result):
+                        await asyncio.wait_for(result, timeout=5.0)
+            except Exception:
+                logger.exception("platform plugin stop hook failed")
         self._plugin_lifecycle_handles = kept
 
     @property
