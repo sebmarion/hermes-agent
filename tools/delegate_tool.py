@@ -2168,6 +2168,8 @@ def _build_child_agent(
     parent_sid = getattr(parent_agent, "session_id", None)
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
+        child._session_init_model_config["_created_by"] = "agent_delegate"
+        child._session_init_model_config["_origin_kind"] = "delegated_child"
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.

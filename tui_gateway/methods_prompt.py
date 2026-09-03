@@ -479,6 +479,8 @@ def _(rid, params: dict) -> dict:
             if session.get("running"):
                 if internal_hosted_submit:
                     return _err(rid, 4091, "hosted room member session is busy")
+                if callable(params.get("_owner_admit")):
+                    return _err(rid, 4091, "owner task is busy")
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
                 # provider interrupt itself must happen after this lock is
@@ -922,6 +924,18 @@ def _(rid, params: dict) -> dict:
                             )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
+        owner_admit = params.get("_owner_admit")
+        owner_storage_ready = False
+        if callable(owner_admit) and _ensure_session_db_row(session) is False:
+            return _err(rid, 5072, "session storage unavailable: state.db could not be opened — the message was not saved; repair state.db and try again")
+        if callable(owner_admit) and session.get("running"):
+            return _err(rid, 4091, "owner task is busy")
+        if owner_admit is not None:
+            if not callable(owner_admit):
+                return _err(rid, 4003, "invalid owner dispatch proof")
+            if not owner_admit():
+                return _err(rid, 4091, "owner dispatch admission rejected")
+            owner_storage_ready = True
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -954,7 +968,7 @@ def _(rid, params: dict) -> dict:
     # Disk-full must fail the RPC (not stream silently): desktop maps the error
     # string to a "disk full" toast so the user knows why the send vanished.
     try:
-        if _ensure_session_db_row(session) is False:
+        if not owner_storage_ready and _ensure_session_db_row(session) is False:
             # Store unavailable: failing the RPC is the only user-visible
             # signal — same principle as the disk-full path above (#98924).
             # _db_error carries the SessionDB open failure for the toast.
