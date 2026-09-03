@@ -471,7 +471,9 @@ class ProcessRegistry:
         # Consumers still inject them as fresh turns through this existing rail.
         try:
             from tools.async_delegation import restore_undelivered_completions
-            restore_undelivered_completions(self.completion_queue)
+            restore_undelivered_completions(
+                self.completion_queue, profile_home=get_hermes_home()
+            )
         except Exception as exc:
             logger.warning("Could not restore async delegation completions: %s", exc)
 

@@ -24,10 +24,15 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.update_cmd import (
-    _clear_stale_sqlite_sidecars,
-    _restore_state_db_from_snapshot,
-)
+import hermes_cli.backup as backup
+from hermes_state import SessionDB
+import hermes_cli.update_cmd as update_cmd
+from hermes_cli.update_cmd import _restore_state_db_from_snapshot
+
+
+def _clear_stale_sqlite_sidecars(db_path: Path) -> None:
+    for suffix in ("-wal", "-shm", "-journal"):
+        db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
 
 OLD_ROWS = 201
 SNAPSHOT_ROWS = 400
@@ -203,11 +208,57 @@ def test_restore_helper_reports_failure_when_the_restored_copy_is_corrupt(tmp_pa
     assert _restore_state_db_from_snapshot(state_path, bad_snapshot) is False
 
 
-def test_restore_helper_propagates_copy_errors(tmp_path):
-    """A missing snapshot raises OSError, which both call sites already catch
-    and report as 'Auto-restore file copy failed'."""
+def test_restore_helper_reports_invalid_snapshot(tmp_path):
+    """Invalid snapshots fail before any destination mutation."""
     state_path = tmp_path / "state.db"
-    state_path.write_bytes(b"whatever")
+    state_path.write_bytes(b"live")
+    bad_snapshot = tmp_path / "bad-snapshot.db"
+    bad_snapshot.write_bytes(b"not sqlite")
 
-    with pytest.raises(OSError):
-        _restore_state_db_from_snapshot(state_path, tmp_path / "does-not-exist.db")
+    assert _restore_state_db_from_snapshot(state_path, bad_snapshot) is False
+    assert update_cmd._last_restore_outcome.reason == "invalid_snapshot"
+    assert state_path.read_bytes() == b"live"
+
+
+def test_restore_helper_reports_sqlite_failure_without_path_mutation(
+    tmp_path, snapshot_db, monkeypatch
+):
+    """Backup failure never falls back to replacing or deleting live state."""
+    state_path = tmp_path / "state.db"
+    state_path.write_bytes(b"live")
+    sidecars = {
+        suffix: _sidecar(state_path, suffix) for suffix in ("-wal", "-shm", "-journal")
+    }
+    for path in sidecars.values():
+        path.write_bytes(path.name.encode())
+    monkeypatch.setattr(backup, "_safe_restore_db", lambda src, dst: False)
+    forbidden = []
+    monkeypatch.setattr(update_cmd.os, "replace", lambda *args: forbidden.append("replace"))
+    monkeypatch.setattr(update_cmd.os, "unlink", lambda *args: forbidden.append("unlink"), raising=False)
+    monkeypatch.setattr(shutil, "move", lambda *args: forbidden.append("move"))
+
+    assert _restore_state_db_from_snapshot(state_path, snapshot_db) is False
+    assert update_cmd._last_restore_outcome.reason == "sqlite_restore_failure"
+    assert not forbidden
+    assert state_path.read_bytes() == b"live"
+    assert all(path.exists() for path in sidecars.values())
+
+
+def test_restore_quick_snapshot_does_not_count_failed_database(
+    tmp_path, monkeypatch
+):
+    """A failed state.db restore is not reported as a restored file."""
+    home = tmp_path / "home"
+    snap_dir = home / "state-snapshots" / "snap"
+    snap_dir.mkdir(parents=True)
+    source = snap_dir / "state.db"
+    _make = sqlite3.connect(source)
+    _make.execute("CREATE TABLE data(value TEXT)")
+    _make.execute("INSERT INTO data VALUES ('snapshot')")
+    _make.commit()
+    _make.close()
+    (home / "state.db").write_bytes(b"live")
+    (snap_dir / "manifest.json").write_text('{"files": {"state.db": 1}}')
+    monkeypatch.setattr(backup, "_safe_restore_db", lambda src, dst: False)
+
+    assert backup.restore_quick_snapshot("snap", hermes_home=home) is False

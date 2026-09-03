@@ -1836,27 +1836,6 @@ def _print_verified_update_completion(message: str) -> bool:
     return False
 
 
-def _clear_stale_sqlite_sidecars(db_path: Path) -> None:
-    """Delete the WAL / shared-memory / rollback-journal files next to *db_path*.
-
-    Call this immediately before overwriting a database file with a snapshot
-    image. Quick snapshots are produced by ``backup._safe_copy_db`` through
-    ``sqlite3.backup()``, so the image is already checkpointed and owns no WAL —
-    which is exactly why ``backup._EXCLUDED_SUFFIXES`` refuses to ship sidecars
-    inside a snapshot. Copying the image over the destination replaces only the
-    main database file, so any ``-wal`` / ``-shm`` left behind by the *old*
-    database (a crashed writer, or a second Hermes process the updater's drain
-    did not stop) survives and is replayed over the fresh image on the next
-    open. The result passes ``PRAGMA integrity_check`` while serving the old
-    database's contents, and the first checkpoint folds it in permanently.
-
-    Removing them is safe here specifically: they belong to a database the
-    caller has already declared corrupt and is about to discard.
-    """
-    for suffix in ("-wal", "-shm", "-journal"):
-        db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
-
-
 def _print_update_summary(
     *,
     node_failures: list,
@@ -1912,41 +1891,76 @@ def _write_gateway_update_exit_code(ok: bool) -> None:
         pass
 
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class RestoreOutcome:
+    ok: bool
+    reason: str = ""
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+_last_restore_outcome = RestoreOutcome(False, "not_started")
+
+
 def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
-    """Replace *state_path* with the snapshot image at *snap_state*.
+    """Restore a verified snapshot through SQLite backup, without path swaps."""
+    global _last_restore_outcome
+    from hermes_cli.backup import _safe_restore_db, verify_sqlite_integrity
 
-    Shared by both post-update auto-restore paths (the ZIP update and the git
-    pull). The destination's stale sidecars are cleared before the copy, so the
-    restored image cannot be silently overwritten by the corrupt database's WAL
-    replay — see :func:`_clear_stale_sqlite_sidecars`.
+    state_path = Path(state_path).expanduser().resolve()
+    snap_state = Path(snap_state).expanduser().resolve()
 
-    Refuses (returns ``False``) while another process still holds the database
-    or its sidecars open: copying a snapshot over a live writer's inode makes
-    the writer's page cache and WAL index disagree with the file bytes, and
-    its next checkpoint writes pages at offsets that no longer mean what it
-    thinks — the #90950 page-1 clobber. ``None`` (scan unavailable) proceeds:
-    the updater has already drained gateways, and refusing on "unknown" would
-    disable auto-restore on every non-Linux host.
-
-    Returns ``True`` when the restored file passes an integrity check. Raises
-    ``OSError`` if the copy itself fails, which callers already report.
-    """
-    from hermes_cli.backup import _foreign_db_holder_pids, verify_sqlite_integrity
-
-    holders = _foreign_db_holder_pids(state_path)
-    if holders:
-        print(
-            f"  ✗ Auto-restore refused: process(es) {holders} still hold "
-            "state.db or its WAL open. Stop them (hermes gateway stop), "
-            "then restore manually with /snapshot restore."
+    if not snap_state.is_file():
+        _last_restore_outcome = RestoreOutcome(
+            False, "invalid_snapshot", f"snapshot not found: {snap_state}"
         )
         return False
-    _clear_stale_sqlite_sidecars(state_path)
-    shutil.copy2(snap_state, state_path)
-    restored = verify_sqlite_integrity(
-        state_path, check_header=True, run_pragma=True
-    )
-    return bool(restored.get("valid"))
+
+    try:
+        snapshot_check = verify_sqlite_integrity(
+            snap_state, check_header=True, run_pragma=True
+        )
+    except Exception as exc:
+        _last_restore_outcome = RestoreOutcome(False, "invalid_snapshot", str(exc))
+        return False
+    if not snapshot_check.get("valid"):
+        _last_restore_outcome = RestoreOutcome(
+            False,
+            "invalid_snapshot",
+            snapshot_check.get("message", "snapshot integrity verification failed"),
+        )
+        return False
+
+    if not _safe_restore_db(snap_state, state_path):
+        _last_restore_outcome = RestoreOutcome(
+            False, "sqlite_restore_failure", "SQLite backup failed"
+        )
+        return False
+
+    try:
+        destination_check = verify_sqlite_integrity(
+            state_path, check_header=True, run_pragma=True
+        )
+    except Exception as exc:
+        _last_restore_outcome = RestoreOutcome(
+            False, "post_restore_verification_failure", str(exc)
+        )
+        return False
+    if not destination_check.get("valid"):
+        _last_restore_outcome = RestoreOutcome(
+            False,
+            "post_restore_verification_failure",
+            destination_check.get("message", "destination integrity verification failed"),
+        )
+        return False
+
+    _last_restore_outcome = RestoreOutcome(True, "restored")
+    return True
 
 
 def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
@@ -2330,22 +2344,28 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
                             )
                             if _snap_ok.get("valid"):
                                 try:
-                                    if _restore_state_db_from_snapshot(
+                                    _restore_ok = _restore_state_db_from_snapshot(
                                         _state_path, _snap_state
-                                    ):
+                                    )
+                                    _restore = _last_restore_outcome
+                                    if _restore_ok:
                                         print(
                                             "  ✓ Auto-restored from snapshot "
                                             f"{_snap_dir.name}"
                                         )
+                                    elif _restore.reason == "invalid_snapshot":
+                                        print("  ✗ Auto-restore rejected — snapshot integrity verification failed; use offline recovery.")
+                                    elif _restore.reason == "sqlite_restore_failure":
+                                        print("  ✗ Auto-restore failed — SQLite restore could not complete. Stop Hermes and perform offline recovery.")
+                                    elif _restore.reason == "post_restore_verification_failure":
+                                        print("  ✗ Auto-restore failed — post-restore verification failed. Stop Hermes and perform offline recovery.")
                                     else:
-                                        print(
-                                            "  ✗ Auto-restore FAILED — restored "
-                                            "copy also failed integrity"
-                                        )
+                                        print("  ✗ Auto-restore failed — restore outcome was not verified. Stop Hermes and perform offline recovery.")
                                     break
                                 except OSError as _exc:
                                     print(
-                                        f"  ✗ Auto-restore file copy failed: {_exc}"
+                                        f"  ✗ Auto-restore failed — SQLite restore could not complete: {_exc}. "
+                                        "Stop Hermes and perform offline recovery."
                                     )
                                     break
     except Exception as exc:
@@ -9145,21 +9165,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             )
                             if _snap_ok.get("valid"):
                                 try:
-                                    if _restore_state_db_from_snapshot(
+                                    _restore_ok = _restore_state_db_from_snapshot(
                                         _state_path, _snap_state
-                                    ):
+                                    )
+                                    _restore = _last_restore_outcome
+                                    if _restore_ok:
                                         print(
                                             "  ✓ Auto-restored from pre-update "
                                             f"snapshot ({_pre_snap_id})"
                                         )
+                                    elif _restore.reason == "invalid_snapshot":
+                                        print("  ✗ Auto-restore rejected — snapshot integrity verification failed; use offline recovery.")
+                                    elif _restore.reason == "sqlite_restore_failure":
+                                        print("  ✗ Auto-restore failed — SQLite restore could not complete. Stop Hermes and perform offline recovery.")
+                                    elif _restore.reason == "post_restore_verification_failure":
+                                        print("  ✗ Auto-restore failed — post-restore verification failed. Stop Hermes and perform offline recovery.")
                                     else:
-                                        print(
-                                            "  ✗ Auto-restore FAILED — restored "
-                                            "copy also failed integrity"
-                                        )
+                                        print("  ✗ Auto-restore failed — restore outcome was not verified. Stop Hermes and perform offline recovery.")
                                 except OSError as _exc:
                                     print(
-                                        f"  ✗ Auto-restore file copy failed: {_exc}"
+                                        f"  ✗ Auto-restore failed — SQLite restore could not complete: {_exc}. "
+                                        "Stop Hermes and perform offline recovery."
                                     )
                             else:
                                 print(

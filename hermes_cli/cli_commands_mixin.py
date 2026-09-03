@@ -361,7 +361,7 @@ class CLICommandsMixin:
         """
         from hermes_cli.backup import (
             create_quick_snapshot, list_quick_snapshots,
-            restore_quick_snapshot, prune_quick_snapshots,
+            quick_snapshot_exists, restore_quick_snapshot, prune_quick_snapshots,
         )
         from hermes_constants import display_hermes_home
 
@@ -435,7 +435,10 @@ class CLICommandsMixin:
                     "to pick up state.db changes."
                 )
             else:
-                print(f"  Snapshot not found: {snap_id}")
+                if quick_snapshot_exists(snap_id):
+                    print(f"  Snapshot restore failed or incomplete: {snap_id}")
+                else:
+                    print(f"  Snapshot not found: {snap_id}")
 
         elif subcmd == "prune":
             keep = 20

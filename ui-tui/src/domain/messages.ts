@@ -23,6 +23,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
 
   const out: Msg[] = []
   let pending: string[] = []
+  let pendingTerminalDeliveryId: string | undefined
 
   for (const row of rows) {
     if (!row || typeof row !== 'object') {
@@ -52,6 +53,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
 
     if (display_kind === 'model_switch') {
       out.push({ kind: 'event', role: 'system', text: 'model changed' })
+      pendingTerminalDeliveryId = undefined
       pending = []
 
       continue
@@ -59,6 +61,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
 
     if (display_kind === 'auto_continue') {
       out.push({ kind: 'event', role: 'system', text: 'resumed interrupted turn' })
+      pendingTerminalDeliveryId = undefined
       pending = []
 
       continue
@@ -66,6 +69,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
 
     if (display_kind === 'personality_switch') {
       out.push({ kind: 'event', role: 'system', text: 'personality changed' })
+      pendingTerminalDeliveryId = undefined
       pending = []
 
       continue
@@ -74,6 +78,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
     if (display_kind === 'async_delegation_complete') {
       const meta = (row as TranscriptRow).display_metadata
       const count = meta && typeof meta.task_count === 'number' ? meta.task_count : undefined
+      const deliveryId = meta && typeof meta.delivery_id === 'string' && meta.delivery_id.trim() ? meta.delivery_id : undefined
 
       const label =
         count === undefined
@@ -81,22 +86,39 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
           : `${count} background agent${count === 1 ? '' : 's'} finished`
 
       out.push({ kind: 'event', role: 'system', text: label })
+      pendingTerminalDeliveryId = deliveryId
       pending = []
 
       continue
     }
 
     if (role === 'assistant') {
-      out.push({ role, text, ...(createdAt !== undefined && { createdAt }), ...(pending.length && { tools: pending }) })
+      const persistedDeliveryId =
+        row.display_metadata && typeof row.display_metadata.delivery_id === 'string'
+          ? row.display_metadata.delivery_id
+          : undefined
+      const deliveryId = persistedDeliveryId ?? pendingTerminalDeliveryId
+      out.push({
+        role,
+        text,
+        ...(deliveryId ? { deliveryId } : {}),
+        ...(createdAt !== undefined && { createdAt }),
+        ...(pending.length && { tools: pending })
+      })
+      pendingTerminalDeliveryId = undefined
       pending = []
     } else if (role === 'user' || role === 'system') {
       out.push({ role, text, ...(createdAt !== undefined && { createdAt }) })
+      pendingTerminalDeliveryId = undefined
       pending = []
     }
   }
 
   return out
 }
+
+export const transcriptDeliveryIds = (messages: Msg[]): string[] =>
+  [...new Set(messages.flatMap(message => (message.deliveryId ? [message.deliveryId] : [])))]
 
 export const fmtDuration = (ms: number) => {
   const t = Math.max(0, Math.floor(ms / 1000))

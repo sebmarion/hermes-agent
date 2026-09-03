@@ -2241,7 +2241,7 @@ def _db_for_profile(profile: str | None = None):
 
     Returns (db, owns_handle). ``db`` is None when unavailable.
     """
-    profile_home = _profile_home(profile)
+    profile_home = _require_profile_home(profile)
     if profile_home is None:
         return _get_db(), False
     try:
@@ -2381,6 +2381,14 @@ def _profile_home(profile: str | None) -> Path | None:
     return home if (home / "state.db").exists() or home.exists() else None
 
 
+def _require_profile_home(profile: str | None) -> Path | None:
+    name = (profile or "").strip()
+    home = _profile_home(name)
+    if name and home is None:
+        raise ValueError(f"Unknown Hermes profile: {name}")
+    return home
+
+
 def _profile_scoped(handler):
     """Bind ``params['profile']``'s HERMES_HOME around a handler.
 
@@ -2391,7 +2399,10 @@ def _profile_scoped(handler):
     """
 
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        profile = params.get("profile") if isinstance(params, dict) else None
+        home = _require_profile_home(profile)
+        if str(profile or "").strip() and home is None:
+            raise ValueError(f"Unknown Hermes profile: {str(profile).strip()}")
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)
@@ -2526,7 +2537,7 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
-    write_json(_event_frame(event, sid, payload))
+    return write_json(_event_frame(event, sid, payload))
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
@@ -3022,6 +3033,26 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     return rid, method, params
 
 
+def _authenticated_reconnect_session() -> tuple[str, dict, object] | None:
+    """Return the session owned by the authenticated current transport."""
+    transport = current_transport()
+    identity = getattr(transport, "auth_identity", None)
+    if transport is None or not isinstance(identity, dict):
+        return None
+    with _sessions_lock:
+        for sid, session in _sessions.items():
+            if session.get("transport") is transport:
+                return sid, session, transport
+    return None
+
+
+def _canary_scope_matches(transport: object, operation_id: str, session_id: str) -> bool:
+    scope = getattr(transport, "auth_scope", None)
+    return (isinstance(scope, dict) and scope.get("kind") == "promotion-canary"
+            and scope.get("operation_id") == operation_id
+            and scope.get("runtime_session_id") == session_id)
+
+
 def handle_request(req: dict) -> dict | None:
     normalized = _normalize_request(req)
     if isinstance(normalized, dict):
@@ -3063,6 +3094,28 @@ def _current_session_steer_authority(
         return transport, session
 
 
+def _capture_canary_resume_projection(transport: object, response: dict | None) -> None:
+    """Bind later canary RPCs to the exact display array returned by resume."""
+    scope = getattr(transport, "auth_scope", None)
+    if not isinstance(scope, dict) or scope.get("kind") != "promotion-canary":
+        return
+    if not isinstance(response, dict) or "error" in response:
+        return
+    result = response.get("result")
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if not isinstance(messages, list):
+        return
+    from tui_gateway.reconnect_proof import canonical_transcript
+    _raw, digest = canonical_transcript(messages)
+    runtime_id = result.get("session_id")
+    if not isinstance(runtime_id, str) or not runtime_id:
+        return
+    scope["runtime_session_id"] = runtime_id
+    scope["resume_transcript_sha256"] = digest
+    scope["resume_transcript_count"] = len(messages)
+    scope["resume_operation_id"] = scope.get("operation_id")
+
+
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
@@ -3083,21 +3136,55 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
+        scope = getattr(t, "auth_scope", None)
+        if isinstance(scope, dict) and scope.get("kind") == "promotion-canary":
+            from tui_gateway.reconnect_auth import CANARY_RPC_ALLOWLIST
+            if method not in CANARY_RPC_ALLOWLIST:
+                return _err(_rid, 4030, "RPC is not allowed for promotion canary")
+            requested = (_params or {}).get("session_id")
+            requested_operation = (_params or {}).get("operation_id")
+            if requested_operation != scope.get("operation_id"):
+                return _err(_rid, 4030, "promotion canary binding mismatch")
+            if method == "session.resume":
+                if (scope.get("runtime_session_id") is not None
+                        or requested != scope.get("session_id")):
+                    return _err(_rid, 4030, "stored session is not bound to promotion canary")
+                if scope.get("resume_pending"):
+                    return _err(_rid, 4092, "session.resume already in flight")
+                scope["resume_pending"] = True
+            elif requested != scope.get("runtime_session_id"):
+                return _err(_rid, 4030, "runtime session is not bound to promotion canary")
         if method not in _LONG_HANDLERS:
-            return handle_request(req)
+            response = handle_request(req)
+            if method == "session.resume":
+                _capture_canary_resume_projection(t, response)
+            return response
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
 
         def run():
             try:
-                resp = handle_request(req)
-            except Exception as exc:
-                resp = _err(req.get("id"), -32000, f"handler error: {exc}")
-            if resp is not None:
-                t.write(resp)
+                try:
+                    resp = handle_request(req)
+                except Exception as exc:
+                    resp = _err(req.get("id"), -32000, f"handler error: {exc}")
+                if resp is not None:
+                    if method == "session.resume":
+                        _capture_canary_resume_projection(t, resp)
+                    t.write(resp)
+            finally:
+                if method == "session.resume":
+                    scope = getattr(t, "auth_scope", None)
+                    if isinstance(scope, dict):
+                        scope["resume_pending"] = False
 
-        _pool.submit(lambda: ctx.run(run))
+        try:
+            _pool.submit(lambda: ctx.run(run))
+        except BaseException:
+            if method == "session.resume" and isinstance(scope, dict):
+                scope["resume_pending"] = False
+            raise
 
         return None
     finally:
@@ -9937,9 +10024,9 @@ def _session_home(session: dict) -> Path:
 
 
 def _retire_turn_marker(session: dict, *keys: str) -> None:
-    """Drop the crash marker for a turn whose outcome is about to reach the client.
+    """Drop the crash marker after publishing the replayable terminal frame.
 
-    Called immediately before the terminal frame rather than at the end of the
+    Called immediately after the terminal frame rather than at the end of the
     turn thread: post-turn work (titles, memory sync, goal hooks) runs for a
     second or more after the client has its answer, and quitting inside that
     window would leave a marker that looks like a crash — re-running a finished
@@ -10484,7 +10571,7 @@ def _emit_terminal_turn_error(
     error_surface: Optional[dict] = None,
     *,
     retire_marker: bool = True,
-) -> None:
+) -> bool:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
     Emits the same ``status: "error"`` frame shape the returned-error path in
@@ -10536,9 +10623,10 @@ def _emit_terminal_turn_error(
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
-    if retire_marker:
+    published = _emit("message.complete", sid, payload) is not False
+    if retire_marker and published:
         _retire_turn_marker(session)
-    _emit("message.complete", sid, payload)
+    return published
 
 
 def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
@@ -11775,6 +11863,23 @@ def _read_spawn_tree_index(session_dir) -> list[dict]:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+def _resolve_notification_session_key(session: dict, key: str) -> str:
+    profile_home = session.get("profile_home")
+    token = set_hermes_home_override(profile_home) if profile_home else None
+    try:
+        db = _get_db()
+        return (db.resolve_resume_session_id(key) if db is not None else key) or key
+    except Exception:
+        return key
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
+def _same_session_profile(left: dict, right: dict) -> bool:
+    return str(left.get("profile_home") or "") == str(right.get("profile_home") or "")
+
+
 def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) -> bool:
     """True if ``evt`` is owned by a *different* live session.
 
@@ -11813,13 +11918,7 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
     # still running. Resolve the event's original key to its continuation tip so
     # an event captured before or after compression still maps to the same live
     # desktop session instead of becoming an orphan that any poller may consume.
-    resolved_key = evt_key
-    try:
-        db = _get_db()
-        if db is not None:
-            resolved_key = db.resolve_resume_session_id(evt_key) or evt_key
-    except Exception:
-        resolved_key = evt_key
+    resolved_key = _resolve_notification_session_key(session, evt_key)
 
     # If the key has a live continuation, prefer that continuation over the
     # compressed parent. Otherwise a stale parent tab could consume the event
@@ -11831,6 +11930,7 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
             with _sessions_lock:
                 continuation_live = any(
                     not s.get("_finalized")
+                    and _same_session_profile(s, session)
                     and (
                         str(s.get("session_key") or "") == resolved_key
                         or _session_lookup_key(s, fallback="") == resolved_key
@@ -11856,6 +11956,7 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
     return any(
         s is not session
         and not s.get("_finalized")
+        and _same_session_profile(s, session)
         and (
             str(s.get("session_key") or "") in {evt_key, resolved_key}
             or _session_lookup_key(s, fallback="") in {evt_key, resolved_key}
@@ -11888,13 +11989,7 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     }
     if evt_key in current_keys:
         return True
-    try:
-        db = _get_db()
-        resolved_key = (
-            db.resolve_resume_session_id(evt_key) if db is not None else evt_key
-        ) or evt_key
-    except Exception:
-        resolved_key = evt_key
+    resolved_key = _resolve_notification_session_key(session, evt_key)
     return resolved_key in current_keys
 
 
@@ -12250,6 +12345,489 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+_ASYNC_DELIVERY_HEARTBEAT_SECONDS = 30.0
+_ASYNC_DELIVERY_CLEANUP_RETRY_SECONDS = 1.0
+_ASYNC_DELIVERY_MAX_TRANSITION_RETRIES = 8
+
+
+def _normalize_terminal_response(result: Any, status: str) -> tuple[str, str]:
+    """Normalize every terminal result into visible, durable assistant text."""
+    raw = result.get("final_response", "") if isinstance(result, dict) else result
+    malformed = raw is not None and not isinstance(raw, str)
+    text = raw if isinstance(raw, str) else ""
+
+    if status == "interrupted" and text.strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+        return (
+            "Error: The parent turn was interrupted before a final response was available. "
+            "The durable delegated result remains available for retry.",
+            "error",
+        )
+    if malformed:
+        return (
+            "Error: The terminal result payload was malformed; "
+            "the durable delegated result remains available for retry.",
+            "error",
+        )
+    if text.strip() not in {"", "(empty)"}:
+        return text, status
+    if status == "interrupted":
+        return (
+            "Error: The parent turn was interrupted before a final response was available. "
+            "The durable delegated result remains available for retry.",
+            "error",
+        )
+    if isinstance(result, dict) and result.get("error"):
+        return f"Error: {result.get('error')}", "error"
+    return (
+        "Error: The agent ended without a final response. "
+        "Any pending background result remains available for retry.",
+        "error",
+    )
+
+
+def _start_async_delegation_heartbeat(
+    evt: dict,
+    claim_id: str,
+    *,
+    on_lost: Callable[[], None] | None = None,
+    profile_home: str | Path | None = None,
+) -> tuple[threading.Event, threading.Thread]:
+    """Renew an async-delivery claim while its parent turn is running."""
+    stop = threading.Event()
+
+    def _claim_lost() -> None:
+        if stop.is_set():
+            return
+        stop.set()
+        if on_lost is not None:
+            try:
+                on_lost()
+            except Exception:
+                logger.warning(
+                    "Async delegation %s claim-loss handler failed",
+                    evt.get("delegation_id"),
+                    exc_info=True,
+                )
+
+    def _loop() -> None:
+        while not stop.wait(_ASYNC_DELIVERY_HEARTBEAT_SECONDS):
+            try:
+                from tools.async_delegation import renew_event_delivery
+
+                token = set_hermes_home_override(profile_home) if profile_home else None
+                try:
+                    renewed = renew_event_delivery(evt, claim_id)
+                finally:
+                    if token is not None:
+                        reset_hermes_home_override(token)
+                if not renewed:
+                    _claim_lost()
+                    return
+            except Exception:
+                # Continuing after a failed renewal would allow the lease to
+                # expire while this parent is still running, permitting a
+                # second worker to execute the same delivery.
+                logger.warning("Async delegation claim renewal failed", exc_info=True)
+                _claim_lost()
+                return
+
+    thread = _RealThread(target=_loop, daemon=True)
+    thread.start()
+    return stop, thread
+
+
+def _fail_closed_async_delivery_claim(session: dict) -> None:
+    """Interrupt a parent whose durable delivery claim can no longer renew."""
+    session["_async_delivery_claim_lost"] = True
+    try:
+        from agent.interrupt_compat import request_hard_interrupt
+
+        request_hard_interrupt(session.get("agent"))
+    except Exception:
+        logger.warning("Unable to interrupt parent after async claim loss", exc_info=True)
+
+
+def _stop_async_delegation_heartbeat(
+    stop: threading.Event | None, thread: threading.Thread | None
+) -> None:
+    if stop is None:
+        return
+    stop.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=1.0)
+
+
+def _async_delegation_delivery_is_retryable(
+    evt: dict, profile_home: str | Path | None = None
+) -> bool:
+    """Return whether a failed durable delivery still has a live retry state."""
+    try:
+        from tools.async_delegation import get_durable_delegation
+
+        durable = _profile_scoped_async_db_call(
+            profile_home,
+            lambda: get_durable_delegation(str(evt.get("delegation_id") or "")),
+        )
+    except Exception:
+        # A registry read failure must not strand an event already removed from
+        # the in-memory queue; the next claimant can make the authoritative
+        # decision once the registry is available again.
+        return True
+    # Missing/pruned rows have no durable recovery state and must not be
+    # requeued after a failed legacy delivery.
+    return durable is not None and durable.get("delivery_state") == "pending"
+
+
+def _requeue_async_delegation(
+    evt: dict, profile_home: str | Path | None = None
+) -> None:
+    if profile_home is None:
+        retryable = _async_delegation_delivery_is_retryable(evt)
+    else:
+        retryable = _async_delegation_delivery_is_retryable(evt, profile_home)
+    if retryable:
+        from tools.process_registry import process_registry
+
+        process_registry.completion_queue.put(evt)
+
+
+def _make_delivery_release_once(
+    evt: dict, claim_id: str, profile_home: str | Path | None = None
+):
+    """Release a delivery claim at most once, including when release raises."""
+    release_attempted = False
+
+    def _release() -> bool:
+        nonlocal release_attempted
+        if release_attempted:
+            return False
+        release_attempted = True
+        try:
+            from tools.async_delegation import release_event_delivery
+
+            result = _profile_scoped_async_db_call(
+                profile_home, lambda: release_event_delivery(evt, claim_id)
+            )
+            return True if result is None else result
+        except Exception:
+            logger.warning(
+                "Async delegation %s delivery release failed",
+                evt.get("delegation_id"),
+                exc_info=True,
+            )
+            return False
+
+    return _release
+
+
+def _profile_scoped_async_db_call(profile_home: str | Path | None, fn: Callable[[], Any]):
+    token = set_hermes_home_override(profile_home) if profile_home else None
+    try:
+        return fn()
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
+def _claim_event_delivery_safely(
+    evt: dict, consumer: str, profile_home: str | Path | None = None
+) -> str | None:
+    """Claim without letting a transient store failure consume the queue event."""
+    try:
+        from tools.async_delegation import claim_event_delivery
+
+        return _profile_scoped_async_db_call(
+            profile_home, lambda: claim_event_delivery(evt, consumer)
+        )
+    except Exception:
+        logger.warning(
+            "Async delegation %s delivery claim failed",
+            evt.get("delegation_id"),
+            exc_info=True,
+        )
+        return None
+
+
+def _schedule_async_delivery_transition_retry(
+    evt: dict,
+    transition: Callable[[], bool],
+    *,
+    heartbeat: tuple[threading.Event, threading.Thread] | None,
+    on_success: Callable[[], None] | None = None,
+    on_exhausted: Callable[[], None] | None = None,
+    check_retryable: bool = True,
+    profile_home: str | Path | None = None,
+) -> None:
+    """Retry a durable transition, then fail closed without an immortal thread."""
+
+    def _retry() -> None:
+        for attempt in range(_ASYNC_DELIVERY_MAX_TRANSITION_RETRIES):
+            def _is_retryable() -> bool:
+                if profile_home is None:
+                    return _async_delegation_delivery_is_retryable(evt)
+                return _async_delegation_delivery_is_retryable(evt, profile_home)
+
+            if check_retryable and not _profile_scoped_async_db_call(
+                profile_home, _is_retryable
+            ):
+                if heartbeat is not None:
+                    _stop_async_delegation_heartbeat(*heartbeat)
+                return
+            try:
+                if transition():
+                    if heartbeat is not None:
+                        _stop_async_delegation_heartbeat(*heartbeat)
+                    if on_success is not None:
+                        on_success()
+                    return
+            except Exception:
+                logger.warning(
+                    "Async delegation %s durable transition retry failed",
+                    evt.get("delegation_id"),
+                    exc_info=True,
+                )
+            if attempt + 1 < _ASYNC_DELIVERY_MAX_TRANSITION_RETRIES:
+                time.sleep(_ASYNC_DELIVERY_CLEANUP_RETRY_SECONDS)
+        if heartbeat is not None:
+            _stop_async_delegation_heartbeat(*heartbeat)
+        if on_exhausted is not None:
+            try:
+                on_exhausted()
+            except Exception:
+                logger.warning(
+                    "Async delegation %s exhausted durable transition retries",
+                    evt.get("delegation_id"),
+                    exc_info=True,
+                )
+
+    _RealThread(target=_retry, daemon=True).start()
+
+
+def _release_async_delivery_claim(
+    evt: dict,
+    claim_id: str,
+    release_once: Callable[[], bool],
+    *,
+    heartbeat: tuple[threading.Event, threading.Thread] | None,
+    on_released: Callable[[], None] | None,
+    on_retry_released: Callable[[], None] | None = None,
+    profile_home: str | Path | None = None,
+) -> bool:
+    """Release now or retain the lease while retrying a failed transition."""
+    if release_once():
+        if heartbeat is not None:
+            _stop_async_delegation_heartbeat(*heartbeat)
+        if on_released is not None:
+            on_released()
+        return True
+    if evt.get("type") != "async_delegation":
+        if heartbeat is not None:
+            _stop_async_delegation_heartbeat(*heartbeat)
+        return False
+
+    from tools.async_delegation import (
+        event_delivery_claim_status,
+        release_event_delivery,
+    )
+
+    outcome = {"requeue": True}
+
+    def _retry_release() -> bool:
+        if _profile_scoped_async_db_call(
+            profile_home, lambda: release_event_delivery(evt, claim_id)
+        ) is not False:
+            return True
+        status = _profile_scoped_async_db_call(
+            profile_home, lambda: event_delivery_claim_status(evt, claim_id)
+        )
+        if status == "owned":
+            return False
+        outcome["requeue"] = status == "unclaimed"
+        return True
+
+    def _released() -> None:
+        callback = on_retry_released or on_released
+        if outcome["requeue"] and callback is not None:
+            callback()
+
+    _schedule_async_delivery_transition_retry(
+        evt,
+        _retry_release,
+        heartbeat=heartbeat,
+        on_success=_released,
+        on_exhausted=lambda: (
+            _requeue_async_delegation(evt)
+            if profile_home is None
+            else _requeue_async_delegation(evt, profile_home)
+        ),
+        profile_home=profile_home,
+    )
+    return False
+
+
+def _ensure_terminal_assistant_identity(
+    db: Any, session_id: str, text: str, delivery_id: str
+) -> bool:
+    """Persist the terminal assistant row and its immutable delivery identity."""
+    metadata = {"delivery_id": delivery_id}
+    try:
+        if db.set_latest_matching_message_display_metadata(
+            session_id,
+            role="assistant",
+            content=text,
+            display_metadata=metadata,
+        ):
+            return True
+    except Exception as exc:
+        raise RuntimeError("terminal delivery identity persistence failed") from exc
+
+    rows = db.get_messages(session_id, latest=True, limit=1)
+    latest = rows[0] if rows else None
+    if latest and latest.get("role") == "assistant":
+        if latest.get("content") == text:
+            raise RuntimeError("terminal delivery identity persistence failed")
+        raise RuntimeError("terminal assistant transcript would violate role alternation")
+
+    try:
+        db.append_message(
+            session_id,
+            "assistant",
+            text,
+            display_metadata=metadata,
+        )
+    except Exception as exc:
+        raise RuntimeError("terminal assistant transcript persistence failed") from exc
+    return True
+
+
+def _async_delegation_terminal_callback(
+    evt: dict,
+    claim_id: str,
+    *,
+    heartbeat: tuple[threading.Event, threading.Thread] | None = None,
+    profile_home: str | Path | None = None,
+):
+    """Acknowledge durable delivery only after the parent emits visible text."""
+    settled = False
+    settled_lock = threading.Lock()
+
+    def _profile_db_call(fn):
+        return _profile_scoped_async_db_call(profile_home, fn)
+
+    def _requeue() -> None:
+        if profile_home is None:
+            _requeue_async_delegation(evt)
+        else:
+            _requeue_async_delegation(evt, profile_home)
+
+    def _terminal(receipt: dict[str, Any]) -> dict[str, Any]:
+        nonlocal settled
+        terminal_event = receipt.get("terminal_event")
+        if not isinstance(terminal_event, dict):
+            raise RuntimeError("durable terminal event required")
+        with settled_lock:
+            if settled:
+                return False
+        from tools.async_delegation import commit_terminal_output
+
+        try:
+            committed = _profile_db_call(
+                lambda: commit_terminal_output(evt, claim_id, terminal_event)
+            )
+            if isinstance(committed, dict):
+                setattr(_terminal, "_durable_delivery_id", committed.get("delivery_id"))
+                setattr(
+                    _terminal,
+                    "_durable_output_already_committed",
+                    bool(committed.get("already_committed")),
+                )
+        except Exception:
+            from tools.async_delegation import event_delivery_claim_status
+
+            try:
+                claim_status = _profile_db_call(
+                    lambda: event_delivery_claim_status(evt, claim_id)
+                )
+            except Exception:
+                claim_status = "owned"
+            if claim_status != "owned":
+                if claim_status == "unclaimed":
+                    # The lease disappeared before durable publication. No
+                    # other consumer owns it, so put the durable event back on
+                    # the queue rather than leaving it stranded forever.
+                    _requeue()
+                if heartbeat is not None:
+                    _stop_async_delegation_heartbeat(*heartbeat)
+                with settled_lock:
+                    settled = True
+                return False
+
+            def _retry_terminal_outbox_commit() -> bool:
+                try:
+                    committed_again = bool(
+                        _profile_db_call(
+                            lambda: commit_terminal_output(evt, claim_id, terminal_event)
+                        )
+                    )
+                except Exception:
+                    try:
+                        retry_status = _profile_db_call(
+                            lambda: event_delivery_claim_status(evt, claim_id)
+                        )
+                    except Exception:
+                        retry_status = "owned"
+                    if retry_status != "owned":
+                        setattr(_terminal, "_durable_retry_lost", True)
+                        return True
+                    raise
+                if committed_again:
+                    setattr(_terminal, "_durable_retry_succeeded", True)
+                return committed_again
+
+            def _terminal_commit_exhausted() -> None:
+                nonlocal settled
+                setattr(_terminal, "_durable_retry_exhausted", True)
+                with settled_lock:
+                    settled = True
+                try:
+                    _requeue()
+                finally:
+                    getattr(_terminal, "_durable_commit_event", threading.Event()).set()
+
+            _schedule_async_delivery_transition_retry(
+                evt,
+                _retry_terminal_outbox_commit,
+                heartbeat=heartbeat,
+                on_success=lambda: getattr(
+                    _terminal, "_durable_commit_event", threading.Event()
+                ).set(),
+                on_exhausted=_terminal_commit_exhausted,
+                profile_home=profile_home,
+            )
+            setattr(_terminal, "_durable_retry_started", True)
+            raise
+        with settled_lock:
+            settled = True
+        commit_event = getattr(_terminal, "_durable_commit_event", None)
+        if commit_event is not None:
+            commit_event.set()
+        if heartbeat is not None:
+            _stop_async_delegation_heartbeat(*heartbeat)
+        return committed
+
+    def _mark_live_published(delivery_id: str) -> bool:
+        from tools.async_delegation import mark_terminal_output_live_published
+
+        return _profile_db_call(
+            lambda: mark_terminal_output_live_published(delivery_id, claim_id)
+        )
+
+    setattr(_terminal, "_durable_claim_id", claim_id)
+    setattr(_terminal, "_mark_live_published", _mark_live_published)
+    setattr(_terminal, "_is_async_delegation_terminal_callback", True)
+    return _terminal
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -12274,6 +12852,25 @@ def _notification_poller_loop(
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
     _last_heartbeat_poll = 0.0
+    _retry_deferred_keys: set[str] = set()
+
+    def _delivery_retry_key(evt: dict) -> str:
+        return str(evt.get("delegation_id") or id(evt))
+
+    def _wait_before_retry() -> None:
+        wait = getattr(stop_event, "wait", None)
+        if callable(wait):
+            wait(0.25)
+        else:
+            time.sleep(0.25)
+
+    def _requeue_for_session(event: dict) -> None:
+        profile_home = session.get("profile_home")
+        if profile_home is None:
+            _requeue_async_delegation(event)
+        else:
+            _requeue_async_delegation(event, profile_home)
+
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
         # Heartbeat state is durable. Poll it from the server-owned session
@@ -12378,6 +12975,7 @@ def _notification_poller_loop(
             )
             continue
 
+        _retry_deferred_keys.discard(_delivery_retry_key(evt))
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
@@ -12406,32 +13004,78 @@ def _notification_poller_loop(
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
             # (100% CPU, GIL churn) for as long as the session stays busy.
-            time.sleep(0.25)
+            _wait_before_retry()
             continue
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
+        from tools.async_delegation import complete_event_delivery
+
+        _claim = _claim_event_delivery_safely(evt, "tui-poller", session.get("profile_home"))
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
+            if evt.get("type") == "async_delegation":
+                _requeue_for_session(evt)
+                _retry_deferred_keys.add(_delivery_retry_key(evt))
+            _wait_before_retry()
             continue
+        _release_claim = _make_delivery_release_once(
+            evt, _claim, session.get("profile_home")
+        )
+        heartbeat = None
+
+        def _requeue_after_release(delivery_event=evt) -> None:
+            if delivery_event.get("type") == "async_delegation":
+                _requeue_for_session(delivery_event)
+                _retry_deferred_keys.add(_delivery_retry_key(delivery_event))
+                _wait_before_retry()
+
         try:
             _emit("message.start", sid)
+            terminal_callback = None
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                heartbeat = _start_async_delegation_heartbeat(
+                    evt,
+                    _claim,
+                    on_lost=lambda session=session: _fail_closed_async_delivery_claim(
+                        session
+                    ),
+                    profile_home=session.get("profile_home"),
+                )
+                terminal_callback = _async_delegation_terminal_callback(
+                    evt, _claim, heartbeat=heartbeat, profile_home=session.get("profile_home")
+                )
+                started = _run_prompt_submit(
                     rid,
                     sid,
                     session,
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    terminal_callback=terminal_callback,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+                started = _run_prompt_submit(rid, sid, session, text)
+            if not started:
+                _release_async_delivery_claim(
+                    evt,
+                    _claim,
+                    _release_claim,
+                    heartbeat=heartbeat,
+                    on_released=_requeue_after_release,
+                    profile_home=session.get("profile_home"),
+                )
+            elif terminal_callback is None and evt.get("type") != "async_delegation":
+                complete_event_delivery(evt, _claim)
         except Exception as exc:
-            release_event_delivery(evt, _claim)
+            _release_async_delivery_claim(
+                evt,
+                _claim,
+                _release_claim,
+                heartbeat=heartbeat,
+                on_released=_requeue_after_release,
+                profile_home=session.get("profile_home"),
+            )
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
@@ -12469,6 +13113,20 @@ def _notification_poller_loop(
                     str(evt.get("session_key") or ""),
                 )
             continue
+        if (
+            evt.get("type") == "async_delegation"
+            and _delivery_retry_key(evt) in _retry_deferred_keys
+        ):
+            _retry_deferred_keys.discard(_delivery_retry_key(evt))
+            if session.get("profile_home") is None:
+                retryable = _async_delegation_delivery_is_retryable(evt)
+            else:
+                retryable = _async_delegation_delivery_is_retryable(
+                    evt, session.get("profile_home")
+                )
+            if retryable:
+                deferred.append(evt)
+            continue
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
@@ -12488,28 +13146,81 @@ def _notification_poller_loop(
             session["running"] = True
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
+        from tools.async_delegation import complete_event_delivery
+
+        _claim = _claim_event_delivery_safely(evt, "tui-poller", session.get("profile_home"))
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
+            if (
+                evt.get("type") == "async_delegation"
+                and (
+                    _async_delegation_delivery_is_retryable(evt)
+                    if session.get("profile_home") is None
+                    else _async_delegation_delivery_is_retryable(
+                        evt, session.get("profile_home")
+                    )
+                )
+            ):
+                deferred.append(evt)
             continue
+        _release_claim = _make_delivery_release_once(
+            evt, _claim, session.get("profile_home")
+        )
+        heartbeat = None
+
+        def _defer_after_shutdown_release(delivery_event=evt) -> None:
+            if delivery_event.get("type") == "async_delegation":
+                deferred.append(delivery_event)
+
         try:
             _emit("message.start", sid)
+            terminal_callback = None
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                heartbeat = _start_async_delegation_heartbeat(
+                    evt,
+                    _claim,
+                    on_lost=lambda session=session: _fail_closed_async_delivery_claim(
+                        session
+                    ),
+                    profile_home=session.get("profile_home"),
+                )
+                terminal_callback = _async_delegation_terminal_callback(
+                    evt, _claim, heartbeat=heartbeat, profile_home=session.get("profile_home")
+                )
+                started = _run_prompt_submit(
                     rid,
                     sid,
                     session,
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    terminal_callback=terminal_callback,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+                started = _run_prompt_submit(rid, sid, session, text)
+            if not started:
+                _release_async_delivery_claim(
+                    evt,
+                    _claim,
+                    _release_claim,
+                    heartbeat=heartbeat,
+                    on_released=_defer_after_shutdown_release,
+                    on_retry_released=lambda event=evt: _requeue_for_session(event),
+                    profile_home=session.get("profile_home"),
+                )
+            elif terminal_callback is None and evt.get("type") != "async_delegation":
+                complete_event_delivery(evt, _claim)
         except Exception as exc:
-            release_event_delivery(evt, _claim)
+            _release_async_delivery_claim(
+                evt,
+                _claim,
+                _release_claim,
+                heartbeat=heartbeat,
+                on_released=_defer_after_shutdown_release,
+                on_retry_released=lambda event=evt: _requeue_for_session(event),
+                profile_home=session.get("profile_home"),
+            )
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
@@ -12538,12 +13249,15 @@ def _async_delegation_display_metadata(evt: dict) -> dict:
         1 for result in results
         if result.get("status") in {"failed", "error"}
     )
+    delegation_id = str(evt.get("delegation_id") or "").strip()
     metadata = {
-        "delegation_id": str(evt.get("delegation_id") or ""),
+        "delegation_id": delegation_id,
         "task_count": task_count,
         "completed_count": completed_count or task_count - failed_count,
         "failed_count": failed_count,
     }
+    if delegation_id:
+        metadata["delivery_id"] = f"async-delegation:{delegation_id}"
     duration = evt.get("total_duration_seconds") or evt.get("duration_seconds")
     if isinstance(duration, (int, float)):
         metadata["duration_seconds"] = duration
@@ -12908,10 +13622,21 @@ def _run_prompt_submit(
         len(images),
     )
     _emit("message.start", sid)
+    async_terminal_cleanup_owned = threading.Event()
+    terminal_durable_commit_event = threading.Event()
+    if terminal_callback is not None:
+        setattr(terminal_callback, "_durable_commit_event", terminal_durable_commit_event)
 
-    def run():
+    def _run():
         terminal_receipt_attempted = False
-        terminal_receipt_committed = terminal_callback is None
+        terminal_frame_published = False
+        terminal_marker_retired = False
+        terminal_receipt_committed = False
+        unpublished_terminal_error = "Turn ended before a terminal response was published."
+        async_terminal_callback = bool(
+            terminal_callback is not None
+            and getattr(terminal_callback, "_is_async_delegation_terminal_callback", False)
+        )
         # The conversation runs on a fresh thread, so ContextVars from the RPC
         # dispatcher do not follow automatically. Rebind the exact transport
         # stored on this session generation before any tool can commission a
@@ -13029,13 +13754,13 @@ def _run_prompt_submit(
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
+                    unpublished_terminal_error = (
+                        "\n".join(ctx.warnings) or "Context injection refused."
+                    )
                     _emit(
                         "error",
                         sid,
-                        {
-                            "message": "\n".join(ctx.warnings)
-                            or "Context injection refused."
-                        },
+                        {"message": unpublished_terminal_error},
                     )
                     return
                 prompt = ctx.message
@@ -13377,27 +14102,7 @@ def _run_prompt_submit(
                     if result.get("interrupted")
                     else "error" if result.get("error") else "complete"
                 )
-                # When the backend produced no visible response AND reported a
-                # real error (e.g. invalid model slug → provider 4xx), surface
-                # that error as the visible text instead of shipping an empty
-                # turn to Ink. Mirrors classic CLI behavior at cli.py where
-                # (failed|partial) + no final_response → "Error: <detail>".
-                # Leaves the None-with-no-error path untouched: an empty
-                # successful turn still renders as empty, and the existing
-                # "(empty)" sentinel handling stays in its own lane.
-                if (not raw) and result.get("error") and (
-                    result.get("failed") or result.get("partial")
-                ):
-                    raw = f"Error: {result.get('error')}"
-                # "Operation interrupted: waiting for model response (…)" is
-                # cancellation metadata, not assistant prose. gateway/run.py
-                # and the ACP adapter already suppress this sentinel; without
-                # this the desktop paints it as the agent's reply whenever a
-                # stop/steer lands mid-request (#7921).
-                if status == "interrupted" and isinstance(raw, str) and raw.strip().startswith(
-                    INTERRUPT_WAITING_FOR_MODEL_PREFIX
-                ):
-                    raw = ""
+                raw, status = _normalize_terminal_response(result, status)
                 lr = result.get("last_reasoning")
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()
@@ -13462,27 +14167,130 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
                 if _error_surface:
                     payload["error_surface"] = _error_surface
-            if terminal_callback is not None:
+            terminal_receipt = {
+                "status": (
+                    "cancelled"
+                    if status == "interrupted"
+                    else "failed" if status == "error" else "settled"
+                ),
+                "text": raw if isinstance(raw, str) else str(raw),
+                **(
+                    {"error": str(result.get("error") or raw)}
+                    if status == "error" and isinstance(result, dict)
+                    else {}
+                ),
+            }
+            async_terminal_callback = bool(
+                terminal_callback is not None
+                and getattr(terminal_callback, "_is_async_delegation_terminal_callback", False)
+            )
+            if async_terminal_callback and session.get("_async_delivery_claim_lost"):
+                status = "error"
+                raw = "The async delivery claim was lost before the parent response completed."
+                result = {"error": raw}
+                payload = {
+                    "status": "error",
+                    "text": raw,
+                    "error": raw,
+                    "recoverable": True,
+                }
+                terminal_receipt["status"] = "failed"
+                terminal_receipt["text"] = raw
+                terminal_receipt["error"] = raw
+            if async_terminal_callback:
+                terminal_receipt["terminal_event"] = {
+                    "type": "message.complete",
+                    "session_id": sid,
+                    "stored_session_id": str(session.get("resume_session_id") or session.get("session_key") or sid),
+                    "payload": dict(payload),
+                }
                 terminal_receipt_attempted = True
-                terminal_callback(
-                    {
-                        "status": (
-                            "cancelled"
-                            if status == "interrupted"
-                            else "failed" if status == "error" else "settled"
-                        ),
-                        "text": raw if isinstance(raw, str) else str(raw),
-                        **(
-                            {"error": str(result.get("error") or raw)}
-                            if status == "error" and isinstance(result, dict)
-                            else {}
-                        ),
-                    }
+                committed_output = terminal_callback(terminal_receipt)
+                delivery_id = (
+                    committed_output.get("delivery_id")
+                    if isinstance(committed_output, dict)
+                    else None
                 )
+                if not isinstance(delivery_id, str) or not delivery_id:
+                    raise RuntimeError("durable terminal outbox commit failed")
+                if isinstance(raw, str) and raw:
+                    db = getattr(agent, "_session_db", None)
+                    current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
+                    if db is not None and current_session_id:
+                        _ensure_terminal_assistant_identity(
+                            db, current_session_id, raw, delivery_id
+                        )
+                payload["delivery_id"] = delivery_id
                 terminal_receipt_committed = True
-            if terminal_receipt_committed:
+                if not getattr(terminal_callback, "_durable_output_already_committed", False):
+                    async_terminal_cleanup_owned.set()
+            if getattr(terminal_callback, "_durable_output_already_committed", False):
+                # Another worker/client already owns the durable publication;
+                # never emit a second live terminal frame from this retry.
+                terminal_frame_published = False
+            else:
+                terminal_frame_published = _emit("message.complete", sid, payload) is not False
+            terminal_receipt["published"] = terminal_frame_published
+            if terminal_frame_published and not getattr(
+                terminal_callback, "_durable_output_already_committed", False
+            ):
+                live_transport = session.get("transport")
+                live_claim = getattr(terminal_callback, "_durable_claim_id", None)
+                if live_transport is not None and isinstance(live_claim, str) and live_claim:
+                    session.setdefault("_terminal_outbox_live_claims", {}).setdefault(
+                        id(live_transport), {}
+                    )[delivery_id] = live_claim
+                mark_live = getattr(terminal_callback, "_mark_live_published", None)
+                if callable(mark_live):
+                    try:
+                        marked_live = bool(mark_live(delivery_id))
+                    except Exception:
+                        marked_live = False
+                    if not marked_live:
+                        def _live_transition() -> bool:
+                            return bool(mark_live(delivery_id))
+
+                        _schedule_async_delivery_transition_retry(
+                            evt,
+                            _live_transition,
+                            heartbeat=None,
+                            check_retryable=False,
+                        )
+            if not async_terminal_callback:
+                terminal_receipt_committed = terminal_frame_published
+            # The durable outbox is the async publication boundary. Once it is
+            # committed, reconnect can replay even if the live write fails.
+            if terminal_receipt_committed and (
+                terminal_callback is None or async_terminal_callback
+            ):
                 _retire_turn_marker(session, marker_key)
-            _emit("message.complete", sid, payload)
+                terminal_marker_retired = True
+                with session["history_lock"]:
+                    if session.get("_active_turn_marker_key") == marker_key:
+                        session.pop("_active_turn_marker_key", None)
+            if terminal_callback is not None and not async_terminal_callback:
+                terminal_receipt_attempted = True
+                try:
+                    callback_result = terminal_callback(terminal_receipt)
+                except Exception:
+                    # A delivery receipt failure must not synthesize a second
+                    # parent error after the parent frame is already visible.
+                    callback_result = False
+                    logger.warning(
+                        "terminal receipt callback failed for session %s",
+                        sid,
+                        exc_info=True,
+                    )
+                if not async_terminal_callback:
+                    if terminal_frame_published and callback_result is not False:
+                        _retire_turn_marker(session, marker_key)
+                        terminal_marker_retired = True
+                        with session["history_lock"]:
+                            if session.get("_active_turn_marker_key") == marker_key:
+                                session.pop("_active_turn_marker_key", None)
+                        terminal_receipt_committed = True
+                    else:
+                        terminal_receipt_committed = False
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -13655,41 +14463,270 @@ def _run_prompt_submit(
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
+            if (
+                async_terminal_callback
+                and terminal_receipt_attempted
+                and not terminal_receipt_committed
+                and getattr(terminal_callback, "_durable_retry_started", False)
+            ):
+                # Durable publication is retrying from the outbox callback.
+                # Do not replace the original result with an ephemeral error
+                # frame or release the still-owned delivery claim.
+                if not terminal_durable_commit_event.wait(
+                    timeout=(_ASYNC_DELIVERY_MAX_TRANSITION_RETRIES + 1)
+                    * _ASYNC_DELIVERY_CLEANUP_RETRY_SECONDS
+                    + 2.0
+                ):
+                    setattr(terminal_callback, "_durable_retry_exhausted", True)
+                terminal_receipt_committed = bool(
+                    getattr(terminal_callback, "_durable_retry_succeeded", False)
+                )
+                if terminal_receipt_committed:
+                    async_terminal_cleanup_owned.set()
+                return
+            if terminal_frame_published or terminal_receipt_committed:
+                # A live frame or durable outbox row already owns the one
+                # terminal response. Later failures are cleanup failures; a
+                # second frame would duplicate the result during replay.
+                callback_pending = (
+                    terminal_callback is not None and not terminal_receipt_attempted
+                )
+                if callback_pending:
+                    if async_terminal_callback:
+                        terminal_receipt["terminal_event"] = {
+                            "type": "message.complete",
+                            "session_id": sid,
+                            "stored_session_id": str(session.get("resume_session_id") or session.get("session_key") or sid),
+                            "payload": {
+                                "text": unpublished_terminal_error,
+                                "status": "failed",
+                                "error": unpublished_terminal_error,
+                            },
+                        }
+                    terminal_receipt_attempted = True
+                    if async_terminal_callback:
+                        async_terminal_cleanup_owned.set()
+                marker_pending = not terminal_marker_retired
+
+                def _finish_published_terminal() -> None:
+                    callback_result = True
+                    if callback_pending and not async_terminal_callback:
+                        try:
+                            callback_result = terminal_callback(terminal_receipt)
+                        except Exception:
+                            logger.warning(
+                                "post-publication terminal callback failed for session %s",
+                                sid,
+                                exc_info=True,
+                            )
+                            return
+                        if callback_result is False:
+                            return
+                    if marker_pending:
+                        while True:
+                            try:
+                                _retire_turn_marker(session, marker_key)
+                                with session["history_lock"]:
+                                    if session.get("_active_turn_marker_key") == marker_key:
+                                        session.pop("_active_turn_marker_key", None)
+                                break
+                            except Exception:
+                                logger.warning(
+                                    "post-publication marker retirement failed for session %s",
+                                    sid,
+                                    exc_info=True,
+                                )
+                                time.sleep(_ASYNC_DELIVERY_CLEANUP_RETRY_SECONDS)
+                    if callback_pending and async_terminal_callback:
+                        try:
+                            terminal_callback(terminal_receipt)
+                        except Exception:
+                            logger.warning(
+                                "post-publication async receipt failed for session %s",
+                                sid,
+                                exc_info=True,
+                            )
+
+                if marker_pending or callback_pending:
+                    _RealThread(target=_finish_published_terminal, daemon=True).start()
+                return
             # The agent persists its working transcript on normal finalization,
             # but an exception in that finalizer can otherwise leave the
             # gateway's separate in-memory history at the turn-start snapshot.
             # Keep the partial turn available to the next prompt; the durable
             # inflight record still carries the recoverable error state.
             _restore_agent_history_after_turn_error(session, agent)
+            terminal_frame_published = False
+            if not async_terminal_callback:
+                try:
+                    # Publish the terminal frame before invoking any generic hosted
+                    # callback. Async delivery is persisted below before its frame.
+                    terminal_frame_published = _emit_terminal_turn_error(
+                        sid,
+                        session,
+                        e,
+                        retire_marker=False,
+                    )
+                except Exception as emit_exc:
+                    print(
+                        f"[gateway-turn] terminal error emit failed: "
+                        f"{type(emit_exc).__name__}: {emit_exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _emit("error", sid, {"message": str(e)})
+            with session["history_lock"]:
+                failed_turn = session.get("inflight_turn") or {}
+                receipt_text = str(failed_turn.get("assistant") or "")
+                if not receipt_text:
+                    receipt_text = f"Error: {failed_turn.get('error') or e}"
+            terminal_receipt = {
+                "status": "failed",
+                "text": receipt_text,
+                "error": str(e),
+                "published": terminal_frame_published,
+            }
+            if async_terminal_callback and not terminal_frame_published:
+                terminal_receipt["terminal_event"] = {
+                    "type": "message.complete",
+                    "session_id": sid,
+                    "stored_session_id": str(session.get("resume_session_id") or session.get("session_key") or sid),
+                    "payload": {
+                        "text": receipt_text,
+                        "status": "failed",
+                        "error": str(e),
+                    },
+                }
+            terminal_receipt_committed = terminal_frame_published
+            if terminal_frame_published and (
+                terminal_callback is None or async_terminal_callback
+            ):
+                try:
+                    _retire_turn_marker(session, marker_key)
+                except Exception:
+                    def _retry_marker_retirement() -> None:
+                        while True:
+                            try:
+                                _retire_turn_marker(session, marker_key)
+                                with session["history_lock"]:
+                                    if session.get("_active_turn_marker_key") == marker_key:
+                                        session.pop("_active_turn_marker_key", None)
+                                return
+                            except Exception:
+                                time.sleep(_ASYNC_DELIVERY_CLEANUP_RETRY_SECONDS)
+
+                    threading.Thread(
+                        target=_retry_marker_retirement,
+                        name="tui-marker-retire-retry",
+                        daemon=True,
+                    ).start()
+                else:
+                    terminal_marker_retired = True
+                    with session["history_lock"]:
+                        if session.get("_active_turn_marker_key") == marker_key:
+                            session.pop("_active_turn_marker_key", None)
             if terminal_callback is not None and not terminal_receipt_attempted:
                 terminal_receipt_attempted = True
                 try:
-                    terminal_callback(
-                        {"status": "failed", "text": "", "error": str(e)}
-                    )
-                    terminal_receipt_committed = True
+                    callback_result = terminal_callback(terminal_receipt)
                 except Exception:
-                    logger.exception("hosted room terminal receipt commit failed")
-            try:
-                # Close the turn with the same terminal error frame shape as
-                # the returned-error path (uniform client handling), retaining
-                # the failed turn for resume replay.
-                _emit_terminal_turn_error(
-                    sid,
-                    session,
-                    e,
-                    retire_marker=terminal_receipt_committed,
-                )
-                turn_error_retained = True
-            except Exception as emit_exc:
-                print(
-                    f"[gateway-turn] terminal error emit failed: "
-                    f"{type(emit_exc).__name__}: {emit_exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                _emit("error", sid, {"message": str(e)})
+                    callback_result = False
+                    logger.warning(
+                        "terminal receipt callback failed for session %s",
+                        sid,
+                        exc_info=True,
+                    )
+                if async_terminal_callback and isinstance(callback_result, dict):
+                    delivery_id = callback_result.get("delivery_id")
+                    terminal_event = terminal_receipt.get("terminal_event")
+                    if (
+                        isinstance(delivery_id, str)
+                        and isinstance(terminal_event, dict)
+                        and not getattr(terminal_callback, "_durable_output_already_committed", False)
+                    ):
+                        terminal_event["payload"]["delivery_id"] = delivery_id
+                        terminal_frame_published = (
+                            _emit("message.complete", sid, terminal_event["payload"])
+                            is not False
+                        )
+                        terminal_receipt_committed = True
+                        mark_live = getattr(terminal_callback, "_mark_live_published", None)
+                        if terminal_frame_published and callable(mark_live):
+                            try:
+                                mark_live(delivery_id)
+                            except Exception:
+                                logger.warning(
+                                    "live terminal outbox mark failed for session %s",
+                                    sid,
+                                    exc_info=True,
+                                )
+                        try:
+                            _retire_turn_marker(session, marker_key)
+                            terminal_marker_retired = True
+                        except Exception:
+                            logger.warning(
+                                "failed to retire marker after durable error output",
+                                exc_info=True,
+                            )
+                    elif (
+                        async_terminal_callback
+                        and isinstance(callback_result, dict)
+                        and getattr(terminal_callback, "_durable_output_already_committed", False)
+                    ):
+                        terminal_receipt_committed = True
+                if not async_terminal_callback:
+                    if terminal_frame_published and callback_result is not False:
+                        _retire_turn_marker(session, marker_key)
+                        terminal_marker_retired = True
+                        with session["history_lock"]:
+                            if session.get("_active_turn_marker_key") == marker_key:
+                                session.pop("_active_turn_marker_key", None)
+                        terminal_receipt_committed = True
+                    else:
+                        terminal_receipt_committed = False
+            turn_error_retained = True
         finally:
+            # A claimed async delivery must leave this turn through exactly one
+            # terminal lifecycle path. This backstop covers every early return
+            # before message.complete: stop claim renewal, release the claim,
+            # and requeue the still-pending durable event without acknowledging
+            # delivery. Normal and exception finalization set the attempted flag
+            # before reaching here, so their ordering contracts stay unchanged.
+            if (
+                async_terminal_callback
+                and terminal_callback is not None
+                and not terminal_receipt_attempted
+            ):
+                terminal_receipt_attempted = True
+                try:
+                    terminal_callback(
+                        {
+                            "status": "failed",
+                            "text": unpublished_terminal_error,
+                            "error": unpublished_terminal_error,
+                            "published": False,
+                            "terminal_event": {
+                                "type": "message.complete",
+                                "session_id": sid,
+                                "stored_session_id": str(
+                                    session.get("resume_session_id")
+                                    or session.get("session_key")
+                                    or sid
+                                ),
+                                "payload": {
+                                    "text": unpublished_terminal_error,
+                                    "status": "failed",
+                                    "error": unpublished_terminal_error,
+                                },
+                            },
+                        }
+                    )
+                except Exception:
+                    logger.warning(
+                        "async terminal cleanup failed for session %s",
+                        sid,
+                        exc_info=True,
+                    )
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
             # new/pruned result; retaining either list defeats this trim.
@@ -13774,8 +14811,9 @@ def _run_prompt_submit(
             )
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
-            if terminal_receipt_committed:
+            if terminal_receipt_committed and not terminal_marker_retired:
                 _retire_turn_marker(session, marker_key)
+                terminal_marker_retired = True
                 with session["history_lock"]:
                     if session.get("_active_turn_marker_key") == marker_key:
                         session.pop("_active_turn_marker_key", None)
@@ -13852,18 +14890,68 @@ def _run_prompt_submit(
                             process_registry.completion_queue.put(pending_evt)
                         break
                     session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
-                )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
+                from tools.async_delegation import complete_event_delivery
+
+                _claim = _claim_event_delivery_safely(_evt, "tui-post-turn", session.get("profile_home"))
                 if _claim is None:
+                    with session["history_lock"]:
+                        session["running"] = False
+                    if _evt.get("type") == "async_delegation":
+                        _requeue_for_session(_evt)
                     continue
+                _release_claim = _make_delivery_release_once(
+                    _evt, _claim, session.get("profile_home")
+                )
+                _delivery_heartbeat = None
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
-                    complete_event_delivery(_evt, _claim)
+                    _delivery_terminal_callback = None
+                    if _evt.get("type") == "async_delegation":
+                        _delivery_heartbeat = _start_async_delegation_heartbeat(
+                            _evt,
+                            _claim,
+                            on_lost=lambda session=session: _fail_closed_async_delivery_claim(
+                                session
+                            ),
+                            profile_home=session.get("profile_home"),
+                        )
+                        _delivery_terminal_callback = _async_delegation_terminal_callback(
+                            _evt,
+                            _claim,
+                            heartbeat=_delivery_heartbeat,
+                            profile_home=session.get("profile_home"),
+                        )
+                        started = _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            synth,
+                            display_kind="async_delegation_complete",
+                            display_metadata=_async_delegation_display_metadata(_evt),
+                            terminal_callback=_delivery_terminal_callback,
+                        )
+                    else:
+                        started = _run_prompt_submit(rid, sid, session, synth)
+                    if not started:
+                        _release_async_delivery_claim(
+                            _evt,
+                            _claim,
+                            _release_claim,
+                            heartbeat=_delivery_heartbeat,
+                            on_released=lambda event=_evt: _requeue_for_session(event),
+                            profile_home=session.get("profile_home"),
+                        )
+                    elif _delivery_terminal_callback is None and _evt.get("type") != "async_delegation":
+                        complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
-                    release_event_delivery(_evt, _claim)
+                    _release_async_delivery_claim(
+                        _evt,
+                        _claim,
+                        _release_claim,
+                        heartbeat=_delivery_heartbeat,
+                        on_released=lambda event=_evt: _requeue_for_session(event),
+                        profile_home=session.get("profile_home"),
+                    )
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "
                         f"{type(_n_exc).__name__}: {_n_exc}",
@@ -13877,6 +14965,46 @@ def _run_prompt_submit(
                 f"{type(_drain_exc).__name__}: {_drain_exc}",
                 file=sys.stderr,
             )
+
+    def run():
+        """Backstop async-delivery ownership around the entire turn thread."""
+        completed = False
+        try:
+            _run()
+            completed = True
+        finally:
+            if terminal_callback is not None and getattr(
+                terminal_callback,
+                "_is_async_delegation_terminal_callback",
+                False,
+            ) and not async_terminal_cleanup_owned.is_set():
+                try:
+                    terminal_callback(
+                        {
+                            "status": "failed",
+                            "text": "Turn ended before a terminal response was published.",
+                            "error": "Turn ended before a terminal response was published.",
+                            "published": False,
+                            "terminal_event": {
+                                "type": "message.complete",
+                                "session_id": sid,
+                                "stored_session_id": str(session.get("resume_session_id") or session.get("session_key") or sid),
+                                "payload": {
+                                    "status": "error",
+                                    "text": "Turn ended before a terminal response was published.",
+                                },
+                            },
+                        }
+                    )
+                except Exception as _cleanup_exc:
+                    print(
+                        f"[tui_gateway] async delivery thread cleanup failed: "
+                        f"{type(_cleanup_exc).__name__}: {_cleanup_exc}",
+                        file=sys.stderr,
+                    )
+            if not completed:
+                with session["history_lock"]:
+                    session["running"] = False
 
     run_thread = threading.Thread(target=run, daemon=True)
     with _sessions_lock:
@@ -18053,6 +19181,7 @@ def _mcp_summarize_server(name, cfg):  # noqa: E402
 from . import (  # noqa: E402
     methods_browser_control as _methods_browser_control,
     methods_bot_relay as _methods_bot_relay,
+    methods_delivery as _methods_delivery,
     methods_complete as _methods_complete,
     methods_config as _methods_config,
     methods_images as _methods_images,
@@ -18072,6 +19201,7 @@ for _m in (
     _methods_profiles,
     _methods_images,
     _methods_bot_relay,
+    _methods_delivery,
 ):
     _m.register(sys.modules[__name__])
 del _m

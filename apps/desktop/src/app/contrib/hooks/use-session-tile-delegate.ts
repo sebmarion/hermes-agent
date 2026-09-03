@@ -54,6 +54,11 @@ interface SessionTileDelegateParams {
   executeSlashCommand: ReturnType<typeof usePromptActions>['executeSlashCommand']
   removeSession: (storedSessionId: string) => Promise<unknown>
   requestGateway: GatewayRequester
+  hydrateFromStoredSession: (
+    attempts?: number,
+    storedSessionId?: string,
+    runtimeSessionId?: string
+  ) => Promise<void>
   runtimeIdByStoredSessionIdRef: SessionStateCache['runtimeIdByStoredSessionIdRef']
   sessionStateByRuntimeIdRef: SessionStateCache['sessionStateByRuntimeIdRef']
   updateSessionState: SessionStateCache['updateSessionState']
@@ -70,6 +75,7 @@ export function useSessionTileDelegate({
   archiveSession,
   branchStoredSession,
   executeSlashCommand,
+  hydrateFromStoredSession,
   removeSession,
   requestGateway,
   runtimeIdByStoredSessionIdRef,
@@ -337,6 +343,7 @@ export function useSessionTileDelegate({
           }),
           storedSessionId
         )
+        void hydrateFromStoredSession(1, storedSessionId, runtimeId).catch(() => undefined)
 
         return runtimeId
       },
@@ -370,6 +377,7 @@ export function useSessionTileDelegate({
     archiveSession,
     branchStoredSession,
     executeSlashCommand,
+    hydrateFromStoredSession,
     removeSession,
     requestGateway,
     runtimeIdByStoredSessionIdRef,

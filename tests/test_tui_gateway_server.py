@@ -1206,6 +1206,12 @@ def test_write_json_returns_false_on_broken_pipe(monkeypatch):
     assert server.write_json({"ok": True}) is False
 
 
+def test_emit_propagates_transport_write_result(monkeypatch):
+    monkeypatch.setattr(server, "write_json", lambda _frame: False)
+
+    assert server._emit("message.complete", "sid") is False
+
+
 def test_write_json_drops_detached_ws_frames(monkeypatch):
     out = _ChunkyStdout()
     monkeypatch.setattr(server, "_real_stdout", out)
@@ -7132,6 +7138,1661 @@ def test_notification_poller_delivers_owned_events(
             process_registry.completion_queue.get_nowait()
 
 
+def test_async_event_delivery_wrappers_propagate_transition_result(monkeypatch):
+    event = {"type": "async_delegation", "delegation_id": "deleg-wrapper"}
+    calls = []
+    monkeypatch.setattr(
+        ad,
+        "complete_completion_delivery",
+        lambda delegation_id, claim_id: calls.append(("complete", delegation_id, claim_id)) or False,
+    )
+    monkeypatch.setattr(
+        ad,
+        "release_completion_delivery",
+        lambda delegation_id, claim_id: calls.append(("release", delegation_id, claim_id)) or True,
+    )
+
+    assert ad.complete_event_delivery(event, "claim-1") is False
+    assert ad.release_event_delivery(event, "claim-1") is True
+    assert calls == [
+        ("complete", "deleg-wrapper", "claim-1"),
+        ("release", "deleg-wrapper", "claim-1"),
+    ]
+
+
+def test_missing_async_delivery_row_is_legacy_and_not_requeued(monkeypatch, tmp_path):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = {"type": "async_delegation", "delegation_id": "missing-row"}
+
+    assert ad.claim_completion_delivery("missing-row", "claim-1") is True
+    legacy_claim = ad.claim_event_delivery(event, "tui-poller")
+    assert legacy_claim and legacy_claim != ""
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    server._requeue_async_delegation(event)
+
+    assert isolated_queue.empty()
+
+
+def test_delivery_release_is_exactly_once_when_release_raises(monkeypatch):
+    calls = []
+    event = {"type": "async_delegation", "delegation_id": "release-once"}
+
+    def _raise(evt, claim):
+        calls.append((evt, claim))
+        raise RuntimeError("release backend unavailable")
+
+    monkeypatch.setattr(ad, "release_event_delivery", _raise)
+    release = server._make_delivery_release_once(event, "claim-1")
+
+    assert release() is False
+    assert release() is False
+    assert calls == [(event, "claim-1")]
+
+
+def test_async_delivery_heartbeat_renews_until_stopped(monkeypatch):
+    renewed = threading.Event()
+    calls = []
+
+    def _renew(evt, claim):
+        calls.append((evt, claim))
+        renewed.set()
+        return True
+
+    monkeypatch.setattr(ad, "renew_event_delivery", _renew, raising=False)
+    monkeypatch.setattr(server, "_ASYNC_DELIVERY_HEARTBEAT_SECONDS", 0.01, raising=False)
+
+    stop, thread = server._start_async_delegation_heartbeat(
+        {"type": "async_delegation", "delegation_id": "deleg-heartbeat"},
+        "claim-1",
+    )
+    try:
+        assert renewed.wait(1.0)
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+    assert calls
+    assert not thread.is_alive()
+
+
+def test_terminal_assistant_identity_persists_missing_row_without_duplicate(monkeypatch):
+    class _MissingAssistantDb:
+        def __init__(self):
+            self.appended = []
+
+        def set_latest_matching_message_display_metadata(self, *args, **kwargs):
+            return False
+
+        def get_messages(self, session_id, latest=False, limit=None):
+            assert session_id == "stable-session"
+            return [{"role": "user", "content": "request"}]
+
+        def append_message(self, session_id, role, content, **kwargs):
+            self.appended.append((session_id, role, content, kwargs))
+            return 42
+
+    db = _MissingAssistantDb()
+
+    assert server._ensure_terminal_assistant_identity(
+        db, "stable-session", "Final answer", "async-delegation:d1"
+    ) is True
+    assert db.appended == [
+        (
+            "stable-session",
+            "assistant",
+            "Final answer",
+            {"display_metadata": {"delivery_id": "async-delegation:d1"}},
+        )
+    ]
+
+
+def test_terminal_assistant_identity_does_not_retag_older_duplicate_content(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        session_id = "duplicate-terminal-session"
+        db.create_session(session_id, source="cli")
+        db.append_message(session_id, "user", "first request")
+        db.append_message(
+            session_id,
+            "assistant",
+            "same answer",
+            display_metadata={"delivery_id": "old-delivery"},
+        )
+        db.append_message(session_id, "user", "second request")
+
+        assert server._ensure_terminal_assistant_identity(
+            db, session_id, "same answer", "async-delegation:new-delivery"
+        ) is True
+
+        rows = db.get_messages_as_conversation(session_id)
+        assert [row["role"] for row in rows] == ["user", "assistant", "user", "assistant"]
+        assert rows[1]["display_metadata"] == {"delivery_id": "old-delivery"}
+        assert rows[3]["display_metadata"] == {
+            "delivery_id": "async-delegation:new-delivery"
+        }
+    finally:
+        db.close()
+
+
+def test_terminal_outbox_ack_rpc_reuses_live_claim_for_same_transport(monkeypatch):
+    transport_a = object()
+    transport_b = object()
+    sid = "runtime-live-ack-repeat"
+    delivery_id = "async-delegation:live-repeat"
+    server._sessions[sid] = {
+        "transport": transport_a,
+        "session_key": "stable-live-ack-repeat",
+        "history": [],
+        "_terminal_outbox_live_claims": {
+            id(transport_a): {delivery_id: "live-publisher-claim"}
+        },
+    }
+    calls = []
+    monkeypatch.setattr(
+        ad,
+        "ack_terminal_output",
+        lambda delivery, session, claim: calls.append((delivery, session, claim)) or True,
+    )
+    try:
+        first = _dispatch_sync(
+            {"jsonrpc": "2.0", "id": "ack-1", "method": "terminal.outbox.ack",
+             "params": {"session_id": sid, "delivery_id": delivery_id}},
+            transport_a,
+        )
+        second = _dispatch_sync(
+            {"jsonrpc": "2.0", "id": "ack-2", "method": "terminal.outbox.ack",
+             "params": {"session_id": sid, "delivery_id": delivery_id}},
+            transport_a,
+        )
+        other = _dispatch_sync(
+            {"jsonrpc": "2.0", "id": "ack-3", "method": "terminal.outbox.ack",
+             "params": {"session_id": sid, "delivery_id": delivery_id}},
+            transport_b,
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert first["result"]["acknowledged"] is True
+    assert second["result"]["acknowledged"] is True
+    assert calls == [
+        (delivery_id, "stable-live-ack-repeat", "live-publisher-claim"),
+        (delivery_id, "stable-live-ack-repeat", "live-publisher-claim"),
+    ]
+    assert other["error"]["code"] == 4010
+
+
+def test_terminal_outbox_ack_survives_restart_until_persisted_assistant_exists(
+    monkeypatch, tmp_path
+):
+    """A replayed outbox row cannot be hidden before its transcript identity exists."""
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    with ad._transaction() as conn:
+        conn.execute(
+            """CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                display_metadata TEXT,
+                active INTEGER NOT NULL DEFAULT 1
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO async_delegations(
+                delegation_id, origin_session, state, dispatched_at,
+                updated_at, delivery_state
+            ) VALUES (?, ?, 'completed', 1, 1, 'delivered')""",
+            ("restart-delivery", "stable-session"),
+        )
+        conn.execute(
+            """INSERT INTO async_terminal_outbox(
+                delivery_id, delegation_id, session_id, event_json, created_at
+            ) VALUES (?, ?, ?, ?, 1)""",
+            (
+                "async-delegation:restart-delivery",
+                "restart-delivery",
+                "stable-session",
+                json.dumps(
+                    {
+                        "type": "message.complete",
+                        "session_id": "stable-session",
+                        "payload": {"text": "answer"},
+                    }
+                ),
+            ),
+        )
+
+    # This is the new transport after a gateway restart: it can claim/replay,
+    # but the prior process died before the separate transcript transaction.
+    transport = object()
+    sid = "runtime-after-restart"
+    server._sessions[sid] = {
+        "transport": transport,
+        "session_key": "stable-session",
+        "history": [],
+    }
+    try:
+        pending = _dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": "pending",
+                "method": "terminal.outbox.pending",
+                "params": {"session_id": sid},
+            },
+            transport,
+        )
+        assert pending["result"]["deliveries"][0]["payload"]["delivery_id"] == (
+            "async-delegation:restart-delivery"
+        )
+
+        hidden = _dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": "ack-before-transcript",
+                "method": "terminal.outbox.ack",
+                "params": {
+                    "session_id": sid,
+                    "delivery_id": "async-delegation:restart-delivery",
+                },
+            },
+            transport,
+        )
+        assert hidden["result"]["acknowledged"] is False
+        assert ad.list_terminal_outputs("stable-session")
+
+        with ad._transaction() as conn:
+            conn.execute(
+                """INSERT INTO messages(session_id, role, content, display_metadata)
+                   VALUES (?, 'assistant', ?, ?)""",
+                (
+                    "stable-session",
+                    "answer",
+                    json.dumps({"delivery_id": "async-delegation:restart-delivery"}),
+                ),
+            )
+
+        acknowledged = _dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": "ack-after-transcript",
+                "method": "terminal.outbox.ack",
+                "params": {
+                    "session_id": sid,
+                    "delivery_id": "async-delegation:restart-delivery",
+                },
+            },
+            transport,
+        )
+        assert acknowledged["result"]["acknowledged"] is True
+        assert ad.list_terminal_outputs("stable-session") == []
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_async_terminal_callback_commits_output_before_transport_publication(monkeypatch):
+    event = {"type": "async_delegation", "delegation_id": "deleg-outbox-callback"}
+    terminal_event = {
+        "type": "message.complete",
+        "session_id": "sid-outbox",
+        "payload": {"text": "Final parent answer", "status": "complete"},
+    }
+    committed = {
+        "delivery_id": "async-delegation:deleg-outbox-callback",
+        "delegation_id": "deleg-outbox-callback",
+        "session_id": "sid-outbox",
+        "event": terminal_event,
+    }
+    calls = []
+
+    monkeypatch.setattr(
+        ad,
+        "commit_terminal_output",
+        lambda evt, claim, output: calls.append((evt, claim, output)) or committed,
+        raising=False,
+    )
+
+    callback = server._async_delegation_terminal_callback(event, "claim-1")
+
+    assert callback(
+        {
+            "status": "settled",
+            "text": "Final parent answer",
+            "terminal_event": terminal_event,
+        }
+    ) == committed
+    assert calls == [(event, "claim-1", terminal_event)]
+
+
+def test_async_terminal_callback_scopes_database_to_session_profile(monkeypatch):
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-profile-callback",
+        "session_key": "profile-session",
+    }
+    observed = []
+
+    def _commit(*_args):
+        observed.append(server.get_hermes_home_override())
+        return {"delivery_id": "async-delegation:deleg-profile-callback"}
+
+    monkeypatch.setattr(ad, "commit_terminal_output", _commit)
+    callback = server._async_delegation_terminal_callback(
+        event, "claim-1", profile_home="/tmp/profile-home"
+    )
+    assert callback(
+        {
+            "terminal_event": {
+                "type": "message.complete",
+                "stored_session_id": "profile-session",
+                "payload": {"text": "Visible"},
+            }
+        }
+    )
+    assert observed == ["/tmp/profile-home"]
+    assert server.get_hermes_home_override() is None
+
+
+def test_async_terminal_callback_requires_durable_terminal_event(monkeypatch):
+    event = {"type": "async_delegation", "delegation_id": "deleg-no-output"}
+    monkeypatch.setattr(
+        ad,
+        "complete_event_delivery",
+        lambda *_args: pytest.fail("legacy completion settlement must not run"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ad,
+        "release_event_delivery",
+        lambda *_args: pytest.fail("legacy claim release must not run"),
+        raising=False,
+    )
+
+    callback = server._async_delegation_terminal_callback(event, "claim-1")
+
+    with pytest.raises(RuntimeError, match="durable terminal event required"):
+        callback({"status": "failed", "text": "visible blocker"})
+
+
+def test_async_terminal_callback_requeues_when_claim_is_lost_before_commit(monkeypatch):
+    event = {"type": "async_delegation", "delegation_id": "deleg-claim-lost-before-commit"}
+    queued = []
+    monkeypatch.setattr(
+        ad,
+        "commit_terminal_output",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("claim lost")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ad,
+        "event_delivery_claim_status",
+        lambda *_args: "unclaimed",
+        raising=False,
+    )
+    monkeypatch.setattr(server, "_requeue_async_delegation", queued.append)
+
+    callback = server._async_delegation_terminal_callback(event, "claim-1")
+    terminal_event = {
+        "type": "message.complete",
+        "session_id": "sid-outbox",
+        "payload": {"text": "Recoverable blocker", "status": "failed"},
+    }
+    assert callback({"status": "failed", "text": "Recoverable blocker", "terminal_event": terminal_event}) is False
+    assert callback({"status": "failed", "text": "Recoverable blocker", "terminal_event": terminal_event}) is False
+    assert queued == [event]
+
+
+def test_async_delivery_heartbeat_fails_closed_on_renewal_error(monkeypatch):
+    lost = threading.Event()
+    monkeypatch.setattr(server, "_ASYNC_DELIVERY_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        ad,
+        "renew_event_delivery",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
+    )
+
+    stop, thread = server._start_async_delegation_heartbeat(
+        {"type": "async_delegation", "delegation_id": "deleg-heartbeat-failure"},
+        "claim-1",
+        on_lost=lost.set,
+    )
+
+    assert lost.wait(1.0)
+    assert stop.is_set()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+
+
+def test_async_delivery_claim_loss_interrupts_parent(monkeypatch):
+    from agent import interrupt_compat
+
+    agent = object()
+    interrupted = []
+    monkeypatch.setattr(
+        interrupt_compat,
+        "request_hard_interrupt",
+        lambda value: interrupted.append(value),
+    )
+    session = {"agent": agent}
+
+    server._fail_closed_async_delivery_claim(session)
+
+    assert session["_async_delivery_claim_lost"] is True
+    assert interrupted == [agent]
+
+
+def test_async_terminal_callback_retries_uncertain_outbox_commit_without_releasing(
+    monkeypatch,
+):
+    """An outbox write exception keeps the claim for durable retry."""
+    event = {"type": "async_delegation", "delegation_id": "deleg-outbox-ack-retry"}
+    terminal_event = {
+        "type": "message.complete",
+        "session_id": "sid-outbox-retry",
+        "payload": {"text": "answer", "status": "complete"},
+    }
+    committed = threading.Event()
+    calls = []
+    heartbeat_stop = threading.Event()
+
+    class _HeartbeatThread:
+        def join(self, timeout=None):
+            calls.append(("heartbeat_join", timeout))
+
+    def _commit(_evt, _claim, _output):
+        calls.append("commit")
+        if calls.count("commit") == 1:
+            raise RuntimeError("outbox store temporarily unavailable")
+        committed.set()
+        return {"delivery_id": "async-delegation:deleg-outbox-ack-retry"}
+
+    monkeypatch.setattr(ad, "commit_terminal_output", _commit)
+    monkeypatch.setattr(ad, "event_delivery_claim_status", lambda *_args: "owned")
+    monkeypatch.setattr(
+        server, "_async_delegation_delivery_is_retryable", lambda _evt: True
+    )
+    monkeypatch.setattr(
+        server, "_ASYNC_DELIVERY_CLEANUP_RETRY_SECONDS", 0.01, raising=False
+    )
+
+    callback = server._async_delegation_terminal_callback(
+        event,
+        "tui-poller:123:claim-1",
+        heartbeat=(heartbeat_stop, _HeartbeatThread()),
+    )
+
+    with pytest.raises(RuntimeError, match="outbox store temporarily unavailable"):
+        callback(
+            {
+                "status": "settled",
+                "text": "answer",
+                "terminal_event": terminal_event,
+            }
+        )
+    assert committed.wait(1.0)
+    assert calls.count("commit") == 2
+    assert heartbeat_stop.is_set()
+
+
+def test_notification_poller_acks_async_delegation_after_final_response(monkeypatch):
+    """Dispatch is not delivery: acknowledge only after the parent settles visibly."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_final_receipt",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid_a",
+        "status": "completed",
+        "summary": "child result",
+    }
+    callbacks = []
+    completed = []
+    released = []
+    session = _session(session_key="session-a")
+    server._sessions["sid_a"] = session
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    def _dispatch(_rid, _sid, _session, _text, **kwargs):
+        callbacks.append(kwargs.get("terminal_callback"))
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _dispatch)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: "claim-1")
+    monkeypatch.setattr(
+        async_delegation,
+        "commit_terminal_output",
+        lambda evt, claim, output: completed.append((evt, claim, output))
+        or {"delivery_id": "async-delegation:deleg_final_receipt"},
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda evt, claim: released.append((evt, claim)),
+    )
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_a", session
+        )
+
+        assert completed == []
+        assert released == []
+        assert len(callbacks) == 1
+        assert callable(callbacks[0])
+
+        callbacks[0](
+            {
+                "status": "settled",
+                "text": "Final parent answer",
+                "terminal_event": {
+                    "type": "message.complete",
+                    "session_id": "sid_a",
+                    "payload": {"text": "Final parent answer"},
+                },
+            }
+        )
+
+        assert completed == [
+            (
+                event,
+                "claim-1",
+                {
+                    "type": "message.complete",
+                    "session_id": "sid_a",
+                    "payload": {"text": "Final parent answer"},
+                },
+            )
+        ]
+        assert released == []
+    finally:
+        server._sessions.pop("sid_a", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_requeues_async_delivery_when_dispatch_not_started(
+    monkeypatch,
+):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-not-started",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid_a",
+        "status": "completed",
+        "summary": "child result",
+    }
+    session = _session(session_key="session-a")
+    server._sessions["sid_a"] = session
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args, **_kwargs: False)
+    released = []
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: "claim-1")
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda evt, claim: released.append((evt, claim)) or True,
+    )
+    monkeypatch.setattr(
+        server, "_async_delegation_delivery_is_retryable", lambda _evt: True
+    )
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_a", session
+        )
+
+        assert released == [(event, "claim-1")]
+        assert process_registry.completion_queue.get_nowait() is event
+    finally:
+        server._sessions.pop("sid_a", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_retries_failed_release_after_dispatch_refusal(
+    monkeypatch,
+):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-not-started-release-retry",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid_a",
+        "status": "completed",
+        "summary": "child result",
+    }
+    session = _session(session_key="session-a")
+    server._sessions["sid_a"] = session
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        async_delegation, "claim_event_delivery", lambda *_args: "claim-1"
+    )
+    release_calls = []
+    released = threading.Event()
+
+    def _release(_evt, _claim):
+        release_calls.append((_evt, _claim))
+        if len(release_calls) == 1:
+            return False
+        released.set()
+        return True
+
+    monkeypatch.setattr(async_delegation, "release_event_delivery", _release)
+    monkeypatch.setattr(
+        async_delegation, "event_delivery_claim_status", lambda *_args: "owned"
+    )
+    monkeypatch.setattr(
+        server, "_async_delegation_delivery_is_retryable", lambda _evt: True
+    )
+    monkeypatch.setattr(
+        server, "_ASYNC_DELIVERY_CLEANUP_RETRY_SECONDS", 0.01, raising=False
+    )
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_a", session
+        )
+
+        assert released.wait(1.0)
+        assert release_calls == [(event, "claim-1"), (event, "claim-1")]
+    finally:
+        server._sessions.pop("sid_a", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_requeues_when_delivery_claim_raises(monkeypatch):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-claim-error",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid_a",
+        "status": "completed",
+        "summary": "child result",
+    }
+    session = _session(session_key="session-a")
+    server._sessions["sid_a"] = session
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_event_delivery",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("claim store unavailable")),
+    )
+    monkeypatch.setattr(
+        server, "_async_delegation_delivery_is_retryable", lambda _evt: True
+    )
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_a", session
+        )
+
+        assert session["running"] is False
+        assert process_registry.completion_queue.get_nowait() is event
+    finally:
+        server._sessions.pop("sid_a", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_requeues_async_delivery_after_dispatch_exception(
+    monkeypatch,
+):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-dispatch-error",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid_a",
+        "status": "completed",
+        "summary": "child result",
+    }
+    session = _session(session_key="session-a")
+    server._sessions["sid_a"] = session
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_async_delegation_delivery_is_retryable", lambda _evt: True)
+
+    def _dispatch(*_args, **_kwargs):
+        raise RuntimeError("dispatch failed")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _dispatch)
+    released = []
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: "claim-1")
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda evt, claim: released.append((evt, claim)) or True,
+    )
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_a", session
+        )
+
+        assert released == [(event, "claim-1")]
+        assert process_registry.completion_queue.get_nowait() is event
+    finally:
+        server._sessions.pop("sid_a", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_requeues_claimed_async_delegation(monkeypatch):
+    """A stale/foreign delivery claim must not strand the session or drop the event."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_claimed_elsewhere",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid_a",
+        "status": "completed",
+        "summary": "child result",
+    }
+    session = _session(session_key="session-a")
+    server._sessions["sid_a"] = session
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: None)
+    monkeypatch.setattr(
+        server, "_async_delegation_delivery_is_retryable", lambda _evt: True
+    )
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_a", session
+        )
+
+        assert session["running"] is False
+        assert process_registry.completion_queue.get_nowait() == event
+    finally:
+        server._sessions.pop("sid_a", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_shutdown_discards_delivered_unclaimed_event(monkeypatch):
+    """Shutdown drain must not revive an event settled after its failed claim."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-settled-during-shutdown",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid_a",
+        "status": "completed",
+        "summary": "child result",
+    }
+    session = _session(session_key="session-a")
+    server._sessions["sid_a"] = session
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: None)
+    delivery_states = iter((True, False))
+    monkeypatch.setattr(
+        server,
+        "_async_delegation_delivery_is_retryable",
+        lambda _evt: next(delivery_states),
+    )
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_a", session
+        )
+
+        assert session["running"] is False
+        assert process_registry.completion_queue.empty()
+    finally:
+        server._sessions.pop("sid_a", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_direct_shutdown_discards_delivered_unclaimed_event(
+    monkeypatch,
+):
+    """The direct shutdown claim-none path must not defer a delivered row."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-settled-before-shutdown-claim",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid_a",
+        "status": "completed",
+        "summary": "child result",
+    }
+    session = _session(session_key="session-a")
+    server._sessions["sid_a"] = session
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: None)
+    monkeypatch.setattr(
+        server, "_async_delegation_delivery_is_retryable", lambda _evt: False
+    )
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    stopped = threading.Event()
+    stopped.set()
+
+    try:
+        server._notification_poller_loop(stopped, "sid_a", session)
+
+        assert session["running"] is False
+        assert process_registry.completion_queue.empty()
+    finally:
+        server._sessions.pop("sid_a", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_post_turn_drain_acks_async_delegation_after_final_response(
+    monkeypatch, tmp_path
+):
+    """The post-turn fast path must use the same durable receipt boundary."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    callbacks = []
+    committed = []
+    monkeypatch.setattr(
+        async_delegation,
+        "commit_terminal_output",
+        lambda evt, claim, output: committed.append((evt, claim, output))
+        or {"delivery_id": "async-delegation:deleg_post_turn"},
+    )
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_post_turn",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid_a",
+        "status": "completed",
+        "summary": "child result",
+    }
+
+    def _post_turn_dispatch(_rid, _sid, _session, _text, **kwargs):
+        callbacks.append(kwargs.get("terminal_callback"))
+        return True
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, *_args, **_kwargs):
+            monkeypatch.setattr(server, "_run_prompt_submit", _post_turn_dispatch)
+            return {"final_response": "Parent response", "messages": []}
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    original_submit = server._run_prompt_submit
+    session = _session(
+        agent=_Agent(), running=True, session_key="session-a"
+    )
+    server._sessions["sid_a"] = session
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: "claim-1")
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+
+    try:
+        original_submit("rid-parent", "sid_a", session, "Parent prompt")
+
+        assert committed == []
+        assert len(callbacks) == 1
+        assert callable(callbacks[0])
+
+        callbacks[0](
+            {
+                "status": "settled",
+                "text": "Final parent answer",
+                "terminal_event": {
+                    "type": "message.complete",
+                    "session_id": "sid_a",
+                    "payload": {"status": "complete", "text": "Final parent answer"},
+                },
+            }
+        )
+
+        assert committed == [
+            (
+                event,
+                "claim-1",
+                {
+                    "type": "message.complete",
+                    "session_id": "sid_a",
+                    "payload": {"status": "complete", "text": "Final parent answer"},
+                },
+            )
+        ]
+    finally:
+        server._sessions.pop("sid_a", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+
+
+
+def test_run_prompt_submit_commits_outbox_before_complete_event(monkeypatch, tmp_path):
+    order = []
+    emitted = []
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "Final answer", "messages": []}
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+
+    def _emit(event, sid, payload=None):
+        order.append(event)
+        emitted.append((event, sid, payload))
+        return True
+
+    monkeypatch.setattr(server, "_emit", _emit)
+    monkeypatch.setattr(
+        server,
+        "_retire_turn_marker",
+        lambda *_args, **_kwargs: order.append("marker.retire"),
+    )
+
+    def _commit_outbox(receipt):
+        order.append("outbox.commit")
+        assert receipt["terminal_event"] == {
+            "type": "message.complete",
+            "session_id": "sid_a",
+            "stored_session_id": "session-a",
+            "payload": receipt["terminal_event"]["payload"],
+        }
+        assert receipt["terminal_event"]["payload"]["text"] == "Final answer"
+        return {"delivery_id": "async-delegation:deleg-outbox-order"}
+
+    _commit_outbox._is_async_delegation_terminal_callback = True
+    session = _session(agent=_Agent(), running=True, session_key="session-a")
+    server._sessions["sid_a"] = session
+
+    try:
+        server._run_prompt_submit(
+            "rid-parent",
+            "sid_a",
+            session,
+            "Parent prompt",
+            terminal_callback=_commit_outbox,
+        )
+
+        assert order.index("outbox.commit") < order.index("message.complete")
+        complete_payload = next(payload for event, _sid, payload in emitted if event == "message.complete")
+        assert complete_payload["delivery_id"] == "async-delegation:deleg-outbox-order"
+        assert order.count("message.complete") == 1
+        assert order.count("outbox.commit") == 1
+    finally:
+        server._sessions.pop("sid_a", None)
+
+
+def test_terminal_outbox_pending_rpc_replays_durable_output_for_attached_session(monkeypatch):
+    transport = object()
+    sid = "runtime-after-restart"
+    stable = "stable-session-key"
+    server._sessions[sid] = {
+        "transport": transport,
+        "session_key": stable,
+        "history": [],
+    }
+    monkeypatch.setattr(
+        ad,
+        "claim_terminal_outputs",
+        lambda session_id, claim_id: [
+            {
+                "delivery_id": "async-delegation:deleg-replay",
+                "session_id": stable,
+                "event": {
+                    "type": "message.complete",
+                    "session_id": "runtime-before-restart",
+                    "stored_session_id": stable,
+                    "payload": {"text": "Recovered terminal answer"},
+                },
+            }
+        ],
+    )
+    try:
+        response = _dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": "pending-1",
+                "method": "terminal.outbox.pending",
+                "params": {"session_id": sid},
+            },
+            transport,
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"]["deliveries"] == [
+        {
+            "type": "message.complete",
+            "session_id": sid,
+            "stored_session_id": stable,
+            "payload": {
+                "text": "Recovered terminal answer",
+                "delivery_id": "async-delegation:deleg-replay",
+            },
+        }
+    ]
+
+
+def test_terminal_outbox_pending_then_ack_same_transport_uses_replay_claim(monkeypatch):
+    transport = object()
+    sid = "runtime-pending-then-ack"
+    stable = "stable-pending-then-ack"
+    delivery_id = "async-delegation:pending-then-ack"
+    server._sessions[sid] = {
+        "transport": transport,
+        "session_key": stable,
+        "history": [],
+        "_terminal_outbox_live_claims": {
+            id(transport): {delivery_id: "stale-live-claim"}
+        },
+    }
+    replay_claim = []
+    ack_claim = []
+
+    def _claim(_session_id, claim_id):
+        replay_claim.append(claim_id)
+        return [{
+            "delivery_id": delivery_id,
+            "session_id": stable,
+            "event": {"type": "message.complete", "payload": {"text": "answer"}},
+        }]
+
+    monkeypatch.setattr(ad, "claim_terminal_outputs", _claim)
+    monkeypatch.setattr(
+        ad,
+        "ack_terminal_output",
+        lambda delivery, session, claim: ack_claim.append((delivery, session, claim)) or True,
+    )
+    try:
+        _dispatch_sync(
+            {"jsonrpc": "2.0", "id": "pending", "method": "terminal.outbox.pending",
+             "params": {"session_id": sid}},
+            transport,
+        )
+        response = _dispatch_sync(
+            {"jsonrpc": "2.0", "id": "ack", "method": "terminal.outbox.ack",
+             "params": {"session_id": sid, "delivery_id": delivery_id}},
+            transport,
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"]["acknowledged"] is True
+    assert ack_claim == [(delivery_id, stable, replay_claim[0])]
+    assert ack_claim[0][2] != "stale-live-claim"
+
+
+def test_terminal_outbox_pending_uses_distinct_transport_claims(monkeypatch):
+    sid = "runtime-shared-session"
+    transport_a = object()
+    transport_b = object()
+    server._sessions[sid] = {
+        "transport": transport_a,
+        "session_key": "shared-stable-session",
+        "history": [],
+    }
+    claims = []
+    monkeypatch.setattr(
+        ad,
+        "claim_terminal_outputs",
+        lambda session_id, claim_id: claims.append((session_id, claim_id)) or [],
+    )
+    try:
+        for transport in (transport_a, transport_b):
+            server._sessions[sid]["transport"] = transport
+            response = _dispatch_sync(
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"pending-{len(claims)}",
+                    "method": "terminal.outbox.pending",
+                    "params": {"session_id": sid},
+                },
+                transport,
+            )
+            assert response["result"]["deliveries"] == []
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert len(claims) == 2
+    assert claims[0][0] == claims[1][0] == "shared-stable-session"
+    assert claims[0][1] != claims[1][1]
+
+
+def test_terminal_outbox_rpc_uses_runtime_id_when_stable_session_id_is_absent(monkeypatch):
+    transport = object()
+    sid = "runtime-only-session"
+    server._sessions[sid] = {"transport": transport, "history": []}
+    seen = []
+    monkeypatch.setattr(
+        ad,
+        "claim_terminal_outputs",
+        lambda session_id, claim_id: seen.append((session_id, claim_id)) or [],
+    )
+    try:
+        response = _dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": "pending-runtime-only",
+                "method": "terminal.outbox.pending",
+                "params": {"session_id": sid},
+            },
+            transport,
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"]["deliveries"] == []
+    assert seen and seen[0][0] == sid and seen[0][1].startswith("terminal-outbox:")
+
+
+def test_terminal_outbox_ack_rpc_requires_attached_session_and_is_idempotent(monkeypatch):
+    transport = object()
+    sid = "runtime-ack"
+    stable = "stable-ack-session"
+    server._sessions[sid] = {"transport": transport, "session_key": stable, "history": []}
+    calls = []
+    monkeypatch.setattr(
+        ad,
+        "ack_terminal_output",
+        lambda delivery_id, session_id, claim_id: calls.append(
+            (delivery_id, session_id, claim_id)
+        )
+        or True,
+    )
+    try:
+        response = _dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": "ack-1",
+                "method": "terminal.outbox.ack",
+                "params": {"session_id": sid, "delivery_id": "async-delegation:d1"},
+            },
+            transport,
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"] == {
+        "acknowledged": True,
+        "delivery_id": "async-delegation:d1",
+        "session_id": sid,
+    }
+    assert calls and calls[0][:2] == ("async-delegation:d1", stable)
+    assert calls[0][2].startswith("terminal-outbox:")
+
+
+def test_run_prompt_submit_replaces_interrupt_sentinel_with_non_empty_terminal_blocker(
+    monkeypatch, tmp_path
+):
+    receipts = []
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {
+                "final_response": "Operation interrupted: waiting for model response (45.8s elapsed)",
+                "interrupted": True,
+                "messages": [],
+            }
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *_args, **_kwargs: True,
+    )
+    def _commit(receipt):
+        receipts.append(receipt)
+        return {"delivery_id": "async-delegation:sentinel-blocker"}
+
+    _commit._is_async_delegation_terminal_callback = True
+    session = _session(agent=_Agent(), running=True, session_key="session-sentinel")
+    server._sessions["sid-sentinel"] = session
+    try:
+        server._run_prompt_submit(
+            "rid-sentinel",
+            "sid-sentinel",
+            session,
+            "Parent prompt",
+            terminal_callback=_commit,
+        )
+    finally:
+        server._sessions.pop("sid-sentinel", None)
+
+    assert len(receipts) == 1
+    assert receipts[0]["terminal_event"]["payload"]["text"].strip()
+
+
+def test_run_prompt_submit_publishes_durable_blocker_when_agent_raises(monkeypatch, tmp_path):
+    events = []
+    receipts = []
+
+    class _Agent:
+        model = 'test-model'
+        provider = 'test-provider'
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, *_args, **_kwargs):
+            raise RuntimeError('model disconnected')
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, '_emit', lambda event, *_args, **_kwargs: events.append(event) or True)
+    monkeypatch.setattr(server, '_retire_turn_marker', lambda *_args, **_kwargs: None)
+
+    def _commit(receipt):
+        receipts.append(receipt)
+        return {'delivery_id': 'async-delegation:agent-error'}
+
+    _commit._is_async_delegation_terminal_callback = True
+    session = _session(agent=_Agent(), running=True, session_key='session-a')
+    server._run_prompt_submit(
+        'rid-error', 'sid_a', session, 'Parent prompt', terminal_callback=_commit
+    )
+
+    assert receipts[0]['terminal_event']['payload']['text'].strip()
+    assert events.count('message.complete') == 1
+
+
+def test_run_prompt_submit_does_not_duplicate_after_post_commit_transport_failure(
+    monkeypatch, tmp_path
+):
+    events = []
+    commits = []
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "Final answer", "messages": []}
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+
+    def _emit(event, *_args, **_kwargs):
+        events.append(event)
+        if event == "message.complete":
+            raise RuntimeError("transport disconnected")
+        return True
+
+    monkeypatch.setattr(server, "_emit", _emit)
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args, **_kwargs: None)
+
+    def _commit_outbox(_receipt):
+        commits.append(True)
+        return {"delivery_id": "async-delegation:deleg-post-commit-disconnect"}
+
+    _commit_outbox._is_async_delegation_terminal_callback = True
+    session = _session(agent=_Agent(), running=True, session_key="session-a")
+    server._sessions["sid_a"] = session
+
+    try:
+        server._run_prompt_submit(
+            "rid-parent",
+            "sid_a",
+            session,
+            "Parent prompt",
+            terminal_callback=_commit_outbox,
+        )
+
+        assert commits == [True]
+        assert events.count("message.complete") == 1
+    finally:
+        server._sessions.pop("sid_a", None)
+
+
+def test_run_prompt_submit_does_not_emit_second_terminal_after_marker_failure(
+    monkeypatch, tmp_path
+):
+    order = []
+    receipts = []
+    receipt_committed = threading.Event()
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "Final answer", "messages": []}
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, *_args, **_kwargs: order.append(event) or True,
+    )
+    marker_attempts = []
+
+    def _retire(*_args, **_kwargs):
+        marker_attempts.append(True)
+        if len(marker_attempts) == 1:
+            raise RuntimeError("marker store temporarily unavailable")
+        order.append("marker.retire")
+
+    monkeypatch.setattr(server, "_retire_turn_marker", _retire)
+    monkeypatch.setattr(
+        server, "_ASYNC_DELIVERY_CLEANUP_RETRY_SECONDS", 0.01, raising=False
+    )
+
+    def _async_terminal(receipt):
+        receipts.append(receipt)
+        order.append("terminal.receipt")
+        receipt_committed.set()
+        return {"delivery_id": "async-delegation:marker-failure"}
+
+    _async_terminal._is_async_delegation_terminal_callback = True
+    session = _session(agent=_Agent(), running=True, session_key="session-a")
+    server._sessions["sid_a"] = session
+
+    try:
+        server._run_prompt_submit(
+            "rid-parent",
+            "sid_a",
+            session,
+            "Parent prompt",
+            terminal_callback=_async_terminal,
+        )
+
+        assert receipt_committed.wait(1.0)
+        assert order.count("message.complete") == 1
+        assert [receipt["status"] for receipt in receipts] == ["settled"]
+        assert order.index("terminal.receipt") < order.index("message.complete")
+        assert order.index("message.complete") < order.index("marker.retire")
+    finally:
+        server._sessions.pop("sid_a", None)
+
+
+def test_run_prompt_submit_releases_async_delivery_when_context_ref_is_blocked(
+    monkeypatch, tmp_path
+):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+        base_url = ""
+        api_key = ""
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, *_args, **_kwargs):
+            pytest.fail("blocked context references must not reach the agent")
+
+    class _HeartbeatThread:
+        def join(self, timeout=None):
+            joins.append(timeout)
+
+    fake_ctx = types.ModuleType("agent.context_references")
+    fake_ctx.preprocess_context_references = lambda *_args, **_kwargs: types.SimpleNamespace(
+        blocked=True,
+        message="@outside",
+        warnings=["Context reference outside workspace"],
+        references=[],
+        injected_tokens=0,
+    )
+    fake_meta = types.ModuleType("agent.model_metadata")
+    fake_meta.get_model_context_length = lambda *_args, **_kwargs: 100000
+
+    event = {"type": "async_delegation", "delegation_id": "deleg-context-blocked"}
+    committed = []
+    joins = []
+    emitted = []
+    heartbeat_stop = threading.Event()
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setitem(sys.modules, "agent.context_references", fake_ctx)
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", fake_meta)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        async_delegation,
+        "commit_terminal_output",
+        lambda evt, claim, output: committed.append((evt, claim, output))
+        or {"delivery_id": "async-delegation:deleg-context-blocked"},
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda *_args: pytest.fail("durable blocker must not release the claim"),
+    )
+    monkeypatch.setattr(
+        server, "_async_delegation_delivery_is_retryable", lambda _evt: True
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, *_args, **_kwargs: emitted.append(event_type) or True,
+    )
+
+    session = _session(agent=_Agent(), running=True, session_key="session-a")
+    server._run_prompt_submit(
+        "rid-parent",
+        "sid_a",
+        session,
+        "@outside",
+        terminal_callback=server._async_delegation_terminal_callback(
+            event,
+            "claim-1",
+            heartbeat=(heartbeat_stop, _HeartbeatThread()),
+        ),
+    )
+
+    assert len(committed) == 1
+    assert committed[0][0:2] == (event, "claim-1")
+    assert committed[0][2]["payload"]["text"].strip()
+    assert isolated_queue.empty()
+    assert heartbeat_stop.is_set()
+    assert joins == [1.0]
+    assert emitted.count("error") == 1
+    assert "message.complete" not in emitted
+
+
+def test_run_prompt_submit_keeps_durable_output_when_terminal_write_fails(
+    monkeypatch, tmp_path
+):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "Final answer", "messages": []}
+
+    event = {"type": "async_delegation", "delegation_id": "deleg-write-failed"}
+    commits = []
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        async_delegation,
+        "commit_terminal_output",
+        lambda evt, claim, output: commits.append((evt, claim, output))
+        or {"delivery_id": "async-delegation:deleg-write-failed"},
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda *_args: pytest.fail("durable output must not release the claim"),
+    )
+    monkeypatch.setattr(
+        server, "_async_delegation_delivery_is_retryable", lambda _evt: True
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: False)
+    retired = []
+    monkeypatch.setattr(
+        server,
+        "_retire_turn_marker",
+        lambda *_args, **_kwargs: retired.append(True),
+    )
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: False)
+    session = _session(agent=_Agent(), running=True, session_key="session-a")
+
+    server._run_prompt_submit(
+        "rid-parent",
+        "sid_a",
+        session,
+        "Parent prompt",
+        terminal_callback=server._async_delegation_terminal_callback(event, "claim-1"),
+    )
+
+    assert len(commits) == 1
+    assert commits[0][0:2] == (event, "claim-1")
+    assert commits[0][2]["payload"]["text"] == "Final answer"
+    assert retired == [True]
+    assert isolated_queue.empty()
+
+
+def test_terminal_callback_failure_does_not_emit_second_parent_error(
+    monkeypatch, tmp_path
+):
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "Final answer", "messages": []}
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, *_args, **_kwargs: emitted.append(event) or True,
+    )
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args: None)
+
+    def _broken_callback(_receipt):
+        raise RuntimeError("receipt backend unavailable")
+
+    session = _session(agent=_Agent(), running=True, session_key="session-a")
+    server._run_prompt_submit(
+        "rid-parent",
+        "sid_a",
+        session,
+        "Parent prompt",
+        terminal_callback=_broken_callback,
+    )
+
+    assert emitted.count("message.complete") == 1
+    assert "error" not in emitted
+
+
 def _configure_immediate_prompt_run(
     monkeypatch, tmp_path, *, immediate_threads=True
 ):
@@ -7165,6 +8826,76 @@ def _configure_immediate_prompt_run(
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_args: False)
     monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
     monkeypatch.setattr(server, "_get_db", lambda: None)
+
+
+def test_run_prompt_submit_durably_records_async_setup_failure(
+    monkeypatch, tmp_path
+):
+    """Setup failures before the turn try-block still publish a blocker."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-marker-setup-failure",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    committed = []
+    heartbeat_stop = threading.Event()
+
+    class _HeartbeatThread:
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(
+        async_delegation,
+        "commit_terminal_output",
+        lambda evt, claim, output: committed.append((evt, claim, output))
+        or {"delivery_id": "async-delegation:deleg-marker-setup-failure"},
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda *_args: pytest.fail("durable blocker must not release the claim"),
+    )
+    monkeypatch.setattr(
+        server, "_async_delegation_delivery_is_retryable", lambda _evt: True
+    )
+    monkeypatch.setattr(
+        server,
+        "record_turn_start",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("marker write failed")),
+    )
+    session = _session(
+        session_key="marker-setup-failure",
+        agent=_RecordingAgent([]),
+        running=True,
+    )
+    callback = server._async_delegation_terminal_callback(
+        event,
+        "claim-marker-failure",
+        heartbeat=(heartbeat_stop, _HeartbeatThread()),
+    )
+
+    with pytest.raises(RuntimeError, match="marker write failed"):
+        server._run_prompt_submit(
+            "rid-marker-failure",
+            "sid-marker-failure",
+            session,
+            "Parent prompt",
+            terminal_callback=callback,
+        )
+
+    assert heartbeat_stop.is_set()
+    assert len(committed) == 1
+    assert committed[0][0:2] == (event, "claim-marker-failure")
+    assert committed[0][2]["payload"]["text"].strip()
+    assert isolated_queue.empty()
+    assert session["running"] is False
 
 
 def test_run_prompt_submit_binds_exact_steer_authority_and_resets_contextvars(
@@ -15917,15 +17648,16 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     assert "kimi-k2.6" in payload.get("text", "")
 
 
-def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
-    """An empty final_response with NO backend error must stay empty — do not
-    synthesize an error string. Preserves the existing None/empty-sentinel
-    semantics owned by downstream handlers."""
+@pytest.mark.parametrize("empty_response", [None, "", "(empty)"])
+def test_prompt_submit_surfaces_empty_success_as_visible_error(
+    monkeypatch, empty_response
+):
+    """A successful turn may not complete without a user-visible receipt."""
 
     class _Agent:
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             return {
-                "final_response": None,
+                "final_response": empty_response,
                 "messages": [],
                 "api_calls": 1,
                 "completed": True,
@@ -15955,11 +17687,11 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     complete_events = [e for e in emitted if e[0] == "message.complete"]
     assert complete_events, "expected message.complete to be emitted"
     payload = complete_events[-1][2]
-    # Status stays "complete" because no error flag was set
-    assert payload.get("status") == "complete"
-    # Text stays empty — we did NOT fabricate an "Error:" string
-    text = payload.get("text", "")
-    assert text in {"", None}, f"expected empty text, got {text!r}"
+    assert payload.get("status") == "error"
+    assert payload.get("text") == (
+        "Error: The agent ended without a final response. "
+        "Any pending background result remains available for retry."
+    )
 
 
 # ── active live TUI sessions ─────────────────────────────────────────
@@ -21613,6 +23345,44 @@ def test_persist_live_session_system_prompt_binds_session_cwd(monkeypatch, tmp_p
     assert persisted["prompt"] == expected, persisted["prompt"]
 
 
+def test_async_terminal_callback_schedules_durable_outbox_retry(monkeypatch):
+    from tools import async_delegation
+
+    event = {'type': 'async_delegation', 'delegation_id': 'deleg-outbox-retry'}
+    terminal_event = {
+        'type': 'message.complete',
+        'session_id': 'runtime',
+        'stored_session_id': 'stable',
+        'payload': {'text': 'answer'},
+    }
+    calls = []
+    scheduled = {}
+
+    def _commit(_event, _claim, _terminal):
+        calls.append(True)
+        if len(calls) == 1:
+            raise OSError('database temporarily unavailable')
+        return {'delivery_id': 'async-delegation:deleg-outbox-retry'}
+
+    monkeypatch.setattr(async_delegation, 'commit_terminal_output', _commit)
+    monkeypatch.setattr(async_delegation, 'event_delivery_claim_status', lambda *_args: 'owned')
+    monkeypatch.setattr(
+        server,
+        '_schedule_async_delivery_transition_retry',
+        lambda evt, transition, **kwargs: scheduled.update(
+            evt=evt, transition=transition, kwargs=kwargs
+        ),
+    )
+    callback = server._async_delegation_terminal_callback(event, 'claim-retry')
+
+    with pytest.raises(OSError, match='temporarily unavailable'):
+        callback({'terminal_event': terminal_event})
+
+    assert scheduled['evt'] is event
+    assert scheduled['transition']() is True
+    assert calls == [True, True]
+
+
 def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     """An explicit Move-to-project must win for a RUNNING session: the stored
     row and the live runtime session re-anchor together, never a UI-vs-db
@@ -21663,3 +23433,43 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+def test_normalize_terminal_response_never_returns_empty_text():
+    for result, status in (
+        ({"final_response": None}, "interrupted"),
+        ({"final_response": "   "}, "error"),
+        ({"final_response": "(empty)"}, "complete"),
+        ({"final_response": 42}, "error"),
+    ):
+        text, normalized_status = server._normalize_terminal_response(result, status)
+        assert text.strip()
+        assert normalized_status != "interrupted" or "response" in text.lower()
+        if result["final_response"] == 42:
+            assert "malformed" in text.lower()
+
+
+def test_async_delivery_retryability_fails_closed_on_database_uncertainty(monkeypatch):
+    def _database_failure(_delegation_id):
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(ad, "get_durable_delegation", _database_failure)
+    assert server._async_delegation_delivery_is_retryable(
+        {"type": "async_delegation", "delegation_id": "deleg-db-uncertain"}
+    )
+
+
+def test_async_delegation_display_metadata_carries_terminal_delivery_identity():
+    metadata = server._async_delegation_display_metadata({"delegation_id": "d1"})
+
+    assert metadata["delivery_id"] == "async-delegation:d1"
+
+
+def test_profile_home_unknown_profile_fails_closed(monkeypatch, tmp_path):
+    from hermes_cli import profiles as profiles_mod
+
+    missing = tmp_path / "profiles" / "ghost"
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda name: missing)
+
+    with pytest.raises(ValueError, match="Unknown Hermes profile: ghost"):
+        server._require_profile_home("ghost")

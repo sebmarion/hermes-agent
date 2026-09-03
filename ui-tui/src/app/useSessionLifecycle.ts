@@ -5,7 +5,7 @@ import { evictInkCaches } from '@hermes/ink'
 import { type RefObject, useCallback, useEffect, useMemo, useRef } from 'react'
 
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
-import { introMsg, toTranscriptMessages } from '../domain/messages.js'
+import { introMsg, toTranscriptMessages, transcriptDeliveryIds } from '../domain/messages.js'
 import { ZERO } from '../domain/usage.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
@@ -59,6 +59,107 @@ export const liveSessionInflightMessages = (inflight?: null | SessionInflightTur
   const user = String(inflight?.user ?? '').trim()
 
   return user ? [{ role: 'user', text: user }] : []
+}
+
+const terminalReplayStates = new WeakMap<Set<string>, Map<string, Promise<void>>>()
+
+export const replayTerminalOutbox = async (
+  deliveries: unknown,
+  seen: Set<string>,
+  append: (msg: Msg) => void,
+  acknowledge: (deliveryId: string) => void | Promise<void>
+) => {
+  if (!Array.isArray(deliveries)) {
+    return
+  }
+
+  const replayStates = terminalReplayStates.get(seen) ?? new Map<string, Promise<void>>()
+  terminalReplayStates.set(seen, replayStates)
+  const processedThisReplay = new Set<string>()
+
+  for (const delivery of deliveries) {
+    if (!delivery || typeof delivery !== 'object') {
+      continue
+    }
+
+    const payload = (delivery as { payload?: unknown }).payload
+    if (!payload || typeof payload !== 'object') {
+      continue
+    }
+
+    const deliveryId = (payload as { delivery_id?: unknown }).delivery_id
+    const text = (payload as { text?: unknown }).text
+    if (typeof deliveryId !== 'string' || !deliveryId.trim() || typeof text !== 'string' || !text.trim()) {
+      continue
+    }
+
+    if (seen.has(deliveryId)) {
+      if (processedThisReplay.has(deliveryId)) {
+        continue
+      }
+      processedThisReplay.add(deliveryId)
+      const ackInFlight = replayStates.get(deliveryId)
+      if (ackInFlight) {
+        await ackInFlight
+      } else {
+        await acknowledge(deliveryId)
+      }
+      continue
+    }
+
+    seen.add(deliveryId)
+    processedThisReplay.add(deliveryId)
+    try {
+      append({ role: 'assistant', text, deliveryId })
+      const ackInFlight = Promise.resolve().then(() => acknowledge(deliveryId)).then(() => undefined)
+      replayStates.set(deliveryId, ackInFlight)
+      await ackInFlight
+      replayStates.delete(deliveryId)
+    } catch (error) {
+      if (!replayStates.has(deliveryId)) {
+        seen.delete(deliveryId)
+      } else {
+        replayStates.delete(deliveryId)
+      }
+      throw error
+    }
+  }
+}
+
+export const replayPendingTerminalOutbox = async (
+  gw: Pick<GatewayClient, 'request'>,
+  sessionId: string,
+  seen: Set<string>,
+  append: (msg: Msg) => void,
+  isCurrent: () => boolean = () => true
+) => {
+  const raw = await gw.request<{ deliveries?: unknown[] }>('terminal.outbox.pending', {
+    session_id: sessionId
+  })
+  const pending = asRpcResult<{ deliveries?: unknown[] }>(raw)
+
+  await replayTerminalOutbox(
+    pending?.deliveries,
+    seen,
+    msg => {
+      if (!isCurrent()) {
+        throw new Error('terminal outbox replay became stale')
+      }
+      append(msg)
+    },
+    async deliveryId => {
+      if (!isCurrent()) {
+        throw new Error('terminal outbox acknowledgement became stale')
+      }
+      const acknowledgement = await gw.request<{ acknowledged?: boolean }>('terminal.outbox.ack', {
+        delivery_id: deliveryId,
+        session_id: sessionId
+      })
+      if (asRpcResult<{ acknowledged?: boolean }>(acknowledgement)?.acknowledged !== true) {
+        throw new Error('terminal outbox acknowledgement was not accepted')
+      }
+    }
+  )
 }
 
 export const hydrateLiveSessionInflight = (inflight?: null | SessionInflightTurn) => {
@@ -141,6 +242,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   )
 
   const cancelResumeScrollRef = useRef<null | (() => void)>(null)
+  const seenTerminalDeliveries = useRef(new Set<string>())
 
   const resetSession = useCallback(() => {
     cancelResumeScrollRef.current?.()
@@ -148,6 +250,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     turnController.fullReset()
     setVoiceRecording(false)
     setVoiceProcessing(false)
+    seenTerminalDeliveries.current.clear()
     patchUiState({ bgTasks: new Set(), info: null, sid: null, usage: ZERO })
     setHistoryItems([])
     setLastUserMsg('')
@@ -305,6 +408,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           resetSession()
           setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
           const transcript = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
+          transcriptDeliveryIds(transcript).forEach(deliveryId => seenTerminalDeliveries.current.add(deliveryId))
           setHistoryItems(info ? [introMsg(info), ...transcript] : transcript)
           writeActiveSessionFile(r.session_key ?? r.session_id)
           patchUiState({
@@ -315,6 +419,18 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             usage: usageFrom(info)
           })
           hydrateLiveSessionInflight(r.inflight)
+          void replayPendingTerminalOutbox(
+            gw,
+            r.session_id,
+            seenTerminalDeliveries.current,
+            msg =>
+              setHistoryItems(items =>
+                items.some(item => item.role === 'assistant' && item.deliveryId === msg.deliveryId)
+                  ? items
+                  : [...items, msg]
+                ),
+                () => getUiState().sid === r.session_id
+                ).catch(() => undefined)
           cancelResumeScrollRef.current?.()
           cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
         })
@@ -358,6 +474,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
             const resumed = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
+            transcriptDeliveryIds(resumed).forEach(deliveryId => seenTerminalDeliveries.current.add(deliveryId))
 
             setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
             writeActiveSessionFile(r.resumed ?? r.session_id)
@@ -369,6 +486,18 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               usage: usageFrom(info)
             })
             hydrateLiveSessionInflight(r.inflight)
+            void replayPendingTerminalOutbox(
+              gw,
+              r.session_id,
+              seenTerminalDeliveries.current,
+              msg =>
+                setHistoryItems(items =>
+                  items.some(item => item.role === 'assistant' && item.deliveryId === msg.deliveryId)
+                    ? items
+                    : [...items, msg]
+                  ),
+                  () => getUiState().sid === r.session_id
+                  ).catch(() => undefined)
             cancelResumeScrollRef.current?.()
             cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
 

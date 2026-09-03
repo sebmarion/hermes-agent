@@ -3,6 +3,7 @@
 import sqlite3
 import time
 import json
+import shutil
 import threading
 from pathlib import Path
 from unittest import mock
@@ -11,7 +12,7 @@ import pytest
 
 import hermes_state
 from agent.session_activity import ActivityProvenance
-from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB, StateDbReplacedError
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -96,6 +97,7 @@ def _no_fts_rebuild_throttle(monkeypatch):
     """
     monkeypatch.setattr(SessionDB, "_FTS_REBUILD_MIN_PAUSE", 0.0)
     monkeypatch.setattr(SessionDB, "_FTS_REBUILD_DUTY_FACTOR", 0.0)
+
 
 
 # =========================================================================
@@ -4769,6 +4771,17 @@ class TestDisplayMetadataPersistence:
         assert reloaded[0]["display_kind"] == "async_delegation_complete"
         assert reloaded[0]["display_metadata"] == meta
 
+    def test_set_latest_matching_message_display_metadata_merges_on_assistant(self, db):
+        db.create_session("s1", source="cli")
+        db.append_message("s1", "assistant", "answer")
+
+        assert db.set_latest_matching_message_display_metadata(
+            "s1", role="assistant", content="answer",
+            display_metadata={"delivery_id": "async-delegation:del-3"},
+        ) is True
+        assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == {
+            "delivery_id": "async-delegation:del-3"
+        }
 
 
 class TestDisplayMetadataReadPaths:

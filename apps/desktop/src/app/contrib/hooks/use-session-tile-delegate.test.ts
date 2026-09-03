@@ -45,6 +45,7 @@ function renderTile(
     runtimeIdByStoredSessionIdRef?: { current: Map<string, string> }
     sessionStateByRuntimeIdRef?: { current: Map<string, unknown> }
     updateSessionState?: ReturnType<typeof vi.fn>
+    hydrateFromStoredSession?: ReturnType<typeof vi.fn>
   }
 ) {
   renderHook(() =>
@@ -54,6 +55,7 @@ function renderTile(
       executeSlashCommand: vi.fn(async () => undefined) as never,
       removeSession: vi.fn(async () => undefined),
       requestGateway: requestGateway as never,
+      hydrateFromStoredSession: (refs?.hydrateFromStoredSession ?? vi.fn(async () => undefined)) as never,
       runtimeIdByStoredSessionIdRef: (refs?.runtimeIdByStoredSessionIdRef ?? { current: new Map() }) as never,
       sessionStateByRuntimeIdRef: (refs?.sessionStateByRuntimeIdRef ?? { current: new Map() }) as never,
       updateSessionState: (refs?.updateSessionState ?? vi.fn()) as never
@@ -102,6 +104,18 @@ describe('useSessionTileDelegate resumeTile', () => {
       undefined
     )
     expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it('replays the durable outbox after a tile resumes a stored session', async () => {
+    setSessions([row({ id: 'stored-outbox', profile: 'default' })])
+    const requestGateway = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForProfile).mockResolvedValueOnce({ session_id: 'runtime-outbox' } as never)
+    const hydrateFromStoredSession = vi.fn(async () => undefined)
+
+    renderTile(requestGateway, { hydrateFromStoredSession })
+    await sessionTileDelegate()!.resumeTile('stored-outbox')
+
+    expect(hydrateFromStoredSession).toHaveBeenCalledWith(1, 'stored-outbox', 'runtime-outbox')
   })
 
   it('resolves and carries a default-profile session explicitly', async () => {

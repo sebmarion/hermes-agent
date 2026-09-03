@@ -667,7 +667,7 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
 
     def _canonical(path: str) -> str:
         return os.path.normcase(
-            os.path.abspath(path.removesuffix(" (deleted)"))
+            os.path.realpath(path.removesuffix(" (deleted)"))
         )
 
     canonical_db = _canonical(os.fspath(db_path))
@@ -700,90 +700,28 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
 
 
 def _safe_restore_db(src: Path, dst: Path) -> bool:
-    """Restore a SQLite database from snapshot *src* into live *dst*.
-
-    Uses SQLite's backup() API to write snapshot pages into the live
-    database file, preserving the file's inode and WAL state so that
-    any other process still holding the DB open (gateway, dashboard,
-    another CLI session) sees the restored data on the next read —
-    instead of continuing to serve stale cached pages from a replaced
-    inode.
-
-    The old approach was ``unlink() + move()``, which replaced the file
-    under any live connection.  SQLite connections cache pages in
-    per-connection page caches keyed by inode; after an unlink+move the
-    old inode still existed (the live connection held a reference), so
-    that connection continued serving the pre-restore data while new
-    connections saw the restored snapshot — a partial/inconsistent
-    state (issue #65942).
-
-    By writing pages through the backup API the file inode is preserved,
-    the WAL journal is updated correctly, and all connections (old and
-    new) converge on the restored data.
-
-    Falls back to the unlink+move approach on failure so restore never
-    blocks on a transient error.
-    """
+    """Restore *src* into *dst* using SQLite's online backup API only."""
+    src_conn = None
+    dst_conn = None
     try:
-        dst_conn = sqlite3.connect(str(dst))
-        try:
-            # Force a WAL checkpoint so the backup starts from a clean
-            # state rather than writing on top of a deep WAL.
-            dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
         src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-        try:
-            src_conn.backup(dst_conn)
-        finally:
-            src_conn.close()
-        dst_conn.close()
-        # Restore original file permissions from the snapshot
-        try:
-            mode = src.stat().st_mode
-            dst.chmod(mode)
-        except Exception:
-            pass
+        dst_conn = sqlite3.connect(str(dst))
+        src_conn.backup(dst_conn)
         return True
     except Exception as exc:
         logger.warning("SQLite safe restore failed for %s -> %s: %s", src, dst, exc)
-        # Fallback: unlink+move (the old approach).  This still works for
-        # the common case where no other process holds the DB open.
-        try:
-            holders = _foreign_db_holder_pids(dst)
-            if holders:
-                # Replacing the inode under a live holder is the #90950
-                # corruption class: the holder keeps writing through a
-                # deleted-inode fd (split brain), and removing its sidecars
-                # detaches the WAL index it is checkpointing through. The
-                # backup-API path above is the live-safe route; if it failed,
-                # fail closed rather than corrupt.
-                logger.error(
-                    "Refusing unlink+move restore of %s: process(es) %s still "
-                    "hold the database or its WAL open. Stop them and retry.",
-                    dst, holders,
-                )
-                return False
-            tmp = dst.parent / f".{dst.name}.snap_restore"
-            shutil.copy2(src, tmp)
-            dst.unlink(missing_ok=True)
-            # Drop the destination's sidecars before installing the
-            # snapshot. The snapshot is a checkpointed ``sqlite3.backup()``
-            # image (see ``_safe_copy_db``) that owns no WAL, so any
-            # ``-wal``/``-shm`` still sitting here describes the database we
-            # just unlinked — an ungracefully killed gateway leaves them
-            # behind, which is exactly when a restore gets run. SQLite
-            # replays that foreign WAL over the restored file on the next
-            # open and the database comes up "malformed" (or silently
-            # resurrects post-snapshot rows). Same reasoning as
-            # ``_EXCLUDED_SUFFIXES``, applied to the restore destination.
-            for _sidecar_suffix in ("-wal", "-shm", "-journal"):
-                dst.with_name(dst.name + _sidecar_suffix).unlink(missing_ok=True)
-            shutil.move(str(tmp), str(dst))
-            return True
-        except Exception as exc2:
-            logger.error("Fallback restore also failed for %s -> %s: %s", src, dst, exc2)
-            return False
+        return False
+    finally:
+        if src_conn is not None:
+            try:
+                src_conn.close()
+            except Exception:
+                pass
+        if dst_conn is not None:
+            try:
+                dst_conn.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1753,6 +1691,22 @@ def list_quick_snapshots(
     return results
 
 
+def quick_snapshot_exists(
+    snapshot_id: str,
+    hermes_home: Optional[Path] = None,
+) -> bool:
+    """Return whether *snapshot_id* names an existing manifest-backed snapshot."""
+    if not snapshot_id or "/" in snapshot_id or "\\" in snapshot_id:
+        return False
+    root = _quick_snapshot_root(hermes_home or get_hermes_home())
+    snap_dir = root / snapshot_id
+    try:
+        snap_dir.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return snap_dir.is_dir() and (snap_dir / "manifest.json").is_file()
+
+
 def restore_quick_snapshot(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
@@ -1791,6 +1745,7 @@ def restore_quick_snapshot(
         meta = json.load(f)
 
     restored = 0
+    failed_db = False
     for rel in meta.get("files", {}):
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
@@ -1814,19 +1769,26 @@ def restore_quick_snapshot(
 
         try:
             if dst.suffix == ".db":
-                # Restore through SQLite backup API so live connections
-                # (gateway, dashboard, another CLI session) see the
-                # restored data instead of continuing to serve stale
-                # cached pages from a replaced inode (issue #65942).
-                _safe_restore_db(src, dst)
+                # SQLite backup is the only safe live-database restore path.
+                if not _safe_restore_db(src, dst):
+                    failed_db = True
+                    logger.error("Failed to restore SQLite database %s", rel)
+                    continue
             else:
                 shutil.copy2(src, dst)
             restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
 
-    logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
-    return restored > 0
+    if failed_db:
+        logger.warning(
+            "Snapshot restore incomplete: restored %d non-database files from %s",
+            restored,
+            snapshot_id,
+        )
+    else:
+        logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
+    return restored > 0 and not failed_db
 
 
 # Relative path of the cron job database inside HERMES_HOME. Kept in sync with

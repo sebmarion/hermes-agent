@@ -3743,6 +3743,172 @@ def _(rid, params: dict) -> dict:
     })
 
 
+def _authenticated_reconnect_session() -> tuple[str, dict, object] | None:
+    """Return the session owned by the authenticated current transport."""
+    transport = current_transport()
+    identity = getattr(transport, "auth_identity", None)
+    if transport is None or not isinstance(identity, dict):
+        return None
+    with _sessions_lock:
+        for sid, session in _sessions.items():
+            if session.get("transport") is transport:
+                return sid, session, transport
+    return None
+
+
+def _canary_scope_matches(transport: object, operation_id: str, session_id: str) -> bool:
+    scope = getattr(transport, "auth_scope", None)
+    return (isinstance(scope, dict) and scope.get("kind") == "promotion-canary"
+            and scope.get("operation_id") == operation_id
+            and scope.get("runtime_session_id") == session_id)
+
+
+@method("session.reconnect.probe")
+def _(rid, params: dict) -> dict:
+    """Arm an authenticated reconnect proof before an external restart."""
+    import os
+
+    attached = _authenticated_reconnect_session()
+    if attached is None:
+        return _err(rid, 4010, "authenticated live session required")
+    sid, session, transport = attached
+    requested_sid = str(params.get("session_id") or "")
+    if requested_sid != sid:
+        return _err(rid, 4001, "session is not attached to this transport")
+    operation_id = params.get("operation_id")
+    if not isinstance(operation_id, str):
+        return _err(rid, 4030, "reconnect operation is not bound to this session")
+    if not _canary_scope_matches(transport, operation_id, requested_sid):
+        return _err(rid, 4030, "reconnect operation is not bound to this session")
+    from tui_gateway import event_replay, reconnect_proof
+    from hermes_constants import get_hermes_home
+
+    try:
+        epoch = str(params.get("replay_epoch") or "")
+        if epoch != event_replay.replay_epoch():
+            return _err(rid, 4090, "replay epoch is stale")
+        scope = transport.auth_scope
+        server_digest = scope.get("resume_transcript_sha256")
+        server_count = scope.get("resume_transcript_count")
+        if (params.get("transcript_sha256") != server_digest
+                or params.get("transcript_count") != server_count):
+            return _err(rid, 4091, "reconnect transcript baseline does not match resumed display")
+        proof = reconnect_proof.begin_probe(
+            get_hermes_home() / "runtime" / "reconnect-proofs",
+            operation_id=str(params.get("operation_id") or ""),
+            probe_id=str(params.get("probe_id") or ""),
+            session_id=str(getattr(transport, "auth_scope", {}).get("session_id") or sid),
+            session_key=str(session.get("resume_session_id") or session.get("session_key") or ""),
+            backend_pid=os.getpid(),
+            replay_epoch=epoch,
+            last_seen_seq=reconnect_proof._require_nonnegative_int(
+                params.get("last_seen_seq", 0), "last_seen_seq"
+            ),
+            auth_identity=transport.auth_identity,
+            transcript_sha256=server_digest,
+            transcript_count=server_count,
+        )
+    except (TypeError, ValueError, OSError, reconnect_proof.ReconnectProofError) as exc:
+        return _err(rid, 4000, f"reconnect probe rejected: {exc}")
+    return _ok(rid, {"status": "armed", "operation_id": proof["operation_id"], "probe_id": proof["probe_id"]})
+
+
+@method("session.reconnect.ack")
+def _(rid, params: dict) -> dict:
+    """Record explicit authenticated session-history replay after reconnect."""
+    import os
+
+    attached = _authenticated_reconnect_session()
+    if attached is None:
+        return _err(rid, 4010, "authenticated live session required")
+    sid, session, transport = attached
+    operation_id = params.get("operation_id")
+    if str(params.get("session_id") or "") != sid:
+        return _err(rid, 4001, "session is not attached to this transport")
+    if not isinstance(operation_id, str) or not _canary_scope_matches(transport, operation_id, sid):
+        return _err(rid, 4030, "reconnect operation is not bound to this session")
+    from tui_gateway import event_replay, reconnect_proof
+    from hermes_constants import get_hermes_home
+
+    try:
+        scope = transport.auth_scope
+        replayed_messages = reconnect_proof._require_positive_int(params.get("replayed_messages"), "replayed_messages")
+        transcript_before_count = reconnect_proof._require_positive_int(
+            params.get("transcript_before_count"), "transcript_before_count"
+        )
+        transcript_after_count = reconnect_proof._require_positive_int(
+            params.get("transcript_after_count"), "transcript_after_count"
+        )
+        proof_root = get_hermes_home() / "runtime" / "reconnect-proofs"
+        completed = reconnect_proof.read_verified(proof_root, operation_id)
+        if completed and completed.get("status") == "completed":
+            # A response can be lost after the durable completion write.  This
+            # readback is deliberately narrower than completion: it accepts only
+            # the same canary operation/session and the exact post-restart facts.
+            current_epoch = event_replay.replay_epoch()
+            display_count = scope.get("resume_transcript_count")
+            display_digest = scope.get("resume_transcript_sha256")
+            current_key = str(session.get("resume_session_id") or session.get("session_key") or "")
+            identity = reconnect_proof._auth_identity_fingerprint(transport.auth_identity)
+            if (
+                completed.get("session_id_after") != scope.get("runtime_session_id")
+                or completed.get("session_id_after") != sid
+                or completed.get("session_key") != current_key
+                or completed.get("backend_pid_after") != os.getpid()
+                or completed.get("replay_epoch_after") != current_epoch
+                or completed.get("auth_identity_fingerprint") != identity
+                or completed.get("transcript_after_sha256") != display_digest
+                or completed.get("transcript_after_count") != display_count
+                or completed.get("replayed_messages") != display_count
+                or params.get("transcript_after_sha256") != display_digest
+                or transcript_after_count != display_count
+                or replayed_messages != display_count
+                or params.get("replay_epoch") not in (None, current_epoch)
+            ):
+                return _err(rid, 4091, "completed reconnect proof does not match current session")
+            try:
+                reconnect_proof.validate_v2_proof(
+                    completed, operation_id=operation_id,
+                    session_id=scope["session_id"], expected_epoch=current_epoch,
+                )
+            except reconnect_proof.ReconnectProofError as exc:
+                return _err(rid, 4091, f"completed reconnect proof rejected: {exc}")
+            return _ok(rid, completed)
+        armed = completed
+        if not armed or armed.get("status") != "armed":
+            return _err(rid, 4091, "reconnect operation is not armed")
+        display_count = scope.get("resume_transcript_count")
+        display_digest = scope.get("resume_transcript_sha256")
+        if replayed_messages != display_count:
+            return _err(rid, 4091, "replayed history count does not match the resumed session")
+        if (params.get("transcript_after_sha256") != display_digest
+                or params.get("transcript_after_count") != display_count):
+            return _err(rid, 4091, "reconnect transcript digest does not match resumed display")
+        if (armed.get("transcript_before_sha256") != display_digest
+                or armed.get("transcript_before_count") != display_count):
+            return _err(rid, 4091, "reconnect transcript baseline does not match resumed display")
+        proof = reconnect_proof.complete_probe(
+            get_hermes_home() / "runtime" / "reconnect-proofs",
+            operation_id=str(params.get("operation_id") or ""),
+            probe_id=str(params.get("probe_id") or ""),
+            session_id=str(getattr(transport, "auth_scope", {}).get("runtime_session_id") or sid),
+            session_key=str(session.get("resume_session_id") or session.get("session_key") or ""),
+            backend_pid=os.getpid(),
+            previous_replay_epoch=str(params.get("previous_replay_epoch") or ""),
+            replay_epoch=event_replay.replay_epoch(),
+            replay_mode=str(params.get("replay_mode") or ""),
+            replayed_messages=replayed_messages,
+            auth_identity=transport.auth_identity,
+            transcript_before_sha256=str(params.get("transcript_before_sha256") or "") or None,
+            transcript_after_sha256=str(params.get("transcript_after_sha256") or "") or None,
+            transcript_before_count=transcript_before_count,
+            transcript_after_count=transcript_after_count,
+        )
+    except (TypeError, ValueError, OSError, reconnect_proof.ReconnectProofError) as exc:
+        return _err(rid, 4000, f"reconnect acknowledgement rejected: {exc}")
+    return _ok(rid, proof)
+
+
 @method("session.events.stats")
 def _(rid, params: dict) -> dict:
     """Replay-buffer telemetry (ops/debug)."""

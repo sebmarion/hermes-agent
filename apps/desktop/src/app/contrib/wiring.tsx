@@ -36,6 +36,7 @@ import { TipHost } from '@/components/tips'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getLatestSessionMessages } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { collectTerminalOutboxDeliveries } from '@/lib/terminal-outbox'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
 import { activateWakeIndicator } from '@/lib/wake-indicator'
@@ -44,6 +45,7 @@ import { $billingSettingsRequest } from '@/store/billing-block'
 import { $desktopBoot } from '@/store/boot'
 import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
+import { $gateway } from '@/store/gateway'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
@@ -185,6 +187,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const cronReviewSeenRef = useRef(0)
   const activeTranscriptSignatureRef = useRef(new Map<string, string>())
   const activeTranscriptRequestSequenceRef = useRef(0)
+  const seenTerminalDeliveriesRef = useRef(new Set<string>())
   // Stable identity for the whole callback surface (see WiringActions). Mutated
   // in place each render so memoized surfaces never re-render on churn.
   const actionsRef = useRef<WiringActions | null>(null)
@@ -388,10 +391,22 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       }
 
       const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
+      const originGateway = $gateway.get()
+      const isCurrent = () =>
+        activeSessionIdRef.current === runtimeSessionId &&
+        selectedStoredSessionIdRef.current === storedSessionId &&
+        $activeGatewayProfile.get() === activeGatewayProfile &&
+        $gateway.get() === originGateway
 
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
+        if (!isCurrent()) {
+          return
+        }
         try {
           const latest = await getLatestSessionMessages(storedSessionId, storedProfile)
+          if (!isCurrent()) {
+            return
+          }
           const messages = toChatMessages(latest.messages)
           updateSessionState(
             runtimeSessionId,
@@ -409,10 +424,85 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
           const restored = todosForHydration(latestSessionTodos(messages))
 
+          if (!isCurrent()) {
+            return
+          }
           if (restored) {
             setSessionTodos(runtimeSessionId, restored)
           } else {
             clearSessionTodos(runtimeSessionId)
+          }
+
+          const gateway = $gateway.get()
+          if (gateway && !isCurrent()) {
+            return
+          }
+          if (gateway) {
+            let deliveries: ReturnType<typeof collectTerminalOutboxDeliveries> = []
+            const acknowledgedDeliveryIds = new Set<string>()
+            try {
+              const pending = (await requestGateway('terminal.outbox.pending', {
+                session_id: runtimeSessionId
+              })) as { deliveries?: unknown[] } | null
+              if (!isCurrent()) {
+                return
+              }
+              const existingSessionMessages = sessionStateByRuntimeIdRef.current.get(runtimeSessionId)?.messages ?? []
+              const existingDeliveryIds = new Set(
+                [...messages, ...existingSessionMessages].flatMap(message =>
+                  message.deliveryId ? [message.deliveryId] : []
+                )
+              )
+              deliveries = collectTerminalOutboxDeliveries(
+                pending?.deliveries,
+                existingDeliveryIds,
+                seenTerminalDeliveriesRef.current
+              )
+              if (!isCurrent()) {
+                throw new Error('stale terminal outbox hydration')
+              }
+              const recovered = deliveries.filter(({ shouldRender }) => shouldRender)
+
+              if (recovered.length) {
+                if (!isCurrent()) {
+                  throw new Error('stale terminal outbox hydration')
+                }
+                const recoveredMessages = toChatMessages(
+                  recovered.map(({ text }) => ({ content: text, role: 'assistant' as const }))
+                ).map((message, index) => ({
+                  ...message,
+                  deliveryId: recovered[index]?.deliveryId
+                }))
+                updateSessionState(
+                  runtimeSessionId,
+                  state => ({ ...state, messages: [...state.messages, ...recoveredMessages] }),
+                  storedSessionId
+                )
+              }
+              for (const { deliveryId } of deliveries) {
+                if (!isCurrent()) {
+                  throw new Error('stale terminal outbox hydration')
+                }
+                const acknowledged = await requestGateway<{ acknowledged?: boolean }>(
+                  'terminal.outbox.ack',
+                  {
+                    delivery_id: deliveryId,
+                    session_id: runtimeSessionId
+                  }
+                )
+                if (acknowledged?.acknowledged !== true) {
+                  throw new Error('terminal outbox acknowledgement was not accepted')
+                }
+                acknowledgedDeliveryIds.add(deliveryId)
+              }
+            } catch {
+              for (const { deliveryId } of deliveries) {
+                if (!acknowledgedDeliveryIds.has(deliveryId)) {
+                  seenTerminalDeliveriesRef.current.delete(deliveryId)
+                }
+              }
+              // The durable row remains pending when replay/ack is unavailable.
+            }
           }
 
           return
@@ -425,7 +515,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         }
       }
     },
-    [activeSessionIdRef, selectedStoredSessionIdRef, updateSessionState]
+    [activeGatewayProfile, activeSessionIdRef, requestGateway, selectedStoredSessionIdRef, updateSessionState]
   )
 
   // Refresh any active transcript changed by another process. Signature-gated
@@ -449,6 +539,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeSessionIdRef,
     hydrateFromStoredSession,
     queryClient,
+    requestGateway,
     refreshHermesConfig,
     refreshSessions,
     sessionStateByRuntimeIdRef,
@@ -662,12 +753,23 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     archiveSession,
     branchStoredSession,
     executeSlashCommand,
+    hydrateFromStoredSession,
     removeSession,
     requestGateway,
     runtimeIdByStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
     updateSessionState
   })
+
+  // Re-run the durable outbox replay on every gateway/session activation, not
+  // only after a completed turn's history hydration. This covers reconnects
+  // where the live completion ACK was lost before the next turn.
+  useEffect(() => {
+    if (gatewayState !== 'open' || !activeSessionId || !selectedStoredSessionId) {
+      return
+    }
+    void hydrateFromStoredSession(1, selectedStoredSessionId, activeSessionId)
+  }, [activeSessionId, gatewayState, hydrateFromStoredSession, selectedStoredSessionId])
 
   // The popped-out pet overlay's bridge back into the app.
   usePetBridge({ requestGateway, resumeSession, submitText })

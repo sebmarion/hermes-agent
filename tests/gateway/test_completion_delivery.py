@@ -9,6 +9,7 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -50,11 +51,11 @@ def _runner(adapter, *, origins=None):
     return runner
 
 
-def _async_event(delegation_id="deleg_duplicate"):
+def _async_event(delegation_id="deleg_duplicate", *, session_key="agent:main:telegram:dm:12345:678"):
     return {
         "type": "async_delegation",
         "delegation_id": delegation_id,
-        "session_key": "agent:main:telegram:dm:12345:678",
+        "session_key": session_key,
         "goal": "Investigate flaky test",
         "status": "completed",
         "summary": "Found it",
@@ -201,6 +202,524 @@ def _persist_pending_completion(event):
         "status": "completed",
         "summary": event["summary"],
     })
+
+
+def test_terminal_outbox_commit_atomically_settles_claimed_completion():
+    """Settlement and durable terminal publication are one transaction."""
+    from tools import async_delegation
+
+    event = _async_event("deleg-terminal-outbox", session_key="session-terminal-outbox")
+    _persist_pending_completion(event)
+    claim_id = "tui-poller:123:terminal-outbox"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+    terminal_event = {
+        "type": "message.complete",
+        "session_id": "session-terminal-outbox",
+        "payload": {"text": "Found it", "status": "success"},
+    }
+
+    committed = async_delegation.commit_terminal_output(
+        event,
+        claim_id,
+        terminal_event,
+    )
+
+    assert committed["delivery_id"] == "async-delegation:deleg-terminal-outbox"
+    assert async_delegation.get_durable_delegation(event["delegation_id"])[
+        "delivery_state"
+    ] == "delivered"
+    assert async_delegation.list_terminal_outputs("session-terminal-outbox") == [
+        {
+            "delivery_id": "async-delegation:deleg-terminal-outbox",
+            "delegation_id": "deleg-terminal-outbox",
+            "session_id": "session-terminal-outbox",
+            "event": terminal_event,
+        }
+    ]
+    committed_again = async_delegation.commit_terminal_output(event, claim_id, terminal_event)
+    assert committed_again == {**committed, "already_committed": True}
+    assert len(async_delegation.list_terminal_outputs("session-terminal-outbox")) == 1
+
+
+def _persist_terminal_assistant(session_id, content, delivery_id):
+    from tools import async_delegation
+
+    with async_delegation._transaction() as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                display_metadata TEXT,
+                active INTEGER NOT NULL DEFAULT 1
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO messages(session_id, role, content, display_metadata, active)
+               VALUES (?, 'assistant', ?, ?, 1)""",
+            (session_id, content, json.dumps({"delivery_id": delivery_id})),
+        )
+
+
+def test_terminal_outbox_ack_rejects_inactive_transcript_identity():
+    from tools import async_delegation
+
+    event = _async_event("deleg-inactive-transcript", session_key="inactive-session")
+    _persist_pending_completion(event)
+    claim_id = "replay-claim-inactive"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+    committed = async_delegation.commit_terminal_output(
+        event,
+        claim_id,
+        {
+            "type": "message.complete",
+            "stored_session_id": "inactive-session",
+            "payload": {"text": "rewound answer"},
+        },
+    )
+    with async_delegation._transaction() as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+                content TEXT NOT NULL, display_metadata TEXT,
+                active INTEGER NOT NULL DEFAULT 1
+            )"""
+        )
+        conn.execute(
+            "UPDATE messages SET active=0 WHERE session_id=?",
+            ("inactive-session",),
+        )
+        conn.execute(
+            """INSERT INTO messages(session_id, role, content, display_metadata, active)
+               VALUES (?, 'assistant', ?, ?, 0)""",
+            (
+                "inactive-session",
+                "rewound answer",
+                json.dumps({"delivery_id": committed["delivery_id"]}),
+            ),
+        )
+
+    assert async_delegation.ack_terminal_output(
+        committed["delivery_id"], "inactive-session", claim_id
+    ) is False
+    assert async_delegation.list_terminal_outputs("inactive-session")
+
+
+def test_terminal_transcript_identity_lookup_is_bounded_to_one_row():
+    from tools import async_delegation
+
+    class _NoFetchAllCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def fetchone(self):
+            return self._cursor.fetchone()
+
+        def fetchall(self):
+            raise AssertionError("terminal identity lookup scanned all assistant rows")
+
+    class _ConnProxy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, *args):
+            return _NoFetchAllCursor(self._conn.execute(*args))
+
+    with async_delegation._transaction() as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+                content TEXT NOT NULL, display_metadata TEXT,
+                active INTEGER NOT NULL DEFAULT 1
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO messages(session_id, role, content, display_metadata, active)
+               VALUES ('bounded-session', 'assistant', 'answer', ?, 1)""",
+            (json.dumps({"delivery_id": "async-delegation:bounded"}),),
+        )
+        assert async_delegation._has_persisted_terminal_assistant(
+            _ConnProxy(conn), "bounded-session", "async-delegation:bounded"
+        ) is True
+
+
+def test_terminal_outbox_ack_is_idempotent_and_stops_replay():
+    from tools import async_delegation
+
+    event = _async_event("deleg-terminal-ack", session_key="session-terminal-ack")
+    _persist_pending_completion(event)
+    claim_id = "tui-poller:123:terminal-ack"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+    terminal_event = {
+        "type": "message.complete",
+        "session_id": "session-terminal-ack",
+        "payload": {"text": "Delivered", "status": "success"},
+    }
+    committed = async_delegation.commit_terminal_output(event, claim_id, terminal_event)
+    _persist_terminal_assistant(
+        "session-terminal-ack",
+        "Delivered",
+        committed["delivery_id"],
+    )
+
+    assert async_delegation.ack_terminal_output(
+        committed["delivery_id"], "session-terminal-ack", claim_id
+    )
+    assert async_delegation.ack_terminal_output(
+        committed["delivery_id"], "session-terminal-ack", claim_id
+    )
+    assert async_delegation.ack_terminal_output(
+        committed["delivery_id"], "session-terminal-ack", "unrelated-transport"
+    ) is False
+    assert async_delegation.list_terminal_outputs("session-terminal-ack") == []
+
+
+def test_terminal_outbox_replay_claim_is_exclusive_and_ack_fenced():
+    from tools import async_delegation
+
+    event = _async_event("deleg-terminal-replay-claim", session_key="shared-session")
+    _persist_pending_completion(event)
+    claim_id = "tui-poller:123:terminal-replay-claim"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+    committed = async_delegation.commit_terminal_output(
+        event,
+        claim_id,
+        {
+            "type": "message.complete",
+            "stored_session_id": "shared-session",
+            "session_id": "runtime-before",
+            "payload": {"text": "One durable answer"},
+        },
+    )
+    _persist_terminal_assistant(
+        "shared-session",
+        "One durable answer",
+        committed["delivery_id"],
+    )
+
+    assert async_delegation.ack_terminal_output(
+        "async-delegation:deleg-terminal-replay-claim", "shared-session", "unclaimed-attacker"
+    ) is False
+    assert async_delegation.claim_terminal_outputs("shared-session", "client-a") == []
+    assert async_delegation.mark_terminal_output_live_published(
+        committed["delivery_id"], claim_id
+    )
+    [first] = async_delegation.claim_terminal_outputs("shared-session", "client-a")
+    assert first["delivery_id"] == committed["delivery_id"]
+    assert async_delegation.claim_terminal_outputs("shared-session", "client-b") == []
+    assert not async_delegation.ack_terminal_output(
+        committed["delivery_id"], "shared-session", "client-b"
+    )
+    assert async_delegation.ack_terminal_output(
+        committed["delivery_id"], "shared-session", "client-a"
+    )
+
+
+def test_terminal_outbox_live_ack_requires_publisher_or_replay_claim():
+    from tools import async_delegation
+
+    event = _async_event("deleg-terminal-live-ack-fence", session_key="live-ack-session")
+    _persist_pending_completion(event)
+    publisher_claim = "tui-poller:live-ack"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], publisher_claim)
+    committed = async_delegation.commit_terminal_output(
+        event,
+        publisher_claim,
+        {
+            "type": "message.complete",
+            "stored_session_id": "live-ack-session",
+            "session_id": "runtime-live-ack",
+            "payload": {"text": "Live answer"},
+        },
+    )
+    _persist_terminal_assistant(
+        "live-ack-session",
+        "Live answer",
+        committed["delivery_id"],
+    )
+    assert async_delegation.mark_terminal_output_live_published(
+        committed["delivery_id"], publisher_claim
+    )
+
+    assert async_delegation.ack_terminal_output(
+        committed["delivery_id"], "live-ack-session", "unrelated-transport"
+    ) is False
+    assert async_delegation.ack_terminal_output(
+        committed["delivery_id"], "live-ack-session", publisher_claim
+    ) is True
+
+
+def test_terminal_outbox_concurrent_replay_claims_have_one_winner():
+    from tools import async_delegation
+
+    event = _async_event("deleg-terminal-concurrent-claim", session_key="shared-concurrent-session")
+    _persist_pending_completion(event)
+    claim_id = "tui-poller:123:terminal-concurrent-claim"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+    committed = async_delegation.commit_terminal_output(
+        event,
+        claim_id,
+        {
+            "type": "message.complete",
+            "stored_session_id": "shared-concurrent-session",
+            "session_id": "runtime-before",
+            "payload": {"text": "One concurrent answer"},
+        },
+    )
+
+    assert async_delegation.mark_terminal_output_live_published(
+        committed["delivery_id"], claim_id
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda client: async_delegation.claim_terminal_outputs(
+                    "shared-concurrent-session", client
+                ),
+                ("client-a", "client-b"),
+            )
+        )
+
+    assert sorted(len(result) for result in results) == [0, 1]
+    winner = next(result for result in results if result)
+    assert winner[0]["delivery_id"] == committed["delivery_id"]
+
+def test_terminal_outbox_ack_rejects_wrong_stable_session():
+    from tools import async_delegation
+
+    event = _async_event("deleg-terminal-wrong-session", session_key="session-terminal-wrong-session")
+    _persist_pending_completion(event)
+    claim_id = "tui-poller:123:terminal-wrong-session"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+    committed = async_delegation.commit_terminal_output(
+        event,
+        claim_id,
+        {
+            "type": "message.complete",
+            "session_id": "runtime-session",
+            "stored_session_id": "session-terminal-wrong-session",
+            "payload": {"text": "Protected answer"},
+        },
+    )
+
+    assert not async_delegation.ack_terminal_output(committed["delivery_id"], "other-session")
+    assert async_delegation.list_terminal_outputs("session-terminal-wrong-session")
+
+
+def test_terminal_outbox_rejects_wrong_claim_without_inserting_or_settling():
+    import pytest
+    from tools import async_delegation
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-atomic-reject",
+        "session_key": "stable-atomic",
+        "parent_session_id": "stable-atomic",
+        "dispatched_at": 1.0,
+        "summary": "child result",
+        "event": {"type": "message.complete", "session_id": "runtime"},
+    }
+    _persist_pending_completion(event)
+    assert async_delegation.claim_completion_delivery("deleg-atomic-reject", "claim-atomic") is True
+
+    terminal_event = {
+        "type": "message.complete",
+        "session_id": "runtime",
+        "stored_session_id": "stable-atomic",
+        "payload": {"text": "Should not commit"},
+    }
+    with pytest.raises(Exception):
+        async_delegation.commit_terminal_output(event, "wrong-claim", terminal_event)
+
+    assert async_delegation.list_terminal_outputs("stable-atomic") == []
+    assert async_delegation.event_delivery_claim_status(event, "claim-atomic") == "owned"
+
+
+def test_terminal_outbox_routes_by_stable_session_key_after_runtime_restart():
+    from tools import async_delegation
+
+    event = _async_event("deleg-terminal-restart", session_key="stable-session-key")
+    _persist_pending_completion(event)
+    claim_id = "tui-poller:123:terminal-restart"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+    terminal_event = {
+        "type": "message.complete",
+        "session_id": "old-runtime-sid",
+        "stored_session_id": "stable-session-key",
+        "payload": {"text": "Recovered after restart", "status": "success"},
+    }
+
+    async_delegation.commit_terminal_output(event, claim_id, terminal_event)
+
+    assert async_delegation.list_terminal_outputs("old-runtime-sid") == []
+    [replayed] = async_delegation.list_terminal_outputs("stable-session-key")
+    assert replayed["session_id"] == "stable-session-key"
+    assert replayed["event"] == terminal_event
+
+
+def test_terminal_outbox_rejects_destination_not_owned_by_claimed_event():
+    """A claimed completion cannot redirect its durable output to another session."""
+    from tools import async_delegation
+
+    event = _async_event("deleg-terminal-route-fence")
+    event["session_key"] = "owned-stable-session"
+    _persist_pending_completion(event)
+    claim_id = "tui-poller:123:terminal-route-fence"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+
+    with pytest.raises(ValueError, match="does not belong"):
+        async_delegation.commit_terminal_output(
+            event,
+            claim_id,
+            {
+                "type": "message.complete",
+                "stored_session_id": "unrelated-stable-session",
+                "session_id": "runtime",
+                "payload": {"text": "must not be redirected"},
+            },
+        )
+
+    assert async_delegation.list_terminal_outputs("unrelated-stable-session") == []
+    assert async_delegation.get_durable_delegation(event["delegation_id"])[
+        "delivery_state"
+    ] == "pending"
+
+
+def test_terminal_outbox_uses_persisted_event_identity_not_mutable_claim_payload():
+    from tools import async_delegation
+
+    event = _async_event("deleg-persisted-identity", session_key="persisted-session")
+    _persist_pending_completion(event)
+    claim_id = "claim-persisted-identity"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+    event["session_key"] = "attacker-session"
+
+    with pytest.raises(ValueError, match="destination"):
+        async_delegation.commit_terminal_output(
+            event,
+            claim_id,
+            {
+                "type": "message.complete",
+                "stored_session_id": "attacker-session",
+                "payload": {"text": "Misrouted"},
+            },
+        )
+    assert async_delegation.get_durable_delegation(event["delegation_id"])[
+        "delivery_state"
+    ] == "pending"
+
+def test_dispatch_persistence_does_not_replace_existing_terminal_record(monkeypatch):
+    """Reusing an id cannot reset a delivered row behind its durable outbox."""
+    from tools import async_delegation
+
+    event = _async_event("deleg-no-dispatch-replace")
+    event["session_key"] = "stable-no-replace"
+    _persist_pending_completion(event)
+    claim_id = "tui-poller:123:no-dispatch-replace"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+    terminal_event = {
+        "type": "message.complete",
+        "stored_session_id": "stable-no-replace",
+        "session_id": "runtime",
+        "payload": {"text": "already durable"},
+    }
+    async_delegation.commit_terminal_output(event, claim_id, terminal_event)
+
+    with pytest.raises(Exception):
+        async_delegation._persist_dispatch({
+            "delegation_id": event["delegation_id"],
+            "session_key": "attacker-or-replacement",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": 9999.0,
+        })
+
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable["delivery_state"] == "delivered"
+    assert async_delegation.list_terminal_outputs("stable-no-replace")[0]["event"] == terminal_event
+
+
+def test_terminal_outbox_replay_rebinds_runtime_session_without_mutating_record():
+    from tools import async_delegation
+
+    row = {
+        "delivery_id": "async-delegation:deleg-rebind",
+        "session_id": "persisted-session",
+        "event": {
+            "type": "message.complete",
+            "session_id": "runtime-before",
+            "stored_session_id": "persisted-session",
+            "payload": {"text": "durable answer"},
+        },
+    }
+
+    replay = async_delegation.replay_terminal_output(row, "runtime-after")
+
+    assert replay["session_id"] == "runtime-after"
+    assert replay["payload"]["delivery_id"] == "async-delegation:deleg-rebind"
+    assert row["event"]["session_id"] == "runtime-before"
+
+
+def test_stale_claim_is_not_stolen_while_owner_process_is_alive(tmp_path):
+    """A missed heartbeat must not permit duplicate work in a live owner process."""
+    import os
+    import sqlite3
+    import time
+
+    from gateway.status import get_process_start_time
+    from tools import async_delegation
+
+    event = _async_event("deleg-live-owner-lease")
+    _persist_pending_completion(event)
+    owner_started_at = get_process_start_time(os.getpid())
+    assert owner_started_at is not None
+    owner_claim = f"tui-notify:{os.getpid()}:{owner_started_at}:owner"
+    assert async_delegation.claim_completion_delivery(
+        event["delegation_id"], owner_claim
+    )
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute(
+            "UPDATE async_delegations SET delivery_claimed_at=? WHERE delegation_id=?",
+            (time.time() - 301, event["delegation_id"]),
+        )
+
+    assert not async_delegation.claim_completion_delivery(
+        event["delegation_id"], f"tui-post-turn:{os.getpid()}:competitor"
+    )
+
+
+def test_event_delivery_claim_status_reports_unclaimed_after_release():
+    from tools import async_delegation
+
+    event = _async_event("deleg-claim-status")
+    _persist_pending_completion(event)
+    claim_id = "tui-poller:123:claim-status"
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], claim_id)
+    assert async_delegation.release_event_delivery(event, claim_id)
+
+    assert async_delegation.event_delivery_claim_status(event, claim_id) == "unclaimed"
+
+
+def test_restore_clears_fresh_claim_owned_by_dead_process():
+    import queue
+    import time
+
+    from tools import async_delegation
+
+    event = _async_event("deleg-dead-owner-restore")
+    event["dispatched_at"] = time.time()
+    event["completed_at"] = event["dispatched_at"]
+    _persist_pending_completion(event)
+    dead_claim = "tui-poller:999999:dead-owner"
+    assert async_delegation.claim_completion_delivery(
+        event["delegation_id"], dead_claim
+    )
+    restored = queue.Queue()
+
+    assert async_delegation.restore_undelivered_completions(restored) == 1
+    assert restored.get_nowait()["delegation_id"] == event["delegation_id"]
+    assert async_delegation.claim_event_delivery(event, "restart-poller") is not None
 
 
 def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch):

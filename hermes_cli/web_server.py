@@ -106,6 +106,7 @@ from gateway.status import (
     read_runtime_status,
     resolve_gateway_liveness,
 )
+from gateway.code_skew import get_boot_fingerprint, runtime_source_digest
 from utils import env_var_enabled
 
 try:
@@ -433,6 +434,7 @@ async def _lifespan(app: "FastAPI"):
     from gateway.code_skew import record_boot_fingerprint
 
     record_boot_fingerprint()
+    app.state.runtime_identity = _runtime_identity_from_boot_fingerprint()
 
     # Hosted Bot rooms belong to the backend process, not to any connected
     # Desktop socket. Recovery may need a contended state.db migration, so keep
@@ -3677,13 +3679,31 @@ async def get_ssh_ownership(request: Request):
     }
 
 
+def _runtime_identity_from_boot_fingerprint() -> dict[str, str | None]:
+    fingerprint = get_boot_fingerprint()
+    code_sha = None
+    if fingerprint:
+        candidate = fingerprint.rsplit(":", 1)[-1]
+        if re.fullmatch(r"[0-9a-f]{40}", candidate):
+            code_sha = candidate
+    return {
+        "code_fingerprint": fingerprint,
+        "code_sha": code_sha,
+        "source_digest": runtime_source_digest(Path(__file__).resolve().parents[1]),
+    }
+
+
 @app.get("/api/health")
 async def get_health():
     """Lightweight process liveness for desktop/backend readiness probes."""
+    runtime_identity = getattr(app.state, "runtime_identity", None)
+    if not isinstance(runtime_identity, dict):
+        runtime_identity = _runtime_identity_from_boot_fingerprint()
     return {
         "ok": True,
         "version": __version__,
         "auth_required": bool(getattr(app.state, "auth_required", False)),
+        "runtime_identity": runtime_identity,
     }
 
 
@@ -16396,6 +16416,10 @@ _GATEWAY_WS_PROTOCOL = "hermes-gateway-v1"
 _GATEWAY_WS_TICKET_PROTOCOL_PREFIX = "hermes-gateway-ticket."
 
 
+def _canary_auth_headers(operation_id: str, token: str) -> dict[str, str]:
+    return {"X-Hermes-Canary-Operation": operation_id, "X-Hermes-Canary-Token": token}
+
+
 def _gateway_ws_ticket_from_subprotocol(ws: "WebSocket") -> tuple[str, str]:
     """Return ``(ticket, reason)`` from an unambiguous gateway protocol set."""
     raw = str(ws.headers.get("sec-websocket-protocol", "") or "")
@@ -16445,6 +16469,30 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     issues from the log.
     """
     auth_required = bool(getattr(app.state, "auth_required", False))
+    # The promotion credential is deliberately a header-only exception. It is
+    # valid solely on the JSON-RPC gateway route and from loopback.
+    canary_op = ws.headers.get("X-Hermes-Canary-Operation", "")
+    canary_token = ws.headers.get("X-Hermes-Canary-Token", "")
+    query_canary = ws.query_params.get("canary") or ws.query_params.get("canary_operation")
+    if query_canary:
+        return "canary_invalid", "canary"
+    if canary_op or canary_token:
+        if ws.url.path != "/api/ws" or not canary_op or not canary_token or not (ws.client and ws.client.host in {"127.0.0.1", "::1"}):
+            return "canary_invalid", "canary"
+        from pathlib import Path
+        from tui_gateway.reconnect_auth import OPERATION_ID_RE, load_descriptor
+        if not isinstance(canary_op, str) or not OPERATION_ID_RE.fullmatch(canary_op):
+            return "canary_invalid", "canary"
+        try:
+            credential_root = Path(os.environ.get("HERMES_RECONNECT_CREDENTIAL_DIR", "/run/hermes-deployment-reconnect"))
+            info = load_descriptor(credential_root / f"{canary_op}.json")
+            if info.operation_id != canary_op or not hmac.compare_digest(canary_token, info.token):
+                return "canary_invalid", "canary"
+            ws._hermes_auth_identity = {"user_id": "promotion-canary", "provider": "promotion-canary"}
+            ws._hermes_auth_scope = {"kind": "promotion-canary", "operation_id": info.operation_id, "session_id": info.session_id}
+            return None, "canary"
+        except (OSError, ValueError, json.JSONDecodeError):
+            return "canary_invalid", "canary"
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
@@ -17657,6 +17705,7 @@ async def gateway_ws(ws: WebSocket) -> None:
     await handle_ws(
         ws,
         auth_identity=getattr(ws, "_hermes_auth_identity", None),
+        auth_scope=getattr(ws, "_hermes_auth_scope", None),
         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
     )
 

@@ -66,6 +66,147 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def test_finalize_retries_transient_persistence_or_queue_failure(monkeypatch):
+    delegation_id = "deleg-finalize-retry"
+    ad._records[delegation_id] = {
+        "delegation_id": delegation_id,
+        "status": "running",
+        "completed_at": None,
+        "interrupt_fn": None,
+        "progress_fn": None,
+    }
+    attempts = []
+    completed = threading.Event()
+
+    def _push(*_args):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError("completion store temporarily unavailable")
+        completed.set()
+
+    monkeypatch.setattr(ad, "_push_completion_event", _push)
+    monkeypatch.setattr(ad, "_FINALIZATION_RETRY_SECONDS", 0.01, raising=False)
+
+    ad._finalize(delegation_id, {"status": "completed"}, "completed")
+
+    assert completed.wait(1.0)
+    assert len(attempts) == 2
+    assert ad._records[delegation_id]["status"] == "completed"
+
+
+def test_push_completion_event_surfaces_queue_publication_failure(monkeypatch):
+    class _BrokenQueue(queue.Queue):
+        def put(self, _event):
+            raise RuntimeError("completion queue unavailable")
+
+    monkeypatch.setattr(process_registry, "completion_queue", _BrokenQueue())
+    monkeypatch.setattr(ad, "_persist_completion", lambda *_args: None)
+    record = {
+        "delegation_id": "deleg-queue-failure",
+        "dispatched_at": time.time(),
+        "completed_at": time.time(),
+    }
+
+    with pytest.raises(RuntimeError, match="completion queue unavailable"):
+        ad._push_completion_event(record, {"summary": "done"}, "completed")
+
+
+def test_finalize_batch_retries_transient_terminal_publication_failure(monkeypatch):
+    delegation_id = "deleg-batch-finalize-retry"
+    ad._records[delegation_id] = {
+        "delegation_id": delegation_id,
+        "status": "running",
+        "completed_at": None,
+        "interrupt_fn": None,
+        "progress_fn": None,
+    }
+    attempts = []
+    completed = threading.Event()
+
+    def _push(*_args):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError("batch completion store temporarily unavailable")
+        completed.set()
+
+    monkeypatch.setattr(ad, "_push_batch_completion_event", _push)
+    monkeypatch.setattr(ad, "_FINALIZATION_RETRY_SECONDS", 0.01, raising=False)
+
+    ad._finalize_batch(delegation_id, {"results": []}, "completed")
+
+    assert completed.wait(1.0)
+    assert len(attempts) == 2
+    assert ad._records[delegation_id]["status"] == "completed"
+
+
+def test_push_batch_completion_event_surfaces_queue_publication_failure(monkeypatch):
+    class _BrokenQueue(queue.Queue):
+        def put(self, _event):
+            raise RuntimeError("batch completion queue unavailable")
+
+    monkeypatch.setattr(process_registry, "completion_queue", _BrokenQueue())
+    monkeypatch.setattr(ad, "_persist_completion", lambda *_args: None)
+    record = {
+        "delegation_id": "deleg-batch-queue-failure",
+        "dispatched_at": time.time(),
+        "completed_at": time.time(),
+    }
+
+    with pytest.raises(RuntimeError, match="batch completion queue unavailable"):
+        ad._push_batch_completion_event(record, {"results": []}, "completed")
+
+
+@pytest.mark.parametrize(
+    "push_name,payload",
+    [
+        ("_push_completion_event", {"summary": "done"}),
+        ("_push_batch_completion_event", {"results": []}),
+    ],
+)
+def test_completion_publication_surfaces_process_registry_import_failure(
+    monkeypatch, push_name, payload
+):
+    monkeypatch.setitem(sys.modules, "tools.process_registry", None)
+    record = {
+        "delegation_id": "deleg-import-failure",
+        "dispatched_at": time.time(),
+        "completed_at": time.time(),
+    }
+
+    with pytest.raises(RuntimeError, match="process_registry import failed"):
+        getattr(ad, push_name)(record, payload, "completed")
+
+
+def test_pruning_never_evicts_record_still_retrying_finalization(monkeypatch):
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 1)
+    ad._records.update({
+        "finalizing": {"status": "finalizing", "completed_at": 1},
+        "completed-old": {"status": "completed", "completed_at": 2},
+        "completed-new": {"status": "completed", "completed_at": 3},
+    })
+
+    with ad._records_lock:
+        ad._prune_completed_locked()
+
+    assert "finalizing" in ad._records
+    assert "completed-old" not in ad._records
+    assert "completed-new" in ad._records
+
+
+def test_claim_owner_identity_includes_process_start_time():
+    from gateway.status import get_process_start_time
+
+    pid = os.getpid()
+    started_at = get_process_start_time(pid)
+    assert started_at is not None
+    claim_id = f"tui-poller:{pid}:{started_at}:claim"
+
+    assert ad._claim_owner_process_is_alive(claim_id)
+    assert not ad._claim_owner_process_is_alive(
+        f"tui-poller:{pid}:{int(started_at) + 1}:claim"
+    )
+
+
 def test_schema_init_preserves_shared_state_db_journal_mode(tmp_path):
     """The delegation ledger is a guest in state.db, not its mode owner."""
     conn = sqlite3.connect(tmp_path / "state.db")

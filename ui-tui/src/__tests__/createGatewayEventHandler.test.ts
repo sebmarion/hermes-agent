@@ -95,6 +95,31 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().todos).toEqual([])
   })
 
+  it('acknowledges a durable terminal delivery after rendering it', async () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    ctx.gateway.gw.request = vi.fn(async () => null)
+    patchUiState({ sid: 'runtime-session' })
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({
+      payload: { delivery_id: 'async-delegation:terminal-1', text: 'Recovered answer' },
+      type: 'message.complete'
+    } as any)
+
+    await vi.waitFor(() =>
+      expect(ctx.gateway.gw.request).toHaveBeenCalledWith('terminal.outbox.ack', {
+        delivery_id: 'async-delegation:terminal-1',
+        session_id: 'runtime-session'
+      })
+    )
+    expect(appended).toContainEqual({
+      deliveryId: 'async-delegation:terminal-1',
+      role: 'assistant',
+      text: 'Recovered answer'
+    })
+  })
+
   it('opens a billing confirm dialog routing Nous to /topup', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

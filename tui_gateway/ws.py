@@ -92,6 +92,7 @@ class WSTransport:
         *,
         peer: str = "unknown",
         auth_identity: dict | None = None,
+        auth_scope: dict | None = None,
     ) -> None:
         self._ws = ws
         self._loop = loop
@@ -104,6 +105,7 @@ class WSTransport:
         #: never populate this: it is the only identity authority for
         #: browser-controller registration.
         self.auth_identity = auth_identity
+        self.auth_scope = auth_scope
         self._closed = False
         self._last_inbound_at = time.monotonic()
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
@@ -321,6 +323,7 @@ async def handle_ws(
     ws: Any,
     *,
     auth_identity: dict | None = None,
+    auth_scope: dict | None = None,
     subprotocol: str | None = None,
 ) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
@@ -356,6 +359,7 @@ async def handle_ws(
             asyncio.get_running_loop(),
             peer=peer,
             auth_identity=auth_identity,
+            auth_scope=auth_scope,
         )
 
         # resolve_skin() reads config + initializes the skin engine —

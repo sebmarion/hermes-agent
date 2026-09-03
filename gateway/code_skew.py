@@ -17,10 +17,12 @@ stays ``None`` and skew detection no-ops — it never produces a false positive.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _boot_fingerprint: str | None = None
+_RUNTIME_SOURCE_DIRS = ("hermes_cli", "gateway", "tui_gateway", "tools")
 
 
 def _fingerprint() -> str | None:
@@ -43,6 +45,35 @@ def record_boot_fingerprint() -> None:
     global _boot_fingerprint
     if _boot_fingerprint is None:
         _boot_fingerprint = _fingerprint()
+
+
+def get_boot_fingerprint() -> str | None:
+    """Return the immutable checkout fingerprint captured at process boot."""
+    return _boot_fingerprint
+
+
+def runtime_source_digest(project_root: Path | None = None) -> str:
+    """Hash the Python source tree used by the backend runtime.
+
+    The git revision alone does not describe an uncommitted worktree. This
+    digest is captured at boot and lets an external coordinator verify the
+    exact source tree that the service started with, without exposing source
+    contents or credentials.
+    """
+    root = (project_root or _PROJECT_ROOT).resolve()
+    digest = hashlib.sha256()
+    files = []
+    for directory in _RUNTIME_SOURCE_DIRS:
+        base = root / directory
+        if base.is_dir():
+            files.extend(path for path in base.rglob("*.py") if path.is_file())
+    for path in sorted(files):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _short(fingerprint: str) -> str:

@@ -1852,5 +1852,92 @@ class TestMemoryProviderExternalPaths:
         assert not (hermes_home / "_external").exists()
 
 
+def test_restore_quick_snapshot_fails_for_partial_mixed_manifest(tmp_path, monkeypatch):
+    """A failed database keeps the whole mixed-manifest restore unsuccessful."""
+    import hermes_cli.backup as backup
+
+    home = tmp_path / "home"
+    snap_dir = home / "state-snapshots" / "snap"
+    snap_dir.mkdir(parents=True)
+    (snap_dir / "state.db").write_bytes(b"snapshot-db")
+    (snap_dir / "config.yaml").write_text("snapshot: true\n")
+    (home / "state.db").write_bytes(b"live-db")
+    (home / "config.yaml").write_text("snapshot: false\n")
+    (snap_dir / "manifest.json").write_text(
+        '{"files": {"state.db": 10, "config.yaml": 16}}'
+    )
+    monkeypatch.setattr(backup, "_safe_restore_db", lambda src, dst: False)
+
+    assert backup.restore_quick_snapshot("snap", hermes_home=home) is False
+    assert (home / "config.yaml").read_text() == "snapshot: true\n"
+
+
+def test_restore_quick_snapshot_cli_distinguishes_incomplete_from_missing(
+    tmp_path, monkeypatch, capsys
+):
+    """An existing failed restore is not reported as a missing snapshot."""
+    import hermes_cli.backup as backup
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+    monkeypatch.setattr(backup, "quick_snapshot_exists", lambda snapshot_id: snapshot_id == "snap")
+    monkeypatch.setattr(backup, "restore_quick_snapshot", lambda snapshot_id: False)
+
+    CLICommandsMixin()._handle_snapshot_command("/snapshot restore snap")
+    assert "restore failed or incomplete" in capsys.readouterr().out.lower()
+
+    CLICommandsMixin()._handle_snapshot_command("/snapshot restore absent")
+    assert "snapshot not found" in capsys.readouterr().out.lower()
+
+
+def test_safe_restore_db_backup_fault_leaves_destination_and_sidecars_unchanged(
+    tmp_path, monkeypatch
+):
+    """A backup() exception does not trigger replace/unlink/move fallback."""
+    import hermes_cli.backup as backup
+
+    src = tmp_path / "source.db"
+    dst = tmp_path / "state.db"
+    for path, value in ((src, "snapshot"), (dst, "live")):
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE data(value TEXT)")
+            conn.execute("INSERT INTO data VALUES (?)", (value,))
+    with sqlite3.connect(dst) as conn:
+        rows_before = conn.execute("SELECT value FROM data").fetchall()
+    destination_bytes_before = dst.read_bytes()
+    sidecars = [dst.with_name(dst.name + suffix) for suffix in ("-wal", "-shm", "-journal")]
+    for sidecar in sidecars:
+        sidecar.write_bytes(b"unchanged")
+
+    real_connect = sqlite3.connect
+
+    class FailingBackupConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def backup(self, other):
+            raise sqlite3.OperationalError("injected backup failure")
+
+        def close(self):
+            self._connection.close()
+
+    def connect(database, *args, **kwargs):
+        connection = real_connect(database, *args, **kwargs)
+        if kwargs.get("uri"):
+            return FailingBackupConnection(connection)
+        return connection
+
+    monkeypatch.setattr(backup.sqlite3, "connect", connect)
+    forbidden = []
+    monkeypatch.setattr(backup.os, "replace", lambda *args: forbidden.append("replace"))
+    monkeypatch.setattr(backup.os, "unlink", lambda *args: forbidden.append("unlink"), raising=False)
+    monkeypatch.setattr(backup.shutil, "move", lambda *args: forbidden.append("move"))
+
+    assert backup._safe_restore_db(src, dst) is False
+    assert not forbidden
+    assert dst.read_bytes() == destination_bytes_before
+    assert rows_before == [("live",)]
+    assert all(sidecar.read_bytes() == b"unchanged" for sidecar in sidecars)
+
+
 
 

@@ -22,6 +22,8 @@ export type ChatMessage = {
   completedAt?: number
   pending?: boolean
   error?: string
+  /** Durable backend terminal-outbox delivery ID, when present. */
+  deliveryId?: string
   /** Structured layer descriptor for a failed turn (parsed error_surface).
    *  Drives the error card's layer label + actions; absent on older
    *  backends, where the card falls back to generic copy. */
@@ -51,6 +53,7 @@ export type GatewayEventPayload = {
   text?: string
   rendered?: string
   status?: string
+  delivery_id?: string
   message?: string
   id?: string
   name?: string

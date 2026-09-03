@@ -421,6 +421,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   const { rpc } = ctx.gateway
   const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
   const { bellOnComplete, stdout, sys } = ctx.system
+  const seenTerminalDeliveryIds = new Set<string>()
   const { appendMessage, panel, setHistoryItems } = ctx.transcript
   const { setInput } = ctx.composer
   const { submitLiteralRef, submitRef } = ctx.submission
@@ -1436,11 +1437,38 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.complete': {
+        const deliveryId = ev.payload?.delivery_id
+        if (typeof deliveryId === 'string' && deliveryId.trim() && seenTerminalDeliveryIds.has(deliveryId)) {
+          const sessionId = getUiState().sid
+          if (sessionId) {
+            void ctx.gateway.gw
+              .request('terminal.outbox.ack', { delivery_id: deliveryId, session_id: sessionId })
+              .catch(() => undefined)
+          }
+          return
+        }
         const { finalMessages, finalText, wasInterrupted } = turnController.recordMessageComplete(ev.payload ?? {})
 
         if (!wasInterrupted) {
-          const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
+          const sourceMessages: Msg[] = finalMessages.length
+            ? finalMessages
+            : [{ role: 'assistant' as const, text: finalText }]
+          const msgs: Msg[] = sourceMessages.map(msg =>
+            typeof deliveryId === 'string' && deliveryId.trim() && msg.role === 'assistant'
+              ? { ...msg, deliveryId }
+              : msg
+          )
           msgs.forEach(appendMessage)
+          if (typeof deliveryId === 'string' && deliveryId.trim()) {
+            seenTerminalDeliveryIds.add(deliveryId)
+          }
+
+          const sessionId = getUiState().sid
+          if (typeof deliveryId === 'string' && deliveryId.trim() && sessionId) {
+            void ctx.gateway.gw
+              .request('terminal.outbox.ack', { delivery_id: deliveryId, session_id: sessionId })
+              .catch(() => undefined)
+          }
 
           // Pet beat: celebrate a finished plan, otherwise a clean-finish wave.
           flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')

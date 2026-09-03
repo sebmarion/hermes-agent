@@ -10,6 +10,7 @@ safe-directory rejection.
 from __future__ import annotations
 
 import pathlib
+import json
 import subprocess
 import sys
 
@@ -17,6 +18,38 @@ REPO = "/home/seb/projects/hermes-agent"
 REPO_USER = "seb"
 STATE = pathlib.Path("/var/lib/hermes-deployment/backend-promoted.sha")
 SERVICE = "hermes-backend.service"
+ACTIVE_SESSIONS = pathlib.Path("/home/seb/.hermes/runtime/active_sessions.json")
+BACKEND_PORT = ":9119"
+
+
+def _active_client_counts() -> tuple[int, int]:
+    """Return active Desktop/TUI leases and established backend connections."""
+    try:
+        payload = json.loads(ACTIVE_SESSIONS.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read active session registry: {exc}") from exc
+
+    entries = payload.get("entries", []) if isinstance(payload, dict) else []
+    if not isinstance(entries, list):
+        raise RuntimeError("active session registry has an invalid entries list")
+    desktop_tui = sum(
+        1
+        for entry in entries
+        if isinstance(entry, dict) and str(entry.get("surface", "")).lower() in {"desktop", "tui"}
+    )
+    try:
+        connections = subprocess.run(
+            ["/usr/bin/ss", "-Htn", "state", "established"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect backend connections: {exc}") from exc
+    if connections.returncode:
+        raise RuntimeError("cannot inspect backend connections")
+    established = sum(1 for line in connections.stdout.splitlines() if BACKEND_PORT in line)
+    return desktop_tui, established
 
 
 def main(argv: list[str]) -> int:
@@ -42,7 +75,22 @@ def main(argv: list[str]) -> int:
         return 1
     head = proc.stdout.strip()
 
-    last = STATE.read_text().strip() if STATE.exists() else ""
+    if "--defer-if-connected" in argv:
+        try:
+            desktop_tui, connections = _active_client_counts()
+        except RuntimeError as exc:
+            print(json.dumps({"deferred": True, "reason": str(exc)}))
+            return 1
+        if desktop_tui or connections:
+            reason = (
+                "backend has an active Desktop/TUI session; disconnect clients before promotion"
+                if desktop_tui
+                else "backend has established client connections; disconnect clients before promotion"
+            )
+            print(json.dumps({"deferred": True, "reason": reason}))
+            return 0
+
+    last = STATE.read_text(encoding="utf-8").strip() if STATE.exists() else ""
     if head == last:
         print(f"hermes-backend already running {head[:12]}")
         return 0
@@ -62,7 +110,7 @@ def main(argv: list[str]) -> int:
         return 1
 
     STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(head + "\n")
+    STATE.write_text(head + "\n", encoding="utf-8")
     print(f"{SERVICE} restarted at {head[:12]}")
     return 0
 

@@ -753,6 +753,7 @@ export type GatewayEvent =
   | {
       payload?: {
         billing?: BillingBlock
+        delivery_id?: string
         failure_reason?: string
         reasoning?: string
         rendered?: string

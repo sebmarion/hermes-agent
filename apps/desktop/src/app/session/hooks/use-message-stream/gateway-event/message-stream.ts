@@ -69,6 +69,7 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, isActiveEvent, occurredAt } = ctx
 
   const {
+    ackTerminalDelivery,
     appendAssistantDelta,
     appendReasoningDelta,
     compactedTurnRef,
@@ -348,7 +349,19 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
           }
         : undefined
 
-    completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure, occurredAt)
+    const deliveryId = payload?.delivery_id
+    completeAssistantMessage(
+      sessionId,
+      finalText,
+      payload?.response_previewed,
+      failure,
+      occurredAt,
+      typeof deliveryId === 'string' && deliveryId.trim() ? deliveryId : undefined
+    )
+
+    if (typeof deliveryId === 'string' && deliveryId.trim()) {
+      ackTerminalDelivery(sessionId, deliveryId)
+    }
 
     // Structured billing wall forwarded by the gateway (out of credits /
     // payment required) — cache it + raise a billing-specific toast.

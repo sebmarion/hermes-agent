@@ -44,6 +44,7 @@ interface MessageStreamOptions {
     runtimeSessionId?: string | null
   ) => Promise<void>
   queryClient: QueryClient
+  requestGateway?: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
   refreshHermesConfig: () => Promise<void>
   refreshSessions: () => Promise<void>
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
@@ -72,6 +73,7 @@ export function useMessageStream({
   activeSessionIdRef,
   hydrateFromStoredSession,
   queryClient,
+  requestGateway,
   refreshHermesConfig,
   refreshSessions,
   sessionStateByRuntimeIdRef,
@@ -563,7 +565,8 @@ export function useMessageStream({
       text: string,
       responsePreviewed?: boolean,
       failure?: { error: string; partial: boolean; surface?: ErrorSurface | null },
-      occurredAt = Date.now() / 1000
+      occurredAt = Date.now() / 1000,
+      deliveryId?: string
     ) => {
       let shouldHydrate = false
 
@@ -618,6 +621,7 @@ export function useMessageStream({
             pending: false,
             interim: false,
             ...(durationS !== undefined ? { durationS } : {}),
+            ...(deliveryId ? { deliveryId } : {}),
             ...(completionError && failure?.surface ? { errorSurface: failure.surface } : {})
           }
 
@@ -643,6 +647,7 @@ export function useMessageStream({
           completedAt: occurredAt,
           branchGroupId: state.pendingBranchGroup ?? undefined,
           ...(durationS !== undefined ? { durationS } : {}),
+          ...(deliveryId ? { deliveryId } : {}),
           ...(completionError && { error: completionError }),
           ...(completionError && failure?.surface ? { errorSurface: failure.surface } : {})
         })
@@ -678,11 +683,15 @@ export function useMessageStream({
               (finalText === existingText || finalText.startsWith(existingText) || existingText.startsWith(finalText))
             )
 
-            if (existing.pending || (!interimBoundaryPending && finalText && existingText === finalText)) {
+            const deliveryIdsDiffer = Boolean(
+              deliveryId && existing.deliveryId && deliveryId !== existing.deliveryId
+            )
+
+            if (!deliveryIdsDiffer && (existing.pending || (!interimBoundaryPending && finalText && existingText === finalText))) {
               nextMessages = prev.map((message, messageIndex) =>
                 messageIndex === index ? completeMessage(message) : message
               )
-            } else if ((interimBoundaryPending && responsePreviewed) || finalContinuesInterim) {
+            } else if (!deliveryIdsDiffer && ((interimBoundaryPending && responsePreviewed) || finalContinuesInterim)) {
               // Settle the interim in place instead of creating a duplicate —
               // the DB has one row, so the live UI must agree. Two distinct
               // settle paths with different boundary requirements:
@@ -859,6 +868,13 @@ export function useMessageStream({
   )
 
   const handleGatewayEvent = useGatewayEventHandler({
+    ackTerminalDelivery: (sessionId, deliveryId) => {
+      if (requestGateway) {
+        void requestGateway('terminal.outbox.ack', { delivery_id: deliveryId, session_id: sessionId }).catch(
+          () => undefined
+        )
+      }
+    },
     activeGatewayProfile,
     appendAssistantDelta,
     appendReasoningDelta,

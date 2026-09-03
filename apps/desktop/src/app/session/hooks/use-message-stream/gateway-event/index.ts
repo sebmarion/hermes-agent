@@ -240,6 +240,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     // depending on the individual fields keeps the handler identity stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
+      deps.ackTerminalDelivery,
       deps.appendAssistantDelta,
       deps.appendReasoningDelta,
       deps.activeSessionIdRef,

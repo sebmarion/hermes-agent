@@ -12115,6 +12115,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return bool(self._execute_write(_do))
 
+    def set_latest_matching_message_display_metadata(
+        self,
+        session_id: str,
+        *,
+        role: str,
+        content: str,
+        display_metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Merge presentation metadata onto the latest matching active row."""
+        if not session_id or not content or not isinstance(display_metadata, dict):
+            return False
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id, role, content, display_metadata FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row is None or row[1] != role or self._decode_content(row[2]) != content:
+                return False
+            metadata = self._decode_display_metadata(row[3]) or {}
+            metadata.update(display_metadata)
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (self._encode_display_metadata(metadata), row[0]),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
     #: Key under which message reactions live inside ``display_metadata``.
     #: Reactions share the existing per-message JSON column rather than a side
     #: table so they survive rewind/compaction row rewrites with the row itself.

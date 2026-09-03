@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -46,7 +47,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
@@ -88,6 +93,10 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # restore_undelivered_completions). 48h keeps overnight/weekend results
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
+# A client that disconnects after claiming a replay must not strand the row
+# forever. The claim is transport-local and expires so another attached client
+# can recover it, while concurrent pending reads remain single-consumer.
+_TERMINAL_OUTBOX_CLAIM_SECONDS = 60.0
 _DB_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -115,6 +124,7 @@ _STALE_CHECK_INTERVAL = 30.0  # seconds between monitor sweeps
 _STALE_IDLE_SECONDS = 450.0  # no progress, no current tool → stalled
 _STALE_IN_TOOL_SECONDS = 1200.0  # no progress while inside a tool → stalled
 _STALL_GRACE_SECONDS = 120.0  # after interrupt, time for the runner to return
+_FINALIZATION_RETRY_SECONDS = 1.0
 
 _monitor_lock = threading.Lock()
 _monitor_thread: Optional[threading.Thread] = None
@@ -128,7 +138,8 @@ def _db_path():
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    from hermes_state import _connect_tracked_db
+    conn = _connect_tracked_db(path, tracking_path=path, timeout=10)
     try:
         _initialize_schema(conn)
     except Exception:
@@ -174,6 +185,35 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             origin_session_id TEXT NOT NULL DEFAULT ''
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS async_terminal_outbox (
+            delivery_id TEXT PRIMARY KEY,
+            delegation_id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            acknowledged_at REAL,
+            delivery_claim TEXT,
+            delivery_claimed_at REAL,
+            live_claim TEXT,
+            live_claimed_at REAL,
+            live_published_at REAL
+        )"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_async_terminal_outbox_session_pending
+           ON async_terminal_outbox(session_id, acknowledged_at, created_at)"""
+    )
+    outbox_columns = {row[1] for row in conn.execute("PRAGMA table_info(async_terminal_outbox)")}
+    for name, sql_type in (
+        ("delivery_claim", "TEXT"),
+        ("delivery_claimed_at", "REAL"),
+        ("live_claim", "TEXT"),
+        ("live_claimed_at", "REAL"),
+        ("live_published_at", "REAL"),
+    ):
+        if name not in outbox_columns:
+            conn.execute(f"ALTER TABLE async_terminal_outbox ADD COLUMN {name} {sql_type}")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
     for name, sql_type in (
         ("owner_pid", "INTEGER"),
@@ -261,7 +301,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     }
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
+            """INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
@@ -286,6 +326,10 @@ def _prune_durable_records() -> None:
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            "DELETE FROM async_terminal_outbox WHERE acknowledged_at IS NOT NULL AND acknowledged_at < ?",
+            (cutoff,),
+        )
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
             (cutoff,),
@@ -340,7 +384,16 @@ def _note_delivery_attempt(delegation_id: str) -> None:
         )
 
 
-def recover_abandoned_delegations() -> int:
+def _run_with_profile_home(profile_home: str | Path | None, fn: Callable[[], Any]):
+    token = set_hermes_home_override(profile_home) if profile_home else None
+    try:
+        return fn()
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
+def _recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
         from gateway.status import _pid_exists, get_process_start_time
@@ -397,7 +450,11 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
-def restore_undelivered_completions(target_queue) -> int:
+def recover_abandoned_delegations(profile_home: str | Path | None = None) -> int:
+    return int(_run_with_profile_home(profile_home, _recover_abandoned_delegations))
+
+
+def _restore_undelivered_completions(target_queue) -> int:
     """Enqueue durable pending completions as fresh turns after process start.
 
     Every restored event is stamped ``restored=True`` (in-memory only — the
@@ -416,17 +473,18 @@ def restore_undelivered_completions(target_queue) -> int:
     102K-token context on the staging fleet) for a result nobody is waiting
     on anymore; the payload stays queryable on the dropped row.
     """
-    recover_abandoned_delegations()
+    _recover_abandoned_delegations()
     now = time.time()
     restored = 0
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, event_json, completed_at, dispatched_at
+            """SELECT delegation_id, event_json, completed_at, dispatched_at,
+                      delivery_claim
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for delegation_id, payload, completed_at, dispatched_at in rows:
+        for delegation_id, payload, completed_at, dispatched_at, delivery_claim in rows:
             age_basis = completed_at or dispatched_at
             if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
                 conn.execute(
@@ -444,12 +502,34 @@ def restore_undelivered_completions(target_queue) -> int:
                     _MAX_COMPLETION_REPLAY_AGE_S / 3600.0,
                 )
                 continue
+            if delivery_claim:
+                if _claim_owner_process_is_alive(str(delivery_claim)):
+                    continue
+                cleared = conn.execute(
+                    """UPDATE async_delegations
+                       SET delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                       WHERE delegation_id=? AND delivery_state='pending'
+                         AND delivery_claim=?""",
+                    (now, delegation_id, delivery_claim),
+                )
+                if cleared.rowcount != 1:
+                    continue
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
             target_queue.put(evt)
             restored += 1
     return restored
+
+
+def restore_undelivered_completions(
+    target_queue, profile_home: str | Path | None = None
+) -> int:
+    return int(
+        _run_with_profile_home(
+            profile_home, lambda: _restore_undelivered_completions(target_queue)
+        )
+    )
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
@@ -464,16 +544,47 @@ def mark_completion_delivered(delegation_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def _claim_owner_process_is_alive(claim_id: str) -> bool:
+    """Whether a PID+start-time claim still belongs to the same process."""
+    try:
+        parts = str(claim_id).rsplit(":", 3)
+        if len(parts) != 4:
+            return False
+        owner_pid = int(parts[-3])
+        owner_started_at = int(parts[-2])
+    except (IndexError, TypeError, ValueError):
+        return False
+    if owner_pid <= 0:
+        return False
+    try:
+        from gateway.status import get_process_start_time
+
+        current_started_at = get_process_start_time(owner_pid)
+    except Exception:
+        return False
+    return current_started_at is not None and int(current_started_at) == owner_started_at
+
+
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            """SELECT delivery_state, delivery_claim, delivery_claimed_at
+               FROM async_delegations WHERE delegation_id=?""",
             (delegation_id,),
         ).fetchone()
         if row is None:
             return True  # legacy event created before durable dispatch
+        current_claim = str(row[1] or "")
+        claimed_at = float(row[2] or 0.0)
+        if (
+            row[0] == "pending"
+            and current_claim
+            and claimed_at < now - 300
+            and _claim_owner_process_is_alive(current_claim)
+        ):
+            return False
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
@@ -491,7 +602,17 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     delegation_id = str(evt.get("delegation_id") or "")
     if not delegation_id:
         return ""
-    claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
+    try:
+        from gateway.status import get_process_start_time
+
+        owner_pid = os.getpid()
+        owner_started_at = get_process_start_time(owner_pid)
+    except Exception:
+        owner_pid = os.getpid()
+        owner_started_at = None
+    claim_id = (
+        f"{consumer}:{owner_pid}:{int(owner_started_at or 0)}:{uuid.uuid4().hex}"
+    )
     return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
 
 
@@ -568,14 +689,305 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
-        complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+def commit_terminal_output(
+    evt: Dict[str, Any],
+    claim_id: str,
+    terminal_event: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Atomically settle one completion and publish its terminal outbox row."""
+    delegation_id = str(evt.get("delegation_id") or "")
+    session_id = str(
+        terminal_event.get("stored_session_id")
+        or terminal_event.get("session_id")
+        or ""
+    )
+    payload = terminal_event.get("payload")
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if evt.get("type") != "async_delegation" or not delegation_id or not claim_id:
+        raise ValueError("a claimed async delegation is required")
+    if terminal_event.get("type") != "message.complete" or not session_id:
+        raise ValueError("a session-scoped message.complete event is required")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("terminal output text must be non-empty")
+
+    expected_session_ids = {
+        str(value).strip()
+        for value in (
+            evt.get("session_key"),
+            evt.get("parent_session_id"),
+            evt.get("origin_session_id"),
+            evt.get("origin_ui_session_id"),
+        )
+        if value is not None and str(value).strip()
+    }
+    if not expected_session_ids or session_id not in expected_session_ids:
+        raise ValueError("terminal output destination does not belong to the claimed delegation")
+
+    delivery_id = f"async-delegation:{delegation_id}"
+    event_json = json.dumps(terminal_event, sort_keys=True, separators=(",", ":"))
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        persisted = conn.execute(
+            """SELECT origin_session, origin_ui_session_id,
+                      parent_session_id, origin_session_id
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+        if persisted is None:
+            raise RuntimeError("async delegation record is missing")
+        persisted_session_ids = {
+            str(value).strip()
+            for value in persisted
+            if value is not None and str(value).strip()
+        }
+        if session_id not in persisted_session_ids:
+            raise ValueError("terminal output destination does not belong to the persisted delegation")
+
+        existing = conn.execute(
+            """SELECT session_id, event_json FROM async_terminal_outbox
+               WHERE delivery_id=?""",
+            (delivery_id,),
+        ).fetchone()
+        already_committed = existing is not None
+        if existing is not None:
+            if existing != (session_id, event_json):
+                raise ValueError("terminal output conflicts with the durable outbox row")
+        else:
+            settled = conn.execute(
+                """UPDATE async_delegations SET delivery_state='delivered',
+                          delivered_at=?, updated_at=?, delivery_claim=NULL,
+                          delivery_claimed_at=NULL
+                   WHERE delegation_id=? AND delivery_state='pending'
+                     AND delivery_claim=?""",
+                (now, now, delegation_id, claim_id),
+            )
+            if settled.rowcount != 1:
+                raise RuntimeError("async delegation claim is no longer owned")
+            conn.execute(
+                """INSERT INTO async_terminal_outbox
+                   (delivery_id, delegation_id, session_id, event_json,
+                    created_at, live_claim, live_claimed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (delivery_id, delegation_id, session_id, event_json, now, claim_id, now),
+            )
+    return {
+        "delivery_id": delivery_id,
+        "delegation_id": delegation_id,
+        "session_id": session_id,
+        "event": terminal_event,
+        "already_committed": already_committed,
+    }
 
 
-def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+def list_terminal_outputs(session_id: str) -> List[Dict[str, Any]]:
+    """Return unacknowledged terminal outputs in stable publication order."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delivery_id, delegation_id, session_id, event_json
+               FROM async_terminal_outbox
+               WHERE session_id=? AND acknowledged_at IS NULL
+               ORDER BY created_at, delivery_id""",
+            (session_id,),
+        ).fetchall()
+    return [
+        {
+            "delivery_id": row[0],
+            "delegation_id": row[1],
+            "session_id": row[2],
+            "event": json.loads(row[3]),
+        }
+        for row in rows
+    ]
+
+
+def claim_terminal_outputs(session_id: str, claim_id: str) -> List[Dict[str, Any]]:
+    """Claim pending terminal rows for one attached transport before replay."""
+    if not session_id or not claim_id:
+        return []
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_terminal_outbox
+                  SET delivery_claim=?, delivery_claimed_at=?,
+                      live_claim=NULL, live_claimed_at=NULL
+                WHERE session_id=? AND acknowledged_at IS NULL
+                  AND (live_published_at IS NOT NULL
+                       OR live_claim IS NULL
+                       OR live_claimed_at < ?)
+                  AND (delivery_claim IS NULL
+                       OR delivery_claim=?
+                       OR delivery_claimed_at < ?)""",
+            (
+                claim_id,
+                now,
+                session_id,
+                now - _TERMINAL_OUTBOX_CLAIM_SECONDS,
+                claim_id,
+                now - _TERMINAL_OUTBOX_CLAIM_SECONDS,
+            ),
+        )
+        rows = conn.execute(
+            """SELECT delivery_id, delegation_id, session_id, event_json
+                 FROM async_terminal_outbox
+                WHERE session_id=? AND acknowledged_at IS NULL
+                  AND delivery_claim=?
+                ORDER BY created_at, delivery_id""",
+            (session_id, claim_id),
+        ).fetchall()
+    return [
+        {
+            "delivery_id": row[0],
+            "delegation_id": row[1],
+            "session_id": row[2],
+            "event": json.loads(row[3]),
+        }
+        for row in rows
+    ]
+
+
+def mark_terminal_output_live_published(delivery_id: str, claim_id: str) -> bool:
+    """Mark live publication while retaining the publisher claim for ACK fencing."""
+    if not delivery_id or not claim_id:
+        return False
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_terminal_outbox
+                  SET live_claimed_at=?,
+                     live_published_at=?
+                WHERE delivery_id=? AND acknowledged_at IS NULL
+                  AND live_claim=?""",
+            (now, now, delivery_id, claim_id),
+        )
+        if cur.rowcount == 1:
+            return True
+        row = conn.execute(
+            """SELECT live_claim, live_published_at FROM async_terminal_outbox
+               WHERE delivery_id=?""",
+            (delivery_id,),
+        ).fetchone()
+    # A replay client may have taken over between the write and this mark.
+    # That is already a valid durable handoff, so the original publisher must
+    # not keep retrying or emit another frame.
+    return bool(row and (row[0] != claim_id or row[1] is not None))
+
+def replay_terminal_output(row: Dict[str, Any], runtime_session_id: str) -> Dict[str, Any]:
+    """Return a transport-bound copy of an outbox event.
+
+    The persisted session key identifies the durable conversation.  The runtime
+    session id is process-local and can change after a reconnect, so replay must
+    bind a copy rather than mutate the durable record.
+    """
+    event = json.loads(json.dumps(row["event"]))
+    event["session_id"] = str(runtime_session_id)
+    payload = event.setdefault("payload", {})
+    payload["delivery_id"] = str(row["delivery_id"])
+    return event
+
+
+def _has_persisted_terminal_assistant(
+    conn: sqlite3.Connection, session_id: str, delivery_id: str
+) -> bool:
+    """Require the immutable delivery identity in the durable transcript."""
+    try:
+        row = conn.execute(
+            """SELECT 1 FROM messages
+               WHERE session_id=? AND role='assistant' AND active=1
+                 AND json_extract(display_metadata, '$.delivery_id') = ?
+               ORDER BY id DESC LIMIT 1""",
+            (session_id, delivery_id),
+        ).fetchone()
+    except sqlite3.Error:
+        # ACK is a destructive transition. If the transcript store cannot be
+        # read, leave the outbox replayable rather than hiding the answer.
+        return False
+    return row is not None
+
+
+def ack_terminal_output(
+    delivery_id: str, session_id: str, claim_id: str | None = None
+) -> bool:
+    """ACK only after the matching assistant identity is durable."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT session_id, acknowledged_at, delivery_claim,
+                      live_claim, live_published_at
+               FROM async_terminal_outbox
+               WHERE delivery_id=?""",
+            (delivery_id,),
+        ).fetchone()
+        if row is None or row[0] != session_id:
+            return False
+        if not _has_persisted_terminal_assistant(conn, session_id, delivery_id):
+            return False
+        if not claim_id or claim_id not in {row[2], row[3]}:
+            return False
+        if row[1] is not None:
+            return True
+        updated = conn.execute(
+            """UPDATE async_terminal_outbox SET acknowledged_at=?
+               WHERE delivery_id=? AND session_id=? AND acknowledged_at IS NULL
+                 AND (delivery_claim=? OR live_claim=?)""",
+            (now, delivery_id, session_id, claim_id, claim_id),
+        )
+        return updated.rowcount == 1
+
+
+def renew_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Extend a live delivery claim without changing its attempt count."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_claimed_at=?, updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
+def renew_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
     if claim_id and evt.get("type") == "async_delegation":
-        release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+        return renew_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+    return True
+
+
+def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
+    if claim_id and evt.get("type") == "async_delegation":
+        return complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+    return True
+
+
+def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
+    if claim_id and evt.get("type") == "async_delegation":
+        return release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+    return True
+
+
+def event_delivery_claim_status(evt: Dict[str, Any], claim_id: str) -> str:
+    """Return whether a durable event claim is ours, free, or terminal."""
+    if not claim_id or evt.get("type") != "async_delegation":
+        return "unclaimed"
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not delegation_id:
+        return "missing"
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT delivery_state, delivery_claim
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+    if row is None:
+        return "missing"
+    delivery_state, current_claim = row
+    if delivery_state != "pending":
+        return "delivered"
+    if current_claim == claim_id:
+        return "owned"
+    if current_claim is None:
+        return "unclaimed"
+    return "other"
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
@@ -720,7 +1132,7 @@ def _prune_completed_locked() -> None:
     completed = [
         (rid, r)
         for rid, r in _records.items()
-        if r.get("status") != "running"
+        if r.get("status") not in {"running", "stalling", "finalizing"}
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -861,7 +1273,16 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    try:
+        _persist_dispatch(record)
+    except Exception:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        try:
+            _delete_durable_delegation(delegation_id)
+        except Exception:
+            logger.exception("Could not clean up failed async dispatch %s", delegation_id)
+        raise
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -912,8 +1333,45 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
-    _push_completion_event(event_record, result, status)
-    _finish_finalization(delegation_id, status)
+    _publish_finalization_with_retry(
+        delegation_id,
+        status,
+        lambda: _push_completion_event(event_record, result, status),
+    )
+
+
+def _publish_finalization_with_retry(
+    delegation_id: str,
+    status: str,
+    publish: Callable[[], None],
+) -> None:
+    """Keep a record finalizing until persistence and queue publication succeed."""
+
+    def _attempt() -> bool:
+        try:
+            publish()
+        except Exception:
+            logger.warning(
+                "Async delegation %s terminal publication failed; retrying",
+                delegation_id,
+                exc_info=True,
+            )
+            return False
+        _finish_finalization(delegation_id, status)
+        return True
+
+    if _attempt():
+        return
+
+    def _retry() -> None:
+        while not _attempt():
+            time.sleep(_FINALIZATION_RETRY_SECONDS)
+
+    threading.Thread(
+        target=_retry,
+        name=f"async-finalize-{delegation_id[:12]}",
+        daemon=True,
+    ).start()
 
 
 def _begin_finalization(
@@ -958,10 +1416,10 @@ def _push_completion_event(
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation %s finished but process_registry import failed; "
-            "result lost: %s",
+            "finalization will retry: %s",
             record.get("delegation_id"), exc,
         )
-        return
+        raise RuntimeError("process_registry import failed") from exc
 
     summary = result.get("summary")
     error = result.get("error")
@@ -1015,9 +1473,10 @@ def _push_completion_event(
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "finalization will retry: %s",
             record.get("delegation_id"), exc,
         )
+        raise
 
 
 def dispatch_async_delegation_batch(
@@ -1104,7 +1563,16 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    try:
+        _persist_dispatch(record)
+    except Exception:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        try:
+            _delete_durable_delegation(delegation_id)
+        except Exception:
+            logger.exception("Could not clean up failed async dispatch %s", delegation_id)
+        raise
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -1162,8 +1630,11 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
-    _push_batch_completion_event(event_record, combined, status)
-    _finish_finalization(delegation_id, status)
+    _publish_finalization_with_retry(
+        delegation_id,
+        status,
+        lambda: _push_batch_completion_event(event_record, combined, status),
+    )
 
 
 def _push_batch_completion_event(
@@ -1175,10 +1646,10 @@ def _push_batch_completion_event(
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
+            "failed; finalization will retry: %s",
             event_record.get("delegation_id"), exc,
         )
-        return
+        raise RuntimeError("process_registry import failed") from exc
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
@@ -1229,9 +1700,10 @@ def _push_batch_completion_event(
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "finalization will retry: %s",
             event_record.get("delegation_id"), exc,
         )
+        raise
 
 
 def _ensure_stale_monitor() -> None:
@@ -1389,31 +1861,31 @@ def _finalize_stalled(delegation_id: str) -> None:
         "stall_grace_seconds": _STALL_GRACE_SECONDS,
     }
     if event_record.get("is_batch"):
-        _push_batch_completion_event(
-            event_record,
-            {
-                "results": [],
-                "error": error,
-                "total_duration_seconds": duration,
-                **stall_meta,
-            },
-            "stalled",
+        combined = {
+            "results": [],
+            "error": error,
+            "total_duration_seconds": duration,
+            **stall_meta,
+        }
+        publish = lambda: _push_batch_completion_event(
+            event_record, combined, "stalled"
         )
     else:
-        _push_completion_event(
+        result = {
+            "status": "stalled",
+            "summary": None,
+            "error": error,
+            "api_calls": 0,
+            "duration_seconds": duration,
+            "exit_reason": "stalled",
+            **stall_meta,
+        }
+        publish = lambda: _push_completion_event(
             event_record,
-            {
-                "status": "stalled",
-                "summary": None,
-                "error": error,
-                "api_calls": 0,
-                "duration_seconds": duration,
-                "exit_reason": "stalled",
-                **stall_meta,
-            },
+            result,
             "stalled",
         )
-    _finish_finalization(delegation_id, "stalled")
+    _publish_finalization_with_retry(delegation_id, "stalled", publish)
 
 
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:

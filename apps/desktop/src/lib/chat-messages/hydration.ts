@@ -119,6 +119,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   const result: ChatMessage[] = []
   let pendingToolParts: ChatMessagePart[] = []
   let pendingToolTimestamp: number | undefined
+  let pendingTerminalDeliveryId: string | undefined
   let activeAssistantIndex: null | number = null
 
   const clearPendingTools = () => {
@@ -207,6 +208,13 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         ? 'system'
         : message.role
 
+    if (message.display_kind === 'async_delegation_complete') {
+      const deliveryId = parseDisplayMetadata(message.display_metadata)?.delivery_id
+      pendingTerminalDeliveryId = typeof deliveryId === 'string' && deliveryId.trim() ? deliveryId : undefined
+    } else if (message.role !== 'assistant') {
+      pendingTerminalDeliveryId = undefined
+    }
+
     // Persisted user turns carry `@image:<path>` directive lines inline in
     // the text (see tui_gateway/server.py's persist-time rewrite). The
     // read-only bubble clamps its body to ~2 lines, and a large inline image
@@ -294,6 +302,14 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     const reactions = messageReactions(message.display_metadata)
+    const persistedDeliveryId =
+      message.display_metadata &&
+      typeof message.display_metadata === 'object' &&
+      'delivery_id' in message.display_metadata &&
+      typeof message.display_metadata.delivery_id === 'string'
+        ? message.display_metadata.delivery_id
+        : undefined
+    const deliveryId = persistedDeliveryId ?? pendingTerminalDeliveryId
     // Gateway resume names the durable row id `row_id`; the REST transcript
     // prefetch ships the same messages.id as a numeric `id`. Either one lets
     // reactions address this exact row later.
@@ -304,10 +320,15 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       role: displayRole,
       parts,
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
+      ...(displayRole === 'assistant' && deliveryId ? { deliveryId } : {}),
       ...(rowId !== undefined ? { rowId } : {}),
       ...(reactions.length ? { reactions } : {}),
       ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {})
     })
+
+    if (displayRole === 'assistant') {
+      pendingTerminalDeliveryId = undefined
+    }
 
     activeAssistantIndex = message.role === 'assistant' ? result.length - 1 : null
   })

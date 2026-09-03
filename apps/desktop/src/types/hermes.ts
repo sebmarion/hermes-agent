@@ -549,6 +549,7 @@ export type TimelineDisplayMetadata =
   | { model: string; provider?: string }
   | {
       delegation_id: string
+      delivery_id?: string
       task_count: number
       completed_count?: number
       failed_count?: number

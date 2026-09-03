@@ -47,6 +47,52 @@ from typing import List, Dict, Any, Optional, Mapping
 
 logger = logging.getLogger(__name__)
 
+
+def _settle_legacy_async_delivery(
+    event: dict,
+    claim: str,
+    *,
+    complete,
+    release,
+    requeue,
+    max_attempts: int = 8,
+    sleep=time.sleep,
+) -> bool:
+    """Bound settlement retries and make an uncertain CLI claim recoverable."""
+    for attempt in range(max(1, int(max_attempts))):
+        try:
+            if complete(event, claim):
+                return True
+        except Exception:
+            logger.warning(
+                "Async completion %s settlement attempt %d failed",
+                event.get("delegation_id"),
+                attempt + 1,
+                exc_info=True,
+            )
+        if attempt + 1 < max(1, int(max_attempts)):
+            sleep(min(1.0, 0.1 * (2**attempt)))
+    try:
+        released = bool(release(event, claim))
+    except Exception:
+        logger.warning(
+            "Async completion %s claim release after settlement exhaustion failed",
+            event.get("delegation_id"),
+            exc_info=True,
+        )
+        return False
+    if released:
+        try:
+            requeue(event)
+        except Exception:
+            logger.warning(
+                "Async completion %s requeue after settlement exhaustion failed",
+                event.get("delegation_id"),
+                exc_info=True,
+            )
+    return False
+
+
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
@@ -13533,6 +13579,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from tools.async_delegation import (
             claim_event_delivery,
             complete_event_delivery,
+            release_event_delivery,
         )
 
         session_key = getattr(self, "session_id", "") or ""
@@ -13543,8 +13590,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
-            complete_event_delivery(event, claim)
+            try:
+                self._pending_input.put(synthetic_message)
+            except Exception:
+                # The claim remains pending when the parent-input queue is
+                # unavailable. Preserve the durable event for a later drain;
+                # never acknowledge a result that was not handed to the parent.
+                try:
+                    if release_event_delivery(event, claim):
+                        process_registry.completion_queue.put(event)
+                except Exception:
+                    logger.exception(
+                        "Could not release/preserve async completion %s after CLI input-queue failure",
+                        event.get("delegation_id"),
+                    )
+                continue
+            settled = _settle_legacy_async_delivery(
+                event,
+                claim,
+                complete=complete_event_delivery,
+                release=release_event_delivery,
+                requeue=process_registry.completion_queue.put,
+            )
+            if not settled and event.get("type") == "async_delegation":
+                # A lost/uncertain settlement remains recoverable through the
+                # durable completion queue rather than being silently dropped.
+                logger.warning(
+                    "Async completion %s was enqueued but not durably settled",
+                    event.get("delegation_id"),
+                )
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.

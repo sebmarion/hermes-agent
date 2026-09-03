@@ -7,6 +7,7 @@ import type { RpcEvent } from '@/types/hermes'
 import type { ClientSessionState } from '../../../../types'
 
 export interface GatewayEventDeps {
+  ackTerminalDelivery: (sessionId: string, deliveryId: string) => void
   activeGatewayProfile: string
   activeSessionIdRef: MutableRefObject<string | null>
   compactedTurnRef: MutableRefObject<Set<string>>
@@ -19,7 +20,8 @@ export interface GatewayEventDeps {
     text: string,
     responsePreviewed?: boolean,
     failure?: { error: string; partial: boolean },
-    occurredAt?: number
+    occurredAt?: number,
+    deliveryId?: string
   ) => void
   failAssistantMessage: (sessionId: string, errorMessage: string, occurredAt?: number) => void
   flushQueuedDeltas: (sessionId?: string) => void
