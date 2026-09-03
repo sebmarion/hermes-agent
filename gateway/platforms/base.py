@@ -3797,7 +3797,11 @@ class BasePlatformAdapter(ABC):
             return
         for factory, plugin_name in factories:
             try:
-                factory(native, self)
+                lifecycle = factory(native, self)
+                if isinstance(lifecycle, dict):
+                    self._plugin_lifecycle_handles = getattr(
+                        self, "_plugin_lifecycle_handles", [])
+                    self._plugin_lifecycle_handles.append((native, lifecycle))
                 logger.info(
                     "[%s] Wired native handlers from plugin '%s'",
                     self.name, plugin_name,
@@ -3807,6 +3811,35 @@ class BasePlatformAdapter(ABC):
                     "[%s] Plugin '%s' handler factory raised: %s",
                     self.name, plugin_name, exc, exc_info=True,
                 )
+
+    async def _start_plugin_lifecycle(self, native: Any) -> None:
+        import inspect
+        for owner, lifecycle in getattr(self, "_plugin_lifecycle_handles", []):
+            if owner is not native or not callable(lifecycle.get("on_ready")):
+                continue
+            result = lifecycle["on_ready"](native)
+            if inspect.isawaitable(result):
+                try:
+                    await result
+                except Exception:
+                    logger.exception("platform plugin ready hook failed")
+
+    async def _stop_plugin_lifecycle(self, native: Any) -> None:
+        import inspect
+        kept = []
+        for owner, lifecycle in getattr(self, "_plugin_lifecycle_handles", []):
+            if owner is not native:
+                kept.append((owner, lifecycle))
+                continue
+            callback = lifecycle.get("on_stop")
+            if callable(callback):
+                result = callback(native)
+                if inspect.isawaitable(result):
+                    try:
+                        await result
+                    except Exception:
+                        logger.exception("platform plugin stop hook failed")
+        self._plugin_lifecycle_handles = kept
 
     @property
     def name(self) -> str:

@@ -4848,10 +4848,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     # and will be GC'd (#67498).
                     if rebuild_app and _attempt < _max_connect - 1:
                         old_app = self._app
+                        await self._stop_plugin_lifecycle(old_app)
                         self._app = builder.build()
                         self._bot = self._app.bot
                         # Keep core and observer handlers in lockstep after a
                         # transient-init rebuild (#64176).
+                        self._wire_plugin_handlers(self._app)
                         self._register_handlers(self._app)
                         # Best-effort discard the old app's resources
                         try:
@@ -4859,6 +4861,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
             await self._app.start()
+            await self._start_plugin_lifecycle(self._app)
 
             # Decide between webhook and polling mode
             webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
@@ -5319,6 +5322,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if self._app:
             try:
+                await self._stop_plugin_lifecycle(self._app)
                 # Only stop the updater if it's running.  Bounded with a
                 # timeout: a CLOSE-WAIT socket can wedge stop() on epoll
                 # indefinitely, which would hang disconnect() (and any
