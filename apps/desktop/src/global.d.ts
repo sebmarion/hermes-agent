@@ -1203,6 +1203,11 @@ export interface HermesApiRequest {
   // through the owning connection, not the local profile pool. Omit / '' to
   // keep the legacy profile-routed path; explicit 'local' forces this device.
   connectionId?: string | null
+  // By-id ownership discovery may probe profiles that do not contain the
+  // session. The Electron bridge returns a null miss for this marked request;
+  // the renderer turns it back into a local 404 so recovery logic is preserved
+  // without Electron logging a rejected IPC handler.
+  suppressNotFound?: boolean
 }
 
 export interface HermesNotification {

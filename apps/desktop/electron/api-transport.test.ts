@@ -23,6 +23,7 @@ import {
   isTransientTransportError,
   jsonAgentFor,
   shouldRetryRequest,
+  shouldSuppressExpectedSessionNotFound,
   withRetry
 } from './api-transport'
 
@@ -108,6 +109,39 @@ describe('shouldRetryRequest truth table', () => {
     // No bodySent flag at all — treat as "may have been sent", don't retry.
     expect(shouldRetryRequest(reset(), 'POST', {})).toBe(false)
     expect(shouldRetryRequest(reset(), 'POST')).toBe(false)
+  })
+})
+
+describe('shouldSuppressExpectedSessionNotFound', () => {
+  it('suppresses an expected by-id session probe at the IPC boundary', () => {
+    expect(
+      shouldSuppressExpectedSessionNotFound(
+        {
+          path: '/api/sessions/stored-id?profile=worker',
+          suppressNotFound: true
+        },
+        Object.assign(new Error('404: {"detail":"Session not found"}'), { statusCode: 404 })
+      )
+    ).toBe(true)
+  })
+
+  it('does not suppress arbitrary 404s or unmarked requests', () => {
+    const error = Object.assign(new Error('404: {"detail":"Session not found"}'), { statusCode: 404 })
+
+    expect(shouldSuppressExpectedSessionNotFound({ path: '/api/sessions/id' }, error)).toBe(false)
+    expect(shouldSuppressExpectedSessionNotFound({ path: '/api/config', suppressNotFound: true }, error)).toBe(false)
+    expect(
+      shouldSuppressExpectedSessionNotFound(
+        { path: '/api/sessions/id/messages', suppressNotFound: true },
+        error
+      )
+    ).toBe(false)
+    expect(
+      shouldSuppressExpectedSessionNotFound(
+        { path: '/api/sessions/id', suppressNotFound: true },
+        Object.assign(new Error('500: boom'), { statusCode: 500 })
+      )
+    ).toBe(false)
   })
 })
 

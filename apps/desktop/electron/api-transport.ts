@@ -167,6 +167,34 @@ async function withRetry(makeAttempt, options: any = {}) {
   throw lastError
 }
 
+/**
+ * A cross-profile session lookup deliberately asks backends that may not own
+ * the durable row. A 404 from that read is a normal miss, but letting it
+ * reject the Electron IPC handler makes Electron print a handler error before
+ * the renderer can catch it. Only an explicitly marked, exact session-resource
+ * lookup is eligible; all other 404s remain real failures.
+ */
+function shouldSuppressExpectedSessionNotFound(request: any, error: any): boolean {
+  if (request?.suppressNotFound !== true) {
+    return false
+  }
+
+  const statusCode = Number(error?.statusCode)
+
+  if (statusCode !== 404 || !/session not found/i.test(String(error?.message || ''))) {
+    return false
+  }
+
+  const method = String(request?.method || 'GET').toUpperCase()
+  const path = String(request?.path || '')
+
+  return (
+    (method === 'GET' || method === 'HEAD') &&
+    /^\/api\/sessions\/[^/?]+(?:\?.*)?$/.test(path) &&
+    !path.startsWith('/api/sessions/search')
+  )
+}
+
 export {
   destroyKeepaliveAgents,
   downloadAgentFor,
@@ -174,5 +202,6 @@ export {
   isTransientTransportError,
   jsonAgentFor,
   shouldRetryRequest,
+  shouldSuppressExpectedSessionNotFound,
   withRetry
 }

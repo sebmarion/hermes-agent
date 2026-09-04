@@ -6,19 +6,57 @@ vi.mock('./client', () => ({
   capabilityScoped: vi.fn(),
   getApiRequestConnection: vi.fn(() => 'prometheus'),
   hermesApi: vi.fn(),
-  profileScoped: vi.fn(() => ({}))
+  profileScoped: vi.fn(() => ({})),
+  sessionScoped: vi.fn((scope?: unknown) => {
+    if (typeof scope === 'string') {
+      return { profile: scope }
+    }
+
+    if (scope && typeof scope === 'object') {
+      return scope
+    }
+
+    return {}
+  })
 }))
 
 const client = await import('./client')
 
-const { deleteSession, setSessionArchived, setSessionPinnedRemote, setSessionUnreadRemote, listSidebarSessions } =
-  await import('./sessions')
+const {
+  deleteSession,
+  getSession,
+  setSessionArchived,
+  setSessionPinnedRemote,
+  setSessionUnreadRemote,
+  listSidebarSessions
+} = await import('./sessions')
 
 const hermesApi = vi.mocked(client.hermesApi)
 
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(client.getApiRequestConnection).mockReturnValue('prometheus')
+  vi.mocked(client.capabilityScoped).mockImplementation(scope =>
+    typeof scope === 'string' ? { profile: scope } : scope && typeof scope === 'object' ? (scope as never) : {}
+  )
+})
+
+describe('getSession expected misses', () => {
+  it('keeps a profile probe miss local so Electron does not log a handler error', async () => {
+    hermesApi.mockResolvedValue(null as never)
+
+    await expect(getSession('missing-session', 'worker')).rejects.toMatchObject({
+      statusCode: 404,
+      message: 'Session not found'
+    })
+
+    expect(hermesApi).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/sessions/missing-session?profile=worker',
+        suppressNotFound: true
+      })
+    )
+  })
 })
 
 describe('deleteSession profile scoping', () => {

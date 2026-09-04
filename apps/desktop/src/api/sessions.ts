@@ -355,13 +355,21 @@ export function searchSessions(query: string): Promise<SessionSearchResponse> {
 // the given `profile`). The backend resolves exact ids and unique prefixes and
 // 404s when the id isn't on that profile — so a cheap by-id lookup replaces the
 // cross-profile list scan when locating an unknown id's owner.
-export function getSession(id: string, profile?: ProfileScope): Promise<SessionInfo> {
+export async function getSession(id: string, profile?: ProfileScope): Promise<SessionInfo> {
   const suffix = sessionScopeQuery(profile)
 
-  return hermesApi<SessionInfo>({
+  const session = await hermesApi<SessionInfo | null>({
     ...sessionScoped(profile),
-    path: `/api/sessions/${encodeURIComponent(id)}${suffix}`
+    path: `/api/sessions/${encodeURIComponent(id)}${suffix}`,
+    suppressNotFound: true
   })
+
+  if (session === null) {
+    const error = Object.assign(new Error('Session not found'), { statusCode: 404 })
+    throw error
+  }
+
+  return session
 }
 
 // Reads another profile's transcript. For a remote profile Electron reroutes
