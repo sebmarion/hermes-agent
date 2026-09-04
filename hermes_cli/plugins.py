@@ -3258,6 +3258,12 @@ class PluginContext:
             raise ValueError("owner inbox provider must be callable")
         self._manager._owner_inbox_providers.append(provider)
 
+    def register_prompt_admission_observer(self, observer: Callable) -> None:
+        """Observe accepted prompt preflight before session persistence."""
+        if not callable(observer):
+            raise ValueError("prompt admission observer must be callable")
+        self._manager._prompt_admission_observers.append(observer)
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -3811,6 +3817,7 @@ class PluginManager:
         self._cli_ref = None  # Set by CLI after plugin discovery
         self._gateway_message_injector: tuple[object, Callable] | None = None
         self._owner_inbox_providers: list[Callable] = []
+        self._prompt_admission_observers: list[Callable] = []
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         self._portable_mcp_servers: Dict[str, Dict[str, Any]] = {}
@@ -6183,6 +6190,9 @@ class PluginManager:
         """Return a snapshot of providers for the current owner process."""
         return list(self._owner_inbox_providers)
 
+    def prompt_admission_observers(self) -> list[Callable]:
+        return list(self._prompt_admission_observers)
+
     def has_portable_mcp_servers(self) -> bool:
         return bool(self._portable_mcp_servers)
 
@@ -6363,6 +6373,17 @@ def get_owner_inbox_providers() -> list[Callable]:
 
 _background_discovery_thread: Optional[threading.Thread] = None
 _background_discovery_lock = threading.Lock()
+
+
+def fire_pre_prompt_admission(*, profile: str, session_id: str,
+                               is_owner_reply: bool, text: str = "") -> None:
+    """Run pre-persistence prompt observers; failures never block prompts."""
+    for observer in get_plugin_manager().prompt_admission_observers():
+        try:
+            observer(profile=profile, session_id=session_id,
+                     is_owner_reply=is_owner_reply, text=text)
+        except Exception:
+            logger.warning("prompt admission observer failed", exc_info=True)
 
 
 def start_background_plugin_discovery() -> None:

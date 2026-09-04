@@ -2167,6 +2167,13 @@ def _build_child_agent(
     # ``list_sessions_rich`` child-exclusion clause.
     parent_sid = getattr(parent_agent, "session_id", None)
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
+        launch_id = f"delegate-launch-{_uuid.uuid4().hex}"
+        child._session_init_model_config["_origin"] = {
+            "version": 1,
+            "launch_id": launch_id,
+            "created_session_id": getattr(child, "session_id", None),
+            "parent_session_id": parent_sid,
+        }
         child._session_init_model_config["_delegate_from"] = parent_sid
         child._session_init_model_config["_created_by"] = "agent_delegate"
         child._session_init_model_config["_origin_kind"] = "delegated_child"
@@ -4057,6 +4064,7 @@ def delegate_task(
     _origin_owner_transport, _origin_owner_session_record = (
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
+    _parent_session_id = str(getattr(parent_agent, "session_id", "") or "")
 
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
@@ -4064,6 +4072,7 @@ def delegate_task(
     # toolset resolution never leaks into the parent (shared with the plugin
     # subagent-lifecycle API).
     children = []
+    child_mapping = None
     for i, t in enumerate(task_list):
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
@@ -4124,6 +4133,23 @@ def delegate_task(
         # attribution (child-started background processes report under it).
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
+            origin = getattr(child, "_session_init_model_config", {}).get("_origin", {})
+            if n_tasks == 1:
+                candidate_mapping = {
+                    "child_session_id": str(getattr(child, "session_id", "") or ""),
+                    "launch_id": str(origin.get("launch_id") or ""),
+                    "origin_version": origin.get("version"),
+                    "created_session_id": str(origin.get("created_session_id") or ""),
+                    "parent_session_id": str(origin.get("parent_session_id") or ""),
+                }
+                if (
+                    all(candidate_mapping[key] for key in (
+                        "child_session_id", "launch_id", "created_session_id",
+                        "parent_session_id",
+                    ))
+                    and candidate_mapping["origin_version"] == 1
+                ):
+                    child_mapping = candidate_mapping
         children.append((i, t, child))
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
@@ -4508,6 +4534,7 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            child_mapping=child_mapping,
         )
 
         if dispatch.get("status") == "dispatched":

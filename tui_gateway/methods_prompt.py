@@ -442,6 +442,39 @@ def _(rid, params: dict) -> dict:
             str(limit_message),
             {"reason": reason} if reason else None,
         )
+    owner_prepare = params.get("_owner_prepare")
+    owner_admit = params.get("_owner_admit")
+    if callable(owner_prepare) or callable(owner_admit):
+        try:
+            from agent import relay_runtime
+            agent_session_id = str(
+                getattr(session.get("agent"), "session_id", "")
+                or session.get("session_key") or sid
+            )
+            if relay_runtime.SESSION_COORDINATOR.has_active_turn(
+                profile_key=relay_runtime.current_profile_key(),
+                session_id=agent_session_id,
+            ):
+                return _err(rid, 4091, "owner task is busy")
+        except Exception:
+            return _err(rid, 4091, "owner task activity could not be verified")
+    try:
+        from hermes_cli.plugins import fire_pre_prompt_admission
+        fire_pre_prompt_admission(
+            profile=_current_profile_name(), session_id=str(
+                getattr(session.get("agent"), "session_id", "")
+                or session.get("session_key") or sid
+            ),
+            is_owner_reply=bool(params.get("_owner_action_id")),
+            text=str(params.get("text") or ""),
+        )
+    except Exception:
+        logger.debug("pre-prompt admission observer dispatch failed", exc_info=True)
+    if callable(owner_prepare):
+        try:
+            owner_prepare()
+        except Exception as exc:
+            return _err(rid, 5073, f"owner prompt preparation failed: {exc}")
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
@@ -933,10 +966,16 @@ def _(rid, params: dict) -> dict:
         if owner_admit is not None:
             if not callable(owner_admit):
                 return _err(rid, 4003, "invalid owner dispatch proof")
-            if not owner_admit():
-                return _err(rid, 4091, "owner dispatch admission rejected")
             owner_storage_ready = True
         session["running"] = True
+        if callable(owner_admit):
+            session["_chief_automation"] = bool(params.get("_chief_automation"))
+            session["_owner_profile"] = params.get("profile") or _current_profile_name()
+            session["_owner_durable_session_id"] = params.get("_owner_durable_session_id", sid)
+            session["_owner_admit_callback"] = owner_admit
+            session["_owner_action_id"] = params.get("_owner_action_id")
+            session["_owner_request_id"] = params.get("_owner_request_id")
+            session["_owner_source_user_message_row_id"] = params.get("work_generation")
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         if internal_hosted_submit:
@@ -1023,12 +1062,20 @@ def _(rid, params: dict) -> dict:
                 error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
             )
             with session["history_lock"]:
+                session.pop("_owner_admit_callback", None)
+                session.pop("_owner_action_id", None)
+                session.pop("_owner_request_id", None)
+                session.pop("_chief_automation", None)
                 session["running"] = False
                 session["last_active"] = time.time()
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
+                session.pop("_owner_admit_callback", None)
+                session.pop("_owner_action_id", None)
+                session.pop("_owner_request_id", None)
+                session.pop("_chief_automation", None)
                 session["running"] = False
                 _clear_inflight_turn(session)
                 # Surface the cancellation to the client. Without this emit the

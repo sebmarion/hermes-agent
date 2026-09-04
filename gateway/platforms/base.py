@@ -3818,12 +3818,9 @@ class BasePlatformAdapter(ABC):
         for owner, lifecycle in getattr(self, "_plugin_lifecycle_handles", []):
             if owner is not native or not callable(lifecycle.get("on_ready")):
                 continue
-            try:
-                result = lifecycle["on_ready"](native)
-                if inspect.isawaitable(result):
-                    await asyncio.wait_for(result, timeout=5.0)
-            except Exception:
-                logger.exception("platform plugin ready hook failed")
+            await self._run_plugin_lifecycle_callback(
+                lifecycle["on_ready"], native, "ready"
+            )
 
     async def _stop_plugin_lifecycle(self, native: Any) -> None:
         import asyncio
@@ -3834,14 +3831,66 @@ class BasePlatformAdapter(ABC):
                 kept.append((owner, lifecycle))
                 continue
             callback = lifecycle.get("on_stop")
-            try:
-                if callable(callback):
-                    result = callback(native)
-                    if inspect.isawaitable(result):
-                        await asyncio.wait_for(result, timeout=5.0)
-            except Exception:
-                logger.exception("platform plugin stop hook failed")
+            if callable(callback):
+                await self._run_plugin_lifecycle_callback(callback, native, "stop")
         self._plugin_lifecycle_handles = kept
+
+    async def _run_plugin_lifecycle_callback(
+        self, callback: Any, native: Any, phase: str
+    ) -> None:
+        """Run one lifecycle callback without allowing cancellation resistance to block.
+
+        ``asyncio.wait_for`` waits for a cancellation-resistant coroutine to
+        finish its cleanup, so a nominal five-second timeout is not a hard
+        adapter deadline. Keep the task tracked after cancelling it and let
+        its done callback consume any eventual exception.
+        """
+        import asyncio
+        import inspect
+
+        try:
+            result = callback(native)
+            if not inspect.isawaitable(result):
+                return
+            task = asyncio.create_task(result)
+            tasks = getattr(self, "_plugin_lifecycle_background_tasks", None)
+            if tasks is None:
+                tasks = set()
+                self._plugin_lifecycle_background_tasks = tasks
+            tasks.add(task)
+
+            def finish(done_task):
+                tasks.discard(done_task)
+                if done_task.cancelled():
+                    return
+                try:
+                    error = done_task.exception()
+                except asyncio.CancelledError:
+                    return
+                if error is not None:
+                    logger.error(
+                        "platform plugin %s hook failed after detachment: %s",
+                        phase, error, exc_info=error,
+                    )
+
+            task.add_done_callback(finish)
+            done, pending = await asyncio.wait({task}, timeout=5.0)
+            if pending:
+                for pending_task in pending:
+                    pending_task.cancel()
+                logger.error(
+                    "platform plugin %s hook exceeded 5s deadline; "
+                    "continuing cleanup in background", phase,
+                )
+                return
+            # Retrieve a completed exception on the current path too; the done
+            # callback remains responsible for tasks that outlive this method.
+            if done:
+                done_task = next(iter(done))
+                if not done_task.cancelled():
+                    done_task.result()
+        except Exception:
+            logger.exception("platform plugin %s hook failed", phase)
 
     @property
     def name(self) -> str:

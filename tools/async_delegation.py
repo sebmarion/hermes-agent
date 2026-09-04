@@ -182,7 +182,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            child_session_id TEXT, launch_id TEXT,
+            origin_version INTEGER, created_session_id TEXT
         )"""
     )
     conn.execute(
@@ -226,6 +228,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        ("child_session_id", "TEXT"),
+        ("launch_id", "TEXT"),
+        ("origin_version", "INTEGER"),
+        ("created_session_id", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -314,6 +320,72 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
              record.get("origin_session_id", "")),
         )
     _prune_durable_records()
+
+
+def bind_child_delegation(delegation_id: str, *, child_session_id: str,
+                           launch_id: str, origin_version: int,
+                           created_session_id: str, parent_session_id: str) -> bool:
+    """Persist the immutable child/launcher mapping for one delegation."""
+    if not all((delegation_id, child_session_id, launch_id, created_session_id,
+                parent_session_id)) or origin_version != 1:
+        return False
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET child_session_id=?, launch_id=?,
+                      origin_version=?, created_session_id=?, parent_session_id=?
+               WHERE delegation_id=? AND (child_session_id IS NULL
+                                          OR child_session_id=?)""",
+            (child_session_id, launch_id, origin_version, created_session_id,
+             parent_session_id, delegation_id, child_session_id),
+        )
+        return cur.rowcount == 1
+
+
+def list_durable_delegations() -> List[Dict[str, Any]]:
+    """Return durable child mappings with completion and delivery evidence."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT d.delegation_id, d.parent_session_id, d.child_session_id,
+ d.launch_id, d.origin_version, d.created_session_id, d.state,
+                      d.event_json, d.result_json, d.delivery_state,
+                      o.delivery_id, o.session_id, o.acknowledged_at,
+                      d.dispatched_at
+                 FROM async_delegations d
+                 LEFT JOIN async_terminal_outbox o ON o.delegation_id=d.delegation_id
+                WHERE d.child_session_id IS NOT NULL"""
+        ).fetchall()
+        out = []
+        for row in rows:
+            event = json.loads(row[7] or "{}")
+            result = json.loads(row[8] or "{}")
+            out.append({
+                "delegation_id": row[0], "parent_session_id": row[1],
+                "child_session_id": row[2], "launch_id": row[3],
+                "origin_version": row[4], "created_session_id": row[5],
+                "status": row[6], "event": event, "result": result,
+                "delivery_state": row[9],
+                "delivery_receipt": (
+                    {"delivery_id": row[10], "session_id": row[11],
+                     "acknowledged_at": row[12]}
+                    if row[10] is not None else None
+                ),
+                "origin_created_at": row[13],
+            })
+        return out
+
+
+def get_delivery_receipt(delegation_id: str) -> Optional[Dict[str, Any]]:
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT delivery_id, session_id, acknowledged_at
+                 FROM async_terminal_outbox
+                WHERE delegation_id=? AND acknowledged_at IS NOT NULL""",
+            (delegation_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"delivery_id": row[0], "session_id": row[1],
+            "acknowledged_at": row[2]}
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
@@ -1495,6 +1567,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    child_mapping: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1565,6 +1638,11 @@ def dispatch_async_delegation_batch(
 
     try:
         _persist_dispatch(record)
+        if child_mapping is not None:
+            if not bind_child_delegation(delegation_id, **child_mapping):
+                raise RuntimeError(
+                    f"Could not bind child mapping for async delegation {delegation_id}"
+                )
     except Exception:
         with _records_lock:
             _records.pop(delegation_id, None)

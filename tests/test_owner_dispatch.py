@@ -1,4 +1,5 @@
 import threading
+import types
 
 from tui_gateway.owner_inbox import OwnerDispatch, live_owner_dispatch
 from tui_gateway import server
@@ -102,3 +103,82 @@ def test_snapshot_uses_authoritative_agent_activity_summary(monkeypatch):
     snap = dispatch.snapshot("default", "durable-activity")
     assert snap["last_active"] == 123.5
     assert snap["active_tools"] is True
+
+
+def test_automation_prefers_newer_durable_genuine_activity(monkeypatch):
+    class Agent:
+        session_id = "durable-activity"
+
+        def get_activity_summary(self):
+            return {"genuine_activity_at": 100.0, "current_tool": None}
+
+    class DB:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_session(self, session_id):
+            return {"id": session_id, "genuine_activity_at": 200.0,
+                    "git_repo_root": "repo"}
+
+        def get_messages(self, session_id, limit=500, after_id=None):
+            return []
+
+        def get_session_turn_lease(self, session_id):
+            return None
+
+        def session_yolo_enabled(self, row):
+            return False
+
+        def latest_message_row_id(self, session_id, role, require_text=False):
+            return 1
+
+    session = {"session_key": "durable-activity", "running": False,
+               "history_lock": threading.RLock(), "agent": Agent()}
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(server, "_sessions", {"live-activity": session})
+    monkeypatch.setattr(server, "_profile_db", lambda params: DB())
+    dispatch = live_owner_dispatch(server, lambda params, current: {"ok": True})
+
+    snapshot = dispatch.automation("default", "durable-activity")
+
+    assert snapshot["last_activity"] == 200.0
+    assert snapshot["evidence_complete"] is True
+
+
+def test_snapshot_rejects_ended_compression_alias(monkeypatch):
+    class Agent:
+        session_id = "active-continuation"
+    session = {"session_key": "ended-parent", "running": False,
+               "history_lock": threading.RLock(), "agent": Agent()}
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(server, "_sessions", {"live": session})
+    dispatch = live_owner_dispatch(server, lambda params, current: {"ok": True})
+    assert dispatch.snapshot("default", "ended-parent") is None
+
+
+def test_extractor_uses_live_runtime_without_tools(monkeypatch):
+    import agent.auxiliary_client as auxiliary
+    class Agent:
+        session_id = "extract-session"
+        _current_turn_id = "turn-current"
+        def _current_main_runtime(self): return {"api_mode": "codex_responses"}
+    session = {"session_key": "extract-session", "running": False,
+               "history_lock": threading.RLock(), "agent": Agent()}
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(server, "_sessions", {"live-extract": session})
+    seen = {}
+    def fake_call(**kwargs):
+        seen.update(kwargs)
+        message = types.SimpleNamespace(content='{"needs_user_input":false}')
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
+    monkeypatch.setattr(auxiliary, "call_llm", fake_call)
+    dispatch = live_owner_dispatch(server, lambda params, session: {"ok": True})
+    result = dispatch.extract("default", "extract-session", [{"role": "assistant", "content": "ok"}])
+    assert result == '{"needs_user_input":false}'
+    assert seen["tools"] == [] and seen["main_runtime"] == {"api_mode": "codex_responses"}
+    assert seen["max_tokens"] <= 512 and seen["timeout"] <= 15
+    assert [m["role"] for m in seen["messages"]] == ["system", "user"]
+    assert len(seen["messages"]) == 2

@@ -1,5 +1,7 @@
 import threading
+from types import SimpleNamespace
 
+from hermes_cli import plugins as plugins_mod
 from tui_gateway import server
 from tui_gateway.owner_inbox import live_owner_dispatch
 from tui_gateway.transport import bind_transport, current_transport, reset_transport
@@ -61,7 +63,8 @@ def test_real_prompt_submit_idle_path_admits_inside_claim(monkeypatch):
         reset_transport(token)
     time.sleep(0.05)
     assert result["result"]["status"] == "streaming"
-    assert admitted == [False]
+    assert admitted == []
+    assert session.get("_owner_admit_callback") is None
     assert session["running"] is False
 
 
@@ -74,12 +77,33 @@ def test_prompt_storage_failure_precedes_owner_admission(monkeypatch):
     monkeypatch.setattr(server, "_sessions", {"live-fail": session})
     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda sid, s: None)
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda s: False)
+    observer_calls = []
+    monkeypatch.setattr(plugins_mod, "fire_pre_prompt_admission", lambda **kw: observer_calls.append(kw))
     started = []
     monkeypatch.setattr(server, "_start_agent_build", lambda *args: started.append(True))
     admitted = []
+    prepared = []
     result = handler("r2", {"session_id": "live-fail", "text": "go",
+                              "_owner_prepare": lambda: prepared.append(True),
                               "_owner_admit": lambda: admitted.append(True) or True})
     assert result["error"]["code"] == 5072
     assert admitted == []
+    assert prepared == [True]
+    assert observer_calls and observer_calls[0]["is_owner_reply"] is False
     assert started == []
     assert session["running"] is False
+
+
+def test_chief_automation_turn_does_not_reset_genuine_activity_clock():
+    from run_agent import AIAgent
+
+    agent = SimpleNamespace(
+        _last_activity_ts=None, _last_activity_desc=None,
+        _last_activity_provenance=None, _chief_automation_turn=True,
+        _persist_session_activity_if_due=lambda: None,
+    )
+    AIAgent._touch_activity(agent, "Chief progress summary")
+    assert getattr(agent, "_genuine_activity_ts", None) is None
+    agent._chief_automation_turn = False
+    AIAgent._touch_activity(agent, "real owned work")
+    assert agent._genuine_activity_ts == agent._last_activity_ts

@@ -303,6 +303,30 @@ class TestChildRunBudget(unittest.TestCase):
 
 
 class TestDelegateTask(unittest.TestCase):
+    def test_child_session_has_immutable_launch_provenance(self):
+        parent = _make_mock_parent(depth=0)
+        parent.session_id = "parent-session"
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.session_id = "child-session"
+            child._session_init_model_config = {}
+            MockAgent.return_value = child
+            _build_child_agent(
+                task_index=0,
+                goal="test provenance",
+                context=None,
+                toolsets=None,
+                model="test-model",
+                max_iterations=5,
+                parent_agent=parent,
+                task_count=1,
+            )
+        origin = child._session_init_model_config["_origin"]
+        self.assertEqual(origin["version"], 1)
+        self.assertTrue(origin["launch_id"])
+        self.assertEqual(origin["created_session_id"], "child-session")
+        self.assertEqual(origin["parent_session_id"], "parent-session")
+
     def test_no_parent_agent(self):
         result = json.loads(delegate_task(goal="test"))
         self.assertIn("error", result)
