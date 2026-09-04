@@ -112,6 +112,63 @@ def test_live_owner_archive_uses_real_sessiondb_and_manual_restore(tmp_path, mon
     check = SessionDB(db_path=profile_home / "state.db")
     assert check.get_session("child")["archived"] == 0
     check.close()
+    assert owner.archive("p", "child", True, expected_lineage=lineage,
+                         expected_proof=proof) is False
+    check = SessionDB(db_path=profile_home / "state.db")
+    assert check.get_session("child")["archived"] == 0
+    check.close()
+
+
+def test_live_owner_archive_refuses_real_second_session_activity(tmp_path, monkeypatch):
+    from tui_gateway import server
+    from tui_gateway.owner_inbox import live_owner_dispatch
+
+    profile_home = tmp_path / "profile"
+    db = SessionDB(db_path=profile_home / "state.db")
+    writer = SessionDB(db_path=profile_home / "state.db")
+    db.create_session("parent", "desktop", git_repo_root="repo")
+    db.append_message("parent", "assistant", "child result",
+                      display_metadata={"delivery_id": "delivery-1"})
+    db.create_session("child", "delegate", parent_session_id="parent",
+                      git_repo_root="repo", model_config={
+                          "_origin": {"version": 1, "launch_id": "launch-1",
+                                      "created_session_id": "child",
+                                      "parent_session_id": "parent"},
+                          "_delegate_from": "parent",
+                          "_created_by": "agent_delegate",
+                          "_origin_kind": "delegated_child",
+                      })
+    db.append_message("child", "assistant", "completed work")
+    db.end_session("child", "completed")
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "p")
+    monkeypatch.setattr(server, "_sessions", {})
+
+    @contextmanager
+    def profile_db(_params):
+        yield db
+
+    monkeypatch.setattr(server, "_profile_db", profile_db)
+    owner = live_owner_dispatch(server, lambda *args: None)
+    lineage = owner.lineage("p", "child")
+    proof = {"delegation_id": "delegation-1", "launch_id": "launch-1",
+             "origin_version": 1, "created_session_id": "child",
+             "parent_session_id": "parent", "child_session_id": "child",
+             "completion_id": "delegation-1", "delivery_id": "delivery-1",
+             "delivery_session_id": "parent", "delivery_acknowledged_at": 1}
+    original = db.set_session_archived
+
+    def append_before_archive(*args, **kwargs):
+        writer.append_message("child", "assistant", "late concurrent activity")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(db, "set_session_archived", append_before_archive)
+    try:
+        assert owner.archive("p", "child", True, expected_lineage=lineage,
+                             expected_proof=proof) is False
+        assert db.get_session("child")["archived"] == 0
+    finally:
+        writer.close()
+        db.close()
 
 
 def test_owner_automation_pages_pending_calls_and_reads_native_queue(tmp_path, monkeypatch):
