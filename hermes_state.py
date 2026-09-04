@@ -4228,22 +4228,22 @@ def divert_session_transcript_jsonl(session_id: str, messages) -> "Optional[Path
 
 
 def _read_sqlite_application_id(db_path: Path) -> "Optional[int]":
-    """Read application_id from the SQLite header without opening a connection."""
+    """Read the generation stamp through SQLite without cancelling live locks."""
     try:
-        with db_path.open("rb") as handle:
-            header = handle.read(_STATE_DB_APPLICATION_ID_OFFSET + 4)
-    except OSError:
+        conn = _connect_tracked_db(
+            db_path.resolve().as_uri() + "?mode=ro",
+            tracking_path=db_path,
+            uri=True,
+            timeout=0.0,
+            isolation_level=None,
+        )
+        try:
+            row = conn.execute("PRAGMA application_id").fetchone()
+            return int(row[0]) if row else None
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError):
         return None
-    if len(header) < _STATE_DB_APPLICATION_ID_OFFSET + 4:
-        return None
-    if header[:16] != b"SQLite format 3\x00":
-        return None
-    return int(
-        struct.unpack(
-            ">I",
-            header[_STATE_DB_APPLICATION_ID_OFFSET:_STATE_DB_APPLICATION_ID_OFFSET + 4],
-        )[0]
-    )
 
 
 def _stat_db_file_identity(path: Path) -> "Optional[tuple]":
