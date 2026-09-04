@@ -105,6 +105,55 @@ class TestRunJobScript:
         assert success is True
         assert output == "relative works"
 
+    @pytest.mark.live_system_guard_bypass
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX setsid regression")
+    def test_script_timeout_kills_a_detached_descendant(self, cron_env, monkeypatch):
+        import signal
+        import time
+
+        import psutil
+
+        from cron.scheduler import _run_job_script
+
+        pid_file = cron_env / "detached-child.pid"
+        script = cron_env / "scripts" / "detached.py"
+        child_code = (
+            "import os,pathlib,time; "
+            "os.setsid(); "
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+            "time.sleep(60)"
+        )
+        script.write_text(
+            "import subprocess,sys,time\n"
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            "time.sleep(60)\n"
+        )
+        monkeypatch.setenv("HERMES_CRON_SCRIPT_TIMEOUT", "1")
+        detached_pid = None
+
+        def alive(pid: int) -> bool:
+            try:
+                return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+            except psutil.Error:
+                return False
+
+        try:
+            success, output = _run_job_script(str(script))
+            assert success is False
+            assert "timed out" in output.lower()
+            deadline = time.monotonic() + 3
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert pid_file.exists()
+            detached_pid = int(pid_file.read_text())
+            deadline = time.monotonic() + 3
+            while alive(detached_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not alive(detached_pid)
+        finally:
+            if detached_pid is not None and alive(detached_pid):
+                os.kill(detached_pid, signal.SIGKILL)
+
 
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):
         """Cron scripts must not inherit Hermes provider env (SECURITY.md §2.3)."""

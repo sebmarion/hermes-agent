@@ -97,7 +97,7 @@ def _remote_main_sha(repo: Path) -> str:
 def _load_sync_state() -> dict:
     path = STATE / "upstream-sync.json"
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     return raw if isinstance(raw, dict) else {}
@@ -382,7 +382,10 @@ def main() -> int:
             f"via fast-forward to {published_sha}"
         )
         report = STATE / "last-upstream-merge.txt"
-        report.write_text(f"started={started}\nexit_code=0\n{output}\n")
+        report.write_text(
+            f"started={started}\nexit_code=0\n{output}\n",
+            encoding="utf-8",
+        )
         _notify(
             "upgrade",
             "Daily Hermes upstream sync succeeded. The isolated tested candidate was "

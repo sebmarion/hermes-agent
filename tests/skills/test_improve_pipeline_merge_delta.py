@@ -11,6 +11,7 @@ These tests define the required behavior for the new delta-based updater:
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -138,6 +139,62 @@ def test_delta_preserves_owned_paths_byte_identical(tmp_path: Path) -> None:
     assert (preview / "core.py").read_text() == "core-upstream\n"
 
 
+def test_delta_preserves_an_owned_deletion(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo, {"core.py": "base\n"})
+    (repo / "owned.txt").write_text("upstream resurrected it\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "upstream adds owned path")
+    upstream_sha = _git(repo, "rev-parse", "HEAD")
+    state_path = tmp_path / "state" / "upstream-sync.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps({"schema": 1, "upstream_sha": base, "owned_paths": ["owned.txt"]})
+    )
+    preview = tmp_path / "preview"
+
+    report = mu.build_delta_candidate(
+        repo, base, upstream_sha, base, state_path, preview
+    )
+
+    assert report["owned_paths"] == ["owned.txt", "scripts/improve_loop_wrapper.py"]
+    assert not (preview / "owned.txt").exists()
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{report['candidate_sha']}:owned.txt"],
+        cwd=repo,
+        capture_output=True,
+    ).returncode != 0
+
+
+def test_delta_owned_restore_does_not_follow_an_upstream_symlink(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo, {"owned.txt": "local\n"})
+    outside = tmp_path / "outside.txt"
+    outside.write_text("safe\n")
+    (repo / "owned.txt").unlink()
+    (repo / "owned.txt").symlink_to(outside)
+    _git(repo, "add", "owned.txt")
+    _git(repo, "commit", "-qm", "upstream symlink")
+    upstream_sha = _git(repo, "rev-parse", "HEAD")
+    state_path = tmp_path / "state" / "upstream-sync.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps({"schema": 1, "upstream_sha": base, "owned_paths": ["owned.txt"]})
+    )
+    preview = tmp_path / "preview"
+
+    report = mu.build_delta_candidate(
+        repo, base, upstream_sha, base, state_path, preview
+    )
+
+    assert outside.read_text() == "safe\n"
+    assert not (preview / "owned.txt").is_symlink()
+    assert (preview / "owned.txt").read_text() == "local\n"
+    assert _git(repo, "show", f"{report['candidate_sha']}:owned.txt") == "local"
+
+
 def test_delta_halts_on_missing_anchor(tmp_path: Path) -> None:
     """Contract 4: missing/corrupt/unknown upstream anchor halts."""
     repo = tmp_path / "repo"
@@ -211,6 +268,38 @@ def test_delta_candidate_records_exact_local_and_upstream_parents(tmp_path: Path
     )
 
 
+def test_owned_only_delta_still_records_upstream_parent_with_local_tree(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(
+        repo,
+        {"scripts/improve_loop_wrapper.py": "local-owned\n"},
+    )
+
+    (repo / "scripts/improve_loop_wrapper.py").write_text("upstream-owned\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "upstream owned-only delta")
+    upstream_sha = _git(repo, "rev-parse", "HEAD")
+
+    preview = tmp_path / "preview"
+    report = mu.build_delta_candidate(
+        repo,
+        base,
+        upstream_sha,
+        base,
+        tmp_path / "state" / "upstream-sync.json",
+        preview,
+    )
+
+    assert report["candidate_sha"] != base
+    assert report["merge_parents"] == [base, upstream_sha]
+    assert report["candidate_tree_sha"] == _git(repo, "rev-parse", f"{base}^{{tree}}")
+    assert _git(
+        preview, "rev-list", "--parents", "-n", "1", report["candidate_sha"]
+    ).split()[1:] == [base, upstream_sha]
+
+
 def test_candidate_lineage_guard_rejects_missing_upstream_parent(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     local_sha = _init_repo(repo, {"core.py": "local\n"})
@@ -271,6 +360,29 @@ def test_noop_candidate_reports_no_merge_parents(tmp_path: Path) -> None:
     assert report["candidate_tree_sha"] == _git(
         repo, "rev-parse", f"{local_sha}^{{tree}}"
     )
+
+
+def test_noop_refuses_recorded_upstream_without_local_ancestry(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    upstream_sha = _init_repo(repo, {"upstream.py": "current\n"})
+    _git(repo, "checkout", "--orphan", "fork")
+    _git(repo, "rm", "-q", "-rf", ".")
+    (repo / "local.py").write_text("fork\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "fork")
+    local_sha = _git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(mu.MergeUpstreamError, match="not in local history"):
+        mu.build_delta_candidate(
+            repo,
+            upstream_sha,
+            upstream_sha,
+            local_sha,
+            tmp_path / "state" / "upstream-sync.json",
+            tmp_path / "preview",
+        )
 
 
 def test_delta_halts_on_remote_movement(tmp_path: Path) -> None:

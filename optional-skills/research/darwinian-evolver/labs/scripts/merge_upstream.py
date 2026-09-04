@@ -542,6 +542,17 @@ def build_delta_candidate(
     # No-op sync: already at the pinned upstream tip. Report without building
     # a candidate (git apply --3way rejects an empty patch stream).
     if anchor_sha == upstream_sha:
+        lineage = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", upstream_sha, local_sha],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        if lineage.returncode != 0:
+            raise MergeUpstreamError(
+                "recorded upstream anchor is not in local history; "
+                "refusing an ancestry-free no-op"
+            )
         state = _load_state(state_path)
         return {
             "candidate_sha": local_sha,
@@ -599,40 +610,57 @@ def build_delta_candidate(
             owned_paths.update(str(path) for path in state.get("owned_paths", []))
         current_tree = full_snapshot(repo, local_sha)
         for path in sorted(owned_paths):
+            rel = Path(path)
+            if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+                raise ConservationError(f"unsafe owned path: {path!r}")
             if path in current_tree:
-                local_blob = _blob(repo, local_sha, path)
-                preview_path = preview / path
-                if local_blob is None:
-                    if preview_path.exists():
-                        preview_path.unlink()
-                else:
-                    preview_path.parent.mkdir(parents=True, exist_ok=True)
-                    preview_path.write_bytes(local_blob)
+                _run(
+                    preview,
+                    "restore",
+                    "--source",
+                    local_sha,
+                    "--staged",
+                    "--worktree",
+                    "--",
+                    path,
+                )
+            else:
+                _run(
+                    preview,
+                    "rm",
+                    "-r",
+                    "-f",
+                    "--ignore-unmatch",
+                    "--",
+                    path,
+                )
 
-        # Verify owned paths are byte-identical to local (compare working tree)
-        local_tree = full_snapshot(repo, local_sha)
+        # Verify both the index and worktree match local, including deletions and
+        # file mode/type. Git performs the restore so an upstream symlink cannot
+        # redirect a filesystem write outside the preview worktree.
         for path in sorted(owned_paths):
-            if path in local_tree:
-                local_blob = _blob(repo, local_sha, path)
-                preview_path = preview / path
-                if local_blob is None:
-                    # Path should not exist in preview
-                    if preview_path.exists():
-                        raise ConservationError(
-                            f"owned path {path} should not exist but was found in preview"
-                        )
-                else:
-                    # Path must exist in preview with identical content
-                    if not preview_path.is_file():
-                        raise ConservationError(
-                            f"owned path {path} was not conserved: missing in preview"
-                        )
-                    preview_content = preview_path.read_bytes()
-                    if preview_content != local_blob:
-                        raise ConservationError(
-                            f"owned path {path} was not conserved: "
-                            f"content differs from local HEAD"
-                        )
+            tracked = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", path],
+                cwd=preview,
+                capture_output=True,
+                text=True,
+            ).returncode == 0
+            if path not in current_tree:
+                if tracked or os.path.lexists(preview / path):
+                    raise ConservationError(
+                        f"owned path {path} should remain deleted"
+                    )
+                continue
+            diff = subprocess.run(
+                ["git", "diff", "--quiet", local_sha, "--", path],
+                cwd=preview,
+                capture_output=True,
+                text=True,
+            )
+            if diff.returncode != 0:
+                raise ConservationError(
+                    f"owned path {path} was not conserved from local HEAD"
+                )
 
         # Stage the tested tree and record both the fork and exact upstream
         # tip as parents. This preserves upstream ancestry without replaying

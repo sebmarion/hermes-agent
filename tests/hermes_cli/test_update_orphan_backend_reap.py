@@ -223,6 +223,23 @@ def test_stop_process_trees_never_raises():
         cli_main._stop_process_trees([111])  # must not raise
 
 
+def test_stop_process_trees_revalidates_ledger_identity_before_taskkill():
+    """A PID reused after ledger selection must not be passed to taskkill."""
+    from hermes_cli import update_cmd
+
+    matching = _proc(111, [], create_time=11.0)
+    reused = _proc(222, [], create_time=99.0)
+    fake = _fake_psutil({111: matching, 222: reused})
+    with patch.dict(sys.modules, {"psutil": fake}), patch.object(
+        update_cmd.subprocess, "run"
+    ) as run:
+        cli_main._stop_process_trees([(111, 11.0), (222, 22.0)])
+
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["taskkill", "/PID", "111", "/T", "/F"]
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Guard integration: orphan reap clears the dead-end
 # ---------------------------------------------------------------------------
@@ -288,10 +305,10 @@ def test_guard_reaps_orphan_backend_and_proceeds():
     holders = _holders()
     # 1st scan: backend present; 2nd (post-reap) scan: clear.
     result, killed = _run_guard(
-        detect_side_effect=[holders, []], orphan_return=[200]
+        detect_side_effect=[holders, []], orphan_return=[(200, 2.0)]
     )
     assert result == "past_guard"
-    assert killed == [[200]]
+    assert killed == [[(200, 2.0)]]
 
 
 def test_guard_still_refuses_when_not_orphaned():

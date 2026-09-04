@@ -223,11 +223,26 @@ def test_updater_reaps_ledger_proven_orphans():
         _entry(201, 2.1, spawner_pid=500, spawner_create=5.0),   # spawner alive → keep
         _entry(202, 2.2, purpose="chat", spawner_pid=700, spawner_create=7.0),  # not reapable purpose
     ]
-    fake = _fake_psutil({500: 5.0})
+    fake = _fake_psutil({200: 2.0, 201: 2.1, 202: 2.2, 500: 5.0})
     with patch.dict(sys.modules, {"psutil": fake}), \
          patch.object(pi, "ledger_entries", return_value=entries), \
          patch.object(pi, "spawner_is_dead", wraps=pi.spawner_is_dead):
-        assert cli_main._ledger_reapable_backend_pids(_holders(200, 201, 202, 203)) == [200]
+        assert cli_main._ledger_reapable_backend_pids(
+            _holders(200, 201, 202, 203)
+        ) == [(200, 2.0)]
+
+
+def test_updater_ledger_rung_rejects_a_reused_target_pid():
+    from hermes_cli import main as cli_main
+
+    entries = [
+        _entry(200, 2.0, spawner_pid=700, spawner_create=7.0),
+    ]
+    fake = _fake_psutil({200: 99.0})
+    with patch.dict(sys.modules, {"psutil": fake}), \
+         patch.object(pi, "ledger_entries", return_value=entries), \
+         patch.object(pi, "spawner_is_dead", wraps=pi.spawner_is_dead):
+        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
 
 
 def test_updater_ledger_rung_empty_without_ledger():
