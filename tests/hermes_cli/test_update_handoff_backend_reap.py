@@ -41,10 +41,11 @@ def _fake_psutil(procs: dict[int, MagicMock]):
     return types.SimpleNamespace(Process=_process, NoSuchProcess=_FakeNoSuchProcess)
 
 
-def _proc(pid: int, cmdline: list[str]):
+def _proc(pid: int, cmdline: list[str], *, create_time: float = 100.0):
     proc = MagicMock()
     proc.pid = pid
     proc.cmdline.return_value = cmdline
+    proc.create_time.return_value = create_time
     return proc
 
 
@@ -74,7 +75,16 @@ def test_live_parent_backend_reaped_in_handoff():
     fake = _fake_psutil({200: backend})
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = [_holder(200, "python.exe -m hermes_cli.main --profile mr-tester serve")]
-        assert cli_main._handoff_reapable_backend_pids(holders) == [200]
+        assert cli_main._handoff_reapable_backend_pids(holders) == [(200, 100.0)]
+
+
+def test_handoff_backend_reap_is_bound_to_its_creation_time():
+    backend = _proc(200, _serve_argv("mr-tester"), create_time=123.5)
+    fake = _fake_psutil({200: backend})
+
+    with patch.dict(sys.modules, {"psutil": fake}):
+        holders = [_holder(200, "python.exe -m hermes_cli.main --profile mr-tester serve")]
+        assert cli_main._handoff_reapable_backend_pids(holders) == [(200, 123.5)]
 
 
 def test_swarm_of_profile_backends_all_reaped():
@@ -86,7 +96,9 @@ def test_swarm_of_profile_backends_all_reaped():
             _holder(200 + i, f"python.exe -m hermes_cli.main --profile {p} serve")
             for i, p in enumerate(profiles)
         ]
-        assert sorted(cli_main._handoff_reapable_backend_pids(holders)) == sorted(procs)
+        assert sorted(cli_main._handoff_reapable_backend_pids(holders)) == [
+            (pid, 100.0) for pid in sorted(procs)
+        ]
 
 
 def test_dashboard_backend_reaped():
@@ -94,7 +106,7 @@ def test_dashboard_backend_reaped():
     fake = _fake_psutil({200: backend})
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = [_holder(200, "python.exe -m hermes_cli.main dashboard")]
-        assert cli_main._handoff_reapable_backend_pids(holders) == [200]
+        assert cli_main._handoff_reapable_backend_pids(holders) == [(200, 100.0)]
 
 
 def test_non_backend_holder_disqualifies_whole_set():
@@ -121,7 +133,7 @@ def test_exited_holder_skipped_not_fatal():
             _holder(300, "python.exe -m hermes_cli.main --profile gone serve"),
             _holder(200, "python.exe -m hermes_cli.main --profile mr-tester serve"),
         ]
-        assert cli_main._handoff_reapable_backend_pids(holders) == [200]
+        assert cli_main._handoff_reapable_backend_pids(holders) == [(200, 100.0)]
 
 
 def test_no_holders_returns_none():

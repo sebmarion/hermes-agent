@@ -192,7 +192,8 @@ def test_updater_ledger_rung_flows_mcp_helper(ledger, child):
 
     # Provably dead spawner → positively identified as reapable.
     _orphan_entry_for(child.pid)
-    assert update_cmd._ledger_reapable_backend_pids(matches) == [child.pid]
+    targets = update_cmd._ledger_reapable_backend_pids(matches)
+    assert targets == [(child.pid, pytest.approx(psutil.Process(child.pid).create_time()))]
 
 
 # ---------------------------------------------------------------------------
