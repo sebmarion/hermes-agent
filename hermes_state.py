@@ -8834,6 +8834,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def get_session_turn_lease(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the current unexpired lineage lease, or ``None``."""
+        if not session_id:
+            return None
+        now = time.time()
+        with self._read_ctx() as conn:
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            row = conn.execute(
+                "SELECT holder, acquired_at, expires_at FROM session_turn_leases "
+                "WHERE conversation_id = ? AND expires_at > ?",
+                (conversation_id, now),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
 
@@ -8859,6 +8873,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         description: Optional[str] = None,
         provenance: Optional[ActivityProvenance] = None,
+        genuine_activity_at: Optional[float] = None,
     ) -> None:
         """Stamp durable mid-turn session activity (observation-only).
 
@@ -8887,9 +8902,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET "
                 "last_activity_at = ?, "
                 "last_activity_description = ?, "
-                "last_activity_provenance = ? "
+                "last_activity_provenance = ?, "
+                "genuine_activity_at = CASE WHEN ? IS NOT NULL AND "
+                "(genuine_activity_at IS NULL OR genuine_activity_at < ?) "
+                "THEN ? ELSE genuine_activity_at END "
                 "WHERE id = ? AND (last_activity_at IS NULL OR last_activity_at < ?)",
-                (when, desc, prov, session_id, when),
+                (when, desc, prov, genuine_activity_at, genuine_activity_at,
+                 genuine_activity_at, session_id, when),
             )
 
         # Observation-only write: never let it ride the full routine
@@ -10695,7 +10714,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return int(self._execute_write(_do) or 0)
 
-    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+    def set_session_archived(self, session_id: str, archived: bool, *,
+                             expected_session_ids=None, expected_rows=None,
+                             precondition=None, turn_lease_holder=None) -> bool:
         """Archive or unarchive a session.
 
         Archived sessions are hidden from the default session list but keep all
@@ -10703,10 +10724,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chains, archive the whole logical conversation. Desktop lists compression
         roots projected forward to their latest continuation; updating only the
         displayed tip lets the still-unarchived root resurrect it on refresh.
+        ``expected_session_ids``/``expected_rows`` and ``precondition`` are
+        optional caller-owned guards evaluated inside the same write
+        transaction as the update.  ``turn_lease_holder`` requires that the
+        caller owns the native compression-lineage turn lease.  Manual archive
+        callers omit all guards and retain the historical behavior.
+
         Returns True when at least one row was updated.
         """
         def _do(conn):
-            cursor = conn.execute(
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_archive_overrides ("
+                "session_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at REAL NOT NULL)"
+            )
+            if not archived and not turn_lease_holder:
+                conn.execute(
+                    "INSERT INTO session_archive_overrides(session_id,state,updated_at) "
+                    "VALUES(?, 'keep', ?) ON CONFLICT(session_id) DO UPDATE SET "
+                    "state='keep', updated_at=excluded.updated_at",
+                    (session_id, time.time()),
+                )
+            rows = conn.execute(
                 f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
@@ -10734,16 +10772,58 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     UNION
                     SELECT id FROM descendants
                   )
-                UPDATE sessions
-                SET archived = ?
-                WHERE id IN (SELECT id FROM lineage)
+                SELECT sessions.*
+                  FROM sessions JOIN lineage ON lineage.id = sessions.id
+                 ORDER BY sessions.id
                 """,
-                (session_id, session_id, 1 if archived else 0),
+                (session_id, session_id),
+            ).fetchall()
+            actual = [dict(row) for row in rows]
+            actual_ids = {row["id"] for row in actual}
+            if expected_session_ids is not None:
+                if actual_ids != {str(value) for value in expected_session_ids}:
+                    return 0
+            if expected_rows is not None:
+                expected_by_id = {
+                    str(row.get("id")): row for row in expected_rows
+                    if isinstance(row, dict) and row.get("id") is not None
+                }
+                if set(expected_by_id) != actual_ids:
+                    return 0
+                for row in actual:
+                    expected = expected_by_id[row["id"]]
+                    if any(row.get(key) != value for key, value in expected.items()
+                           if key != "id"):
+                        return 0
+            if turn_lease_holder:
+                override = conn.execute(
+                    "SELECT state FROM session_archive_overrides WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()
+                if override is not None and override["state"] == "keep":
+                    return 0
+                conversation_id = self._session_turn_lease_key_on_conn(
+                    conn, session_id)
+                lease = conn.execute(
+                    "SELECT holder, expires_at FROM session_turn_leases "
+                    "WHERE conversation_id = ?", (conversation_id,)
+                ).fetchone()
+                if (lease is None or lease["holder"] != turn_lease_holder
+                        or float(lease["expires_at"]) <= time.time()):
+                    return 0
+            if precondition is not None and not precondition(conn, actual):
+                return 0
+            if not actual:
+                return 0
+            marks = ",".join("?" for _ in actual)
+            cursor = conn.execute(
+                f"UPDATE sessions SET archived = ? WHERE id IN ({marks})",
+                [1 if archived else 0, *sorted(actual_ids)],
             )
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:
                 rowcount = conn.execute("SELECT changes()").fetchone()[0]
-            return rowcount
+            return rowcount if rowcount == len(actual_ids) else 0
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
@@ -12145,7 +12225,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return bool(self._execute_write(_do))
 
-    #: Key under which message reactions live inside ``display_metadata``.
+    def has_persisted_message_marker(self, session_id: str, *, role: str,
+                                      key: str, value: Any) -> bool:
+        if not session_id or not role or not key:
+            return False
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT display_metadata FROM messages "
+                "WHERE session_id=? AND role=? AND active=1 ORDER BY id DESC",
+                (session_id, role),
+            ).fetchall()
+        for row in rows:
+            metadata = self._decode_display_metadata(row[0]) or {}
+            if metadata.get(key) == value:
+                return True
+        return False
+
+    def latest_persisted_message_marker(self, session_id: str, *, role: str,
+                                        key: str, value: Any) -> bool:
+        if not session_id or not role or not key:
+            return False
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT display_metadata FROM messages "
+                "WHERE session_id=? AND role=? AND active=1 ORDER BY id DESC LIMIT 1",
+                (session_id, role),
+            ).fetchone()
+        if row is None:
+            return False
+        metadata = self._decode_display_metadata(row[0]) or {}
+        return metadata.get(key) == value
+
     #: Reactions share the existing per-message JSON column rather than a side
     #: table so they survive rewind/compaction row rewrites with the row itself.
     REACTIONS_METADATA_KEY = "reactions"

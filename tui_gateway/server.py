@@ -12667,10 +12667,13 @@ def _release_async_delivery_claim(
 
 
 def _ensure_terminal_assistant_identity(
-    db: Any, session_id: str, text: str, delivery_id: str
+    db: Any, session_id: str, text: str, delivery_id: str,
+    *, delegation_id: str | None = None,
 ) -> bool:
     """Persist the terminal assistant row and its immutable delivery identity."""
     metadata = {"delivery_id": delivery_id}
+    if delegation_id:
+        metadata["delegation_id"] = delegation_id
     try:
         if db.set_latest_matching_message_display_metadata(
             session_id,
@@ -12825,6 +12828,7 @@ def _async_delegation_terminal_callback(
 
     setattr(_terminal, "_durable_claim_id", claim_id)
     setattr(_terminal, "_mark_live_published", _mark_live_published)
+    setattr(_terminal, "_delegation_id", evt.get("delegation_id"))
     setattr(_terminal, "_is_async_delegation_terminal_callback", True)
     return _terminal
 
@@ -13574,17 +13578,29 @@ def _run_prompt_submit(
             getattr(ownership_refusal, "reason", None) or "refused",
         )
         with session["history_lock"]:
+            session.pop("_owner_admit_callback", None)
+            session.pop("_owner_action_id", None)
+            session.pop("_owner_request_id", None)
+            session.pop("_chief_automation", None)
             session["running"] = False
         _emit("error", sid, {"message": str(ownership_refusal)})
         return False
     with session["history_lock"]:
         if session.get("_closing"):
+            session.pop("_owner_admit_callback", None)
+            session.pop("_owner_action_id", None)
+            session.pop("_owner_request_id", None)
+            session.pop("_chief_automation", None)
             session["running"] = False
             return False
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
+            session.pop("_owner_admit_callback", None)
+            session.pop("_owner_action_id", None)
+            session.pop("_owner_request_id", None)
+            session.pop("_chief_automation", None)
             session["running"] = False
             return False
         if image_paths is None:
@@ -13932,6 +13948,25 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            owner_action_id = session.pop("_owner_action_id", None)
+            owner_request_id = session.pop("_owner_request_id", None)
+            chief_automation = bool(session.pop("_chief_automation", False))
+            owner_source_revision = session.pop("_owner_source_user_message_row_id", None)
+            if owner_action_id:
+                run_kwargs["persist_user_display_kind"] = "chief_reply"
+                run_kwargs["persist_user_display_metadata"] = {
+                    "owner_action_id": owner_action_id,
+                    "owner_request_id": owner_request_id,
+                    "owner_source_user_message_row_id": owner_source_revision,
+                }
+                agent._owner_action_id = owner_action_id
+                agent._owner_request_id = owner_request_id
+                agent._owner_source_user_message_row_id = owner_source_revision
+                agent._owner_durable_session_id = session.get("_owner_durable_session_id", session["session_key"])
+                agent._owner_profile = session.get("_owner_profile") or session.get("profile")
+                agent._owner_profile_canonical = _current_profile_name()
+            agent._chief_automation_turn = chief_automation
+            agent._owner_admit = session.pop("_owner_admit_callback", None)
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -14219,7 +14254,9 @@ def _run_prompt_submit(
                     current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
                     if db is not None and current_session_id:
                         _ensure_terminal_assistant_identity(
-                            db, current_session_id, raw, delivery_id
+                            db, current_session_id, raw, delivery_id,
+                            delegation_id=getattr(terminal_callback,
+                                                   "_delegation_id", None),
                         )
                 payload["delivery_id"] = delivery_id
                 terminal_receipt_committed = True
@@ -15015,8 +15052,8 @@ def _run_prompt_submit(
             and (registered is None or registered is session)
         )
         if can_start:
-            session["_run_thread"] = run_thread
             run_thread.start()
+            session["_run_thread"] = run_thread
     if not can_start:
         with session["history_lock"]:
             session["running"] = False

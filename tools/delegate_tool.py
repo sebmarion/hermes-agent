@@ -2167,7 +2167,16 @@ def _build_child_agent(
     # ``list_sessions_rich`` child-exclusion clause.
     parent_sid = getattr(parent_agent, "session_id", None)
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
+        launch_id = f"delegate-launch-{_uuid.uuid4().hex}"
+        child._session_init_model_config["_origin"] = {
+            "version": 1,
+            "launch_id": launch_id,
+            "created_session_id": getattr(child, "session_id", None),
+            "parent_session_id": parent_sid,
+        }
         child._session_init_model_config["_delegate_from"] = parent_sid
+        child._session_init_model_config["_created_by"] = "agent_delegate"
+        child._session_init_model_config["_origin_kind"] = "delegated_child"
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -4055,6 +4064,7 @@ def delegate_task(
     _origin_owner_transport, _origin_owner_session_record = (
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
+    _parent_session_id = str(getattr(parent_agent, "session_id", "") or "")
 
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
@@ -4062,6 +4072,7 @@ def delegate_task(
     # toolset resolution never leaks into the parent (shared with the plugin
     # subagent-lifecycle API).
     children = []
+    child_mapping = None
     for i, t in enumerate(task_list):
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
@@ -4122,6 +4133,23 @@ def delegate_task(
         # attribution (child-started background processes report under it).
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
+            origin = getattr(child, "_session_init_model_config", {}).get("_origin", {})
+            if n_tasks == 1:
+                candidate_mapping = {
+                    "child_session_id": str(getattr(child, "session_id", "") or ""),
+                    "launch_id": str(origin.get("launch_id") or ""),
+                    "origin_version": origin.get("version"),
+                    "created_session_id": str(origin.get("created_session_id") or ""),
+                    "parent_session_id": str(origin.get("parent_session_id") or ""),
+                }
+                if (
+                    all(candidate_mapping[key] for key in (
+                        "child_session_id", "launch_id", "created_session_id",
+                        "parent_session_id",
+                    ))
+                    and candidate_mapping["origin_version"] == 1
+                ):
+                    child_mapping = candidate_mapping
         children.append((i, t, child))
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
@@ -4319,6 +4347,68 @@ def delegate_task(
             "results": results,
             "total_duration_seconds": total_duration,
         }
+        # Synchronous delegation has no async outbox row.  Put the same
+        # immutable child/result mapping into the durable tool result so the
+        # owner consumer can distinguish a completed delegated child from an
+        # ordinary worker session after the parent turn is persisted.
+        parent_session_id = getattr(parent_agent, "session_id", None)
+        if not isinstance(parent_session_id, str):
+            parent_session_id = None
+        receipt_children = []
+        for entry in results:
+            task_index = entry.get("task_index")
+            if (isinstance(task_index, bool) or
+                    not isinstance(task_index, int) or
+                    not 0 <= task_index < len(task_list)):
+                continue
+            child = next((child for index, _task, child in children
+                          if index == task_index), None)
+            origin_config = getattr(child, "_session_init_model_config", None)
+            origin = (origin_config.get("_origin")
+                      if isinstance(origin_config, dict) else None)
+            if not isinstance(origin, dict):
+                continue
+            child_session_id = getattr(child, "session_id", None)
+            if not isinstance(child_session_id, str):
+                child_session_id = None
+            if child_session_id is None:
+                continue
+            origin_version = origin.get("version")
+            launch_id = origin.get("launch_id")
+            created_session_id = origin.get("created_session_id")
+            origin_parent_session_id = origin.get("parent_session_id")
+            if (not isinstance(origin_version, int) or
+                    not isinstance(launch_id, str) or
+                    not isinstance(created_session_id, str) or
+                    not isinstance(origin_parent_session_id, str)):
+                continue
+            receipt_children.append({
+                "task_index": task_index,
+                "goal": (task_list[task_index].get("goal")
+                         if isinstance(task_index, int) and
+                         0 <= task_index < len(task_list) else None),
+                "child_session_id": child_session_id,
+                "launch_id": launch_id,
+                "origin_version": origin_version,
+                "created_session_id": created_session_id,
+                "parent_session_id": origin_parent_session_id,
+                "completion_id": (
+                    live_deleg_id if n_tasks == 1
+                    else f"{live_deleg_id}:{task_index}"
+                ),
+                "status": entry.get("status"),
+                "exit_reason": entry.get("exit_reason", entry.get("status")),
+                "truncated": bool(entry.get("truncated", False)),
+            })
+        combined["archive_receipt"] = {
+            "kind": "delegated_child_result",
+            "version": 1,
+            "delivery_id": f"sync-delegation:{live_deleg_id}",
+            "delegation_id": live_deleg_id,
+            "parent_session_id": parent_session_id,
+            "is_batch": n_tasks > 1,
+            "children": receipt_children,
+        }
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
         return combined
@@ -4506,6 +4596,7 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            child_mapping=child_mapping,
         )
 
         if dispatch.get("status") == "dispatched":

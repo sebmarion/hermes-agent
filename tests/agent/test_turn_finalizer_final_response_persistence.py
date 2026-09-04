@@ -83,6 +83,35 @@ class FakeAgent:
 
 
 
+def test_finalize_turn_passes_exact_current_turn_id_to_transform_hook(monkeypatch):
+    captured = {}
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+
+    finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "q"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="current-turn-id",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert captured["turn_id"] == "current-turn-id"
+
 
 
 def test_final_response_closes_tool_tail_before_persistence(monkeypatch):

@@ -3797,7 +3797,11 @@ class BasePlatformAdapter(ABC):
             return
         for factory, plugin_name in factories:
             try:
-                factory(native, self)
+                lifecycle = factory(native, self)
+                if isinstance(lifecycle, dict):
+                    self._plugin_lifecycle_handles = getattr(
+                        self, "_plugin_lifecycle_handles", [])
+                    self._plugin_lifecycle_handles.append((native, lifecycle))
                 logger.info(
                     "[%s] Wired native handlers from plugin '%s'",
                     self.name, plugin_name,
@@ -3807,6 +3811,86 @@ class BasePlatformAdapter(ABC):
                     "[%s] Plugin '%s' handler factory raised: %s",
                     self.name, plugin_name, exc, exc_info=True,
                 )
+
+    async def _start_plugin_lifecycle(self, native: Any) -> None:
+        import asyncio
+        import inspect
+        for owner, lifecycle in getattr(self, "_plugin_lifecycle_handles", []):
+            if owner is not native or not callable(lifecycle.get("on_ready")):
+                continue
+            await self._run_plugin_lifecycle_callback(
+                lifecycle["on_ready"], native, "ready"
+            )
+
+    async def _stop_plugin_lifecycle(self, native: Any) -> None:
+        import asyncio
+        import inspect
+        kept = []
+        for owner, lifecycle in getattr(self, "_plugin_lifecycle_handles", []):
+            if owner is not native:
+                kept.append((owner, lifecycle))
+                continue
+            callback = lifecycle.get("on_stop")
+            if callable(callback):
+                await self._run_plugin_lifecycle_callback(callback, native, "stop")
+        self._plugin_lifecycle_handles = kept
+
+    async def _run_plugin_lifecycle_callback(
+        self, callback: Any, native: Any, phase: str
+    ) -> None:
+        """Run one lifecycle callback without allowing cancellation resistance to block.
+
+        ``asyncio.wait_for`` waits for a cancellation-resistant coroutine to
+        finish its cleanup, so a nominal five-second timeout is not a hard
+        adapter deadline. Keep the task tracked after cancelling it and let
+        its done callback consume any eventual exception.
+        """
+        import asyncio
+        import inspect
+
+        try:
+            result = callback(native)
+            if not inspect.isawaitable(result):
+                return
+            task = asyncio.create_task(result)
+            tasks = getattr(self, "_plugin_lifecycle_background_tasks", None)
+            if tasks is None:
+                tasks = set()
+                self._plugin_lifecycle_background_tasks = tasks
+            tasks.add(task)
+
+            def finish(done_task):
+                tasks.discard(done_task)
+                if done_task.cancelled():
+                    return
+                try:
+                    error = done_task.exception()
+                except asyncio.CancelledError:
+                    return
+                if error is not None:
+                    logger.error(
+                        "platform plugin %s hook failed after detachment: %s",
+                        phase, error, exc_info=error,
+                    )
+
+            task.add_done_callback(finish)
+            done, pending = await asyncio.wait({task}, timeout=5.0)
+            if pending:
+                for pending_task in pending:
+                    pending_task.cancel()
+                logger.error(
+                    "platform plugin %s hook exceeded 5s deadline; "
+                    "continuing cleanup in background", phase,
+                )
+                return
+            # Retrieve a completed exception on the current path too; the done
+            # callback remains responsible for tasks that outlive this method.
+            if done:
+                done_task = next(iter(done))
+                if not done_task.cancelled():
+                    done_task.result()
+        except Exception:
+            logger.exception("platform plugin %s hook failed", phase)
 
     @property
     def name(self) -> str:

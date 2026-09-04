@@ -615,6 +615,7 @@ def finalize_turn(
                 "transform_llm_output",
                 response_text=final_response,
                 session_id=agent.session_id or "",
+                turn_id=turn_id,
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
             )
@@ -830,6 +831,18 @@ def finalize_turn(
     # Plugins can use this for cleanup, flushing buffers, etc.
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+        owner_action_id = getattr(agent, "_owner_action_id", None)
+        transcript_marker_verified = False
+        if owner_action_id:
+            try:
+                transcript_marker_verified = bool(
+                    agent._session_db.has_persisted_message_marker(
+                        agent.session_id, role="user", key="owner_action_id",
+                        value=owner_action_id,
+                    )
+                )
+            except Exception:
+                transcript_marker_verified = False
         _invoke_hook(
             "on_session_end",
             session_id=agent.session_id,
@@ -841,9 +854,13 @@ def finalize_turn(
             turn_exit_reason=_turn_exit_reason,
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            owner_action_id=owner_action_id,
+            transcript_marker_verified=transcript_marker_verified,
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+    finally:
+        agent._owner_action_id = None
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

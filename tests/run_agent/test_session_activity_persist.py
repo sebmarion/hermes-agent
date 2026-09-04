@@ -46,6 +46,7 @@ def test_touch_activity_persists_session_activity_once_per_minute(monkeypatch):
         1_700_000_000.0,
         description="starting API call #1",
         provenance=ActivityProvenance.UNKNOWN,
+        genuine_activity_at=1_700_000_000.0,
     )
 
     agent._session_db.touch_session_activity.reset_mock()
@@ -60,6 +61,7 @@ def test_touch_activity_persists_session_activity_once_per_minute(monkeypatch):
         1_700_000_000.0,
         description="API call #1 completed",
         provenance=ActivityProvenance.UNKNOWN,
+        genuine_activity_at=1_700_000_000.0,
     )
 
 
@@ -91,6 +93,7 @@ def test_touch_activity_accepts_named_provenance(monkeypatch):
         1_700_000_000.0,
         description="compressing context",
         provenance=ActivityProvenance.AGENT_COMPRESSION,
+        genuine_activity_at=1_700_000_000.0,
     )
 
     agent._session_db.touch_session_activity.reset_mock()
@@ -102,6 +105,7 @@ def test_touch_activity_accepts_named_provenance(monkeypatch):
         1_700_000_000.0,
         description="starting API call #1",
         provenance=ActivityProvenance.UNKNOWN,
+        genuine_activity_at=1_700_000_000.0,
     )
 
 
@@ -178,6 +182,7 @@ def test_get_activity_summary_exposes_shared_activity_contract(monkeypatch):
     monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_010.0)
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     agent._last_activity_ts = 1_700_000_000.0
+    agent._genuine_activity_ts = 1_700_000_000.0
     agent._last_activity_desc = "executing tool: terminal"
     agent._last_activity_provenance = ActivityProvenance.UNKNOWN
 
@@ -187,6 +192,7 @@ def test_get_activity_summary_exposes_shared_activity_contract(monkeypatch):
     assert summary["last_activity_provenance"] == "unknown"
     assert summary["seconds_since_activity"] == 10.0
     assert summary["last_activity_ts"] == 1_700_000_000.0
+    assert summary["genuine_activity_at"] == 1_700_000_000.0
     assert summary["last_activity_desc"] == "executing tool: terminal"
     assert "phase" not in summary
     assert "last_progress_at" not in summary

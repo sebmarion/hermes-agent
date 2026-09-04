@@ -1042,6 +1042,7 @@ def init_agent(
     # Default / unmigrated paths and _touch_activity stamp unknown; named
     # provenances are stamped by compression writers (heartbeat / timeout / cooldown).
     agent._last_activity_provenance = ActivityProvenance.UNKNOWN
+    agent._genuine_activity_ts: float | None = None
     # Rate-limit durable SessionDB activity stamps from _touch_activity (#72016).
     agent._session_activity_last_persist_mono: float = 0.0
     agent._current_tool: str | None = None

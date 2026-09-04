@@ -1,3 +1,4 @@
+import atexit
 import os
 import sys
 
@@ -44,6 +45,55 @@ _mcp_discovery_thread = None
 # re-probing config) so non-MCP sessions never pay the tools.mcp_tool import
 # on the per-agent-build wait path.
 _mcp_discovery_enabled = False
+_owner_inbox_stops = []
+_owner_inbox_started = False
+_owner_inbox_starting = False
+_owner_inbox_lock = threading.Lock()
+
+
+def _start_owner_inboxes() -> None:
+    """Start generic plugin inboxes in the owning TUI process."""
+    global _owner_inbox_started, _owner_inbox_starting
+    with _owner_inbox_lock:
+        if _owner_inbox_started or _owner_inbox_starting:
+            return
+        _owner_inbox_starting = True
+    try:
+        from tui_gateway.owner_inbox import start_registered_owner_inboxes
+        from tui_gateway.transport import bind_transport, reset_transport
+        prompt_submit = server._methods.get("prompt.submit")
+        if not callable(prompt_submit):
+            logger.warning("prompt.submit is not registered; owner inbox waits")
+            return
+
+        def submit(params, session):
+            token = bind_transport(session.get("transport"))
+            try:
+                return prompt_submit(params.get("_owner_request_id"), params)
+            finally:
+                reset_transport(token)
+
+        _owner_inbox_stops.extend(
+            start_registered_owner_inboxes(server, submit)
+        )
+        with _owner_inbox_lock:
+            _owner_inbox_started = True
+    except Exception:
+        logger.warning("owner inbox startup failed", exc_info=True)
+    finally:
+        with _owner_inbox_lock:
+            _owner_inbox_starting = False
+
+
+def _stop_owner_inboxes() -> None:
+    for stop in reversed(_owner_inbox_stops):
+        try:
+            stop()
+        except Exception:
+            logger.debug("owner inbox shutdown failed", exc_info=True)
+
+
+atexit.register(_stop_owner_inboxes)
 
 
 def _install_sidecar_publisher() -> None:
@@ -440,6 +490,8 @@ def main():
         server._schedule_startup_orphan_sweep()
     except Exception:
         logger.warning("startup orphan sweep scheduling failed", exc_info=True)
+
+    _start_owner_inboxes()
 
     # MCP tool discovery — backgrounded so a slow or unreachable MCP server
     # can't freeze TUI startup (a dead stdio/http server burns 1+2+4s of

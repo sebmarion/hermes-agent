@@ -415,6 +415,11 @@ async def handle_ws(
             server._schedule_startup_orphan_sweep()
         except Exception:
             _log.warning("startup orphan sweep scheduling failed", exc_info=True)
+        try:
+            from tui_gateway.entry import _start_owner_inboxes
+            _start_owner_inboxes()
+        except Exception:
+            _log.warning("owner inbox startup failed", exc_info=True)
         if not ready_ok:
             disconnect_reason = "ready_send_failed"
             send_failures += 1

@@ -3248,6 +3248,22 @@ class PluginContext:
         # for the Telegram-specific docs above.
         self.register_platform_handler("telegram", factory)
 
+    def register_owner_inbox_provider(self, provider: Callable) -> None:
+        """Register a generic provider consumed by the TUI owner process.
+
+        The provider receives an owner-bound dispatch facade at TUI startup;
+        it must not inject through a gateway or create another session owner.
+        """
+        if not callable(provider):
+            raise ValueError("owner inbox provider must be callable")
+        self._manager._owner_inbox_providers.append(provider)
+
+    def register_prompt_admission_observer(self, observer: Callable) -> None:
+        """Observe accepted prompt preflight before session persistence."""
+        if not callable(observer):
+            raise ValueError("prompt admission observer must be callable")
+        self._manager._prompt_admission_observers.append(observer)
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -3800,6 +3816,8 @@ class PluginManager:
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         self._gateway_message_injector: tuple[object, Callable] | None = None
+        self._owner_inbox_providers: list[Callable] = []
+        self._prompt_admission_observers: list[Callable] = []
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         self._portable_mcp_servers: Dict[str, Dict[str, Any]] = {}
@@ -6168,6 +6186,13 @@ class PluginManager:
             for name, config in self._portable_mcp_servers.items()
         }
 
+    def owner_inbox_providers(self) -> list[Callable]:
+        """Return a snapshot of providers for the current owner process."""
+        return list(self._owner_inbox_providers)
+
+    def prompt_admission_observers(self) -> list[Callable]:
+        return list(self._prompt_admission_observers)
+
     def has_portable_mcp_servers(self) -> bool:
         return bool(self._portable_mcp_servers)
 
@@ -6341,8 +6366,24 @@ def discover_plugins(force: bool = False) -> None:
     get_plugin_manager().discover_and_load(force=force)
 
 
+def get_owner_inbox_providers() -> list[Callable]:
+    """Return owner-inbox providers after normal plugin discovery."""
+    return get_plugin_manager().owner_inbox_providers()
+
+
 _background_discovery_thread: Optional[threading.Thread] = None
 _background_discovery_lock = threading.Lock()
+
+
+def fire_pre_prompt_admission(*, profile: str, session_id: str,
+                               is_owner_reply: bool, text: str = "") -> None:
+    """Run pre-persistence prompt observers; failures never block prompts."""
+    for observer in get_plugin_manager().prompt_admission_observers():
+        try:
+            observer(profile=profile, session_id=session_id,
+                     is_owner_reply=is_owner_reply, text=text)
+        except Exception:
+            logger.warning("prompt admission observer failed", exc_info=True)
 
 
 def start_background_plugin_discovery() -> None:

@@ -493,6 +493,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity_at REAL,
     last_activity_description TEXT,
     last_activity_provenance TEXT,
+    genuine_activity_at REAL,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,

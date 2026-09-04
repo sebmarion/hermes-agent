@@ -4399,10 +4399,13 @@ class AIAgent:
             _clock_lock = threading.Lock()
             self._turn_liveness_activity_lock = _clock_lock
         with _clock_lock:
+            activity_stamp = time.time()
             self._turn_liveness_activity_generation = (
                 getattr(self, "_turn_liveness_activity_generation", 0) + 1
             )
-            self._last_activity_ts = time.time()
+            self._last_activity_ts = activity_stamp
+            if not getattr(self, "_chief_automation_turn", False):
+                self._genuine_activity_ts = activity_stamp
             self._last_activity_desc = bound_activity_description(desc)
             self._last_activity_provenance = normalize_activity_provenance(provenance)
             # Real progress invalidates any reserved abort claim. A watchdog
@@ -4465,6 +4468,7 @@ class AIAgent:
                 provenance=normalize_activity_provenance(
                     getattr(self, "_last_activity_provenance", None)
                 ),
+                genuine_activity_at=getattr(self, "_genuine_activity_ts", None),
             )
         except Exception:
             # Never let durable heartbeat I/O break the agent loop. The
@@ -4729,11 +4733,22 @@ class AIAgent:
         provenance = getattr(self, "_last_activity_provenance", None)
         if provenance is None:
             provenance = ActivityProvenance.UNKNOWN
+        genuine_activity = getattr(self, "_genuine_activity_ts", None)
+        if genuine_activity is None:
+            session_db = getattr(self, "_session_db", None)
+            session_id = getattr(self, "session_id", None)
+            if session_db is not None and session_id:
+                try:
+                    row = session_db.get_session(session_id)
+                    genuine_activity = row.get("genuine_activity_at") if row else None
+                except Exception:
+                    genuine_activity = None
         return build_activity_snapshot(
             last_activity_at=getattr(self, "_last_activity_ts", None),
             last_activity_description=getattr(self, "_last_activity_desc", None) or "",
             last_activity_provenance=provenance,
             extra={
+            "genuine_activity_at": genuine_activity,
             "current_tool": self._current_tool,
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,
@@ -9497,6 +9512,50 @@ class AIAgent:
                 turn_id=relay_turn_id,
                 task_id=effective_task_id,
             )
+            owner_admit = getattr(self, "_owner_admit", None)
+            if callable(owner_admit):
+                self._owner_admit = None
+                owner_source_revision = getattr(
+                    self, "_owner_source_user_message_row_id", None
+                )
+                owner_profile = str(getattr(self, "_owner_profile", "") or "")
+                current_profile = str(
+                    getattr(self, "_owner_profile_canonical", "") or ""
+                )
+                owner_session = str(
+                    getattr(self, "_owner_durable_session_id", "") or ""
+                )
+                marker_ok = False
+                owner_db = getattr(self, "_session_db", None)
+                if (owner_db is not None and owner_source_revision is not None
+                        and owner_session
+                        and hasattr(owner_db, "latest_persisted_message_marker")):
+                    marker_ok = owner_db.latest_persisted_message_marker(
+                        owner_session, role="user",
+                        key="owner_source_user_message_row_id",
+                        value=owner_source_revision,
+                    )
+                    if not marker_ok and hasattr(owner_db, "latest_message_row_id"):
+                        marker_ok = owner_db.latest_message_row_id(
+                            owner_session, role="user", require_text=False
+                        ) == owner_source_revision
+                identity_ok = (
+                    str(getattr(self, "session_id", "") or "") == owner_session
+                    and owner_profile == current_profile
+                    and marker_ok
+                )
+                if not identity_ok or not owner_admit():
+                    relay_outcome = "failed"
+                    relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
+                        relay_turn, outcome=relay_outcome
+                    )
+                    return {
+                        "final_response": "Owner dispatch admission rejected.",
+                        "completed": False,
+                        "failed": True,
+                        "interrupted": False,
+                        "turn_exit_reason": "owner_admission_rejected",
+                    }
             # Keep existing tests and external relay-runtime shims that return
             # a minimal turn object compatible with the new opt-out flag.
             if getattr(relay_turn, "relay_enabled", True):
@@ -9653,6 +9712,10 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    if getattr(self, "_owner_admit", None) is not None:
+                        self._owner_admit = None
+                    self._owner_action_id = None
+                    self._owner_request_id = None
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
