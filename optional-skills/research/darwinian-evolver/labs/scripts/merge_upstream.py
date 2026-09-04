@@ -542,6 +542,17 @@ def build_delta_candidate(
     # No-op sync: already at the pinned upstream tip. Report without building
     # a candidate (git apply --3way rejects an empty patch stream).
     if anchor_sha == upstream_sha:
+        lineage = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", upstream_sha, local_sha],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        if lineage.returncode != 0:
+            raise MergeUpstreamError(
+                "recorded upstream anchor is not in local history; "
+                "refusing an ancestry-free no-op"
+            )
         state = _load_state(state_path)
         return {
             "candidate_sha": local_sha,
