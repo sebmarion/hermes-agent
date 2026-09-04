@@ -2385,7 +2385,10 @@ def _require_profile_home(profile: str | None) -> Path | None:
     name = (profile or "").strip()
     home = _profile_home(name)
     if name and home is None:
-        raise ValueError(f"Unknown Hermes profile: {name}")
+        from hermes_cli.profiles import profile_matches_home
+
+        if not profile_matches_home(name, Path(_hermes_home)):
+            raise ValueError(f"Unknown Hermes profile: {name}")
     return home
 
 
@@ -2401,8 +2404,6 @@ def _profile_scoped(handler):
     def wrapper(rid, params):
         profile = params.get("profile") if isinstance(params, dict) else None
         home = _require_profile_home(profile)
-        if str(profile or "").strip() and home is None:
-            raise ValueError(f"Unknown Hermes profile: {str(profile).strip()}")
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)
@@ -12666,10 +12667,13 @@ def _release_async_delivery_claim(
 
 
 def _ensure_terminal_assistant_identity(
-    db: Any, session_id: str, text: str, delivery_id: str
+    db: Any, session_id: str, text: str, delivery_id: str,
+    *, delegation_id: str | None = None,
 ) -> bool:
     """Persist the terminal assistant row and its immutable delivery identity."""
     metadata = {"delivery_id": delivery_id}
+    if delegation_id:
+        metadata["delegation_id"] = delegation_id
     try:
         if db.set_latest_matching_message_display_metadata(
             session_id,
@@ -12824,6 +12828,7 @@ def _async_delegation_terminal_callback(
 
     setattr(_terminal, "_durable_claim_id", claim_id)
     setattr(_terminal, "_mark_live_published", _mark_live_published)
+    setattr(_terminal, "_delegation_id", evt.get("delegation_id"))
     setattr(_terminal, "_is_async_delegation_terminal_callback", True)
     return _terminal
 
@@ -14249,7 +14254,9 @@ def _run_prompt_submit(
                     current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
                     if db is not None and current_session_id:
                         _ensure_terminal_assistant_identity(
-                            db, current_session_id, raw, delivery_id
+                            db, current_session_id, raw, delivery_id,
+                            delegation_id=getattr(terminal_callback,
+                                                   "_delegation_id", None),
                         )
                 payload["delivery_id"] = delivery_id
                 terminal_receipt_committed = True

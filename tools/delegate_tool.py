@@ -4347,6 +4347,68 @@ def delegate_task(
             "results": results,
             "total_duration_seconds": total_duration,
         }
+        # Synchronous delegation has no async outbox row.  Put the same
+        # immutable child/result mapping into the durable tool result so the
+        # owner consumer can distinguish a completed delegated child from an
+        # ordinary worker session after the parent turn is persisted.
+        parent_session_id = getattr(parent_agent, "session_id", None)
+        if not isinstance(parent_session_id, str):
+            parent_session_id = None
+        receipt_children = []
+        for entry in results:
+            task_index = entry.get("task_index")
+            if (isinstance(task_index, bool) or
+                    not isinstance(task_index, int) or
+                    not 0 <= task_index < len(task_list)):
+                continue
+            child = next((child for index, _task, child in children
+                          if index == task_index), None)
+            origin_config = getattr(child, "_session_init_model_config", None)
+            origin = (origin_config.get("_origin")
+                      if isinstance(origin_config, dict) else None)
+            if not isinstance(origin, dict):
+                continue
+            child_session_id = getattr(child, "session_id", None)
+            if not isinstance(child_session_id, str):
+                child_session_id = None
+            if child_session_id is None:
+                continue
+            origin_version = origin.get("version")
+            launch_id = origin.get("launch_id")
+            created_session_id = origin.get("created_session_id")
+            origin_parent_session_id = origin.get("parent_session_id")
+            if (not isinstance(origin_version, int) or
+                    not isinstance(launch_id, str) or
+                    not isinstance(created_session_id, str) or
+                    not isinstance(origin_parent_session_id, str)):
+                continue
+            receipt_children.append({
+                "task_index": task_index,
+                "goal": (task_list[task_index].get("goal")
+                         if isinstance(task_index, int) and
+                         0 <= task_index < len(task_list) else None),
+                "child_session_id": child_session_id,
+                "launch_id": launch_id,
+                "origin_version": origin_version,
+                "created_session_id": created_session_id,
+                "parent_session_id": origin_parent_session_id,
+                "completion_id": (
+                    live_deleg_id if n_tasks == 1
+                    else f"{live_deleg_id}:{task_index}"
+                ),
+                "status": entry.get("status"),
+                "exit_reason": entry.get("exit_reason", entry.get("status")),
+                "truncated": bool(entry.get("truncated", False)),
+            })
+        combined["archive_receipt"] = {
+            "kind": "delegated_child_result",
+            "version": 1,
+            "delivery_id": f"sync-delegation:{live_deleg_id}",
+            "delegation_id": live_deleg_id,
+            "parent_session_id": parent_session_id,
+            "is_batch": n_tasks > 1,
+            "children": receipt_children,
+        }
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
         return combined

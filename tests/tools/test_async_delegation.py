@@ -1118,3 +1118,56 @@ def test_batch_model_rejection_notice_requires_configured_model_in_text(monkeypa
     text = format_process_notification(evt)
     assert text is not None
     assert "SUBAGENT MODEL REJECTED" not in text
+
+
+def test_real_async_batch_receipt_expands_per_child_after_restart(monkeypatch, tmp_path):
+    """The persisted batch producer exposes exact child/result identities."""
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    delegation_id = "async-batch-receipt"
+    receipt = {
+        "kind": "delegated_child_result", "version": 1,
+        "delivery_id": "async-delegation:async-batch-receipt",
+        "delegation_id": delegation_id, "parent_session_id": "parent",
+        "is_batch": True,
+        "children": [
+            {"task_index": 0, "goal": "first", "child_session_id": "child-0",
+             "launch_id": "launch-0", "origin_version": 1,
+             "created_session_id": "child-0", "parent_session_id": "parent",
+             "completion_id": f"{delegation_id}:0", "status": "completed",
+             "exit_reason": "completed", "truncated": False},
+            {"task_index": 1, "goal": "second", "child_session_id": "child-1",
+             "launch_id": "launch-1", "origin_version": 1,
+             "created_session_id": "child-1", "parent_session_id": "parent",
+             "completion_id": f"{delegation_id}:1", "status": "completed",
+             "exit_reason": "completed", "truncated": False},
+        ],
+    }
+    result = {
+        "results": [dict(entry) for entry in receipt["children"]],
+        "archive_receipt": receipt,
+    }
+    dispatch = ad.dispatch_async_delegation_batch(
+        goals=["first", "second"], context=None, toolsets=None, role="leaf",
+        model=None, session_key="parent", parent_session_id="parent",
+        delegation_id=delegation_id, runner=lambda: result,
+    )
+    assert dispatch == {"status": "dispatched", "delegation_id": delegation_id}
+    event = _drain_for(delegation_id)
+    assert event["results"] == result["results"]
+    deadline = time.monotonic() + 2
+    records = []
+    while time.monotonic() < deadline:
+        records = ad.list_durable_delegations()
+        if len(records) == 2:
+            break
+        time.sleep(0.02)
+    assert [(row["child_session_id"], row["completion_id"])
+            for row in records] == [("child-0", f"{delegation_id}:0"),
+                                    ("child-1", f"{delegation_id}:1")]
+    ad._reset_for_tests()
+    assert [(row["child_session_id"], row["completion_id"])
+            for row in ad.list_durable_delegations()] == [
+                ("child-0", f"{delegation_id}:0"),
+                ("child-1", f"{delegation_id}:1"),
+            ]

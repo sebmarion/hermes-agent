@@ -352,25 +352,64 @@ def list_durable_delegations() -> List[Dict[str, Any]]:
                       d.dispatched_at
                  FROM async_delegations d
                  LEFT JOIN async_terminal_outbox o ON o.delegation_id=d.delegation_id
-                WHERE d.child_session_id IS NOT NULL"""
+                WHERE d.child_session_id IS NOT NULL
+                  OR d.result_json IS NOT NULL"""
         ).fetchall()
         out = []
         for row in rows:
-            event = json.loads(row[7] or "{}")
-            result = json.loads(row[8] or "{}")
-            out.append({
+            try:
+                event = json.loads(row[7] or "{}")
+                result = json.loads(row[8] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            delivery_receipt = (
+                {"delivery_id": row[10], "session_id": row[11],
+                 "acknowledged_at": row[12]}
+                if row[10] is not None else None
+            )
+            base = {
                 "delegation_id": row[0], "parent_session_id": row[1],
                 "child_session_id": row[2], "launch_id": row[3],
                 "origin_version": row[4], "created_session_id": row[5],
                 "status": row[6], "event": event, "result": result,
-                "delivery_state": row[9],
-                "delivery_receipt": (
-                    {"delivery_id": row[10], "session_id": row[11],
-                     "acknowledged_at": row[12]}
-                    if row[10] is not None else None
-                ),
+                "delivery_state": row[9], "delivery_receipt": delivery_receipt,
                 "origin_created_at": row[13],
-            })
+            }
+            receipt = result.get("archive_receipt") if isinstance(result, dict) else None
+            entries = receipt.get("children") if isinstance(receipt, dict) else None
+            if not isinstance(entries, list):
+                if row[2] is not None:
+                    out.append(base)
+                continue
+            result_entries = result.get("results") if isinstance(result, dict) else None
+            if not isinstance(result_entries, list):
+                result_entries = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                task_index = entry.get("task_index")
+                mapped_result = next(
+                    (candidate for candidate in result_entries
+                     if isinstance(candidate, dict)
+                     and candidate.get("task_index") == task_index),
+                    None,
+                )
+                item = dict(base)
+                item.update({
+                    "child_session_id": entry.get("child_session_id"),
+                    "launch_id": entry.get("launch_id"),
+                    "origin_version": entry.get("origin_version"),
+                    "created_session_id": entry.get("created_session_id"),
+                    "parent_session_id": entry.get("parent_session_id"),
+                    "completion_id": entry.get("completion_id") or (
+                        row[0] if not receipt.get("is_batch") else None
+                    ),
+                    "archive_receipt_entry": dict(entry),
+                    "archive_result_entry": (
+                        dict(mapped_result) if isinstance(mapped_result, dict) else None
+                    ),
+                })
+                out.append(item)
         return out
 
 

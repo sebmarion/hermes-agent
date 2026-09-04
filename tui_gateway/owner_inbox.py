@@ -341,9 +341,39 @@ def live_owner_dispatch(server, prompt_submit):
                             any(proof.get(key) in (None, "") for key in required) or
                             str(proof["child_session_id"]) != str(durable_id) or
                             str(proof["delivery_session_id"]) != str(proof["parent_session_id"]) or
-                            int(proof["origin_version"]) < 1 or
                             len(_rows) != 1 or len(expected_rows) != 1 or
                             any(row.get("pinned") for row in _rows)):
+                        return False
+                    child = _rows[0]
+                    if (str(child.get("id")) != str(proof["child_session_id"]) or
+                            str(child.get("parent_session_id")) != str(proof["parent_session_id"]) or
+                            child.get("ended_at") is None or
+                            child.get("end_reason") != "completed"):
+                        return False
+                    config = child.get("model_config")
+                    if isinstance(config, str):
+                        try:
+                            config = json.loads(config)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            return False
+                    origin = config.get("_origin") if isinstance(config, dict) else None
+                    if (not isinstance(origin, dict) or
+                            origin.get("version") != 1 or
+                            str(origin.get("launch_id")) != str(proof["launch_id"]) or
+                            str(origin.get("created_session_id")) != str(proof["child_session_id"]) or
+                            str(origin.get("created_session_id")) != str(proof["created_session_id"]) or
+                            str(origin.get("parent_session_id")) != str(proof["parent_session_id"]) or
+                            str(config.get("_delegate_from")) != str(proof["parent_session_id"]) or
+                            config.get("_created_by") != "agent_delegate" or
+                            config.get("_origin_kind") != "delegated_child" or
+                            config.get("_branched_from") or
+                            config.get("_compression_from")):
+                        return False
+                    descendant = _conn.execute(
+                        "SELECT 1 FROM sessions WHERE parent_session_id=? LIMIT 1",
+                        (str(proof["child_session_id"]),),
+                    ).fetchone()
+                    if descendant is not None:
                         return False
                     parent = _conn.execute(
                         "SELECT id FROM sessions WHERE id=?",
@@ -351,9 +381,9 @@ def live_owner_dispatch(server, prompt_submit):
                     ).fetchone()
                     if parent is None:
                         return False
-                    marker_found = False
+                    matching_receipts = []
                     for message in _conn.execute(
-                            "SELECT role, display_metadata FROM messages "
+                            "SELECT id, role, display_metadata, content FROM messages "
                             "WHERE session_id=? AND role='assistant' AND active=1",
                             (str(proof["parent_session_id"]),)):
                         metadata = message["display_metadata"]
@@ -362,13 +392,86 @@ def live_owner_dispatch(server, prompt_submit):
                                 metadata = json.loads(metadata)
                             except (TypeError, ValueError, json.JSONDecodeError):
                                 continue
-                        if isinstance(metadata, dict) and (
-                                metadata.get("delivery_id") == proof["delivery_id"] or
-                                metadata.get("result_receipt_id") == proof["delivery_id"]):
-                            marker_found = True
-                            break
-                    if not marker_found:
+                        if not isinstance(metadata, dict):
+                            continue
+                        receipt_id = metadata.get("delivery_id") or metadata.get(
+                            "result_receipt_id")
+                        if (receipt_id == proof["delivery_id"] and
+                                metadata.get("delegation_id") == proof["delegation_id"]):
+                            matching_receipts.append(metadata)
+                    for message in _conn.execute(
+                            "SELECT id, role, content FROM messages "
+                            "WHERE session_id=? AND role IN ('tool', 'tool_result') AND active=1",
+                            (str(proof["parent_session_id"]),)):
+                        try:
+                            payload = json.loads(message["content"] or "")
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        receipt = (payload.get("archive_receipt")
+                                   if isinstance(payload, dict) else None)
+                        entries = receipt.get("children") if isinstance(receipt, dict) else None
+                        matches = ([entry for entry in entries
+                                    if isinstance(entry, dict) and
+                                    str(entry.get("child_session_id") or "") ==
+                                    str(proof["child_session_id"])]
+                                   if isinstance(entries, list) else [])
+                        result_entries = (payload.get("results")
+                                          if isinstance(payload, dict) else None)
+                        if (not isinstance(receipt, dict) or
+                                receipt.get("kind") != "delegated_child_result" or
+                                receipt.get("version") != 1 or
+                                receipt.get("delegation_id") != proof["delegation_id"] or
+                                receipt.get("delivery_id") != proof["delivery_id"] or
+                                receipt.get("parent_session_id") != proof["parent_session_id"] or
+                                not isinstance(result_entries, list) or
+                                len(matches) != 1 or not entries):
+                            continue
+                        entry = matches[0]
+                        result_matches = [item for item in result_entries
+                                          if isinstance(item, dict) and
+                                          item.get("task_index") == entry.get("task_index")]
+                        if (entry.get("launch_id") != proof["launch_id"] or
+                                entry.get("origin_version") != proof["origin_version"] or
+                                entry.get("created_session_id") != proof["created_session_id"] or
+                                entry.get("parent_session_id") != proof["parent_session_id"] or
+                                entry.get("completion_id", proof["delegation_id"]) !=
+                                proof["completion_id"] or
+                                len(result_matches) != 1 or
+                                result_matches[0].get("status") != entry.get("status") or
+                                result_matches[0].get("exit_reason",
+                                                      result_matches[0].get("status")) !=
+                                entry.get("exit_reason") or
+                                bool(result_matches[0].get("truncated", False)) !=
+                                entry.get("truncated") or
+                                entry.get("status") != "completed" or
+                                entry.get("exit_reason") != "completed" or
+                                entry.get("truncated") is not False):
+                            continue
+                        matching_receipts.append({
+                            "delivery_id": receipt["delivery_id"],
+                            "delegation_id": receipt["delegation_id"],
+                            "launch_id": entry["launch_id"],
+                            "parent_session_id": receipt["parent_session_id"],
+                            "child_session_id": entry["child_session_id"],
+                            "completion_id": entry.get("completion_id",
+                                                       receipt["delegation_id"]),
+                            "acknowledged_at": message["id"],
+                        })
+                    if len(matching_receipts) != 1:
                         return False
+                    receipt = matching_receipts[0]
+                    if (receipt.get("acknowledged_at") is not None and
+                            str(receipt["acknowledged_at"]) !=
+                            str(proof["delivery_acknowledged_at"])):
+                        return False
+                    for metadata_key, proof_key in (
+                            ("launch_id", "launch_id"),
+                            ("parent_session_id", "parent_session_id"),
+                            ("child_session_id", "child_session_id"),
+                            ("completion_id", "completion_id")):
+                        if (metadata_key in receipt and
+                                str(receipt[metadata_key]) != str(proof[proof_key])):
+                            return False
                     for live, _lock in locks:
                         if (live.get("running") is not False or
                                 live.get("queued") is True or
@@ -422,16 +525,42 @@ def live_owner_dispatch(server, prompt_submit):
                 if db is None:
                     return []
                 enriched = []
+                seen_child_ids = set()
                 for raw in records:
                     if not isinstance(raw, dict):
                         continue
                     child_id = raw.get("child_session_id") or raw.get("created_session_id")
                     if not child_id:
                         continue
+                    seen_child_ids.add(str(child_id))
                     row = db.get_session(str(child_id))
                     if row is None:
                         continue
                     item = dict(raw)
+                    receipt_entry = item.get("archive_receipt_entry")
+                    result_entry = item.get("archive_result_entry")
+                    if receipt_entry is not None or result_entry is not None:
+                        if (not isinstance(receipt_entry, dict) or
+                                not isinstance(result_entry, dict) or
+                                isinstance(receipt_entry.get("task_index"), bool) or
+                                not isinstance(receipt_entry.get("task_index"), int) or
+                                receipt_entry.get("task_index") < 0 or
+                                receipt_entry.get("child_session_id") != child_id or
+                                result_entry.get("task_index") !=
+                                receipt_entry.get("task_index") or
+                                result_entry.get("status") != receipt_entry.get("status") or
+                                result_entry.get("exit_reason",
+                                                  result_entry.get("status")) !=
+                                receipt_entry.get("exit_reason") or
+                                bool(result_entry.get("truncated", False)) !=
+                                receipt_entry.get("truncated") or
+                                (bool((item.get("event") or {}).get("is_batch")) and
+                                 not receipt_entry.get("completion_id"))):
+                            continue
+                        item["completion_id"] = (
+                            receipt_entry.get("completion_id") or
+                            item.get("delegation_id")
+                        )
                     item["repository"] = row.get("git_repo_root")
                     ended = row.get("ended_at") is not None
                     lease = db.get_session_turn_lease(str(child_id))
@@ -506,6 +635,159 @@ def live_owner_dispatch(server, prompt_submit):
                             continue
                     item["status"] = status
                     enriched.append(item)
+                # Synchronous delegate_task results have no async outbox row.
+                # Consume only the durable receipt embedded in the parent's
+                # persisted tool result; an origin row by itself is not proof.
+                for summary in db.list_sessions_rich(
+                        include_children=True, include_archived=True,
+                        include_hidden=True, project_compression_tips=False,
+                        limit=10000):
+                    child_id = str(summary.get("id") or "")
+                    if not child_id or child_id in seen_child_ids:
+                        continue
+                    row = db.get_session(child_id)
+                    if row is None or row.get("ended_at") is None:
+                        continue
+                    config = row.get("model_config")
+                    if isinstance(config, str):
+                        try:
+                            config = json.loads(config)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                    origin = config.get("_origin") if isinstance(config, dict) else None
+                    if (not isinstance(origin, dict) or
+                            config.get("_origin_kind") != "delegated_child" or
+                            config.get("_created_by") != "agent_delegate" or
+                            config.get("_delegate_from") != row.get("parent_session_id")):
+                        continue
+                    parent_id = str(row.get("parent_session_id") or "")
+                    if not parent_id:
+                        continue
+                    receipt_match = None
+                    parent_messages = db.get_messages(parent_id, limit=10000)
+                    for message in parent_messages:
+                        if message.get("role") not in {"tool", "tool_result"}:
+                            continue
+                        try:
+                            payload = json.loads(message.get("content") or "")
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        receipt = payload.get("archive_receipt") if isinstance(payload, dict) else None
+                        entries = receipt.get("children") if isinstance(receipt, dict) else None
+                        result_entries = payload.get("results") if isinstance(payload, dict) else None
+                        if (not isinstance(receipt, dict) or
+                                receipt.get("kind") != "delegated_child_result" or
+                                receipt.get("version") != 1 or
+                                receipt.get("parent_session_id") != parent_id or
+                                not isinstance(entries, list) or
+                                not isinstance(result_entries, list)):
+                            continue
+                        matches = [entry for entry in entries
+                                   if isinstance(entry, dict) and
+                                   str(entry.get("child_session_id") or "") == child_id]
+                        if len(matches) == 1 and receipt_match is None:
+                            receipt_match = (receipt, matches[0], message)
+                        elif len(matches) > 1:
+                            receipt_match = None
+                            break
+                    if receipt_match is None:
+                        continue
+                    receipt, entry, message = receipt_match
+                    if (isinstance(entry.get("task_index"), bool) or
+                            not isinstance(entry.get("task_index"), int) or
+                            entry.get("task_index") < 0 or
+                            (not receipt.get("is_batch") and
+                             entry.get("task_index") != 0) or
+                            not entry.get("goal") or
+                            (bool(receipt.get("is_batch")) and
+                             not entry.get("completion_id")) or
+                            entry.get("origin_version") != origin.get("version") or
+                            entry.get("launch_id") != origin.get("launch_id") or
+                            entry.get("created_session_id") != origin.get("created_session_id") or
+                            entry.get("parent_session_id") != origin.get("parent_session_id") or
+                            entry.get("status") != "completed" or
+                            entry.get("exit_reason") != "completed" or
+                            entry.get("truncated") is not False):
+                        continue
+                    if row.get("end_reason") != "completed":
+                        continue
+                    all_entries = receipt.get("children")
+                    if not isinstance(all_entries, list):
+                        continue
+                    valid_entries = []
+                    seen_indices = set()
+                    for item in all_entries:
+                        if (not isinstance(item, dict) or
+                                isinstance(item.get("task_index"), bool) or
+                                not isinstance(item.get("task_index"), int) or
+                                item.get("task_index") < 0 or
+                                (not receipt.get("is_batch") and
+                                 item.get("task_index") != 0) or
+                                not item.get("goal") or
+                                item.get("task_index") in seen_indices or
+                                (bool(receipt.get("is_batch")) and
+                                 not item.get("completion_id"))):
+                            continue
+                        seen_indices.add(item["task_index"])
+                        valid_entries.append(item)
+                    result_matches = [item for item in result_entries
+                                      if isinstance(item, dict) and
+                                      item.get("task_index") == entry.get("task_index")]
+                    if (not valid_entries or entry not in valid_entries or
+                            len(result_matches) != 1 or
+                            result_matches[0].get("status") != entry.get("status") or
+                            result_matches[0].get("exit_reason",
+                                                  result_matches[0].get("status")) !=
+                            entry.get("exit_reason") or
+                            bool(result_matches[0].get("truncated", False)) !=
+                            entry.get("truncated") or
+                            not receipt.get("delegation_id") or
+                            not receipt.get("delivery_id")):
+                        continue
+                    goals = [item["goal"] for item in valid_entries]
+                    batch = bool(receipt.get("is_batch")) or len(valid_entries) != 1
+                    completion_id = (entry.get("completion_id") or
+                                     receipt.get("delegation_id"))
+                    enriched.append({
+                        "delegation_id": receipt.get("delegation_id"),
+                        "child_session_id": child_id,
+                        "created_session_id": origin.get("created_session_id"),
+                        "parent_session_id": parent_id,
+                        "origin_version": origin.get("version"),
+                        "launch_id": origin.get("launch_id"),
+                        "origin_created_at": row.get("started_at"),
+                        "repository": row.get("git_repo_root"),
+                        "event": {"is_batch": batch, "goals": goals},
+                        "completion_id": completion_id,
+                        "archive_receipt_entry": dict(entry),
+                        "archive_result_entry": dict(result_matches[0]),
+                        "result": {"is_batch": batch, "results": valid_entries,
+                                   "status": entry.get("status"),
+                                   "exit_reason": entry.get("exit_reason"),
+                                   "truncated": entry.get("truncated")},
+                        "delivery_state": "delivered",
+                        "delivery_receipt": {
+                            "delivery_id": receipt.get("delivery_id"),
+                            "session_id": parent_id,
+                            "child_session_id": child_id,
+                            "completion_id": completion_id,
+                            "acknowledged_at": message.get("id"),
+                        },
+                        "active": False, "queued": False, "needs_input": False,
+                        "pending_tool_results": False,
+                        "manual_fork": bool(row.get("pinned") or config.get("_branched_from")),
+                        "compression_continuation": bool(config.get("_compression_from")),
+                        "is_parent": any(other.get("parent_session_id") == child_id
+                                         for other in db.list_sessions_rich(
+                                             include_children=True,
+                                             include_archived=True,
+                                             include_hidden=True,
+                                             project_compression_tips=False,
+                                             limit=10000)),
+                        "unresolved_failure": False,
+                        "status": "completed",
+                    })
+                    seen_child_ids.add(child_id)
                 return enriched
         except Exception:
             raise

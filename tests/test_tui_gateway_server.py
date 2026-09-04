@@ -7240,14 +7240,16 @@ def test_terminal_assistant_identity_persists_missing_row_without_duplicate(monk
     db = _MissingAssistantDb()
 
     assert server._ensure_terminal_assistant_identity(
-        db, "stable-session", "Final answer", "async-delegation:d1"
+        db, "stable-session", "Final answer", "async-delegation:d1",
+        delegation_id="d1",
     ) is True
     assert db.appended == [
         (
             "stable-session",
             "assistant",
             "Final answer",
-            {"display_metadata": {"delivery_id": "async-delegation:d1"}},
+            {"display_metadata": {"delivery_id": "async-delegation:d1",
+                                   "delegation_id": "d1"}},
         )
     ]
 

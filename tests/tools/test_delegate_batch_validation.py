@@ -15,6 +15,7 @@ Inspired by: MoonshotAI/kimi-code agent-swarm.md validation rules (MIT)
 import json
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import delegate_task
@@ -169,6 +170,51 @@ class TestValidBatchStillRuns(unittest.TestCase):
             result = _call([{"goal": GOOD_A}, {"goal": GOOD_B}])
         self.assertNotIn("error", result)
         self.assertEqual(len(result["results"]), 2)
+
+    def test_real_batch_result_producer_emits_per_child_archive_identity(self):
+        parent = _make_mock_parent()
+        parent.session_id = "parent"
+        children = []
+        for index in range(2):
+            children.append(SimpleNamespace(
+                session_id=f"child-{index}",
+                _delegate_role="leaf",
+                tool_progress_callback=None,
+                _session_init_model_config={"_origin": {
+                    "version": 1, "launch_id": f"launch-{index}",
+                    "created_session_id": f"child-{index}",
+                    "parent_session_id": parent.session_id,
+                }},
+            ))
+        with patch("tools.delegate_tool._build_child_preserving_parent_tools",
+                   side_effect=children), \
+             patch("tools.delegate_tool._run_single_child", side_effect=[
+                 {"task_index": 0, "status": "completed", "summary": "A",
+                  "exit_reason": "completed", "truncated": False,
+                  "api_calls": 1, "duration_seconds": 1.0},
+                 {"task_index": 1, "status": "completed", "summary": "B",
+                  "exit_reason": "completed", "truncated": False,
+                  "api_calls": 1, "duration_seconds": 1.0},
+             ]), \
+             patch("tools.delegation_live_log.create_live_transcripts",
+                   return_value=("batch-producer", [None, None], [])), \
+             patch("tools.delegation_live_log.update_manifest_statuses"), \
+             patch("tools.delegate_tool._capture_gateway_steer_authority",
+                   return_value=(None, None)), \
+             patch("tools.delegate_tool._resolve_delegation_credentials",
+                   return_value={"model": None, "provider": None,
+                                 "base_url": None, "api_key": None,
+                                 "api_mode": None}):
+            result = json.loads(delegate_task(
+                tasks=[{"goal": GOOD_A}, {"goal": GOOD_B}], parent_agent=parent
+            ))
+        receipt = result["archive_receipt"]
+        assert [(entry["child_session_id"], entry["completion_id"])
+                for entry in receipt["children"]] == [
+                    ("child-0", "batch-producer:0"),
+                    ("child-1", "batch-producer:1"),
+                ]
+        assert [entry["task_index"] for entry in result["results"]] == [0, 1]
 
     def test_single_goal_form_unaffected_by_batch_checks(self):
         # goal="test" is short — must NOT trip the batch-only length check.

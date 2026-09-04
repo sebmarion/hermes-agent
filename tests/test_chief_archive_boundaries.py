@@ -18,7 +18,7 @@ def test_archive_rechecks_late_changes(tmp_path, monkeypatch, late_change):
         db.create_session(session_id, "desktop", git_repo_root="repo")
     parent_user = db.append_message(parent, "user", "Synthetic parent request")
     db.append_message(parent, "assistant", "Synthetic child result",
-                      display_metadata={"delivery_id": "delivery-1"})
+                      display_metadata={"delivery_id": "delivery-1", "delegation_id": "delegation-1"})
     db.create_session(child, "delegate", parent_session_id=parent,
                       git_repo_root="repo", model_config={
                           "_origin": {"version": 1, "launch_id": "launch-1",
