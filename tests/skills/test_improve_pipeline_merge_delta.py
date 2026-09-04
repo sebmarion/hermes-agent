@@ -273,6 +273,29 @@ def test_noop_candidate_reports_no_merge_parents(tmp_path: Path) -> None:
     )
 
 
+def test_noop_refuses_recorded_upstream_without_local_ancestry(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    upstream_sha = _init_repo(repo, {"upstream.py": "current\n"})
+    _git(repo, "checkout", "--orphan", "fork")
+    _git(repo, "rm", "-q", "-rf", ".")
+    (repo / "local.py").write_text("fork\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "fork")
+    local_sha = _git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(mu.MergeUpstreamError, match="not in local history"):
+        mu.build_delta_candidate(
+            repo,
+            upstream_sha,
+            upstream_sha,
+            local_sha,
+            tmp_path / "state" / "upstream-sync.json",
+            tmp_path / "preview",
+        )
+
+
 def test_delta_halts_on_remote_movement(tmp_path: Path) -> None:
     """Contract 6: remote movement between preview and publish halts."""
     # This test requires mocking the remote SHA check
