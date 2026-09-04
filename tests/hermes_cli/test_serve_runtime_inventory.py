@@ -129,7 +129,11 @@ def test_ledger_manual_serve_holders_filters_correctly(monkeypatch):
         ledger_entries=lambda **k: [manual, desktop_owned, gateway, not_a_holder],
         spawner_is_dead=lambda e: False if e["pid"] == 200 else None,
     )
+    fake_psutil = SimpleNamespace(
+        Process=lambda pid: SimpleNamespace(create_time=lambda: 111.0)
+    )
     monkeypatch.setitem(sys.modules, "hermes_cli.process_identity", fake_pi)
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
     holders = [(100, "python.exe", "..."), (200, "python.exe", "..."), (300, "python.exe", "...")]
 
     result = update_cmd._ledger_manual_serve_holders(holders)
@@ -138,6 +142,22 @@ def test_ledger_manual_serve_holders_filters_correctly(monkeypatch):
         "only the manual serve holder qualifies: desktop-owned keeps the "
         "refusal, gateways belong to the pause machinery, non-holders skipped"
     )
+
+
+def test_ledger_manual_serve_holder_rejects_a_reused_target_pid(monkeypatch):
+    entry = _ledger_entry(pid=100, create_time=111.0)
+    fake_pi = SimpleNamespace(
+        ledger_entries=lambda **k: [entry],
+        spawner_is_dead=lambda e: None,
+    )
+    live = SimpleNamespace(create_time=lambda: 999.0)
+    fake_psutil = SimpleNamespace(Process=lambda pid: live)
+    monkeypatch.setitem(sys.modules, "hermes_cli.process_identity", fake_pi)
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._ledger_manual_serve_holders(
+        [(100, "python.exe", "...")]
+    ) == []
 
 
 def test_serve_relaunch_commands_built_from_structured_identity(monkeypatch):
@@ -216,3 +236,22 @@ def test_scan_dashboard_processes_ledger_respects_exclusions(monkeypatch):
     monkeypatch.setattr(dp.subprocess, "run", lambda *a, **k: fake_run)
 
     assert dp._scan_dashboard_processes(exclude_pids={8124}) == []
+
+
+def test_inventory_records_the_serve_process_incarnation(monkeypatch):
+    """The plan carries ``(pid, create_time)``, not just the PID (#92145 review).
+
+    The post-abort survivor probe compares a planned serve against the live
+    spawn ledger. With only the number to compare, a NEW serve that reused the
+    old PID reads as the pre-update process that never restarted, and recovery
+    stays incomplete forever.
+    """
+    entry = _ledger_entry(create_time=1712345678.5)
+    fake_pi = SimpleNamespace(
+        ledger_entries=lambda **k: [entry],
+        spawner_is_dead=lambda e: None,
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.process_identity", fake_pi)
+    plan = update_inventory.collect_runtime_inventory()
+    serves = [r for r in plan.runtimes if r.kind == "serve"]
+    assert serves and serves[0].detail["create_time"] == 1712345678.5

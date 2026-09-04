@@ -390,6 +390,70 @@ class TestGetProcessStartTime:
 
 
 class TestTerminatePid:
+    def test_identity_bound_termination_refuses_a_recycled_pid(self, monkeypatch):
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 222)
+        monkeypatch.setattr(
+            status.subprocess,
+            "run",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("recycled PID must not reach taskkill")
+            ),
+        )
+
+        with pytest.raises(ProcessLookupError, match="identity changed"):
+            status.terminate_pid(123, force=True, expected_start_time=111)
+
+    def test_identity_bound_windows_force_uses_process_handles(self, monkeypatch):
+        events = []
+
+        class Process:
+            def __init__(self, pid, create_time, children=()):
+                self.pid = pid
+                self._create_time = create_time
+                self._children = list(children)
+
+            def create_time(self):
+                return self._create_time
+
+            def children(self):
+                return list(self._children)
+
+            def suspend(self):
+                events.append(("suspend", self.pid))
+
+            def resume(self):
+                events.append(("resume", self.pid))
+
+            def kill(self):
+                events.append(("kill", self.pid))
+
+        child = Process(124, 124.0)
+        root = Process(123, 123.45, (child,))
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 12345)
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(Process=lambda _pid: root),
+        )
+        monkeypatch.setattr(
+            status.subprocess,
+            "run",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("identity-bound force stop must not call taskkill")
+            ),
+        )
+
+        status.terminate_pid(123, force=True, expected_start_time=12345)
+
+        assert events == [
+            ("suspend", 123),
+            ("suspend", 124),
+            ("kill", 124),
+            ("kill", 123),
+        ]
+
     @pytest.mark.windows_only
     def test_force_uses_taskkill_on_windows(self, monkeypatch):
         # Faking _IS_WINDOWS on POSIX could not reproduce the real

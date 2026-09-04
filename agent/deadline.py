@@ -65,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import faulthandler
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -548,16 +549,22 @@ def run_bounded_sync(
 # ---------------------------------------------------------------------------
 
 
-def kill_process_tree(pid: int, *, sig: Optional[int] = None) -> bool:
+def kill_process_tree(
+    pid: int,
+    *,
+    sig: Optional[int] = None,
+    expected_create_time: Optional[float] = None,
+) -> bool:
     """Terminate ``pid`` and all its descendants, portably.
 
     Kill-on-timeout that signals only the direct child orphans process trees
     (cron scripts, in-container shells, browser daemons — #71148 class).
 
-    * Windows: ``taskkill /F /T`` terminates the tree (``sig`` ignored;
-      Windows has no equivalent). Console-window flash is suppressed via
-      ``windows_hide_flags`` and the exit code is checked, so a dead or
-      inaccessible PID reports ``False`` like the POSIX path.
+    * Windows: the process tree is suspended and terminated through
+      identity-bound process handles (``sig`` ignored; Windows has no
+      equivalent), but only when ``expected_create_time`` proves the PID still
+      names the process the caller observed. A dead, recycled, inaccessible,
+      or unbound PID reports ``False``; no raw-PID ``taskkill`` fallback runs.
     * POSIX: the descendant set is snapshotted via psutil (a hard
       dependency) BEFORE any signal — once the parent dies its children are
       reparented and can no longer be found by a parent walk. Then the
@@ -574,26 +581,42 @@ def kill_process_tree(pid: int, *, sig: Optional[int] = None) -> bool:
     when the process was already gone or every termination call failed.
     """
     if sys.platform == "win32":
-        try:
-            from hermes_cli._subprocess_compat import windows_hide_flags
-
-            creationflags = windows_hide_flags()
-        except Exception:
-            creationflags = 0
-        try:
-            proc = subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True,
-                timeout=15,
-                check=False,
-                creationflags=creationflags,
+        if expected_create_time is None:
+            logger.debug(
+                "kill_process_tree: refusing unbound Windows PID %s", pid
             )
-            # taskkill exits non-zero for not-found / access-denied; keep the
-            # cross-platform contract (False = nothing was terminated).
-            return proc.returncode == 0
+            return False
+        try:
+            expected_create = float(expected_create_time)
+            if not (
+                math.isfinite(expected_create)
+                and expected_create > 0
+            ):
+                logger.debug(
+                    "kill_process_tree: refusing invalid Windows PID %s identity",
+                    pid,
+                )
+                return False
+            from gateway.status import terminate_pid
+
+            terminate_pid(
+                int(pid),
+                force=True,
+                expected_start_time=int(round(expected_create * 100)),
+            )
+            return True
+        except (OSError, ProcessLookupError, ValueError):
+            logger.debug(
+                "kill_process_tree: Windows PID %s identity-bound termination failed",
+                pid,
+                exc_info=True,
+            )
+            return False
         except Exception:
             logger.debug(
-                "kill_process_tree: taskkill failed for pid %s", pid, exc_info=True
+                "kill_process_tree: Windows PID %s termination unavailable",
+                pid,
+                exc_info=True,
             )
             return False
 

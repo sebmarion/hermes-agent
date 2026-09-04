@@ -3248,7 +3248,9 @@ class PluginContext:
         # for the Telegram-specific docs above.
         self.register_platform_handler("telegram", factory)
 
-    def register_owner_inbox_provider(self, provider: Callable) -> None:
+    def register_owner_inbox_provider(
+        self, provider: Callable
+    ) -> PluginRegistration:
         """Register a generic provider consumed by the TUI owner process.
 
         The provider receives an owner-bound dispatch facade at TUI startup;
@@ -3256,13 +3258,85 @@ class PluginContext:
         """
         if not callable(provider):
             raise ValueError("owner inbox provider must be callable")
-        self._manager._owner_inbox_providers.append(provider)
 
-    def register_prompt_admission_observer(self, observer: Callable) -> None:
+        stop_lock = threading.Lock()
+        started_stops: List[Callable[[], Any]] = []
+        released = False
+
+        def _idempotent_stop(stop: Callable[[], Any]) -> Callable[[], Any]:
+            called = False
+            called_lock = threading.Lock()
+
+            @wraps(stop)
+            def guarded_stop():
+                nonlocal called
+                with called_lock:
+                    if called:
+                        return None
+                    called = True
+                return stop()
+
+            return guarded_stop
+
+        @wraps(provider)
+        def managed_provider(owner):
+            with stop_lock:
+                if released:
+                    return None
+            stop = provider(owner)
+            if not callable(stop):
+                return stop
+            guarded_stop = _idempotent_stop(stop)
+            with stop_lock:
+                stop_after_start = released
+                if not stop_after_start:
+                    started_stops.append(guarded_stop)
+            if stop_after_start:
+                guarded_stop()
+            return guarded_stop
+
+        def release_provider() -> None:
+            nonlocal released
+            with stop_lock:
+                if released:
+                    return
+                released = True
+                stops = list(reversed(started_stops))
+                started_stops.clear()
+            self._manager._remove_identity(
+                self._manager._owner_inbox_providers, managed_provider
+            )
+            for stop in stops:
+                try:
+                    stop()
+                except Exception:
+                    logger.warning(
+                        "Owner inbox provider shutdown failed for plugin %s",
+                        self.manifest.name,
+                        exc_info=_PLUGINS_DEBUG,
+                    )
+
+        self._manager._owner_inbox_providers.append(managed_provider)
+        return self._track(
+            "owner_inbox_provider",
+            "owner_inbox_provider",
+            release_provider,
+        )
+
+    def register_prompt_admission_observer(
+        self, observer: Callable
+    ) -> PluginRegistration:
         """Observe accepted prompt preflight before session persistence."""
         if not callable(observer):
             raise ValueError("prompt admission observer must be callable")
         self._manager._prompt_admission_observers.append(observer)
+        return self._track(
+            "prompt_admission_observer",
+            "prompt_admission_observer",
+            lambda: self._manager._remove_identity(
+                self._manager._prompt_admission_observers, observer
+            ),
+        )
 
     # -- hook registration --------------------------------------------------
 
@@ -4323,18 +4397,21 @@ class PluginManager:
                 # first process sees plugin backends (tracking #64177).
                 self._refresh_secret_sources_after_discovery()
                 if force:
-                    # config.yaml shell hooks live in ``_hooks`` but are
-                    # config-owned, not plugin-owned — the ledger-driven
-                    # unload() above wiped them and cannot restore them.
-                    # Re-register so force-reload is symmetric (#60036;
-                    # tracking #64178 — salvaged from PR #64188).
-                    self._re_register_shell_hooks_after_force()
+                    # config.yaml shell hooks and outbound webhooks live in
+                    # ``_hooks`` but are config-owned, not plugin-owned —
+                    # the ledger-driven unload() above wiped them and
+                    # cannot restore them. Re-register so force-reload is
+                    # symmetric (#60036; tracking #64178 — salvaged from
+                    # PR #64188; outbound webhooks added per #92682 review).
+                    self._re_register_config_hooks_after_force()
             except BaseException:
                 self._discovered = False
                 raise
 
-    def _re_register_shell_hooks_after_force(self) -> None:
-        """Restore config.yaml shell hooks wiped by force-clear of ``_hooks``."""
+    def _re_register_config_hooks_after_force(self) -> None:
+        """Restore config.yaml shell hooks/outbound webhooks wiped by
+        force-clear of ``_hooks``. Each re-register call is independently
+        guarded so one failing does not skip the other."""
         try:
             from agent.shell_hooks import re_register_config_hooks
 
@@ -4342,6 +4419,14 @@ class PluginManager:
         except Exception as exc:
             # Import cycle / missing module must not abort force reload.
             logger.debug("force-reload shell-hook re-register skipped: %s", exc)
+        try:
+            from agent.outbound_webhooks import (
+                re_register_config_hooks as re_register_outbound_webhooks,
+            )
+
+            re_register_outbound_webhooks()
+        except Exception as exc:
+            logger.debug("force-reload outbound-webhook re-register skipped: %s", exc)
 
     def _refresh_secret_sources_after_discovery(self) -> None:
         """If any plugin secret source is enabled, reset cache and re-apply.

@@ -7,11 +7,15 @@ def test_plugin_can_register_generic_owner_inbox_provider(tmp_path):
     manager = PluginManager(scope_key=str(tmp_path))
     manifest = SimpleNamespace(name="example", key="example")
     context = PluginContext(manifest, manager)
-    provider = lambda owner: None
+    seen = []
+    provider = lambda owner: seen.append(owner)
 
     context.register_owner_inbox_provider(provider)
 
-    assert manager.owner_inbox_providers() == [provider]
+    providers = manager.owner_inbox_providers()
+    assert len(providers) == 1
+    providers[0]("owner")
+    assert seen == ["owner"]
 
 
 def test_owner_startup_discovers_and_starts_providers(monkeypatch):

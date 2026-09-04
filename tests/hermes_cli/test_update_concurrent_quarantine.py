@@ -227,12 +227,19 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
         if pid == 202
         else None,
     )
+    monkeypatch.setattr(
+        status_mod,
+        "get_process_start_time",
+        lambda pid: {101: 1001, 202: 2002}[pid],
+    )
 
     terminated = []
     monkeypatch.setattr(
         status_mod,
         "terminate_pid",
-        lambda pid, force=False: terminated.append((pid, force)),
+        lambda pid, force=False, expected_start_time=None: terminated.append(
+            (pid, force, expected_start_time)
+        ),
     )
 
     token = cli_main._pause_windows_gateways_for_update()
@@ -249,7 +256,7 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
         ],
     }
     assert waited_for == [101]
-    assert terminated == [(202, True)]
+    assert terminated == [(202, True, 2002)]
 
     marker = json.loads(
         (profile_home / ".gateway-planned-stop.json").read_text(encoding="utf-8")
@@ -500,6 +507,26 @@ def test_stop_windows_gateway_service_waits_for_original_descendants(
         )
 
 
+def test_stop_windows_gateway_service_rejects_non_finite_descendant_identity(
+    monkeypatch,
+):
+    import hermes_cli.update_cmd as update_cmd
+
+    service = SimpleNamespace(status=lambda: "stopped")
+    fake_psutil = SimpleNamespace(
+        win_service_get=lambda _name: service,
+        Process=lambda _pid: SimpleNamespace(create_time=lambda: 12.5),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    with pytest.raises(RuntimeError, match="invalid process identity"):
+        update_cmd._stop_windows_gateway_service(
+            "HermesGateway",
+            expected_processes=((123, float("nan")),),
+            timeout=0,
+        )
+
+
 @patch.object(cli_main, "_is_windows", return_value=True)
 def test_resume_windows_gateway_service_failure_stays_retryable(
     _winp,
@@ -594,6 +621,9 @@ def _fake_psutil_tree(tree, venv_exe, worker_exe, dead=None):
         def exe(self):
             # Parents of workers are the launchers under test.
             return venv_exe if self.pid % 2 == 0 else worker_exe
+
+        def create_time(self):
+            return float(self.pid)
 
     mod = types.SimpleNamespace(Process=FakeProc)
     return mod
@@ -692,17 +722,21 @@ def test_pause_kill_set_covers_venv_guard_abort_set(
     monkeypatch.setattr(
         status_mod,
         "terminate_pid",
-        lambda pid, force=False: terminated.append(int(pid)),
+        lambda pid, force=False, expected_start_time=None: terminated.append(
+            (int(pid), expected_start_time)
+        ),
     )
 
     cli_main._pause_windows_gateways_for_update()
 
     # What the downstream venv-holder guard would report as blocking.
     guard_would_abort_on = {launcher_pid}
-    assert guard_would_abort_on.issubset(set(terminated)), (
-        f"pause stopped {sorted(terminated)} but the venv guard aborts on "
+    terminated_pids = {pid for pid, _start_time in terminated}
+    assert guard_would_abort_on.issubset(terminated_pids), (
+        f"pause stopped {sorted(terminated_pids)} but the venv guard aborts on "
         f"{sorted(guard_would_abort_on)} — disjoint sets abort the update"
     )
+    assert (launcher_pid, launcher_pid * 100) in terminated
 
 
 # ---------------------------------------------------------------------------
@@ -734,12 +768,66 @@ def _fake_psutil_cmdlines(argv_by_pid):
         def __init__(self, pid):
             if pid not in argv_by_pid:
                 raise ValueError(f"no such pid {pid}")
+            self._pid = pid
             self._argv = argv_by_pid[pid]
 
         def cmdline(self):
             return self._argv
 
+        def create_time(self):
+            return float(self._pid)
+
     return types.SimpleNamespace(Process=FakeProc)
+
+
+def test_leftover_gateway_holders_return_bound_process_identities(monkeypatch):
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def cmdline(self):
+            return GATEWAY_ARGV
+
+        def create_time(self):
+            return 123.45
+
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(Process=FakeProc))
+
+    assert cli_main._leftover_pausable_gateway_pids(
+        [(300, "python.exe", "truncated...")]
+    ) == [(300, 12345)]
+
+
+def test_identity_bound_gateway_stop_forwards_recorded_start_times(monkeypatch):
+    import gateway.status as status_mod
+    import hermes_cli.update_cmd as update_cmd
+
+    stopped = []
+    monkeypatch.setattr(
+        status_mod,
+        "terminate_pid",
+        lambda pid, force=False, expected_start_time=None: stopped.append(
+            (pid, force, expected_start_time)
+        ),
+    )
+
+    assert update_cmd._stop_identity_bound_gateway_pids([(300, 12345)]) == [300]
+    assert stopped == [(300, True, 12345)]
+
+
+def test_gateway_survivor_filter_rejects_a_recycled_pid(monkeypatch):
+    import gateway.status as status_mod
+    import hermes_cli.update_cmd as update_cmd
+
+    monkeypatch.setattr(
+        status_mod,
+        "get_process_start_time",
+        lambda pid: {300: 12345, 301: 99999}[pid],
+    )
+
+    assert update_cmd._matching_gateway_process_identities(
+        [300, 301], {300: 12345, 301: 30100}
+    ) == [(300, 12345)]
 
 
 def test_leftover_holders_that_are_all_gateways_are_nominated(monkeypatch):
@@ -754,7 +842,10 @@ def test_leftover_holders_that_are_all_gateways_are_nominated(monkeypatch):
         (301, "python.exe", "truncated..."),
     ]
 
-    assert cli_main._leftover_pausable_gateway_pids(matches) == [300, 301]
+    assert cli_main._leftover_pausable_gateway_pids(matches) == [
+        (300, 30000),
+        (301, 30100),
+    ]
 
 
 def test_one_non_gateway_holder_keeps_the_hard_refusal(monkeypatch):
@@ -771,18 +862,17 @@ def test_one_non_gateway_holder_keeps_the_hard_refusal(monkeypatch):
     assert cli_main._leftover_pausable_gateway_pids(matches) is None
 
 
-def test_unreadable_argv_falls_back_to_the_captured_prefix(monkeypatch):
-    """psutil failure degrades to the scan's captured cmdline, not a crash.
-
-    The captured prefix decides: a gateway invocation still qualifies, and
-    anything else still refuses.
-    """
+def test_unreadable_process_identity_keeps_the_hard_refusal(monkeypatch):
+    """A captured gateway prefix is not authority to kill an unbound PID."""
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil_cmdlines({}))
     gateway_prefix = r"venv\Scripts\python.exe -m hermes_cli.main gateway run"
 
-    assert cli_main._leftover_pausable_gateway_pids(
-        [(300, "python.exe", gateway_prefix)]
-    ) == [300]
+    assert (
+        cli_main._leftover_pausable_gateway_pids(
+            [(300, "python.exe", gateway_prefix)]
+        )
+        is None
+    )
     assert (
         cli_main._leftover_pausable_gateway_pids(
             [

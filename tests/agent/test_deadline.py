@@ -367,6 +367,72 @@ class TestRunBoundedAsync:
 # ---------------------------------------------------------------------------
 
 
+def test_windows_tree_kill_refuses_an_unbound_pid(monkeypatch):
+    calls = []
+
+    class _Result:
+        returncode = 0
+
+    monkeypatch.setattr("agent.deadline.sys.platform", "win32")
+    monkeypatch.setattr(
+        "agent.deadline.subprocess.run",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or _Result(),
+    )
+
+    assert kill_process_tree(4321) is False
+    assert calls == []
+
+
+def test_windows_tree_kill_refuses_a_recycled_pid(monkeypatch):
+    calls = []
+
+    class _Process:
+        def create_time(self):
+            return 20.0
+
+    class _Psutil:
+        @staticmethod
+        def Process(pid):
+            assert pid == 4321
+            return _Process()
+
+    class _Result:
+        returncode = 0
+
+    monkeypatch.setattr("agent.deadline.sys.platform", "win32")
+    monkeypatch.setitem(sys.modules, "psutil", _Psutil)
+    monkeypatch.setattr(
+        "agent.deadline.subprocess.run",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or _Result(),
+    )
+
+    assert kill_process_tree(4321, expected_create_time=10.0) is False
+    assert calls == []
+
+
+def test_windows_tree_kill_uses_identity_bound_process_handles(monkeypatch):
+    from gateway import status as status_mod
+
+    calls = []
+    monkeypatch.setattr("agent.deadline.sys.platform", "win32")
+    monkeypatch.setattr(
+        status_mod,
+        "terminate_pid",
+        lambda pid, force=False, expected_start_time=None: calls.append(
+            (pid, force, expected_start_time)
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.deadline.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("identity-bound tree kill must not call taskkill")
+        ),
+    )
+
+    assert kill_process_tree(4321, expected_create_time=10.0) is True
+    assert calls == [(4321, True, 1000)]
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group semantics")
 class TestKillProcessTree:
     def test_kills_descendants_of_session_leader(self, tmp_path):

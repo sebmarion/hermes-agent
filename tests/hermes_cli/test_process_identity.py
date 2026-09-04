@@ -83,6 +83,11 @@ def test_parse_spawn_tag_dash_create_is_none():
     assert tag.spawner_create is None
 
 
+@pytest.mark.parametrize("create", ["nan", "inf", "-inf", "0", "-1"])
+def test_parse_spawn_tag_rejects_invalid_creation_time(create):
+    assert pi.parse_spawn_tag(f"v1:abcdef:serve:42:{create}") is None
+
+
 def test_desktop_style_tag_parses():
     # The Electron side emits install `-` with a winms-derived create time.
     tag = pi.parse_spawn_tag("v1:-:serve:5100:1755689000.123")
@@ -129,6 +134,32 @@ def test_register_self_writes_and_prunes_dead(tmp_path):
     me = next(e for e in entries if e["pid"] == 999)
     assert me["purpose"] == "serve"
     assert me["create_time"] == pytest.approx(50.0, abs=0.01)
+
+
+def test_register_self_rejects_non_finite_creation_time(tmp_path):
+    ledger = tmp_path / "spawn-ledger.json"
+    fake = _fake_psutil({999: float("nan")})
+    with patch.dict(sys.modules, {"psutil": fake}), patch.object(
+        pi, "_ledger_path", return_value=ledger
+    ), patch.object(pi.os, "getpid", return_value=999):
+        assert pi.register_self("serve", project_root=Path("/x/install")) is False
+
+    assert not ledger.exists()
+
+
+def test_register_self_prunes_invalid_recorded_creation_time(tmp_path):
+    ledger = tmp_path / "spawn-ledger.json"
+    ledger.write_text(
+        json.dumps([_entry(300, float("nan"))]),
+        encoding="utf-8",
+    )
+    fake = _fake_psutil({300: 30.0, 999: 50.0})
+    with patch.dict(sys.modules, {"psutil": fake}), patch.object(
+        pi, "_ledger_path", return_value=ledger
+    ), patch.object(pi.os, "getpid", return_value=999):
+        assert pi.register_self("serve", project_root=Path("/x/install")) is True
+
+    assert [entry["pid"] for entry in json.loads(ledger.read_text())] == [999]
 
 
 def test_register_self_inherits_spawn_tag_lineage(tmp_path):
@@ -197,6 +228,43 @@ def test_ledger_entries_filters_dead_reused_and_foreign(tmp_path):
     assert [e["pid"] for e in live] == [100]
 
 
+def test_ledger_entries_rejects_non_finite_target_creation_time(tmp_path):
+    ledger = tmp_path / "spawn-ledger.json"
+    ledger.write_text(
+        json.dumps([_entry(100, float("nan"))]),
+        encoding="utf-8",
+    )
+    fake = _fake_psutil({100: 10.0})
+    with patch.dict(sys.modules, {"psutil": fake}), patch.object(
+        pi, "_ledger_path", return_value=ledger
+    ):
+        live = pi.ledger_entries(project_root=Path("/x/install"))
+
+    assert live == []
+
+
+def test_ledger_entries_rejects_boolean_pid(tmp_path):
+    ledger = tmp_path / "spawn-ledger.json"
+    ledger.write_text(
+        json.dumps([_entry(True, 200.0)]),
+        encoding="utf-8",
+    )
+    fake = _fake_psutil({True: 200.0})
+    with patch.dict(sys.modules, {"psutil": fake}), patch.object(
+        pi, "_ledger_path", return_value=ledger
+    ):
+        live = pi.ledger_entries(project_root=Path("/x/install"))
+
+    assert live == []
+
+
+def test_pid_alive_matches_none_is_liveness_only():
+    fake = _fake_psutil({500: 5.0})
+    with patch.dict(sys.modules, {"psutil": fake}):
+        assert pi._pid_alive_matches(500, None) is True
+        assert pi._pid_alive_matches(600, None) is False
+
+
 def test_spawner_is_dead_tristate():
     fake = _fake_psutil({500: 5.0})
     with patch.dict(sys.modules, {"psutil": fake}):
@@ -205,6 +273,32 @@ def test_spawner_is_dead_tristate():
         # PID reuse: recorded spawner create differs from live process → dead.
         assert pi.spawner_is_dead(_entry(1, 1.0, spawner_pid=500, spawner_create=999.0)) is True
         assert pi.spawner_is_dead(_entry(1, 1.0)) is None
+
+
+@pytest.mark.parametrize(
+    "spawner_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0, True]
+)
+def test_spawner_is_dead_refuses_invalid_creation_time(spawner_create):
+    fake = _fake_psutil({500: 5.0})
+    with patch.dict(sys.modules, {"psutil": fake}):
+        assert (
+            pi.spawner_is_dead(
+                _entry(1, 1.0, spawner_pid=500, spawner_create=spawner_create)
+            )
+            is None
+        )
+
+
+@pytest.mark.parametrize("live_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_spawner_is_dead_refuses_invalid_live_creation_time(live_create):
+    fake = _fake_psutil({500: live_create})
+    with patch.dict(sys.modules, {"psutil": fake}):
+        assert (
+            pi.spawner_is_dead(
+                _entry(1, 1.0, spawner_pid=500, spawner_create=5.0)
+            )
+            is None
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +317,40 @@ def test_updater_reaps_ledger_proven_orphans():
         _entry(201, 2.1, spawner_pid=500, spawner_create=5.0),   # spawner alive → keep
         _entry(202, 2.2, purpose="chat", spawner_pid=700, spawner_create=7.0),  # not reapable purpose
     ]
-    fake = _fake_psutil({500: 5.0})
+    fake = _fake_psutil({200: 2.0, 201: 2.1, 202: 2.2, 500: 5.0})
     with patch.dict(sys.modules, {"psutil": fake}), \
          patch.object(pi, "ledger_entries", return_value=entries), \
          patch.object(pi, "spawner_is_dead", wraps=pi.spawner_is_dead):
-        assert cli_main._ledger_reapable_backend_pids(_holders(200, 201, 202, 203)) == [200]
+        assert cli_main._ledger_reapable_backend_pids(
+            _holders(200, 201, 202, 203)
+        ) == [(200, 2.0)]
+
+
+def test_updater_ledger_rung_rejects_a_reused_target_pid():
+    from hermes_cli import main as cli_main
+
+    entries = [
+        _entry(200, 2.0, spawner_pid=700, spawner_create=7.0),
+    ]
+    fake = _fake_psutil({200: 99.0})
+    with patch.dict(sys.modules, {"psutil": fake}), \
+         patch.object(pi, "ledger_entries", return_value=entries), \
+         patch.object(pi, "spawner_is_dead", wraps=pi.spawner_is_dead):
+        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
+
+
+@pytest.mark.parametrize("recorded_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_updater_ledger_rung_rejects_invalid_target_creation_time(recorded_create):
+    from hermes_cli import main as cli_main
+
+    entries = [
+        _entry(200, recorded_create, spawner_pid=700, spawner_create=7.0),
+    ]
+    fake = _fake_psutil({200: 2.0})
+    with patch.dict(sys.modules, {"psutil": fake}), \
+         patch.object(pi, "ledger_entries", return_value=entries), \
+         patch.object(pi, "spawner_is_dead", return_value=True):
+        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
 
 
 def test_updater_ledger_rung_empty_without_ledger():

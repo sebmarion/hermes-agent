@@ -1,8 +1,10 @@
 import json
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -349,33 +351,33 @@ def test_owner_children_skips_malformed_task_index_without_aborting_valid_candid
         db.close()
 
 
-def test_chief_archives_each_completed_child_from_real_two_child_sync_batch(
+def test_chief_keeps_receipt_results_bound_past_later_parent_tool_output(
         tmp_path, monkeypatch):
     from chief_plugin import ChiefPlugin
+    from tools import async_delegation
     from tui_gateway import server
     from tui_gateway.owner_inbox import live_owner_dispatch
 
     profile_home = tmp_path / "profile"
     db = SessionDB(db_path=profile_home / "state.db")
     db.create_session("parent", "desktop", git_repo_root="repo")
-    receipt = {
-        "kind": "delegated_child_result", "version": 1,
-        "delivery_id": "sync-delegation:batch-real",
-        "delegation_id": "batch-real", "parent_session_id": "parent",
-        "is_batch": True, "children": [],
-    }
-    for index, child_id in enumerate(("child-0", "child-1", "child-failed")):
-        status = "failed" if child_id == "child-failed" else "completed"
-        receipt["children"].append({
-            "task_index": index, "goal": f"task {index}",
+    children = []
+    for index, (child_id, status, task_index) in enumerate((
+            ("child-valid", "completed", 0),
+            ("child-failed", "failed", 1),
+            ("child-malformed", "completed", "bad"))):
+        entry = {
+            "task_index": task_index, "goal": f"task {index}",
             "child_session_id": child_id, "launch_id": f"launch-{index}",
             "origin_version": 1, "created_session_id": child_id,
-            "parent_session_id": "parent", "completion_id": f"batch-real:{index}",
+            "parent_session_id": "parent", "completion_id": f"final:{index}",
             "status": status, "exit_reason": status, "truncated": False,
-        })
+        }
+        children.append(entry)
         db.create_session(child_id, "delegate", parent_session_id="parent",
                           git_repo_root="repo", model_config={
-                              "_origin": {"version": 1, "launch_id": f"launch-{index}",
+                              "_origin": {"version": 1,
+                                          "launch_id": f"launch-{index}",
                                           "created_session_id": child_id,
                                           "parent_session_id": "parent"},
                               "_delegate_from": "parent",
@@ -384,9 +386,263 @@ def test_chief_archives_each_completed_child_from_real_two_child_sync_batch(
                           })
         db.append_message(child_id, "assistant", "child result")
         db.end_session(child_id, status)
+    receipt = {
+        "kind": "delegated_child_result", "version": 1,
+        "delivery_id": "sync-delegation:final", "delegation_id": "final",
+        "parent_session_id": "parent", "is_batch": True, "children": children,
+    }
     db.append_message("parent", "tool", json.dumps({
-        "archive_receipt": receipt, "results": receipt["children"],
-    }), tool_name="delegate_task", tool_call_id="call-batch-real")
+        "archive_receipt": receipt, "results": children,
+    }), tool_name="delegate_task", tool_call_id="call-final")
+    db.append_message("parent", "tool", json.dumps({"output": "ok"}),
+                      tool_name="ordinary_tool", tool_call_id="call-ordinary")
+    db.append_message("parent", "tool", json.dumps({
+        "archive_receipt": {
+            "kind": "delegated_child_result", "version": 1,
+            "delivery_id": "sync-delegation:unrelated",
+            "delegation_id": "unrelated", "parent_session_id": "parent",
+            "is_batch": True, "children": [{
+                "task_index": 0, "goal": "unrelated", "child_session_id": "other",
+                "launch_id": "other-launch", "origin_version": 1,
+                "created_session_id": "other", "parent_session_id": "parent",
+                "completion_id": "unrelated:0", "status": "completed",
+                "exit_reason": "completed", "truncated": False,
+            }],
+        },
+        "results": [{"task_index": 0, "status": "completed",
+                      "exit_reason": "completed", "truncated": False}],
+    }), tool_name="delegate_task", tool_call_id="call-unrelated")
+    db.append_message("parent", "tool", json.dumps({"output": "still ok"}),
+                      tool_name="ordinary_tool", tool_call_id="call-ordinary-2")
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "p")
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(async_delegation, "list_durable_delegations", lambda: [])
+
+    @contextmanager
+    def profile_db(_params):
+        yield db
+
+    monkeypatch.setattr(server, "_profile_db", profile_db)
+    context = SimpleNamespace(get_config=lambda key, default=None: {
+        "enabled": True, "owner_inbox_enabled": True,
+        "ledger_path": str(tmp_path / "chief.db"),
+        "profile_name": "p", "archive_enabled": True,
+        "archive_activation_cutoff": 0,
+        "archive_allowlist": [
+            {"profile": "p", "session_id": child_id, "repository": "repo"}
+            for child_id, _status, _task_index in (
+                ("child-valid", "completed", 0),
+                ("child-failed", "failed", 1),
+                ("child-malformed", "completed", "bad"),
+            )
+        ],
+    }.get(key, default))
+    plugin = ChiefPlugin(context)
+    try:
+        dispatch = live_owner_dispatch(server, lambda *args: None)
+        plugin._archive_children(dispatch)
+        plugin._archive_children(dispatch)
+        assert [db.get_session(child_id)["archived"] for child_id in
+                ("child-valid", "child-failed", "child-malformed")] == [1, 0, 0]
+        assert ledger.archive_receipt_state(plugin.db, "final:0") == "archived"
+        assert ledger.archive_receipt_state(plugin.db, "final:1") is None
+        assert ledger.archive_receipt_state(plugin.db, "final:2") is None
+    finally:
+        db.close()
+
+
+def test_duplicate_receipt_indices_leave_all_ambiguous_children_unarchived(
+        tmp_path, monkeypatch):
+    from chief_plugin import ChiefPlugin
+    from tools import async_delegation
+    from tui_gateway import server
+    from tui_gateway.owner_inbox import live_owner_dispatch
+
+    profile_home = tmp_path / "profile"
+    db = SessionDB(db_path=profile_home / "state.db")
+    db.create_session("parent", "desktop", git_repo_root="repo")
+    specs = (("child-duplicate-a", 0), ("child-duplicate-b", 0),
+             ("child-valid", 1))
+    entries = []
+    for index, (child_id, task_index) in enumerate(specs):
+        launch_id = f"duplicate-launch-{index}"
+        entry = {
+            "task_index": task_index, "goal": f"task {index}",
+            "child_session_id": child_id, "launch_id": launch_id,
+            "origin_version": 1, "created_session_id": child_id,
+            "parent_session_id": "parent", "completion_id": f"duplicate:{index}",
+            "status": "completed", "exit_reason": "completed", "truncated": False,
+        }
+        entries.append(entry)
+        db.create_session(child_id, "delegate", parent_session_id="parent",
+                          git_repo_root="repo", model_config={
+                              "_origin": {"version": 1, "launch_id": launch_id,
+                                          "created_session_id": child_id,
+                                          "parent_session_id": "parent"},
+                              "_delegate_from": "parent",
+                              "_created_by": "agent_delegate",
+                              "_origin_kind": "delegated_child",
+                          })
+        db.append_message(child_id, "assistant", "child result")
+        db.end_session(child_id, "completed")
+    receipt_message_id = db.append_message("parent", "tool", json.dumps({
+        "archive_receipt": {
+            "kind": "delegated_child_result", "version": 1,
+            "delivery_id": "sync-delegation:duplicate",
+            "delegation_id": "duplicate", "parent_session_id": "parent",
+            "is_batch": True, "children": entries,
+        },
+        "results": [
+            {"task_index": 0, "status": "completed",
+             "exit_reason": "completed", "truncated": False},
+            {"task_index": 1, "status": "completed",
+             "exit_reason": "completed", "truncated": False},
+        ],
+    }), tool_name="delegate_task", tool_call_id="call-duplicate")
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "p")
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(async_delegation, "list_durable_delegations", lambda: [])
+
+    @contextmanager
+    def profile_db(_params):
+        yield db
+
+    monkeypatch.setattr(server, "_profile_db", profile_db)
+    context = SimpleNamespace(get_config=lambda key, default=None: {
+        "enabled": True, "owner_inbox_enabled": True,
+        "ledger_path": str(tmp_path / "chief.db"), "profile_name": "p",
+        "archive_enabled": True, "archive_activation_cutoff": 0,
+        "archive_allowlist": [
+            {"profile": "p", "session_id": child_id, "repository": "repo"}
+            for child_id, _task_index in specs
+        ],
+    }.get(key, default))
+    plugin = ChiefPlugin(context)
+    try:
+        dispatch = live_owner_dispatch(server, lambda *args: None)
+        for index, (child_id, _task_index) in enumerate(specs[:2]):
+            assert not dispatch.archive(
+                "p", child_id, True,
+                expected_lineage=dispatch.lineage("p", child_id),
+                expected_proof={
+                    "delegation_id": "duplicate",
+                    "launch_id": f"duplicate-launch-{index}",
+                    "origin_version": 1,
+                    "created_session_id": child_id,
+                    "parent_session_id": "parent",
+                    "child_session_id": child_id,
+                    "completion_id": f"duplicate:{index}",
+                    "delivery_id": "sync-delegation:duplicate",
+                    "delivery_session_id": "parent",
+                    "delivery_acknowledged_at": receipt_message_id,
+                },
+            )
+        plugin._archive_children(dispatch)
+        plugin._archive_children(dispatch)
+        assert [db.get_session(child_id)["archived"] for child_id, _ in specs] == [0, 0, 1]
+        assert ledger.archive_receipt_state(plugin.db, "duplicate:0") is None
+        assert ledger.archive_receipt_state(plugin.db, "duplicate:1") is None
+        assert ledger.archive_receipt_state(plugin.db, "duplicate:2") == "archived"
+    finally:
+        db.close()
+
+
+def test_chief_archives_each_completed_child_from_real_two_child_sync_batch(
+        tmp_path, monkeypatch):
+    from chief_plugin import ChiefPlugin
+    from tools.delegate_tool import delegate_task
+    from tui_gateway import server
+    from tui_gateway.owner_inbox import live_owner_dispatch
+
+    profile_home = tmp_path / "profile"
+    db = SessionDB(db_path=profile_home / "state.db")
+    db.create_session("parent", "desktop", git_repo_root="repo")
+    parent = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1", api_key="test-key",
+        provider="openrouter", api_mode="chat_completions",
+        model="test/model", platform="cli", providers_allowed=None,
+        providers_ignored=None, providers_order=None, provider_sort=None,
+        _session_db=db, session_id="parent", _delegate_depth=0,
+        _active_children=[], _active_children_lock=threading.Lock(),
+        _print_fn=None, tool_progress_callback=None, thinking_callback=None,
+        _interrupt_requested=False,
+    )
+    child_specs = (
+        ("child-0", "launch-0"), ("child-1", "launch-1"),
+        ("child-failed", "launch-2"),
+    )
+
+    def build_child(**kwargs):
+        index = kwargs["task_index"]
+        child_id, launch_id = child_specs[index]
+        db.create_session(child_id, "delegate", parent_session_id="parent",
+                          git_repo_root="repo", model_config={
+                              "_origin": {"version": 1, "launch_id": launch_id,
+                                          "created_session_id": child_id,
+                                          "parent_session_id": "parent"},
+                              "_delegate_from": "parent",
+                              "_created_by": "agent_delegate",
+                              "_origin_kind": "delegated_child",
+                          })
+        db.append_message(child_id, "assistant", "child result")
+        db.end_session(child_id, "failed" if index == 2 else "completed")
+        return SimpleNamespace(
+            session_id=child_id, _delegate_role="leaf",
+            tool_progress_callback=None,
+            _session_init_model_config={"_origin": {
+                "version": 1, "launch_id": launch_id,
+                "created_session_id": child_id,
+                "parent_session_id": "parent",
+            }},
+        )
+
+    child_results = [
+        {"task_index": 0, "status": "completed", "summary": "A done",
+         "exit_reason": "completed", "truncated": False,
+         "api_calls": 1, "duration_seconds": 1.0},
+        {"task_index": 1, "status": "completed", "summary": "B done",
+         "exit_reason": "completed", "truncated": False,
+         "api_calls": 1, "duration_seconds": 1.0},
+        {"task_index": 2, "status": "failed", "summary": None,
+         "exit_reason": "failed", "truncated": False,
+         "api_calls": 1, "duration_seconds": 1.0},
+    ]
+    with patch("tools.delegate_tool._build_child_preserving_parent_tools",
+               side_effect=build_child), \
+         patch("tools.delegate_tool._run_single_child",
+               side_effect=child_results), \
+         patch("tools.delegation_live_log.create_live_transcripts",
+               return_value=("batch-real", [None, None, None], [])), \
+         patch("tools.delegation_live_log.update_manifest_statuses"), \
+         patch("tools.delegate_tool._capture_gateway_steer_authority",
+               return_value=(None, None)), \
+         patch("tools.delegate_tool._resolve_delegation_credentials",
+               return_value={"model": None, "provider": None,
+                             "base_url": None, "api_key": None,
+                             "api_mode": None}):
+        aggregated = json.loads(delegate_task(
+            tasks=[
+                {"goal": "Implement the first delegated regression task"},
+                {"goal": "Implement the second delegated regression task"},
+                {"goal": "Implement the failed delegated regression task"},
+            ],
+            parent_agent=parent,
+        ))
+    from run_agent import AIAgent
+    with patch("run_agent.get_tool_definitions", return_value=[]), \
+         patch("run_agent.check_toolset_requirements", return_value={}), \
+         patch("run_agent.OpenAI"):
+        parent_persistence = AIAgent(
+            base_url="https://openrouter.ai/api/v1", api_key="test-key",
+            provider="openrouter", api_mode="chat_completions",
+            model="test/model", quiet_mode=True, session_id="parent",
+            session_db=db, skip_context_files=True, skip_memory=True,
+        )
+        parent_persistence._flush_messages_to_session_db(
+            [{"role": "tool", "content": json.dumps(aggregated),
+              "tool_name": "delegate_task", "tool_call_id": "call-batch-real"}],
+            conversation_history=[],
+        )
     monkeypatch.setattr(server, "_current_profile_name", lambda: "p")
     monkeypatch.setattr(server, "_sessions", {})
 
@@ -696,3 +952,191 @@ def test_profile_db_is_exact_with_empty_live_registry(tmp_path, monkeypatch):
     assert owner.lineage("p1", "child")[0]["git_repo_root"] == "repo-p1"
     assert owner.lineage("p2", "child") == []
     assert owner.automation("p1", "child") is None
+
+
+def test_real_async_batch_terminal_receipt_reaches_chief_and_native_archive(
+        tmp_path, monkeypatch):
+    from chief_plugin import ChiefPlugin
+    from tools import async_delegation as ad
+    from tui_gateway import server
+    from tui_gateway.owner_inbox import live_owner_dispatch
+
+    profile_home = tmp_path / "profile"
+    state_path = profile_home / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: state_path)
+    db = SessionDB(db_path=state_path)
+    db.create_session("parent", "desktop", git_repo_root="repo")
+    from tools.delegate_tool import delegate_task
+    child_ids = ("async-child-0", "async-child-1", "async-child-failed")
+    parent = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1", api_key="test-key",
+        provider="openrouter", api_mode="chat_completions",
+        model="test/model", platform="cli", providers_allowed=None,
+        providers_ignored=None, providers_order=None, provider_sort=None,
+        _session_db=db, session_id="parent", _delegate_depth=0,
+        _active_children=[], _active_children_lock=threading.Lock(),
+        _print_fn=None, tool_progress_callback=None, thinking_callback=None,
+        _interrupt_requested=False,
+    )
+
+    def build_child(**kwargs):
+        index = kwargs["task_index"]
+        child_id = child_ids[index]
+        launch_id = f"async-launch-{index}"
+        db.create_session(child_id, "delegate", parent_session_id="parent",
+                          git_repo_root="repo", model_config={
+                              "_origin": {"version": 1, "launch_id": launch_id,
+                                          "created_session_id": child_id,
+                                          "parent_session_id": "parent"},
+                              "_delegate_from": "parent",
+                              "_created_by": "agent_delegate",
+                              "_origin_kind": "delegated_child",
+                          })
+        return SimpleNamespace(
+            session_id=child_id, _delegate_role="leaf",
+            tool_progress_callback=None,
+            _session_init_model_config={"_origin": {
+                "version": 1, "launch_id": launch_id,
+                "created_session_id": child_id,
+                "parent_session_id": "parent",
+            }},
+            get_activity_summary=lambda: {},
+        )
+
+    def run_child(*, task_index, **_kwargs):
+        status = "failed" if task_index == 2 else "completed"
+        worker_db = SessionDB(db_path=state_path)
+        worker_db.append_message(child_ids[task_index], "assistant", "async result")
+        worker_db.end_session(child_ids[task_index], status)
+        worker_db.close()
+        return {
+            "task_index": task_index, "status": status,
+            "summary": None if status == "failed" else f"async {task_index} done",
+            "exit_reason": status, "truncated": False,
+            "api_calls": 1, "duration_seconds": 1.0,
+        }
+
+    with patch("tools.delegate_tool._build_child_preserving_parent_tools",
+               side_effect=build_child), \
+         patch("tools.delegate_tool._run_single_child", side_effect=run_child), \
+         patch("tools.delegation_live_log.create_live_transcripts",
+               return_value=("async-batch", [None, None, None], [])), \
+         patch("tools.delegation_live_log.update_manifest_statuses"), \
+         patch("tools.delegate_tool._capture_gateway_steer_authority",
+               return_value=(None, None)), \
+         patch("tools.delegate_tool._resolve_delegation_credentials",
+               return_value={"model": None, "provider": None,
+                             "base_url": None, "api_key": None,
+                             "api_mode": None}):
+        dispatched = json.loads(delegate_task(
+            tasks=[
+                {"goal": "Run the first async delegated regression task"},
+                {"goal": "Run the second async delegated regression task"},
+                {"goal": "Run the failed async delegated regression task"},
+            ], background=True, parent_agent=parent,
+        ))
+        assert dispatched["status"] == "dispatched"
+        deadline = time.time() + 5
+        while ad.active_count() and time.time() < deadline:
+            time.sleep(0.01)
+    assert ad.active_count() == 0
+    claim = "async-test-claim"
+    assert ad.claim_completion_delivery(dispatched["delegation_id"], claim)
+    event = {"type": "async_delegation",
+             "delegation_id": dispatched["delegation_id"],
+             "session_key": "parent", "parent_session_id": "parent"}
+    from run_agent import AIAgent
+    parent_agent = AIAgent(
+        base_url="https://openrouter.ai/api/v1", api_key="test-key",
+        provider="openrouter", api_mode="chat_completions",
+        model="test/model", quiet_mode=True, session_id="parent",
+        session_db=db, skip_context_files=True, skip_memory=True,
+    )
+
+    def mock_model_turn(_prompt, **_kwargs):
+        return {"final_response": "async batch done",
+                "messages": [{"role": "assistant", "content": "async batch done"}],
+                "completed": True}
+
+    parent_agent.run_conversation = mock_model_turn
+
+    session = {
+        "session_key": "parent", "agent": parent_agent, "history": [],
+        "history_lock": threading.RLock(), "running": True, "queued": False,
+        "profile_home": str(profile_home), "cols": 80, "attached_images": [],
+        "transport": None,
+    }
+    terminal_callback = server._async_delegation_terminal_callback(
+        event, claim, profile_home=profile_home
+    )
+    identity_calls = []
+    real_ensure_terminal_assistant_identity = server._ensure_terminal_assistant_identity
+
+    def record_terminal_identity(db_handle, session_id, text, delivery_id,
+                                 *, delegation_id=None):
+        identity_calls.append((session_id, text, delivery_id, delegation_id))
+        return real_ensure_terminal_assistant_identity(
+            db_handle, session_id, text, delivery_id,
+            delegation_id=delegation_id,
+        )
+
+    monkeypatch.setattr(server, "_ensure_terminal_assistant_identity",
+                        record_terminal_identity)
+    assert server._run_prompt_submit(
+        "receipt-turn", "parent", session, "async batch done",
+        display_kind="async_delegation_complete",
+        display_metadata=server._async_delegation_display_metadata(event),
+        terminal_callback=terminal_callback,
+    ) is True
+    deadline = time.time() + 5
+    while session.get("running") and time.time() < deadline:
+        time.sleep(0.01)
+    assert not session.get("running")
+    assert identity_calls == [(
+        "parent", "async batch done", "async-delegation:async-batch", "async-batch"
+    )]
+    assert ad.ack_terminal_output("async-delegation:async-batch", "parent", claim)
+    assert ad.list_terminal_outputs("parent") == []
+    assert db.get_messages("parent", latest=True, limit=1)[0]["display_metadata"] == {
+        "delivery_id": "async-delegation:async-batch",
+        "delegation_id": "async-batch",
+    }
+
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "p")
+    monkeypatch.setattr(server, "_sessions", {})
+    @contextmanager
+    def profile_db(_params):
+        yield db
+    monkeypatch.setattr(server, "_profile_db", profile_db)
+    context = SimpleNamespace(get_config=lambda key, default=None: {
+        "enabled": True, "owner_inbox_enabled": True,
+        "ledger_path": str(tmp_path / "chief.db"), "profile_name": "p",
+        "archive_enabled": True, "archive_activation_cutoff": 0,
+        "archive_allowlist": [
+            {"profile": "p", "session_id": child, "repository": "repo"}
+            for child in child_ids
+        ],
+    }.get(key, default))
+    plugin = ChiefPlugin(context)
+    try:
+        dispatch = live_owner_dispatch(server, lambda *args: None)
+        records = dispatch.children("p")
+        assert [(row["child_session_id"], row["completion_id"])
+                for row in records] == [
+                    ("async-child-0", "async-batch:0"),
+                    ("async-child-1", "async-batch:1"),
+                    ("async-child-failed", "async-batch:2"),
+                ]
+        plugin._archive_children(dispatch)
+        assert [db.get_session(child)["archived"] for child in child_ids] == [1, 1, 0]
+        assert ledger.archive_receipt_state(plugin.db, "async-batch:0") == "archived"
+        assert ledger.archive_receipt_state(plugin.db, "async-batch:1") == "archived"
+        db.close()
+        db = SessionDB(db_path=state_path)
+        assert [db.get_session(child)["archived"] for child in child_ids] == [1, 1, 0]
+        assert ledger.mark_archive_restored(plugin.db, "async-batch:0", now=4)
+        assert dispatch.archive("p", "async-child-0", False)
+        plugin._archive_children(dispatch)
+        assert db.get_session("async-child-0")["archived"] == 0
+    finally:
+        db.close()

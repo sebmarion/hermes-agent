@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import platform
 import threading
@@ -61,6 +62,24 @@ _IS_WINDOWS = platform.system() == "Windows"
 # kernel closes it (and kills the job) when we die. Never close it manually.
 _JOB_HANDLE = None
 _LEDGER_LOCK = threading.Lock()
+
+
+def coerce_process_create_time(value: object) -> Optional[float]:
+    """Return a finite positive process creation time, else ``None``."""
+    if isinstance(value, bool):
+        return None
+    try:
+        create_time = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(create_time) or create_time <= 0:
+        return None
+    return create_time
+
+
+def _is_valid_pid(value: object) -> bool:
+    """True only for positive integer PIDs (never bool-as-int)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +110,7 @@ def _own_create_time() -> Optional[float]:
     try:
         import psutil
 
-        return float(psutil.Process(os.getpid()).create_time())
+        return coerce_process_create_time(psutil.Process(os.getpid()).create_time())
     except Exception:
         return None
 
@@ -140,9 +159,8 @@ def parse_spawn_tag(raw: object) -> Optional[SpawnTag]:
         return None
     create: Optional[float] = None
     if create_s != "-":
-        try:
-            create = float(create_s)
-        except ValueError:
+        create = coerce_process_create_time(create_s)
+        if create is None:
             return None
     return SpawnTag(install=install, purpose=purpose, spawner_pid=pid, spawner_create=create)
 
@@ -216,6 +234,8 @@ def _quarantine_ledger(path: Path) -> None:
 
 def _pid_alive_matches(pid: int, create_time: Optional[float]) -> Optional[bool]:
     """True/False when provable; ``None`` when psutil can't say."""
+    if not _is_valid_pid(pid):
+        return False
     try:
         import psutil
     except Exception:
@@ -224,7 +244,11 @@ def _pid_alive_matches(pid: int, create_time: Optional[float]) -> Optional[bool]
         proc = psutil.Process(int(pid))
         if create_time is None:
             return True
-        return abs(float(proc.create_time()) - float(create_time)) < 2.0
+        expected_create = coerce_process_create_time(create_time)
+        live_create = coerce_process_create_time(proc.create_time())
+        if expected_create is None or live_create is None:
+            return None
+        return abs(live_create - expected_create) < 2.0
     except psutil.NoSuchProcess:
         return False
     except Exception:
@@ -269,9 +293,12 @@ def register_self(
                 spawner_create = float(marker.split(":", 1)[1]) / 1000.0
             except (ValueError, IndexError):
                 spawner_create = None
+    own_create_time = _own_create_time()
+    if own_create_time is None:
+        return False
     entry = LedgerEntry(
         pid=os.getpid(),
-        create_time=_own_create_time(),
+        create_time=own_create_time,
         purpose=purpose,
         install=install_id(project_root),
         spawner_pid=spawner_pid,
@@ -318,11 +345,11 @@ def _append_entry(entry: LedgerEntry) -> bool:
         pruned: list[dict] = []
         for e in entries:
             pid = e.get("pid")
-            if not isinstance(pid, int) or pid == entry.pid:
+            if not _is_valid_pid(pid) or pid == entry.pid:
                 continue
             alive = _pid_alive_matches(pid, e.get("create_time"))
-            if alive is False:
-                continue  # provably dead → prune
+            if alive is not True:
+                continue  # dead or not identity-bound → prune
             pruned.append(e)
         pruned.append(asdict(entry))
         try:
@@ -359,17 +386,21 @@ def register_child(
     provable ``create_time`` means no forge-proof identity — don't record a
     pid-only entry a reuse could impersonate) or the write failed.
     """
+    if isinstance(pid, bool):
+        return False
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return False
-    if pid <= 0:
+    if not _is_valid_pid(pid):
         return False
     try:
         import psutil
 
-        child_create: Optional[float] = float(psutil.Process(pid).create_time())
+        child_create = coerce_process_create_time(psutil.Process(pid).create_time())
     except Exception:
+        return False
+    if child_create is None:
         return False
     entry = LedgerEntry(
         pid=pid,
@@ -411,9 +442,12 @@ def ledger_entries(*, project_root: Optional[Path] = None) -> list[dict]:
         if e.get("install") != want_install:
             continue
         pid = e.get("pid")
-        if not isinstance(pid, int):
+        if not _is_valid_pid(pid):
             continue
-        if _pid_alive_matches(pid, e.get("create_time")) is False:
+        create_time = coerce_process_create_time(e.get("create_time"))
+        if create_time is None:
+            continue
+        if _pid_alive_matches(pid, create_time) is not True:
             continue
         out.append(e)
     return out
@@ -426,9 +460,12 @@ def spawner_is_dead(entry: dict) -> Optional[bool]:
     ``False`` → owner still alive. ``None`` → no spawner recorded / unprovable.
     """
     spawner_pid = entry.get("spawner_pid")
-    if not isinstance(spawner_pid, int) or spawner_pid <= 0:
+    if not _is_valid_pid(spawner_pid):
         return None
-    alive = _pid_alive_matches(spawner_pid, entry.get("spawner_create"))
+    spawner_create = coerce_process_create_time(entry.get("spawner_create"))
+    if spawner_create is None:
+        return None
+    alive = _pid_alive_matches(spawner_pid, spawner_create)
     if alive is None:
         return None
     return not alive
@@ -465,22 +502,22 @@ def reap_orphaned_mcp_helpers(
             if entry.get("purpose") != "mcp-helper":
                 continue
             pid = entry.get("pid")
-            if not isinstance(pid, int) or pid <= 0 or pid == own_pid:
+            if not _is_valid_pid(pid) or pid == own_pid:
+                continue
+            recorded_create = coerce_process_create_time(entry.get("create_time"))
+            if recorded_create is None:
                 continue
             if spawner_is_dead(entry) is not True:
                 continue  # live or unprovable spawner → never touch
+            import psutil
+
+            proc = psutil.Process(pid)
+            live_create = coerce_process_create_time(proc.create_time())
+            if live_create is None or abs(live_create - recorded_create) >= 2.0:
+                continue
             if kill_fn is not None:
                 kill_fn(pid)
             else:
-                import psutil
-
-                proc = psutil.Process(pid)
-                # Re-verify identity at the moment of kill (PID-reuse guard).
-                create = entry.get("create_time")
-                if create is not None and abs(
-                    float(proc.create_time()) - float(create)
-                ) >= 2.0:
-                    continue
                 proc.terminate()
                 try:
                     proc.wait(timeout=2.0)

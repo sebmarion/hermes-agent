@@ -427,6 +427,12 @@ def live_owner_dispatch(server, prompt_submit):
                                 len(matches) != 1 or not entries):
                             continue
                         entry = matches[0]
+                        receipt_index_matches = [item for item in entries
+                                                 if isinstance(item, dict) and
+                                                 item.get("task_index") ==
+                                                 entry.get("task_index")]
+                        if len(receipt_index_matches) != 1:
+                            continue
                         result_matches = [item for item in result_entries
                                           if isinstance(item, dict) and
                                           item.get("task_index") == entry.get("task_index")]
@@ -664,6 +670,7 @@ def live_owner_dispatch(server, prompt_submit):
                     if not parent_id:
                         continue
                     receipt_match = None
+                    receipt_match_invalid = False
                     parent_messages = db.get_messages(parent_id, limit=10000)
                     for message in parent_messages:
                         if message.get("role") not in {"tool", "tool_result"}:
@@ -675,24 +682,28 @@ def live_owner_dispatch(server, prompt_submit):
                         receipt = payload.get("archive_receipt") if isinstance(payload, dict) else None
                         entries = receipt.get("children") if isinstance(receipt, dict) else None
                         result_entries = payload.get("results") if isinstance(payload, dict) else None
+                        matches = ([entry for entry in entries
+                                   if isinstance(entry, dict) and
+                                   str(entry.get("child_session_id") or "") == child_id]
+                                   if isinstance(entries, list) else [])
                         if (not isinstance(receipt, dict) or
                                 receipt.get("kind") != "delegated_child_result" or
                                 receipt.get("version") != 1 or
                                 receipt.get("parent_session_id") != parent_id or
-                                not isinstance(entries, list) or
-                                not isinstance(result_entries, list)):
+                                not isinstance(entries, list)):
+                            if matches:
+                                receipt_match_invalid = True
                             continue
-                        matches = [entry for entry in entries
-                                   if isinstance(entry, dict) and
-                                   str(entry.get("child_session_id") or "") == child_id]
-                        if len(matches) == 1 and receipt_match is None:
-                            receipt_match = (receipt, matches[0], message)
+                        if len(matches) == 1:
+                            if not isinstance(result_entries, list) or receipt_match is not None:
+                                receipt_match_invalid = True
+                                continue
+                            receipt_match = (receipt, matches[0], message, result_entries)
                         elif len(matches) > 1:
-                            receipt_match = None
-                            break
-                    if receipt_match is None:
+                            receipt_match_invalid = True
+                    if receipt_match is None or receipt_match_invalid:
                         continue
-                    receipt, entry, message = receipt_match
+                    receipt, entry, message, result_entries = receipt_match
                     if (isinstance(entry.get("task_index"), bool) or
                             not isinstance(entry.get("task_index"), int) or
                             entry.get("task_index") < 0 or
@@ -714,6 +725,19 @@ def live_owner_dispatch(server, prompt_submit):
                     all_entries = receipt.get("children")
                     if not isinstance(all_entries, list):
                         continue
+                    receipt_index_counts = {}
+                    for item in all_entries:
+                        if (isinstance(item, dict) and
+                                isinstance(item.get("task_index"), int) and
+                                not isinstance(item.get("task_index"), bool)):
+                            task_index = item["task_index"]
+                            receipt_index_counts[task_index] = (
+                                receipt_index_counts.get(task_index, 0) + 1
+                            )
+                    duplicate_receipt_indices = {
+                        task_index for task_index, count in receipt_index_counts.items()
+                        if count > 1
+                    }
                     valid_entries = []
                     seen_indices = set()
                     for item in all_entries:
@@ -725,6 +749,7 @@ def live_owner_dispatch(server, prompt_submit):
                                  item.get("task_index") != 0) or
                                 not item.get("goal") or
                                 item.get("task_index") in seen_indices or
+                                item.get("task_index") in duplicate_receipt_indices or
                                 (bool(receipt.get("is_batch")) and
                                  not item.get("completion_id"))):
                             continue

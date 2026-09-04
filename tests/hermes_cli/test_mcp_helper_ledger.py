@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import psutil
@@ -91,8 +92,157 @@ def test_register_child_rejects_dead_or_invalid_pids(ledger):
     assert pi.register_child(dead_pid, "mcp-helper") is False
     assert pi.register_child(0, "mcp-helper") is False
     assert pi.register_child(-5, "mcp-helper") is False
+    assert pi.register_child(True, "mcp-helper") is False
     assert pi.register_child("junk", "mcp-helper") is False  # type: ignore[arg-type]
     assert not ledger.exists() or json.loads(ledger.read_text()) == []
+
+
+def test_register_child_rejects_non_finite_creation_time(ledger, monkeypatch):
+    fake_process = lambda _pid: type(
+        "FakeProcess",
+        (),
+        {
+            "create_time": lambda self: float("nan"),
+            "cmdline": lambda self: ["helper"],
+        },
+    )()
+    monkeypatch.setattr(psutil, "Process", fake_process)
+
+    assert pi.register_child(123, "mcp-helper") is False
+    assert not ledger.exists()
+
+
+@pytest.mark.parametrize("use_callback", [True, False], ids=["callback", "default"])
+@pytest.mark.parametrize(
+    "stored_create",
+    [
+        pytest.param("missing", id="missing"),
+        pytest.param(None, id="null"),
+        pytest.param("junk", id="malformed-string"),
+        pytest.param(False, id="bool"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_reap_rejects_invalid_child_identity(
+    ledger, use_callback, stored_create
+):
+    child_pid = 61001
+    spawner_pid = 61002
+    events = []
+
+    class NoSuchProcess(Exception):
+        pass
+
+    class TimeoutExpired(Exception):
+        pass
+
+    class Child:
+        def create_time(self):
+            return 200.0
+
+        def terminate(self):
+            events.append(("terminate", child_pid))
+
+        def wait(self, timeout):
+            return None
+
+        def kill(self):
+            events.append(("kill", child_pid))
+
+    def process(pid):
+        if pid == spawner_pid:
+            raise NoSuchProcess(pid)
+        assert pid == child_pid
+        return Child()
+
+    fake_psutil = SimpleNamespace(
+        Process=process,
+        NoSuchProcess=NoSuchProcess,
+        TimeoutExpired=TimeoutExpired,
+    )
+    entry = {
+        "pid": child_pid,
+        "purpose": "mcp-helper",
+        "install": pi.install_id(),
+        "spawner_pid": spawner_pid,
+        "spawner_create": 100.0,
+    }
+    if stored_create != "missing":
+        entry["create_time"] = stored_create
+    ledger.write_text(json.dumps([entry]), encoding="utf-8")
+    callbacks = []
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}):
+        kwargs = {"kill_fn": callbacks.append} if use_callback else {}
+        reaped = pi.reap_orphaned_mcp_helpers(**kwargs)
+
+    assert reaped == []
+    assert callbacks == []
+    assert events == []
+
+
+def test_reap_rechecks_child_identity_before_callback(monkeypatch):
+    child_pid = 61001
+    entry = {
+        "pid": child_pid,
+        "purpose": "mcp-helper",
+        "install": pi.install_id(),
+        "create_time": 200.0,
+        "spawner_pid": 61002,
+        "spawner_create": 100.0,
+    }
+    callbacks = []
+    events = []
+
+    class Child:
+        def create_time(self):
+            events.append(("create_time", child_pid))
+            return 202.0
+
+        def terminate(self):
+            events.append(("terminate", child_pid))
+
+    fake_psutil = SimpleNamespace(Process=lambda _pid: Child())
+    monkeypatch.setattr(pi, "ledger_entries", lambda **_kwargs: [entry])
+    monkeypatch.setattr(pi, "spawner_is_dead", lambda _entry: True)
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}):
+        assert pi.reap_orphaned_mcp_helpers(kill_fn=callbacks.append) == []
+
+    assert callbacks == []
+    assert events == [("create_time", child_pid)]
+
+
+def test_reap_destructive_boundary_rejects_boolean_pid(monkeypatch):
+    callbacks = []
+    fake_psutil = SimpleNamespace(
+        Process=lambda _pid: SimpleNamespace(create_time=lambda: 200.0),
+        NoSuchProcess=RuntimeError,
+    )
+    monkeypatch.setattr(
+        pi,
+        "ledger_entries",
+        lambda **_kwargs: [
+            {
+                "pid": True,
+                "create_time": 200.0,
+                "purpose": "mcp-helper",
+                "spawner_pid": 61002,
+                "spawner_create": 100.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(pi, "spawner_is_dead", lambda _entry: True)
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}):
+        reaped = pi.reap_orphaned_mcp_helpers(kill_fn=callbacks.append)
+
+    assert reaped == []
+    assert callbacks == []
 
 
 def test_mcp_helper_is_reapable_purpose():
@@ -192,7 +342,8 @@ def test_updater_ledger_rung_flows_mcp_helper(ledger, child):
 
     # Provably dead spawner → positively identified as reapable.
     _orphan_entry_for(child.pid)
-    assert update_cmd._ledger_reapable_backend_pids(matches) == [child.pid]
+    targets = update_cmd._ledger_reapable_backend_pids(matches)
+    assert targets == [(child.pid, pytest.approx(psutil.Process(child.pid).create_time()))]
 
 
 # ---------------------------------------------------------------------------

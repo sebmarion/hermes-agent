@@ -84,7 +84,15 @@ def test_orphan_backend_dead_parent_qualifies():
     backend = _proc(200, _SERVE_ARGV, ppid=999)  # 999 not in table → dead
     fake = _fake_psutil({200: backend})
     with patch.dict(sys.modules, {"psutil": fake}):
-        assert cli_main._orphaned_desktop_backend_pids(_holders()) == [200]
+        assert cli_main._orphaned_desktop_backend_pids(_holders()) == [(200, 100.0)]
+
+
+def test_orphan_backend_reap_is_bound_to_its_creation_time():
+    backend = _proc(200, _SERVE_ARGV, ppid=999, create_time=123.5)
+    fake = _fake_psutil({200: backend})
+
+    with patch.dict(sys.modules, {"psutil": fake}):
+        assert cli_main._orphaned_desktop_backend_pids(_holders()) == [(200, 123.5)]
 
 
 def test_backend_with_live_parent_keeps_refusal():
@@ -101,7 +109,7 @@ def test_recycled_parent_pid_counts_as_orphan():
     backend = _proc(200, _SERVE_ARGV, ppid=50, create_time=100.0)
     fake = _fake_psutil({50: recycled, 200: backend})
     with patch.dict(sys.modules, {"psutil": fake}):
-        assert cli_main._orphaned_desktop_backend_pids(_holders()) == [200]
+        assert cli_main._orphaned_desktop_backend_pids(_holders()) == [(200, 100.0)]
 
 
 def test_non_backend_holder_keeps_refusal():
@@ -136,7 +144,7 @@ def test_orphan_root_plus_managed_runtime_descendant_qualifies():
     fake = _fake_psutil({200: backend, 210: child})
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = _holders() + [(210, "python.exe", " ".join(child_argv))]
-        assert cli_main._orphaned_desktop_backend_pids(holders) == [200]
+        assert cli_main._orphaned_desktop_backend_pids(holders) == [(200, 100.0)]
 
 
 def test_descendant_of_grandchild_depth_qualifies():
@@ -150,7 +158,7 @@ def test_descendant_of_grandchild_depth_qualifies():
     fake = _fake_psutil({200: backend, 210: mid, 220: grand})
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = _holders() + [(220, "python.exe", "python.exe leaf.py")]
-        assert cli_main._orphaned_desktop_backend_pids(holders) == [200]
+        assert cli_main._orphaned_desktop_backend_pids(holders) == [(200, 100.0)]
 
 
 def test_non_descendant_alongside_orphan_root_keeps_refusal():
@@ -172,7 +180,7 @@ def test_descendant_exited_between_scan_and_classify_is_skipped():
     fake = _fake_psutil({200: backend})  # descendant 210 already gone
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = _holders() + [(210, "python.exe", "python.exe worker.py")]
-        assert cli_main._orphaned_desktop_backend_pids(holders) == [200]
+        assert cli_main._orphaned_desktop_backend_pids(holders) == [(200, 100.0)]
 
 
 def test_holder_gone_between_scan_and_classify_is_skipped():
@@ -205,8 +213,16 @@ def test_missing_psutil_keeps_refusal():
 def test_stop_process_trees_kills_full_tree():
     from hermes_cli import update_cmd
 
-    with patch.object(update_cmd.subprocess, "run") as run:
-        cli_main._stop_process_trees([111, 222])
+    fake = _fake_psutil(
+        {
+            111: _proc(111, _SERVE_ARGV, create_time=10.0),
+            222: _proc(222, _SERVE_ARGV, create_time=20.0),
+        }
+    )
+    with patch.dict(sys.modules, {"psutil": fake}), patch.object(
+        update_cmd.subprocess, "run"
+    ) as run:
+        cli_main._stop_process_trees([(111, 10.0), (222, 20.0)])
     calls = [c.args[0] for c in run.call_args_list]
     assert calls == [
         ["taskkill", "/PID", "111", "/T", "/F"],
@@ -221,6 +237,48 @@ def test_stop_process_trees_never_raises():
         update_cmd.subprocess, "run", side_effect=OSError("no taskkill")
     ):
         cli_main._stop_process_trees([111])  # must not raise
+
+
+def test_stop_process_trees_revalidates_ledger_identity_before_taskkill():
+    """A PID reused after ledger selection must not be passed to taskkill."""
+    from hermes_cli import update_cmd
+
+    matching = _proc(111, [], create_time=11.0)
+    reused = _proc(222, [], create_time=99.0)
+    fake = _fake_psutil({111: matching, 222: reused})
+    with patch.dict(sys.modules, {"psutil": fake}), patch.object(
+        update_cmd.subprocess, "run"
+    ) as run:
+        cli_main._stop_process_trees([(111, 11.0), (222, 22.0)])
+
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["taskkill", "/PID", "111", "/T", "/F"]
+    ]
+
+
+def test_stop_process_trees_refuses_an_unbound_bare_pid():
+    """A PID without its observed creation time cannot authorize taskkill."""
+    from hermes_cli import update_cmd
+
+    with patch.object(update_cmd.subprocess, "run") as run:
+        cli_main._stop_process_trees([111])
+
+    run.assert_not_called()
+
+
+def test_stop_process_trees_refuses_non_finite_creation_times():
+    """NaN/Infinity must never satisfy the taskkill identity guard."""
+    from hermes_cli import update_cmd
+
+    fake = _fake_psutil({111: _proc(111, [], create_time=11.0)})
+    with patch.dict(sys.modules, {"psutil": fake}), patch.object(
+        update_cmd.subprocess, "run"
+    ) as run:
+        cli_main._stop_process_trees(
+            [(111, float("nan")), (111, float("inf")), (111, float("-inf"))]
+        )
+
+    run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -288,10 +346,10 @@ def test_guard_reaps_orphan_backend_and_proceeds():
     holders = _holders()
     # 1st scan: backend present; 2nd (post-reap) scan: clear.
     result, killed = _run_guard(
-        detect_side_effect=[holders, []], orphan_return=[200]
+        detect_side_effect=[holders, []], orphan_return=[(200, 2.0)]
     )
     assert result == "past_guard"
-    assert killed == [[200]]
+    assert killed == [[(200, 2.0)]]
 
 
 def test_guard_still_refuses_when_not_orphaned():

@@ -105,6 +105,242 @@ class TestRunJobScript:
         assert success is True
         assert output == "relative works"
 
+    def test_timeout_binds_tree_kill_to_spawned_process_creation_time(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text('print("never reached")\n', encoding="utf-8")
+        captured = {}
+
+        class FakeProc:
+            pid = 4321
+            returncode = None
+
+            def poll(self):
+                return None
+
+            def communicate(self, timeout=None):
+                return ("", "")
+
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(sched_mod, "_get_script_timeout", lambda: 0.0)
+        monkeypatch.setattr(
+            sched_mod,
+            "_snapshot_process_create_time",
+            lambda proc: 123.5,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            sched_mod,
+            "_terminate_cron_script_tree",
+            lambda proc, run_token, expected_create_time=None: captured.update(
+                proc=proc,
+                run_token=run_token,
+                expected_create_time=expected_create_time,
+            ),
+        )
+
+        success, _output = _run_job_script("probe.py")
+
+        assert success is False
+        assert captured["proc"].pid == 4321
+        assert captured["run_token"]
+        assert captured["expected_create_time"] == 123.5
+
+    @pytest.mark.live_system_guard_bypass
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX setsid regression")
+    def test_script_timeout_kills_a_detached_descendant(self, cron_env, monkeypatch):
+        import signal
+        import time
+
+        import psutil
+
+        from cron.scheduler import _run_job_script
+
+        pid_file = cron_env / "detached-child.pid"
+        script = cron_env / "scripts" / "detached.py"
+        child_code = (
+            "import os,pathlib,time; "
+            "os.setsid(); "
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+            "time.sleep(60)"
+        )
+        script.write_text(
+            "import subprocess,sys,time\n"
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            "time.sleep(60)\n"
+        )
+        monkeypatch.setenv("HERMES_CRON_SCRIPT_TIMEOUT", "1")
+        detached_pid = None
+
+        def alive(pid: int) -> bool:
+            try:
+                return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+            except psutil.Error:
+                return False
+
+        try:
+            success, output = _run_job_script(str(script))
+            assert success is False
+            assert "timed out" in output.lower()
+            deadline = time.monotonic() + 3
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert pid_file.exists()
+            detached_pid = int(pid_file.read_text())
+            deadline = time.monotonic() + 3
+            while alive(detached_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not alive(detached_pid)
+        finally:
+            if detached_pid is not None and alive(detached_pid):
+                os.kill(detached_pid, signal.SIGKILL)
+
+    def test_tree_cleanup_sweeps_a_tagged_descendant_created_after_first_scan(
+        self, monkeypatch
+    ):
+        import psutil
+
+        from agent import deadline as deadline_mod
+        from cron.scheduler import _terminate_cron_script_tree
+
+        class LateDescendant:
+            pid = 9876
+
+            def __init__(self):
+                self.killed = False
+
+            def environ(self):
+                return {"HERMES_INTERNAL_CRON_SCRIPT_RUN_TOKEN": "run-token"}
+
+            def is_running(self):
+                return True
+
+            def kill(self):
+                self.killed = True
+
+        late_descendant = LateDescendant()
+        scans = iter(([], [late_descendant], []))
+        monkeypatch.setattr(psutil, "process_iter", lambda: next(scans, []))
+        monkeypatch.setattr(deadline_mod, "kill_process_tree", lambda *a, **k: True)
+        root = SimpleNamespace(pid=4321, poll=lambda: None)
+
+        _terminate_cron_script_tree(
+            root, "run-token", expected_create_time=123.5
+        )
+
+        assert late_descendant.killed is True
+
+    @pytest.mark.live_system_guard_bypass
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX setsid regression")
+    def test_script_timeout_kills_detached_descendant_after_root_exits(
+        self, cron_env, monkeypatch
+    ):
+        import signal
+        import time
+
+        import psutil
+
+        from cron.scheduler import _run_job_script
+
+        pid_file = cron_env / "detached-after-exit.pid"
+        script = cron_env / "scripts" / "detached-after-exit.py"
+        child_code = (
+            "import os,pathlib,time; "
+            "os.setsid(); "
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+            "time.sleep(60)"
+        )
+        script.write_text(
+            "import subprocess,sys\n"
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        )
+        monkeypatch.setenv("HERMES_CRON_SCRIPT_TIMEOUT", "1")
+        detached_pid = None
+
+        def alive(pid: int) -> bool:
+            try:
+                return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+            except psutil.Error:
+                return False
+
+        try:
+            success, output = _run_job_script(str(script))
+            assert success is False
+            assert "timed out" in output.lower()
+            assert pid_file.exists()
+            detached_pid = int(pid_file.read_text())
+            deadline = time.monotonic() + 3
+            while alive(detached_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not alive(detached_pid)
+        finally:
+            if detached_pid is not None and alive(detached_pid):
+                os.kill(detached_pid, signal.SIGKILL)
+
+    @pytest.mark.live_system_guard_bypass
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX setsid regression")
+    def test_script_cancellation_kills_detached_descendant_after_root_exits(
+        self, cron_env, monkeypatch
+    ):
+        import signal
+        import threading
+        import time
+
+        import psutil
+
+        from cron.scheduler import _run_job_script
+
+        pid_file = cron_env / "detached-after-cancel.pid"
+        script = cron_env / "scripts" / "detached-after-cancel.py"
+        child_code = (
+            "import os,pathlib,time; "
+            "os.setsid(); "
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+            "time.sleep(60)"
+        )
+        script.write_text(
+            "import subprocess,sys\n"
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        )
+        monkeypatch.setenv("HERMES_CRON_SCRIPT_TIMEOUT", "10")
+        cancel_event = threading.Event()
+        detached_pid = None
+
+        def cancel_after_spawn() -> None:
+            deadline = time.monotonic() + 3
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            cancel_event.set()
+
+        def alive(pid: int) -> bool:
+            try:
+                return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+            except psutil.Error:
+                return False
+
+        canceller = threading.Thread(target=cancel_after_spawn, daemon=True)
+        canceller.start()
+        try:
+            success, output = _run_job_script(
+                str(script), cancel_event=cancel_event
+            )
+            canceller.join(timeout=1)
+            assert success is False
+            assert "cancelled" in output.lower()
+            assert pid_file.exists()
+            detached_pid = int(pid_file.read_text())
+            deadline = time.monotonic() + 3
+            while alive(detached_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not alive(detached_pid)
+        finally:
+            if detached_pid is not None and alive(detached_pid):
+                os.kill(detached_pid, signal.SIGKILL)
+
 
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):
         """Cron scripts must not inherit Hermes provider env (SECURITY.md §2.3)."""

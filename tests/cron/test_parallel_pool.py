@@ -7,6 +7,7 @@ prevented the ticker thread from firing, causing all other jobs to be fast-forwa
 import concurrent.futures
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -170,7 +171,6 @@ class TestRunningJobGuard:
             return {"id": f"{job_id}-execution"}
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [failing_job, healthy_job])
-        monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
         monkeypatch.setattr(sched, "create_execution", create_execution_side_effect)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: called.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
@@ -187,7 +187,7 @@ class TestRunningJobGuard:
             if job_id == "healthy-job"
             else None,
         )
-        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: {})
         monkeypatch.setattr(sched, "heartbeat_fire_claim", lambda *_a, **_kw: True)
 
         n = sched.tick(verbose=False)
@@ -357,40 +357,37 @@ class TestWorkdirParallelPool:
         sched._running_job_ids.discard("guard-seq")
         sched._shutdown_parallel_pool()
 
-class TestTickBatchAdvance:
-    """The tick's pre-dispatch advance must go through advance_next_runs
-    exactly once with the whole due set — a revert to the per-job loop
-    (or back to advance_next_run) must fail this test, not slip past the
-    helper-level I/O pin."""
-
-    def test_tick_calls_advance_next_runs_once_with_all_due_ids(self, tmp_path, monkeypatch):
+class TestDispatchFailureKeepsRecurringFireDue:
+    def test_submit_failure_does_not_advance_recurring_job(
+        self, tmp_path, monkeypatch
+    ):
         import cron.scheduler as sched
+        from cron.jobs import get_job, save_jobs, use_cron_store
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        scheduled_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        job = {
+            "id": "submit-fails",
+            "name": "submit-fails",
+            "prompt": "test",
+            "schedule": {"kind": "interval", "minutes": 5},
+            "enabled": True,
+            "next_run_at": scheduled_at,
+            "deliver": "local",
+        }
+
+        class BrokenPool:
+            def submit(self, _callback):
+                raise RuntimeError("executor unavailable")
+
+        monkeypatch.setattr(sched, "_get_parallel_pool", lambda _workers: BrokenPool())
+        monkeypatch.setattr(
+            sched, "create_execution", lambda *_a, **_kw: {"id": "exec-submit-fails"}
+        )
+        monkeypatch.setattr(sched, "finish_execution", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_maybe_run_worktree_maintenance", lambda: None)
         sched._running_job_ids.clear()
 
-        jobs = [
-            {"id": f"job-{i}", "name": f"Job {i}", "prompt": "test",
-             "schedule": "every 5m", "enabled": True,
-             "next_run_at": "2020-01-01T00:00:00", "deliver": "local"}
-            for i in range(4)
-        ]
-
-        advance_calls = []
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
-        monkeypatch.setattr(
-            sched, "advance_next_runs",
-            lambda ids: advance_calls.append(list(ids)) or len(list(ids)))
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
-        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
-        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
-        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
-
-        n = sched.tick(verbose=False)
-
-        assert n == 4
-        assert advance_calls == [["job-0", "job-1", "job-2", "job-3"]], (
-            f"tick must batch-advance the due set in ONE call; got {advance_calls}")
-
-        sched._shutdown_parallel_pool()
+        with use_cron_store(tmp_path):
+            save_jobs([job])
+            assert sched.tick(verbose=False, sync=True) == 0
+            assert get_job(job["id"])["next_run_at"] == scheduled_at
