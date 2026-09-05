@@ -61,10 +61,6 @@ def test_author_credits_contributor(frontmatter) -> None:
         "scripts/parrot_openrouter.py",
         "scripts/show_snapshot.py",
         "templates/custom_problem_template.py",
-        # Bounded Zeus research pilot (labs/) — new scripts must also parse.
-        "labs/scripts/validate_hermes_skill_dataset.py",
-        "labs/scripts/score_hermes_skill_run.py",
-        "labs/scripts/qualify_zeus_researcher.py",
     ],
 )
 def test_shipped_scripts_parse(path: str) -> None:

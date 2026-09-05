@@ -179,64 +179,6 @@ shipped `scripts/parrot_openrouter.py` is the reference.
 8. **No PyPI package.** `pip install darwinian-evolver` will pull the wrong
    thing. Always install from the GitHub repo.
 
-## Bounded Research Pilot — `labs/` (Zeus best-plan study)
-
-A bounded, fail-closed pilot that lets a local LLM endpoint act as a *proposer* of
-Hermes-skill improvements, scored by an independent non-Zeus reviewer. It is an
-extension of this skill, not a new app. Everything runs in one isolated
-worktree; at most one local commit, never pushed.
-
-- `labs/RUNBOOK.md` — the only execution contract (gates G0–G7, steps, cleanup).
-- `labs/schemas/hermes_skill_dataset.schema.json` — dataset row contract.
-- `labs/schemas/blind_judge.schema.json` — blind A/B judge row contract.
-- `labs/templates/research_loop.yaml` — phase sequence (harvest → candidate → blind_ab → review).
-- `labs/scripts/validate_hermes_skill_dataset.py` — fail-closed dataset validator (+ credential scan).
-- `labs/scripts/score_hermes_skill_run.py` — deterministic scorecard; never invents a verdict.
-- `labs/scripts/qualify_zeus_researcher.py` — live `/v1/models` qualification gate for the researcher endpoint.
-
-Run this skill's tests before touching the pilot:
-
-```bash
-scripts/run_tests.sh \
-  tests/skills/test_darwinian_evolver_skill.py \
-  tests/skills/test_bestplan_research_pilot.py -q
-```
-
-Do **not** commit run artifacts (datasets, transcripts, judge JSONL, diffs); they live outside git under `~/.hermes/labs/bestplan-research/runs/<run-id>/`.
-
-### Pitfalls observed in harvested runs (evidence-anchored)
-
-These are not generic advice — each names a specific failure class that prior
-agent runs hit, and the exact check that prevents it:
-
-1. **Verify state, don't recall it.** A transcript that says "done" can be wrong:
-   a plan may exist while producing zero artifacts. Before reporting completion,
-   confirm ground truth against the filesystem — `git worktree list`, `ls` the
-   run directory, `git log --oneline -5`. The pilot's G2 snapshot
-   (`source-snapshot.json`) exists precisely so later runs can re-verify instead
-   of trusting a prior summary.
-
-2. **A "looks right" regex/validator is not a passing one.** A dead alternation
-   branch, an unanchored alternative that accepts input it should reject, and a
-   scorecard that silently scores surviving rows on mixed valid/invalid judge
-   input are all invisible to a happy-path test suite. Drive the code with
-   adversarial inputs beyond what the suite exercises, then add a regression
-   test pinning the boundary. A green suite is necessary, not sufficient.
-
-3. **Re-qualify after a model or endpoint change.** When the served model changes
-   mid-session, the historical alias no longer proves what is actually up. Re-run
-   `qualify_zeus_researcher.py` against the live `/v1/models` before treating the
-   researcher as eligible. Never assume the alias survived a model swap.
-
-4. **Gate on observable state, not presence.** A control that exists in the DOM
-   but is `display:none` is not "there." Any gate (UX metric, dataset validator,
-   judge) must assert the *observable* property — visible controls, parseable
-   rows, in-enum verdicts — not merely the existence of the node. Presence ≠ validity.
-
-5. **Commit is a gate output, not a step.** The local commit happens only after
-   every gate is green AND the blind A/B review passes. A red gate or an
-   unreviewed diff means no commit — a hard stop, not a skipped step.
-
 ## Verification
 
 After install + a parrot run, exit code 0 from this is sufficient:
