@@ -397,7 +397,7 @@ describe('ClarifyTool keyboard navigation', () => {
   })
 
   it('does not submit the highlighted recommendation without an explicit selection', async () => {
-    const request = renderLiveClarify()
+    const { request } = renderLiveClarify()
 
     fireEvent.keyDown(window, { key: 'Enter' })
 
@@ -925,6 +925,7 @@ describe('ClarifyTool visible-card scoping', () => {
       </>
     )
 
+    fireEvent.keyDown(window, { key: '1' })
     fireEvent.keyDown(window, { key: 'Enter' })
 
     await waitFor(() => {
@@ -988,6 +989,7 @@ describe('ClarifyTool visible-card scoping', () => {
     const request = renderSplit()
 
     $activeTreeGroup.set('zone-b')
+    fireEvent.keyDown(window, { key: '1' })
     fireEvent.keyDown(window, { key: 'Enter' })
 
     await waitFor(() => {
@@ -1006,6 +1008,7 @@ describe('ClarifyTool visible-card scoping', () => {
     const request = renderSplit()
 
     $activeTreeGroup.set('zone-a')
+    fireEvent.keyDown(window, { key: '1' })
     fireEvent.keyDown(window, { key: 'Enter' })
 
     await waitFor(() => {

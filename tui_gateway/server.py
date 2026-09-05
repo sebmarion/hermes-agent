@@ -495,7 +495,7 @@ def _profile_scoped(handler):
     own bridge output there and keeps its legacy precedence.
     """
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        home = _require_profile_home(params.get("profile") if isinstance(params, dict) else None)
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)

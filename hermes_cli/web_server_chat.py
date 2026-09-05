@@ -501,7 +501,3 @@ def _get_console_executor() -> concurrent.futures.ThreadPoolExecutor:
                     lambda: _console_executor
                     and _console_executor.shutdown(wait=False, cancel_futures=True))
     return _console_executor
-
-def _canary_auth_headers(operation_id: str, token: str) -> dict[str, str]:
-    return {"X-Hermes-Canary-Operation": operation_id, "X-Hermes-Canary-Token": token}
-

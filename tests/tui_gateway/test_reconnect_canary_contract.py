@@ -85,12 +85,6 @@ def test_descriptor_rejects_traversal_symlink_mode_size_and_expiry(tmp_path: Pat
         reconnect_auth.load_descriptor(descriptor, now=1)
 
 
-def test_canary_headers_are_not_query_and_scope_binds_operation():
-    from hermes_cli import web_server_chat as web_server
-    assert web_server._canary_auth_headers("op-1", "secret") == {
-        "X-Hermes-Canary-Operation": "op-1", "X-Hermes-Canary-Token": "secret"
-    }
-
 
 def test_web_canary_is_only_api_ws_and_loopback(tmp_path: Path, monkeypatch):
     from hermes_cli import web_server_chat as web_server

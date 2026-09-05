@@ -204,26 +204,8 @@ class TestReservedModelConfigKeysSurviveMetaOverwrite:
         assert stored["cwd"] == "/c"
 
 
-class TestSharedMarkerEdgeConstants:
-    """Review of #92533 point 2: walker SQL interpolates shared constants."""
-
-    def test_no_pasted_marker_arms_in_hermes_state(self):
-        src = (
-            Path(__file__).resolve().parents[2] / "hermes_state.py"
-        ).read_text(encoding="utf-8")
-        assert (
-            "OR json_extract(COALESCE(child.model_config" not in src
-        ), "pasted OR-arm still present in walker SQL"
-
-    def test_marker_edge_constants_render_valid_sql(self):
-        from hermes_state_common import (
-            _COMPRESSION_MARKER_CHILD_EDGE_SQL,
-            _COMPRESSION_MARKER_PARENT_EDGE_SQL,
-        )
-
-        parent_edge = _COMPRESSION_MARKER_PARENT_EDGE_SQL.format(a="child")
-        child_edge = _COMPRESSION_MARKER_CHILD_EDGE_SQL.format(a="parent")
-        assert "child.parent_session_id" in parent_edge
-        assert "'$._compression_from'" in parent_edge
-        assert "parent.id" in child_edge
-        assert "'$._compression_from'" in child_edge
+def test_lineage_predicate_is_bound_to_the_specific_child():
+    from hermes_state_common import _COMPRESSION_MARKER_PARENT_EDGE_SQL
+    predicate = _COMPRESSION_MARKER_PARENT_EDGE_SQL.format(a="child")
+    assert "child.parent_session_id" in predicate
+    assert "child.model_config" in predicate

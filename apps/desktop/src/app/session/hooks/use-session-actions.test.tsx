@@ -1,3 +1,4 @@
+import { restorePendingClarifyFromSnapshot } from './use-session-actions/restore-pending-clarify'
 import { registryBackendScopeKey } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
@@ -75,7 +76,7 @@ import { deferred } from '../../../test/deferred'
 import { NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
-import { restorePendingClarify, useSessionActions } from './use-session-actions'
+import { useSessionActions } from './use-session-actions'
 import { useSessionStateCache } from './use-session-state-cache'
 
 vi.mock('@/hermes', async importOriginal => ({
@@ -200,7 +201,7 @@ describe('pending clarify resume restoration', () => {
       }
     } as unknown as SessionResumeResponse
 
-    expect(restorePendingClarify(response, 'runtime-resume')).toBe(true)
+    expect(restorePendingClarifyFromSnapshot(response, 'runtime-resume', 0).request).not.toBeNull()
     expect($clarifyRequests.get()['runtime-resume']).toMatchObject({
       lockedAnswers: { q0: 'yes' },
       requestId: 'req-batch-resume',

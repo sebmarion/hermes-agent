@@ -105,7 +105,7 @@ def _sync_persisted_markers(target_messages, source_messages) -> None:
 
 
 def _run_under_progress_timeout(
-    agent, run, messages, system_message, *, active_fence, fence_registration_lock, idle_timeout, total_ceiling
+    agent, run, messages, system_message, *, active_fence, fence_registration_lock, idle_timeout, total_ceiling, stall_fallback=True
 ):
     """Run ``run(fence, target_messages=snapshot)`` on the pool under the progress-aware timeout.
     The pooled worker must NEVER share the caller's live transcript — a late engine after a host timeout could
@@ -150,7 +150,7 @@ def _run_under_progress_timeout(
         idle_timeout_seconds=idle_timeout, total_ceiling_seconds=total_ceiling, on_timeout=_on_timeout,
         on_timeout_cause=_on_timeout_cause,
         on_commit_overrun=lambda waited, ceiling: _warn_commit_overrun(agent, waited, ceiling), fence=active_fence,
-        telemetry_agent=agent, new_fence=_publish_new_fence,
+        telemetry_agent=agent, new_fence=_publish_new_fence, stall_fallback=stall_fallback,
     )
 
 
@@ -253,8 +253,17 @@ class CompressionFacadeMixin:
             # Callers that already own a progress-aware wait (gateway session
             # hygiene) pass commit_fence and must not be double-wrapped.
             direct_path = commit_fence is not None
+            budget = getattr(self, "run_budget_seconds", None)
+            budget_started = getattr(self, "_run_budget_started_at", None)
+            bounded = not force and budget is not None and budget_started is not None
             if not direct_path:
-                idle_timeout, total_ceiling = resolve_context_compression_timeouts()
+                budget_args = ({"run_budget_seconds": budget, "run_budget_started_at": budget_started}
+                               if bounded else {})
+                idle_timeout, total_ceiling = resolve_context_compression_timeouts(**budget_args)
+                if bounded and (idle_timeout <= 0 or total_ceiling <= 0):
+                    from agent.conversation_compression import mark_context_compression_timed_out
+                    mark_context_compression_timed_out(self)
+                    return messages, system_message
                 direct_path = idle_timeout <= 0
             if direct_path:
                 result = _run(active_fence)
@@ -262,7 +271,7 @@ class CompressionFacadeMixin:
                 result = _run_under_progress_timeout(
                     self, _run, messages, system_message,
                     active_fence=active_fence, fence_registration_lock=fence_registration_lock,
-                    idle_timeout=idle_timeout, total_ceiling=total_ceiling,
+                    idle_timeout=idle_timeout, total_ceiling=total_ceiling, stall_fallback=not bounded,
                 )
             _mirror_result_onto_live_lists(self, result, messages, direct_path=direct_path)
             _rebind_caller_session_context(self)

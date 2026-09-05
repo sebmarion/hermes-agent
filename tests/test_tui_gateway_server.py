@@ -7319,20 +7319,6 @@ def test_missing_async_delivery_row_is_legacy_and_not_requeued(monkeypatch, tmp_
     assert isolated_queue.empty()
 
 
-def test_delivery_release_is_exactly_once_when_release_raises(monkeypatch):
-    calls = []
-    event = {"type": "async_delegation", "delegation_id": "release-once"}
-
-    def _raise(evt, claim):
-        calls.append((evt, claim))
-        raise RuntimeError("release backend unavailable")
-
-    monkeypatch.setattr(ad, "release_event_delivery", _raise)
-    release = server._make_delivery_release_once(event, "claim-1")
-
-    assert release() is False
-    assert release() is False
-    assert calls == [(event, "claim-1")]
 
 
 def test_async_delivery_heartbeat_renews_until_stopped(monkeypatch):

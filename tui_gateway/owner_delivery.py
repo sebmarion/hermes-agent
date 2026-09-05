@@ -457,34 +457,6 @@ def _settle_owner_terminal_error(sid, session, st, error, *, publish=True):
         _publish_owner_terminal(sid, session, st, payload)
 
 
-def _make_delivery_release_once(
-    evt: dict, claim_id: str, profile_home: str | Path | None = None
-):
-    """Release a delivery claim at most once, including when release raises."""
-    release_attempted = False
-
-    def _release() -> bool:
-        nonlocal release_attempted
-        if release_attempted:
-            return False
-        release_attempted = True
-        try:
-            from tools.async_delegation import release_event_delivery
-
-            result = _profile_scoped_async_db_call(
-                profile_home, lambda: release_event_delivery(evt, claim_id)
-            )
-            return True if result is None else result
-        except Exception:
-            logger.warning(
-                "Async delegation %s delivery release failed",
-                evt.get("delegation_id"),
-                exc_info=True,
-            )
-            return False
-
-    return _release
-
 def _require_profile_home(profile: str | None) -> Path | None:
     name = (profile or "").strip()
     home = _profile_home(name)

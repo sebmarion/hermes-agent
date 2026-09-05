@@ -253,6 +253,8 @@ def begin_probe(
                     "backend_pid_before",
                     "replay_epoch_before",
                     "auth_identity_fingerprint",
+                    "version", "last_seen_seq_before",
+                    "transcript_before_sha256", "transcript_before_count",
                 )
             ):
                 return existing
@@ -321,25 +323,22 @@ def complete_probe(
             raise ReconnectProofError("reconnect transcript before mismatch")
         if transcript_after_sha256 != transcript_before_sha256 or transcript_after_count != transcript_before_count:
             raise ReconnectProofError("reconnect transcript after mismatch")
-        payload = {
-            "version": 2,
-            "status": "completed",
-            "operation_id": operation_id,
-            "session_id_before": armed.get("session_id_before"),
-            "session_id_after": session_id,
-            "session_key": session_key,
-            "backend_pid_before": before_pid,
-            "backend_pid_after": backend_pid,
-            "replay_epoch_before": previous_replay_epoch,
-            "replay_epoch_after": replay_epoch,
-            "replay_mode": replay_mode,
-            "replayed_messages": replayed_messages,
-            "transcript_before_sha256": transcript_before_sha256,
-            "transcript_after_sha256": transcript_after_sha256,
-            "transcript_before_count": transcript_before_count,
-            "transcript_after_count": transcript_after_count,
-            "auth_identity_fingerprint": identity,
-        }
+        payload = make_v2_proof(
+            operation_id=operation_id, session_id_before=armed.get("session_id_before"),
+            session_id_after=session_id, session_key=session_key,
+            backend_pid_before=before_pid, backend_pid_after=backend_pid,
+            replay_epoch_before=previous_replay_epoch, replay_epoch_after=replay_epoch,
+            replay_mode=replay_mode, replayed_messages=replayed_messages,
+            transcript_before_sha256=transcript_before_sha256,
+            transcript_after_sha256=transcript_after_sha256,
+            transcript_before_count=transcript_before_count,
+            transcript_after_count=transcript_after_count, auth_identity=auth_identity,
+        )
+        if transcript_before_sha256 is not None:
+            # Validate before the irreversible armed->completed transition.
+            validate_v2_proof(payload, operation_id=operation_id,
+                              session_id=armed["session_id_before"])
+        payload.pop("proof_sha256")
         if transcript_before_sha256 is None:
             payload = {
                 "version": 1, "status": "completed", "operation_id": operation_id, "probe_id": probe_id,

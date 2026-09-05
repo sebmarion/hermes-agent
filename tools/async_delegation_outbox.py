@@ -15,17 +15,23 @@ def bind_child_delegation(delegation_id: str, *, child_session_id: str,
                            launch_id: str, origin_version: int,
                            created_session_id: str, parent_session_id: str) -> bool:
     """Persist the immutable child/launcher mapping for one delegation."""
-    if not all((delegation_id, child_session_id, launch_id, created_session_id,
-                parent_session_id)) or origin_version != 1:
+    identities = (delegation_id, child_session_id, launch_id,
+                  created_session_id, parent_session_id)
+    if (any(not isinstance(value, str) or not value.strip() for value in identities)
+            or type(origin_version) is not int or origin_version != 1):
         return False
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET child_session_id=?, launch_id=?,
                       origin_version=?, created_session_id=?, parent_session_id=?
-               WHERE delegation_id=? AND (child_session_id IS NULL
-                                          OR child_session_id=?)""",
+               WHERE delegation_id=? AND parent_session_id=?
+                 AND ((child_session_id IS NULL AND launch_id IS NULL
+                       AND origin_version IS NULL AND created_session_id IS NULL)
+                      OR (child_session_id=? AND launch_id=? AND origin_version=?
+                          AND created_session_id=?))""",
             (child_session_id, launch_id, origin_version, created_session_id,
-             parent_session_id, delegation_id, child_session_id),
+             parent_session_id, delegation_id, parent_session_id,
+             child_session_id, launch_id, origin_version, created_session_id),
         )
         return cur.rowcount == 1
 

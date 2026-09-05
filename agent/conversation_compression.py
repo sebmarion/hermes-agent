@@ -673,7 +673,9 @@ def _get_compress_timeout_executor():
         return _compress_timeout_executor
 
 
-def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None) -> Tuple[float, float]:
+def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None, *,
+    run_budget_seconds=None, run_budget_started_at=None, now=None,
+) -> Tuple[float, float]:
     """Return ``(idle_timeout_seconds, total_ceiling_seconds)``.
     ``idle_timeout_seconds <= 0`` disables the progress-aware wrapper. The ceiling is clamped to at least one
     idle window when the idle budget is positive."""
@@ -697,6 +699,18 @@ def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None)
                 ceiling = float(cfg["context_total_ceiling_seconds"])
     if idle > 0:
         ceiling = max(ceiling, idle)
+    if run_budget_seconds is not None and run_budget_started_at is not None:
+        # Custom hosted children reserve the final 20% for native wrap-up.
+        import math
+        values = (run_budget_seconds, run_budget_started_at, time.time() if now is None else now)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) for value in values) or run_budget_seconds <= 0:
+            return 0.0, 0.0
+        remaining = max(0.0, 0.8 * run_budget_seconds - (values[2] - run_budget_started_at))
+        if remaining <= 0:
+            return 0.0, 0.0
+        idle = min(idle, remaining) if idle > 0 else remaining
+        ceiling = min(ceiling, remaining) if ceiling > 0 else remaining
     return idle, ceiling
 
 

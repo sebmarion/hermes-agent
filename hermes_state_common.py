@@ -1092,10 +1092,11 @@ _COMPRESSION_MARKER_PARENT_EDGE_SQL = (
     "                        '$._compression_from') = p.id)"
 )
 
-_COMPRESSION_MARKER_CHILD_EDGE_SQL = (
-    "EXISTS (SELECT 1 FROM sessions c"
-    "        WHERE c.parent_session_id = {a}.id"
-    "        AND json_extract(COALESCE(c.model_config, '{{}}'),"
-    "                        '$._compression_from') = {a}.id)"
-)
 
+# Explicit non-compression child markers outrank the legacy parent-end heuristic.
+_COMPRESSION_LINEAGE_EDGE_SQL = (
+    "(" + _COMPRESSION_CHILD_SQL + " OR " + _COMPRESSION_MARKER_PARENT_EDGE_SQL + ")"
+    " AND json_extract(COALESCE({a}.model_config, '{{}}'), '$._branched_from') IS NULL"
+    " AND json_extract(COALESCE({a}.model_config, '{{}}'), '$._delegate_from') IS NULL"
+    " AND json_extract(COALESCE({a}.model_config, '{{}}'), '$._reset_from') IS NULL"
+)

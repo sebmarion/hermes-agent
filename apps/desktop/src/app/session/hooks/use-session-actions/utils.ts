@@ -165,10 +165,12 @@ const COMPARED_FIELDS = [
   'completedAt',
   // Turn wall-clock duration — stamps the visible "⏱ 38s" badge, so a change
   // must re-render (set once at completion; stable afterwards).
-  'durationS'
+  'durationS',
+  // Hydration must retain the durable identity used for replay deduplication.
+  'deliveryId'
 ] as const
 
-const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'rowId', 'deliveryId'] as const
+const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'rowId'] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
 // chatPartsEquivalent. If @assistant-ui adds a new part type, this fails tsc.
@@ -264,6 +266,7 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean 
     a.id !== b.id ||
     a.role !== b.role ||
     a.pending !== b.pending ||
+    a.deliveryId !== b.deliveryId ||
     a.error !== b.error ||
     // Structural compare — the descriptor arrives as a fresh object per
     // resume/replay, so identity comparison would repaint forever.

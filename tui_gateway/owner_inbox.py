@@ -206,6 +206,52 @@ class OwnerDispatch:
         return None
 
 
+
+def _pending_tool_call_ids(messages):
+    """Match active call/result identities in order across the whole history."""
+    pending = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("invalid message evidence")
+        if message.get("active", 1) == 0:
+            continue
+        if message.get("role") == "assistant":
+            value = message.get("tool_calls") or []
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, dict):
+                value = [value]
+            if not isinstance(value, list):
+                raise ValueError("invalid tool-call evidence")
+            for call in value:
+                call_id = (call.get("id") or call.get("tool_call_id")) if isinstance(call, dict) else None
+                if not isinstance(call_id, str) or not call_id.strip():
+                    raise ValueError("tool-call evidence has no identity")
+                pending.add(call_id)
+        elif message.get("role") in {"tool", "tool_result"}:
+            call_id = message.get("tool_call_id")
+            if isinstance(call_id, str) and call_id:
+                pending.discard(call_id)
+    return pending
+
+
+def _active_message_pages(db, session_id):
+    after_id = None
+    while True:
+        page = db.get_messages(str(session_id), limit=500, after_id=after_id)
+        if not isinstance(page, list):
+            raise ValueError("message pagination returned an invalid page")
+        if not page:
+            return
+        yield from page
+        if len(page) < 500:
+            return
+        last_id = page[-1].get("id")
+        if type(last_id) is not int or (after_id is not None and last_id <= after_id):
+            raise ValueError("message pagination did not advance")
+        after_id = last_id
+
+
 def live_owner_dispatch(server, prompt_submit):
     """Build a dispatcher bound to this TUI process's live session registry."""
     def lookup(profile, session_id):
@@ -486,25 +532,12 @@ def live_owner_dispatch(server, prompt_submit):
                             return False
                         if live.get("pending_input") is True:
                             return False
-                    calls, results = set(), set()
-                    for raw_message in _conn.execute(
-                            "SELECT * FROM messages WHERE session_id=? ORDER BY id",
-                            (str(durable_id),)):
-                        message = dict(raw_message)
-                        if message.get("role") == "assistant":
-                            value = message.get("tool_calls") or []
-                            if isinstance(value, str):
-                                value = json.loads(value)
-                            if isinstance(value, dict):
-                                value = [value]
-                            for call in value:
-                                if isinstance(call, dict) and call.get("id"):
-                                    calls.add(str(call["id"]))
-                        elif message.get("role") in {"tool", "tool_result"}:
-                            call_id = message.get("tool_call_id") or message.get("id")
-                            if call_id:
-                                results.add(str(call_id))
-                    if calls - results:
+                    active_messages = (
+                        dict(row) for row in _conn.execute(
+                            "SELECT * FROM messages WHERE session_id=? AND active=1 ORDER BY id",
+                            (str(durable_id),))
+                    )
+                    if _pending_tool_call_ids(active_messages):
                         return False
                     return True
                 return bool(db.set_session_archived(
@@ -578,40 +611,15 @@ def live_owner_dispatch(server, prompt_submit):
                         pending_input_state, _ = pending(live.get("_owner_live_id"))
                         item["needs_input"] = bool(pending_input_state)
                     elif ended:
-                        item["active"] = False
+                        item["active"] = lease is not None
                         item["queued"] = False
                         item["needs_input"] = False
                     else:
                         item["active"] = True if lease is not None else None
                         item["queued"] = None
                         item["needs_input"] = None
-                    item["pending_tool_results"] = False
-                    after_id = None
-                    while True:
-                        page = db.get_messages(str(child_id), limit=500,
-                                                after_id=after_id)
-                        if not page:
-                            break
-                        calls, results = set(), set()
-                        for message in page:
-                            if message.get("role") == "assistant":
-                                calls_value = message.get("tool_calls") or []
-                                if isinstance(calls_value, str):
-                                    calls_value = json.loads(calls_value)
-                                if isinstance(calls_value, dict):
-                                    calls_value = [calls_value]
-                                for call in calls_value:
-                                    if isinstance(call, dict) and (call.get("id") or call.get("tool_call_id")):
-                                        calls.add(str(call.get("id") or call.get("tool_call_id")))
-                            elif message.get("role") in {"tool", "tool_result"}:
-                                call_id = message.get("tool_call_id") or message.get("id")
-                                if call_id:
-                                    results.add(str(call_id))
-                        item["pending_tool_results"] = item["pending_tool_results"] or bool(calls - results)
-                        last_id = page[-1].get("id")
-                        if not isinstance(last_id, int) or len(page) < 500:
-                            break
-                        after_id = last_id
+                    item["pending_tool_results"] = bool(_pending_tool_call_ids(
+                        _active_message_pages(db, child_id)))
                     item["manual_fork"] = bool(row.get("pinned"))
                     config = row.get("model_config")
                     if isinstance(config, str):
@@ -644,10 +652,12 @@ def live_owner_dispatch(server, prompt_submit):
                 # Synchronous delegate_task results have no async outbox row.
                 # Consume only the durable receipt embedded in the parent's
                 # persisted tool result; an origin row by itself is not proof.
-                for summary in db.list_sessions_rich(
-                        include_children=True, include_archived=True,
-                        include_hidden=True, project_compression_tips=False,
-                        limit=10000):
+                summaries = db.list_sessions_rich(
+                    include_children=True, include_archived=True,
+                    include_hidden=True, project_compression_tips=False, limit=10000)
+                known_parent_ids = {item.get("parent_session_id") for item in summaries}
+                parent_history_cache = {}
+                for summary in summaries:
                     child_id = str(summary.get("id") or "")
                     if not child_id or child_id in seen_child_ids:
                         continue
@@ -671,7 +681,9 @@ def live_owner_dispatch(server, prompt_submit):
                         continue
                     receipt_match = None
                     receipt_match_invalid = False
-                    parent_messages = db.get_messages(parent_id, limit=10000)
+                    if parent_id not in parent_history_cache:
+                        parent_history_cache[parent_id] = db.get_messages(parent_id, limit=10000)
+                    parent_messages = parent_history_cache[parent_id]
                     for message in parent_messages:
                         if message.get("role") not in {"tool", "tool_result"}:
                             continue
@@ -802,13 +814,7 @@ def live_owner_dispatch(server, prompt_submit):
                         "pending_tool_results": False,
                         "manual_fork": bool(row.get("pinned") or config.get("_branched_from")),
                         "compression_continuation": bool(config.get("_compression_from")),
-                        "is_parent": any(other.get("parent_session_id") == child_id
-                                         for other in db.list_sessions_rich(
-                                             include_children=True,
-                                             include_archived=True,
-                                             include_hidden=True,
-                                             project_compression_tips=False,
-                                             limit=10000)),
+                        "is_parent": child_id in known_parent_ids,
                         "unresolved_failure": False,
                         "status": "completed",
                     })
@@ -849,38 +855,8 @@ def live_owner_dispatch(server, prompt_submit):
                     if not valid_activity:
                         return None
                     genuine_activity = max(valid_activity)
-                    calls = set()
-                    results = set()
-                    after_id = None
-                    while True:
-                        page = db.get_messages(str(durable_id), limit=500,
-                                                after_id=after_id)
-                        if not page:
-                            break
-                        for message in page:
-                            if message.get("role") == "assistant":
-                                tool_calls = message.get("tool_calls") or []
-                                if isinstance(tool_calls, str):
-                                    try:
-                                        tool_calls = json.loads(tool_calls)
-                                    except (TypeError, ValueError, json.JSONDecodeError):
-                                        return None
-                                if isinstance(tool_calls, dict):
-                                    tool_calls = [tool_calls]
-                                for call in tool_calls:
-                                    if isinstance(call, dict):
-                                        call_id = call.get("id") or call.get("tool_call_id")
-                                        if call_id:
-                                            calls.add(str(call_id))
-                            elif message.get("role") in {"tool", "tool_result"}:
-                                call_id = message.get("tool_call_id") or message.get("id")
-                                if call_id:
-                                    results.add(str(call_id))
-                        last_id = page[-1].get("id")
-                        if not isinstance(last_id, int) or len(page) < 500:
-                            break
-                        after_id = last_id
-                    pending_tool_results = bool(calls - results)
+                    pending_tool_results = bool(_pending_tool_call_ids(
+                        _active_message_pages(db, durable_id)))
                     pending_prompt, _payload = pending(session.get("_owner_live_id"))
                     queued = (session.get("queued_prompt") is not None or
                               bool(session.get("queued_prompts")))

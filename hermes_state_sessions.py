@@ -14,7 +14,7 @@ from agent.session_activity import (
     ActivityProvenance, bound_activity_description, normalize_activity_provenance,
 )
 from hermes_state_common import (
-    _COMPRESSION_CHILD_SQL, _COMPRESSION_MARKER_PARENT_EDGE_SQL, _COMPRESSION_MARKER_CHILD_EDGE_SQL,
+    _COMPRESSION_LINEAGE_EDGE_SQL,
     _LISTABLE_CHILD_SQL, _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL, _RESET_END_REASONS, _legacy_reset_child_sql, _shape_preview,
     _sql_session_last_active, _sql_session_last_active_by_id, escape_like as _escape_like,
@@ -361,6 +361,9 @@ class SessionSessionsMixin:
                     "UPDATE sessions SET model_config=json_set(COALESCE(model_config,'{}'), "
                     "'$._compression_from',parent_session_id) WHERE id=? "
                     "AND json_extract(COALESCE(model_config,'{}'),'$._compression_from') IS NULL "
+                    "AND json_extract(COALESCE(model_config,'{}'),'$._branched_from') IS NULL "
+                    "AND json_extract(COALESCE(model_config,'{}'),'$._delegate_from') IS NULL "
+                    "AND json_extract(COALESCE(model_config,'{}'),'$._reset_from') IS NULL "
                     "AND EXISTS (SELECT 1 FROM sessions p WHERE p.id=sessions.parent_session_id "
                     "AND p.end_reason='compression' AND p.ended_at IS NOT NULL)", (session_id,))
         # Transcript-critical: a failed row creation aborts the turn.
@@ -840,8 +843,7 @@ class SessionSessionsMixin:
                 FROM ancestors a
                 JOIN sessions child ON child.id = a.id
                 JOIN sessions parent ON parent.id = child.parent_session_id
-                WHERE parent.end_reason = 'compression'
-                   OR json_extract(COALESCE(child.model_config, '{{}}'), '$._compression_from') = parent.id
+                WHERE {_COMPRESSION_LINEAGE_EDGE_SQL.format(a="child")}
               ),
               descendants(id) AS (
                 SELECT ?
@@ -850,8 +852,7 @@ class SessionSessionsMixin:
                 FROM descendants d
                 JOIN sessions parent ON parent.id = d.id
                 JOIN sessions child ON child.parent_session_id = parent.id
-                WHERE parent.end_reason = 'compression'
-                   OR json_extract(COALESCE(child.model_config, '{{}}'), '$._compression_from') = parent.id
+                WHERE {_COMPRESSION_LINEAGE_EDGE_SQL.format(a="child")}
               ),
               lineage(id) AS (
                 SELECT id FROM ancestors
@@ -888,13 +889,6 @@ class SessionSessionsMixin:
                 "CREATE TABLE IF NOT EXISTS session_archive_overrides ("
                 "session_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at REAL NOT NULL)"
             )
-            if not archived and not turn_lease_holder:
-                conn.execute(
-                    "INSERT INTO session_archive_overrides(session_id,state,updated_at) "
-                    "VALUES(?, 'keep', ?) ON CONFLICT(session_id) DO UPDATE SET "
-                    "state='keep', updated_at=excluded.updated_at",
-                    (session_id, time.time()),
-                )
             rows = conn.execute(
                 f"""
                 WITH RECURSIVE
@@ -905,8 +899,7 @@ class SessionSessionsMixin:
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE {_COMPRESSION_CHILD_SQL.format(a="child")}
-                       OR {_COMPRESSION_MARKER_PARENT_EDGE_SQL.format(a="child")}
+                    WHERE {_COMPRESSION_LINEAGE_EDGE_SQL.format(a="child")}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -915,8 +908,7 @@ class SessionSessionsMixin:
                     FROM descendants d
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
-                       OR {_COMPRESSION_MARKER_CHILD_EDGE_SQL.format(a="parent")}
+                    WHERE {_COMPRESSION_LINEAGE_EDGE_SQL.format(a="child")}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -947,9 +939,13 @@ class SessionSessionsMixin:
                            if key != "id"):
                         return 0
             if turn_lease_holder:
+                # A manual restore protects the logical conversation even
+                # when a later sweep addresses another compression segment.
+                override_marks = ",".join("?" for _ in actual_ids)
                 override = conn.execute(
-                    "SELECT state FROM session_archive_overrides WHERE session_id=?",
-                    (session_id,),
+                    f"SELECT state FROM session_archive_overrides "
+                    f"WHERE session_id IN ({override_marks}) AND state='keep' LIMIT 1",
+                    tuple(sorted(actual_ids)),
                 ).fetchone()
                 if override is not None and override["state"] == "keep":
                     return 0
@@ -966,6 +962,13 @@ class SessionSessionsMixin:
                 return 0
             if not actual:
                 return 0
+            if not archived and not turn_lease_holder:
+                conn.execute(
+                    "INSERT INTO session_archive_overrides(session_id,state,updated_at) "
+                    "VALUES(?, 'keep', ?) ON CONFLICT(session_id) DO UPDATE SET "
+                    "state='keep', updated_at=excluded.updated_at",
+                    (session_id, time.time()),
+                )
             marks = ",".join("?" for _ in actual)
             cursor = conn.execute(
                 f"UPDATE sessions SET archived = ? WHERE id IN ({marks})",

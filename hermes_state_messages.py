@@ -1158,6 +1158,10 @@ class SessionMessagesMixin:
             if row is None or row[1] != role or self._decode_content(row[2]) != content:
                 return False
             metadata = self._decode_display_metadata(row[3]) or {}
+            for identity_key in ("delivery_id", "delegation_id"):
+                if (identity_key in metadata and identity_key in display_metadata
+                        and metadata[identity_key] != display_metadata[identity_key]):
+                    raise ValueError("terminal delivery identity cannot be replaced")
             metadata.update(display_metadata)
             conn.execute(
                 "UPDATE messages SET display_metadata = ? WHERE id = ?",
