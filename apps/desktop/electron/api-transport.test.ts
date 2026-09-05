@@ -131,10 +131,7 @@ describe('shouldSuppressExpectedSessionNotFound', () => {
     expect(shouldSuppressExpectedSessionNotFound({ path: '/api/sessions/id' }, error)).toBe(false)
     expect(shouldSuppressExpectedSessionNotFound({ path: '/api/config', suppressNotFound: true }, error)).toBe(false)
     expect(
-      shouldSuppressExpectedSessionNotFound(
-        { path: '/api/sessions/id/messages', suppressNotFound: true },
-        error
-      )
+      shouldSuppressExpectedSessionNotFound({ path: '/api/sessions/id/messages', suppressNotFound: true }, error)
     ).toBe(false)
     expect(
       shouldSuppressExpectedSessionNotFound(

@@ -174,6 +174,7 @@ export function truncateSubmitParams(
 
   const hasMessageId =
     typeof truncateMessageId === 'string' && truncateMessageId.length > 0 && !isSyntheticRendererId(truncateMessageId)
+
   const hasDurableAddress = hasMessageId || hasRowId
 
   if (!hasOrdinal && !hasMessageId && !hasRowId) {

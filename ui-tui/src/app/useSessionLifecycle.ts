@@ -83,12 +83,14 @@ export const replayTerminalOutbox = async (
     }
 
     const payload = (delivery as { payload?: unknown }).payload
+
     if (!payload || typeof payload !== 'object') {
       continue
     }
 
     const deliveryId = (payload as { delivery_id?: unknown }).delivery_id
     const text = (payload as { text?: unknown }).text
+
     if (typeof deliveryId !== 'string' || !deliveryId.trim() || typeof text !== 'string' || !text.trim()) {
       continue
     }
@@ -97,21 +99,27 @@ export const replayTerminalOutbox = async (
       if (processedThisReplay.has(deliveryId)) {
         continue
       }
+
       processedThisReplay.add(deliveryId)
       const ackInFlight = replayStates.get(deliveryId)
+
       if (ackInFlight) {
         await ackInFlight
       } else {
         await acknowledge(deliveryId)
       }
+
       continue
     }
 
     seen.add(deliveryId)
     processedThisReplay.add(deliveryId)
+
     try {
       append({ role: 'assistant', text, deliveryId })
-      const ackInFlight = Promise.resolve().then(() => acknowledge(deliveryId)).then(() => undefined)
+      const ackInFlight = Promise.resolve()
+        .then(() => acknowledge(deliveryId))
+        .then(() => undefined)
       replayStates.set(deliveryId, ackInFlight)
       await ackInFlight
       replayStates.delete(deliveryId)
@@ -121,6 +129,7 @@ export const replayTerminalOutbox = async (
       } else {
         replayStates.delete(deliveryId)
       }
+
       throw error
     }
   }
@@ -136,6 +145,7 @@ export const replayPendingTerminalOutbox = async (
   const raw = await gw.request<{ deliveries?: unknown[] }>('terminal.outbox.pending', {
     session_id: sessionId
   })
+
   const pending = asRpcResult<{ deliveries?: unknown[] }>(raw)
 
   await replayTerminalOutbox(
@@ -145,16 +155,19 @@ export const replayPendingTerminalOutbox = async (
       if (!isCurrent()) {
         throw new Error('terminal outbox replay became stale')
       }
+
       append(msg)
     },
     async deliveryId => {
       if (!isCurrent()) {
         throw new Error('terminal outbox acknowledgement became stale')
       }
+
       const acknowledgement = await gw.request<{ acknowledged?: boolean }>('terminal.outbox.ack', {
         delivery_id: deliveryId,
         session_id: sessionId
       })
+
       if (asRpcResult<{ acknowledged?: boolean }>(acknowledgement)?.acknowledged !== true) {
         throw new Error('terminal outbox acknowledgement was not accepted')
       }
@@ -428,9 +441,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                 items.some(item => item.role === 'assistant' && item.deliveryId === msg.deliveryId)
                   ? items
                   : [...items, msg]
-                ),
-                () => getUiState().sid === r.session_id
-                ).catch(() => undefined)
+              ),
+            () => getUiState().sid === r.session_id
+          ).catch(() => undefined)
           cancelResumeScrollRef.current?.()
           cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
         })
@@ -495,9 +508,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   items.some(item => item.role === 'assistant' && item.deliveryId === msg.deliveryId)
                     ? items
                     : [...items, msg]
-                  ),
-                  () => getUiState().sid === r.session_id
-                  ).catch(() => undefined)
+                ),
+              () => getUiState().sid === r.session_id
+            ).catch(() => undefined)
             cancelResumeScrollRef.current?.()
             cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
 

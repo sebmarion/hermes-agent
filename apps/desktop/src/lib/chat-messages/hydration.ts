@@ -302,6 +302,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     const reactions = messageReactions(message.display_metadata)
+
     const persistedDeliveryId =
       message.display_metadata &&
       typeof message.display_metadata === 'object' &&
@@ -309,6 +310,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       typeof message.display_metadata.delivery_id === 'string'
         ? message.display_metadata.delivery_id
         : undefined
+
     const deliveryId = persistedDeliveryId ?? pendingTerminalDeliveryId
     // Gateway resume names the durable row id `row_id`; the REST transcript
     // prefetch ships the same messages.id as a numeric `id`. Either one lets

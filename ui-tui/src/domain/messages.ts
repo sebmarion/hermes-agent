@@ -78,7 +78,8 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
     if (display_kind === 'async_delegation_complete') {
       const meta = (row as TranscriptRow).display_metadata
       const count = meta && typeof meta.task_count === 'number' ? meta.task_count : undefined
-      const deliveryId = meta && typeof meta.delivery_id === 'string' && meta.delivery_id.trim() ? meta.delivery_id : undefined
+      const deliveryId =
+        meta && typeof meta.delivery_id === 'string' && meta.delivery_id.trim() ? meta.delivery_id : undefined
 
       const label =
         count === undefined
@@ -97,6 +98,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
         row.display_metadata && typeof row.display_metadata.delivery_id === 'string'
           ? row.display_metadata.delivery_id
           : undefined
+
       const deliveryId = persistedDeliveryId ?? pendingTerminalDeliveryId
       out.push({
         role,
@@ -117,8 +119,9 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
   return out
 }
 
-export const transcriptDeliveryIds = (messages: Msg[]): string[] =>
-  [...new Set(messages.flatMap(message => (message.deliveryId ? [message.deliveryId] : [])))]
+export const transcriptDeliveryIds = (messages: Msg[]): string[] => [
+  ...new Set(messages.flatMap(message => (message.deliveryId ? [message.deliveryId] : [])))
+]
 
 export const fmtDuration = (ms: number) => {
   const t = Math.max(0, Math.floor(ms / 1000))

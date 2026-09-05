@@ -54,11 +54,7 @@ interface SessionTileDelegateParams {
   executeSlashCommand: ReturnType<typeof usePromptActions>['executeSlashCommand']
   removeSession: (storedSessionId: string) => Promise<unknown>
   requestGateway: GatewayRequester
-  hydrateFromStoredSession: (
-    attempts?: number,
-    storedSessionId?: string,
-    runtimeSessionId?: string
-  ) => Promise<void>
+  hydrateFromStoredSession: (attempts?: number, storedSessionId?: string, runtimeSessionId?: string) => Promise<void>
   runtimeIdByStoredSessionIdRef: SessionStateCache['runtimeIdByStoredSessionIdRef']
   sessionStateByRuntimeIdRef: SessionStateCache['sessionStateByRuntimeIdRef']
   updateSessionState: SessionStateCache['updateSessionState']

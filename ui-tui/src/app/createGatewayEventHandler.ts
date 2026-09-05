@@ -1451,32 +1451,40 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'message.complete': {
         const deliveryId = ev.payload?.delivery_id
+
         if (typeof deliveryId === 'string' && deliveryId.trim() && seenTerminalDeliveryIds.has(deliveryId)) {
           const sessionId = getUiState().sid
+
           if (sessionId) {
             void ctx.gateway.gw
               .request('terminal.outbox.ack', { delivery_id: deliveryId, session_id: sessionId })
               .catch(() => undefined)
           }
+
           return
         }
+
         const { finalMessages, finalText, wasInterrupted } = turnController.recordMessageComplete(ev.payload ?? {})
 
         if (!wasInterrupted) {
           const sourceMessages: Msg[] = finalMessages.length
             ? finalMessages
             : [{ role: 'assistant' as const, text: finalText }]
+
           const msgs: Msg[] = sourceMessages.map(msg =>
             typeof deliveryId === 'string' && deliveryId.trim() && msg.role === 'assistant'
               ? { ...msg, deliveryId }
               : msg
           )
+
           msgs.forEach(appendMessage)
+
           if (typeof deliveryId === 'string' && deliveryId.trim()) {
             seenTerminalDeliveryIds.add(deliveryId)
           }
 
           const sessionId = getUiState().sid
+
           if (typeof deliveryId === 'string' && deliveryId.trim() && sessionId) {
             void ctx.gateway.gw
               .request('terminal.outbox.ack', { delivery_id: deliveryId, session_id: sessionId })

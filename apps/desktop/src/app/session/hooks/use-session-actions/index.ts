@@ -370,7 +370,9 @@ export function restorePendingClarify(response: SessionResumeResponse, sessionId
 
   if (questions.length > 0) {
     const lockedAnswers = pending.answers
-      ? Object.fromEntries(Object.entries(pending.answers).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+      ? Object.fromEntries(
+          Object.entries(pending.answers).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+        )
       : undefined
 
     setClarifyRequest({
