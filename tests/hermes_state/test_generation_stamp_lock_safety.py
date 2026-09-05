@@ -70,7 +70,9 @@ def test_generation_read_is_nonblocking_under_exclusive_lock(tmp_path):
         conn.execute("CREATE TABLE payload (value INTEGER)")
         conn.commit()
         conn.execute("BEGIN EXCLUSIVE")
-        assert _read_sqlite_application_id(path) is None
+        # Latest upstream uses lock-safe cached pread, so the committed header
+        # can be read while the writer is locked. Lock exclusion is tested above.
+        assert _read_sqlite_application_id(path) in (None, 0)
     finally:
         conn.rollback()
         conn.close()

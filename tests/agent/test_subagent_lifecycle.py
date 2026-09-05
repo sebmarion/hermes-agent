@@ -117,7 +117,7 @@ def test_public_lifecycle_forwards_lane_provider_and_api_mode(monkeypatch):
 
     monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
     monkeypatch.setattr(
-        "tools.delegate_tool._resolve_delegation_credentials",
+        "tools.delegate_tool_config._resolve_delegation_credentials",
         lambda _cfg, _parent: {
             "provider": "openai-codex",
             "model": "gpt-5.6-sol",

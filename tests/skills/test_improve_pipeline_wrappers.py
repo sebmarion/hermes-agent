@@ -421,15 +421,22 @@ def test_crash_after_publish_recovers_only_from_matching_receipt(
     assert _git(canonical, "status", "--porcelain") == ""
 
 
-def test_improve_loop_child_path_contains_ocr_and_hermes_tool_dirs() -> None:
+def test_improve_loop_child_path_contains_ocr_and_hermes_tool_dirs(tmp_path, monkeypatch) -> None:
     wrapper = _load_improve_wrapper()
+    node = tmp_path / "node/bin"
+    local = tmp_path / "local/bin"
+    python = tmp_path / "venv/bin"
+    for directory in (node, local, python): directory.mkdir(parents=True)
+    command = local / "ocr"
+    command.write_text("#!/bin/sh\nexit 0\n")
+    command.chmod(0o755)
+    missing = tmp_path / "not-installed"
+    monkeypatch.setattr(wrapper, "TOOL_PATHS", (python, local, node, missing))
     child_env = wrapper._child_env()
     child_path = child_env["PATH"].split(wrapper.os.pathsep)
-
-    assert str(Path.home() / "tools" / "node-v22.23.2-linux-x64" / "bin") in child_path
-    assert str(Path.home() / ".local" / "bin") in child_path
-    assert str(wrapper.REPO / ".venv" / "bin") in child_path
-    assert shutil.which("ocr", path=child_env["PATH"])
+    assert child_path[:3] == [str(python), str(local), str(node)]
+    assert str(missing) not in child_path
+    assert shutil.which("ocr", path=child_env["PATH"]) == str(command)
 
 
 def test_improve_loop_allows_one_full_bounded_model_batch() -> None:

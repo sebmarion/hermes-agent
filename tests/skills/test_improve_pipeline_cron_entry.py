@@ -18,7 +18,15 @@ from hermes_state import SessionDB
 
 
 @pytest.fixture(autouse=True)
-def _configured_auxiliary_judge(monkeypatch):
+def _configured_auxiliary_judge(monkeypatch, tmp_path):
+    repo = tmp_path / "fixture-skills"
+    target = repo / "software-development/bestplan/SKILL.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# BestPlan test fixture\n")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    monkeypatch.setattr(entry, "DEFAULT_SKILL_PATH", target)
+    monkeypatch.setattr(entry, "DEFAULT_LIVE_SKILLS", repo)
+
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
         lambda: {
