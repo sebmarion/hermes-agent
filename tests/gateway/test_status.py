@@ -454,28 +454,12 @@ class TestTerminatePid:
             ("kill", 123),
         ]
 
-    @pytest.mark.windows_only
-    def test_force_uses_taskkill_on_windows(self, monkeypatch):
-        # Faking _IS_WINDOWS on POSIX could not reproduce the real
-        # CREATE_NO_WINDOW creationflags value that windows_hide_flags()
-        # returns only on Windows (it is 0 elsewhere).
-        calls = []
-
-        def fake_run(cmd, capture_output=False, text=False, timeout=None, creationflags=0, **kwargs):
-            calls.append((cmd, capture_output, text, timeout, creationflags))
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(status.subprocess, "run", fake_run)
-
-        status.terminate_pid(123, force=True)
-
-        # taskkill is spawned with the no-window flag so the windowless
-        # pythonw.exe backend doesn't flash a conhost window on force-kill.
-        from hermes_cli._subprocess_compat import windows_hide_flags
-
-        assert calls == [
-            (["taskkill", "/PID", "123", "/T", "/F"], True, True, 10, windows_hide_flags())
-        ]
+    def test_windows_force_requires_an_identity_guard(self, monkeypatch):
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+        monkeypatch.setattr(status.subprocess, "run", lambda *_a, **_k:
+            (_ for _ in ()).throw(AssertionError("unguarded force must not spawn taskkill")))
+        with pytest.raises(OSError, match="without a process start-time guard"):
+            status.terminate_pid(123, force=True)
 
 
 class TestScopedLocks:

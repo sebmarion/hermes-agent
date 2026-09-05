@@ -210,10 +210,50 @@ def normalize_updated_at(value: Any) -> Optional[str]:
     return None
 
 
+def _terminate_windows_tree_by_handles(
+    pid: int, expected_start_time: int
+) -> None:
+    """Suspend and kill one verified Windows tree through process handles."""
+    import psutil  # type: ignore
+
+    root = psutil.Process(pid)
+    root_start_time = int(round(float(root.create_time()) * 100))
+    if root_start_time != expected_start_time:
+        raise ProcessLookupError(f"PID {pid} identity changed before termination")
+
+    suspended = []
+    pending = [root]
+    seen = {(pid, root_start_time)}
+    try:
+        root.suspend()
+        suspended.append(root)
+        while pending:
+            parent = pending.pop(0)
+            for child in parent.children():
+                child_start_time = int(round(float(child.create_time()) * 100))
+                child_identity = (int(child.pid), child_start_time)
+                if child_identity in seen:
+                    continue
+                child.suspend()
+                seen.add(child_identity)
+                suspended.append(child)
+                pending.append(child)
+                if len(seen) > 4096:
+                    raise OSError("Windows process tree exceeded safe termination bound")
+        for process in reversed(suspended):
+            process.kill()
+    except BaseException:
+        for process in reversed(suspended):
+            try:
+                process.resume()
+            except Exception:
+                pass
+        raise
+
 def terminate_pid(
     pid: int, *, force: bool = False, expected_start_time: Optional[float] = None
 ) -> None:
-    """Terminate a PID; POSIX SIGTERM/SIGKILL, Windows taskkill /T /F for force. Identity guard:
+    """Terminate a PID; POSIX SIGTERM/SIGKILL, Windows identity-bound process handles for force. Identity guard:
     Windows ``force`` REQUIRES a matching ``expected_start_time`` (taskkill on a recycled PID has
     killed svchost.exe); POSIX optional, but a provided mismatch refuses the kill everywhere.
 
@@ -221,7 +261,7 @@ def terminate_pid(
     process, the kill is refused on every platform — a mismatched fingerprint always means the PID was
     recycled. See #89614.
     """
-    if force and (_IS_WINDOWS or expected_start_time is not None):
+    if expected_start_time is not None or (force and _IS_WINDOWS):
         if expected_start_time is None:
             raise OSError(f"refusing to force-kill PID {pid} without a process start-time guard")
         current_start_time = _get_process_start_time(pid)
@@ -229,26 +269,15 @@ def terminate_pid(
             raise OSError(f"refusing to force-kill PID {pid}; process start time is unavailable")
         try:
             if not _start_times_agree(current_start_time, expected_start_time):
-                raise OSError(f"refusing to force-kill PID {pid}; process identity changed")
+                raise ProcessLookupError(f"refusing to terminate PID {pid}; process identity changed")
         except (TypeError, ValueError) as exc:
             raise OSError(f"refusing to force-kill PID {pid}; malformed start time") from exc
+    if force and _IS_WINDOWS:
+        _terminate_windows_tree_by_handles(pid, int(round(float(expected_start_time))))
+        return
     if not (force and _IS_WINDOWS):
         os.kill(pid, signal.SIGTERM if not force else getattr(signal, "SIGKILL", signal.SIGTERM))
         return
-    # Hide flags: a bare taskkill spawn from windowless pythonw.exe would flash a conhost window.
-    from hermes_cli._subprocess_compat import windows_hide_flags
-
-    try:
-        result = subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=10, creationflags=windows_hide_flags(),
-        )
-    except FileNotFoundError:
-        os.kill(pid, signal.SIGTERM)
-        return
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout or "").strip()
-        raise OSError(details or f"taskkill failed for PID {pid}")
 
 
 def _start_times_agree(current: Any, *recorded: Any) -> bool:
@@ -437,7 +466,8 @@ def _get_code_identity_fields() -> dict[str, Any]:
         from hermes_cli.build_info import get_code_identity
         from gateway.code_skew import runtime_source_digest
         identity = get_code_identity()
-        return {"code_sha": identity.get("sha"), "code_version": identity.get("version")}
+        return {"code_sha": identity.get("sha"), "code_version": identity.get("version"),
+                "source_digest": _gateway_boot_source_digest()}
     except Exception:
         return {}
 
