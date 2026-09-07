@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "zeus.project/v1",
+  "projectId": "hermes",
+  "profile": "source",
+  "canonicalSource": {
+    "repository": "https://github.com/NousResearch/hermes-agent",
+    "branch": "main"
+  },
+  "environments": {
+    "production": {
+      "url": "https://hermes-agent.nousresearch.com/"
+    },
+    "admin": {
+      "url": "https://zeus.tailfad2e3.ts.net:3300/radar/"
+    }
+  },
+  "capabilities": {
+    "provides": [
+      "agents.execute"
+    ],
+    "consumes": []
+  },
+  "modules": {
+    "releaseReadiness": {
+      "state": "required",
+      "standard": "zeus.release-readiness/v1"
+    }
+  },
+  "connections": [],
+  "constraints": {
+    "primaryBusinessId": "platform",
+    "servesBusinessIds": [
+      "platform",
+      "client-labs",
+      "comandero",
+      "invoice-retriever"
+    ],
+    "rawCustomerDataInZeusOs": "forbidden",
+    "sideEffects": "owner-policy-gated"
+  }
+}
