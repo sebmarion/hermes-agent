@@ -591,7 +591,10 @@ def _release_session_resources(task_id: str, session_info: Dict[str, Any]) -> No
     _forget_session_tracking(task_id, session=True)
 
     if (session_info.get("features") or {}).get("browserd"):
-        _broker.release(session_info, close_worker=True)
+        _broker.release(
+            session_info,
+            close_worker=not bool(session_info.get("browserd_persistent", True)),
+        )
     elif bb_session_id:  # cloud only — local sidecars have bb_session_id=None
         provider = _cloud._get_cloud_provider()
         if provider is not None:

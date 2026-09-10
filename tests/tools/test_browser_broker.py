@@ -42,7 +42,7 @@ def test_broker_cleanup_releases_owner(monkeypatch):
     info = {
         "session_name": "broker_test", "bb_session_id": None,
         "features": {"browserd": True}, "browserd_lease_id": "lease-1",
-        "browserd_session": "hermes-test",
+        "browserd_session": "hermes-test", "browserd_persistent": True,
     }
     released = []
     monkeypatch.setattr(browser_tool, "_active_sessions", {"task": info})
@@ -53,5 +53,40 @@ def test_broker_cleanup_releases_owner(monkeypatch):
     monkeypatch.setattr(browser_tool, "_maybe_stop_recording", lambda *_: None)
     monkeypatch.setattr(lifecycle, "_kill_verified_daemon", lambda *_: False)
     lifecycle._cleanup_single_browser_session("task")
-    assert released == [(info, True)]
+    assert released == [(info, False)]
     assert "task" not in browser_tool._active_sessions
+
+
+def test_configured_broker_session_is_shared(monkeypatch):
+    monkeypatch.setattr(broker, "_configured_session", lambda: "hermes-shared-main")
+    assert broker._session_key("task-a") == "hermes-shared-main"
+    assert broker._session_key("task-b") == "hermes-shared-main"
+
+
+def test_invalid_broker_session_rejected(monkeypatch):
+    def cfg(key, default, cast, source):
+        return "../bad" if key == "broker_session" else default
+    monkeypatch.setattr(broker._bt, "_browser_cfg", cfg)
+    try:
+        broker._configured_session()
+        assert False, "invalid session should fail"
+    except RuntimeError as exc:
+        assert "invalid browser.broker_session" in str(exc)
+
+
+def test_ephemeral_broker_cleanup_closes_worker(monkeypatch):
+    info = {
+        "session_name": "broker_ephemeral", "bb_session_id": None,
+        "features": {"browserd": True}, "browserd_lease_id": "lease-e",
+        "browserd_session": "hermes-e", "browserd_persistent": False,
+    }
+    released = []
+    monkeypatch.setattr(browser_tool, "_active_sessions", {"task-e": info})
+    monkeypatch.setattr(browser_tool, "_session_last_activity", {"task-e": 1.0})
+    monkeypatch.setattr(browser_tool, "_last_active_session_key", {})
+    monkeypatch.setattr(broker, "release", lambda got, close_worker=True: released.append((got, close_worker)))
+    monkeypatch.setattr("tools.browser_tool_cdp._stop_cdp_supervisor", lambda *_: None)
+    monkeypatch.setattr(browser_tool, "_maybe_stop_recording", lambda *_: None)
+    monkeypatch.setattr(lifecycle, "_kill_verified_daemon", lambda *_: False)
+    lifecycle._cleanup_single_browser_session("task-e")
+    assert released == [(info, True)]

@@ -8,6 +8,7 @@ still take precedence in browser_tool_session.
 import hashlib
 import json
 import os
+import re
 import socket
 from typing import Any, Dict, Optional
 
@@ -54,7 +55,21 @@ def _send(payload: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
     return result
 
 
+_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+def _configured_session() -> str:
+    value = _bt._browser_cfg(
+        "broker_session", "", lambda v: str(v or "").strip(),
+        "broker_session from config",
+    )
+    if value and not _SESSION_RE.fullmatch(value):
+        raise RuntimeError("invalid browser.broker_session")
+    return value
+
 def _session_key(task_id: str) -> str:
+    configured = _configured_session()
+    if configured:
+        return configured
     digest = hashlib.sha256(task_id.encode("utf-8", "replace")).hexdigest()[:20]
     return f"hermes-{digest}"
 
