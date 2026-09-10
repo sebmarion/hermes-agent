@@ -18,6 +18,7 @@ from hermes_constants import get_hermes_home, reset_hermes_home_override, set_he
 from tools.browser_tool_origin import origin as _bt
 from tools import browser_tool_cdp as _cdp
 from tools import browser_tool_cloud as _cloud
+from tools import browser_tool_broker as _broker
 from tools import browser_tool_session as _session
 from tools import browser_tool_install as _install
 from tools import browser_tool_real_profile as _real_profile
@@ -589,7 +590,9 @@ def _release_session_resources(task_id: str, session_info: Dict[str, Any]) -> No
     bb_session_id = session_info.get("bb_session_id", "unknown")
     _forget_session_tracking(task_id, session=True)
 
-    if bb_session_id:  # cloud only — local sidecars have bb_session_id=None
+    if (session_info.get("features") or {}).get("browserd"):
+        _broker.release(session_info, close_worker=True)
+    elif bb_session_id:  # cloud only — local sidecars have bb_session_id=None
         provider = _cloud._get_cloud_provider()
         if provider is not None:
             try:
@@ -649,7 +652,9 @@ def _cleanup_single_browser_session(task_id: str) -> None:
 
     # Lightpanda sessions have no daemon to ``close``; an expired cloud CDP URL cannot
     # accept one and would make _get_session_info() renew the session mid-cleanup.
-    if (session_info.get("features") or {}).get("lightpanda"):
+    if (session_info.get("features") or {}).get("browserd"):
+        _bt.logger.debug("Skipping agent-browser close for broker-owned session %s", task_id)
+    elif (session_info.get("features") or {}).get("lightpanda"):
         try:
             from tools.browser_lightpanda import stop_lightpanda
             stop_lightpanda(session_info.get("session_name", ""))

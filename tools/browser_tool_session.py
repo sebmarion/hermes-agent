@@ -17,6 +17,7 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.browser_tool_origin import origin as _bt
 from tools import browser_tool_cdp as _cdp
 from tools import browser_tool_cloud as _cloud
+from tools import browser_tool_broker as _broker
 from tools import browser_tool_install as _install
 from tools import browser_tool_lifecycle as _lifecycle
 from tools import browser_tool_lightpanda_fallback as _lp
@@ -243,11 +244,18 @@ def _create_cloud_session_or_fallback(task_id: str, provider) -> Dict[str, Any]:
 
 
 def _create_session_for_key(task_id: str, force_local: bool) -> Dict[str, Any]:
-    """Fresh session for ``task_id`` (runs OUTSIDE the lock: cloud mode makes a network call).
-    Precedence: CDP override > hybrid local sidecar (never real-profile) > cloud > local."""
+    """Fresh session for ``task_id`` (runs OUTSIDE the lock).
+
+    Precedence: explicit CDP override > configured local broker > hybrid local
+    sidecar > cloud > legacy local. Broker sessions are persistent for normal
+    tasks so authentication survives worker recycling; private-network sidecars
+    are ephemeral to avoid carrying identity state into arbitrary internal hosts.
+    """
     cdp_override = _cdp._get_cdp_override()
     if cdp_override and not force_local:
         return _create_cdp_session(task_id, cdp_override)
+    if _broker.enabled():
+        return _broker.acquire(task_id, persistent=not force_local, ttl=300)
     if force_local:
         return _create_local_session(task_id, allow_real_profile=False)
     provider = _cloud._get_cloud_provider()
@@ -286,7 +294,20 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
                 return replacement
             existing_session = None
         elif not _lifecycle._session_has_expired(existing_session) and not _local_backend_process_dead(existing_session):
-            return existing_session
+            if (existing_session.get("features") or {}).get("browserd"):
+                try:
+                    _broker.renew(existing_session, ttl=300)
+                except RuntimeError as exc:
+                    _bt.logger.warning("Browser broker lease unhealthy for task %s: %s", task_id, exc)
+                    _lifecycle._cleanup_single_browser_session(task_id)
+                    replacement = _replacement_after_teardown()
+                    if replacement is not None:
+                        return replacement
+                    existing_session = None
+                else:
+                    return existing_session
+            else:
+                return existing_session
         else:
             _bt.logger.info("Replacing expired or dead browser session for task %s", task_id)
             _lifecycle._cleanup_single_browser_session(task_id)
