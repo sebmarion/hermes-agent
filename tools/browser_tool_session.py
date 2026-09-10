@@ -252,10 +252,15 @@ def _create_session_for_key(task_id: str, force_local: bool) -> Dict[str, Any]:
     are ephemeral to avoid carrying identity state into arbitrary internal hosts.
     """
     cdp_override = _cdp._get_cdp_override()
+    if _broker.enabled():
+        if cdp_override and not force_local:
+            raise RuntimeError(
+                "browser broker is configured; direct CDP overrides are disabled. "
+                "Use the broker-managed session, or explicitly remove browser.broker_socket for a human-approved handoff."
+            )
+        return _broker.acquire(task_id, persistent=not force_local, ttl=300)
     if cdp_override and not force_local:
         return _create_cdp_session(task_id, cdp_override)
-    if _broker.enabled():
-        return _broker.acquire(task_id, persistent=not force_local, ttl=300)
     if force_local:
         return _create_local_session(task_id, allow_real_profile=False)
     provider = _cloud._get_cloud_provider()

@@ -1,8 +1,8 @@
 """Optional local browser broker adapter for concurrency-safe Zeus sessions.
 
 When browser.broker_socket is configured, Hermes leases a browser from the broker
-instead of spawning or sharing a browser directly. Explicit operator CDP overrides
-still take precedence in browser_tool_session.
+instead of spawning or sharing a browser directly. Broker mode is fail-closed:
+direct CDP overrides are rejected so automation cannot silently bypass browserd.
 """
 
 import hashlib

@@ -90,3 +90,22 @@ def test_ephemeral_broker_cleanup_closes_worker(monkeypatch):
     monkeypatch.setattr(lifecycle, "_kill_verified_daemon", lambda *_: False)
     lifecycle._cleanup_single_browser_session("task-e")
     assert released == [(info, True)]
+
+
+def test_broker_rejects_direct_cdp_override(monkeypatch):
+    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "http://127.0.0.1:9334")
+    monkeypatch.setattr(broker, "enabled", lambda: True)
+    monkeypatch.setattr(broker, "acquire", Mock(side_effect=AssertionError("must not acquire after policy violation")))
+    try:
+        session._create_session_for_key("task-direct", False)
+        assert False, "direct CDP must fail closed while broker is configured"
+    except RuntimeError as exc:
+        assert "direct CDP overrides are disabled" in str(exc)
+
+
+def test_direct_cdp_still_supported_without_broker(monkeypatch):
+    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "http://127.0.0.1:9444")
+    monkeypatch.setattr(broker, "enabled", lambda: False)
+    info = session._create_session_for_key("task-direct", False)
+    assert info["features"]["cdp_override"] is True
+    assert info["cdp_url"] == "http://127.0.0.1:9444"

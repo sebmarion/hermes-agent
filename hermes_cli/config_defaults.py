@@ -395,7 +395,7 @@ DEFAULT_CONFIG = {
         "engine": "auto",
         # With a cloud provider, auto-spawn local Chromium for LAN/localhost URLs instead
         "auto_local_for_private_urls": True,
-        "cdp_url": "",  # persistent operator CDP override; bypasses the local broker
+        "cdp_url": "",  # persistent operator CDP override; rejected while broker_socket is configured
         # Optional concurrency-safe local browser broker. When set, it owns Chrome processes,
         # profiles, and per-session serialization. broker_session pins multiple Hermes profiles
         # to one persisted browser identity; empty derives an isolated session from task_id.
