@@ -1899,7 +1899,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             </div>
           )}
 
-          <Button
+          {!founderEmbed && <Button
             ghost
             onClick={handleCopyLast}
             title="Copy last assistant response as raw markdown"
@@ -1922,7 +1922,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 {copyState === "copied" ? "copied" : copyState === "copying" ? "copying…" : copyState === "failed" ? "copy failed" : "copy last response"}
               </span>
             </span>
-          </Button>
+          </Button>}
 
           {chatPanelCollapsed && (
             <Button
