@@ -25,9 +25,11 @@ export async function copyBoundReply(binding: ChatCopyBinding,
 }
 
 /** IPC session IDs and stored transcript IDs are deliberately different. */
-export function storedCopySessionId(payload: unknown, profile?: string): string | null {
+export function storedCopySessionId(payload: unknown): string | null {
   if (!payload || typeof payload !== "object") return null;
-  const info=payload as {stored_session_id?:unknown;profile_name?:unknown};
-  if (profile && info.profile_name !== profile) return null;
+  const info=payload as {stored_session_id?:unknown};
+  // The event channel already isolates this PTY. Profile authorization belongs
+  // to the subsequent /sessions read, which is explicitly scoped by profile;
+  // rejecting here on display metadata can strand a valid conversation.
   return typeof info.stored_session_id === "string" && info.stored_session_id.length > 0 && info.stored_session_id.length <= 200 ? info.stored_session_id : null;
 }

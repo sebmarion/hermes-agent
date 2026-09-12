@@ -12,8 +12,8 @@ describe('read-only bound reply copy',()=>{
 });
 
 it('uses the server-reported stored transcript ID, never the IPC session ID',()=>{
- expect(storedCopySessionId({session_id:'ipc-id',stored_session_id:'db-id',profile_name:'zeus-os'},'zeus-os')).toBe('db-id');
- expect(storedCopySessionId({session_id:'ipc-id',profile_name:'zeus-os'},'zeus-os')).toBeNull();
- expect(storedCopySessionId({stored_session_id:'db-id',profile_name:'other'},'zeus-os')).toBeNull();
- expect(storedCopySessionId({stored_session_id:4,profile_name:'zeus-os'},'zeus-os')).toBeNull();
+ expect(storedCopySessionId({session_id:'ipc-id',stored_session_id:'db-id',profile_name:'zeus-os'})).toBe('db-id');
+ expect(storedCopySessionId({session_id:'ipc-id',profile_name:'zeus-os'})).toBeNull();
+ expect(storedCopySessionId({stored_session_id:'db-id',profile_name:'other'})).toBe('db-id');
+ expect(storedCopySessionId({stored_session_id:4,profile_name:'zeus-os'})).toBeNull();
 });

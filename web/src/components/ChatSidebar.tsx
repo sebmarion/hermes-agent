@@ -411,7 +411,7 @@ export function ChatSidebar({
         const { type, payload } = frame.params;
 
         if (type === "session.info") {
-          const id = storedCopySessionId(payload, profile);
+          const id = storedCopySessionId(payload);
           if (id) onSessionIdentityChange?.(id);
           const title = titleFromSessionInfoPayload(payload);
           if (title !== undefined) {
