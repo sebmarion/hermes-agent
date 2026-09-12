@@ -220,7 +220,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       ? "Session token unavailable. Open this page through `hermes dashboard`, not directly."
       : null,
   );
-  const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
+  const [copyState, setCopyState] = useState<"idle" | "copying" | "copied" | "failed">("idle");
+  const copyPendingRef = useRef(false);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
@@ -490,20 +491,25 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
   const handleCopyLast = () => {
     const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // Send the slash as a burst, wait long enough for Ink's tokenizer to
-    // emit a keypress event for each character (not coalesce them into a
-    // paste), then send Return as its own event.  The timing here is
-    // empirical — 100ms is safely past Node's default stdin coalescing
-    // window and well inside UI responsiveness.
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setBanner("Chat is not connected. Copy has not completed."); return;
+    }
+    if (ptyInputLineRef.current.trim()) {
+      setBanner("Your draft has not been sent. Send or clear it before copying the last reply."); return;
+    }
+    if (copyPendingRef.current) return;
+    setBanner(null); copyPendingRef.current = true; setCopyState("copying");
     ws.send("/copy");
     setTimeout(() => {
-      const s = wsRef.current;
-      if (s === ws && s.readyState === WebSocket.OPEN) s.send("\r");
+      if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) ws.send("\r");
     }, 100);
-    setCopyState("copied");
     if (copyResetRef.current) clearTimeout(copyResetRef.current);
-    copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
+    copyResetRef.current = setTimeout(() => {
+      if (copyPendingRef.current) {
+        copyPendingRef.current = false; setCopyState("failed");
+        setBanner("Copy could not be confirmed. Please try again.");
+      }
+    }, 4000);
     termRef.current?.focus();
   };
 
@@ -603,9 +609,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         // write is rejected — e.g. the OSC 52 response arriving outside the
         // original keydown event's activation ("user gesture" requirement).
         void copyTextToClipboard(text).then((copied) => {
-          if (!copied) {
-            console.warn("[dashboard clipboard] OSC 52 write failed");
+          if (unmounting || termRef.current !== term) return;
+          if (copyPendingRef.current) {
+            copyPendingRef.current = false;
+            if (copyResetRef.current) clearTimeout(copyResetRef.current);
+            setCopyState(copied ? "copied" : "failed");
+            if (!copied) setBanner("Clipboard access failed. Select the reply and use your device’s Copy command.");
+            copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
           }
+          if (!copied) console.warn("[dashboard clipboard] OSC 52 write failed");
         });
       } catch {
         console.warn("[dashboard clipboard] malformed OSC 52 payload");
@@ -1505,6 +1517,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     return () => {
       unmounting = true;
+      copyPendingRef.current = false;
       imageUploadDisposed = true;
       syncMetricsRef.current = null;
       clearEraseSuppressionTimer();
@@ -1891,7 +1904,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             <span className="inline-flex items-center gap-1.5">
               <Copy className="h-3 w-3 shrink-0" />
               <span className="hidden min-[400px]:inline tracking-wide">
-                {copyState === "copied" ? "copied" : "copy last response"}
+                {copyState === "copied" ? "copied" : copyState === "copying" ? "copying…" : copyState === "failed" ? "copy failed" : "copy last response"}
               </span>
             </span>
           </Button>
