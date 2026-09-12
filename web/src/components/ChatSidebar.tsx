@@ -63,7 +63,7 @@ interface SessionInfo {
 
 interface RpcEnvelope {
   method?: string;
-  params?: { type?: string; payload?: unknown };
+  params?: { type?: string; payload?: unknown; session_id?: unknown };
 }
 
 const STATE_LABEL: Record<ConnectionState, string> = {
@@ -92,6 +92,7 @@ interface ChatSidebarProps {
   className?: string;
   onDashboardNewSessionRequest?: () => void;
   onSessionTitleChange?: (title: string | null) => void;
+  onSessionIdentityChange?: (id: string) => void;
 }
 
 /** Build the ``session.create`` params for the sidecar session.
@@ -115,6 +116,7 @@ export function ChatSidebar({
   className,
   onDashboardNewSessionRequest,
   onSessionTitleChange,
+  onSessionIdentityChange,
 }: ChatSidebarProps) {
   // `version` bumps on reconnect; gw is derived so we never call setState
   // for it inside an effect (React 19's set-state-in-effect rule). The
@@ -392,6 +394,7 @@ export function ChatSidebar({
       });
 
       socket.addEventListener("message", (ev) => {
+        if (!isCurrent()) return;
         let frame: RpcEnvelope;
 
         try {
@@ -407,6 +410,8 @@ export function ChatSidebar({
         const { type, payload } = frame.params;
 
         if (type === "session.info") {
+          const id = frame.params.session_id;
+          if (typeof id === "string" && id.length > 0 && id.length <= 200) onSessionIdentityChange?.(id);
           const title = titleFromSessionInfoPayload(payload);
           if (title !== undefined) {
             onSessionTitleChange?.(title);
@@ -429,7 +434,7 @@ export function ChatSidebar({
       }
       ws?.close();
     };
-  }, [channel, onDashboardNewSessionRequest, onSessionTitleChange, version]);
+  }, [channel, onDashboardNewSessionRequest, onSessionTitleChange, onSessionIdentityChange, version]);
 
   // Seed the badge on mount and re-read it whenever the sockets are rebuilt
   // (a profile/channel switch bumps `version`).

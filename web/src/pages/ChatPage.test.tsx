@@ -49,9 +49,7 @@ class FakeTerminal {
 
   loadAddon() {}
 
-  onData() {
-    return { dispose() {} };
-  }
+  onData(handler: (text:string)=>void) { terminalInput.handler=handler;return {dispose(){if(terminalInput.handler===handler)terminalInput.handler=null;}}; }
 
   onResize() {
     return { dispose() {} };
@@ -79,8 +77,11 @@ class FakeTerminal {
 }
 
 const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
+const sidebarEvents=vi.hoisted(()=>({bind:null as null|((id:string)=>void)}));
+const terminalInput = vi.hoisted(() => ({ handler: null as null | ((text:string)=>void) }));
 const apiMocks = vi.hoisted(() => ({
   buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
+  getSessionMessages: vi.fn(async (id:string) => ({session_id:id,profile:"default",messages:[{role:"assistant",content:"synthetic reply"}]})),
   getSessionDetail: vi.fn(async () => ({ title: null })),
   getSessionLatestDescendant: vi.fn(async () => ({ session_id: null })),
 }));
@@ -91,7 +92,7 @@ vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: class {} }));
 vi.mock("@xterm/addon-webgl", () => ({ WebglAddon: FakeWebglAddon }));
 vi.mock("@xterm/xterm", () => ({ Terminal: FakeTerminal }));
 vi.mock("@/components/ChatSidebar", () => ({
-  ChatSidebar: () => null,
+  ChatSidebar: (props:{onSessionIdentityChange?: (id:string)=>void}) => {sidebarEvents.bind=props.onSessionIdentityChange||null;return null;},
 }));
 vi.mock("@/components/ChatSessionList", () => ({
   ChatSessionList: () => null,
@@ -193,6 +194,7 @@ async function render(ui: ReactNode) {
 
 beforeEach(() => {
   FakeWebSocket.instances = [];
+  terminalInput.handler = null;sidebarEvents.bind=null;apiMocks.getSessionMessages.mockClear();
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   apiMocks.buildWsUrl.mockReset();
   apiMocks.buildWsUrl.mockResolvedValue("ws://localhost/api/pty?channel=chat-1");
@@ -352,9 +354,7 @@ describe("ChatPage side panel collapse", () => {
     });
 
     expect(localStorage.getItem("hermes-chat-panel-collapsed")).toBe("1");
-    expect(
-      container.querySelector('[aria-label="Collapse chat side panel"]'),
-    ).toBeNull();
+    expect(container.querySelector('#chat-side-panel')?.getAttribute('aria-hidden')).toBe('true');
     expect(
       container.querySelector('[aria-label="Show chat side panel"]'),
     ).not.toBeNull();
@@ -469,7 +469,27 @@ describe("replacement PTY ownership",()=>{
   await act(async()=>{[...container.querySelectorAll('button')].find(b=>b.textContent==='Resume fixture')!.click();});
   await vi.waitFor(()=>expect(FakeWebSocket.instances).toHaveLength(2));const current=FakeWebSocket.instances[1];
   await act(async()=>{current.onopen?.();old.onclose?.({code:1001,reason:'previous session',wasClean:true});});
+  await act(async()=>sidebarEvents.bind?.('qa-current-session'));
   await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="Copy last assistant response"]')!.click());
-  expect(current.send).toHaveBeenCalledWith('/copy');expect(old.send).not.toHaveBeenCalledWith('/copy');
+  expect(apiMocks.getSessionMessages).toHaveBeenCalledWith('qa-current-session','');
+  expect(current.send).not.toHaveBeenCalledWith('/copy');expect(old.send).not.toHaveBeenCalledWith('/copy');
+ });
+});
+
+describe("safe last-response copy",()=>{
+ it("does not append a command or submit an existing draft",async()=>{
+  const {default:ChatPage}=await import("./ChatPage");await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive/></MemoryRouter>);
+  await vi.waitFor(()=>expect(FakeWebSocket.instances).toHaveLength(1));const socket=FakeWebSocket.instances[0];
+  await act(async()=>{socket.onopen?.();sidebarEvents.bind?.('qa-draft-session');});
+  expect(terminalInput.handler).not.toBeNull();await act(async()=>terminalInput.handler?.('Unsent owner draft'));socket.send.mockClear();
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="Copy last assistant response"]')!.click());
+  expect(socket.send).not.toHaveBeenCalled();expect(apiMocks.getSessionMessages).toHaveBeenCalledWith('qa-draft-session','');
+ });
+ it("does not announce clipboard success just because a command was sent",async()=>{
+  const {default:ChatPage}=await import("./ChatPage");await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive/></MemoryRouter>);
+  await vi.waitFor(()=>expect(FakeWebSocket.instances).toHaveLength(1));const socket=FakeWebSocket.instances[0];await act(async()=>{socket.onopen?.();sidebarEvents.bind?.('qa-pending-session');});
+  apiMocks.getSessionMessages.mockImplementationOnce(()=>new Promise(()=>{}));
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="Copy last assistant response"]')!.click());
+  expect(container.textContent).toContain('copying…');expect(container.textContent).not.toContain('copied');expect(socket.send).not.toHaveBeenCalledWith('/copy');
  });
 });

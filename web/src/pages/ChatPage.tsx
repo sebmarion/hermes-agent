@@ -1,3 +1,4 @@
+import { copyBoundReply, type ChatCopyBinding } from "@/lib/chat-response-copy";
 import { ChatToolsDialog } from "@/components/ChatToolsDialog";
 import { isZeusFounderChat } from "@/lib/founder-embed";
 /**
@@ -222,6 +223,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   );
   const [copyState, setCopyState] = useState<"idle" | "copying" | "copied" | "failed">("idle");
   const copyPendingRef = useRef(false);
+  const copySessionRef = useRef<ChatCopyBinding | null>(null);
+  const copyEpochRef = useRef(0);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
@@ -489,28 +492,46 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => setEnd(null);
   }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
 
-  const handleCopyLast = () => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setBanner("Chat is not connected. Copy has not completed."); return;
-    }
-    if (ptyInputLineRef.current.trim()) {
-      setBanner("Your draft has not been sent. Send or clear it before copying the last reply."); return;
+  const handleSessionIdentityChange = useCallback((id: string) => {
+    const old = copySessionRef.current;
+    if (old?.id === id && old.channel === channel && old.profile === (scopedProfile || "")) return;
+    copyEpochRef.current += 1;
+    copySessionRef.current = { id, channel, profile: scopedProfile || "" };
+    copyPendingRef.current = false;
+  }, [channel, scopedProfile]);
+  useLayoutEffect(() => {
+    copyEpochRef.current += 1; copySessionRef.current = null; copyPendingRef.current = false;
+  }, [channel, scopedProfile, resumeParam]);
+  const handleCopyLast = async () => {
+    const binding = copySessionRef.current;
+    if (!binding || binding.channel !== channel || binding.profile !== (scopedProfile || "")) {
+      setBanner("Waiting for this conversation to connect before copying."); return;
     }
     if (copyPendingRef.current) return;
-    setBanner(null); copyPendingRef.current = true; setCopyState("copying");
-    ws.send("/copy");
-    setTimeout(() => {
-      if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) ws.send("\r");
-    }, 100);
+    const epoch = ++copyEpochRef.current;
+    const current = () => copyEpochRef.current === epoch && copySessionRef.current === binding;
+    copyPendingRef.current = true; setCopyState("copying"); setBanner(null);
     if (copyResetRef.current) clearTimeout(copyResetRef.current);
     copyResetRef.current = setTimeout(() => {
-      if (copyPendingRef.current) {
-        copyPendingRef.current = false; setCopyState("failed");
-        setBanner("Copy could not be confirmed. Please try again.");
+      if (!current()) return;
+      copyEpochRef.current += 1; copyPendingRef.current = false; setCopyState("failed");
+      setBanner("Copy timed out. Your draft was not submitted or changed.");
+    }, 10000);
+    try {
+      const copied = await copyBoundReply(binding,
+        (id, profile) => api.getSessionMessages(id, profile), copyTextToClipboard, current);
+      if (!current()) return;
+      setCopyState(copied ? "copied" : "failed");
+      if (!copied) setBanner("Clipboard access failed. Select the reply and use your device’s Copy command.");
+    } catch (error) {
+      if (current()) { setCopyState("failed"); setBanner(error instanceof Error ? error.message : "Copy failed."); }
+    } finally {
+      if (current()) {
+        copyPendingRef.current = false;
+        if (copyResetRef.current) clearTimeout(copyResetRef.current);
+        copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
       }
-    }, 4000);
-    termRef.current?.focus();
+    }
   };
 
   useEffect(() => {
@@ -610,13 +631,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         // original keydown event's activation ("user gesture" requirement).
         void copyTextToClipboard(text).then((copied) => {
           if (unmounting || termRef.current !== term) return;
-          if (copyPendingRef.current) {
-            copyPendingRef.current = false;
-            if (copyResetRef.current) clearTimeout(copyResetRef.current);
-            setCopyState(copied ? "copied" : "failed");
-            if (!copied) setBanner("Clipboard access failed. Select the reply and use your device’s Copy command.");
-            copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
-          }
           if (!copied) console.warn("[dashboard clipboard] OSC 52 write failed");
         });
       } catch {
@@ -1517,7 +1531,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     return () => {
       unmounting = true;
-      copyPendingRef.current = false;
+      copyEpochRef.current += 1; copyPendingRef.current = false;
       imageUploadDisposed = true;
       syncMetricsRef.current = null;
       clearEraseSuppressionTimer();
@@ -1790,6 +1804,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
+                onSessionIdentityChange={handleSessionIdentityChange}
               />
             </div>
             <ChatSessionList
@@ -1936,12 +1951,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           )}
         </div>
 
-        {!narrow && !chatPanelCollapsed && (
+        {!narrow && (
           <div
             id="chat-side-panel"
             role="complementary"
             aria-label={modelToolsLabel}
-            className="flex min-h-0 shrink-0 flex-col gap-3 overflow-hidden lg:h-full lg:w-60"
+            aria-hidden={chatPanelCollapsed}
+            className={cn("min-h-0 shrink-0 flex-col gap-3 overflow-hidden lg:h-full lg:w-60", chatPanelCollapsed ? "hidden" : "flex")}
           >
             <div className="flex h-8 shrink-0 items-center justify-end pr-1">
               <Button
@@ -1962,6 +1978,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
+                onSessionIdentityChange={handleSessionIdentityChange}
               />
             </div>
 
