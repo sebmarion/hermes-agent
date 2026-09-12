@@ -400,6 +400,14 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
+  const embedParams = new URLSearchParams(window.location.search);
+  // Zeus embeds only the action-taking founder chat, never Hermes' admin console.
+  // Scope this narrowly so ordinary dashboard links and other profiles keep the
+  // complete management interface.
+  const zeusFounderEmbed =
+    isChatRoute &&
+    embedParams.get("embed") === "zeus" &&
+    embedParams.get("profile") === "zeus-os";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
   // Defer mounting the persistent chat host (and its xterm chunk) until the
   // user has actually opened /chat at least once. Sticky after that so the
@@ -524,7 +532,7 @@ export default function App() {
         <PluginSlot name="backdrop" />
       </div>
 
-      <header
+      {!zeusFounderEmbed && <header
         className={cn(
           "lg:hidden fixed top-0 left-0 right-0 z-40 min-h-14",
           "flex items-center gap-2 px-4 py-2",
@@ -552,9 +560,9 @@ export default function App() {
         <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
           {t.app.brand}
         </Typography>
-      </header>
+      </header>}
 
-      {mobileOpen && (
+      {!zeusFounderEmbed && mobileOpen && (
         <Button
           ghost
           aria-label={t.app.closeNavigation}
@@ -570,14 +578,14 @@ export default function App() {
           fixed lg:hidden header is h-14/z-40; previously each banner carried
           its own mt-14 AND the content kept pt-14, so two visible banners
           stacked three offsets (NS-656 review P3). One spacer, applied once. */}
-      <div aria-hidden className="h-14 shrink-0 lg:hidden" />
-      <PluginSlot name="header-banner" />
-      <ProfileScopeBanner />
-      <MemoryPressureBanner status={sidebarStatus} />
+      {!zeusFounderEmbed && <div aria-hidden className="h-14 shrink-0 lg:hidden" />}
+      {!zeusFounderEmbed && <PluginSlot name="header-banner" />}
+      {!zeusFounderEmbed && <ProfileScopeBanner />}
+      {!zeusFounderEmbed && <MemoryPressureBanner status={sidebarStatus} />}
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <div className="flex min-h-0 min-w-0 flex-1">
-          <aside
+          {!zeusFounderEmbed && <aside
             id="app-sidebar"
             aria-label={t.app.navigation}
             className={cn(
@@ -749,20 +757,20 @@ export default function App() {
               <AuthWidget />
               <SidebarFooter status={sidebarStatus} />
             </div>
-          </aside>
+          </aside>}
 
           <PageHeaderProvider pluginTabs={pluginTabMeta}>
             <div
               className={cn(
                 "relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
-                "px-3 sm:px-6",
+                zeusFounderEmbed ? "p-0" : "px-3 sm:px-6",
                 isChatRoute
                   ? "pb-0 pt-1 sm:pt-2 lg:pt-4"
                   : "pt-2 sm:pt-4 lg:pt-6",
                 isDocsRoute && "min-h-0 flex-1",
               )}
             >
-              <PluginSlot name="pre-main" />
+              {!zeusFounderEmbed && <PluginSlot name="pre-main" />}
               <div
                 className={cn(
                   "w-full min-w-0",
@@ -817,13 +825,13 @@ export default function App() {
                     <RouteFallback label="Loading chat…" />
                   ) : null)}
               </div>
-              <PluginSlot name="post-main" />
+              {!zeusFounderEmbed && <PluginSlot name="post-main" />}
             </div>
           </PageHeaderProvider>
         </div>
       </div>
 
-      <PluginSlot name="overlay" />
+      {!zeusFounderEmbed && <PluginSlot name="overlay" />}
     </div>
     </ProfileProvider>
   );
