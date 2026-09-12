@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, useNavigate } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { PTY_TICKET_TIMEOUT_MS } from "@/lib/pty-reconnect";
@@ -81,6 +81,8 @@ class FakeTerminal {
 const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
 const apiMocks = vi.hoisted(() => ({
   buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
+  getSessionDetail: vi.fn(async () => ({ title: null })),
+  getSessionLatestDescendant: vi.fn(async () => ({ session_id: null })),
 }));
 
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: FakeFitAddon }));
@@ -146,7 +148,7 @@ class FakeWebSocket {
     this.readyState = 3;
   }
 
-  send() {}
+  send = vi.fn();
 }
 
 type CloseEventLike = {
@@ -456,4 +458,18 @@ describe("ChatPage PTY ticket connect deadline", () => {
     await advance(PTY_TICKET_TIMEOUT_MS);
     expect(apiMocks.buildWsUrl).toHaveBeenCalledTimes(1);
   });
+});
+
+function ResumeFixture() { const navigate=useNavigate();return <button onClick={()=>navigate("/chat?resume=qa-socket-race")}>Resume fixture</button>; }
+describe("replacement PTY ownership",()=>{
+ it("late close from old session cannot disconnect copy from the replacement",async()=>{
+  const {default:ChatPage}=await import("./ChatPage");
+  await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive/><ResumeFixture/></MemoryRouter>);
+  await vi.waitFor(()=>expect(FakeWebSocket.instances).toHaveLength(1));const old=FakeWebSocket.instances[0];
+  await act(async()=>{[...container.querySelectorAll('button')].find(b=>b.textContent==='Resume fixture')!.click();});
+  await vi.waitFor(()=>expect(FakeWebSocket.instances).toHaveLength(2));const current=FakeWebSocket.instances[1];
+  await act(async()=>{current.onopen?.();old.onclose?.({code:1001,reason:'previous session',wasClean:true});});
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="Copy last assistant response"]')!.click());
+  expect(current.send).toHaveBeenCalledWith('/copy');expect(old.send).not.toHaveBeenCalledWith('/copy');
+ });
 });

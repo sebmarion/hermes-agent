@@ -499,7 +499,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     ws.send("/copy");
     setTimeout(() => {
       const s = wsRef.current;
-      if (s && s.readyState === WebSocket.OPEN) s.send("\r");
+      if (s === ws && s.readyState === WebSocket.OPEN) s.send("\r");
     }, 100);
     setCopyState("copied");
     if (copyResetRef.current) clearTimeout(copyResetRef.current);
@@ -1214,6 +1214,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }, PTY_CONNECTING_TIMEOUT_MS);
 
     ws.onopen = () => {
+      if (unmounting || wsRef.current !== ws) { ws.close(); return; }
       clearReconnectTimer();
       clearConnectingTimer();
       connectInFlightRef.current = false;
@@ -1284,6 +1285,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     }
 
     ws.onmessage = (ev) => {
+      if (unmounting || wsRef.current !== ws) return;
       if (typeof ev.data === "string") {
         // The active-session fallback (no `?resume=` on the URL) tells us
         // via a one-off JSON control frame that a replay is starting (#93518,
@@ -1325,6 +1327,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
 
     ws.onclose = (ev) => {
+      // A previous session can finish closing AFTER its replacement connects.
+      // It must not clear the live socket ref used by copy, resize and reconnect.
+      if (unmounting || wsRef.current !== ws) return;
       // Drain buffered sanitizer state. A buffered partial escape is dropped
       // (writing an unterminated CSI would wedge xterm's parser); a buffered
       // newline run is emitted collapsed.
