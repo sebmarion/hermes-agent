@@ -69,6 +69,10 @@ function hermesDevToken(): Plugin {
 }
 
 export default defineConfig({
+  // The dashboard is intentionally embeddable below a reverse-proxy prefix
+  // (Zeus serves it at /ai/). Relative asset URLs keep lazy chunks and CSS
+  // inside that prefix instead of escaping to the host root.
+  base: "./",
   plugins: [
     react(),
     babel({ presets: [compilerPreset()] }),
