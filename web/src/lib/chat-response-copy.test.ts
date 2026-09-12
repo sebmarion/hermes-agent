@@ -1,5 +1,5 @@
 import {describe,it,expect,vi} from 'vitest';
-import {copyBoundReply,lastAssistantReply} from './chat-response-copy';
+import {copyBoundReply,lastAssistantReply,storedCopySessionId} from './chat-response-copy';
 const binding={id:'session-qa',profile:'zeus-os',channel:'channel-qa'};
 const reply={session_id:'session-qa',profile:'zeus-os',messages:[{role:'user',content:'not the reply'},{role:'assistant',content:'earlier'},{role:'assistant',content:'Exact \nreply ✓'}]};
 describe('read-only bound reply copy',()=>{
@@ -9,4 +9,11 @@ describe('read-only bound reply copy',()=>{
  it('does not replace the clipboard after a scope change',async()=>{const write=vi.fn();expect(await copyBoundReply(binding,async()=>reply,write,()=>false)).toBe(false);expect(write).not.toHaveBeenCalled();});
  it('propagates clipboard failure instead of claiming success',async()=>{const write=vi.fn(async()=>false);expect(await copyBoundReply(binding,async()=>reply,write,()=>true)).toBe(false);expect(write).toHaveBeenCalledWith('Exact \nreply ✓');});
  it('does not treat pending tool calls as completed assistant replies',()=>{expect(lastAssistantReply({...reply,messages:[...reply.messages,{role:'assistant',content:'working',tool_calls:[{}]}]},binding)).toBe('Exact \nreply ✓');});
+});
+
+it('uses the server-reported stored transcript ID, never the IPC session ID',()=>{
+ expect(storedCopySessionId({session_id:'ipc-id',stored_session_id:'db-id',profile_name:'zeus-os'},'zeus-os')).toBe('db-id');
+ expect(storedCopySessionId({session_id:'ipc-id',profile_name:'zeus-os'},'zeus-os')).toBeNull();
+ expect(storedCopySessionId({stored_session_id:'db-id',profile_name:'other'},'zeus-os')).toBeNull();
+ expect(storedCopySessionId({stored_session_id:4,profile_name:'zeus-os'},'zeus-os')).toBeNull();
 });

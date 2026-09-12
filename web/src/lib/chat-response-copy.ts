@@ -23,3 +23,11 @@ export async function copyBoundReply(binding: ChatCopyBinding,
   if (!current()) return false;
   return write(text);
 }
+
+/** IPC session IDs and stored transcript IDs are deliberately different. */
+export function storedCopySessionId(payload: unknown, profile?: string): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const info=payload as {stored_session_id?:unknown;profile_name?:unknown};
+  if (profile && info.profile_name !== profile) return null;
+  return typeof info.stored_session_id === "string" && info.stored_session_id.length > 0 && info.stored_session_id.length <= 200 ? info.stored_session_id : null;
+}

@@ -1,3 +1,4 @@
+import { storedCopySessionId } from "@/lib/chat-response-copy";
 /**
  * ChatSidebar — structured-events panel that sits next to the xterm.js
  * terminal in the dashboard Chat tab.
@@ -63,7 +64,7 @@ interface SessionInfo {
 
 interface RpcEnvelope {
   method?: string;
-  params?: { type?: string; payload?: unknown; session_id?: unknown };
+  params?: { type?: string; payload?: unknown };
 }
 
 const STATE_LABEL: Record<ConnectionState, string> = {
@@ -410,8 +411,8 @@ export function ChatSidebar({
         const { type, payload } = frame.params;
 
         if (type === "session.info") {
-          const id = frame.params.session_id;
-          if (typeof id === "string" && id.length > 0 && id.length <= 200) onSessionIdentityChange?.(id);
+          const id = storedCopySessionId(payload, profile);
+          if (id) onSessionIdentityChange?.(id);
           const title = titleFromSessionInfoPayload(payload);
           if (title !== undefined) {
             onSessionTitleChange?.(title);
@@ -434,7 +435,7 @@ export function ChatSidebar({
       }
       ws?.close();
     };
-  }, [channel, onDashboardNewSessionRequest, onSessionTitleChange, onSessionIdentityChange, version]);
+  }, [channel, profile, onDashboardNewSessionRequest, onSessionTitleChange, onSessionIdentityChange, version]);
 
   // Seed the badge on mount and re-read it whenever the sockets are rebuilt
   // (a profile/channel switch bumps `version`).
