@@ -501,7 +501,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   }, [channel, scopedProfile]);
   useLayoutEffect(() => {
     copyEpochRef.current += 1; copySessionRef.current = null; copyPendingRef.current = false;
-  }, [channel, scopedProfile, resumeParam]);
+  }, [channel, scopedProfile, resumeParam, reconnectNonce]);
   const handleCopyLast = async () => {
     const binding = copySessionRef.current;
     if (!binding || binding.channel !== channel || binding.profile !== (scopedProfile || "")) {

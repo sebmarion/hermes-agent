@@ -81,7 +81,7 @@ const sidebarEvents=vi.hoisted(()=>({bind:null as null|((id:string)=>void)}));
 const terminalInput = vi.hoisted(() => ({ handler: null as null | ((text:string)=>void) }));
 const apiMocks = vi.hoisted(() => ({
   buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
-  getSessionMessages: vi.fn(async (id:string) => ({session_id:id,profile:"default",messages:[{role:"assistant",content:"synthetic reply"}]})),
+  getSessionMessages: vi.fn(async (id:string, profile:string) => ({session_id:id,profile,messages:[{role:"assistant",content:"synthetic reply"}]})),
   getSessionDetail: vi.fn(async () => ({ title: null })),
   getSessionLatestDescendant: vi.fn(async () => ({ session_id: null })),
 }));
