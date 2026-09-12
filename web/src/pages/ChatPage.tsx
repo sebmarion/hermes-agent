@@ -1,3 +1,5 @@
+import { ChatToolsDialog } from "@/components/ChatToolsDialog";
+import { isZeusFounderChat } from "@/lib/founder-embed";
 /**
  * ChatPage — embeds `hermes --tui` inside the dashboard.
  *
@@ -368,6 +370,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // management profile. Changing it remounts the terminal (key below /
   // effect dep) so the user explicitly starts a fresh scoped session.
   const { profile: scopedProfile } = useProfileScope();
+  const founderEmbed = isZeusFounderChat("/chat", searchParams.toString());
   const channel = useMemo(
     () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}`),
     [resumeParam, scopedProfile],
@@ -443,19 +446,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => mql.removeEventListener("change", sync);
   }, []);
 
-  useEffect(() => {
-    if (!mobilePanelOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeMobilePanel();
-    };
-    document.addEventListener("keydown", onKey);
-    const prevOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.body.style.overflow = prevOverflow;
-    };
-  }, [mobilePanelOpen, closeMobilePanel]);
+
 
   useEffect(() => {
     const mql = window.matchMedia("(min-width: 1024px)");
@@ -484,7 +475,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         aria-controls="chat-side-panel"
         className={cn(
           "shrink-0 rounded border border-current/20",
-          "px-2 py-1 text-xs font-medium tracking-wide",
+          "min-h-[44px] px-3 py-2 text-sm font-medium tracking-wide",
           "text-text-secondary hover:text-midground hover:bg-midground/5",
         )}
       >
@@ -544,8 +535,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       cursorBlink: true,
       fontFamily:
         "'JetBrains Mono', 'Cascadia Mono', 'Fira Code', 'MesloLGS NF', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
-      fontSize: terminalFontSizeForWidth(tierW0),
-      lineHeight: terminalLineHeightForWidth(tierW0),
+      fontSize: founderEmbed ? Math.max(14, terminalFontSizeForWidth(tierW0)) : terminalFontSizeForWidth(tierW0),
+      lineHeight: founderEmbed ? 1.2 : terminalLineHeightForWidth(tierW0),
       letterSpacing: 0,
       fontWeight: "400",
       fontWeightBold: "700",
@@ -946,8 +937,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         return;
       }
       const w = terminalTierWidthPx(host);
-      const nextSize = terminalFontSizeForWidth(w);
-      const nextLh = terminalLineHeightForWidth(w);
+      const nextSize = founderEmbed ? Math.max(14, terminalFontSizeForWidth(w)) : terminalFontSizeForWidth(w);
+      const nextLh = founderEmbed ? 1.2 : terminalLineHeightForWidth(w);
       const fontChanged =
         term.options.fontSize !== nextSize ||
         term.options.lineHeight !== nextLh;
@@ -1563,6 +1554,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     clearReconnectTimer,
     resumeParam,
     scopedProfile,
+    founderEmbed,
     reconnectNonce,
   ]);
 
@@ -1742,36 +1734,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     narrow &&
     portalRoot &&
     createPortal(
-      <>
-        {mobilePanelOpen && (
-          <Button
-            ghost
-            aria-label={t.app.closeModelTools}
-            onClick={closeMobilePanel}
-            className={cn(
-              "fixed inset-0 z-[55] p-0 block",
-              "bg-black/60",
-            )}
-          />
-        )}
-
-        <div
-          id="chat-side-panel"
-          role="complementary"
-          aria-label={modelToolsLabel}
-          className={cn(
-            "font-mondwest fixed top-0 right-0 z-[60] flex h-dvh max-h-dvh w-64 min-w-0 flex-col antialiased",
-            "border-l border-current/20 text-midground",
-            "bg-background-base/95",
-            "transition-transform duration-200 ease-out",
-            "[background:var(--component-sidebar-background)]",
-            "[clip-path:var(--component-sidebar-clip-path)]",
-            "[border-image:var(--component-sidebar-border-image)]",
-            mobilePanelOpen
-              ? "translate-x-0"
-              : "pointer-events-none translate-x-full",
-          )}
-        >
+      <ChatToolsDialog open={mobilePanelOpen} onClose={closeMobilePanel} label={modelToolsLabel}>
           <div
             className={cn(
               "flex h-14 shrink-0 items-center justify-between gap-2 border-b border-current/20 px-5",
@@ -1815,13 +1778,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               activeSessionId={resumeParam}
               profile={scopedProfile}
               onPicked={closeMobilePanel}
-              onNewChat={startFreshDashboardChat}
+              onNewChat={() => { closeMobilePanel(); startFreshDashboardChat(); }}
             />
           </div>
-        </div>
-      </>,
+      </ChatToolsDialog>,
       portalRoot,
     );
+
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2">

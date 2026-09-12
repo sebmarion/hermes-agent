@@ -1,3 +1,4 @@
+import { isZeusFounderChat } from "./lib/founder-embed";
 import {
   lazy,
   Suspense,
@@ -371,7 +372,7 @@ const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
 export default function App() {
   const { t } = useI18n();
-  const { pathname } = useLocation();
+  const { pathname, search } = useLocation();
   const { manifests, loading: pluginsLoading } = usePlugins();
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -400,14 +401,7 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
-  const embedParams = new URLSearchParams(window.location.search);
-  // Zeus embeds only the action-taking founder chat, never Hermes' admin console.
-  // Scope this narrowly so ordinary dashboard links and other profiles keep the
-  // complete management interface.
-  const zeusFounderEmbed =
-    isChatRoute &&
-    embedParams.get("embed") === "zeus" &&
-    embedParams.get("profile") === "zeus-os";
+  const zeusFounderEmbed = isZeusFounderChat(pathname, search);
   const embeddedChat = isDashboardEmbeddedChatEnabled();
   // Defer mounting the persistent chat host (and its xterm chunk) until the
   // user has actually opened /chat at least once. Sticky after that so the
