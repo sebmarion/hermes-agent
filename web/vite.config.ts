@@ -69,6 +69,8 @@ function hermesDevToken(): Plugin {
 }
 
 export default defineConfig({
+  // Keep lazy chunks, CSS and fonts relative so the same build works at / and behind a proxy prefix.
+  base: "./",
   plugins: [
     react(),
     babel({ presets: [compilerPreset()] }),
