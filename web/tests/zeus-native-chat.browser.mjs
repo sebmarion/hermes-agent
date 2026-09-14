@@ -97,6 +97,29 @@ try{
   const composerBox=await chat.locator('#zeus-message').boundingBox();assert.ok(composerBox.y>=0&&composerBox.y+composerBox.height<=height+1,JSON.stringify(composerBox));
  });
  await page.setViewportSize({width:390,height:844});
+
+ await check('Executive question reaches the real native composer once, without a prompt or execution',async()=>{
+  const before=calls.filter(c=>c.method==='prompt.submit').length;
+  await chat.getByRole('button',{name:'Back to Zeus OS',exact:true}).click();
+  await page.locator('.founder-axis[data-id="money"]').click();await page.locator('[data-action="founder-deep"]').click();
+  await chat.locator('#zeus-message').filter({visible:true}).waitFor();
+  await page.waitForFunction(()=>document.querySelector('#zeus-ai-frame').contentDocument?.querySelector('#zeus-message')?.value==='What is our software MRR?');
+  assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);
+  await chat.locator('#zeus-message').fill('');
+ });
+ await check('A handoff never destroys the existing draft and has an explicit usable recovery',async()=>{
+  const before=calls.filter(c=>c.method==='prompt.submit').length;
+  await chat.locator('#zeus-message').fill('An existing owner draft');
+  await chat.getByRole('button',{name:'Back to Zeus OS',exact:true}).click();
+  await page.locator('[data-action="founder-ask"][data-id="yesterday"]').click();await page.locator('[data-action="founder-deep"]').click();
+  await chat.locator('.zc-incoming-question').waitFor();assert.equal(await chat.locator('#zeus-message').inputValue(),'An existing owner draft');
+  assert.equal(await chat.getByRole('button',{name:'Use question',exact:true}).isDisabled(),true);
+  for(const [width,height] of [[390,420],[844,390]]){await page.setViewportSize({width,height});await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));const box=await chat.locator('#zeus-message').boundingBox();assert.ok(box.y>=0&&box.y+box.height<=height+1,JSON.stringify(box));}
+  await page.setViewportSize({width:390,height:844});
+  await chat.locator('#zeus-message').fill('');await chat.getByRole('button',{name:'Use question',exact:true}).click();
+  assert.equal(await chat.locator('#zeus-message').inputValue(),'What made money yesterday?');assert.equal(await chat.locator('.zc-incoming-question').count(),0);
+  assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);await chat.locator('#zeus-message').fill('');
+ });
  await check('Global dashboard notices cannot cover the immersive chat',async()=>{await page.locator('#snapshot-notice').evaluate(el=>{el.textContent='QA status source unavailable';el.hidden=false;});assert.equal(await page.locator('#snapshot-notice').isVisible(),false);});
  await check('Mobile Enter inserts a newline rather than accidentally sending',async()=>{const before=calls.filter(c=>c.method==='prompt.submit').length;await chat.locator('#zeus-message').fill('First line');await chat.locator('#zeus-message').press('Enter');assert.equal(await chat.locator('#zeus-message').inputValue(),'First line\n');assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);});
  await check('Streaming, new draft during send, collapsed tools, and safe Markdown',async()=>{

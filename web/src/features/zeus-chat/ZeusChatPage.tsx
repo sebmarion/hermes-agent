@@ -3,6 +3,8 @@ import { ArrowDown, ArrowLeft, ArrowUp, Check, Copy, History, MessageCircle, Plu
 import { Markdown } from "@/components/Markdown";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { ZeusChatController } from "./controller";
+import { createComposeHandler } from "./compose";
+import { QuickAnswers } from "./QuickAnswers";
 import { RequestPanel } from "./RequestPanel";
 import type { ChatItem } from "./model";
 import "./chat.css";
@@ -39,10 +41,25 @@ export default function ZeusChatPage() {
   const following = useRef(true);
   const [showLatest, setShowLatest] = useState(false);
   const [search, setSearch] = useState("");
+  const [incomingQuestion, setIncomingQuestion] = useState("");
+  const [questionCopyError, setQuestionCopyError] = useState(false);
   useEffect(() => {
     controller.start();
     if (window.parent !== window) window.parent.postMessage({ type: "zeus-chat:ready", load: new URLSearchParams(window.location.search).get("zeusLoad") }, window.location.origin);
     return () => controller.stop();
+  }, [controller]);
+  useEffect(() => {
+    if (window.parent === window) return;
+    const handler = createComposeHandler({
+      parent: window.parent, origin: window.location.origin,
+      load: new URLSearchParams(window.location.search).get("zeusLoad") || "",
+      read: controller.getSnapshot,
+      setDraft: text => { controller.setDraft(text); composer.current?.focus(); },
+      occupied: text => { setIncomingQuestion(text); setQuestionCopyError(false); },
+      acknowledge: result => window.parent.postMessage(result, window.location.origin),
+    });
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
   }, [controller]);
   useLayoutEffect(() => {
     const input = composer.current;
@@ -76,6 +93,7 @@ export default function ZeusChatPage() {
       <header className="zc-header">
         <button type="button" className="zc-icon" aria-label="Back to Zeus OS" title="Back to Zeus OS" onClick={close}><ArrowLeft size={21} /></button>
         <div className="zc-identity"><strong>Zeus</strong><span title={state.title}>{state.title}</span></div>
+        <QuickAnswers prepare={text => { const current = controller.getSnapshot(); if (current.draft.length || current.busy || current.sending || current.loading || current.uncertain || current.pending) setIncomingQuestion(text); else { controller.setDraft(text); composer.current?.focus(); } }} />
         <button type="button" className="zc-icon" aria-label="Conversation history" title="Conversation history" onClick={openHistory}><History size={21} /></button>
         <button type="button" className="zc-icon" aria-label="New conversation" title="New conversation" disabled={state.sending} onClick={newChat}><Plus size={22} /></button>
       </header>
@@ -95,6 +113,8 @@ export default function ZeusChatPage() {
         </div>
       </div>
       <div className="zc-bottom">
+        {incomingQuestion && <aside className="zc-incoming-question" aria-label="Prepared executive question"><strong>Your existing draft is safe.</strong><p>{incomingQuestion}</p><div><button type="button" disabled={Boolean(state.draft.length || state.loading || state.sending || state.busy || state.pending || state.uncertain)} onClick={() => { controller.setDraft(incomingQuestion); setIncomingQuestion(""); composer.current?.focus(); }}>Use question</button><button type="button" onClick={() => void copyTextToClipboard(incomingQuestion).then(ok => setQuestionCopyError(!ok))}>Copy question</button><button type="button" onClick={() => setIncomingQuestion("")}>Dismiss</button></div>{questionCopyError && <p role="status">Touch and hold the question to copy it.</p>}</aside>}
+
         {showLatest && <button type="button" className="zc-latest" onClick={bottom}><ArrowDown size={16} />Jump to latest</button>}
         {state.pending && <RequestPanel key={`${state.pending.request_id}:${state.pending.questions?.[0]?.qid || ""}`} request={state.pending} disabled={!online || state.sending} respond={controller.respond} />}
         {!state.pending && <form className="zc-composer" aria-label="Message Zeus" onSubmit={event => { event.preventDefault(); send(); }}>
