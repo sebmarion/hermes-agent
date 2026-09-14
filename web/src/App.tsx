@@ -96,6 +96,7 @@ const ChannelsPage = lazy(() => import("@/pages/ChannelsPage"));
 const WebhooksPage = lazy(() => import("@/pages/WebhooksPage"));
 const SystemPage = lazy(() => import("@/pages/SystemPage"));
 const ChatPage = lazy(() => import("@/pages/ChatPage"));
+const ZeusChatPage = lazy(() => import("@/features/zeus-chat/ZeusChatPage"));
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -818,7 +819,7 @@ export default function App() {
                           ) : null
                         }
                       >
-                        <ChatPage isActive={isChatRoute} />
+                        {zeusFounderEmbed ? <ZeusChatPage /> : <ChatPage isActive={isChatRoute} />}
                       </Suspense>
                     </div>
                   ) : isChatRoute ? (
