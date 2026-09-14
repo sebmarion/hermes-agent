@@ -243,7 +243,7 @@ function parseInline(text: string): InlineNode[] {
   const nodes: InlineNode[] = [];
   // Pattern priority: code > link > bold > italic > bare URL > line break
   const pattern =
-    /(`[^`]+`)|(\[([^\]]+)\]\(([^)]+)\))|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)|(\bhttps?:\/\/[^\s<>)\]]+)|(\n)/g;
+    /(`[^`]+`)|(\[([^\]]+)\]\(((?:[^()]|\([^()]*\))*)\))|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)|(\bhttps?:\/\/[^\s<>)\]]+)|(\n)/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -331,11 +331,10 @@ function InlineContent({
             const href = node.href.trim();
             if (!/^(https?:|mailto:)/i.test(href)) {
               return (
-                <HighlightedText
-                  key={i}
-                  text={node.text}
-                  terms={highlightTerms}
-                />
+                <span key={i} className="markdown-blocked-link" title="This link uses an unsupported URL scheme and cannot be opened.">
+                  <HighlightedText text={node.text} terms={highlightTerms} />
+                  <span className="markdown-blocked-link-note"> (link blocked)</span>
+                </span>
               );
             }
             return (

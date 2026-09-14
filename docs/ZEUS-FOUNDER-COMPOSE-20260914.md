@@ -12,3 +12,10 @@ Build: `cd web && npm test && npm run build`. Browser acceptance requires the ex
 ## Exact-source isolation correction
 
 The first commit `2a19e045c3` accidentally included an import/render reference and styles for a concurrently edited `QuickAnswers` component whose implementation was still untracked. The clean checkout correctly failed compilation. This qualification branch removes only that incomplete dependency from its isolated candidate; it does not delete, revert, stage or approve the original worktree’s continuing quick-answer implementation. Do not certify `2a19e045c3` from an older compiled bundle. Build and test the correction commit itself before integration.
+
+
+## Wave 6 release continuation
+
+The current isolated release line re-integrates the complete Instant company answers drawer with its validated message parser and tests; no untracked import is required. It uses only correlated parent snapshot queries and expires displayed evidence. Unsupported queries prepare a normal AI draft. The normal chat model and gateway remain unchanged.
+
+The independent design review found a malformed rejected-link label, visually clipped long code and an intrusive parent draft-preservation toast. The shared Markdown parser now consumes balanced one-level URL parentheses and renders unsupported schemes as non-navigable labelled text; escaped raw HTML remains escaped. Zeus-only CSS soft-wraps long code without modifying copy text and uses its own native colour tokens. The parent suppresses the duplicate occupied-draft toast; the native recovery card remains authoritative. The exact built-bundle browser suite proves blocked schemes produce no anchors, code fits the composer viewport, no auto-submission occurs and existing drafts survive. This is candidate web evidence, not physical-device certification or production release.

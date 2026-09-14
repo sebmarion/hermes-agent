@@ -4,6 +4,7 @@ import { Markdown } from "@/components/Markdown";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { ZeusChatController } from "./controller";
 import { createComposeHandler } from "./compose";
+import { QuickAnswers } from "./QuickAnswers";
 import { RequestPanel } from "./RequestPanel";
 import type { ChatItem } from "./model";
 import "./chat.css";
@@ -92,6 +93,7 @@ export default function ZeusChatPage() {
       <header className="zc-header">
         <button type="button" className="zc-icon" aria-label="Back to Zeus OS" title="Back to Zeus OS" onClick={close}><ArrowLeft size={21} /></button>
         <div className="zc-identity"><strong>Zeus</strong><span title={state.title}>{state.title}</span></div>
+        <QuickAnswers prepare={text => { const current = controller.getSnapshot(); if (current.draft.length || current.busy || current.sending || current.loading || current.uncertain || current.pending) setIncomingQuestion(text); else { controller.setDraft(text); composer.current?.focus(); } }} />
         <button type="button" className="zc-icon" aria-label="Conversation history" title="Conversation history" onClick={openHistory}><History size={21} /></button>
         <button type="button" className="zc-icon" aria-label="New conversation" title="New conversation" disabled={state.sending} onClick={newChat}><Plus size={22} /></button>
       </header>

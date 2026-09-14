@@ -120,13 +120,33 @@ try{
   assert.equal(await chat.locator('#zeus-message').inputValue(),'What made money yesterday?');assert.equal(await chat.locator('.zc-incoming-question').count(),0);
   assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);await chat.locator('#zeus-message').fill('');
  });
+ await check('Instant company answers use the parent snapshot without any model prompt and preserve the composer',async()=>{
+  const before=calls.filter(c=>c.method==='prompt.submit').length;
+  await chat.locator('#zeus-message').fill('Preserve this draft');
+  await chat.getByRole('button',{name:'Instant company answers',exact:true}).click();
+  await chat.getByRole('button',{name:'What made money yesterday?',exact:true}).click();
+  await chat.locator('.zc-quick-answer').waitFor();assert.match(await chat.locator('.zc-quick-answer').innerText(),/not available from this snapshot/);
+  assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);await chat.getByRole('button',{name:'Close instant answers',exact:true}).click();
+  assert.equal(await chat.locator('#zeus-message').inputValue(),'Preserve this draft');await chat.locator('#zeus-message').fill('');
+ });
+ await check('Instant answers fit dark and small-phone viewports and expose actual evidence',async()=>{
+  await page.emulateMedia({colorScheme:'dark',reducedMotion:'reduce'});await page.setViewportSize({width:320,height:568});
+  await chat.getByRole('button',{name:'Instant company answers',exact:true}).click();
+  await chat.getByRole('button',{name:'Give me the company briefing.',exact:true}).click();await chat.locator('.zc-quick-answer').waitFor();
+  await chat.locator('.zc-quick-answer summary').click();assert.match(await chat.locator('.zc-quick-answer').innerText(),/Barcelona|Timestamp unavailable/);
+  const f=page.frames().find(f=>f.url().includes('/ai/chat'));
+  assert.ok(await f.evaluate(()=>{const n=document.querySelector('.zc-quick-dialog');return n.scrollWidth<=n.clientWidth+1&&n.getBoundingClientRect().width<=innerWidth;}));
+  await page.screenshot({path:path.join(out,'instant-answers-320-dark.png')});await chat.getByRole('button',{name:'Close instant answers',exact:true}).click();
+  await page.emulateMedia({colorScheme:'light',reducedMotion:'reduce'});await page.setViewportSize({width:390,height:844});
+ });
  await check('Global dashboard notices cannot cover the immersive chat',async()=>{await page.locator('#snapshot-notice').evaluate(el=>{el.textContent='QA status source unavailable';el.hidden=false;});assert.equal(await page.locator('#snapshot-notice').isVisible(),false);});
  await check('Mobile Enter inserts a newline rather than accidentally sending',async()=>{const before=calls.filter(c=>c.method==='prompt.submit').length;await chat.locator('#zeus-message').fill('First line');await chat.locator('#zeus-message').press('Enter');assert.equal(await chat.locator('#zeus-message').inputValue(),'First line\n');assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);});
  await check('Streaming, new draft during send, collapsed tools, and safe Markdown',async()=>{
   await chat.locator('#zeus-message').fill('Please review this example');await chat.getByRole('button',{name:'Send message',exact:true}).click();await chat.locator('#zeus-message').fill('Draft for my next message');
   await chat.getByText('Here is the answer.',{exact:false}).waitFor();
-  assert.equal(await chat.locator('#zeus-message').inputValue(),'Draft for my next message');assert.equal(await chat.locator('.zc-tools').getAttribute('open'),null);assert.equal(await chat.locator('a[href^="javascript:"]').count(),0);assert.ok(!(await chat.locator('.zc-transcript').innerText()).includes('never-render-this'));
+  assert.equal(await chat.locator('#zeus-message').inputValue(),'Draft for my next message');assert.equal(await chat.locator('.zc-tools').getAttribute('open'),null);assert.equal(await chat.locator('a[href^="javascript:"]').count(),0);assert.match(await chat.locator('.markdown-blocked-link').innerText(),/Unsafe link.*link blocked/);assert.doesNotMatch(await chat.locator('.zc-transcript').innerText(),/Unsafe link\)/);assert.ok(!(await chat.locator('.zc-transcript').innerText()).includes('never-render-this'));
   const f=page.frames().find(f=>f.url().includes('/ai/chat'));assert.equal(await f.evaluate(()=>document.querySelector('.zc-scroll').scrollWidth<=innerWidth+1),true);
+  assert.ok(await chat.locator('pre').evaluate(el=>el.scrollWidth<=el.clientWidth+1),'Long code wraps within the transcript');
   await page.screenshot({path:path.join(out,'mobile-conversation.png')});
  });
  await check('Approval is visible and never answered automatically',async()=>{await newSend('Approval test','approval');await chat.getByRole('button',{name:'Allow once',exact:true}).waitFor();assert.equal(calls.filter(c=>c.method==='approval.respond').length,0);await chat.getByRole('button',{name:'Do not allow',exact:true}).click();await chat.getByText('Your explicit choice was received.',{exact:true}).waitFor();assert.deepEqual(calls.filter(c=>c.method==='approval.respond').map(c=>c.params.choice),['deny']);});
