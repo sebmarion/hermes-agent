@@ -7,3 +7,8 @@ The parent may prepare a question only through a matching origin, parent window,
 `compose.test.ts` checks validation, replay and draft/turn protection. The actual production bundle is exercised by `web/tests/zeus-native-chat.browser.mjs` with the candidate Zeus shell and simulated RPCs: no production prompt or mutation is sent. The harness covers short phone viewports with the occupied-question card as well as draft handoff, history, uncertain acknowledgements, approvals and streaming. Physical iOS and real model response latency are not certified by those fixtures.
 
 Build: `cd web && npm test && npm run build`. Browser acceptance requires the existing Zeus broker lease and explicit `ZEUS_CHAT_SHELL` / `ZEUS_CHAT_EVIDENCE` paths. Do not deploy this bundle independently and claim the parent handoff is live: both repository changes and the exact combined release must be qualified. Production service files, generic Hermes routes, systemd and provider settings were not changed by this work.
+
+
+## Exact-source isolation correction
+
+The first commit `2a19e045c3` accidentally included an import/render reference and styles for a concurrently edited `QuickAnswers` component whose implementation was still untracked. The clean checkout correctly failed compilation. This qualification branch removes only that incomplete dependency from its isolated candidate; it does not delete, revert, stage or approve the original worktree’s continuing quick-answer implementation. Do not certify `2a19e045c3` from an older compiled bundle. Build and test the correction commit itself before integration.
