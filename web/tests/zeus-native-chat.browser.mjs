@@ -93,9 +93,11 @@ try{
   const f=page.frames().find(f=>f.url().includes('/ai/chat'));
   const dims=await f.evaluate(()=>{const root=document.querySelector('.zeus-chat'),input=document.querySelector('.zc-composer');return {width:innerWidth,scroll:root.scrollWidth,bottom:input.getBoundingClientRect().bottom,height:innerHeight,top:input.getBoundingClientRect().top};});
   assert.ok(dims.scroll<=dims.width+1,JSON.stringify(dims));assert.ok(dims.bottom<=dims.height+1&&dims.top>=0,JSON.stringify(dims));
-  if(width<=800){const frameBox=await page.locator('#zeus-ai-frame').boundingBox();assert.ok(frameBox.y>=-1&&frameBox.y+frameBox.height<=height+1,JSON.stringify(frameBox));}
+  const frameBox=await page.locator('#zeus-ai-frame').boundingBox();assert.ok(frameBox.y>=-1&&frameBox.y+frameBox.height<=height+1,JSON.stringify(frameBox));
+  const composerBox=await chat.locator('#zeus-message').boundingBox();assert.ok(composerBox.y>=0&&composerBox.y+composerBox.height<=height+1,JSON.stringify(composerBox));
  });
  await page.setViewportSize({width:390,height:844});
+ await check('Global dashboard notices cannot cover the immersive chat',async()=>{await page.locator('#snapshot-notice').evaluate(el=>{el.textContent='QA status source unavailable';el.hidden=false;});assert.equal(await page.locator('#snapshot-notice').isVisible(),false);});
  await check('Mobile Enter inserts a newline rather than accidentally sending',async()=>{const before=calls.filter(c=>c.method==='prompt.submit').length;await chat.locator('#zeus-message').fill('First line');await chat.locator('#zeus-message').press('Enter');assert.equal(await chat.locator('#zeus-message').inputValue(),'First line\n');assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);});
  await check('Streaming, new draft during send, collapsed tools, and safe Markdown',async()=>{
   await chat.locator('#zeus-message').fill('Please review this example');await chat.getByRole('button',{name:'Send message',exact:true}).click();await chat.locator('#zeus-message').fill('Draft for my next message');
