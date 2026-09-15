@@ -78,6 +78,18 @@ await context.routeWebSocket('**/ai/api/ws*',ws=>{
   reply({ok:true});
  });
 });
+// Register the synthetic parent reply before product listeners; a late window listener
+// cannot retract a real reply already posted by the shell. Disabled outside this one case.
+await context.addInitScript(() => {
+ if (window.parent !== window) return;
+ addEventListener('message', event => {
+  const frame=document.querySelector('#zeus-ai-frame');
+  if(!window.__qaExpiryEnabled||event.origin!==location.origin||event.source!==frame?.contentWindow||event.data?.type!=='zeus-chat:snapshot')return;
+  event.stopImmediatePropagation();const at=Date.now();
+  const answer={question:event.data.question,mode:'snapshot',text:'Company cash total unknown.',state:'unknown',facts:['Retail POS: €12.34 covered subtotal.'],limitations:['Isolated test only.'],source:'Isolated expiry fixture',path:'executiveIntelligence.answers.money_yesterday',checkedAt:new Date(at).toISOString(),expiresAt:new Date(at+2000).toISOString()};
+  frame.contentWindow.postMessage({type:'zeus-chat:snapshot-result',requestId:event.data.requestId,load:event.data.load,answer},location.origin);
+ },true);
+});
 const page=await context.newPage();page.setDefaultTimeout(12000);page.on('pageerror',error=>errors.push(error.message));page.on('request',req=>requests.push(new URL(req.url()).pathname));
 let chat;
 async function check(name,fn){try{await fn();results.push({name,pass:true});console.log('PASS',name);}catch(error){results.push({name,pass:false,error:error.message});console.log('FAIL',name,error.message.slice(0,350));await page.screenshot({path:path.join(out,`failure-${results.length}.png`)}).catch(()=>{});}}
@@ -125,7 +137,7 @@ try{
   await chat.locator('#zeus-message').fill('Preserve this draft');
   await chat.getByRole('button',{name:'Instant company answers',exact:true}).click();
   await chat.getByRole('button',{name:'What made money yesterday?',exact:true}).click();
-  await chat.locator('.zc-quick-answer').waitFor();assert.match(await chat.locator('.zc-quick-answer').innerText(),/not available from this snapshot/);
+  await chat.locator('.zc-quick-answer').waitFor();assert.match(await chat.locator('.zc-quick-answer').innerText(),/company (?:cash )?total|executive answer is unavailable|executive answer has expired/);
   assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);await chat.getByRole('button',{name:'Close instant answers',exact:true}).click();
   assert.equal(await chat.locator('#zeus-message').inputValue(),'Preserve this draft');await chat.locator('#zeus-message').fill('');
  });
@@ -138,6 +150,19 @@ try{
   assert.ok(await f.evaluate(()=>{const n=document.querySelector('.zc-quick-dialog');return n.scrollWidth<=n.clientWidth+1&&n.getBoundingClientRect().width<=innerWidth;}));
   await page.screenshot({path:path.join(out,'instant-answers-320-dark.png')});await chat.getByRole('button',{name:'Close instant answers',exact:true}).click();
   await page.emulateMedia({colorScheme:'light',reducedMotion:'reduce'});await page.setViewportSize({width:390,height:844});
+ });
+ await check('An unknown cash headline still expires known source facts at the producer deadline',async()=>{
+  await page.evaluate(()=>{window.__qaExpiryEnabled=true;});
+  try{
+   const before=calls.filter(c=>c.method==='prompt.submit').length;
+   await chat.getByRole('button',{name:'Instant company answers',exact:true}).click();
+   await chat.getByRole('button',{name:'What made money yesterday?',exact:true}).click();
+   await chat.locator('.zc-quick-answer').filter({hasText:'Retail POS: €12.34'}).waitFor();
+   await chat.locator('.zc-quick-answer').filter({hasText:'This snapshot has expired.'}).waitFor({timeout:6000});
+   assert.doesNotMatch(await chat.locator('.zc-quick-answer').innerText(),/€12\.34/);
+   assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);
+   await chat.getByRole('button',{name:'Close instant answers',exact:true}).click();
+  }finally{await page.evaluate(()=>{window.__qaExpiryEnabled=false;});await chat.getByRole('button',{name:'Close instant answers',exact:true}).click({timeout:1500}).catch(()=>{});}
  });
  await check('Global dashboard notices cannot cover the immersive chat',async()=>{await page.locator('#snapshot-notice').evaluate(el=>{el.textContent='QA status source unavailable';el.hidden=false;});assert.equal(await page.locator('#snapshot-notice').isVisible(),false);});
  await check('Mobile Enter inserts a newline rather than accidentally sending',async()=>{const before=calls.filter(c=>c.method==='prompt.submit').length;await chat.locator('#zeus-message').fill('First line');await chat.locator('#zeus-message').press('Enter');assert.equal(await chat.locator('#zeus-message').inputValue(),'First line\n');assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);});

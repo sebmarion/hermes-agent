@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { X, ArrowUpRight, Zap } from "lucide-react";
-import { parseSnapshotReply, type SnapshotAnswer } from "./snapshot";
+import { parseSnapshotReply, snapshotExpiry, type SnapshotAnswer } from "./snapshot";
 
 interface QuickAnswersProps {
   prepare: (question: string) => void;
@@ -27,8 +27,9 @@ export function QuickAnswers({ prepare }: QuickAnswersProps) {
     return () => { window.removeEventListener("message", receive); clearTimeout(timer.current); request.current = ""; };
   }, [load]);
   useEffect(() => {
-    if (!answer?.checkedAt || !["current", "partial"].includes(answer.state)) return;
-    const expiry = setTimeout(() => setAnswer(current => current === answer ? { ...current, state: "stale", text: "This snapshot has expired. Ask again for current evidence.", facts: [] } : current), Math.max(0, Date.parse(answer.checkedAt) + 180000 - Date.now()));
+    const deadline = answer ? snapshotExpiry(answer) : null;
+    if (!answer || deadline === null) return;
+    const expiry = setTimeout(() => setAnswer(current => current && current === answer ? { ...current, state: "stale", text: "This snapshot has expired. Ask again for current evidence.", facts: [] } : current), Math.max(0, deadline - Date.now()));
     return () => clearTimeout(expiry);
   }, [answer]);
   const ask = (text: string) => {
