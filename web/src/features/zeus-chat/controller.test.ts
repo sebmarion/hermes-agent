@@ -77,3 +77,96 @@ describe("Zeus gateway and draft ownership", () => {
   });
 
 });
+
+const fixtureChoices = { model: "fixture-default", provider: "qa", providers: [{ slug: "qa", name: "QA Provider", models: ["fixture-default", "fixture-fast", "fixture-expensive"] }] };
+it("selects a catalogue model with an explicit session pin, preserves draft/history and confirms expensive picks", async () => {
+  await settle();
+  let activeModel = "fixture-default";
+  mocks.request.mockImplementation(async (method: string, params: Record<string, unknown>) => {
+    if (method === "model.options") return fixtureChoices;
+    if (method === "session.resume" || method === "session.activate") return { session_id: "runtime", session_key: "stored", messages: [{ role: "user", text: "Existing history" }], info: { model: activeModel, provider: "qa" } };
+    if (method === "config.set" && params.confirm_expensive_model) activeModel = "fixture-expensive";
+    if (method === "config.set") return params.confirm_expensive_model ? { key: "model", value: "fixture-expensive", scope: "session" } : { key: "model", value: "fixture-expensive", confirm_required: true, confirm_message: "Review the higher cost" };
+    return {};
+  });
+  await controller.open("stored"); controller.setDraft("Keep my unsent question");
+  const options = await controller.loadModels(); const selected = options.choices[2];
+  const warning = await controller.changeModel(selected);
+  expect(warning.confirm_required).toBe(true); expect(controller.getSnapshot().model).toBe("fixture-default");
+  expect(controller.getSnapshot().draft).toBe("Keep my unsent question");
+  await controller.changeModel(selected, true);
+  expect(controller.getSnapshot()).toMatchObject({ model: "fixture-expensive", provider: "qa", modelChanging: false, draft: "Keep my unsent question", storedId: "stored" });
+  expect(controller.getSnapshot().items[0].text).toBe("Existing history");
+  expect(mocks.request.mock.calls.filter(call => call[0] === "prompt.submit")).toHaveLength(0);
+  const changes = mocks.request.mock.calls.filter(call => call[0] === "config.set");
+  expect(changes).toHaveLength(2);
+  expect(changes[0][1]).toMatchObject({ profile: "zeus-os", session_id: "runtime", key: "model", value: "fixture-expensive --provider qa --session", confirm_expensive_model: false });
+  expect(changes[1][1].confirm_expensive_model).toBe(true);
+});
+it("never replays an unconfirmed model switch or sends through it, and only authoritative resume clears uncertainty", async () => {
+  await settle();
+  mocks.request.mockImplementation(async (method: string) => {
+    if (method === "model.options") return fixtureChoices;
+    if (method === "session.create") return { session_id: "runtime", stored_session_id: "stored", info: { model: "fixture-default", provider: "qa" } };
+    if (method === "config.set") throw new Error("Lost model acknowledgement");
+    return { session_id: "runtime", session_key: "stored", messages: [], info: { model: "fixture-fast", provider: "qa" } };
+  });
+  controller.setDraft("Unsent draft");const options = await controller.loadModels();
+  await expect(controller.changeModel(options.choices[1])).rejects.toThrow("Lost model acknowledgement");
+  expect(controller.getSnapshot()).toMatchObject({ modelChanging: false, modelUncertain: true, draft: "Unsent draft" });
+  await controller.send();await expect(controller.changeModel(options.choices[1])).rejects.toThrow();
+  expect(mocks.request.mock.calls.filter(call => call[0] === "prompt.submit")).toHaveLength(0);
+  expect(mocks.request.mock.calls.filter(call => call[0] === "config.set")).toHaveLength(1);
+  await controller.open("stored", true);
+  expect(controller.getSnapshot()).toMatchObject({ model: "fixture-fast", modelUncertain: false, draft: "Unsent draft" });
+  expect(mocks.request.mock.calls.filter(call => call[0] === "config.set")).toHaveLength(1);
+});
+
+it("rejects a misleading acknowledgement and releases pre-submission model spinners on restart", async () => {
+  await settle();
+  mocks.request.mockImplementation(async (method: string) => {
+    if (method === "model.options") return fixtureChoices;
+    if (method === "session.create") return { session_id: "runtime", stored_session_id: "stored" };
+    if (method === "config.set") return { key: "model", value: "fixture-fast", scope: "session" };
+    return { session_id: "runtime", session_key: "stored", info: { model: "fixture-fast", provider: "WRONG_PROVIDER" } };
+  });
+  const options = await controller.loadModels();
+  await expect(controller.changeModel(options.choices[1])).rejects.toThrow("did not confirm");
+  expect(controller.getSnapshot().modelUncertain).toBe(true);
+  expect(controller.getSnapshot().model).not.toBe("fixture-fast");
+  controller.newChat();
+  let create: (value: unknown) => void = () => {};
+  mocks.request.mockImplementation((method: string) => method === "model.options" ? Promise.resolve(fixtureChoices) : new Promise(resolve => { create = resolve; }));
+  await controller.loadModels();const operation = controller.changeModel(options.choices[1]);await settle();
+  expect(controller.getSnapshot().modelChanging).toBe(true);controller.stop();
+  create({ session_id: "orphan", stored_session_id: "orphan-stored" });await expect(operation).rejects.toThrow("conversation changed");
+  controller.start();await settle();expect(controller.getSnapshot().modelChanging).toBe(false);
+});
+it("a concurrent remote response queues the verified choice for next reply without presenting it as already active", async () => {
+  await settle();
+  mocks.request.mockImplementation(async (method: string) => {
+    if (method === "model.options") return fixtureChoices;
+    if (method === "session.create") return { session_id: "runtime", stored_session_id: "stored" };
+    if (method === "config.set") return { key: "model", value: "fixture-fast", scope: "session", deferred: true };
+    return { session_id: "runtime", session_key: "stored", running: true, info: { model: "fixture-fast", provider: "qa" } };
+  });
+  const options = await controller.loadModels();await controller.changeModel(options.choices[1]);
+  expect(controller.getSnapshot()).toMatchObject({ modelDeferred: true, model: "fixture-fast", modelUncertain: false });
+  expect(controller.getSnapshot().modelNotice).toContain("current response is unchanged");
+});
+
+it("waits for the real runtime metadata without resending a switch or a prompt when new-session resume is only a lazy default", async () => {
+  await settle();let activations = 0;
+  mocks.request.mockImplementation(async (method: string) => {
+    if (method === "model.options") return fixtureChoices;
+    if (method === "session.create") return { session_id: "runtime", stored_session_id: "stored", info: { model: "fixture-default", lazy: true } };
+    if (method === "config.set") return { key: "model", value: "fixture-fast", scope: "session" };
+    if (method === "session.activate") { activations++; return { session_id: "runtime", session_key: "stored", info: activations === 1 ? { model: "fixture-default", lazy: true } : { model: "fixture-fast", provider: "qa" } }; }
+    throw new Error("Unexpected request: " + method);
+  });
+  const options = await controller.loadModels();await controller.changeModel(options.choices[1]);
+  expect(controller.getSnapshot()).toMatchObject({ model: "fixture-fast", provider: "qa", modelUncertain: false, modelChanging: false });
+  expect(activations).toBe(2);
+  expect(mocks.request.mock.calls.filter(call => call[0] === "config.set")).toHaveLength(1);
+  expect(mocks.request.mock.calls.filter(call => call[0] === "prompt.submit")).toHaveLength(0);
+});

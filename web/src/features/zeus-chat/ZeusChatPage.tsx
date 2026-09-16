@@ -4,6 +4,7 @@ import { Markdown } from "@/components/Markdown";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { ZeusChatController } from "./controller";
 import { createComposeHandler } from "./compose";
+import { ModelSelector } from "./ModelSelector";
 import { QuickAnswers } from "./QuickAnswers";
 import { RequestPanel } from "./RequestPanel";
 import type { ChatItem } from "./model";
@@ -86,7 +87,7 @@ export default function ZeusChatPage() {
     else window.location.assign("/#view=command");
   };
   const online = state.connection === "open";
-  const canSend = online && !state.sending && !state.busy && !state.loading && !state.uncertain && Boolean(state.draft.trim());
+  const canSend = online && !state.modelChanging && !state.modelUncertain && !state.sending && !state.busy && !state.loading && !state.uncertain && Boolean(state.draft.trim());
   const rows = state.sessions.filter(row => `${row.title || ""} ${row.preview || ""}`.toLowerCase().includes(search.toLowerCase()));
   return (
     <section className="zeus-chat" aria-label="Zeus AI chat" data-zeus-chat="native">
@@ -95,8 +96,9 @@ export default function ZeusChatPage() {
         <div className="zc-identity"><strong>Zeus</strong><span title={state.title}>{state.title}</span></div>
         <QuickAnswers prepare={text => { const current = controller.getSnapshot(); if (current.draft.length || current.busy || current.sending || current.loading || current.uncertain || current.pending) setIncomingQuestion(text); else { controller.setDraft(text); composer.current?.focus(); } }} />
         <button type="button" className="zc-icon" aria-label="Conversation history" title="Conversation history" onClick={openHistory}><History size={21} /></button>
-        <button type="button" className="zc-icon" aria-label="New conversation" title="New conversation" disabled={state.sending} onClick={newChat}><Plus size={22} /></button>
+        <button type="button" className="zc-icon" aria-label="New conversation" title="New conversation" disabled={state.sending || state.modelChanging} onClick={newChat}><Plus size={22} /></button>
       </header>
+      <ModelSelector controller={controller} state={state} />
       {!online && <div className="zc-connection" role="status"><span>{state.connection === "connecting" || state.connection === "idle" ? "Connecting to Zeus…" : "Connection lost. Reconnecting… Your draft is safe."}</span><button type="button" onClick={() => void controller.reconnect()}>Reconnect</button></div>}
       <div className="zc-scroll" ref={scroller} role="log" aria-label="Conversation" aria-live="off" onScroll={() => {
         const node = scroller.current;
@@ -124,14 +126,14 @@ export default function ZeusChatPage() {
           }} />
           {state.busy ? <button type="button" className="zc-send zc-stop" aria-label="Stop response" title="Stop response" disabled={!online || state.sending} onClick={() => void controller.interrupt()}><Square size={17} fill="currentColor" /></button> : <button type="submit" className="zc-send" aria-label="Send message" title="Send message" disabled={!canSend}><ArrowUp size={22} /></button>}
         </form>}
-        <p className="zc-caption">{state.sending ? "Sending…" : state.pending ? "Zeus is waiting for your response." : "Zeus can make mistakes. Your existing approval rules still apply."}</p>
+        <p className="zc-caption">{state.modelChanging ? "Changing model for this conversation…" : state.sending ? "Sending…" : state.pending ? "Zeus is waiting for your response." : "Zeus can make mistakes. Your existing approval rules still apply."}</p>
       </div>
       <dialog className="zc-history" ref={history} aria-labelledby="zeus-history-title">
         <header><h2 id="zeus-history-title">Conversations</h2><button type="button" className="zc-icon" aria-label="Close conversation history" onClick={() => history.current?.close()}><X size={21} /></button></header>
-        <button type="button" className="zc-new" disabled={state.sending} onClick={newChat}><Plus size={19} />New conversation</button>
+        <button type="button" className="zc-new" disabled={state.sending || state.modelChanging} onClick={newChat}><Plus size={19} />New conversation</button>
         <label className="zc-sr" htmlFor="zeus-history-search">Search conversations</label><input id="zeus-history-search" ref={historySearch} type="search" placeholder="Search conversations" value={search} onChange={event => setSearch(event.target.value)} />
         {state.historyError && <div className="zc-error" role="alert">History could not be loaded. <button type="button" onClick={() => void controller.refreshHistory()}>Retry</button></div>}
-        <div className="zc-history-list">{rows.map(row => <button type="button" key={row.id} className={row.id === state.storedId ? "selected" : ""} disabled={!online || state.sending} onClick={() => { history.current?.close(); bottom(); void controller.open(row.id); }}><strong>{row.title || row.preview || "Conversation"}</strong><span>{new Date((row.last_active || row.started_at) * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short" })}{row.is_active ? " · Active" : ""}</span></button>)}{!rows.length && !state.historyError && <p className="zc-muted">{search ? "No matching conversations in the loaded history." : "Your conversations will appear here."}</p>}</div>
+        <div className="zc-history-list">{rows.map(row => <button type="button" key={row.id} className={row.id === state.storedId ? "selected" : ""} disabled={!online || state.sending || state.modelChanging} onClick={() => { history.current?.close(); bottom(); void controller.open(row.id); }}><strong>{row.title || row.preview || "Conversation"}</strong><span>{new Date((row.last_active || row.started_at) * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short" })}{row.is_active ? " · Active" : ""}</span></button>)}{!rows.length && !state.historyError && <p className="zc-muted">{search ? "No matching conversations in the loaded history." : "Your conversations will appear here."}</p>}</div>
         {state.sessions.length < state.total && <button type="button" className="zc-more" onClick={() => void controller.refreshHistory(true)}>Load older conversations</button>}
       </dialog>
     </section>

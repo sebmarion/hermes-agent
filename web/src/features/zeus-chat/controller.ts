@@ -1,5 +1,6 @@
 import { JsonRpcGatewayClient, JsonRpcGatewayError, type ConnectionState } from "@hermes/shared";
 import { api, buildWsUrl, type SessionInfo } from "@/lib/api";
+import { choiceKey, modelSwitchValue, parseModelOptions, type ModelChoice, type ModelOptions, type ModelSwitchResult } from "./model-controls";
 import { emptyConversation, historyItems, reduceEvent, type Conversation, type RequestCard } from "./model";
 
 interface SessionResult {
@@ -11,7 +12,7 @@ interface SessionResult {
   running?: boolean;
   pending_approval?: Record<string, unknown>;
   pending_clarify?: Record<string, unknown>;
-  info?: { model?: string };
+  info?: { model?: string; provider?: string; lazy?: boolean };
   inflight?: { assistant?: string; user?: string; status?: string; streaming?: boolean; error?: string };
 }
 export interface ChatSnapshot extends Conversation {
@@ -25,6 +26,11 @@ export interface ChatSnapshot extends Conversation {
   storedId: string | null;
   title: string;
   model: string;
+  provider: string;
+  modelChanging: boolean;
+  modelUncertain: boolean;
+  modelNotice: string;
+  modelDeferred: boolean;
   draft: string;
 }
 const PROFILE = "zeus-os";
@@ -47,11 +53,13 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : "
 export class ZeusChatController {
   private state: ChatSnapshot = {
     ...emptyConversation(), connection: "idle", sessions: [], total: 0, historyError: "", loading: false,
-    sending: false, uncertain: false, storedId: null, title: "New conversation", model: "", draft: readDraft(null),
+    sending: false, uncertain: false, storedId: null, title: "New conversation", model: "", provider: "", modelChanging: false, modelUncertain: false, modelNotice: "", modelDeferred: false, draft: readDraft(null),
   };
   private listeners = new Set<() => void>();
   private client = new JsonRpcGatewayClient({ requestIdPrefix: "zeus-chat-", requestTimeoutMs: 30000 });
   private runtimeId: string | null = null;
+  private modelChoices: ModelChoice[] = [];
+  private modelSwitchSubmitted = false;
   private generation = 0;
   private lifecycle = 0;
   private stopped = false;
@@ -89,6 +97,11 @@ export class ZeusChatController {
         void this.client.request(bridge[0], { session_id: this.runtimeId, profile: PROFILE, request_id: payload.request_id, [bridge[1]]: JSON.stringify({ ok: false, error: message }) }).catch(error => this.patch({ error: errorText(error) }));
         return;
       }
+      if (event.type === "session.info" && event.session_id === this.runtimeId && !this.state.modelChanging) {
+        const info = event.payload as SessionResult["info"];
+        if (info?.model && !info.lazy) this.patch({ model: info.model, provider: info.provider || this.state.provider, modelUncertain: false });
+      }
+      if (event.type === "message.start" && event.session_id === this.runtimeId && this.state.modelDeferred) this.patch({ modelDeferred: false, modelNotice: "Using the selected model for this reply." });
       const next = reduceEvent(this.state, event, this.runtimeId);
       if (next !== this.state) this.patch(next);
       if (event.type === "approval.request" && event.session_id === this.runtimeId) {
@@ -107,6 +120,7 @@ export class ZeusChatController {
   }
   stop() {
     this.stopped = true; this.lifecycle++; this.generation++;
+    this.patch({ modelChanging: false, modelUncertain: this.state.modelUncertain || this.modelSwitchSubmitted });
     this.reconnectFlight = null;
     clearTimeout(this.retryTimer); this.retryTimer = undefined;
     this.disposers.forEach(dispose => dispose()); this.disposers = [];
@@ -158,17 +172,18 @@ export class ZeusChatController {
     try { if (id) localStorage.setItem(ACTIVE_KEY, id); else localStorage.removeItem(ACTIVE_KEY); } catch { /* Server history remains available. */ }
   }
   newChat = () => {
-    if (this.state.sending) return;
+    if (this.state.sending || this.state.modelChanging) return;
     this.generation++; this.runtimeId = null; this.remember(null);
-    this.patch({ ...emptyConversation(), storedId: null, draft: readDraft(null), title: "New conversation", model: "", loading: false, uncertain: false });
+    this.patch({ ...emptyConversation(), storedId: null, draft: readDraft(null), title: "New conversation", model: "", provider: "", modelUncertain: false, modelNotice: "", modelDeferred: false, loading: false, uncertain: false });
   };
   open = async (id: string, reconnect = false) => {
-    if (this.state.sending && !reconnect) return;
+    if ((this.state.sending || this.state.modelChanging) && !reconnect) return;
     const generation = ++this.generation;
     const same = this.state.storedId === id;
+    if (reconnect && this.state.modelChanging) this.patch({ modelChanging: false, modelUncertain: true });
     this.runtimeId = null;
     const row = this.state.sessions.find(session => session.id === id);
-    this.patch({ ...(same ? {} : emptyConversation()), storedId: id, title: row?.title || row?.preview || "Conversation", loading: true, draft: same ? this.state.draft : readDraft(id), uncertain: unconfirmed(id), error: "" });
+    this.patch({ ...(same ? {} : { ...emptyConversation(), model: "", provider: "", modelUncertain: false, modelNotice: "", modelDeferred: false }), storedId: id, title: row?.title || row?.preview || "Conversation", loading: true, draft: same ? this.state.draft : readDraft(id), uncertain: unconfirmed(id), error: "" });
     this.remember(id);
     try {
       const result = await this.client.request<SessionResult>("session.resume", { session_id: id, profile: PROFILE, source: "web", cols: 96 });
@@ -184,14 +199,71 @@ export class ZeusChatController {
       if ((result.running || failed) && result.inflight?.assistant && items.at(-1)?.text !== result.inflight.assistant) {
         items.push({ id: "resumed-stream", role: "assistant", text: result.inflight.assistant, streaming: Boolean(result.running) && !failed });
       }
+      if (result.info?.model && result.info?.provider && !result.running) this.modelSwitchSubmitted = false;
       const pending = result.pending_approval ? { ...result.pending_approval, kind: "approval" } as RequestCard : result.pending_clarify ? { ...result.pending_clarify, kind: "clarify" } as RequestCard : null;
-      this.patch({ storedId, items, loading: false, busy: Boolean(result.running), activity: pending ? "Needs your reply" : result.running ? "Working…" : "", pending, error: failed ? result.inflight?.error || "Zeus could not finish the previous response." : unconfirmed(storedId) ? "A previous send was not confirmed. Check this conversation before sending the saved draft again." : "", model: result.info?.model || this.state.model });
+      this.patch({ storedId, items, loading: false, busy: Boolean(result.running), activity: pending ? "Needs your reply" : result.running ? "Working…" : "", pending, error: failed ? result.inflight?.error || "Zeus could not finish the previous response." : unconfirmed(storedId) ? "A previous send was not confirmed. Check this conversation before sending the saved draft again." : "", model: result.info?.model || this.state.model, provider: result.info?.provider || this.state.provider, ...(!result.info?.lazy && result.info?.model ? { modelUncertain: false } : {}) });
     } catch (error) { if (generation === this.generation && !this.stopped) this.patch({ loading: false, error: `Conversation could not be restored: ${errorText(error)}` }); }
+  };
+  private async ensureSession(title: string) {
+    if (this.runtimeId) return;
+    if (this.state.storedId) throw new Error("Restore this conversation before changing its model.");
+    const generation = this.generation;
+    const created = await this.client.request<SessionResult>("session.create", { profile: PROFILE, source: "web", title, close_on_disconnect: false });
+    if (generation !== this.generation || this.stopped) throw new Error("The conversation changed. No model change was submitted.");
+    if (!created.session_id || !created.stored_session_id) throw new Error("The server did not return a persistent conversation identity.");
+    this.runtimeId = created.session_id;
+    this.remember(created.stored_session_id);
+    this.patch({ storedId: created.stored_session_id, title, model: created.info?.model || this.state.model, provider: created.info?.provider || this.state.provider });
+    try { sessionStorage.removeItem(draftKey(null)); } catch { /* Draft stays in memory. */ }
+    this.setDraft(this.state.draft);
+  }
+  loadModels = async (refresh = false): Promise<ModelOptions> => {
+    if (this.state.connection !== "open") throw new Error("Reconnect to Zeus to load models.");
+    const generation = this.generation;
+    const raw = await this.client.request("model.options", { profile: PROFILE, ...(this.runtimeId ? { session_id: this.runtimeId } : {}), refresh, include_unconfigured: false });
+    if (generation !== this.generation || this.stopped) throw new Error("The conversation changed. Reopen the model selector.");
+    const options = parseModelOptions(raw); this.modelChoices = options.choices;
+    if (options.model && !this.state.modelChanging && (!this.state.storedId || !this.state.model)) this.patch({ model: options.model, provider: options.provider });
+    return { ...options, model: this.state.model || options.model, provider: this.state.provider || options.provider };
+  };
+  changeModel = async (choice: ModelChoice, confirmed = false): Promise<ModelSwitchResult> => {
+    if (this.state.modelChanging || this.state.sending || this.state.busy || this.state.pending || this.state.loading || this.state.uncertain || this.state.modelUncertain || this.state.connection !== "open") throw new Error("Wait for the response to finish, or reconnect and refresh the conversation first.");
+    if (!this.modelChoices.some(row => choiceKey(row) === choiceKey(choice))) throw new Error("Reload the model list before choosing this model.");
+    const value = modelSwitchValue(choice), generation = this.generation;
+    this.patch({ modelChanging: true, modelNotice: "" });
+    this.modelSwitchSubmitted = false;
+    let submitted = false;
+    try {
+      await this.ensureSession(this.state.draft.trim().slice(0, 80) || "New conversation");
+      const sessionId = this.runtimeId;
+      if (!sessionId) throw new Error("The conversation is unavailable.");
+      submitted = true; this.modelSwitchSubmitted = true;
+      const result = await this.client.request<ModelSwitchResult>("config.set", { profile: PROFILE, session_id: sessionId, key: "model", value, confirm_expensive_model: confirmed });
+      if (generation !== this.generation || this.stopped) throw new Error("Reconnect to verify the model. The change will not be replayed.");
+      if (result.confirm_required) { this.modelSwitchSubmitted = false; return result; }
+      if (result.key !== "model" || result.value !== choice.model || result.scope !== "session") throw new Error("The model change was not verified. Refresh the conversation before sending.");
+      // A newly created gateway returns lazy profile defaults until its scheduled agent
+      // build completes. Poll only read-back; never replay config.set or send a probe prompt.
+      let verified: SessionResult | undefined;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        if (generation !== this.generation || this.stopped) throw new Error("The conversation changed during model verification.");
+        verified = await this.client.request<SessionResult>("session.activate", { profile: PROFILE, session_id: sessionId, omit_messages: true });
+        if (!verified.info?.lazy) break;
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      if (generation !== this.generation || this.stopped || verified?.session_id !== sessionId || verified.info?.lazy || verified.info?.model !== choice.model || verified.info?.provider !== choice.provider) throw new Error("The session did not confirm the selected model and provider. Refresh the conversation before sending.");
+      this.modelSwitchSubmitted = false;
+      this.patch({ model: verified.info.model, provider: verified.info.provider, busy: this.state.busy || !!verified.running, modelUncertain: false, modelDeferred: !!result.deferred, modelNotice: result.deferred ? "Queued for the next reply; the current response is unchanged." : "Model changed for this conversation only." });
+      return result;
+    } catch (error) {
+      if (generation === this.generation && !this.stopped) this.patch({ modelUncertain: submitted, modelNotice: submitted ? "Model change unconfirmed. Refresh the conversation before sending; it will not be retried automatically." : "The model was not changed." });
+      throw error;
+    } finally { if (generation === this.generation && !this.stopped) this.patch({ modelChanging: false }); }
   };
   send = async () => {
     const originalDraft = this.state.draft;
     const text = originalDraft.trim();
-    if (!text || this.state.sending || this.state.busy || this.state.loading || this.state.uncertain || this.state.connection !== "open") return;
+    if (!text || this.state.modelChanging || this.state.modelUncertain || this.state.sending || this.state.busy || this.state.loading || this.state.uncertain || this.state.connection !== "open") return;
     if (this.state.storedId && !this.runtimeId) {
       this.patch({ error: "Restore this conversation before sending. No new conversation has been created." });
       return;
@@ -200,15 +272,7 @@ export class ZeusChatController {
     const optimisticId = `user-${Date.now()}`;
     let submitted = false;
     try {
-      if (!this.runtimeId) {
-        const created = await this.client.request<SessionResult>("session.create", { profile: PROFILE, source: "web", title: text.slice(0, 80), close_on_disconnect: false });
-        this.runtimeId = created.session_id;
-        if (!created.stored_session_id) throw new Error("The server did not return a persistent conversation identity.");
-        this.remember(created.stored_session_id);
-        this.patch({ storedId: created.stored_session_id, title: text.slice(0, 80), model: created.info?.model || "" });
-        try { sessionStorage.removeItem(draftKey(null)); } catch { /* Draft stays in memory. */ }
-        this.setDraft(this.state.draft);
-      }
+      await this.ensureSession(text.slice(0, 80));
       this.patch({ busy: true, activity: "Thinking…", items: [...this.state.items, { id: optimisticId, role: "user", text }] });
       submitted = true;
       markDelivery(this.state.storedId, true);

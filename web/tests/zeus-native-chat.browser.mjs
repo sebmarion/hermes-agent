@@ -16,7 +16,8 @@ if(!token)throw Error('Existing read-only dashboard auth unavailable');
 const transcript=new Map([['history',Array.from({length:24},(_,i)=>({role:i%2?'assistant':'user',text:i%2?`Saved reply ${i}: ${'Readable chat. '.repeat(15)}`:`Saved question ${i}`}))]]);
 let sessions=[{id:'history',title:'[QA fixture] Saved conversation',preview:'Earlier messages',source:'desktop',profile:'zeus-os',last_active:1700000000,started_at:1700000000,is_active:false,message_count:24}];
 const calls=[],results=[],errors=[],requests=[],timers=[];let mode='answer',count=0,currentSocket=null,currentRuntime=null;
-const runtimeToStored=new Map();
+const runtimeToStored=new Map(),modelByStored=new Map();let modelFailure=false,modelCatalogueFailure=false;
+const defaultModel={model:'fixture-default',provider:'qa'},modelChoices=['fixture-default','fixture-fast','fixture-expensive'];
 const mime={'.html':'text/html','.css':'text/css','.js':'text/javascript','.json':'application/json','.svg':'image/svg+xml','.png':'image/png','.woff2':'font/woff2'};
 const server=http.createServer(async(req,res)=>{
  try{
@@ -48,14 +49,29 @@ await context.routeWebSocket('**/ai/api/ws*',ws=>{
  ws.onMessage(raw=>{
   const call=JSON.parse(raw);if(!call.method)return;calls.push({method:call.method,params:call.params});
   const p=call.params||{},reply=result=>ws.send(JSON.stringify({jsonrpc:'2.0',id:call.id,result}));
+  if(call.method==='model.options'){
+   if(modelCatalogueFailure){ws.send(JSON.stringify({jsonrpc:'2.0',id:call.id,error:{code:5033,message:'Synthetic catalogue unavailable'}}));return;}
+   reply({...modelByStored.get(runtimeToStored.get(p.session_id))||defaultModel,providers:[{slug:'qa',name:'QA Provider',models:modelChoices}]});return;
+  }
+  if(call.method==='config.set'){
+   assert.equal(p.profile,'zeus-os');assert.equal(p.key,'model');assert.match(p.value,/ --session$/);assert.ok(!p.value.includes('--global'));
+   if(modelFailure){ws.send(JSON.stringify({jsonrpc:'2.0',id:call.id,error:{code:4002,message:'Synthetic provider unavailable; model unchanged'}}));return;}
+   const model=p.value.split(' ')[0];assert.ok(modelChoices.includes(model));
+   if(model==='fixture-expensive'&&!p.confirm_expensive_model){reply({key:'model',value:model,confirm_required:true,confirm_message:'This fixture model has higher usage costs.'});return;}
+   modelByStored.set(runtimeToStored.get(p.session_id),{model,provider:'qa'});
+   later(()=>reply({key:'model',value:model,scope:'session',confirm_required:false}),200);return;
+  }
   if(call.method==='session.create'){
    const stored=`qa-${++count}`,sid=`runtime-${count}`;runtimeToStored.set(sid,stored);currentRuntime=sid;transcript.set(stored,[]);
    sessions.unshift({id:stored,title:p.title,source:'desktop',profile:'zeus-os',preview:p.title,last_active:Date.now()/1000,started_at:Date.now()/1000,is_active:false,message_count:0});
-   reply({session_id:sid,stored_session_id:stored,messages:[]});return;
+   modelByStored.set(stored,{...defaultModel});reply({session_id:sid,stored_session_id:stored,messages:[],info:defaultModel});return;
+  }
+  if(call.method==='session.activate'){
+   const stored=runtimeToStored.get(p.session_id);assert(stored);reply({session_id:p.session_id,session_key:stored,messages:[],running:false,info:modelByStored.get(stored)||defaultModel});return;
   }
   if(call.method==='session.resume'){
-   const sid=`resumed-${p.session_id}`;currentRuntime=sid;runtimeToStored.set(sid,p.session_id);
-   reply({session_id:sid,session_key:p.session_id,messages:transcript.get(p.session_id)||[],running:false,info:{}});return;
+   const sid=[...runtimeToStored].find(([,stored])=>stored===p.session_id)?.[0]||`resumed-${p.session_id}`;currentRuntime=sid;runtimeToStored.set(sid,p.session_id);
+   reply({session_id:sid,session_key:p.session_id,messages:transcript.get(p.session_id)||[],running:false,info:modelByStored.get(p.session_id)||defaultModel});return;
   }
   if(call.method==='prompt.submit'){
    const sid=p.session_id,stored=runtimeToStored.get(sid);currentRuntime=sid;transcript.get(stored)?.push({role:'user',text:p.text});
@@ -167,6 +183,55 @@ try{
    await chat.getByRole('button',{name:'Close instant answers',exact:true}).click();
   }finally{await page.evaluate(()=>{window.__qaExpiryEnabled=false;});await chat.getByRole('button',{name:'Close instant answers',exact:true}).click({timeout:1500}).catch(()=>{});}
  });
+ await check('Model selector preserves the draft and switches only this conversation without a prompt',async()=>{
+  const before=calls.filter(c=>c.method==='prompt.submit').length;
+  await chat.locator('#zeus-message').fill('Keep this draft while choosing a model');
+  await chat.getByRole('button',{name:/^Change model/}).click();await chat.getByRole('searchbox',{name:'Search models'}).fill('fixture-fast');
+  await chat.locator('.zc-model-list button').filter({hasText:'fixture-fast'}).click();await chat.getByRole('button',{name:'Use model',exact:true}).click();
+  assert.equal(await chat.getByRole('button',{name:'Cancel',exact:true}).isDisabled(),true);
+  assert.equal(await chat.getByRole('button',{name:'Close model selector',exact:true}).isDisabled(),true);
+  await page.keyboard.press('Escape');assert.equal(await chat.locator('.zc-model-dialog').isVisible(),true);
+  await chat.locator('.zc-model-dialog').waitFor({state:'hidden'});
+  assert.match(await chat.locator('.zc-model-trigger').innerText(),/fixture-fast/);
+  assert.equal(await chat.locator('#zeus-message').inputValue(),'Keep this draft while choosing a model');assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);
+  const change=calls.filter(c=>c.method==='config.set').at(-1);assert.equal(change.params.value,'fixture-fast --provider qa --session');
+ });
+ await check('Model selector fits small and landscape phones with visible Close and Apply controls',async()=>{
+  await chat.getByRole('button',{name:/^Change model/}).click();await chat.locator('.zc-model-list button').first().waitFor();
+  for(const [width,height] of [[320,568],[390,420],[844,390],[1440,900]]){
+   await page.setViewportSize({width,height});await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));
+   const bounds=await chat.locator('.zc-model-dialog').boundingBox();assert(bounds&&bounds.y>=0&&bounds.y+bounds.height<=height+1,JSON.stringify(bounds));
+   for(const name of ['Close model selector','Use model']){const box=await chat.getByRole('button',{name,exact:true}).boundingBox();assert(box&&box.y>=0&&box.y+box.height<=height+1,JSON.stringify(box));}
+   assert.equal(await chat.locator('.zc-model-dialog').evaluate(el=>el.scrollWidth<=el.clientWidth+1),true);
+   if(width===320)await page.screenshot({path:path.join(out,'model-selector-320.png')});
+  }
+  await chat.getByRole('button',{name:'Close model selector',exact:true}).click();await page.setViewportSize({width:390,height:844});
+ });
+ await check('Expensive-model warning requires an explicit second confirmation; Cancel keeps the active model',async()=>{
+  await chat.getByRole('button',{name:/^Change model/}).click();await chat.locator('.zc-model-list button').filter({hasText:'fixture-expensive'}).click();
+  await chat.getByRole('button',{name:'Use model',exact:true}).click();await chat.getByText('This fixture model has higher usage costs.',{exact:true}).waitFor();
+  assert.match(await chat.locator('.zc-model-trigger').innerText(),/fixture-fast/);
+  await chat.getByRole('button',{name:'Cancel',exact:true}).click();assert.match(await chat.locator('.zc-model-trigger').innerText(),/fixture-fast/);
+  await chat.getByRole('button',{name:/^Change model/}).click();await chat.locator('.zc-model-list button').filter({hasText:'fixture-expensive'}).click();await chat.getByRole('button',{name:'Use model',exact:true}).click();
+  await chat.getByRole('button',{name:'Confirm switch',exact:true}).click();await chat.locator('.zc-model-dialog').waitFor({state:'hidden'});assert.match(await chat.locator('.zc-model-trigger').innerText(),/fixture-expensive/);
+ });
+ await check('Provider/catalogue errors have a recovery action and never claim a successful switch',async()=>{
+  modelFailure=true;await chat.getByRole('button',{name:/^Change model/}).click();await chat.locator('.zc-model-list button').filter({hasText:'fixture-fast'}).click();await chat.getByRole('button',{name:'Use model',exact:true}).click();
+  await chat.getByText('Synthetic provider unavailable; model unchanged',{exact:true}).waitFor();assert.match(await chat.locator('.zc-model-trigger').innerText(),/Check model/);
+  await chat.getByRole('button',{name:'Close model selector',exact:true}).click();modelFailure=false;
+  assert.equal(await chat.getByRole('button',{name:'Send message',exact:true}).isDisabled(),true);
+  await chat.getByRole('button',{name:'Refresh conversation',exact:true}).click();
+  await chat.getByRole('button',{name:/^Change model: fixture-expensive/}).waitFor();assert.match(await chat.locator('.zc-model-trigger').innerText(),/fixture-expensive/);
+  modelCatalogueFailure=true;await chat.getByRole('button',{name:/^Change model/}).click();await chat.getByText('Synthetic catalogue unavailable',{exact:true}).waitFor();
+  modelCatalogueFailure=false;await chat.getByRole('button',{name:'Refresh models',exact:true}).click();await chat.locator('.zc-model-list button').filter({hasText:'fixture-default'}).waitFor();
+  await chat.getByRole('button',{name:'Close model selector',exact:true}).click();
+ });
+ await check('Selected model survives reload; a new conversation starts from the profile default',async()=>{
+  await page.reload({waitUntil:'domcontentloaded'});chat=page.frameLocator('#zeus-ai-frame');await chat.getByRole('button',{name:/^Change model: fixture-expensive/}).waitFor();
+  assert.equal(await chat.locator('#zeus-message').inputValue(),'Keep this draft while choosing a model');
+  await chat.getByRole('button',{name:'New conversation',exact:true}).first().click();
+  await chat.getByRole('button',{name:/^Change model: fixture-default/}).waitFor();
+ });
  await check('Global dashboard notices cannot cover the immersive chat',async()=>{await page.locator('#snapshot-notice').evaluate(el=>{el.textContent='QA status source unavailable';el.hidden=false;});assert.equal(await page.locator('#snapshot-notice').isVisible(),false);});
  await check('Mobile Enter inserts a newline rather than accidentally sending',async()=>{const before=calls.filter(c=>c.method==='prompt.submit').length;await chat.locator('#zeus-message').fill('First line');await chat.locator('#zeus-message').press('Enter');assert.equal(await chat.locator('#zeus-message').inputValue(),'First line\n');assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);});
  await check('Streaming, new draft during send, collapsed tools, and safe Markdown',async()=>{
@@ -201,7 +266,7 @@ try{
   await page.locator('#ai-section').waitFor({state:'hidden'});assert.equal(await page.evaluate(()=>document.body.classList.contains('zeus-chat-open')),false);
   await page.unroute('**/ai/chat?**');
  });
- await check('Every execution RPC remains Zeus-scoped, and no PTY or browser errors occur',async()=>{for(const call of calls.filter(c=>['session.create','session.resume','prompt.submit','session.interrupt','approval.respond','clarify.respond'].includes(c.method)))assert.equal(call.params.profile,'zeus-os');assert.ok(!requests.some(url=>url.includes('/api/pty')));assert.deepEqual(errors,[]);});
+ await check('Every execution RPC remains Zeus-scoped, and no PTY or browser errors occur',async()=>{for(const call of calls.filter(c=>['session.create','session.resume','prompt.submit','session.interrupt','approval.respond','clarify.respond','config.set','model.options','session.activate'].includes(c.method)))assert.equal(call.params.profile,'zeus-os');assert.ok(!requests.some(url=>url.includes('/api/pty')));assert.deepEqual(errors,[]);});
 }finally{
  for(const timer of timers)clearTimeout(timer);
  await fs.writeFile(path.join(out,'results.json'),JSON.stringify({testedAt:new Date().toISOString(),results,errors,rpcCounts:Object.fromEntries([...new Set(calls.map(c=>c.method))].map(method=>[method,calls.filter(c=>c.method===method).length])),productionWrites:0,physicalIOS:false},null,2));
