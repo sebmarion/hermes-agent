@@ -1,6 +1,28 @@
 # Zeus Chat model selector — 16 September 2026
 
-## Status: implemented and tested; production publication held
+## Current status — published, 16 September 2026
+
+The model selector was published at 16:16 Barcelona time after the owner's explicit renewal approval. Live native revision: `1324578547f3e2c161cc361ebf7500947331790d`. The existing Zeus shell remains `60fca86c49d3dc092b66ce2304c85642a19284dc`; the dashboard service was not restarted and the profile default remains Sol with XHigh reasoning.
+
+Open Zeus chat, refresh once, and click **Model** directly below the header. Search for a model, select its provider-specific row, and press **Use model**. The change applies only to that conversation. Higher-cost choices retain the existing confirmation step. Model selection does not itself send a message.
+
+The normal AfterCI gate passed without a bypass. Receipt: `875847461183dbb295c12aacf8d06ed0def4f7b16f36351a254f69ffa5e7d2f8`. Canonical and installed consumers both verified the release at publication; the canonical consumer was rechecked successfully during continuation. Renewal is recorded against the owner's actual “Yes,” not a manufactured approval or changed test threshold.
+
+Final-source qualification passed 318 frontend tests, 20 backend tests, 28 managed-browser scenarios, TypeScript/build and scoped lint. The final independent source review passed after fixing incomplete model/provider recovery and abandoned-switch state. The same exact candidate was exercised against the actual backend: Sol to Terra, authoritative model/provider read-back, reload before the first prompt, one read-only QA reply, and reload preserving the selected model, history and draft. That candidate reply took 2.653 seconds in one run; this is not a latency benchmark.
+
+Post-publication observation on the actual served page, with no route interception or permission overrides, verified the visible selector, populated searchable catalogue, Close/focus restoration and Back. Selector controls fit 390×844, 320×568, 844×390 and 1440×900 viewports. All 61 candidate files matched deployed local bytes; 68 HTTPS asset checks passed; 147 pre-existing non-index files remain intact. Profile configuration remained byte-identical.
+
+**Remaining verification limitation:** the separate post-deployment model-change test was blocked by the tool safety check before execution. It is not counted as passed and was not retried through another route. Read-only production checks are not a substitute for that full mutating round trip. Physical iPhone/Safari keyboard and VoiceOver remain unverified. The publication is live; full post-deployment functional certification is not claimed.
+
+The initial read-only viewport probe measured immediately after resize and failed a bounds assertion; after waiting two animation frames for layout, the same bounds assertions passed at every viewport. Both records are retained; product code was not changed to accommodate the probe.
+
+Evidence: `/home/seb/.local/state/zeus-chat-model-selector-20260916/release-20260916/`. Key records are `native-published.json`, `native-acceptance.json`, `roundtrip-review-result.txt`, `final-source-live/result.json`, `continuation-gate-assessment.json`, `published-assets.json`, and `published-readonly-ui-v2/result.json`. Original gate failures, older candidate checks and the publication receipt remain unmodified. Documentation-only successors do not change the released executable revision.
+
+---
+
+The following is the retained pre-publication report, not the current release status.
+
+## Historical implementation and pre-renewal release hold
 
 Owner request: “I need to be able to change model from that chat.”
 
