@@ -182,3 +182,44 @@ it("restores the chosen model before the first prompt even when lazy resume repo
   expect(controller.getSnapshot()).toMatchObject({ storedId: "stored", model: "fixture-fast", provider: "qa", modelUncertain: false, loading: false });
   expect(mocks.request.mock.calls.filter(call => call[0] === "config.set" || call[0] === "prompt.submit")).toHaveLength(0);
 });
+
+it("does not combine an incomplete recovery response with a stale provider or unblock sends", async () => {
+  await settle();
+  mocks.request.mockImplementation(async (method: string) => {
+    if (method === "model.options") return fixtureChoices;
+    if (method === "session.create") return { session_id: "runtime", stored_session_id: "stored", info: { model: "fixture-default", provider: "qa" } };
+    if (method === "config.set") throw new Error("Lost acknowledgement");
+    return { session_id: "runtime", session_key: "stored", messages: [], info: { model: "fixture-fast" } };
+  });
+  const options = await controller.loadModels();
+  await expect(controller.changeModel(options.choices[1])).rejects.toThrow("Lost acknowledgement");
+  const client = mocks.clients.at(-1) as { events: Set<(event: unknown) => void> };
+  const emit = (info: unknown) => client.events.forEach(fn => fn({ type: "session.info", session_id: "runtime", payload: info }));
+  emit({ model: "fixture-fast" });
+  expect(controller.getSnapshot()).toMatchObject({ model: "fixture-default", provider: "qa", modelUncertain: true });
+  await controller.open("stored", true);
+  expect(controller.getSnapshot()).toMatchObject({ model: "fixture-default", provider: "qa", modelUncertain: true });
+  controller.setDraft("Not yet safe to send"); await controller.send();
+  expect(mocks.request.mock.calls.filter(call => call[0] === "prompt.submit")).toHaveLength(0);
+  emit({ model: "fixture-fast", provider: "qa" });
+  expect(controller.getSnapshot()).toMatchObject({ model: "fixture-fast", provider: "qa", modelUncertain: false });
+});
+
+it("keeps an abandoned unconfirmed switch out of a new chat across a stop/start lifecycle", async () => {
+  await settle();let creates = 0;
+  mocks.request.mockImplementation(async (method: string) => {
+    if (method === "model.options") return fixtureChoices;
+    if (method === "session.create") { creates++; return { session_id: `runtime-${creates}`, stored_session_id: `stored-${creates}`, info: { model: "fixture-default", provider: "qa" } }; }
+    if (method === "config.set") throw new Error("Lost acknowledgement");
+    if (method === "prompt.submit") return { accepted: true };
+    throw new Error("Unexpected request: " + method);
+  });
+  const options = await controller.loadModels();
+  await expect(controller.changeModel(options.choices[1])).rejects.toThrow("Lost acknowledgement");
+  controller.newChat(); controller.stop(); controller.start(); await settle();
+  expect(controller.getSnapshot()).toMatchObject({ storedId: null, modelUncertain: false, modelChanging: false });
+  controller.setDraft("A separate conversation"); await controller.send();
+  const submits = mocks.request.mock.calls.filter(call => call[0] === "prompt.submit");
+  expect(submits).toHaveLength(1); expect(submits[0][1].session_id).toBe("runtime-2");
+  expect(mocks.request.mock.calls.filter(call => call[0] === "config.set")).toHaveLength(1);
+});

@@ -99,7 +99,7 @@ export class ZeusChatController {
       }
       if (event.type === "session.info" && event.session_id === this.runtimeId && !this.state.modelChanging) {
         const info = event.payload as SessionResult["info"];
-        if (info?.model && !info.lazy) this.patch({ model: info.model, provider: info.provider || this.state.provider, modelUncertain: false });
+        if (info?.model && info.provider && !info.lazy) { this.modelSwitchSubmitted = false; this.patch({ model: info.model, provider: info.provider, modelUncertain: false }); }
       }
       if (event.type === "message.start" && event.session_id === this.runtimeId && this.state.modelDeferred) this.patch({ modelDeferred: false, modelNotice: "Using the selected model for this reply." });
       const next = reduceEvent(this.state, event, this.runtimeId);
@@ -173,13 +173,14 @@ export class ZeusChatController {
   }
   newChat = () => {
     if (this.state.sending || this.state.modelChanging) return;
-    this.generation++; this.runtimeId = null; this.remember(null);
+    this.generation++; this.runtimeId = null; this.modelSwitchSubmitted = false; this.remember(null);
     this.patch({ ...emptyConversation(), storedId: null, draft: readDraft(null), title: "New conversation", model: "", provider: "", modelUncertain: false, modelNotice: "", modelDeferred: false, loading: false, uncertain: false });
   };
   open = async (id: string, reconnect = false) => {
     if ((this.state.sending || this.state.modelChanging) && !reconnect) return;
     const generation = ++this.generation;
     const same = this.state.storedId === id;
+    if (!same) this.modelSwitchSubmitted = false;
     if (reconnect && this.state.modelChanging) this.patch({ modelChanging: false, modelUncertain: true });
     this.runtimeId = null;
     const row = this.state.sessions.find(session => session.id === id);
@@ -207,7 +208,7 @@ export class ZeusChatController {
       }
       if (result.info?.model && result.info?.provider && !result.running) this.modelSwitchSubmitted = false;
       const pending = result.pending_approval ? { ...result.pending_approval, kind: "approval" } as RequestCard : result.pending_clarify ? { ...result.pending_clarify, kind: "clarify" } as RequestCard : null;
-      this.patch({ storedId, items, loading: false, busy: Boolean(result.running), activity: pending ? "Needs your reply" : result.running ? "Working…" : "", pending, error: failed ? result.inflight?.error || "Zeus could not finish the previous response." : unconfirmed(storedId) ? "A previous send was not confirmed. Check this conversation before sending the saved draft again." : "", model: result.info?.model || this.state.model, provider: result.info?.provider || this.state.provider, ...(!result.info?.lazy && result.info?.model ? { modelUncertain: false } : {}) });
+      this.patch({ storedId, items, loading: false, busy: Boolean(result.running), activity: pending ? "Needs your reply" : result.running ? "Working…" : "", pending, error: failed ? result.inflight?.error || "Zeus could not finish the previous response." : unconfirmed(storedId) ? "A previous send was not confirmed. Check this conversation before sending the saved draft again." : "", ...(!result.info?.lazy && result.info?.model && result.info.provider ? { model: result.info.model, provider: result.info.provider, modelUncertain: false } : {}) });
     } catch (error) { if (generation === this.generation && !this.stopped) this.patch({ loading: false, error: `Conversation could not be restored: ${errorText(error)}` }); }
   };
   private async ensureSession(title: string) {
