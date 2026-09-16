@@ -184,15 +184,16 @@ export class ZeusChatController {
     if (reconnect && this.state.modelChanging) this.patch({ modelChanging: false, modelUncertain: true });
     this.runtimeId = null;
     const row = this.state.sessions.find(session => session.id === id);
-    this.patch({ ...(same ? {} : { ...emptyConversation(), model: "", provider: "", modelUncertain: false, modelNotice: "", modelDeferred: false }), storedId: id, title: row?.title || row?.preview || "Conversation", loading: true, draft: same ? this.state.draft : readDraft(id), uncertain: unconfirmed(id), error: "" });
+    this.patch({ ...(same ? {} : { ...emptyConversation(), model: "", provider: "", modelUncertain: false, modelNotice: "", modelDeferred: false }), storedId: id, title: row?.title || row?.preview || "Conversation", loading: true, modelUncertain: true, draft: same ? this.state.draft : readDraft(id), uncertain: unconfirmed(id), error: "" });
     this.remember(id);
     try {
       let result = await this.client.request<SessionResult>("session.resume", { session_id: id, profile: PROFILE, source: "web", cols: 96 });
       if (generation !== this.generation || this.stopped) return;
       this.runtimeId = result.session_id;
-      if (result.info?.lazy) {
+      if (result.info?.lazy || !result.info?.model || !result.info.provider) {
         this.patch({ modelUncertain: true });
         const runtime = await this.readModelRuntime(result.session_id, generation);
+        if (generation !== this.generation || this.stopped) return;
         if (runtime.session_id !== result.session_id || runtime.info?.lazy || !runtime.info?.model || !runtime.info?.provider) throw new Error("The restored model is not yet verified. Refresh this conversation before sending.");
         result = { ...result, info: runtime.info, running: runtime.running ?? result.running };
       }
@@ -209,7 +210,7 @@ export class ZeusChatController {
       if (result.info?.model && result.info?.provider && !result.running) this.modelSwitchSubmitted = false;
       const pending = result.pending_approval ? { ...result.pending_approval, kind: "approval" } as RequestCard : result.pending_clarify ? { ...result.pending_clarify, kind: "clarify" } as RequestCard : null;
       this.patch({ storedId, items, loading: false, busy: Boolean(result.running), activity: pending ? "Needs your reply" : result.running ? "Working…" : "", pending, error: failed ? result.inflight?.error || "Zeus could not finish the previous response." : unconfirmed(storedId) ? "A previous send was not confirmed. Check this conversation before sending the saved draft again." : "", ...(!result.info?.lazy && result.info?.model && result.info.provider ? { model: result.info.model, provider: result.info.provider, modelUncertain: false } : {}) });
-    } catch (error) { if (generation === this.generation && !this.stopped) this.patch({ loading: false, error: `Conversation could not be restored: ${errorText(error)}` }); }
+    } catch (error) { if (generation === this.generation && !this.stopped) { this.runtimeId = null; this.patch({ loading: false, modelUncertain: true, modelNotice: "The restored model is not verified. Refresh this conversation before sending.", error: `Conversation could not be restored: ${errorText(error)}` }); } }
   };
   private async ensureSession(title: string) {
     if (this.runtimeId) return;

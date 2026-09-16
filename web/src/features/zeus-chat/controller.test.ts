@@ -24,7 +24,7 @@ const settle = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(
 beforeEach(() => {
   localStorage.clear(); sessionStorage.clear(); mocks.request.mockReset(); mocks.history.mockReset();
   mocks.history.mockResolvedValue({ sessions: [], total: 0 });
-  mocks.request.mockImplementation(async (method: string) => method === "session.create" ? { session_id: "runtime", stored_session_id: "stored", messages: [] } : { session_id: "runtime", session_key: "stored", messages: [], running: false });
+  mocks.request.mockImplementation(async (method: string) => method === "session.create" ? { session_id: "runtime", stored_session_id: "stored", messages: [] } : { session_id: "runtime", session_key: "stored", messages: [], running: false, info: { model: "fixture-default", provider: "qa" } });
   controller = new ZeusChatController(); controller.start();
 });
 afterEach(() => controller.stop());
@@ -45,14 +45,15 @@ describe("Zeus gateway and draft ownership", () => {
     controller.setDraft("Do not create a replacement"); const before = mocks.request.mock.calls.length;
     await controller.send();
     expect(mocks.request.mock.calls.length).toBe(before);
-    expect(controller.getSnapshot().error).toContain("Restore this conversation");
+    expect(controller.getSnapshot().error).toContain("could not be restored");
+    expect(controller.getSnapshot().modelUncertain).toBe(true);
   });
   it("does not replay an uncertain send after reconnect or reload and keeps it tied to its conversation", async () => {
     await settle();
     mocks.request.mockImplementation(async (method: string) => {
       if (method === "session.create") return { session_id: "runtime", stored_session_id: "stored" };
       if (method === "prompt.submit") throw new Error("WebSocket closed before acknowledgement");
-      return { session_id: "runtime", session_key: "stored", messages: [{ role: "user", text: "Exactly once" }, { role: "assistant", text: "Received" }], running: false };
+      return { session_id: "runtime", session_key: "stored", messages: [{ role: "user", text: "Exactly once" }, { role: "assistant", text: "Received" }], running: false, info: { model: "fixture-default", provider: "qa" } };
     });
     controller.setDraft("Exactly once"); await controller.send();
     expect(controller.getSnapshot().uncertain).toBe(true);
@@ -183,25 +184,27 @@ it("restores the chosen model before the first prompt even when lazy resume repo
   expect(mocks.request.mock.calls.filter(call => call[0] === "config.set" || call[0] === "prompt.submit")).toHaveLength(0);
 });
 
-it("does not combine an incomplete recovery response with a stale provider or unblock sends", async () => {
-  await settle();
-  mocks.request.mockImplementation(async (method: string) => {
+it("requires complete recovery metadata even after leaving and reopening an uncertain conversation", async () => {
+  await settle();let complete = false;
+  mocks.request.mockImplementation(async (method: string, params: Record<string, unknown>) => {
     if (method === "model.options") return fixtureChoices;
     if (method === "session.create") return { session_id: "runtime", stored_session_id: "stored", info: { model: "fixture-default", provider: "qa" } };
     if (method === "config.set") throw new Error("Lost acknowledgement");
-    return { session_id: "runtime", session_key: "stored", messages: [], info: { model: "fixture-fast" } };
+    if (params.session_id === "other") return { session_id: "runtime-other", session_key: "other", messages: [], info: { model: "fixture-default", provider: "qa" } };
+    return { session_id: "runtime", session_key: "stored", messages: [], info: complete ? { model: "fixture-fast", provider: "qa" } : { model: "fixture-fast" } };
   });
   const options = await controller.loadModels();
   await expect(controller.changeModel(options.choices[1])).rejects.toThrow("Lost acknowledgement");
   const client = mocks.clients.at(-1) as { events: Set<(event: unknown) => void> };
-  const emit = (info: unknown) => client.events.forEach(fn => fn({ type: "session.info", session_id: "runtime", payload: info }));
-  emit({ model: "fixture-fast" });
+  client.events.forEach(fn => fn({ type: "session.info", session_id: "runtime", payload: { model: "fixture-fast" } }));
   expect(controller.getSnapshot()).toMatchObject({ model: "fixture-default", provider: "qa", modelUncertain: true });
   await controller.open("stored", true);
-  expect(controller.getSnapshot()).toMatchObject({ model: "fixture-default", provider: "qa", modelUncertain: true });
+  expect(controller.getSnapshot().modelUncertain).toBe(true);
+  await controller.open("other"); expect(controller.getSnapshot().modelUncertain).toBe(false);
+  await controller.open("stored"); expect(controller.getSnapshot().modelUncertain).toBe(true);
   controller.setDraft("Not yet safe to send"); await controller.send();
   expect(mocks.request.mock.calls.filter(call => call[0] === "prompt.submit")).toHaveLength(0);
-  emit({ model: "fixture-fast", provider: "qa" });
+  complete = true; await controller.open("stored", true);
   expect(controller.getSnapshot()).toMatchObject({ model: "fixture-fast", provider: "qa", modelUncertain: false });
 });
 
