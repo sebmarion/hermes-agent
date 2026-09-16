@@ -4,7 +4,7 @@ export interface ModelSwitchResult { key?: string; value?: string; scope?: strin
 const text = (value: unknown) => typeof value === "string" ? value : "";
 /** Only catalogue IDs can become model-switch arguments; never accept arbitrary slash commands. */
 export function modelSwitchValue(choice: ModelChoice): string {
-  if (!choice.model || choice.model.length > 300 || !/^[a-zA-Z0-9][a-zA-Z0-9._:/@+\[\]-]*$/.test(choice.model) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(choice.provider)) throw new Error("This model identifier is not supported by the selector.");
+  if (!choice.model || choice.model.length > 300 || !/^[a-zA-Z0-9][a-zA-Z0-9._:/@+[\]-]*$/.test(choice.model) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(choice.provider)) throw new Error("This model identifier is not supported by the selector.");
   return `${choice.model} --provider ${choice.provider} --session`;
 }
 export function parseModelOptions(value: unknown): ModelOptions {
