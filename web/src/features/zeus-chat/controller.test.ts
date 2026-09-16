@@ -170,3 +170,15 @@ it("waits for the real runtime metadata without resending a switch or a prompt w
   expect(mocks.request.mock.calls.filter(call => call[0] === "config.set")).toHaveLength(1);
   expect(mocks.request.mock.calls.filter(call => call[0] === "prompt.submit")).toHaveLength(0);
 });
+
+it("restores the chosen model before the first prompt even when lazy resume reports the profile default", async () => {
+  await settle();
+  mocks.request.mockImplementation(async (method: string) => {
+    if (method === "session.resume") return { session_id: "runtime", stored_session_id: "stored", messages: [], info: { model: "fixture-default", lazy: true } };
+    if (method === "session.activate") return { session_id: "runtime", session_key: "stored", running: false, info: { model: "fixture-fast", provider: "qa" } };
+    throw new Error("Unexpected request: " + method);
+  });
+  await controller.open("stored");
+  expect(controller.getSnapshot()).toMatchObject({ storedId: "stored", model: "fixture-fast", provider: "qa", modelUncertain: false, loading: false });
+  expect(mocks.request.mock.calls.filter(call => call[0] === "config.set" || call[0] === "prompt.submit")).toHaveLength(0);
+});

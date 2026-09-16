@@ -186,9 +186,15 @@ export class ZeusChatController {
     this.patch({ ...(same ? {} : { ...emptyConversation(), model: "", provider: "", modelUncertain: false, modelNotice: "", modelDeferred: false }), storedId: id, title: row?.title || row?.preview || "Conversation", loading: true, draft: same ? this.state.draft : readDraft(id), uncertain: unconfirmed(id), error: "" });
     this.remember(id);
     try {
-      const result = await this.client.request<SessionResult>("session.resume", { session_id: id, profile: PROFILE, source: "web", cols: 96 });
+      let result = await this.client.request<SessionResult>("session.resume", { session_id: id, profile: PROFILE, source: "web", cols: 96 });
       if (generation !== this.generation || this.stopped) return;
       this.runtimeId = result.session_id;
+      if (result.info?.lazy) {
+        this.patch({ modelUncertain: true });
+        const runtime = await this.readModelRuntime(result.session_id, generation);
+        if (runtime.session_id !== result.session_id || runtime.info?.lazy || !runtime.info?.model || !runtime.info?.provider) throw new Error("The restored model is not yet verified. Refresh this conversation before sending.");
+        result = { ...result, info: runtime.info, running: runtime.running ?? result.running };
+      }
       const storedId = result.stored_session_id || result.session_key || result.resumed || id;
       this.remember(storedId);
       const items = historyItems(result.messages || []);
@@ -226,6 +232,18 @@ export class ZeusChatController {
     if (options.model && !this.state.modelChanging && (!this.state.storedId || !this.state.model)) this.patch({ model: options.model, provider: options.provider });
     return { ...options, model: this.state.model || options.model, provider: this.state.provider || options.provider };
   };
+  private async readModelRuntime(sessionId: string, generation: number): Promise<SessionResult> {
+    // Unpersisted resume payloads contain profile defaults. The existing activation
+    // read returns the real runtime; waiting never repeats a write or sends a prompt.
+    let result: SessionResult = { session_id: sessionId };
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if (generation !== this.generation || this.stopped) throw new Error("The conversation changed during model verification.");
+      result = await this.client.request<SessionResult>("session.activate", { profile: PROFILE, session_id: sessionId, omit_messages: true });
+      if (!result.info?.lazy) return result;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    return result;
+  }
   changeModel = async (choice: ModelChoice, confirmed = false): Promise<ModelSwitchResult> => {
     if (this.state.modelChanging || this.state.sending || this.state.busy || this.state.pending || this.state.loading || this.state.uncertain || this.state.modelUncertain || this.state.connection !== "open") throw new Error("Wait for the response to finish, or reconnect and refresh the conversation first.");
     if (!this.modelChoices.some(row => choiceKey(row) === choiceKey(choice))) throw new Error("Reload the model list before choosing this model.");
@@ -242,15 +260,7 @@ export class ZeusChatController {
       if (generation !== this.generation || this.stopped) throw new Error("Reconnect to verify the model. The change will not be replayed.");
       if (result.confirm_required) { this.modelSwitchSubmitted = false; return result; }
       if (result.key !== "model" || result.value !== choice.model || result.scope !== "session") throw new Error("The model change was not verified. Refresh the conversation before sending.");
-      // A newly created gateway returns lazy profile defaults until its scheduled agent
-      // build completes. Poll only read-back; never replay config.set or send a probe prompt.
-      let verified: SessionResult | undefined;
-      for (let attempt = 0; attempt < 20; attempt++) {
-        if (generation !== this.generation || this.stopped) throw new Error("The conversation changed during model verification.");
-        verified = await this.client.request<SessionResult>("session.activate", { profile: PROFILE, session_id: sessionId, omit_messages: true });
-        if (!verified.info?.lazy) break;
-        await new Promise(resolve => setTimeout(resolve, 250));
-      }
+      const verified = await this.readModelRuntime(sessionId, generation);
       if (generation !== this.generation || this.stopped || verified?.session_id !== sessionId || verified.info?.lazy || verified.info?.model !== choice.model || verified.info?.provider !== choice.provider) throw new Error("The session did not confirm the selected model and provider. Refresh the conversation before sending.");
       this.modelSwitchSubmitted = false;
       this.patch({ model: verified.info.model, provider: verified.info.provider, busy: this.state.busy || !!verified.running, modelUncertain: false, modelDeferred: !!result.deferred, modelNotice: result.deferred ? "Queued for the next reply; the current response is unchanged." : "Model changed for this conversation only." });

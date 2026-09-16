@@ -49,6 +49,8 @@ try{
   await Promise.race([chat.locator('.zc-model-dialog').waitFor({state:'hidden',timeout:60000}),chat.locator('.zc-model-feedback [role=alert]').waitFor({timeout:60000}).then(async()=>{throw Error(await chat.locator('.zc-model-feedback').innerText());})]);
   report.selectedModel=await chat.locator('.zc-model-trigger').innerText();assert(report.selectedModel.includes(target));
   assert.equal(report.rpc.filter(row=>row.method==='prompt.submit').length,0,'Selecting a model must not send a prompt');
+  await page.reload({waitUntil:'domcontentloaded'});chat=page.frameLocator('#zeus-ai-frame');await chat.getByRole('button',{name:new RegExp('^Change model: '+target.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'))}).waitFor({timeout:60000});
+  assert((await chat.locator('.zc-model-trigger').innerText()).includes(target));report.modelSurvivedBeforeFirstPrompt=true;
   const prompt='[MODEL SELECTOR READ-ONLY QA] Reply exactly ZEUS_MODEL_SELECTOR_OK. Do not use tools, inspect files, change anything, or contact anyone.';
   await chat.locator('#zeus-message').fill(prompt);const started=Date.now();await chat.getByRole('button',{name:'Send message',exact:true}).click();
   await chat.locator('.zc-assistant').filter({hasText:'ZEUS_MODEL_SELECTOR_OK'}).waitFor({timeout:180000});
