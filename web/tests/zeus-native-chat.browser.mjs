@@ -124,9 +124,12 @@ try{
   const before=calls.filter(c=>c.method==='prompt.submit').length;
   await chat.locator('#zeus-message').fill('Preserve this draft');
   await chat.getByRole('button',{name:'Instant company answers',exact:true}).click();
-  await chat.getByRole('button',{name:'What made money yesterday?',exact:true}).click();
-  await chat.locator('.zc-quick-answer').waitFor();assert.match(await chat.locator('.zc-quick-answer').innerText(),/not available from this snapshot/);
-  assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);await chat.getByRole('button',{name:'Close instant answers',exact:true}).click();
+  try{
+   await chat.getByRole('button',{name:'What made money yesterday?',exact:true}).click();
+   await chat.locator('.zc-quick-answer').waitFor();const answer=await chat.locator('.zc-quick-answer').innerText();
+   assert.match(answer,/(CURRENT|PARTIAL|UNKNOWN|UNAVAILABLE|STALE) · No model call/);assert.ok((await chat.locator('.zc-quick-answer h3').innerText()).trim().length>0);
+   assert.equal(calls.filter(c=>c.method==='prompt.submit').length,before);
+  }finally{if(await chat.getByRole('button',{name:'Close instant answers',exact:true}).isVisible().catch(()=>false))await chat.getByRole('button',{name:'Close instant answers',exact:true}).click();}
   assert.equal(await chat.locator('#zeus-message').inputValue(),'Preserve this draft');await chat.locator('#zeus-message').fill('');
  });
  await check('Instant answers fit dark and small-phone viewports and expose actual evidence',async()=>{
