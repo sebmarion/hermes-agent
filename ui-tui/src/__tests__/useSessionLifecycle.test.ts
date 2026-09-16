@@ -7,7 +7,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
 import { patchUiState, resetUiState } from '../app/uiStore.js'
-import { toTranscriptMessages, transcriptDeliveryIds } from '../domain/messages.js'
 import {
   hydrateLiveSessionInflight,
   liveSessionInflightMessages,
@@ -17,6 +16,7 @@ import {
   signalFreshSessionBoundary,
   writeActiveSessionFile
 } from '../app/useSessionLifecycle.js'
+import { toTranscriptMessages, transcriptDeliveryIds } from '../domain/messages.js'
 
 describe('transcript delivery identity', () => {
   it('hydrates a persisted async completion delivery id onto its assistant response', () => {
@@ -37,7 +37,6 @@ describe('transcript delivery identity', () => {
     expect(transcriptDeliveryIds(transcript)).toEqual(['async-delegation:d1'])
   })
 })
-
 
 describe('fresh session boundary', () => {
   it('signals only when a live session is replaced by a different session', () => {
@@ -97,9 +96,11 @@ describe('durable terminal outbox replay', () => {
     const appended: unknown[] = []
     const seen = new Set<string>()
     let releaseAck!: () => void
+
     const ackPending = new Promise<void>(resolve => {
       releaseAck = resolve
     })
+
     const acknowledge = vi.fn(() => ackPending)
     const deliveries = [{ payload: { delivery_id: 'delivery-concurrent', text: 'Once' } }]
 
@@ -116,21 +117,18 @@ describe('durable terminal outbox replay', () => {
   it('fetches, appends, and acknowledges pending deliveries during activation replay', async () => {
     const appended: unknown[] = []
     const seen = new Set<string>()
+
     const gw = {
       request: vi.fn(async (method: string) => {
         if (method === 'terminal.outbox.pending') {
           return { deliveries: [{ payload: { delivery_id: 'activation-1', text: 'Recovered on activation' } }] }
         }
+
         return { acknowledged: true }
       })
     }
 
-    await replayPendingTerminalOutbox(
-      gw,
-      'runtime-activation',
-      seen,
-      msg => appended.push(msg)
-    )
+    await replayPendingTerminalOutbox(gw, 'runtime-activation', seen, msg => appended.push(msg))
 
     expect(appended).toEqual([{ role: 'assistant', text: 'Recovered on activation', deliveryId: 'activation-1' }])
     expect(gw.request).toHaveBeenNthCalledWith(1, 'terminal.outbox.pending', { session_id: 'runtime-activation' })

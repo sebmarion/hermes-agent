@@ -1,4 +1,3 @@
-import { restorePendingClarifyFromSnapshot } from './use-session-actions/restore-pending-clarify'
 import { registryBackendScopeKey } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
@@ -77,6 +76,7 @@ import { NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
 import { useSessionActions } from './use-session-actions'
+import { restorePendingClarifyFromSnapshot } from './use-session-actions/restore-pending-clarify'
 import { useSessionStateCache } from './use-session-state-cache'
 
 vi.mock('@/hermes', async importOriginal => ({

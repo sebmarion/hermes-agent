@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
-import { toChatMessages } from './chat-messages'
 import { chatMessagesEquivalent } from '../app/session/hooks/use-session-actions/utils'
+
+import { toChatMessages } from './chat-messages'
 import { collectTerminalOutboxDeliveries } from './terminal-outbox'
 
 describe('terminal outbox', () => {
@@ -78,12 +79,15 @@ describe('terminal outbox', () => {
   })
 })
 
-
 it('hydrates an explicit terminal identity from JSON-encoded metadata', () => {
-  const messages = toChatMessages([{
-    role: 'assistant', content: 'Recovered answer',
-    display_metadata: JSON.stringify({ delivery_id: 'durable-1', delegation_id: 'child-1' })
-  }])
+  const messages = toChatMessages([
+    {
+      role: 'assistant',
+      content: 'Recovered answer',
+      display_metadata: JSON.stringify({ delivery_id: 'durable-1', delegation_id: 'child-1' })
+    }
+  ])
+
   expect(messages[0]?.deliveryId).toBe('durable-1')
 })
 

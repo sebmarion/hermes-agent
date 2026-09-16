@@ -393,6 +393,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
       const originGateway = $gateway.get()
+
       const isCurrent = () =>
         activeSessionIdRef.current === runtimeSessionId &&
         selectedStoredSessionIdRef.current === storedSessionId &&
@@ -403,11 +404,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         if (!isCurrent()) {
           return
         }
+
         try {
           const latest = await getLatestSessionMessages(storedSessionId, storedProfile)
+
           if (!isCurrent()) {
             return
           }
+
           const messages = toChatMessages(latest.messages)
           updateSessionState(
             runtimeSessionId,
@@ -428,6 +432,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           if (!isCurrent()) {
             return
           }
+
           if (restored) {
             setSessionTodos(runtimeSessionId, restored)
           } else {
@@ -435,65 +440,77 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           }
 
           const gateway = $gateway.get()
+
           if (gateway && !isCurrent()) {
             return
           }
+
           if (gateway) {
             let deliveries: ReturnType<typeof collectTerminalOutboxDeliveries> = []
             const acknowledgedDeliveryIds = new Set<string>()
+
             try {
               const pending = (await requestGateway('terminal.outbox.pending', {
                 session_id: runtimeSessionId
               })) as { deliveries?: unknown[] } | null
+
               if (!isCurrent()) {
                 return
               }
+
               const existingSessionMessages = sessionStateByRuntimeIdRef.current.get(runtimeSessionId)?.messages ?? []
+
               const existingDeliveryIds = new Set(
                 [...messages, ...existingSessionMessages].flatMap(message =>
                   message.deliveryId ? [message.deliveryId] : []
                 )
               )
+
               deliveries = collectTerminalOutboxDeliveries(
                 pending?.deliveries,
                 existingDeliveryIds,
                 seenTerminalDeliveriesRef.current
               )
+
               if (!isCurrent()) {
                 throw new Error('stale terminal outbox hydration')
               }
+
               const recovered = deliveries.filter(({ shouldRender }) => shouldRender)
 
               if (recovered.length) {
                 if (!isCurrent()) {
                   throw new Error('stale terminal outbox hydration')
                 }
+
                 const recoveredMessages = toChatMessages(
                   recovered.map(({ text }) => ({ content: text, role: 'assistant' as const }))
                 ).map((message, index) => ({
                   ...message,
                   deliveryId: recovered[index]?.deliveryId
                 }))
+
                 updateSessionState(
                   runtimeSessionId,
                   state => ({ ...state, messages: [...state.messages, ...recoveredMessages] }),
                   storedSessionId
                 )
               }
+
               for (const { deliveryId } of deliveries) {
                 if (!isCurrent()) {
                   throw new Error('stale terminal outbox hydration')
                 }
-                const acknowledged = await requestGateway<{ acknowledged?: boolean }>(
-                  'terminal.outbox.ack',
-                  {
-                    delivery_id: deliveryId,
-                    session_id: runtimeSessionId
-                  }
-                )
+
+                const acknowledged = await requestGateway<{ acknowledged?: boolean }>('terminal.outbox.ack', {
+                  delivery_id: deliveryId,
+                  session_id: runtimeSessionId
+                })
+
                 if (acknowledged?.acknowledged !== true) {
                   throw new Error('terminal outbox acknowledgement was not accepted')
                 }
+
                 acknowledgedDeliveryIds.add(deliveryId)
               }
             } catch {
@@ -794,6 +811,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     if (gatewayState !== 'open' || !activeSessionId || !selectedStoredSessionId) {
       return
     }
+
     void hydrateFromStoredSession(1, selectedStoredSessionId, activeSessionId)
   }, [activeSessionId, gatewayState, hydrateFromStoredSession, selectedStoredSessionId])
 

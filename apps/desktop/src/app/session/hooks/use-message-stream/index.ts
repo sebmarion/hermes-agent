@@ -683,11 +683,12 @@ export function useMessageStream({
               (finalText === existingText || finalText.startsWith(existingText) || existingText.startsWith(finalText))
             )
 
-            const deliveryIdsDiffer = Boolean(
-              deliveryId && existing.deliveryId && deliveryId !== existing.deliveryId
-            )
+            const deliveryIdsDiffer = Boolean(deliveryId && existing.deliveryId && deliveryId !== existing.deliveryId)
 
-            if (!deliveryIdsDiffer && (existing.pending || (!interimBoundaryPending && finalText && existingText === finalText))) {
+            if (
+              !deliveryIdsDiffer &&
+              (existing.pending || (!interimBoundaryPending && finalText && existingText === finalText))
+            ) {
               nextMessages = prev.map((message, messageIndex) =>
                 messageIndex === index ? completeMessage(message) : message
               )

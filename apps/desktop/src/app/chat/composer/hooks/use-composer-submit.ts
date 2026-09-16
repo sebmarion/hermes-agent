@@ -165,6 +165,7 @@ export function useComposerSubmit({
     if (payloadPresent && !queueEdit && hasClarifyRequest(sessionId)) {
       queueCurrentDraft()
       focusInput()
+
       return
     }
 
