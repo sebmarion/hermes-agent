@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -28,19 +29,33 @@ def _close_quietly(conn: Optional[sqlite3.Connection]) -> None:
             conn.close()
 
 
-def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> bool:
-    """Copy a SQLite database with the backup() API (WAL-safe consistent snapshot).
-
-    Fails closed when no consistent snapshot can be made: copying only the main file loses WAL data.
-    """
-    conn = backup_conn = None
+def _file_identity(path: Path) -> Optional[tuple[int, int]]:
+    """Return device and inode for one regular non-symlink file."""
     try:
-        # sqlite3.connect() creates a missing destination with the process
-        # umask, which is commonly 0022 (0644).  Snapshot databases contain
-        # session and tool state, so create the inode owner-only before SQLite
-        # writes its first byte.  O_NOFOLLOW also refuses a planted symlink on
-        # platforms that support it.  Tighten an existing internal staging
-        # file as well (NamedTemporaryFile callers already create it 0600).
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _unlink_if_same_identity(path: Path, expected: Optional[tuple[int, int]]) -> bool:
+    """Remove only the exact staging inode we own; preserve a concurrent replacement."""
+    if expected is None or _file_identity(path) != expected:
+        return False
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> bool:
+    """Create a WAL-safe snapshot without deleting a concurrently replaced destination."""
+    conn = backup_conn = None
+    copied_identity: Optional[tuple[int, int]] = None
+    try:
         if os.name != "nt":
             open_flags = os.O_WRONLY | os.O_CREAT
             if hasattr(os, "O_NOFOLLOW"):
@@ -50,10 +65,9 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
                 os.fchmod(secure_fd, 0o600)
             finally:
                 os.close(secure_fd)
-        # timeout=0.0 disables sqlite3's implicit busy wait so the progress callback owns the
-        # full locked-source deadline instead of adding the default timeout before each callback.
         conn = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=0.0)
         backup_conn = sqlite3.connect(str(dst))
+        copied_identity = _file_identity(dst)
         busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
 
         def _check_backup_progress(status: int, _remaining: int, _total: int) -> None:
@@ -61,7 +75,9 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
             now = time.monotonic()
             if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                 if now >= busy_deadline:
-                    raise _SQLiteBackupTimeout(f"database remained locked for {timeout_seconds:g} seconds")
+                    raise _SQLiteBackupTimeout(
+                        f"database remained locked for {timeout_seconds:g} seconds"
+                    )
             else:
                 busy_deadline = now + max(0.0, timeout_seconds)
 
@@ -69,16 +85,37 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
         return True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
-        # Windows won't remove the partial destination while SQLite still has it open.
         _close_quietly(backup_conn)
         backup_conn = None
-        with suppress(OSError):
-            dst.unlink(missing_ok=True)
+        _unlink_if_same_identity(dst, copied_identity)
         return False
     finally:
         _close_quietly(backup_conn)
         _close_quietly(conn)
 
+
+def copy_db_and_verify(src: Path, dst: Path) -> bool:
+    """Create a WAL-safe copy and verify the exact destination generation."""
+    if not _safe_copy_db(src, dst):
+        return False
+    copied_identity = _file_identity(dst)
+    if copied_identity is None:
+        return False
+    from hermes_cli.backup import verify_sqlite_integrity
+
+    integrity = verify_sqlite_integrity(dst, run_pragma=True)
+    if not integrity.get("valid"):
+        _unlink_if_same_identity(dst, copied_identity)
+        logger.warning(
+            "Backup of %s failed integrity verification: %s",
+            src,
+            integrity.get("message"),
+        )
+        return False
+    if _file_identity(dst) != copied_identity:
+        logger.warning("Backup destination changed during verification: %s", dst)
+        return False
+    return True
 
 def preflight_state_db(home: Path) -> dict:
     """Publish an emergency snapshot; do not prune recovery files on failure."""

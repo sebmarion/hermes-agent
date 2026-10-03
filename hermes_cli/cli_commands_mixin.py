@@ -830,7 +830,7 @@ class CLICommandsMixin:
               else f"  {_t('snapshot.nothing_to_snapshot')}")
 
     def _snapshot_restore(self, parts) -> None:
-        from hermes_cli.backup import list_quick_snapshots, restore_quick_snapshot
+        from hermes_cli.backup import list_quick_snapshots, quick_snapshot_exists, restore_quick_snapshot
         if len(parts) < 3:
             print(f"  {_t('snapshot.usage_restore')}")
             snaps = list_quick_snapshots(limit=1)
@@ -857,7 +857,8 @@ class CLICommandsMixin:
             _pr(f"  {_t('snapshot.restored', snapshot_id=snap_id)}",
                 f"  {_t('snapshot.restart_recommended')}")
         else:
-            print(f"  {_t('snapshot.not_found', snapshot_id=snap_id)}")
+            key = "snapshot.restore_failed" if quick_snapshot_exists(snap_id) else "snapshot.not_found"
+            print(f"  {_t(key, snapshot_id=snap_id)}")
 
     def _snapshot_prune(self, parts) -> None:
         from hermes_cli.backup import prune_quick_snapshots

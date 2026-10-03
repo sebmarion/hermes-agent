@@ -23,6 +23,8 @@ import hermes_cli.web_server_profiles as _web_server_profiles
 def _reset_boot_fingerprint(monkeypatch):
     """Each test starts with no recorded boot fingerprint."""
     monkeypatch.setattr(code_skew, "_boot_fingerprint", None)
+    monkeypatch.setattr(code_skew, "_boot_source_digest", None)
+    monkeypatch.setattr(code_skew, "_boot_identity_recorded", False)
 
 
 class TestDetectCodeSkew:
@@ -182,3 +184,14 @@ class TestModelSetSkewGuard:
         body = _rt_models.ModelAssignment(scope="main", provider="nous", model="some-model")
         result = asyncio.run(_rt_models.set_model_assignment(body))
         assert result["ok"] is True
+
+
+def test_boot_source_digest_is_captured_once_with_the_boot_fingerprint(monkeypatch):
+    monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:main:" + "a" * 40)
+    digests = iter(("b" * 64, "c" * 64))
+    monkeypatch.setattr(code_skew, "runtime_source_digest", lambda *_a, **_k: next(digests))
+
+    code_skew.record_boot_fingerprint()
+
+    assert code_skew.get_boot_source_digest() == "b" * 64
+    assert code_skew.get_boot_source_digest() == "b" * 64

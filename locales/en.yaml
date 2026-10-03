@@ -2820,6 +2820,7 @@ cli:
       restored: "Restored state from: {snapshot_id}"
       restart_recommended: "Restart recommended for gateway/dashboard processes to pick up state.db changes."
       not_found: "Snapshot not found: {snapshot_id}"
+      restore_failed: "Snapshot restore failed or incomplete: {snapshot_id}"
       usage_prune: "Usage: /snapshot prune [keep-count]"
       pruned: "Pruned {deleted} old snapshot(s) (keeping {keep})."
     export:

@@ -15,6 +15,8 @@ from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _boot_fingerprint: str | None = None
+_boot_source_digest: str | None = None
+_boot_identity_recorded = False
 _RUNTIME_SOURCE_DIRS = ("hermes_cli", "gateway", "tui_gateway", "tools")
 
 
@@ -30,15 +32,22 @@ def _fingerprint() -> str | None:
 
 
 def record_boot_fingerprint() -> None:
-    """Snapshot the checkout revision at gateway startup (idempotent)."""
-    global _boot_fingerprint
-    if _boot_fingerprint is None:
+    """Snapshot the checkout revision and source digest at process startup."""
+    global _boot_fingerprint, _boot_source_digest, _boot_identity_recorded
+    if not _boot_identity_recorded:
         _boot_fingerprint = _fingerprint()
+        _boot_source_digest = runtime_source_digest(_PROJECT_ROOT)
+        _boot_identity_recorded = True
 
 
 def get_boot_fingerprint() -> str | None:
     """Return the immutable checkout fingerprint captured at process boot."""
     return _boot_fingerprint
+
+
+def get_boot_source_digest() -> str | None:
+    """Return the immutable source-tree digest captured with the boot fingerprint."""
+    return _boot_source_digest
 
 
 def runtime_source_digest(project_root: Path | None = None) -> str:

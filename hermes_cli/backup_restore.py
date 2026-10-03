@@ -7,6 +7,7 @@ helpers used by ``hermes import`` and ``/snapshot restore``.  Backup
 which composes these helpers.
 """
 
+import errno
 import logging
 import os
 import shutil
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from hermes_state_holders import read_only_db_uri
+from hermes_cli.backup_sqlite import _file_identity
 from utils import (
     _preserve_file_mode, _preserve_file_owner, _restore_file_mode, _restore_file_owner, atomic_replace,
     mkstemp_beside,
@@ -26,25 +28,25 @@ from utils import (
 
 logger = logging.getLogger(__name__)
 
-def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
-    """PIDs of OTHER processes holding *db_path* or its WAL/SHM open.
+_SQLITE_HEADER = b"SQLite format 3\x00"
+_SQLITE_DESTINATION_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
-    Linux-only ``/proc/<pid>/fd`` scan (no psutil dependency), preserving the
-    kernel's ``(deleted)`` suffix so an already-unlinked sidecar generation —
-    the #90950 split-brain fingerprint — still counts as held. Returns
-    ``None`` when the scan is unavailable (non-Linux, or /proc unreadable);
-    callers must treat ``None`` as "unknown", not as "no holders".
-    """
+
+def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
+    """Return other-process holders, or None when holder state is unprovable."""
     if not sys.platform.startswith("linux"):
         return None
 
     def _canonical(path: str) -> str:
-        return os.path.normcase(
-            os.path.abspath(path.removesuffix(" (deleted)"))
-        )
+        return os.path.normcase(os.path.realpath(path.removesuffix(" (deleted)")))
 
     canonical_db = _canonical(os.fspath(db_path))
-    watched = {canonical_db, canonical_db + "-wal", canonical_db + "-shm"}
+    watched = {
+        canonical_db,
+        canonical_db + "-wal",
+        canonical_db + "-shm",
+        canonical_db + "-journal",
+    }
     pids: List[int] = []
     try:
         own_pid = os.getpid()
@@ -57,13 +59,17 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
             fd_dir = f"/proc/{pid}/fd"
             try:
                 fds = os.listdir(fd_dir)
-            except OSError:
-                continue
+            except OSError as exc:
+                if exc.errno in {errno.ENOENT, errno.ESRCH, errno.ENOTDIR}:
+                    continue
+                return None
             for fd in fds:
                 try:
                     target = os.readlink(f"{fd_dir}/{fd}")
-                except OSError:
-                    continue
+                except OSError as exc:
+                    if exc.errno in {errno.ENOENT, errno.ESRCH, errno.ENOTDIR}:
+                        continue
+                    return None
                 if _canonical(target) in watched:
                     pids.append(pid)
                     break
@@ -72,140 +78,292 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
     return pids
 
 
-def _safe_restore_db(src: Path, dst: Path) -> bool:
-    """Restore a SQLite database from snapshot *src* into live *dst*.
+def _sqlite_main_file_is_structurally_valid(path: Path) -> bool:
+    """Probe the main SQLite file without consulting or mutating sidecars."""
+    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
 
-    Uses SQLite's backup() API to write snapshot pages into the live
-    database file, preserving the file's inode and WAL state so that
-    any other process still holding the DB open (gateway, dashboard,
-    another CLI session) sees the restored data on the next read —
-    instead of continuing to serve stale cached pages from a replaced
-    inode.
-
-    The old approach was ``unlink() + move()``, which replaced the file
-    under any live connection.  SQLite connections cache pages in
-    per-connection page caches keyed by inode; after an unlink+move the
-    old inode still existed (the live connection held a reference), so
-    that connection continued serving the pre-restore data while new
-    connections saw the restored snapshot — a partial/inconsistent
-    state (issue #65942).
-
-    By writing pages through the backup API the file inode is preserved,
-    the WAL journal is updated correctly, and all connections (old and
-    new) converge on the restored data.
-
-    Falls back to the unlink+move approach on failure ONLY when no other
-    process or in-process connection holds the file: replacing the inode
-    under a live holder is the #90950 split-brain, so that branch fails
-    closed (returns ``False``) and the caller reports the file as skipped.
-    It also returns ``False``, without touching *dst*, when *src* fails the
-    SQLite integrity check.
-    """
-    from hermes_cli.backup import verify_sqlite_integrity
-
-    # backup() copies pages without validating their contents; its fallback
-    # copies bytes even when SQLite rejected the source. Neither may touch the
-    # destination until the snapshot passes the existing bounded integrity policy.
-    source_check = verify_sqlite_integrity(src)
-    if not source_check["valid"]:
-        logger.error("Refusing SQLite restore from %s: %s", src, source_check["message"])
+    if read_header_bytes_preopen(path, length=len(_SQLITE_HEADER)) != _SQLITE_HEADER:
         return False
-
-    dst_conn: Optional[sqlite3.Connection] = None
+    probe: Optional[sqlite3.Connection] = None
     try:
-        dst_conn = sqlite3.connect(str(dst))
-        try:
-            # Force a WAL checkpoint so the backup starts from a clean
-            # state rather than writing on top of a deep WAL.
-            dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
-        src_conn = sqlite3.connect(read_only_db_uri(src), uri=True)
-        try:
-            src_conn.backup(dst_conn)
-        finally:
-            src_conn.close()
-        dst_conn.close()
-        # Restore original file permissions from the snapshot
-        try:
-            mode = src.stat().st_mode
-            dst.chmod(mode)
-        except Exception:
-            pass
+        probe = sqlite3.dbapi2.connect(
+            f"{path.resolve().as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=1.0,
+        )
+        probe.execute("PRAGMA schema_version").fetchone()
+        probe.execute("SELECT count(*) FROM sqlite_master").fetchone()
         return True
-    except Exception as exc:
-        logger.warning("SQLite safe restore failed for %s -> %s: %s", src, dst, exc)
-        # Release our own handle on *dst* before the fallback: on Windows an
-        # open connection blocks unlink() with WinError 32, which would make
-        # the fallback below dead code exactly when it is needed.
-        if dst_conn is not None:
+    except (sqlite3.DatabaseError, OSError):
+        return False
+    finally:
+        if probe is not None:
             try:
-                dst_conn.close()
+                probe.close()
             except Exception:
                 pass
-        # Fallback: unlink+move (the old approach).  This still works for
-        # the common case where no other process holds the DB open.
-        from hermes_cli.sqlite_safe_read import (
-            LiveConnectionError,
-            offline_file_access,
-        )
 
-        try:
-            holders = _foreign_db_holder_pids(dst)
-            if holders:
-                # Replacing the inode under a live holder is the #90950
-                # corruption class: the holder keeps writing through a
-                # deleted-inode fd (split brain), and removing its sidecars
-                # detaches the WAL index it is checkpointing through. The
-                # backup-API path above is the live-safe route; if it failed,
-                # fail closed rather than corrupt.
+
+def _current_process_holds_sqlite_family(path: Path) -> bool:
+    """Whether this process has an open descriptor for the database family."""
+    if not sys.platform.startswith("linux"):
+        return False
+    canonical = os.path.realpath(os.fspath(path))
+    watched = {
+        canonical,
+        canonical + "-wal",
+        canonical + "-shm",
+        canonical + "-journal",
+    }
+    try:
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                target = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                continue
+            if os.path.realpath(target.removesuffix(" (deleted)")) in watched:
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def _can_remove_sqlite_sidecars(path: Path) -> bool:
+    """Prove the database family is offline before deleting sidecars."""
+    if _current_process_holds_sqlite_family(path):
+        return False
+    return _foreign_db_holder_pids(path) == []
+
+
+def _remove_sqlite_sidecars(
+    path: Path, expected_identity: Optional[tuple[int, int]] = None
+) -> bool:
+    """Remove only the sidecar generation captured before destructive cleanup."""
+    sidecars = [
+        path.with_name(path.name + suffix)
+        for suffix in _SQLITE_DESTINATION_SIDECAR_SUFFIXES
+    ]
+    try:
+        captured = {sidecar: _file_identity(sidecar) for sidecar in sidecars}
+        if expected_identity is not None and _file_identity(path) != expected_identity:
+            return False
+        if all(identity is None for identity in captured.values()):
+            return expected_identity is None or _file_identity(path) == expected_identity
+        for sidecar in sidecars:
+            if expected_identity is not None and _file_identity(path) != expected_identity:
+                return False
+            if not _can_remove_sqlite_sidecars(path):
+                return False
+            identity = captured[sidecar]
+            if _file_identity(sidecar) != identity:
+                return False
+            if identity is not None:
+                sidecar.unlink()
+                if _file_identity(sidecar) is not None:
+                    return False
+        if expected_identity is not None and _file_identity(path) != expected_identity:
+            return False
+    except OSError as exc:
+        logger.error("Could not remove SQLite sidecar for %s: %s", path, exc)
+        return False
+    return True
+
+
+def _settle_sqlite_sidecars_after_online_backup(
+    path: Path, expected_identity: tuple[int, int]
+) -> bool:
+    """Clean offline sidecars or prove they belong to a known live generation."""
+    if _remove_sqlite_sidecars(path, expected_identity):
+        return True
+    if _current_process_holds_sqlite_family(path):
+        return True
+    holders = _foreign_db_holder_pids(path)
+    if holders:
+        return True
+    if holders is None:
+        logger.error(
+            "Could not prove SQLite sidecars for %s are offline or held by a known live generation",
+            path,
+        )
+    return False
+
+
+def _validate_final_sqlite_destination(
+    path: Path, expected_identity: tuple[int, int]
+) -> bool:
+    """Validate the exact installed database generation and reject swaps."""
+    before = _file_identity(path)
+    if before != expected_identity:
+        logger.error("SQLite destination identity changed before validation for %s", path)
+        return False
+    from hermes_cli.backup import verify_sqlite_integrity
+
+    integrity = verify_sqlite_integrity(
+        path,
+        check_header=not _current_process_holds_sqlite_family(path),
+        run_pragma=True,
+    )
+    after = _file_identity(path)
+    if after != expected_identity or after != before:
+        logger.error("SQLite destination identity changed during validation for %s", path)
+        return False
+    if not integrity.get("valid"):
+        logger.error(
+            "SQLite destination failed final integrity verification for %s: %s",
+            path,
+            integrity.get("message"),
+        )
+        return False
+    return True
+
+
+def _safe_restore_db(src: Path, dst: Path) -> bool:
+    """Restore a verified SQLite image without accepting identity races."""
+    from hermes_cli.backup import verify_sqlite_integrity
+
+    source_integrity = verify_sqlite_integrity(src, run_pragma=True)
+    if not source_integrity.get("valid"):
+        logger.warning(
+            "SQLite restore source failed integrity verification for %s: %s",
+            src,
+            source_integrity.get("message"),
+        )
+        return False
+
+    destination_identity = _file_identity(dst)
+    destination_invalid = not _sqlite_main_file_is_structurally_valid(dst)
+    if _file_identity(dst) != destination_identity:
+        logger.error(
+            "Refusing SQLite restore of %s: destination identity changed during pre-restore checks",
+            dst,
+        )
+        return False
+
+    if destination_identity is None:
+        existing_sidecars = [
+            dst.with_name(dst.name + suffix)
+            for suffix in _SQLITE_DESTINATION_SIDECAR_SUFFIXES
+            if dst.with_name(dst.name + suffix).exists()
+        ]
+        if existing_sidecars:
+            if not _can_remove_sqlite_sidecars(dst):
                 logger.error(
-                    "Refusing unlink+move restore of %s: process(es) %s still "
-                    "hold the database or its WAL open. Stop them and retry.",
-                    dst, holders,
+                    "Refusing SQLite restore of %s: sidecars exist but the family is not provably offline",
+                    dst,
                 )
                 return False
-            # The foreign-pid scan above deliberately excludes THIS process,
-            # but an in-process SessionDB (the agent's own handle during
-            # /snapshot restore, a second SessionDB instance, a read pool)
-            # is exactly as much of a live holder: unlinking the DB and its
-            # sidecars under it leaves this process on deleted-inode fds —
-            # the same #90950 split brain, produced first-party (proven live
-            # on main: `/proc/self/fd` shows `state.db-wal (deleted)` right
-            # after this fallback ran under a tracked connection).
-            # ``offline_file_access`` fails CLOSED when any tracked
-            # connection to *dst* is live and holds the connection-lifecycle
-            # lock across the whole swap so no new connection can appear
-            # mid-replace.
-            with offline_file_access(dst, what="unlink+move restore of"):
-                tmp = dst.parent / f".{dst.name}.snap_restore"
-                shutil.copy2(src, tmp)
-                dst.unlink(missing_ok=True)
-                # Drop the destination's sidecars before installing the
-                # snapshot. The snapshot is a checkpointed ``sqlite3.backup()``
-                # image (see ``_safe_copy_db``) that owns no WAL, so any
-                # ``-wal``/``-shm`` still sitting here describes the database we
-                # just unlinked — an ungracefully killed gateway leaves them
-                # behind, which is exactly when a restore gets run. SQLite
-                # replays that foreign WAL over the restored file on the next
-                # open and the database comes up "malformed" (or silently
-                # resurrects post-snapshot rows). Same reasoning as
-                # ``_EXCLUDED_SUFFIXES``, applied to the restore destination.
-                for _sidecar_suffix in ("-wal", "-shm", "-journal"):
-                    dst.with_name(dst.name + _sidecar_suffix).unlink(missing_ok=True)
-                shutil.move(str(tmp), str(dst))
-            return True
-        except LiveConnectionError as exc2:
+            if not _remove_sqlite_sidecars(dst):
+                return False
+        if _file_identity(dst) is not None:
             logger.error(
-                "Refusing unlink+move restore of %s: %s Close the in-process "
-                "database handles (or restart Hermes) and retry.",
-                dst, exc2,
+                "Refusing SQLite restore of %s: destination appeared during pre-restore cleanup",
+                dst,
             )
             return False
-        except Exception as exc2:
-            logger.error("Fallback restore also failed for %s -> %s: %s", src, dst, exc2)
-            return False
 
+    dst_conn: Optional[sqlite3.Connection] = None
+    src_conn: Optional[sqlite3.Connection] = None
+    opened_destination_identity: Optional[tuple[int, int]] = None
+    primary_succeeded = False
+    try:
+        src_conn = sqlite3.connect(read_only_db_uri(src), uri=True)
+        dst_conn = sqlite3.connect(str(dst))
+        opened_destination_identity = _file_identity(dst)
+        if opened_destination_identity is None:
+            raise OSError("SQLite restore destination disappeared after opening")
+        src_conn.backup(dst_conn)
+        primary_succeeded = True
+    except Exception as exc:
+        logger.warning("SQLite safe restore failed for %s -> %s: %s", src, dst, exc)
+    finally:
+        for connection in (src_conn, dst_conn):
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    if primary_succeeded:
+        final_identity = destination_identity or opened_destination_identity
+        if final_identity is None:
+            logger.error("SQLite restore completed without an installed destination: %s", dst)
+            return False
+        try:
+            dst.chmod(src.stat().st_mode)
+        except Exception:
+            pass
+        if not _settle_sqlite_sidecars_after_online_backup(dst, final_identity):
+            return False
+        if not _validate_final_sqlite_destination(dst, final_identity):
+            return False
+        validation_sidecars = [
+            dst.with_name(dst.name + suffix)
+            for suffix in _SQLITE_DESTINATION_SIDECAR_SUFFIXES
+            if dst.with_name(dst.name + suffix).exists()
+        ]
+        if validation_sidecars and not _current_process_holds_sqlite_family(dst):
+            holders = _foreign_db_holder_pids(dst)
+            if holders == [] and not _remove_sqlite_sidecars(dst, final_identity):
+                return False
+            if holders is None:
+                return False
+        return True
+
+    if not destination_invalid:
+        logger.error(
+            "Refusing fallback restore of %s: destination passed its pre-restore structural check",
+            dst,
+        )
+        return False
+
+    from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
+
+    try:
+        holders = _foreign_db_holder_pids(dst)
+        if holders is None:
+            logger.error(
+                "Refusing fallback restore of %s: holder state could not be proven",
+                dst,
+            )
+            return False
+        if holders:
+            logger.error(
+                "Refusing fallback restore of %s: process(es) %s still hold the database family",
+                dst,
+                holders,
+            )
+            return False
+        with offline_file_access(dst, what="fallback restore of"):
+            tmp = dst.parent / f".{dst.name}.snap_restore"
+            try:
+                shutil.copy2(src, tmp)
+                staged_identity = _file_identity(tmp)
+                if staged_identity is None:
+                    raise OSError("fallback SQLite staging file disappeared")
+                if _file_identity(dst) != destination_identity:
+                    raise OSError("SQLite destination was substituted before fallback publish")
+                if _foreign_db_holder_pids(dst) != []:
+                    raise OSError("SQLite destination gained a foreign holder before fallback publish")
+                if not _remove_sqlite_sidecars(dst, destination_identity):
+                    raise OSError("SQLite fallback sidecar cleanup failed")
+                atomic_replace(tmp, dst)
+                if not _validate_final_sqlite_destination(dst, staged_identity):
+                    raise OSError("installed SQLite fallback destination failed final validation")
+                if not _remove_sqlite_sidecars(dst, staged_identity):
+                    raise OSError("SQLite fallback sidecar cleanup failed after publish")
+                return True
+            finally:
+                tmp.unlink(missing_ok=True)
+    except LiveConnectionError as exc:
+        logger.error(
+            "Refusing fallback restore of %s: %s Close in-process database handles and retry.",
+            dst,
+            exc,
+        )
+        return False
+    except Exception as exc:
+        logger.error("Fallback restore also failed for %s -> %s: %s", src, dst, exc)
+        return False
 
 def _validate_backup_zip(zf: zipfile.ZipFile) -> tuple[bool, str]:
     """Check that a zip looks like a Hermes backup.
@@ -392,7 +550,10 @@ def _count_session_rows(path: Path) -> Optional[Tuple[int, int]]:
     if not path.is_file():
         return None
     try:
-        conn = sqlite3.connect(read_only_db_uri(path), uri=True)
+        conn = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        )
     except sqlite3.Error:
         return None
     try:
@@ -411,71 +572,66 @@ def _import_db_member(
     target: Path,
     new_file_mode: Optional[int] = None,
 ) -> None:
-    """Publish a SQLite ``.db`` member onto *target* without replacing its inode.
+    """Stage, verify, and publish one SQLite archive member safely."""
+    from hermes_cli.backup import verify_sqlite_integrity
 
-    ``_extract_member_atomically`` publishes with a rename.  For an ordinary
-    file that is the safest write available; for a live SQLite database it is
-    the #65942 / #90950 corruption class.  A gateway, dashboard, or WebUI
-    process holding the database open keeps its descriptor on the now-unlinked
-    inode: it goes on serving pre-import pages and writing sessions that no
-    other process will ever see, and any sidecar WAL left beside the new file
-    describes the database that was just unlinked.  Nothing fails, so nothing
-    is reported — the sessions simply are not there afterwards (issue #100960).
-
-    ``hermes import`` is the disaster-recovery path, so that failure mode lands
-    on users who have already lost something once.  Route the member through
-    the same ``_safe_restore_db`` page copy that ``/snapshot restore`` has used
-    since #65942: the live inode is preserved, every open connection converges
-    on the imported data, and the sidecars are handled there.
-
-    Raises ``OSError`` when the database could not be replaced safely, so the
-    caller reports a skipped file instead of counting a silent success.
-    """
-    if not target.exists():
-        # "Missing" is not "unheld": a gateway or dashboard that had the database open when it
-        # was unlinked still writes the deleted inode (the ``(deleted)`` fingerprint of #90950).
-        # Publishing a fresh inode here re-creates the same split brain the branch below exists
-        # to prevent, so refuse and name the holders instead (#110179).
-        holders = _foreign_db_holder_pids(target)
-        if holders:
-            raise OSError(
-                f"{target.name} was deleted but is still open in PID(s) "
-                f"{', '.join(str(pid) for pid in sorted(holders))}; publishing a new file would "
-                "leave them writing an invisible database. Stop those processes and re-run the import."
-            )
-        _extract_member_atomically(zf, member, target, new_file_mode)
-        return
-
-    # The database keeps its own mode/ownership: the bytes come from the
-    # archive but the file does not, so the archive has no say in either.
-    mode = _preserve_file_mode(target)
-    owner = _preserve_file_owner(target)
+    target_exists = target.exists()
+    target_identity = _file_identity(target) if target_exists else None
+    mode = _preserve_file_mode(target) if target_exists else None
+    owner = _preserve_file_owner(target) if target_exists else None
 
     fd, tmp_name = tempfile.mkstemp(
         dir=str(target.parent), prefix=f".{target.name[:80]}.", suffix=".dbimport"
     )
     try:
         with os.fdopen(fd, "wb") as dst:
-            # Stream: a multi-gigabyte state.db member must not be held in
-            # memory in one piece.
             with zf.open(member) as src:
                 shutil.copyfileobj(src, dst)
             dst.flush()
             os.fsync(dst.fileno())
-        if not _safe_restore_db(Path(tmp_name), target):
-            from hermes_cli.backup import verify_sqlite_integrity
+        tmp_path = Path(tmp_name)
+        if not _sqlite_main_file_is_structurally_valid(tmp_path):
+            _extract_member_atomically(zf, member, target, new_file_mode)
+            return
 
-            # Re-check only on failure so the user gets the real cause; the
-            # detailed integrity message was already logged by _safe_restore_db.
-            if not verify_sqlite_integrity(Path(tmp_name))["valid"]:
-                raise OSError(
-                    "the archived database failed its integrity check; the existing "
-                    "database was left untouched."
-                )
+        integrity = verify_sqlite_integrity(tmp_path, run_pragma=True)
+        if not integrity.get("valid"):
             raise OSError(
-                "live-safe restore refused or failed; the existing database was "
-                "left untouched. Stop the gateway/dashboard processes holding it "
-                "open and re-run the import."
+                "archive database failed integrity verification; restore refused: "
+                f"{integrity.get('message')}"
+            )
+
+        if not target_exists:
+            if _file_identity(target) is not None:
+                raise OSError(
+                    "SQLite destination appeared or was substituted before publish; restore refused"
+                )
+            expected_identity = _file_identity(tmp_path)
+            if expected_identity is None:
+                raise OSError("staged SQLite database disappeared; restore refused")
+            if not _remove_sqlite_sidecars(target):
+                raise OSError("SQLite destination sidecar cleanup failed; restore refused")
+            if _file_identity(target) is not None:
+                raise OSError(
+                    "SQLite destination appeared during sidecar cleanup; restore refused"
+                )
+            os.replace(tmp_path, target)
+            if not _remove_sqlite_sidecars(target, expected_identity):
+                raise OSError("installed SQLite sidecar cleanup failed; restore refused")
+            if not _validate_final_sqlite_destination(target, expected_identity):
+                raise OSError(
+                    "installed SQLite destination failed final validation; restore refused"
+                )
+            if new_file_mode is not None:
+                _restore_file_mode(target, new_file_mode)
+            return
+
+        if _file_identity(target) != target_identity:
+            raise OSError("SQLite destination was substituted while staging; restore refused")
+        if not _safe_restore_db(tmp_path, target):
+            raise OSError(
+                "live-safe restore refused or failed; the existing database was left untouched. "
+                "Stop processes holding it open and re-run the import."
             )
         _restore_file_owner(target, owner)
         _restore_file_mode(target, mode)

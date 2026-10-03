@@ -13,6 +13,9 @@ from unittest.mock import patch
 
 import pytest
 
+import hermes_cli.backup_restore as backup_restore_mod
+import hermes_cli.backup_sqlite as backup_sqlite_mod
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1548,7 +1551,7 @@ class TestQuickSnapshot:
         def boom(src, dst):
             return False
 
-        monkeypatch.setattr(backup_mod, "_safe_copy_db", boom)
+        monkeypatch.setattr(backup_mod, "copy_db_and_verify", boom)
         snap_id = backup_mod.create_quick_snapshot(hermes_home=hermes_home)
         # Other small files still snapshot; the failed DB is recorded, not silently dropped.
         assert snap_id
@@ -1599,7 +1602,7 @@ class TestQuickSnapshot:
         import hermes_cli.backup as backup
         from hermes_cli.backup import create_quick_snapshot, restore_quick_snapshot
 
-        monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+        monkeypatch.setattr(backup_restore_mod, "_foreign_db_holder_pids", lambda _path: [])
 
         snap_id = create_quick_snapshot(hermes_home=hermes_home)
         state_db = hermes_home / "state.db"
@@ -1814,13 +1817,13 @@ class TestQuickSnapshotProjectsKanban:
         conn.close()
 
         called = {"db": []}
-        real = bk._safe_copy_db
+        real = bk.copy_db_and_verify
 
         def _spy(src, dst):
             called["db"].append(str(src))
             return real(src, dst)
 
-        monkeypatch.setattr(bk, "_safe_copy_db", _spy)
+        monkeypatch.setattr(bk, "copy_db_and_verify", _spy)
         snap_id = create_quick_snapshot(hermes_home=hermes_home)
         # The board db was copied via _safe_copy_db (not raw copy).
         assert any(s.endswith("boards/work/kanban.db") for s in called["db"]), called["db"]
@@ -1845,13 +1848,13 @@ class TestQuickSnapshotProjectsKanban:
 
         real_copy = bk._safe_copy_db
 
-        def corrupt_after_copy(src, dst):
-            copied = real_copy(src, dst)
+        def corrupt_after_copy(src, dst, **kwargs):
+            copied = real_copy(src, dst, **kwargs)
             if src == source and copied:
                 dst.write_bytes(dst.read_bytes()[:100])
             return copied
 
-        monkeypatch.setattr(bk, "_safe_copy_db", corrupt_after_copy)
+        monkeypatch.setattr(backup_sqlite_mod, "_safe_copy_db", corrupt_after_copy)
         snap_id = create_quick_snapshot(hermes_home=hermes_home)
 
         assert snap_id is not None
@@ -2601,9 +2604,13 @@ def test_restore_quick_snapshot_fails_for_partial_mixed_manifest(tmp_path, monke
     home = tmp_path / "home"
     snap_dir = home / "state-snapshots" / "snap"
     snap_dir.mkdir(parents=True)
-    (snap_dir / "state.db").write_bytes(b"snapshot-db")
+    for db_path, value in ((snap_dir / "state.db", "snapshot-db"), (home / "state.db", "live-db")):
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE marker (value TEXT)")
+        conn.execute("INSERT INTO marker VALUES (?)", (value,))
+        conn.commit()
+        conn.close()
     (snap_dir / "config.yaml").write_text("snapshot: true\n")
-    (home / "state.db").write_bytes(b"live-db")
     (home / "config.yaml").write_text("snapshot: false\n")
     (snap_dir / "manifest.json").write_text(
         '{"files": {"state.db": 10, "config.yaml": 16}}'
@@ -2668,13 +2675,13 @@ def test_safe_restore_db_backup_fault_leaves_destination_and_sidecars_unchanged(
             return FailingBackupConnection(connection)
         return connection
 
-    monkeypatch.setattr(backup.sqlite3, "connect", connect)
+    monkeypatch.setattr(backup_restore_mod.sqlite3, "connect", connect)
     forbidden = []
-    monkeypatch.setattr(backup.os, "replace", lambda *args: forbidden.append("replace"))
-    monkeypatch.setattr(backup.os, "unlink", lambda *args: forbidden.append("unlink"), raising=False)
-    monkeypatch.setattr(backup.shutil, "move", lambda *args: forbidden.append("move"))
+    monkeypatch.setattr(backup_restore_mod.os, "replace", lambda *args: forbidden.append("replace"))
+    monkeypatch.setattr(backup_restore_mod.os, "unlink", lambda *args: forbidden.append("unlink"), raising=False)
+    monkeypatch.setattr(backup_restore_mod.shutil, "move", lambda *args: forbidden.append("move"))
 
-    assert backup._safe_restore_db(src, dst) is False
+    assert backup_restore_mod._safe_restore_db(src, dst) is False
     assert not forbidden
     assert dst.read_bytes() == destination_bytes_before
     assert rows_before == [("live",)]
@@ -2704,7 +2711,7 @@ def test_safe_restore_db_rejects_a_corrupt_source_before_touching_destination(
     assert backup.verify_sqlite_integrity(src)["valid"] is False
     before = dst.read_bytes()
 
-    assert backup._safe_restore_db(src, dst) is False
+    assert backup_restore_mod._safe_restore_db(src, dst) is False
     assert dst.read_bytes() == before
     with sqlite3.connect(dst) as conn:
         assert conn.execute("SELECT value FROM data").fetchall() == [("live",)]
@@ -2734,7 +2741,7 @@ def test_import_db_member_rejects_corrupt_archive_for_a_new_target(tmp_path):
     with zipfile.ZipFile(archive) as zf, pytest.raises(
         OSError, match="integrity|restore refused"
     ):
-        backup._import_db_member(zf, "state.db", target)
+        backup_restore_mod._import_db_member(zf, "state.db", target)
 
     assert not target.exists()
 
@@ -2817,7 +2824,7 @@ def test_safe_restore_db_recovers_corruption_behind_a_valid_header(
 ):
     import hermes_cli.backup as backup
 
-    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+    monkeypatch.setattr(backup_restore_mod, "_foreign_db_holder_pids", lambda _path: [])
 
     src = tmp_path / "source.db"
     dst = tmp_path / "state.db"
@@ -2836,7 +2843,7 @@ def test_safe_restore_db_recovers_corruption_behind_a_valid_header(
     dst.write_bytes(damaged)
     assert backup.verify_sqlite_integrity(dst)["valid"] is False
 
-    assert backup._safe_restore_db(src, dst) is True
+    assert backup_restore_mod._safe_restore_db(src, dst) is True
     assert backup.verify_sqlite_integrity(dst)["valid"] is True
     with sqlite3.connect(dst) as conn:
         assert conn.execute("SELECT value FROM data").fetchall() == [("snapshot",)]
@@ -3120,7 +3127,7 @@ class TestImportLiveSessionDatabase:
         import hermes_cli.backup as backup
         from hermes_cli.backup import run_import
 
-        monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+        monkeypatch.setattr(backup_restore_mod, "_foreign_db_holder_pids", lambda _path: [])
 
         home, live_db, zip_path = self._prepare(
             tmp_path, monkeypatch, live=(1, 1), backup=(2, 3)
@@ -3143,7 +3150,7 @@ class TestImportLiveSessionDatabase:
         import hermes_cli.backup as backup
         from hermes_cli.backup import run_import
 
-        monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+        monkeypatch.setattr(backup_restore_mod, "_foreign_db_holder_pids", lambda _path: [])
 
         home = tmp_path / ".hermes"
         home.mkdir()
@@ -3183,18 +3190,18 @@ def test_import_rejects_corrupted_final_destination(
 
     target = tmp_path / "home" / "state.db"
     target.parent.mkdir()
-    real_replace = backup.os.replace
+    real_replace = backup_restore_mod.os.replace
 
     def corrupt_after_publish(src, dst):
         real_replace(src, dst)
         if Path(dst) == target:
             target.write_bytes(target.read_bytes()[:100])
 
-    monkeypatch.setattr(backup.os, "replace", corrupt_after_publish)
+    monkeypatch.setattr(backup_restore_mod.os, "replace", corrupt_after_publish)
     with zipfile.ZipFile(archive) as zf, pytest.raises(
         OSError, match="destination|integrity|restore refused"
     ):
-        backup._import_db_member(zf, "state.db", target)
+        backup_restore_mod._import_db_member(zf, "state.db", target)
 
     assert target.exists()
     assert not backup.verify_sqlite_integrity(target)["valid"]
@@ -3219,11 +3226,11 @@ def test_import_preserves_published_database_when_post_publish_cleanup_refuses(
         cleanup_calls.append(expected_identity)
         return len(cleanup_calls) == 1
 
-    monkeypatch.setattr(backup, "_remove_sqlite_sidecars", refuse_after_publish)
+    monkeypatch.setattr(backup_restore_mod, "_remove_sqlite_sidecars", refuse_after_publish)
     with zipfile.ZipFile(archive) as zf, pytest.raises(
         OSError, match="sidecar cleanup failed"
     ):
-        backup._import_db_member(zf, "state.db", target)
+        backup_restore_mod._import_db_member(zf, "state.db", target)
 
     assert len(cleanup_calls) == 2
     assert target.exists()
@@ -3243,13 +3250,13 @@ def test_import_preserves_published_database_when_final_validation_locks(
     target = tmp_path / "home" / "state.db"
     target.parent.mkdir()
     monkeypatch.setattr(
-        backup, "_validate_final_sqlite_destination", lambda *_args: False
+        backup_restore_mod, "_validate_final_sqlite_destination", lambda *_args: False
     )
 
     with zipfile.ZipFile(archive) as zf, pytest.raises(
         OSError, match="final validation"
     ):
-        backup._import_db_member(zf, "state.db", target)
+        backup_restore_mod._import_db_member(zf, "state.db", target)
 
     assert target.exists()
     assert _count_rows(target) == (2, 6)
@@ -3268,16 +3275,16 @@ def test_fallback_restore_preserves_published_database_when_cleanup_refuses(
     target.write_bytes(b"corrupt-live-database")
     cleanup_calls = []
 
-    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+    monkeypatch.setattr(backup_restore_mod, "_foreign_db_holder_pids", lambda _path: [])
 
     def refuse_after_publish(path, expected_identity=None):
         assert path == target
         cleanup_calls.append(expected_identity)
         return len(cleanup_calls) == 1
 
-    monkeypatch.setattr(backup, "_remove_sqlite_sidecars", refuse_after_publish)
+    monkeypatch.setattr(backup_restore_mod, "_remove_sqlite_sidecars", refuse_after_publish)
 
-    assert backup._safe_restore_db(source, target) is False
+    assert backup_restore_mod._safe_restore_db(source, target) is False
     assert len(cleanup_calls) == 2
     assert target.exists()
     with sqlite3.connect(target) as conn:
@@ -3295,12 +3302,12 @@ def test_fallback_restore_preserves_published_database_when_final_validation_loc
         conn.execute("INSERT INTO data VALUES ('snapshot')")
     target = tmp_path / "state.db"
     target.write_bytes(b"corrupt-live-database")
-    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+    monkeypatch.setattr(backup_restore_mod, "_foreign_db_holder_pids", lambda _path: [])
     monkeypatch.setattr(
-        backup, "_validate_final_sqlite_destination", lambda *_args: False
+        backup_restore_mod, "_validate_final_sqlite_destination", lambda *_args: False
     )
 
-    assert backup._safe_restore_db(source, target) is False
+    assert backup_restore_mod._safe_restore_db(source, target) is False
     assert target.exists()
     with sqlite3.connect(target) as conn:
         assert conn.execute("SELECT value FROM data").fetchall() == [("snapshot",)]
@@ -3324,7 +3331,7 @@ def test_safe_restore_detects_destination_substitution_before_final_validation(
             conn.execute("CREATE TABLE data(value TEXT)")
             conn.execute("INSERT INTO data VALUES (?)", (value,))
 
-    real_probe = backup._sqlite_main_file_is_structurally_valid
+    real_probe = backup_restore_mod._sqlite_main_file_is_structurally_valid
 
     def substitute_after_probe(path):
         result = real_probe(path)
@@ -3333,10 +3340,10 @@ def test_safe_restore_detects_destination_substitution_before_final_validation(
         return result
 
     monkeypatch.setattr(
-        backup, "_sqlite_main_file_is_structurally_valid", substitute_after_probe
+        backup_restore_mod, "_sqlite_main_file_is_structurally_valid", substitute_after_probe
     )
 
-    assert backup._safe_restore_db(source, target) is False
+    assert backup_restore_mod._safe_restore_db(source, target) is False
 
 
 def test_safe_restore_rejects_destination_substitution_during_final_validation(
@@ -3367,7 +3374,7 @@ def test_safe_restore_rejects_destination_substitution_during_final_validation(
 
     monkeypatch.setattr(backup, "verify_sqlite_integrity", substitute_after_verify)
 
-    assert backup._safe_restore_db(source, target) is False
+    assert backup_restore_mod._safe_restore_db(source, target) is False
 
 
 def test_safe_restore_rejects_corrupted_fallback_destination(
@@ -3383,7 +3390,7 @@ def test_safe_restore_rejects_corrupted_fallback_destination(
         conn.execute("INSERT INTO data VALUES ('snapshot')")
     target.write_bytes(b"corrupt-destination")
 
-    real_connect = backup.sqlite3.connect
+    real_connect = backup_restore_mod.sqlite3.connect
     source_opens = 0
 
     def fail_restore_source_open(database, *args, **kwargs):
@@ -3394,10 +3401,10 @@ def test_safe_restore_rejects_corrupted_fallback_destination(
                 raise sqlite3.OperationalError("injected restore open failure")
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(backup.sqlite3, "connect", fail_restore_source_open)
+    monkeypatch.setattr(backup_restore_mod.sqlite3, "connect", fail_restore_source_open)
 
-    real_move = backup.shutil.move
-    real_atomic_replace = backup.atomic_replace
+    real_move = backup_restore_mod.shutil.move
+    real_atomic_replace = backup_restore_mod.atomic_replace
 
     def corrupt_after_move(src, dst):
         result = real_move(src, dst)
@@ -3411,10 +3418,10 @@ def test_safe_restore_rejects_corrupted_fallback_destination(
             target.write_bytes(target.read_bytes()[:100])
         return result
 
-    monkeypatch.setattr(backup.shutil, "move", corrupt_after_move)
-    monkeypatch.setattr(backup, "atomic_replace", corrupt_after_atomic_replace)
+    monkeypatch.setattr(backup_restore_mod.shutil, "move", corrupt_after_move)
+    monkeypatch.setattr(backup_restore_mod, "atomic_replace", corrupt_after_atomic_replace)
 
-    assert backup._safe_restore_db(source, target) is False
+    assert backup_restore_mod._safe_restore_db(source, target) is False
     assert target.exists()
     assert not backup.verify_sqlite_integrity(target)["valid"]
 
@@ -3426,7 +3433,7 @@ def test_foreign_holder_scan_is_unknown_on_permission_error(
     import hermes_cli.backup as backup
 
     db = tmp_path / "state.db"
-    real_listdir = backup.os.listdir
+    real_listdir = backup_restore_mod.os.listdir
 
     def listdir(path):
         if path == "/proc":
@@ -3437,17 +3444,17 @@ def test_foreign_holder_scan_is_unknown_on_permission_error(
             return ["7"]
         return real_listdir(path)
 
-    monkeypatch.setattr(backup.sys, "platform", "linux")
-    monkeypatch.setattr(backup.os, "getpid", lambda: 61000)
-    monkeypatch.setattr(backup.os, "listdir", listdir)
+    monkeypatch.setattr(backup_restore_mod.sys, "platform", "linux")
+    monkeypatch.setattr(backup_restore_mod.os, "getpid", lambda: 61000)
+    monkeypatch.setattr(backup_restore_mod.os, "listdir", listdir)
     if failure_stage == "fd_link":
         monkeypatch.setattr(
-            backup.os,
+            backup_restore_mod.os,
             "readlink",
             lambda _path: (_ for _ in ()).throw(PermissionError("denied")),
         )
 
-    assert backup._foreign_db_holder_pids(db) is None
+    assert backup_restore_mod._foreign_db_holder_pids(db) is None
 
 
 def test_sidecar_cleanup_does_not_require_offline_scan_when_no_sidecars_exist(
@@ -3458,15 +3465,15 @@ def test_sidecar_cleanup_does_not_require_offline_scan_when_no_sidecars_exist(
     target = tmp_path / "state.db"
     target.write_bytes(b"main")
     monkeypatch.setattr(
-        backup,
+        backup_restore_mod,
         "_can_remove_sqlite_sidecars",
         lambda _path: (_ for _ in ()).throw(
             AssertionError("an absent sidecar set needs no destructive-action proof")
         ),
     )
 
-    assert backup._remove_sqlite_sidecars(
-        target, backup._file_identity(target)
+    assert backup_restore_mod._remove_sqlite_sidecars(
+        target, backup_restore_mod._file_identity(target)
     ) is True
 
 
@@ -3477,7 +3484,7 @@ def test_sidecar_cleanup_rechecks_main_generation_when_no_sidecars_exist(
 
     target = tmp_path / "state.db"
     target.write_bytes(b"main")
-    expected = backup._file_identity(target)
+    expected = backup_restore_mod._file_identity(target)
     assert expected is not None
     main_reads = 0
 
@@ -3488,9 +3495,9 @@ def test_sidecar_cleanup_rechecks_main_generation_when_no_sidecars_exist(
             return expected if main_reads == 1 else (expected[0], expected[1] + 1)
         return None
 
-    monkeypatch.setattr(backup, "_file_identity", identity)
+    monkeypatch.setattr(backup_restore_mod, "_file_identity", identity)
 
-    assert backup._remove_sqlite_sidecars(target, expected) is False
+    assert backup_restore_mod._remove_sqlite_sidecars(target, expected) is False
 
 
 def test_safe_restore_db_does_not_report_success_when_sidecar_cleanup_is_unknown(
@@ -3507,16 +3514,16 @@ def test_safe_restore_db_does_not_report_success_when_sidecar_cleanup_is_unknown
 
     cleanup_calls = []
     monkeypatch.setattr(
-        backup, "_current_process_holds_sqlite_family", lambda _path: False
+        backup_restore_mod, "_current_process_holds_sqlite_family", lambda _path: False
     )
-    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: None)
+    monkeypatch.setattr(backup_restore_mod, "_foreign_db_holder_pids", lambda _path: None)
     monkeypatch.setattr(
-        backup,
+        backup_restore_mod,
         "_remove_sqlite_sidecars",
         lambda *_args, **_kwargs: cleanup_calls.append(True) or False,
     )
 
-    assert backup._safe_restore_db(source, target) is False
+    assert backup_restore_mod._safe_restore_db(source, target) is False
     assert cleanup_calls == [True]
 
 
@@ -3533,7 +3540,7 @@ def test_missing_destination_with_unremovable_sidecars_fails_before_open(
     sidecar = target.with_name(target.name + "-wal")
     sidecar.write_bytes(b"held-generation")
     target_opens = []
-    real_connect = backup.sqlite3.connect
+    real_connect = backup_restore_mod.sqlite3.connect
 
     def connect(database, *args, **kwargs):
         if database == str(target):
@@ -3541,11 +3548,11 @@ def test_missing_destination_with_unremovable_sidecars_fails_before_open(
             raise AssertionError("unproven sidecars must be refused before target open")
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(backup.sqlite3, "connect", connect)
-    monkeypatch.setattr(backup, "_can_remove_sqlite_sidecars", lambda _path: False)
-    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [61001])
+    monkeypatch.setattr(backup_restore_mod.sqlite3, "connect", connect)
+    monkeypatch.setattr(backup_restore_mod, "_can_remove_sqlite_sidecars", lambda _path: False)
+    monkeypatch.setattr(backup_restore_mod, "_foreign_db_holder_pids", lambda _path: [61001])
 
-    assert backup._safe_restore_db(source, target) is False
+    assert backup_restore_mod._safe_restore_db(source, target) is False
     assert target_opens == []
     assert not target.exists()
     assert sidecar.read_bytes() == b"held-generation"
@@ -3558,11 +3565,11 @@ def test_sidecar_cleanup_rechecks_holder_state_before_unlink(tmp_path, monkeypat
     target.write_bytes(b"main")
     sidecar = target.with_name(target.name + "-wal")
     sidecar.write_bytes(b"live-generation")
-    monkeypatch.setattr(backup, "_current_process_holds_sqlite_family", lambda _p: False)
-    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _p: [61001])
+    monkeypatch.setattr(backup_restore_mod, "_current_process_holds_sqlite_family", lambda _p: False)
+    monkeypatch.setattr(backup_restore_mod, "_foreign_db_holder_pids", lambda _p: [61001])
 
-    assert backup._remove_sqlite_sidecars(
-        target, backup._file_identity(target)
+    assert backup_restore_mod._remove_sqlite_sidecars(
+        target, backup_restore_mod._file_identity(target)
     ) is False
     assert sidecar.read_bytes() == b"live-generation"
 
@@ -3576,8 +3583,8 @@ def test_sidecar_cleanup_refuses_a_recreated_generation(tmp_path, monkeypatch):
     sidecar.write_bytes(b"captured-generation")
     replacement = tmp_path / "replacement-wal"
     replacement.write_bytes(b"new-generation")
-    expected_main = backup._file_identity(target)
-    real_identity = backup._file_identity
+    expected_main = backup_restore_mod._file_identity(target)
+    real_identity = backup_restore_mod._file_identity
     sidecar_reads = 0
 
     def identity(path):
@@ -3588,10 +3595,10 @@ def test_sidecar_cleanup_refuses_a_recreated_generation(tmp_path, monkeypatch):
                 replacement.replace(sidecar)
         return real_identity(path)
 
-    monkeypatch.setattr(backup, "_file_identity", identity)
-    monkeypatch.setattr(backup, "_can_remove_sqlite_sidecars", lambda _path: True)
+    monkeypatch.setattr(backup_restore_mod, "_file_identity", identity)
+    monkeypatch.setattr(backup_restore_mod, "_can_remove_sqlite_sidecars", lambda _path: True)
 
-    assert backup._remove_sqlite_sidecars(target, expected_main) is False
+    assert backup_restore_mod._remove_sqlite_sidecars(target, expected_main) is False
     assert sidecar.read_bytes() == b"new-generation"
 
 
@@ -3612,7 +3619,7 @@ def test_copy_verification_failure_preserves_replaced_destination(tmp_path, monk
 
     monkeypatch.setattr(backup, "verify_sqlite_integrity", replace_then_reject)
 
-    assert backup.copy_db_and_verify(source, destination) is False
+    assert backup_sqlite_mod.copy_db_and_verify(source, destination) is False
     assert destination.read_bytes() == b"another-writer"
 
 
@@ -3624,7 +3631,7 @@ def test_safe_copy_failure_preserves_replaced_destination(tmp_path, monkeypatch)
     replacement = tmp_path / "replacement.db"
     source.write_bytes(b"source")
     replacement.write_bytes(b"another-writer")
-    real_connect = backup.sqlite3.connect
+    real_connect = backup_sqlite_mod.sqlite3.connect
 
     class SourceConnection:
         def backup(self, _destination, **_kwargs):
@@ -3635,18 +3642,18 @@ def test_safe_copy_failure_preserves_replaced_destination(tmp_path, monkeypatch)
             return None
 
     def connect(database, *args, **kwargs):
-        if database == f"file:{source}?mode=ro":
+        if database == f"{source.resolve().as_uri()}?mode=ro":
             return SourceConnection()
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(backup.sqlite3, "connect", connect)
+    monkeypatch.setattr(backup_sqlite_mod.sqlite3, "connect", connect)
 
-    assert backup._safe_copy_db(source, destination) is False
+    assert backup_sqlite_mod._safe_copy_db(source, destination) is False
     assert destination.read_bytes() == b"another-writer"
 
 
 def _count_rows(db_path: Path) -> tuple[int, int]:
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro&immutable=1", uri=True)
     try:
         return (
             conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],

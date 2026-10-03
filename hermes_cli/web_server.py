@@ -8,7 +8,7 @@ Usage: ``python -m hermes_cli.main web [--port 8080]``.
 
 from contextlib import asynccontextmanager
 
-from gateway.code_skew import get_boot_fingerprint, runtime_source_digest
+from gateway.code_skew import get_boot_fingerprint, get_boot_source_digest, runtime_source_digest
 import asyncio
 from collections import deque
 import hmac
@@ -2060,6 +2060,6 @@ def _runtime_identity_from_boot_fingerprint() -> dict[str, str | None]:
     return {
         "code_fingerprint": fingerprint,
         "code_sha": code_sha,
-        "source_digest": runtime_source_digest(Path(__file__).resolve().parents[1]),
+        "source_digest": get_boot_source_digest(),
     }
 

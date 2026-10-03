@@ -26,7 +26,7 @@ from hermes_state_holders import read_only_db_uri
 
 from agent.provider_media import GENERATED_SUBDIR
 from hermes_cli.archive_safe import normalize_archive_parts
-from hermes_cli.backup_sqlite import _close_quietly, _safe_copy_db
+from hermes_cli.backup_sqlite import _close_quietly, _safe_copy_db, copy_db_and_verify
 from hermes_cli.home_data_layout import PM_RUNTIME_ROOT_DIRS, profile_root_entry
 from hermes_cli.sizefmt import format_bytes as _format_size
 
@@ -37,6 +37,7 @@ from hermes_cli.backup_restore import (
     _extract_member_atomically,
     _import_db_member,
     _safe_restore_db,
+    _sqlite_main_file_is_structurally_valid,
     _validate_backup_zip,
 )
 
@@ -493,7 +494,7 @@ def _zip_sqlite_snapshot(zf: zipfile.ZipFile, abs_path: Path, rel_path: Path, ou
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False, dir=str(out_path.parent)) as tmp:
         tmp_db = Path(tmp.name)
     try:
-        if not _safe_copy_db(abs_path, tmp_db):
+        if not copy_db_and_verify(abs_path, tmp_db):
             return None
         _write_zip_file(zf, tmp_db, str(rel_path))
         return tmp_db.stat().st_size
@@ -1312,7 +1313,7 @@ def _create_quick_snapshot_locked(
                     # board DB with an open WAL (the gateway may hold it at
                     # snapshot time) is captured consistently.
                     if sub.suffix == ".db":
-                        if not _safe_copy_db(sub, dst):
+                        if not copy_db_and_verify(sub, dst):
                             failed_dbs.append(sub_rel)
                             print(
                                 f"  ⚠ Snapshot: SQLite safe copy FAILED for {sub_rel} "
@@ -1344,7 +1345,7 @@ def _create_quick_snapshot_locked(
 
         try:
             if src.suffix == ".db":
-                if not _safe_copy_db(src, dst):
+                if not copy_db_and_verify(src, dst):
                     failed_dbs.append(rel)
                     print(
                         f"  ⚠ Snapshot: SQLite safe copy FAILED for {rel} "
@@ -1453,6 +1454,21 @@ def _create_quick_snapshot_locked(
     return snap_id
 
 
+def quick_snapshot_exists(
+    snapshot_id: str, hermes_home: Optional[Path] = None
+) -> bool:
+    """Return whether snapshot_id names an existing in-root snapshot directory."""
+    if not snapshot_id or "/" in snapshot_id or "\\" in snapshot_id or snapshot_id in (".", ".."):
+        return False
+    root = _quick_snapshot_root(hermes_home)
+    candidate = root / snapshot_id
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return candidate.is_dir() and (candidate / "manifest.json").is_file()
+
+
 def list_quick_snapshots(
     limit: int = 20,
     hermes_home: Optional[Path] = None,
@@ -1517,6 +1533,7 @@ def restore_quick_snapshot(
         meta = json.load(f)
 
     restored = 0
+    failed = 0
     for rel in meta.get("files", {}):
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
@@ -1534,29 +1551,28 @@ def restore_quick_snapshot(
             continue
 
         if not src.exists():
+            failed += 1
             continue
 
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            if dst.suffix == ".db":
-                # Restore through SQLite backup API so live connections
-                # (gateway, dashboard, another CLI session) see the
-                # restored data instead of continuing to serve stale
-                # cached pages from a replaced inode (issue #65942).
+            if dst.suffix == ".db" and _sqlite_main_file_is_structurally_valid(src):
+                # Restore real SQLite databases through the backup API so live
+                # connections converge without replacing the destination inode.
                 if not _safe_restore_db(src, dst):
-                    # Refused, failed, or source failed its integrity check:
-                    # dst left as it was. Count as a failure, not a restore.
                     logger.error("Failed to restore %s: refused or source integrity check failed (see previous log)", rel)
+                    failed += 1
                     continue
             else:
                 shutil.copy2(src, dst)
             restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
+            failed += 1
 
-    logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
-    return restored > 0
+    logger.info("Restored %d files from snapshot %s (%d failed)", restored, snapshot_id, failed)
+    return restored > 0 and failed == 0
 
 
 def _count_cron_jobs(path: Path) -> Optional[int]:

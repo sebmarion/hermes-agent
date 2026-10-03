@@ -1,4 +1,4 @@
-import { JsonRpcGatewayClient, JsonRpcGatewayError, type ConnectionState } from "@hermes/shared";
+import { JsonRpcGatewayClient, JsonRpcGatewayError, type ConnectionState, type ServerRequest } from "@hermes/shared";
 import { api, buildWsUrl, type SessionInfo } from "@/lib/api";
 import { choiceKey, modelSwitchValue, parseModelOptions, type ModelChoice, type ModelOptions, type ModelSwitchResult } from "./model-controls";
 import { emptyConversation, historyItems, reduceEvent, type Conversation, type RequestCard } from "./model";
@@ -11,7 +11,6 @@ interface SessionResult {
   messages?: unknown[];
   running?: boolean;
   pending_approval?: Record<string, unknown>;
-  pending_clarify?: Record<string, unknown>;
   info?: { model?: string; provider?: string; lazy?: boolean };
   inflight?: { assistant?: string; user?: string; status?: string; streaming?: boolean; error?: string };
 }
@@ -48,6 +47,8 @@ function readDraft(id: string | null): string {
   try { return sessionStorage.getItem(draftKey(id)) || ""; } catch { return ""; }
 }
 const errorText = (error: unknown) => error instanceof Error ? error.message : "Something went wrong. Please try again.";
+const stringValue = (value: unknown): string => typeof value === "string" ? value : "";
+const stringList = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 
 /** One foreground view; the existing gateway remains the execution and persistence authority. */
 export class ZeusChatController {
@@ -62,14 +63,127 @@ export class ZeusChatController {
   private modelSwitchSubmitted = false;
   private generation = 0;
   private lifecycle = 0;
+  private resumeGeneration: number | null = null;
   private stopped = false;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectFlight: Promise<void> | null = null;
   private retries = 0;
   private disposers: Array<() => void> = [];
+  private serverRequests = new Map<string, ServerRequest>();
+  private serverRequestCards = new Map<string, RequestCard>();
   getSnapshot = () => this.state;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => this.listeners.delete(listener); };
   private patch(patch: Partial<ChatSnapshot>) { this.state = { ...this.state, ...patch }; this.listeners.forEach(listener => listener()); }
+
+  private parkServerRequest(request: ServerRequest, card: RequestCard) {
+    this.serverRequests.set(request.id, request);
+    this.serverRequestCards.set(request.id, card);
+    const current = this.state.pending;
+    const replacesSameApproval = current?.kind === "approval" && card.kind === "approval" && current.request_id === card.request_id;
+    if (!current || current.server_request_id === request.id || replacesSameApproval) {
+      this.patch({ pending: card, busy: true, activity: "Needs your reply" });
+    }
+  }
+
+  private finishServerRequest(id: string) {
+    this.serverRequests.delete(id);
+    this.serverRequestCards.delete(id);
+    if (this.state.pending?.server_request_id !== id) return;
+    const next = this.serverRequestCards.values().next().value as RequestCard | undefined;
+    this.patch({
+      pending: next ?? null,
+      activity: next ? "Needs your reply" : "Working…",
+    });
+  }
+
+  private clearLiveRequests() {
+    this.serverRequests.clear();
+    this.serverRequestCards.clear();
+  }
+
+  private handleServerRequest = (request: ServerRequest): boolean => {
+    const params = request.params;
+    const sessionId = stringValue(params.session_id);
+    const owned = this.runtimeId
+      ? sessionId === this.runtimeId
+      : Boolean(request.replayed && this.resumeGeneration !== null && sessionId);
+    if (!owned) {
+      request.decline?.("Zeus web chat is not showing this session.");
+      return false;
+    }
+
+    if (["terminal.read", "preview.read", "preview.act", "window.read", "tour"].includes(request.method)) {
+      const message = "Desktop pane controls are not available in Zeus web chat. Use standard server tools or ask the user in chat.";
+      request.respond({ value: JSON.stringify({ ok: false, error: message }) });
+      return true;
+    }
+
+    if (request.method === "approval") {
+      const requestId = stringValue(params.request_id);
+      if (!requestId) {
+        request.fail(-32602, "approval request is missing request_id");
+        return true;
+      }
+      const card: RequestCard = {
+        ...params,
+        kind: "approval",
+        request_id: requestId,
+        server_request_id: request.id,
+        choices: stringList(params.choices),
+        command: stringValue(params.command),
+        description: stringValue(params.description),
+      };
+      this.parkServerRequest(request, card);
+      void this.client.request("approval.received", {
+        session_id: sessionId, profile: PROFILE, request_id: requestId,
+      }).catch(error => {
+        if (this.serverRequests.has(request.id)) this.patch({ error: "Approval acknowledgement failed: " + errorText(error) });
+      });
+      return true;
+    }
+
+    if (request.method === "clarify") {
+      const questions = (Array.isArray(params.questions) ? params.questions : [])
+        .map(raw => raw && typeof raw === "object" ? raw as Record<string, unknown> : {})
+        .filter(question => stringValue(question.qid) && stringValue(question.question).trim())
+        .map(question => ({
+          qid: stringValue(question.qid),
+          question: stringValue(question.question).trim(),
+          choices: stringList(question.choices),
+          multi_select: question.multi_select === true,
+        }));
+      if (!questions.length) {
+        request.respond({});
+        return true;
+      }
+      const answers = params.answers && typeof params.answers === "object"
+        ? Object.fromEntries(Object.entries(params.answers as Record<string, unknown>)
+            .filter((entry): entry is [string, string | null] => typeof entry[1] === "string" || entry[1] === null))
+        : {};
+      this.parkServerRequest(request, {
+        kind: "clarify", request_id: request.id, server_request_id: request.id, questions, answers,
+      });
+      return true;
+    }
+
+    if (request.method === "sudo") {
+      this.parkServerRequest(request, {
+        kind: "sudo", request_id: request.id, server_request_id: request.id,
+        command: stringValue(params.command),
+      });
+      return true;
+    }
+
+    if (request.method === "secret") {
+      this.parkServerRequest(request, {
+        kind: "secret", request_id: request.id, server_request_id: request.id,
+        prompt: stringValue(params.prompt),
+      });
+      return true;
+    }
+
+    return false;
+  };
 
   start() {
     this.stopped = false;
@@ -79,24 +193,8 @@ export class ZeusChatController {
       this.patch({ connection });
       if ((connection === "closed" || connection === "error") && !this.stopped) this.scheduleReconnect();
     }));
+    this.disposers.push(this.client.onRequest(this.handleServerRequest));
     this.disposers.push(this.client.onEvent(event => {
-      // A resumed desktop conversation may request UI panes that this chat deliberately does not expose.
-      // Fail those read/GUI bridges explicitly; never auto-approve or pretend to perform an action.
-      const unsupported: Record<string, [string, string]> = {
-        "terminal.read.request": ["terminal.read.respond", "text"],
-        "preview.read.request": ["preview.read.respond", "text"],
-        "preview.act.request": ["preview.act.respond", "text"],
-        "window.read.request": ["window.read.respond", "text"],
-        "tour.request": ["tour.respond", "text"],
-        "mcp.setup.request": ["mcp.setup.respond", "result"],
-      };
-      const bridge = unsupported[event.type];
-      const payload = event.payload as { request_id?: string } | undefined;
-      if (bridge && this.runtimeId && event.session_id === this.runtimeId && payload?.request_id) {
-        const message = "Desktop pane controls are not available in Zeus web chat. Use standard server tools or ask the user in chat.";
-        void this.client.request(bridge[0], { session_id: this.runtimeId, profile: PROFILE, request_id: payload.request_id, [bridge[1]]: JSON.stringify({ ok: false, error: message }) }).catch(error => this.patch({ error: errorText(error) }));
-        return;
-      }
       if (event.type === "session.info" && event.session_id === this.runtimeId && !this.state.modelChanging) {
         const info = event.payload as SessionResult["info"];
         if (info?.model && info.provider && !info.lazy) { this.modelSwitchSubmitted = false; this.patch({ model: info.model, provider: info.provider, modelUncertain: false }); }
@@ -104,9 +202,9 @@ export class ZeusChatController {
       if (event.type === "message.start" && event.session_id === this.runtimeId && this.state.modelDeferred) this.patch({ modelDeferred: false, modelNotice: "Using the selected model for this reply." });
       const next = reduceEvent(this.state, event, this.runtimeId);
       if (next !== this.state) this.patch(next);
-      if (event.type === "approval.request" && event.session_id === this.runtimeId) {
-        const request = this.state.pending;
-        if (request) void this.client.request("approval.received", { session_id: this.runtimeId, profile: PROFILE, request_id: request.request_id }).catch(() => {});
+      if (event.type === "request.cancel" && event.session_id === this.runtimeId) {
+        const cancelled = event.payload as { id?: string };
+        if (typeof cancelled.id === "string") this.finishServerRequest(cancelled.id);
       }
       if (event.type === "message.complete" && event.session_id === this.runtimeId) void this.refreshHistory();
     }));
@@ -120,7 +218,9 @@ export class ZeusChatController {
   }
   stop() {
     this.stopped = true; this.lifecycle++; this.generation++;
-    this.patch({ modelChanging: false, modelUncertain: this.state.modelUncertain || this.modelSwitchSubmitted });
+    this.clearLiveRequests();
+    this.resumeGeneration = null;
+    this.patch({ modelChanging: false, modelUncertain: this.state.modelUncertain || this.modelSwitchSubmitted, pending: null });
     this.reconnectFlight = null;
     clearTimeout(this.retryTimer); this.retryTimer = undefined;
     this.disposers.forEach(dispose => dispose()); this.disposers = [];
@@ -173,6 +273,8 @@ export class ZeusChatController {
   }
   newChat = () => {
     if (this.state.sending || this.state.modelChanging) return;
+    this.clearLiveRequests();
+    this.resumeGeneration = null;
     this.generation++; this.runtimeId = null; this.modelSwitchSubmitted = false; this.remember(null);
     this.patch({ ...emptyConversation(), storedId: null, draft: readDraft(null), title: "New conversation", model: "", provider: "", modelUncertain: false, modelNotice: "", modelDeferred: false, loading: false, uncertain: false });
   };
@@ -182,14 +284,20 @@ export class ZeusChatController {
     const same = this.state.storedId === id;
     if (!same) this.modelSwitchSubmitted = false;
     if (reconnect && this.state.modelChanging) this.patch({ modelChanging: false, modelUncertain: true });
+    this.clearLiveRequests();
     this.runtimeId = null;
+    this.resumeGeneration = generation;
     const row = this.state.sessions.find(session => session.id === id);
-    this.patch({ ...(same ? {} : { ...emptyConversation(), model: "", provider: "", modelUncertain: false, modelNotice: "", modelDeferred: false }), storedId: id, title: row?.title || row?.preview || "Conversation", loading: true, modelUncertain: true, draft: same ? this.state.draft : readDraft(id), uncertain: unconfirmed(id), error: "" });
+    this.patch({ ...(same ? { pending: null } : { ...emptyConversation(), model: "", provider: "", modelUncertain: false, modelNotice: "", modelDeferred: false }), storedId: id, title: row?.title || row?.preview || "Conversation", loading: true, modelUncertain: true, draft: same ? this.state.draft : readDraft(id), uncertain: unconfirmed(id), error: "" });
     this.remember(id);
     try {
       let result = await this.client.request<SessionResult>("session.resume", { session_id: id, profile: PROFILE, source: "web", cols: 96 });
-      if (generation !== this.generation || this.stopped) return;
+      if (this.resumeGeneration === generation) this.resumeGeneration = null;
+      if (generation !== this.generation || this.stopped) { this.clearLiveRequests(); return; }
       this.runtimeId = result.session_id;
+      for (const [requestId, live] of this.serverRequests) {
+        if (stringValue(live.params.session_id) !== result.session_id) this.finishServerRequest(requestId);
+      }
       if (result.info?.lazy || !result.info?.model || !result.info.provider) {
         this.patch({ modelUncertain: true });
         const runtime = await this.readModelRuntime(result.session_id, generation);
@@ -208,9 +316,15 @@ export class ZeusChatController {
         items.push({ id: "resumed-stream", role: "assistant", text: result.inflight.assistant, streaming: Boolean(result.running) && !failed });
       }
       if (result.info?.model && result.info?.provider && !result.running) this.modelSwitchSubmitted = false;
-      const pending = result.pending_approval ? { ...result.pending_approval, kind: "approval" } as RequestCard : result.pending_clarify ? { ...result.pending_clarify, kind: "clarify" } as RequestCard : null;
-      this.patch({ storedId, items, loading: false, busy: Boolean(result.running), activity: pending ? "Needs your reply" : result.running ? "Working…" : "", pending, error: failed ? result.inflight?.error || "Zeus could not finish the previous response." : unconfirmed(storedId) ? "A previous send was not confirmed. Check this conversation before sending the saved draft again." : "", ...(!result.info?.lazy && result.info?.model && result.info.provider ? { model: result.info.model, provider: result.info.provider, modelUncertain: false } : {}) });
-    } catch (error) { if (generation === this.generation && !this.stopped) { this.runtimeId = null; this.patch({ loading: false, modelUncertain: true, modelNotice: "The restored model is not verified. Refresh this conversation before sending.", error: `Conversation could not be restored: ${errorText(error)}` }); } }
+      const pending = this.state.pending ?? (result.pending_approval ? { ...result.pending_approval, kind: "approval" } as RequestCard : null);
+      this.patch({ storedId, items, loading: false, busy: Boolean(result.running) || Boolean(pending), activity: pending ? "Needs your reply" : result.running ? "Working…" : "", pending, error: failed ? result.inflight?.error || "Zeus could not finish the previous response." : unconfirmed(storedId) ? "A previous send was not confirmed. Check this conversation before sending the saved draft again." : "", ...(!result.info?.lazy && result.info?.model && result.info.provider ? { model: result.info.model, provider: result.info.provider, modelUncertain: false } : {}) });
+    } catch (error) {
+      if (this.resumeGeneration === generation) this.resumeGeneration = null;
+      if (generation === this.generation && !this.stopped) {
+        this.clearLiveRequests(); this.runtimeId = null;
+        this.patch({ loading: false, pending: null, modelUncertain: true, modelNotice: "The restored model is not verified. Refresh this conversation before sending.", error: "Conversation could not be restored: " + errorText(error) });
+      }
+    }
   };
   private async ensureSession(title: string) {
     if (this.runtimeId) return;
@@ -308,11 +422,11 @@ export class ZeusChatController {
   };
   private async refreshPending() {
     const generation = this.generation, storedId = this.state.storedId;
-    if (!storedId || !this.runtimeId) return;
+    if (!storedId || !this.runtimeId || this.state.pending) return;
     try {
       const result = await this.client.request<SessionResult>("session.resume", { session_id: storedId, profile: PROFILE, source: "web", omit_messages: true });
       if (generation !== this.generation || this.stopped || this.state.pending) return;
-      const pending = result.pending_approval ? { ...result.pending_approval, kind: "approval" } as RequestCard : result.pending_clarify ? { ...result.pending_clarify, kind: "clarify" } as RequestCard : null;
+      const pending = result.pending_approval ? { ...result.pending_approval, kind: "approval" } as RequestCard : null;
       if (pending) this.patch({ pending, busy: true, activity: "Needs your reply" });
     } catch (error) { if (generation === this.generation && !this.stopped) this.patch({ error: `Could not check remaining requests: ${errorText(error)}` }); }
   }
@@ -320,16 +434,62 @@ export class ZeusChatController {
     if (this.state.sending || !this.runtimeId || this.state.pending?.request_id !== request.request_id) return;
     this.patch({ sending: true, error: "" });
     try {
-      const key = { approval: "choice", clarify: "answer", sudo: "password", secret: "value" }[request.kind];
-      const result = await this.client.request<{ resolved?: number }>(`${request.kind}.respond`, {
-        session_id: this.runtimeId, profile: PROFILE, request_id: request.request_id, [key]: value,
-        ...(questionId ? { question_id: questionId } : {}),
-      });
-      if (request.kind === "approval" && !result.resolved) throw new Error("This approval has expired or was already answered. Refresh the conversation.");
-      const remaining = questionId ? request.questions?.filter(q => q.qid !== questionId) : [];
-      this.patch({ pending: remaining?.length ? { ...request, questions: remaining } : null, activity: remaining?.length ? "Needs your reply" : "Working…" });
-      if (!remaining?.length) await this.refreshPending();
-    } catch (error) { this.patch({ error: `Reply was not confirmed: ${errorText(error)}` }); }
-    finally { this.patch({ sending: false }); }
+      const live = request.server_request_id ? this.serverRequests.get(request.server_request_id) : undefined;
+
+      if (request.kind === "approval") {
+        if (live?.method === "approval") {
+          live.respond({ choice: value });
+          this.finishServerRequest(live.id);
+        } else {
+          const result = await this.client.request<{ resolved?: number }>("approval.respond", {
+            session_id: this.runtimeId, profile: PROFILE, request_id: request.request_id, choice: value,
+          });
+          if (!result.resolved) throw new Error("This approval has expired or was already answered. Refresh the conversation.");
+          if (this.state.pending?.request_id === request.request_id) this.patch({ pending: null, activity: "Working…" });
+        }
+        await this.refreshPending();
+        return;
+      }
+
+      if (!live) throw new Error("This request has expired or was already answered. Refresh the conversation.");
+
+      if (request.kind === "clarify") {
+        if (live.method !== "clarify") throw new Error("The pending request changed. Refresh the conversation.");
+        if (!questionId) {
+          live.respond({});
+          this.finishServerRequest(live.id);
+          return;
+        }
+        const result = await this.client.request<{ status?: string; remaining?: string[] }>("clarify.lock", {
+          session_id: this.runtimeId, profile: PROFILE, request_id: live.id,
+          question_id: questionId, answer: value.trim() ? value : null,
+        });
+        if (result.status === "expired") {
+          this.finishServerRequest(live.id);
+          return;
+        }
+        const remaining = Array.isArray(result.remaining) ? result.remaining : [];
+        if (!remaining.length) {
+          this.finishServerRequest(live.id);
+          return;
+        }
+        const answers = { ...(request.answers ?? {}), [questionId]: value.trim() ? value : null };
+        const questions = request.questions?.filter(question => question.qid && remaining.includes(question.qid)) ?? [];
+        const updated = { ...request, answers, questions };
+        this.serverRequestCards.set(live.id, updated);
+        this.patch({ pending: updated, activity: "Needs your reply" });
+        return;
+      }
+
+      if ((request.kind === "sudo" && live.method !== "sudo") || (request.kind === "secret" && live.method !== "secret")) {
+        throw new Error("The pending request changed. Refresh the conversation.");
+      }
+      live.respond({ value });
+      this.finishServerRequest(live.id);
+    } catch (error) {
+      this.patch({ error: "Reply was not confirmed: " + errorText(error) });
+    } finally {
+      this.patch({ sending: false });
+    }
   };
 }
