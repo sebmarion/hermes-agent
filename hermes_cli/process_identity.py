@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import platform
 import sys
@@ -57,12 +58,30 @@ def install_id(project_root: Optional[Path] = None) -> str:
     return hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()[:12]
 
 
+def _valid_pid(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _valid_creation_time(value: object) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value > 0
+    except OverflowError:
+        # JSON integers need not fit the process clock's floating-point range.
+        return False
+
+
 def _process_create_time(pid: Optional[int] = None) -> Optional[float]:
     """``psutil`` create time for ``pid`` (default: this process); ``None`` when psutil can't say."""
     try:
         import psutil
 
-        return float(psutil.Process(os.getpid() if pid is None else pid).create_time())
+        target = os.getpid() if pid is None else pid
+        if not _valid_pid(target):
+            return None
+        created = psutil.Process(target).create_time()
+        return float(created) if _valid_creation_time(created) else None
     except Exception:
         return None
 
@@ -103,7 +122,9 @@ def parse_spawn_tag(raw: object) -> Optional[SpawnTag]:
         create = None if create_s == "-" else float(create_s)
     except ValueError:
         return None
-    return SpawnTag(install, purpose, pid, create) if pid > 0 else None
+    if not _valid_pid(pid) or (create is not None and not _valid_creation_time(create)):
+        return None
+    return SpawnTag(install, purpose, pid, create)
 
 
 # Layer 2 — spawn ledger
@@ -182,20 +203,30 @@ def _same_incarnation(proc, create_time: Optional[float]) -> bool:
 
 
 def _pid_alive_matches(pid: int, create_time: Optional[float], *, strict: bool = False) -> Optional[bool]:
-    """True/False when provable; ``None`` when psutil can't say."""
+    """True/False when provable; ``None`` when identity or liveness is unknown."""
+    if not _valid_pid(pid):
+        return None
+    if create_time is not None and not _valid_creation_time(create_time):
+        return None
+    if strict and create_time is None:
+        return None
     try:
         import psutil
     except Exception:
         return None
     try:
-        proc = psutil.Process(int(pid))
+        proc = psutil.Process(pid)
+        live_create = proc.create_time()
+        if not _valid_creation_time(live_create):
+            return None
         if strict:
-            return (create_time is not None and proc.create_time() == create_time
-                    and proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE)
+            return (live_create == create_time and proc.is_running()
+                    and proc.status() != getattr(psutil, "STATUS_ZOMBIE", "zombie"))
         # A zombie keeps its create_time until its parent reaps it, but it is already dead: the
         # dashboard stop check (``gateway.status._pid_exists``) books it stopped, so the ledger must
         # not report it as a live pre-update survivor. Windows has no zombies (and status() is slow there).
-        return _same_incarnation(proc, create_time) and (
+        matches = create_time is None or abs(live_create - create_time) < 2.0
+        return matches and (
             os.name == "nt" or proc.status() != getattr(psutil, "STATUS_ZOMBIE", "zombie"))
     except psutil.NoSuchProcess:
         return False
@@ -215,7 +246,10 @@ def register_self(purpose: str, *, project_root: Optional[Path] = None, detail: 
 
     tag = parse_spawn_tag(os.environ.get(SPAWN_ENV_VAR))
     spawner_pid, spawner_create = (tag.spawner_pid, tag.spawner_create) if tag else _desktop_spawner_identity()
-    entry = _new_entry(os.getpid(), _process_create_time(), purpose, project_root, spawner_pid, spawner_create)
+    created = _process_create_time()
+    if not _valid_creation_time(created):
+        return False
+    entry = _new_entry(os.getpid(), created, purpose, project_root, spawner_pid, spawner_create)
     entry.hermes_home = hermes_home_key()
     if detail:
         try:
@@ -297,7 +331,8 @@ def _append_entry(entry: LedgerEntry) -> bool:
         # Drop malformed entries, our own stale entry, and provably dead pids.
         pruned = [
             e for e in entries
-            if isinstance(e.get("pid"), int)
+            if _valid_pid(e.get("pid"))
+            and (e.get("create_time") is None or _valid_creation_time(e.get("create_time")))
             and e["pid"] != entry.pid
             and _pid_alive_matches(e["pid"], e.get("create_time")) is not False
         ]
@@ -322,12 +357,10 @@ def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = Non
     ``(pid, create_time)`` with THIS process as spawner, so a helper whose spawner is provably gone
     is a reapable orphan and one whose spawner is alive is never reaped.
     """
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
+    if not _valid_pid(pid):
         return False
-    child_create = _process_create_time(pid) if pid > 0 else None
-    if child_create is None:
+    child_create = _process_create_time(pid)
+    if not _valid_creation_time(child_create):
         return False
     entry = _new_entry(pid, child_create, purpose, project_root, os.getpid(), _process_create_time())
     try:
@@ -360,7 +393,8 @@ def ledger_entries(
     return [
         e for e in entries
         if (all_installs or e.get("install") == want_install)
-        and isinstance(e.get("pid"), int)
+        and _valid_pid(e.get("pid"))
+        and (e.get("create_time") is None or _valid_creation_time(e.get("create_time")))
         and (_pid_alive_matches(e["pid"], e.get("create_time"), strict=True) is True
              if verified_only else _pid_alive_matches(e["pid"], e.get("create_time")) is not False)
     ]
@@ -369,7 +403,7 @@ def ledger_entries(
 def spawner_is_dead(entry: dict) -> Optional[bool]:
     """Is the recorded spawner of this entry provably gone? ``None`` when unrecorded/unprovable."""
     spawner_pid = entry.get("spawner_pid")
-    if not isinstance(spawner_pid, int) or spawner_pid <= 0:
+    if not _valid_pid(spawner_pid) or not _valid_creation_time(entry.get("spawner_create")):
         return None
     alive = _pid_alive_matches(spawner_pid, entry.get("spawner_create"))
     return None if alive is None else not alive
@@ -391,18 +425,23 @@ def reap_orphaned_mcp_helpers(*, project_root: Optional[Path] = None, kill_fn=No
     for entry in entries:
         try:
             pid = entry.get("pid")
-            if entry.get("purpose") != "mcp-helper" or not isinstance(pid, int) or pid <= 0 or pid == own_pid:
+            created = entry.get("create_time")
+            if (entry.get("purpose") != "mcp-helper" or not _valid_pid(pid)
+                    or pid == own_pid or not _valid_creation_time(created)):
                 continue
             if spawner_is_dead(entry) is not True:
                 continue  # live or unprovable spawner → never touch
+            import psutil
+
+            # A liveness-only ledger entry never authorizes a destructive action.
+            # Revalidate both callback and default paths at the final boundary.
+            proc = psutil.Process(pid)
+            live_create = proc.create_time()
+            if not _valid_creation_time(live_create) or live_create != created:
+                continue
             if kill_fn is not None:
                 kill_fn(pid)
             else:
-                import psutil
-
-                proc = psutil.Process(pid)
-                if not _same_incarnation(proc, entry.get("create_time")):
-                    continue  # PID reused since registration
                 # Windows: descendants (npx.cmd → node.exe) have no pgid to group-kill and
                 # reparent with ParentId=null when the direct child exits first (#61059), so
                 # reap the whole tree. On POSIX the killpg-based sweep already reaches them.

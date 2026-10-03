@@ -27,6 +27,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_cli import process_identity as pi
+from tests.compat.old_updater_support import fresh_child, no_external_work  # noqa: F401
 
 
 class _FakeNoSuchProcess(Exception):
@@ -328,7 +329,7 @@ def test_spawner_is_dead_tristate():
 
 
 @pytest.mark.parametrize(
-    "spawner_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0, True]
+    "spawner_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0, True, pytest.param(10**1000, id="oversized")]
 )
 def test_spawner_is_dead_refuses_invalid_creation_time(spawner_create):
     fake = _fake_psutil({500: 5.0})
@@ -341,7 +342,7 @@ def test_spawner_is_dead_refuses_invalid_creation_time(spawner_create):
         )
 
 
-@pytest.mark.parametrize("live_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+@pytest.mark.parametrize("live_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0, pytest.param(10**1000, id="oversized")])
 def test_spawner_is_dead_refuses_invalid_live_creation_time(live_create):
     fake = _fake_psutil({500: live_create})
     with patch.dict(sys.modules, {"psutil": fake}):
@@ -354,66 +355,33 @@ def test_spawner_is_dead_refuses_invalid_live_creation_time(live_create):
 
 
 # ---------------------------------------------------------------------------
-# Updater rung: _ledger_reapable_backend_pids
+# Historical updater exports: the new package manager owns continuation.
 # ---------------------------------------------------------------------------
 
-def _holders(*pids):
-    return [(p, "python.exe", f"python.exe -m hermes_cli.main --profile p{p} serve") for p in pids]
+@pytest.mark.real_concurrent_gate
+@pytest.mark.parametrize("holders", [
+    [],
+    [(200, "python.exe", "python.exe -m hermes_cli.main serve")],
+    [(True, "python.exe", "unknown"), (200, "python.exe", "reused identity")],
+])
+def test_historical_updater_hands_off_without_classifying_or_killing(
+    holders, monkeypatch, fresh_child, no_external_work,
+):
+    """A retired entry point must not reintroduce a PID-only kill path.
 
+    The live package manager builds a new environment, so historical callers
+    hand off without scanning or reaping holders of the previous environment.
+    """
+    from copy import deepcopy
+    from hermes_cli import main
+    import psutil
 
-def test_updater_reaps_ledger_proven_orphans():
-    from hermes_cli import update_cmd_windows
-
-    entries = [
-        _entry(200, 2.0, spawner_pid=700, spawner_create=7.0),   # spawner dead → reap
-        _entry(201, 2.1, spawner_pid=500, spawner_create=5.0),   # spawner alive → keep
-        _entry(202, 2.2, purpose="chat", spawner_pid=700, spawner_create=7.0),  # not reapable purpose
-    ]
-    fake = _fake_psutil({200: 2.0, 201: 2.1, 202: 2.2, 500: 5.0})
-    with patch.dict(sys.modules, {"psutil": fake}), \
-         patch.object(pi, "ledger_entries", return_value=entries), \
-         patch.object(pi, "spawner_is_dead", wraps=pi.spawner_is_dead):
-        assert cli_main._ledger_reapable_backend_pids(
-            _holders(200, 201, 202, 203)
-        ) == [(200, 2.0)]
-
-
-def test_updater_ledger_rung_rejects_a_reused_target_pid():
-    from hermes_cli import main as cli_main
-
-    entries = [
-        _entry(200, 2.0, spawner_pid=700, spawner_create=7.0),
-    ]
-    fake = _fake_psutil({200: 99.0})
-    with patch.dict(sys.modules, {"psutil": fake}), \
-         patch.object(pi, "ledger_entries", return_value=entries), \
-         patch.object(pi, "spawner_is_dead", wraps=pi.spawner_is_dead):
-        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
-
-
-@pytest.mark.parametrize("recorded_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
-def test_updater_ledger_rung_rejects_invalid_target_creation_time(recorded_create):
-    from hermes_cli import main as cli_main
-
-    entries = [
-        _entry(200, recorded_create, spawner_pid=700, spawner_create=7.0),
-    ]
-    fake = _fake_psutil({200: 2.0})
-    with patch.dict(sys.modules, {"psutil": fake}), \
-         patch.object(pi, "ledger_entries", return_value=entries), \
-         patch.object(pi, "spawner_is_dead", return_value=True):
-        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
-
-        assert update_cmd_windows._ledger_reapable_backend_pids(_holders(200, 201, 202, 203)) == [200]
-
-
-
-
-def test_updater_ledger_rung_never_raises():
-    from hermes_cli import update_cmd_windows
-
-    with patch.object(pi, "ledger_entries", side_effect=RuntimeError("boom")):
-        assert update_cmd_windows._ledger_reapable_backend_pids(_holders(200)) == []
+    before = deepcopy(holders)
+    monkeypatch.setattr(pi, "ledger_entries", no_external_work)
+    monkeypatch.setattr(psutil, "Process", no_external_work)
+    with fresh_child.exits():
+        main._ledger_reapable_backend_pids(holders)
+    assert holders == before
 
 
 def test_desktop_ssh_backend_spawn_shape_is_desktop_owned(monkeypatch):

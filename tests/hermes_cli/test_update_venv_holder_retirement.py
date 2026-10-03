@@ -83,6 +83,9 @@ def test_command_reaches_checkout_preparation_without_holder_gates(monkeypatch, 
     reached = []
     forbidden = Mock(side_effect=AssertionError("current update called a retired holder gate"))
     monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    # This test explicitly selects its disposable checkout. Otherwise the real
+    # interpreter-ownership guard correctly redirects to the developer checkout.
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     monkeypatch.setattr(main, "_update_preflight_handled", lambda args: False)
     monkeypatch.setattr(main, "_install_hangup_protection", lambda **kwargs: None)
     monkeypatch.setattr(main, "_finalize_update_output", lambda token: None)
