@@ -267,10 +267,18 @@ def live_owner_dispatch(server, prompt_submit):
         return None
 
     def pending(live_id):
-        for rid, (owner, _event) in server._pending.items():
+        for rid, (owner, _event) in getattr(server, "_pending", {}).items():
             if owner == live_id:
-                item = server._pending_prompt_payloads.get(rid)
+                item = getattr(server, "_pending_prompt_payloads", {}).get(rid)
                 return True, item[1] if item else None
+        try:
+            from tui_gateway import server_requests
+            requests = server_requests.open_requests(str(live_id or ""))
+            if requests:
+                first = requests[0]
+                return True, first.get("params") if isinstance(first, dict) else None
+        except Exception:
+            pass
         return False, None
     def revision(session, durable_id):
         try:
