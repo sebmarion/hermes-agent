@@ -15,7 +15,7 @@ def _manager_with_alpha_and_beta(tmp_path):
     PluginContext(beta, manager).register_owner_inbox_provider(beta_provider)
     PluginContext(alpha, manager).register_prompt_admission_observer(alpha_observer)
     PluginContext(beta, manager).register_prompt_admission_observer(beta_observer)
-    manager._plugins["alpha"] = SimpleNamespace(manifest=alpha, enabled=True)
+    manager._plugins["alpha"] = SimpleNamespace(manifest=alpha, enabled=True, error=None, deferred=False)
     return manager, alpha, beta_provider, beta_observer
 
 

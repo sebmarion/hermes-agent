@@ -10,6 +10,8 @@ export interface Question { qid?: string; question: string; choices?: string[]; 
 export interface RequestCard {
   kind: "approval" | "clarify" | "sudo" | "secret";
   request_id: string;
+  server_request_id?: string;
+  answers?: Record<string, string | null>;
   question?: string;
   multi_select?: boolean;
   questions?: Question[];
@@ -74,12 +76,6 @@ export function reduceEvent(state: Conversation, event: GatewayEvent, sessionId:
     if (index >= 0) items[index] = item; else items.push(item);
     return { ...state, items, activity: event.type === "tool.start" ? `Using ${name}…` : "Working…" };
   }
-  const requestKind = { "approval.request": "approval", "clarify.request": "clarify", "sudo.request": "sudo", "secret.request": "secret" } as const;
-  if (event.type in requestKind && text(p.request_id)) {
-    const kind = requestKind[event.type as keyof typeof requestKind];
-    return { ...state, busy: true, activity: "Needs your reply", pending: { ...p, kind, request_id: text(p.request_id) } as RequestCard };
-  }
-  if (event.type.endsWith(".expire") && p.request_id === state.pending?.request_id) return { ...state, pending: null, activity: "Working…" };
   if (event.type === "error") return { ...state, busy: false, activity: "", error: text(p.message) || body || "The AI connection reported an error." };
   return state;
 }

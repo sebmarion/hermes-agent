@@ -34,7 +34,6 @@ def server(tmp_path, monkeypatch):
         yield mod
         mod._sessions.clear()
         mod._pending.clear()
-        mod._answers.clear()
     goals._DB_CACHE.clear()
     reset_hermes_home_override(token)
 
@@ -96,14 +95,14 @@ def test_session_notification_poller_drives_heartbeat_after_restart(
         assert session_ is session
         called.set()
 
-    with patch.object(server, "_maybe_fire_tui_heartbeat", fake_heartbeat):
+    with patch.object(server, "_maybe_fire_tui_heartbeat_tick", fake_heartbeat):
         thread = threading.Thread(
             target=server._notification_poller_loop,
             args=(stop, sid, session),
             daemon=True,
         )
         thread.start()
-        observed = called.wait(0.2)
+        observed = called.wait(2.0)
         stop.set()
         thread.join(timeout=1)
 

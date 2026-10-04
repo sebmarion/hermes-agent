@@ -53,8 +53,8 @@ class TestRunningJobGuard:
         import cron.scheduler as sched
 
         # Reset state.
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         job = {
@@ -68,7 +68,7 @@ class TestRunningJobGuard:
         }
 
         # Simulate the job already running.
-        sched._running_job_ids.add("guard-job")
+        sched._running_job_ids.add(sched._inflight_key("guard-job"))
 
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
@@ -82,9 +82,8 @@ class TestRunningJobGuard:
         assert n == 0  # skipped, not dispatched
         assert dispatched == []
 
-        sched._running_job_ids.discard("guard-job")
+        sched._running_job_ids.discard(sched._inflight_key("guard-job"))
         sched._shutdown_parallel_pool()
-
 
     def test_fire_claim_is_acquired_only_when_executor_worker_starts(self, monkeypatch):
         """Queue wait must not consume the durable claim TTL."""
@@ -133,15 +132,14 @@ class TestRunningJobGuard:
         future.set_result(result)
 
         assert claim_calls == [("queued-job", {"return_job": True})]
-        assert "queued-job" not in sched._running_job_ids
-
+        assert sched._inflight_key("queued-job") not in sched._running_job_ids
 
     def test_create_execution_failure_does_not_wedge_running_set(self, tmp_path, monkeypatch):
         """create_execution failures clear the running lock and still allow next jobs."""
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         failing_job = {
@@ -165,7 +163,7 @@ class TestRunningJobGuard:
 
         called = []
 
-        def create_execution_side_effect(job_id, source):
+        def create_execution_side_effect(job_id, source, **kwargs):
             if job_id == "failing-job":
                 raise RuntimeError("execution ledger unavailable")
             return {"id": f"{job_id}-execution"}
@@ -194,11 +192,10 @@ class TestRunningJobGuard:
 
         assert n == 1
         assert called == ["healthy-job"]
-        assert "failing-job" not in sched._running_job_ids
-        assert "healthy-job" not in sched._running_job_ids
+        assert sched._inflight_key("failing-job") not in sched._running_job_ids
+        assert sched._inflight_key("healthy-job") not in sched._running_job_ids
 
         sched._shutdown_parallel_pool()
-
 
 class TestSyncMode:
     """tick() blocks by default (sync=True); tick(sync=False) returns immediately."""
@@ -207,8 +204,8 @@ class TestSyncMode:
         """sync=True waits for jobs and returns actual results."""
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         jobs = [
@@ -234,8 +231,8 @@ class TestSyncMode:
         """sync=False returns before parallel jobs finish (optimistic count)."""
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         job = {

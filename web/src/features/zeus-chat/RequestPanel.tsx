@@ -11,6 +11,7 @@ export function RequestPanel({ request, disabled, respond }: Props) {
   const question = request.questions?.[0];
   const secure = request.kind === "sudo" || request.kind === "secret";
   const submit = (value: string) => { setAnswer(""); void respond(request, value, question?.qid); };
+  const cancel = () => { setAnswer(""); void respond(request, ""); };
   if (request.kind === "approval") return (
     <section className="zc-request" aria-label="Approval required">
       <strong>Your approval is needed</strong>
@@ -29,7 +30,7 @@ export function RequestPanel({ request, disabled, respond }: Props) {
         {(question?.choices || request.choices)?.length ? <div className="zc-choices">{(question?.choices || request.choices || []).map(choice => <button type="button" key={choice} disabled={disabled} onClick={() => setAnswer(current => (question?.multi_select || request.multi_select) && current ? `${current}, ${choice}` : choice)}>{choice}</button>)}</div> : null}
         <textarea id="zeus-request-answer" rows={2} value={answer} onChange={event => setAnswer(event.target.value)} placeholder="Your reply…" disabled={disabled} />
       </>}
-      <div className="zc-request-actions"><button type="button" disabled={disabled} onClick={() => submit("")}>Cancel request</button><button type="submit" className="zc-primary" disabled={disabled || !answer.trim()}>Send reply</button></div>
+      <div className="zc-request-actions"><button type="button" disabled={disabled} onClick={cancel}>Cancel request</button><button type="submit" className="zc-primary" disabled={disabled || !answer.trim()}>Send reply</button></div>
     </form>
   );
 }

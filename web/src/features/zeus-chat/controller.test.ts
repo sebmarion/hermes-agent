@@ -7,9 +7,11 @@ vi.mock("@hermes/shared", () => {
     connectionState = "idle";
     states = new Set<(state: string) => void>();
     events = new Set<(event: unknown) => void>();
+    requests = new Set<(request: unknown) => boolean | void>();
     constructor() { mocks.clients.push(this); }
     onState(fn: (state: string) => void) { this.states.add(fn); fn(this.connectionState); return () => this.states.delete(fn); }
     onEvent(fn: (event: unknown) => void) { this.events.add(fn); return () => this.events.delete(fn); }
+    onRequest(fn: (request: unknown) => boolean | void) { this.requests.add(fn); return () => this.requests.delete(fn); }
     async connect() { this.connectionState = "open"; this.states.forEach(fn => fn("open")); }
     close() { this.connectionState = "closed"; this.states.forEach(fn => fn("closed")); }
     request(method: string, params: Record<string, unknown>) { return mocks.request(method, params); }
@@ -66,15 +68,62 @@ describe("Zeus gateway and draft ownership", () => {
     await controller.open("stored"); expect(controller.getSnapshot().uncertain).toBe(true);
     controller.confirmReviewed(); expect(controller.getSnapshot().uncertain).toBe(false);
   });
-  it("surfaces the next unresolved approval without granting it implicitly", async () => {
+  it("answers the live approval server request exactly once and then surfaces the queued fallback", async () => {
     await settle(); await controller.open("stored");
-    const client = mocks.clients.at(-1) as { events: Set<(event: unknown) => void> };
-    const pending = { kind: "approval" as const, request_id: "latest", choices: ["once", "deny"], command: "Latest queued action" };
-    client.events.forEach(fn => fn({ type: "approval.request", session_id: "runtime", payload: pending }));
-    mocks.request.mockImplementation(async (method: string) => method === "approval.respond" ? { resolved: 1 } : { session_id: "runtime", pending_approval: { request_id: "earlier", choices: ["once", "deny"], command: "Another action still needs approval" } });
-    await controller.respond(pending, "deny");
+    const client = mocks.clients.at(-1) as {
+      requests: Set<(request: Record<string, unknown>) => boolean | void>;
+    };
+    const respond = vi.fn();
+    const fail = vi.fn();
+    const decline = vi.fn();
+    const serverRequest = {
+      id: "srv-latest", method: "approval",
+      params: { session_id: "runtime", request_id: "latest", choices: ["once", "deny"], command: "Latest queued action" },
+      respond, fail, decline,
+    };
+    client.requests.forEach(fn => fn(serverRequest));
+    await settle();
+    expect(controller.getSnapshot().pending).toMatchObject({ kind: "approval", request_id: "latest", server_request_id: "srv-latest" });
+    expect(mocks.request.mock.calls.some(call => call[0] === "approval.received" && call[1].request_id === "latest")).toBe(true);
+    mocks.request.mockImplementation(async (method: string) =>
+      method === "session.resume"
+        ? { session_id: "runtime", pending_approval: { request_id: "earlier", choices: ["once", "deny"], command: "Another action still needs approval" }, info: { model: "fixture-default", provider: "qa" } }
+        : {});
+    await controller.respond(controller.getSnapshot().pending!, "deny");
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(respond).toHaveBeenCalledWith({ choice: "deny" });
+    expect(fail).not.toHaveBeenCalled();
+    expect(mocks.request.mock.calls.filter(call => call[0] === "approval.respond")).toHaveLength(0);
     expect(controller.getSnapshot().pending).toMatchObject({ kind: "approval", request_id: "earlier" });
-    expect(mocks.request.mock.calls.filter(call => call[0] === "approval.respond").map(call => call[1].choice)).toEqual(["deny"]);
+  });
+
+  it("declines a server request owned by another conversation and clears only the matching cancelled request", async () => {
+    await settle(); await controller.open("stored");
+    const client = mocks.clients.at(-1) as {
+      events: Set<(event: unknown) => void>;
+      requests: Set<(request: Record<string, unknown>) => boolean | void>;
+    };
+    const otherDecline = vi.fn();
+    const otherRespond = vi.fn();
+    client.requests.forEach(fn => fn({
+      id: "srv-other", method: "secret", params: { session_id: "other", env_var: "TOKEN", prompt: "Token" },
+      respond: otherRespond, fail: vi.fn(), decline: otherDecline,
+    }));
+    expect(otherDecline).toHaveBeenCalledTimes(1);
+    expect(otherRespond).not.toHaveBeenCalled();
+    expect(controller.getSnapshot().pending).toBeNull();
+
+    const respond = vi.fn();
+    client.requests.forEach(fn => fn({
+      id: "srv-secret", method: "secret", params: { session_id: "runtime", env_var: "TOKEN", prompt: "Token" },
+      respond, fail: vi.fn(), decline: vi.fn(),
+    }));
+    expect(controller.getSnapshot().pending).toMatchObject({ kind: "secret", server_request_id: "srv-secret" });
+    client.events.forEach(fn => fn({ type: "request.cancel", session_id: "runtime", payload: { id: "different", method: "secret", reason: "resolved" } }));
+    expect(controller.getSnapshot().pending).not.toBeNull();
+    client.events.forEach(fn => fn({ type: "request.cancel", session_id: "runtime", payload: { id: "srv-secret", method: "secret", reason: "resolved" } }));
+    expect(controller.getSnapshot().pending).toBeNull();
+    expect(respond).not.toHaveBeenCalled();
   });
 
 });
