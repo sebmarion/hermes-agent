@@ -2,9 +2,8 @@
 
 Covers ``register_child`` (the ledger mirror of ``register_self`` for
 subprocesses that never import Hermes code), the live-spawner protection
-contract, dead-spawner reap eligibility through BOTH consumers (the updater's
-``_ledger_reapable_backend_pids`` rung and the startup
-``reap_orphaned_mcp_helpers`` sweep), and prune-on-write of exited children.
+contract, dead-spawner reap eligibility through the startup
+``reap_orphaned_mcp_helpers`` sweep, and prune-on-write of exited children.
 
 Uses REAL subprocesses (``sleep``) and the real psutil so the
 ``(pid, create_time)`` identity pair is exercised end-to-end, with the ledger
@@ -25,10 +24,9 @@ import psutil
 import pytest
 
 from hermes_cli import process_identity as pi
+from tests.compat.old_updater_support import fresh_child, no_external_work  # noqa: F401
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32", reason="uses POSIX sleep children"
-)
+pytestmark = pytest.mark.platforms("posix")  # uses POSIX sleep children
 
 
 @pytest.fixture
@@ -331,19 +329,16 @@ def test_reap_ignores_non_mcp_purposes(ledger, child):
 # Updater rung (_ledger_reapable_backend_pids) flow-through
 # ---------------------------------------------------------------------------
 
-def test_updater_ledger_rung_flows_mcp_helper(ledger, child):
-    from hermes_cli import update_cmd
+@pytest.mark.real_concurrent_gate
+def test_historical_updater_hands_off_without_reaping_helpers(
+    monkeypatch, fresh_child, no_external_work,
+):
+    from hermes_cli import main
 
-    pi.register_child(child.pid, "mcp-helper")
-    matches = [(child.pid, "python", "sleep 300")]
-
-    # Live spawner (this process) → never selected.
-    assert update_cmd._ledger_reapable_backend_pids(matches) == []
-
-    # Provably dead spawner → positively identified as reapable.
-    _orphan_entry_for(child.pid)
-    targets = update_cmd._ledger_reapable_backend_pids(matches)
-    assert targets == [(child.pid, pytest.approx(psutil.Process(child.pid).create_time()))]
+    monkeypatch.setattr(pi, "ledger_entries", no_external_work)
+    monkeypatch.setattr(psutil, "Process", no_external_work)
+    with fresh_child.exits():
+        main._ledger_reapable_backend_pids([(61001, "helper", "helper")])
 
 
 # ---------------------------------------------------------------------------

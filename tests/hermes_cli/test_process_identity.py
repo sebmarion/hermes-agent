@@ -15,7 +15,11 @@ Runs on any host: psutil interactions go through a fake module.
 from __future__ import annotations
 
 import json
+import os
+import stat
+import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -23,7 +27,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_cli import process_identity as pi
-from hermes_cli import update_cmd
+from tests.compat.old_updater_support import fresh_child, no_external_work  # noqa: F401
 
 
 class _FakeNoSuchProcess(Exception):
@@ -161,6 +165,33 @@ def test_register_self_prunes_invalid_recorded_creation_time(tmp_path):
         assert pi.register_self("serve", project_root=Path("/x/install")) is True
 
     assert [entry["pid"] for entry in json.loads(ledger.read_text())] == [999]
+def test_register_self_survives_non_utf8_argv(tmp_path):
+    ledger = tmp_path / "spawn-ledger.json"
+    fake = _fake_psutil({999: 50.0})
+    bad_argv = ["hermes", "serve", os.fsdecode(b"/tmp/project-\xff")]  # surrogate-escaped path
+    with patch.dict(sys.modules, {"psutil": fake}), \
+         patch.object(pi, "_ledger_path", return_value=ledger), \
+         patch.object(pi.os, "getpid", return_value=999), \
+         patch.object(sys, "argv", bad_argv):
+        assert pi.register_self("serve", project_root=Path("/x/install")) is True
+    me = next(e for e in json.loads(ledger.read_text(encoding="utf-8")) if e["pid"] == 999)
+    assert me["argv"] == " ".join(bad_argv)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")
+def test_register_self_writes_ledger_with_0600(tmp_path):
+    ledger = tmp_path / "spawn-ledger.json"
+    fake = _fake_psutil({999: 50.0})
+    old_umask = os.umask(0o022)  # permissive umask: the mode must come from the writer, not the env
+    try:
+        with patch.dict(sys.modules, {"psutil": fake}), \
+             patch.object(pi, "_ledger_path", return_value=ledger), \
+             patch.object(pi.os, "getpid", return_value=999):
+            assert pi.register_self("serve", project_root=Path("/x/install")) is True
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(os.stat(ledger).st_mode) == 0o600
 
 
 def test_register_self_inherits_spawn_tag_lineage(tmp_path):
@@ -264,6 +295,27 @@ def test_pid_alive_matches_none_is_liveness_only():
     with patch.dict(sys.modules, {"psutil": fake}):
         assert pi._pid_alive_matches(500, None) is True
         assert pi._pid_alive_matches(600, None) is False
+@pytest.mark.platforms("posix")
+def test_ledger_entries_excludes_a_killed_but_unreaped_process(tmp_path):
+    """A zombie is dead even though it keeps its create_time until reaped: ``hermes update``
+    books the stopped dashboard gone, then must not find it again as a pre-update survivor."""
+    import psutil
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        created = psutil.Process(child.pid).create_time()
+        child.terminate()
+        deadline = time.monotonic() + 10
+        while psutil.Process(child.pid).status() != psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "child never became a zombie"
+            time.sleep(0.05)
+        ledger = tmp_path / "spawn-ledger.json"
+        ledger.write_text(json.dumps([_entry(child.pid, created, purpose="dashboard")]), encoding="utf-8")
+        with patch.object(pi, "_ledger_path", return_value=ledger):
+            assert pi.ledger_entries(project_root=Path("/x/install")) == []
+    finally:
+        child.kill()
+        child.wait()
 
 
 def test_spawner_is_dead_tristate():
@@ -277,7 +329,7 @@ def test_spawner_is_dead_tristate():
 
 
 @pytest.mark.parametrize(
-    "spawner_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0, True]
+    "spawner_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0, True, pytest.param(10**1000, id="oversized")]
 )
 def test_spawner_is_dead_refuses_invalid_creation_time(spawner_create):
     fake = _fake_psutil({500: 5.0})
@@ -290,7 +342,7 @@ def test_spawner_is_dead_refuses_invalid_creation_time(spawner_create):
         )
 
 
-@pytest.mark.parametrize("live_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+@pytest.mark.parametrize("live_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0, pytest.param(10**1000, id="oversized")])
 def test_spawner_is_dead_refuses_invalid_live_creation_time(live_create):
     fake = _fake_psutil({500: live_create})
     with patch.dict(sys.modules, {"psutil": fake}):
@@ -303,66 +355,46 @@ def test_spawner_is_dead_refuses_invalid_live_creation_time(live_create):
 
 
 # ---------------------------------------------------------------------------
-# Updater rung: _ledger_reapable_backend_pids
+# Historical updater exports: the new package manager owns continuation.
 # ---------------------------------------------------------------------------
 
-def _holders(*pids):
-    return [(p, "python.exe", f"python.exe -m hermes_cli.main --profile p{p} serve") for p in pids]
+@pytest.mark.real_concurrent_gate
+@pytest.mark.parametrize("holders", [
+    [],
+    [(200, "python.exe", "python.exe -m hermes_cli.main serve")],
+    [(True, "python.exe", "unknown"), (200, "python.exe", "reused identity")],
+])
+def test_historical_updater_hands_off_without_classifying_or_killing(
+    holders, monkeypatch, fresh_child, no_external_work,
+):
+    """A retired entry point must not reintroduce a PID-only kill path.
+
+    The live package manager builds a new environment, so historical callers
+    hand off without scanning or reaping holders of the previous environment.
+    """
+    from copy import deepcopy
+    from hermes_cli import main
+    import psutil
+
+    before = deepcopy(holders)
+    monkeypatch.setattr(pi, "ledger_entries", no_external_work)
+    monkeypatch.setattr(psutil, "Process", no_external_work)
+    with fresh_child.exits():
+        main._ledger_reapable_backend_pids(holders)
+    assert holders == before
 
 
-def test_updater_reaps_ledger_proven_orphans():
-    from hermes_cli import main as cli_main
+def test_desktop_ssh_backend_spawn_shape_is_desktop_owned(monkeypatch):
+    """Desktop's SSH spawn is ``env HERMES_DESKTOP=1 hermes serve --isolated ... --ssh-session-token-file F``
+    with NO token env var (its tests assert the var name never appears on the wire). Missing that
+    shape made the SSH child claim ROLE_SERVE on the remote host (the #119824 shape there)."""
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+    ssh_argv = ["serve", "--isolated", "--host", "127.0.0.1", "--port", "0",
+                "--ssh-session-token-file", "/home/u/.hermes/desktop-ssh/abc.token"]
 
-    entries = [
-        _entry(200, 2.0, spawner_pid=700, spawner_create=7.0),   # spawner dead → reap
-        _entry(201, 2.1, spawner_pid=500, spawner_create=5.0),   # spawner alive → keep
-        _entry(202, 2.2, purpose="chat", spawner_pid=700, spawner_create=7.0),  # not reapable purpose
-    ]
-    fake = _fake_psutil({200: 2.0, 201: 2.1, 202: 2.2, 500: 5.0})
-    with patch.dict(sys.modules, {"psutil": fake}), \
-         patch.object(pi, "ledger_entries", return_value=entries), \
-         patch.object(pi, "spawner_is_dead", wraps=pi.spawner_is_dead):
-        assert cli_main._ledger_reapable_backend_pids(
-            _holders(200, 201, 202, 203)
-        ) == [(200, 2.0)]
-
-
-def test_updater_ledger_rung_rejects_a_reused_target_pid():
-    from hermes_cli import main as cli_main
-
-    entries = [
-        _entry(200, 2.0, spawner_pid=700, spawner_create=7.0),
-    ]
-    fake = _fake_psutil({200: 99.0})
-    with patch.dict(sys.modules, {"psutil": fake}), \
-         patch.object(pi, "ledger_entries", return_value=entries), \
-         patch.object(pi, "spawner_is_dead", wraps=pi.spawner_is_dead):
-        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
-
-
-@pytest.mark.parametrize("recorded_create", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
-def test_updater_ledger_rung_rejects_invalid_target_creation_time(recorded_create):
-    from hermes_cli import main as cli_main
-
-    entries = [
-        _entry(200, recorded_create, spawner_pid=700, spawner_create=7.0),
-    ]
-    fake = _fake_psutil({200: 2.0})
-    with patch.dict(sys.modules, {"psutil": fake}), \
-         patch.object(pi, "ledger_entries", return_value=entries), \
-         patch.object(pi, "spawner_is_dead", return_value=True):
-        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
-
-
-def test_updater_ledger_rung_empty_without_ledger():
-    from hermes_cli import main as cli_main
-
-    with patch.object(pi, "ledger_entries", return_value=[]):
-        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
-
-
-def test_updater_ledger_rung_never_raises():
-    from hermes_cli import main as cli_main
-
-    with patch.object(pi, "ledger_entries", side_effect=RuntimeError("boom")):
-        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
+    assert pi.is_desktop_owned_backend(ssh_argv) is True
+    monkeypatch.setattr(sys, "argv", ["hermes", *ssh_argv])
+    assert pi.is_desktop_owned_backend() is True
+    # The bare inherited flag (a Desktop terminal pane running `hermes serve`) is still not ownership.
+    assert pi.is_desktop_owned_backend(["serve", "--host", "127.0.0.1", "--port", "0"]) is False
