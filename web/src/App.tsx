@@ -73,6 +73,8 @@ import { useProfileScope } from "@/contexts/useProfileScope";
 import { ProfileSwitcher } from "@/components/ProfileSwitcher";
 import { ProfileScopeBanner } from "@/components/ProfileScopeBanner";
 import { MemoryPressureBanner } from "@/components/MemoryPressureBanner";
+import { MultiplexStandaloneBanner } from "@/components/MultiplexStandaloneBanner";
+import { SharedMetricsConsentBanner } from "@/components/SharedMetricsConsentBanner";
 import { useSystemActions } from "@/contexts/useSystemActions";
 import type { SystemAction } from "@/contexts/system-actions-context";
 // Route pages are lazy-loaded so the initial dashboard shell does not pay for
@@ -96,7 +98,6 @@ const ChannelsPage = lazy(() => import("@/pages/ChannelsPage"));
 const WebhooksPage = lazy(() => import("@/pages/WebhooksPage"));
 const SystemPage = lazy(() => import("@/pages/SystemPage"));
 const ChatPage = lazy(() => import("@/pages/ChatPage"));
-const ZeusChatPage = lazy(() => import("@/features/zeus-chat/ZeusChatPage"));
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -106,6 +107,7 @@ import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { latchChatActivation } from "@/lib/chat-activation";
+import { sharedGatewayProfiles, sharedGatewayRestartDescription } from "@/lib/shared-gateway";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
 
@@ -401,14 +403,6 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
-  const embedParams = new URLSearchParams(window.location.search);
-  // Zeus embeds only the action-taking founder chat, never Hermes' admin console.
-  // Scope this narrowly so ordinary dashboard links and other profiles keep the
-  // complete management interface.
-  const zeusFounderEmbed =
-    isChatRoute &&
-    embedParams.get("embed") === "zeus" &&
-    embedParams.get("profile") === "zeus-os";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
   // Defer mounting the persistent chat host (and its xterm chunk) until the
   // user has actually opened /chat at least once. Sticky after that so the
@@ -533,7 +527,7 @@ export default function App() {
         <PluginSlot name="backdrop" />
       </div>
 
-      {!zeusFounderEmbed && <header
+      <header
         className={cn(
           "lg:hidden fixed top-0 left-0 right-0 z-40 min-h-14",
           "flex items-center gap-2 px-4 py-2",
@@ -541,7 +535,8 @@ export default function App() {
           "bg-background-base",
         )}
         style={{
-          background: "var(--component-header-background)",
+          background:
+            "var(--component-header-background, var(--background-base))",
           borderImage: "var(--component-header-border-image)",
           clipPath: "var(--component-header-clip-path)",
         }}
@@ -561,9 +556,9 @@ export default function App() {
         <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
           {t.app.brand}
         </Typography>
-      </header>}
+      </header>
 
-      {!zeusFounderEmbed && mobileOpen && (
+      {mobileOpen && (
         <Button
           ghost
           aria-label={t.app.closeNavigation}
@@ -579,14 +574,16 @@ export default function App() {
           fixed lg:hidden header is h-14/z-40; previously each banner carried
           its own mt-14 AND the content kept pt-14, so two visible banners
           stacked three offsets (NS-656 review P3). One spacer, applied once. */}
-      {!zeusFounderEmbed && <div aria-hidden className="h-14 shrink-0 lg:hidden" />}
-      {!zeusFounderEmbed && <PluginSlot name="header-banner" />}
-      {!zeusFounderEmbed && <ProfileScopeBanner />}
-      {!zeusFounderEmbed && <MemoryPressureBanner status={sidebarStatus} />}
+      <div aria-hidden className="h-14 shrink-0 lg:hidden" />
+      <PluginSlot name="header-banner" />
+      <ProfileScopeBanner />
+      <MemoryPressureBanner status={sidebarStatus} />
+      <MultiplexStandaloneBanner status={sidebarStatus} />
+      <SharedMetricsConsentBanner />
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <div className="flex min-h-0 min-w-0 flex-1">
-          {!zeusFounderEmbed && <aside
+          <aside
             id="app-sidebar"
             aria-label={t.app.navigation}
             className={cn(
@@ -600,7 +597,8 @@ export default function App() {
               collapsed && "lg:w-14",
             )}
             style={{
-              background: "var(--component-sidebar-background)",
+              background:
+                "var(--component-sidebar-background, var(--background-base))",
               clipPath: "var(--component-sidebar-clip-path)",
               borderImage: "var(--component-sidebar-border-image)",
             }}
@@ -758,20 +756,20 @@ export default function App() {
               <AuthWidget />
               <SidebarFooter status={sidebarStatus} />
             </div>
-          </aside>}
+          </aside>
 
           <PageHeaderProvider pluginTabs={pluginTabMeta}>
             <div
               className={cn(
                 "relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
-                zeusFounderEmbed ? "p-0" : "px-3 sm:px-6",
+                "px-3 sm:px-6",
                 isChatRoute
                   ? "pb-0 pt-1 sm:pt-2 lg:pt-4"
                   : "pt-2 sm:pt-4 lg:pt-6",
                 isDocsRoute && "min-h-0 flex-1",
               )}
             >
-              {!zeusFounderEmbed && <PluginSlot name="pre-main" />}
+              <PluginSlot name="pre-main" />
               <div
                 className={cn(
                   "w-full min-w-0",
@@ -819,20 +817,20 @@ export default function App() {
                           ) : null
                         }
                       >
-                        {zeusFounderEmbed ? <ZeusChatPage /> : <ChatPage isActive={isChatRoute} />}
+                        <ChatPage isActive={isChatRoute} />
                       </Suspense>
                     </div>
                   ) : isChatRoute ? (
                     <RouteFallback label="Loading chat…" />
                   ) : null)}
               </div>
-              {!zeusFounderEmbed && <PluginSlot name="post-main" />}
+              <PluginSlot name="post-main" />
             </div>
           </PageHeaderProvider>
         </div>
       </div>
 
-      {!zeusFounderEmbed && <PluginSlot name="overlay" />}
+      <PluginSlot name="overlay" />
     </div>
     </ProfileProvider>
   );
@@ -950,6 +948,8 @@ function SidebarSystemActions({
   const { activeAction, isBusy, isRunning, pendingAction, runAction } =
     useSystemActions();
   const canUpdateHermes = status?.can_update_hermes === true;
+  // Served by the shared multiplexer: a restart blips every bot on this device — say which.
+  const sharedGateway = sharedGatewayProfiles(status);
   const [restartConfirmOpen, setRestartConfirmOpen] = useState(false);
   const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
   const [updateConfirmInfo, setUpdateConfirmInfo] =
@@ -1083,17 +1083,21 @@ function SidebarSystemActions({
 
     <ConfirmDialog
       cancelLabel={t.common.cancel}
-      confirmLabel={t.status.restartGateway}
+      confirmLabel={sharedGateway ? "Restart all" : t.status.restartGateway}
       description={
-        t.status.restartGatewayConfirmMessage ??
-        "This restarts the Hermes gateway process. Connected channels and active sessions will reconnect afterward."
+        sharedGateway
+          ? sharedGatewayRestartDescription(sharedGateway)
+          : (t.status.restartGatewayConfirmMessage ??
+            "This restarts the Hermes gateway process. Connected channels and active sessions will reconnect afterward.")
       }
       loading={pendingAction === "restart"}
       onCancel={() => setRestartConfirmOpen(false)}
       onConfirm={confirmRestart}
       open={restartConfirmOpen}
       title={
-        t.status.restartGatewayConfirmTitle ?? `${t.status.restartGateway}?`
+        sharedGateway
+          ? "Restart the shared gateway?"
+          : (t.status.restartGatewayConfirmTitle ?? `${t.status.restartGateway}?`)
       }
     />
 

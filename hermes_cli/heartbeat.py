@@ -99,12 +99,15 @@ def _get_session_db() -> Optional[Any]:
         return None
 
 
+_META_PREFIX = "heartbeat:"
+
+
 def load_heartbeat(session_id: str) -> Optional[HeartbeatState]:
     db = _get_session_db() if session_id else None
     if db is None:
         return None
     try:
-        raw = db.get_meta(f"heartbeat:{session_id}")
+        raw = db.get_meta(_META_PREFIX + session_id)
     except Exception as exc:
         logger.debug("HeartbeatManager: get_meta failed: %s", exc)
         return None
@@ -116,6 +119,19 @@ def load_heartbeat(session_id: str) -> Optional[HeartbeatState]:
     return None if state is None or state.status == "cleared" else state
 
 
+def store_has_active_heartbeat(db: Any) -> bool:
+    """True when *db* holds an ACTIVE ``heartbeat:*`` row — or one that cannot be parsed (unknown, so
+    the caller keeps its full sweep). ``clear``/``pause`` keep their rows (status ``cleared``/``paused``),
+    so key existence alone is not "active". Read errors propagate: "unavailable" is the caller's call."""
+    for _key, raw in db.list_meta_prefix(_META_PREFIX):
+        try:
+            if HeartbeatState.from_json(raw).status == "active":
+                return True
+        except Exception:
+            return True
+    return False
+
+
 def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
     if not session_id:
         return
@@ -125,7 +141,7 @@ def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
         _warn_dropped_write("HeartbeatManager", "heartbeat", session_id)
         return
     try:
-        db.set_meta(f"heartbeat:{session_id}", state.to_json())
+        db.set_meta(_META_PREFIX + session_id, state.to_json())
     except Exception as exc:
         logger.debug("HeartbeatManager: set_meta failed: %s", exc)
 
@@ -140,7 +156,7 @@ class HeartbeatManager:
     def __init__(self, session_id: str):
         self.session_id = session_id
         self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
-        self._claimed_previous_state: Optional[HeartbeatState] = None
+        self._last_claim: Optional[tuple[float, int]] = None  # (last_fired_at, fire_count) before the last due_prompt
 
     @property
     def state(self) -> Optional[HeartbeatState]:
@@ -197,78 +213,6 @@ class HeartbeatManager:
         self._state = None
         return cleared
 
-    def claim_due_prompt(self, now: Optional[float] = None) -> Optional[str]:
-        """Atomically claim a due heartbeat and return its injection prompt.
-
-        The conditional update prevents a stale poller from overwriting a
-        pause, clear, or replacement heartbeat written by another process.
-        """
-        db = _get_session_db()
-        if db is None:
-            return None
-        now = now if now is not None else time.time()
-        key = f"heartbeat:{self.session_id}"
-
-        def _claim(conn: Any) -> Optional[tuple[HeartbeatState, HeartbeatState]]:
-            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
-            if not row:
-                return None
-            try:
-                before = HeartbeatState.from_json(row[0])
-            except Exception:
-                return None
-            if not before.is_due(now):
-                return None
-            claimed = HeartbeatState.from_json(row[0])
-            claimed.last_fired_at = now
-            claimed.fire_count += 1
-            cursor = conn.execute(
-                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
-                (claimed.to_json(), key, row[0]),
-            )
-            if cursor.rowcount != 1:
-                return None
-            return before, claimed
-
-        try:
-            result = db._execute_write(_claim)
-        except Exception as exc:
-            logger.debug("HeartbeatManager: atomic claim failed: %s", exc)
-            return None
-        if result is None:
-            return None
-        before, claimed = result
-        self._claimed_previous_state = before
-        self._state = claimed
-        return claimed.render_prompt()
-
-    def abandon_prompt(self) -> bool:
-        """Undo this manager's claim when prompt dispatch was not admitted."""
-        before = self._claimed_previous_state
-        current = self._state
-        if before is None or current is None:
-            return False
-        db = _get_session_db()
-        if db is None:
-            return False
-        key = f"heartbeat:{self.session_id}"
-        try:
-            def _restore(conn: Any) -> int:
-                cursor = conn.execute(
-                    "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
-                    (before.to_json(), key, current.to_json()),
-                )
-                return cursor.rowcount
-            restored = db._execute_write(_restore)
-        except Exception as exc:
-            logger.debug("HeartbeatManager: claim rollback failed: %s", exc)
-            return False
-        if restored != 1:
-            return False
-        self._state = before
-        self._claimed_previous_state = None
-        return True
-
     def due_prompt(self, now: Optional[float] = None) -> Optional[str]:
         """Return the injection prompt if the heartbeat is due, else None.
 
@@ -279,10 +223,27 @@ class HeartbeatManager:
         s = self._state
         if s is None or not s.is_due(now):
             return None
+        self._last_claim = (s.last_fired_at, s.fire_count)
         s.last_fired_at = now if now is not None else time.time()
         s.fire_count += 1
         save_heartbeat(self.session_id, s)
         return s.render_prompt()
+
+    def abandon_fire(self) -> bool:
+        """Rewind the fire recorded by the last :meth:`due_prompt` whose turn never started, so the tick stays
+        due for the next poll instead of being silently consumed. Mirrors ``LoopManager.abandon_tick``. Skipped
+        (False) when the persisted state moved on — a pause/resume/clear that landed in between wins."""
+        claim, s = self._last_claim, self._state
+        if claim is None or s is None:
+            return False
+        current = load_heartbeat(self.session_id)
+        if current is None or current.status != "active" or (current.last_fired_at, current.fire_count) != (
+                s.last_fired_at, s.fire_count):
+            return False
+        s.last_fired_at, s.fire_count = claim
+        self._last_claim = None
+        save_heartbeat(self.session_id, s)
+        return True
 
 
 def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bool:
@@ -309,11 +270,3 @@ __all__ = [
     "HeartbeatState", "HeartbeatManager", "parse_interval", "format_interval", "load_heartbeat", "save_heartbeat",
     "migrate_heartbeat_to_session", "HEARTBEAT_PROMPT_TEMPLATE", "MIN_INTERVAL_SECONDS", "POLL_SECONDS",
 ]
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import Dict  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----

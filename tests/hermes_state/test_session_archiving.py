@@ -1,6 +1,4 @@
-import json
 import time
-from pathlib import Path
 
 import pytest
 
@@ -53,159 +51,49 @@ def test_unarchiving_compression_tip_unarchives_projected_root(db):
     assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == ["tip"]
 
 
-# --- reopened-link regression -------------------------------------------------
-#
-# A mistaken TUI reaper close (``end_reason = 'ws_orphan_reap'``) followed by
-# stale-route recovery (``reopen_session``) clears the parent's mutable
-# ``end_reason``. Before the ``$._compression_from`` marker existed, every
-# lineage walk keyed on ``end_reason = 'compression'`` silently lost the link:
-# archiving only covered the segment below the break and the unarchived,
-# re-active root resurrected the conversation in the sidebar.
+def test_archived_only_view_includes_hidden_archived_sessions(db):
+    """The archived-only view is the recovery surface: a session that is both
+    archived and hidden (Bot Mode marks its sessions hidden) must appear
+    there, otherwise it is unreachable from every UI list (#90946)."""
+    db.create_session("plain", source="cli")
+    db.create_session("both", source="cli")
+    assert db.set_session_hidden("both", True) is True
+    assert db.set_session_archived("both", True) is True
+
+    # Default list: hidden rows stay excluded (unchanged behaviour)...
+    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == ["plain"]
+    # ...and the archived-only view must surface the archived+hidden row.
+    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True, archived_only=True)] == ["both"]
 
 
-def _published_pair(db: SessionDB):
-    """Build root->tip through the real rotation path, then reap + reopen."""
-    import json as _json
-
-    db.create_session("root", source="cli")
-    db.publish_compression_child(
-        parent_session_id="root",
-        child_session_id="tip",
-        source="cli",
-        messages=[{"role": "user", "content": "hello"}],
-        require_compression_lease=False,
-    )
-    # The rotation must have stamped the durable lineage marker.
-    row = db._conn.execute(
-        "SELECT model_config FROM sessions WHERE id = 'tip'"
-    ).fetchone()
-    assert _json.loads(row["model_config"])["_compression_from"] == "root"
-
-    # Simulate the production reap/reopen cycle that erases the link.
+def _stale_lineage(db: SessionDB, prefix: str) -> tuple[str, str]:
+    """root(compression, 40 days old) -> tip; the tip's state is the caller's."""
+    root, tip = f"{prefix}-root", f"{prefix}-tip"
+    db.create_session(root, source="feishu")
+    db.create_session(tip, source="feishu", parent_session_id=root)
+    base = time.time() - 40 * 86400
     db._conn.execute(
-        "UPDATE sessions SET end_reason = 'ws_orphan_reap' WHERE id = 'root'"
-    )
+        "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = 'compression', last_activity_at = ? WHERE id = ?",
+        (base, base + 10, base + 10, root))
     db._conn.commit()
-    db.reopen_session("root")
-    assert db.get_session("root")["end_reason"] is None
+    return root, tip
 
 
-def test_publish_compression_child_stamps_durable_marker(db):
-    import json as _json
+def test_bulk_archive_matches_a_lineage_through_its_tip_only(db):
+    """#115489: `hermes sessions archive --older-than` must never hide an OPEN, active continuation
+    because its compression ancestor is old — the lineage is archived through its tip, and an idle
+    ended tip still takes its whole chain with it."""
+    live_root, live_tip = _stale_lineage(db, "live")
+    db.append_message(live_tip, "user", "still chatting")
+    stale_root, stale_tip = _stale_lineage(db, "stale")
+    stale = time.time() - 35 * 86400
+    db._conn.execute("UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = 'cli_close', last_activity_at = ? "
+                     "WHERE id = ?", (stale, stale + 10, stale + 10, stale_tip))
+    db._conn.commit()
 
-    db.create_session("root", source="cli")
-    db.publish_compression_child(
-        parent_session_id="root",
-        child_session_id="tip",
-        source="cli",
-        messages=[{"role": "user", "content": "hello"}],
-        require_compression_lease=False,
-    )
-    row = db._conn.execute(
-        "SELECT model_config FROM sessions WHERE id = 'tip'"
-    ).fetchone()
-    assert _json.loads(row["model_config"])["_compression_from"] == "root"
+    assert [r["id"] for r in db.list_prune_candidates(older_than_days=30, archived=False, lineage_tips_only=True)] == [stale_tip]
+    assert db.archive_sessions(older_than_days=30) == 1
 
-
-def test_archiving_after_reopened_link_still_covers_whole_lineage(db):
-    _published_pair(db)
-
-    assert db.set_session_archived("tip", True) is True
-
-    assert db.get_session("root")["archived"] == 1
-    assert db.get_session("tip")["archived"] == 1
-    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == []
-
-
-def test_unarchiving_after_reopened_link_restores_whole_lineage(db):
-    _published_pair(db)
-    db.set_session_archived("tip", True)
-
-    assert db.set_session_archived("tip", False) is True
-
-    assert db.get_session("root")["archived"] == 0
-    assert db.get_session("tip")["archived"] == 0
-    # The reopened root is live again (ended_at cleared by reopen_session),
-    # so the sidebar surfaces the root row itself.
-    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == ["root"]
-
-
-def test_pinning_after_reopened_link_covers_whole_lineage(db):
-    _published_pair(db)
-
-    assert db.set_session_pinned("tip", True) is True
-
-    assert db.get_session("root")["pinned"] == 1
-    assert db.get_session("tip")["pinned"] == 1
-
-
-def test_creation_time_marker_covers_children_of_already_ended_parent(db):
-    """Children created under an ended compression parent keep the link even
-    if the parent is reopened before any rotation backfill runs."""
-    import json as _json
-
-    base = time.time() - 100
-    db.create_session("root", source="cli")
-    db._conn.execute(
-        "UPDATE sessions SET started_at = ?, ended_at = ?, "
-        "end_reason = 'compression' WHERE id = 'root'",
-        (base, base + 10),
-    )
-    db.create_session("late", source="cli", parent_session_id="root")
-
-    row = db._conn.execute(
-        "SELECT model_config FROM sessions WHERE id = 'late'"
-    ).fetchone()
-    assert _json.loads(row["model_config"])["_compression_from"] == "root"
-
-    db.reopen_session("root")
-    assert db.set_session_archived("late", True) is True
-    assert db.get_session("root")["archived"] == 1
-
-
-def _stamp_compression_marker(db: SessionDB, parent: str, child: str):
-    """Drive the real rotation path so ``$._compression_from`` lands on *child*."""
-    db.create_session(parent, source="cli")
-    db.publish_compression_child(
-        parent_session_id=parent,
-        child_session_id=child,
-        source="cli",
-        messages=[{"role": "user", "content": "hello"}],
-        require_compression_lease=False,
-    )
-
-
-class TestReservedModelConfigKeysSurviveMetaOverwrite:
-    """Review of #92533 point 1: update_session_meta wholesale replacement must
-    preserve ``_``-prefixed lineage markers."""
-
-    def test_compression_marker_survives_acp_style_meta_overwrite(self, db):
-        _stamp_compression_marker(db, "root", "tip")
-
-        # acp_adapter/session.py replaces model_config wholesale on every persist.
-        db.update_session_meta("tip", '{"cwd": "/y", "provider": "openrouter"}')
-
-        stored = json.loads(db.get_session("tip")["model_config"])
-        assert stored["cwd"] == "/y"
-        assert stored["_compression_from"] == "root"
-
-    def test_reset_from_marker_also_survives(self, db):
-        db.create_session("s1", source="cli", model_config={"cwd": "/a"})
-        db._conn.execute(
-            "UPDATE sessions SET model_config = ? WHERE id = 's1'",
-            (json.dumps({"cwd": "/a", "_reset_from": "old-root"}),),
-        )
-        db._conn.commit()
-
-        db.update_session_meta("s1", '{"cwd": "/c"}')
-
-        stored = json.loads(db.get_session("s1")["model_config"])
-        assert stored["_reset_from"] == "old-root"
-        assert stored["cwd"] == "/c"
-
-
-def test_lineage_predicate_is_bound_to_the_specific_child():
-    from hermes_state_common import _COMPRESSION_MARKER_PARENT_EDGE_SQL
-    predicate = _COMPRESSION_MARKER_PARENT_EDGE_SQL.format(a="child")
-    assert "child.parent_session_id" in predicate
-    assert "child.model_config" in predicate
+    assert {s: db.get_session(s)["archived"] for s in (live_root, live_tip)} == {live_root: 0, live_tip: 0}
+    assert {s: db.get_session(s)["archived"] for s in (stale_root, stale_tip)} == {stale_root: 1, stale_tip: 1}
+    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == [live_tip]

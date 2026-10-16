@@ -2,30 +2,33 @@ import { writeFileSync } from 'node:fs'
 
 import type { ScrollBoxHandle } from '@hermes/ink'
 import { evictInkCaches } from '@hermes/ink'
+import type { InflightTurn, SessionResumeResult, Usage } from '@hermes/shared/gateway-events'
 import { type RefObject, useCallback, useEffect, useMemo, useRef } from 'react'
 
-import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
-import { introMsg, toTranscriptMessages, transcriptDeliveryIds } from '../domain/messages.js'
+import { STARTUP_WORKSPACE_CWD } from '../config/env.js'
+import { buildSetupRequiredSections, setupRequiredTitle } from '../content/setup.js'
+import { introMsg, toTranscriptMessages } from '../domain/messages.js'
 import { ZERO } from '../domain/usage.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
   SessionActivateResponse,
   SessionCloseResponse,
   SessionCreateResponse,
-  SessionInflightTurn,
-  SessionResumeResponse,
   SessionTitleResponse,
   SetupStatusResponse
 } from '../gatewayTypes.js'
+import { t } from '../i18n/runtime.js'
 import { asRpcResult } from '../lib/rpc.js'
-import type { Msg, PanelSection, SessionInfo, Usage } from '../types.js'
+import type { Msg, PanelSection, SessionInfo } from '../types.js'
 
+import { applyConnectionRequest, clearConnectionOperation } from './connectionOperationStore.js'
 import type { ComposerActions, GatewayRpc, StateSetter } from './interfaces.js'
 import { patchOverlayState } from './overlayStore.js'
 import { scheduleResumeScrollToBottom } from './sessionResumeView.js'
 import { turnController } from './turnController.js'
 import { patchTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
+import { describeCredentialWarning } from './userMessages.js'
 
 export { refreshSessionView, scheduleResumeScrollToBottom } from './sessionResumeView.js'
 
@@ -33,11 +36,11 @@ const usageFrom = (info: null | SessionInfo): Usage => (info?.usage ? { ...ZERO,
 
 const statusFromLiveSession = (status?: string, running = false) => {
   if (status === 'waiting') {
-    return 'waiting for input…'
+    return t('session.status.waitingForInput')
   }
 
   if (status === 'starting') {
-    return 'starting agent…'
+    return t('session.status.startingAgent')
   }
 
   return running || status === 'working' ? 'running…' : 'ready'
@@ -55,114 +58,22 @@ export const writeActiveSessionFile = (sessionId: null | string, file = process.
   }
 }
 
-export const liveSessionInflightMessages = (inflight?: null | SessionInflightTurn): Msg[] => {
+export const liveSessionInflightMessages = (inflight?: null | InflightTurn): Msg[] => {
   const user = String(inflight?.user ?? '').trim()
 
-  return user ? [{ role: 'user', text: user }] : []
+  return user
+    ? toTranscriptMessages([
+        {
+          role: 'user',
+          text: user,
+          ...(inflight?.display_kind ? { display_kind: inflight.display_kind } : {}),
+          ...(inflight?.display_metadata ? { display_metadata: inflight.display_metadata } : {})
+        }
+      ])
+    : []
 }
 
-const terminalReplayStates = new WeakMap<Set<string>, Map<string, Promise<void>>>()
-
-export const replayTerminalOutbox = async (
-  deliveries: unknown,
-  seen: Set<string>,
-  append: (msg: Msg) => void,
-  acknowledge: (deliveryId: string) => void | Promise<void>
-) => {
-  if (!Array.isArray(deliveries)) {
-    return
-  }
-
-  const replayStates = terminalReplayStates.get(seen) ?? new Map<string, Promise<void>>()
-  terminalReplayStates.set(seen, replayStates)
-  const processedThisReplay = new Set<string>()
-
-  for (const delivery of deliveries) {
-    if (!delivery || typeof delivery !== 'object') {
-      continue
-    }
-
-    const payload = (delivery as { payload?: unknown }).payload
-    if (!payload || typeof payload !== 'object') {
-      continue
-    }
-
-    const deliveryId = (payload as { delivery_id?: unknown }).delivery_id
-    const text = (payload as { text?: unknown }).text
-    if (typeof deliveryId !== 'string' || !deliveryId.trim() || typeof text !== 'string' || !text.trim()) {
-      continue
-    }
-
-    if (seen.has(deliveryId)) {
-      if (processedThisReplay.has(deliveryId)) {
-        continue
-      }
-      processedThisReplay.add(deliveryId)
-      const ackInFlight = replayStates.get(deliveryId)
-      if (ackInFlight) {
-        await ackInFlight
-      } else {
-        await acknowledge(deliveryId)
-      }
-      continue
-    }
-
-    seen.add(deliveryId)
-    processedThisReplay.add(deliveryId)
-    try {
-      append({ role: 'assistant', text, deliveryId })
-      const ackInFlight = Promise.resolve().then(() => acknowledge(deliveryId)).then(() => undefined)
-      replayStates.set(deliveryId, ackInFlight)
-      await ackInFlight
-      replayStates.delete(deliveryId)
-    } catch (error) {
-      if (!replayStates.has(deliveryId)) {
-        seen.delete(deliveryId)
-      } else {
-        replayStates.delete(deliveryId)
-      }
-      throw error
-    }
-  }
-}
-
-export const replayPendingTerminalOutbox = async (
-  gw: Pick<GatewayClient, 'request'>,
-  sessionId: string,
-  seen: Set<string>,
-  append: (msg: Msg) => void,
-  isCurrent: () => boolean = () => true
-) => {
-  const raw = await gw.request<{ deliveries?: unknown[] }>('terminal.outbox.pending', {
-    session_id: sessionId
-  })
-  const pending = asRpcResult<{ deliveries?: unknown[] }>(raw)
-
-  await replayTerminalOutbox(
-    pending?.deliveries,
-    seen,
-    msg => {
-      if (!isCurrent()) {
-        throw new Error('terminal outbox replay became stale')
-      }
-      append(msg)
-    },
-    async deliveryId => {
-      if (!isCurrent()) {
-        throw new Error('terminal outbox acknowledgement became stale')
-      }
-      const acknowledgement = await gw.request<{ acknowledged?: boolean }>('terminal.outbox.ack', {
-        delivery_id: deliveryId,
-        session_id: sessionId
-      })
-      if (asRpcResult<{ acknowledged?: boolean }>(acknowledgement)?.acknowledged !== true) {
-        throw new Error('terminal outbox acknowledgement was not accepted')
-      }
-    }
-  )
-}
-
-export const hydrateLiveSessionInflight = (inflight?: null | SessionInflightTurn) => {
+export const hydrateLiveSessionInflight = (inflight?: null | InflightTurn) => {
   const assistant = String(inflight?.assistant ?? '')
 
   if (!assistant && !inflight?.streaming) {
@@ -242,7 +153,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   )
 
   const cancelResumeScrollRef = useRef<null | (() => void)>(null)
-  const seenTerminalDeliveries = useRef(new Set<string>())
 
   const resetSession = useCallback(() => {
     cancelResumeScrollRef.current?.()
@@ -250,8 +160,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     turnController.fullReset()
     setVoiceRecording(false)
     setVoiceProcessing(false)
-    seenTerminalDeliveries.current.clear()
-    patchUiState({ bgTasks: new Set(), info: null, sid: null, usage: ZERO })
+    patchUiState({ bgTasks: new Set(), info: null, sid: null, storedSid: null, usage: ZERO })
     setHistoryItems([])
     setLastUserMsg('')
     setStickyPrompt('')
@@ -291,8 +200,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       const setup = await rpc<SetupStatusResponse>('setup.status', {})
 
       if (setup?.provider_configured === false) {
-        panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections())
-        patchUiState({ status: 'setup required' })
+        panel(setupRequiredTitle(), buildSetupRequiredSections())
+        patchUiState({ status: t('session.status.setupRequired') })
 
         return null
       }
@@ -303,7 +212,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         await closeSession(previousSid)
       }
 
-      const r = await rpc<SessionCreateResponse>('session.create', { cols: colsRef.current })
+      const r = await rpc<SessionCreateResponse>('session.create', {
+        cols: colsRef.current,
+        ...(STARTUP_WORKSPACE_CWD ? { cwd: STARTUP_WORKSPACE_CWD } : {})
+      })
 
       if (!r) {
         patchUiState({ status: 'ready' })
@@ -311,17 +223,21 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         return null
       }
 
-      const info = r.info ?? null
+      // The durable id lives on the create result; the lazy-create `info` does
+      // not carry it, and session.resume / the exit epilogue need the stored id.
+      const storedSid = r.stored_session_id || r.session_id
+      const info = r.info ? { ...r.info, stored_session_id: storedSid } : null
       const requestedTitle = title?.trim() ?? ''
 
       resetSession()
       setSessionStartedAt(Date.now())
 
-      writeActiveSessionFile(r.session_id)
+      writeActiveSessionFile(storedSid)
       patchUiState({
         info,
         sid: r.session_id,
-        status: info?.version ? 'ready' : 'starting agent…',
+        status: info?.version ? 'ready' : t('session.status.startingAgent'),
+        storedSid,
         usage: usageFrom(info)
       })
 
@@ -330,7 +246,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       }
 
       if (info?.credential_warning) {
-        sys(`warning: ${info.credential_warning}`)
+        sys(`warning: ${describeCredentialWarning(info.credential_warning)}`)
       }
 
       if (info?.config_warning) {
@@ -352,9 +268,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             }
 
             const nextTitle = (result.title ?? requestedTitle).trim()
-            const suffix = result.pending ? ' (queued while session initializes)' : ''
+            const suffix = result.pending ? t('session.lifecycle.titleQueuedSuffix') : ''
             patchUiState({ sessionTitle: nextTitle })
-            sys(`session title set: ${nextTitle}${suffix}`)
+            sys(`${t('session.lifecycle.sessionTitleSet', nextTitle)}${suffix}`)
           })
           .catch((err: unknown) => {
             if (getUiState().sid !== r.session_id) {
@@ -362,7 +278,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             }
 
             const message = err instanceof Error ? err.message : String(err)
-            sys(`warning: failed to set session title: ${message}`)
+            sys(`warning: ${t('session.lifecycle.failedToSetTitle', message)}`)
           })
       }
 
@@ -379,7 +295,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   )
 
   const newLiveSession = useCallback(
-    (msg = 'new live session started', title?: string) => {
+    (msg = t('session.lifecycle.newLiveSessionStarted'), title?: string) => {
       patchOverlayState({ sessions: false })
 
       return startNewSession(msg, title, true)
@@ -390,47 +306,45 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   const activateLiveSession = useCallback(
     (id: string) => {
       patchOverlayState({ sessions: false })
-      patchUiState({ status: 'switching session…' })
+      patchUiState({ status: t('session.status.switchingSession') })
+      // The card belongs to the session being left; the activated one answers with its own.
+      clearConnectionOperation()
 
       gw.request<SessionActivateResponse>('session.activate', { session_id: id })
         .then(raw => {
           const r = asRpcResult<SessionActivateResponse>(raw)
 
           if (!r) {
-            sys('error: invalid response: session.activate')
+            sys(`error: ${t('session.common.invalidResponse', 'session.activate')}`)
 
             return patchUiState({ status: 'ready' })
           }
 
           const info = r.info ?? null
+          // Agent-less (lazy) activations answer with `_fallback_session_info`, which
+          // has no stored_session_id; the durable id is the response's session_key.
+          const storedSid = r.session_key || r.session_id
           const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
 
           resetSession()
           setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
           const transcript = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
-          transcriptDeliveryIds(transcript).forEach(deliveryId => seenTerminalDeliveries.current.add(deliveryId))
           setHistoryItems(info ? [introMsg(info), ...transcript] : transcript)
-          writeActiveSessionFile(r.session_key ?? r.session_id)
+          writeActiveSessionFile(storedSid)
           patchUiState({
             busy: running,
             info,
             sid: r.session_id,
             status: statusFromLiveSession(r.status, running),
+            storedSid,
             usage: usageFrom(info)
           })
           hydrateLiveSessionInflight(r.inflight)
-          void replayPendingTerminalOutbox(
-            gw,
-            r.session_id,
-            seenTerminalDeliveries.current,
-            msg =>
-              setHistoryItems(items =>
-                items.some(item => item.role === 'assistant' && item.deliveryId === msg.deliveryId)
-                  ? items
-                  : [...items, msg]
-                ),
-                () => getUiState().sid === r.session_id
-                ).catch(() => undefined)
+
+          if (r.pending_connection) {
+            applyConnectionRequest(r.pending_connection)
+          }
+
           cancelResumeScrollRef.current?.()
           cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
         })
@@ -445,59 +359,57 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   const resumeById = useCallback(
     (id: string) => {
       patchOverlayState({ sessions: false })
-      patchUiState({ status: 'resuming…' })
+      patchUiState({ status: t('session.status.resuming') })
 
-      rpc<SetupStatusResponse>('setup.status', {}).then(setup => {
+      return rpc<SetupStatusResponse>('setup.status', {}).then(setup => {
         if (setup?.provider_configured === false) {
-          panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections())
-          patchUiState({ status: 'setup required' })
+          panel(setupRequiredTitle(), buildSetupRequiredSections())
+          patchUiState({ status: t('session.status.setupRequired') })
 
           return
         }
 
         const previousSid = getUiState().sid
 
-        gw.request<SessionResumeResponse>('session.resume', { cols: colsRef.current, session_id: id })
+        return gw
+          .request<SessionResumeResult>('session.resume', { cols: colsRef.current, session_id: id })
           .then(raw => {
-            const r = asRpcResult<SessionResumeResponse>(raw)
+            const r = asRpcResult<SessionResumeResult>(raw)
 
             if (!r) {
-              sys('error: invalid response: session.resume')
+              sys(`error: ${t('session.common.invalidResponse', 'session.resume')}`)
 
               return patchUiState({ status: 'ready' })
             }
 
-            const info = r.info ?? null
+            const storedSid = r.info?.stored_session_id || r.stored_session_id || r.resumed || id
+            const info = r.info ? { ...r.info, stored_session_id: storedSid } : null
+
             const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
 
             resetSession()
             setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
             const resumed = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
-            transcriptDeliveryIds(resumed).forEach(deliveryId => seenTerminalDeliveries.current.add(deliveryId))
 
             setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
-            writeActiveSessionFile(r.resumed ?? r.session_id)
+            writeActiveSessionFile(storedSid)
             patchUiState({
               busy: running,
               info,
               sid: r.session_id,
-              status: statusFromLiveSession(r.status, running),
+              status: statusFromLiveSession(r.status ?? undefined, running),
+              storedSid,
               usage: usageFrom(info)
             })
             hydrateLiveSessionInflight(r.inflight)
-            void replayPendingTerminalOutbox(
-              gw,
-              r.session_id,
-              seenTerminalDeliveries.current,
-              msg =>
-                setHistoryItems(items =>
-                  items.some(item => item.role === 'assistant' && item.deliveryId === msg.deliveryId)
-                    ? items
-                    : [...items, msg]
-                  ),
-                  () => getUiState().sid === r.session_id
-                  ).catch(() => undefined)
+
+            if (r.pending_connection) {
+              applyConnectionRequest(r.pending_connection)
+            } else {
+              clearConnectionOperation()
+            }
+
             cancelResumeScrollRef.current?.()
             cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
 
@@ -515,12 +427,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   )
 
   const guardBusySessionSwitch = useCallback(
-    (what = 'switch sessions') => {
+    (what = t('session.lifecycle.switchSessions')) => {
       if (!getUiState().busy) {
         return false
       }
 
-      sys(`interrupt the current turn before trying to ${what}`)
+      sys(t('session.lifecycle.interruptBeforeSwitch', what))
 
       return true
     },
