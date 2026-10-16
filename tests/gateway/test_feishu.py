@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from gateway.platforms.base import ProcessingOutcome
 
 try:
@@ -20,6 +22,26 @@ try:
     _HAS_LARK_OAPI = True
 except ImportError:
     _HAS_LARK_OAPI = False
+
+
+_REAL_HERMES_HOME = (Path.home() / ".hermes").resolve()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_feishu_hermes_home(tmp_path, monkeypatch):
+    fake_user_home = tmp_path / "user"
+    fake_hermes_home = fake_user_home / ".hermes"
+    fake_hermes_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: fake_user_home)
+    monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+
+
+class TestHermesHomeIsolation(unittest.TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_cleared_environment_cannot_resolve_the_live_hermes_home(self):
+        from hermes_constants import get_hermes_home
+
+        self.assertNotEqual(get_hermes_home().resolve(), _REAL_HERMES_HOME)
 
 
 class _FakeRequestContent:

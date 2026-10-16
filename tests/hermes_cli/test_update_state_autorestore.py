@@ -182,7 +182,7 @@ def test_clear_removes_every_sidecar_suffix_and_spares_the_database(tmp_path):
 
 
 def test_restore_helper_serves_snapshot_rows_over_a_hot_wal(
-    live_db_with_hot_wal, snapshot_db
+    live_db_with_hot_wal, snapshot_db, monkeypatch
 ):
     """The shared restore helper is what both update paths call.
 
@@ -190,6 +190,7 @@ def test_restore_helper_serves_snapshot_rows_over_a_hot_wal(
     has to hold the SNAPSHOT's rows even though the destination still owned a
     hot WAL from the corrupt database.
     """
+    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
     assert _restore_state_db_from_snapshot(live_db_with_hot_wal, snapshot_db) is True
 
     assert _row_count(live_db_with_hot_wal) == SNAPSHOT_ROWS
@@ -306,6 +307,7 @@ def test_post_update_guard_covers_sibling_profiles(tmp_path, monkeypatch, capsys
     (sibling_home / "state.db").write_bytes(b"\x00" * 4096)
 
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: root_home)
+    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
     monkeypatch.setattr(
         "hermes_cli.backup._sibling_profile_homes",
         lambda invoking_home: [("work", sibling_home)],

@@ -26,6 +26,7 @@ loaded, so there is no import cycle).
 import hashlib
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -5815,10 +5816,62 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     return found
 
 
+def _stop_identity_bound_gateway_pids(
+    identities: list[tuple[int, int]],
+) -> list[int]:
+    """Force-stop only gateway PIDs whose recorded start identity still matches."""
+    from gateway.status import terminate_pid
+
+    stopped: list[int] = []
+    for pid, start_time in identities:
+        if (
+            not isinstance(pid, int)
+            or isinstance(start_time, bool)
+            or not isinstance(start_time, int)
+            or pid <= 0
+            or start_time <= 0
+        ):
+            continue
+        try:
+            terminate_pid(
+                pid,
+                force=True,
+                expected_start_time=start_time,
+            )
+            stopped.append(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+    return stopped
+
+
+def _matching_gateway_process_identities(
+    pids: list[int], expected_start_times: dict[int, int]
+) -> list[tuple[int, int]]:
+    """Return only surviving gateways whose PID/start identity is unchanged."""
+    from gateway.status import get_process_start_time
+
+    matches: list[tuple[int, int]] = []
+    for pid in pids:
+        expected = expected_start_times.get(int(pid))
+        if (
+            isinstance(expected, bool)
+            or not isinstance(expected, int)
+            or expected <= 0
+        ):
+            continue
+        try:
+            current = get_process_start_time(int(pid))
+        except Exception:
+            continue
+        if current == expected:
+            matches.append((int(pid), expected))
+    return matches
+
+
 def _leftover_pausable_gateway_pids(
     matches: list[tuple[int, str, str]],
-) -> list[int] | None:
-    """PIDs from *matches* when every remaining venv holder is a pausable gateway.
+) -> list[tuple[int, int]] | None:
+    """Bound identities when every remaining venv holder is a pausable gateway.
 
     ``_pause_windows_gateways_for_update()`` stops every gateway its discovery
     finds, but the venv-holder guard downstream sees the process table as it
@@ -5847,18 +5900,25 @@ def _leftover_pausable_gateway_pids(
     except Exception:
         psutil = None
 
-    pids: list[int] = []
+    from hermes_cli.process_identity import coerce_process_create_time
+
+    identities: list[tuple[int, int]] = []
     for pid, _name, cmdline in matches:
         argv = cmdline
+        create_time = None
         if psutil is not None:
             try:
-                argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
+                proc = psutil.Process(int(pid))
+                argv = " ".join(proc.cmdline()) or cmdline
+                create_time = coerce_process_create_time(proc.create_time())
             except Exception:
                 pass
         if not _is_pausable_gateway(argv):
             return None
-        pids.append(int(pid))
-    return pids
+        if create_time is None:
+            return None
+        identities.append((int(pid), int(round(create_time * 100))))
+    return identities
 
 
 def _ledger_manual_serve_holders(
@@ -6129,13 +6189,21 @@ def _ledger_reapable_backend_pids(
         if not isinstance(recorded_create, (int, float)):
             continue
         try:
+            recorded_create = float(recorded_create)
             live_create = float(psutil.Process(int(pid)).create_time())
         except Exception:
             continue
-        if abs(live_create - float(recorded_create)) > 0.001:
+        if not (
+            math.isfinite(recorded_create)
+            and math.isfinite(live_create)
+            and recorded_create > 0
+            and live_create > 0
+        ):
+            continue
+        if abs(live_create - recorded_create) > 0.001:
             continue
         if spawner_is_dead(entry) is True:
-            roots.append((int(pid), float(recorded_create)))
+            roots.append((int(pid), recorded_create))
     return roots
 
 
@@ -6232,7 +6300,15 @@ def _stop_process_trees(pids: list[int | tuple[int, float]]) -> None:
             import psutil  # type: ignore
 
             live_create = float(psutil.Process(int(pid)).create_time())
-            if abs(live_create - float(expected_create)) > 0.001:
+            expected_create = float(expected_create)
+            if not (
+                math.isfinite(live_create)
+                and math.isfinite(expected_create)
+                and live_create > 0
+                and expected_create > 0
+            ):
+                continue
+            if abs(live_create - expected_create) > 0.001:
                 continue
             subprocess.run(
                 ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
@@ -6325,6 +6401,26 @@ def _stop_windows_gateway_service(
 ) -> None:
     """Stop one verified Windows service and wait until SCM reports it down."""
     import psutil  # noqa: PLC0415
+    from hermes_cli.process_identity import coerce_process_create_time
+
+    def _validated_identity(
+        identity: tuple[int, float] | None,
+    ) -> tuple[int, float] | None:
+        if identity is None:
+            return None
+        pid, raw_create_time = identity
+        create_time = coerce_process_create_time(raw_create_time)
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or create_time is None:
+            raise RuntimeError(f"Windows service {name} has an invalid process identity")
+        return pid, create_time
+
+    expected_processes = tuple(
+        identity
+        for raw_identity in expected_processes
+        if (identity := _validated_identity(raw_identity)) is not None
+    )
+    expected_service_identity = _validated_identity(expected_service_identity)
+    expected_gateway_identity = _validated_identity(expected_gateway_identity)
 
     service = psutil.win_service_get(name)
     if expected_service_identity is not None:
@@ -6390,13 +6486,15 @@ def _stop_windows_gateway_service(
 
     def _original_process_is_alive(pid: int, create_time: float) -> bool:
         try:
-            current = float(psutil.Process(pid).create_time())
+            current = coerce_process_create_time(psutil.Process(pid).create_time())
         except (psutil.NoSuchProcess, psutil.ZombieProcess):
             # A vanished process is clear.
             return False
         except Exception:
             # AccessDenied or any unknown probe failure stays fail-closed
             # because the venv may still be locked.
+            return True
+        if current is None:
             return True
         return abs(current - create_time) <= 0.001
 
@@ -6494,7 +6592,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
         return None
 
     try:
-        from gateway.status import terminate_pid
+        from gateway.status import get_process_start_time, terminate_pid
         from hermes_cli.gateway import (
             _capture_gateway_argv,
             _get_restart_drain_timeout,
@@ -6628,6 +6726,15 @@ def _pause_windows_gateways_for_update() -> dict | None:
     # downstream. Left alive, it trips the venv-holder guard and aborts the
     # update even though the gateway itself is stopped.
     launcher_pids = _m()._venv_launcher_ancestors(mapped_pids)
+    unmapped_pids = [
+        pid
+        for pid in running_pids
+        if pid not in profile_processes and pid not in service_gateway_pids
+    ]
+    force_target_start_times = {
+        int(pid): get_process_start_time(int(pid))
+        for pid in set(mapped_pids).union(unmapped_pids).union(launcher_pids)
+    }
 
     print("→ Stopping Windows gateway process(es) before updating Hermes...")
     try:
@@ -6655,11 +6762,6 @@ def _pause_windows_gateways_for_update() -> dict | None:
         mapped_pids,
         timeout=drain_timeout,
     )
-    unmapped_pids = [
-        pid
-        for pid in running_pids
-        if pid not in profile_processes and pid not in service_gateway_pids
-    ]
 
     # Snapshot each unmapped gateway's command line *before* we force-kill it,
     # so ``_resume_windows_gateways_after_update`` can respawn it by replaying
@@ -6683,8 +6785,20 @@ def _pause_windows_gateways_for_update() -> dict | None:
     # and is skipped.
     force_killed = []
     for pid in sorted(set(survivors).union(unmapped_pids).union(launcher_pids)):
+        expected_start_time = force_target_start_times.get(int(pid))
+        if expected_start_time is None:
+            logger.warning(
+                "Refusing to force-stop Windows gateway PID %s without a "
+                "recorded process identity",
+                pid,
+            )
+            continue
         try:
-            terminate_pid(int(pid), force=True)
+            terminate_pid(
+                int(pid),
+                force=True,
+                expected_start_time=expected_start_time,
+            )
             force_killed.append(int(pid))
         except (ProcessLookupError, PermissionError, OSError):
             pass
@@ -8290,19 +8404,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # does not map. Stop them and re-check instead of
                 # dead-ending; the post-update resume (and the supervisor
                 # that respawned them) brings gateways back afterwards.
-                from gateway.status import terminate_pid
-
                 print(
                     f"  ⚠ {len(_gateway_holders)} gateway process(es) still "
                     "hold the venv after the pause; stopping them"
                 )
-                for _pid in _gateway_holders:
-                    try:
-                        terminate_pid(int(_pid), force=True)
-                    except Exception as exc:
-                        logger.debug(
-                            "Could not stop leftover gateway %s: %s", _pid, exc
-                        )
+                _stop_identity_bound_gateway_pids(_gateway_holders)
                 _time.sleep(1.0)
                 _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
@@ -9805,6 +9911,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # discovered gateway lets the handler fail closed on an empty survivor
         # probe rather than reporting a clean update (#78574).
         _pre_restart_gateway_pids: list | None = []
+        _pre_restart_gateway_start_times: dict[int, int] = {}
         # Declared outside the restart try/except below (and never reset
         # to None) so it's always safe to read afterwards even if that
         # block raises before reaching its own restart bookkeeping —
@@ -10024,8 +10131,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # survivor probe's own None result already fails closed).
             try:
                 _pre_restart_gateway_pids = list(find_gateway_pids(all_profiles=True))
+                from gateway.status import get_process_start_time
+
+                for _pid in _pre_restart_gateway_pids:
+                    _start_time = get_process_start_time(int(_pid))
+                    if isinstance(_start_time, int) and _start_time > 0:
+                        _pre_restart_gateway_start_times[int(_pid)] = _start_time
             except Exception:
                 _pre_restart_gateway_pids = None
+                _pre_restart_gateway_start_times = {}
 
             # --- Systemd services (Linux) ---
             # Discover all hermes-gateway* units (default + profiles) plus
@@ -10516,26 +10630,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     exclude_pids=_service_pids_after,
                     all_profiles=True,
                 )
-                # Scope to PIDs we already tried to kill during this
-                # update (killed_pids).  Anything new is a gateway that
-                # started AFTER our restart attempt — respecting user
-                # intent, we don't kill those.
-                _stuck = [pid for pid in _surviving if pid in killed_pids]
+                # Scope to the exact process identities we already tried to
+                # stop. A recycled PID or anything new belongs to a later
+                # process generation and must never be force-killed here.
+                _stuck_candidates = [
+                    pid for pid in _surviving if pid in killed_pids
+                ]
+                _stuck = _matching_gateway_process_identities(
+                    _stuck_candidates,
+                    _pre_restart_gateway_start_times,
+                )
                 if _stuck:
                     print()
                     print(
                         f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
                     )
-                    from gateway.status import terminate_pid as _terminate_pid
-                    for pid in _stuck:
-                        try:
-                            # Routes through taskkill /T /F on Windows,
-                            # SIGKILL on POSIX — _signal.SIGKILL doesn't
-                            # exist on Windows so the old raw os.kill call
-                            # used to crash the entire update path.
-                            _terminate_pid(pid, force=True)
-                        except (ProcessLookupError, PermissionError, OSError):
-                            pass
+                    _stop_identity_bound_gateway_pids(_stuck)
                     # Give the OS a beat to reap the processes so the
                     # watchers see them exit and respawn.
                     _time.sleep(1.5)

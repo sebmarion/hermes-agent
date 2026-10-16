@@ -209,12 +209,20 @@ def full_snapshot(repo: Path, ref: str) -> dict[str, str]:
     return result
 
 
-def assert_core_conserved(current: dict[str, str], upstream: dict[str, str]) -> None:
+def assert_core_conserved(
+    current: dict[str, str],
+    upstream: dict[str, str],
+    *,
+    detect_local_deletions: bool = False,
+) -> None:
     """Refuse any preview that would replace or delete unowned local code."""
+    paths = set(current)
+    if detect_local_deletions:
+        paths.update(upstream)
     replaced = sorted(
         path
-        for path, identity in current.items()
-        if not is_edge_path(path) and upstream.get(path) != identity
+        for path in paths
+        if not is_edge_path(path) and upstream.get(path) != current.get(path)
     )
     if replaced:
         raise ScopeViolation(
@@ -557,6 +565,7 @@ def build_delta_candidate(
         assert_core_conserved(
             full_snapshot(repo, local_sha),
             full_snapshot(repo, anchor_sha),
+            detect_local_deletions=True,
         )
         state = _load_state(state_path)
         return {
@@ -579,6 +588,7 @@ def build_delta_candidate(
     assert_core_conserved(
         full_snapshot(repo, local_sha),
         full_snapshot(repo, anchor_sha),
+        detect_local_deletions=True,
     )
 
     # Validate anchor is an ancestor of upstream (the delta must be forward)

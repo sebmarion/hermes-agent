@@ -4389,20 +4389,40 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
-def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
+def _snapshot_process_create_time(proc: subprocess.Popen) -> Optional[float]:
+    """Capture the spawned root identity; return ``None`` if it is not provable."""
+    if proc.poll() is not None:
+        return None
+    try:
+        import psutil
+        from hermes_cli.process_identity import coerce_process_create_time
+
+        create_time = coerce_process_create_time(psutil.Process(proc.pid).create_time())
+    except Exception:
+        return None
+    if proc.poll() is not None:
+        return None
+    return create_time
+
+
+def _terminate_cron_script_process(
+    proc: subprocess.Popen, *, expected_create_time: Optional[float] = None
+) -> None:
     """Best-effort hard stop of a cron script and every child it spawned."""
     if proc.poll() is not None:
         return
     if sys.platform == "win32":
         try:
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                timeout=10,
-                creationflags=windows_hide_flags(),
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+            from agent.deadline import kill_process_tree
+
+            if not kill_process_tree(
+                proc.pid, expected_create_time=expected_create_time
+            ):
+                proc.kill()
+        except Exception:
+            # ``Popen.kill`` uses the retained Windows process handle, so this
+            # fallback cannot target a recycled PID. Tagged descendants are
+            # swept separately by ``_terminate_cron_script_tree``.
             proc.kill()
     else:
         try:
@@ -4477,8 +4497,18 @@ def _terminate_tagged_cron_script_processes(run_token: Optional[str]) -> bool:
     return signalled
 
 
+def _sweep_tagged_cron_script_processes(run_token: Optional[str]) -> None:
+    """Rescan after root teardown until no newly tagged descendant is found."""
+    for _ in range(3):
+        if not _terminate_tagged_cron_script_processes(run_token):
+            return
+
+
 def _terminate_cron_script_tree(
-    proc: subprocess.Popen, run_token: Optional[str] = None
+    proc: subprocess.Popen,
+    run_token: Optional[str] = None,
+    *,
+    expected_create_time: Optional[float] = None,
 ) -> None:
     """Terminate a script tree, then fall back to the local process-group path."""
     _terminate_tagged_cron_script_processes(run_token)
@@ -4486,6 +4516,7 @@ def _terminate_cron_script_tree(
         # Already exited (e.g. finished right at the deadline): nothing to
         # signal, and calling kill_process_tree on a reaped pid would log a
         # spurious "no signal" warning. Mirrors _terminate_cron_script_process.
+        _sweep_tagged_cron_script_processes(run_token)
         return
     pid = getattr(proc, "pid", None)
     if not isinstance(pid, int) or pid <= 0:
@@ -4494,7 +4525,10 @@ def _terminate_cron_script_tree(
             "falling back to process-group termination",
             pid,
         )
-        _terminate_cron_script_process(proc)
+        _terminate_cron_script_process(
+            proc, expected_create_time=expected_create_time
+        )
+        _sweep_tagged_cron_script_processes(run_token)
         return
     try:
         # Function-local so tests can monkeypatch agent.deadline.kill_process_tree;
@@ -4507,10 +4541,14 @@ def _terminate_cron_script_tree(
             "falling back to process-group termination",
             exc_info=True,
         )
-        _terminate_cron_script_process(proc)
+        _terminate_cron_script_process(
+            proc, expected_create_time=expected_create_time
+        )
+        _sweep_tagged_cron_script_processes(run_token)
         return
     try:
-        if kill_process_tree(pid):
+        if kill_process_tree(pid, expected_create_time=expected_create_time):
+            _sweep_tagged_cron_script_processes(run_token)
             return
         logger.warning(
             "Cron script tree-kill reported no signal for pid %s; "
@@ -4524,7 +4562,8 @@ def _terminate_cron_script_tree(
             pid,
             exc_info=True,
         )
-    _terminate_cron_script_process(proc)
+    _terminate_cron_script_process(proc, expected_create_time=expected_create_time)
+    _sweep_tagged_cron_script_processes(run_token)
 
 
 def _drain_script_pipes(proc: subprocess.Popen) -> None:
@@ -4765,15 +4804,24 @@ def _run_job_script(
             env=env,
             **popen_kwargs,
         )
+        process_create_time = _snapshot_process_create_time(proc)
         deadline = time.monotonic() + script_timeout
         while True:
             if cancel_event is not None and cancel_event.is_set():
-                _terminate_cron_script_tree(proc, run_token)
+                _terminate_cron_script_tree(
+                    proc,
+                    run_token,
+                    expected_create_time=process_create_time,
+                )
                 _drain_script_pipes(proc)
                 return False, "Script cancelled because cron fire ownership was lost"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _terminate_cron_script_tree(proc, run_token)
+                _terminate_cron_script_tree(
+                    proc,
+                    run_token,
+                    expected_create_time=process_create_time,
+                )
                 _drain_script_pipes(proc)
                 return False, f"Script timed out after {script_timeout}s: {path}"
             try:

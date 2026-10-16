@@ -105,6 +105,51 @@ class TestRunJobScript:
         assert success is True
         assert output == "relative works"
 
+    def test_timeout_binds_tree_kill_to_spawned_process_creation_time(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text('print("never reached")\n', encoding="utf-8")
+        captured = {}
+
+        class FakeProc:
+            pid = 4321
+            returncode = None
+
+            def poll(self):
+                return None
+
+            def communicate(self, timeout=None):
+                return ("", "")
+
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(sched_mod, "_get_script_timeout", lambda: 0.0)
+        monkeypatch.setattr(
+            sched_mod,
+            "_snapshot_process_create_time",
+            lambda proc: 123.5,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            sched_mod,
+            "_terminate_cron_script_tree",
+            lambda proc, run_token, expected_create_time=None: captured.update(
+                proc=proc,
+                run_token=run_token,
+                expected_create_time=expected_create_time,
+            ),
+        )
+
+        success, _output = _run_job_script("probe.py")
+
+        assert success is False
+        assert captured["proc"].pid == 4321
+        assert captured["run_token"]
+        assert captured["expected_create_time"] == 123.5
+
     @pytest.mark.live_system_guard_bypass
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX setsid regression")
     def test_script_timeout_kills_a_detached_descendant(self, cron_env, monkeypatch):
@@ -153,6 +198,41 @@ class TestRunJobScript:
         finally:
             if detached_pid is not None and alive(detached_pid):
                 os.kill(detached_pid, signal.SIGKILL)
+
+    def test_tree_cleanup_sweeps_a_tagged_descendant_created_after_first_scan(
+        self, monkeypatch
+    ):
+        import psutil
+
+        from agent import deadline as deadline_mod
+        from cron.scheduler import _terminate_cron_script_tree
+
+        class LateDescendant:
+            pid = 9876
+
+            def __init__(self):
+                self.killed = False
+
+            def environ(self):
+                return {"HERMES_INTERNAL_CRON_SCRIPT_RUN_TOKEN": "run-token"}
+
+            def is_running(self):
+                return True
+
+            def kill(self):
+                self.killed = True
+
+        late_descendant = LateDescendant()
+        scans = iter(([], [late_descendant], []))
+        monkeypatch.setattr(psutil, "process_iter", lambda: next(scans, []))
+        monkeypatch.setattr(deadline_mod, "kill_process_tree", lambda *a, **k: True)
+        root = SimpleNamespace(pid=4321, poll=lambda: None)
+
+        _terminate_cron_script_tree(
+            root, "run-token", expected_create_time=123.5
+        )
+
+        assert late_descendant.killed is True
 
     @pytest.mark.live_system_guard_bypass
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX setsid regression")

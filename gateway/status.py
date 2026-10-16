@@ -337,12 +337,74 @@ def normalize_updated_at(value: Any) -> Optional[str]:
     return None
 
 
-def terminate_pid(pid: int, *, force: bool = False) -> None:
+def _terminate_windows_tree_by_handles(
+    pid: int, expected_start_time: int
+) -> None:
+    """Suspend and kill one verified Windows tree through process handles."""
+    import psutil  # type: ignore
+
+    root = psutil.Process(pid)
+    root_start_time = int(round(float(root.create_time()) * 100))
+    if root_start_time != expected_start_time:
+        raise ProcessLookupError(f"PID {pid} identity changed before termination")
+
+    suspended = []
+    pending = [root]
+    seen = {(pid, root_start_time)}
+    try:
+        root.suspend()
+        suspended.append(root)
+        while pending:
+            parent = pending.pop(0)
+            for child in parent.children():
+                child_start_time = int(round(float(child.create_time()) * 100))
+                child_identity = (int(child.pid), child_start_time)
+                if child_identity in seen:
+                    continue
+                child.suspend()
+                seen.add(child_identity)
+                suspended.append(child)
+                pending.append(child)
+                if len(seen) > 4096:
+                    raise OSError("Windows process tree exceeded safe termination bound")
+        for process in reversed(suspended):
+            process.kill()
+    except BaseException:
+        for process in reversed(suspended):
+            try:
+                process.resume()
+            except Exception:
+                pass
+        raise
+
+
+def terminate_pid(
+    pid: int,
+    *,
+    force: bool = False,
+    expected_start_time: Optional[int] = None,
+) -> None:
     """Terminate a PID with platform-appropriate force semantics.
 
     POSIX uses SIGTERM/SIGKILL. Windows uses taskkill /T /F for true force-kill
     because os.kill(..., SIGTERM) is not equivalent to a tree-killing hard stop.
+    When ``expected_start_time`` is supplied, refuse to signal a recycled PID.
     """
+    if expected_start_time is not None:
+        if (
+            isinstance(expected_start_time, bool)
+            or not isinstance(expected_start_time, int)
+            or expected_start_time <= 0
+        ):
+            raise ValueError("expected_start_time must be a positive integer")
+        current_start_time = _get_process_start_time(pid)
+        if current_start_time != expected_start_time:
+            raise ProcessLookupError(f"PID {pid} identity changed before termination")
+
+    if force and _IS_WINDOWS and expected_start_time is not None:
+        _terminate_windows_tree_by_handles(pid, expected_start_time)
+        return
+
     if force and _IS_WINDOWS:
         # CREATE_NO_WINDOW: terminate_pid runs from the windowless pythonw.exe
         # gateway/desktop backend, so a bare taskkill spawn would flash a

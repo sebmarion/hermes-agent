@@ -266,6 +266,21 @@ def test_stop_process_trees_refuses_an_unbound_bare_pid():
     run.assert_not_called()
 
 
+def test_stop_process_trees_refuses_non_finite_creation_times():
+    """NaN/Infinity must never satisfy the taskkill identity guard."""
+    from hermes_cli import update_cmd
+
+    fake = _fake_psutil({111: _proc(111, [], create_time=11.0)})
+    with patch.dict(sys.modules, {"psutil": fake}), patch.object(
+        update_cmd.subprocess, "run"
+    ) as run:
+        cli_main._stop_process_trees(
+            [(111, float("nan")), (111, float("inf")), (111, float("-inf"))]
+        )
+
+    run.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Guard integration: orphan reap clears the dead-end
 # ---------------------------------------------------------------------------

@@ -1402,7 +1402,31 @@ class TestQuickSnapshot:
         )
 
 
+    def test_restore_removes_stale_database_sidecars(self, hermes_home, monkeypatch):
+        """A restore must not leave old WAL/SHM/journal files at the target."""
+        import hermes_cli.backup as backup
+        from hermes_cli.backup import create_quick_snapshot, restore_quick_snapshot
 
+        monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        try:
+            conn.execute("INSERT INTO sessions VALUES ('s2', 'post-snapshot')")
+            conn.commit()
+        finally:
+            conn.close()
+        sidecars = [state_db.with_name(state_db.name + suffix) for suffix in (
+            "-wal", "-shm", "-journal"
+        )]
+        for sidecar in sidecars:
+            sidecar.write_bytes(b"stale-sidecar")
+
+        assert restore_quick_snapshot(snap_id, hermes_home=hermes_home) is True
+        assert all(not sidecar.exists() for sidecar in sidecars)
+        with sqlite3.connect(state_db) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
 
 
 
@@ -1614,6 +1638,40 @@ class TestQuickSnapshotProjectsKanban:
         copy = hermes_home / "state-snapshots" / snap_id / "kanban" / "boards" / "work" / "kanban.db"
         rows = sqlite3.connect(str(copy)).execute("SELECT * FROM tasks").fetchall()
         assert rows == [("w1", "ship")]
+
+
+    def test_directory_db_snapshot_rejects_corrupt_destination(
+        self, hermes_home, monkeypatch
+    ):
+        """A valid source must not publish a corrupt directory-branch copy."""
+        import hermes_cli.backup as bk
+        from hermes_cli.backup import create_quick_snapshot
+
+        board = hermes_home / "kanban" / "boards" / "work"
+        board.mkdir(parents=True)
+        source = board / "kanban.db"
+        with sqlite3.connect(source) as conn:
+            conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, data TEXT)")
+            conn.execute("INSERT INTO tasks VALUES ('w1', 'ship')")
+
+        real_copy = bk._safe_copy_db
+
+        def corrupt_after_copy(src, dst):
+            copied = real_copy(src, dst)
+            if src == source and copied:
+                dst.write_bytes(dst.read_bytes()[:100])
+            return copied
+
+        monkeypatch.setattr(bk, "_safe_copy_db", corrupt_after_copy)
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+
+        assert snap_id is not None
+        snap_dir = hermes_home / "state-snapshots" / snap_id
+        manifest = json.loads((snap_dir / "manifest.json").read_text())
+        rel = "kanban/boards/work/kanban.db"
+        assert rel not in manifest["files"]
+        assert rel in manifest["failed_dbs"]
+        assert not (snap_dir / rel).exists()
 
 
 class TestPreUpdateBackup:
@@ -2343,8 +2401,12 @@ def test_manual_backup_excludes_a_corrupt_database_source(tmp_path, monkeypatch)
         assert "state.db" not in zf.namelist()
 
 
-def test_safe_restore_db_recovers_corruption_behind_a_valid_header(tmp_path):
+def test_safe_restore_db_recovers_corruption_behind_a_valid_header(
+    tmp_path, monkeypatch
+):
     import hermes_cli.backup as backup
+
+    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
 
     src = tmp_path / "source.db"
     dst = tmp_path / "state.db"
@@ -2660,6 +2722,535 @@ class TestImportLiveSessionDatabase:
 
         run_import(Namespace(zipfile=str(zip_path), force=True))
         assert _count_rows(home / "state.db") == (2, 6)
+
+    def test_import_removes_stale_database_sidecars(self, tmp_path, monkeypatch):
+        """Import must clear target sidecars before installing database pages."""
+        import hermes_cli.backup as backup
+        from hermes_cli.backup import run_import
+
+        monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+
+        home, live_db, zip_path = self._prepare(
+            tmp_path, monkeypatch, live=(1, 1), backup=(2, 3)
+        )
+        sidecars = [live_db.with_name(live_db.name + suffix) for suffix in (
+            "-wal", "-shm", "-journal"
+        )]
+        for sidecar in sidecars:
+            sidecar.write_bytes(b"stale-sidecar")
+
+        run_import(Namespace(zipfile=str(zip_path), force=True))
+
+        assert all(not sidecar.exists() for sidecar in sidecars)
+        assert _count_rows(live_db) == (2, 6)
+
+    def test_import_missing_target_removes_stale_database_sidecars(
+        self, tmp_path, monkeypatch
+    ):
+        """A fresh import also removes sidecars left beside a missing target."""
+        import hermes_cli.backup as backup
+        from hermes_cli.backup import run_import
+
+        monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        staged = tmp_path / "backup-state.db"
+        _write_session_db(staged, 2, 3)
+        zip_path = tmp_path / "backup.zip"
+        self._zip_with_db(zip_path, staged)
+        live_db = home / "state.db"
+        sidecars = [live_db.with_name(live_db.name + suffix) for suffix in (
+            "-wal", "-shm", "-journal"
+        )]
+        for sidecar in sidecars:
+            sidecar.write_bytes(b"stale-sidecar")
+
+        run_import(Namespace(zipfile=str(zip_path), force=True))
+
+        assert all(not sidecar.exists() for sidecar in sidecars)
+        assert _count_rows(live_db) == (2, 6)
+
+
+def test_import_rejects_corrupted_final_destination(
+    tmp_path, monkeypatch
+):
+    """A destination corrupted after publish must not be accepted."""
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "archive-state.db"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE data(value TEXT)")
+        conn.execute("INSERT INTO data VALUES ('snapshot')")
+    archive = tmp_path / "backup.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.write(source, "state.db")
+
+    target = tmp_path / "home" / "state.db"
+    target.parent.mkdir()
+    real_replace = backup.os.replace
+
+    def corrupt_after_publish(src, dst):
+        real_replace(src, dst)
+        if Path(dst) == target:
+            target.write_bytes(target.read_bytes()[:100])
+
+    monkeypatch.setattr(backup.os, "replace", corrupt_after_publish)
+    with zipfile.ZipFile(archive) as zf, pytest.raises(
+        OSError, match="destination|integrity|restore refused"
+    ):
+        backup._import_db_member(zf, "state.db", target)
+
+    assert target.exists()
+    assert not backup.verify_sqlite_integrity(target)["valid"]
+
+
+def test_import_preserves_published_database_when_post_publish_cleanup_refuses(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "archive-state.db"
+    _write_session_db(source, 2, 3)
+    archive = tmp_path / "backup.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.write(source, "state.db")
+    target = tmp_path / "home" / "state.db"
+    target.parent.mkdir()
+    cleanup_calls = []
+
+    def refuse_after_publish(path, expected_identity=None):
+        assert path == target
+        cleanup_calls.append(expected_identity)
+        return len(cleanup_calls) == 1
+
+    monkeypatch.setattr(backup, "_remove_sqlite_sidecars", refuse_after_publish)
+    with zipfile.ZipFile(archive) as zf, pytest.raises(
+        OSError, match="sidecar cleanup failed"
+    ):
+        backup._import_db_member(zf, "state.db", target)
+
+    assert len(cleanup_calls) == 2
+    assert target.exists()
+    assert _count_rows(target) == (2, 6)
+
+
+def test_import_preserves_published_database_when_final_validation_locks(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "archive-state.db"
+    _write_session_db(source, 2, 3)
+    archive = tmp_path / "backup.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.write(source, "state.db")
+    target = tmp_path / "home" / "state.db"
+    target.parent.mkdir()
+    monkeypatch.setattr(
+        backup, "_validate_final_sqlite_destination", lambda *_args: False
+    )
+
+    with zipfile.ZipFile(archive) as zf, pytest.raises(
+        OSError, match="final validation"
+    ):
+        backup._import_db_member(zf, "state.db", target)
+
+    assert target.exists()
+    assert _count_rows(target) == (2, 6)
+
+
+def test_fallback_restore_preserves_published_database_when_cleanup_refuses(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "source.db"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE data(value TEXT)")
+        conn.execute("INSERT INTO data VALUES ('snapshot')")
+    target = tmp_path / "state.db"
+    target.write_bytes(b"corrupt-live-database")
+    cleanup_calls = []
+
+    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+
+    def refuse_after_publish(path, expected_identity=None):
+        assert path == target
+        cleanup_calls.append(expected_identity)
+        return len(cleanup_calls) == 1
+
+    monkeypatch.setattr(backup, "_remove_sqlite_sidecars", refuse_after_publish)
+
+    assert backup._safe_restore_db(source, target) is False
+    assert len(cleanup_calls) == 2
+    assert target.exists()
+    with sqlite3.connect(target) as conn:
+        assert conn.execute("SELECT value FROM data").fetchall() == [("snapshot",)]
+
+
+def test_fallback_restore_preserves_published_database_when_final_validation_locks(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "source.db"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE data(value TEXT)")
+        conn.execute("INSERT INTO data VALUES ('snapshot')")
+    target = tmp_path / "state.db"
+    target.write_bytes(b"corrupt-live-database")
+    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [])
+    monkeypatch.setattr(
+        backup, "_validate_final_sqlite_destination", lambda *_args: False
+    )
+
+    assert backup._safe_restore_db(source, target) is False
+    assert target.exists()
+    with sqlite3.connect(target) as conn:
+        assert conn.execute("SELECT value FROM data").fetchall() == [("snapshot",)]
+
+
+def test_safe_restore_detects_destination_substitution_before_final_validation(
+    tmp_path, monkeypatch
+):
+    """A target swapped during restore must be rejected by final identity checks."""
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "source.db"
+    target = tmp_path / "state.db"
+    replacement = tmp_path / "replacement.db"
+    for path, value in (
+        (source, "snapshot"),
+        (target, "live"),
+        (replacement, "substitute"),
+    ):
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE data(value TEXT)")
+            conn.execute("INSERT INTO data VALUES (?)", (value,))
+
+    real_probe = backup._sqlite_main_file_is_structurally_valid
+
+    def substitute_after_probe(path):
+        result = real_probe(path)
+        if path == target:
+            replacement.replace(target)
+        return result
+
+    monkeypatch.setattr(
+        backup, "_sqlite_main_file_is_structurally_valid", substitute_after_probe
+    )
+
+    assert backup._safe_restore_db(source, target) is False
+
+
+def test_safe_restore_rejects_destination_substitution_during_final_validation(
+    tmp_path, monkeypatch
+):
+    """A target swapped after validation content is read must still be rejected."""
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "source.db"
+    target = tmp_path / "state.db"
+    replacement = tmp_path / "replacement.db"
+    for path, value in (
+        (source, "snapshot"),
+        (target, "live"),
+        (replacement, "substitute"),
+    ):
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE data(value TEXT)")
+            conn.execute("INSERT INTO data VALUES (?)", (value,))
+
+    real_verify = backup.verify_sqlite_integrity
+
+    def substitute_after_verify(path, *args, **kwargs):
+        result = real_verify(path, *args, **kwargs)
+        if path == target and result.get("valid"):
+            replacement.replace(target)
+        return result
+
+    monkeypatch.setattr(backup, "verify_sqlite_integrity", substitute_after_verify)
+
+    assert backup._safe_restore_db(source, target) is False
+
+
+def test_safe_restore_rejects_corrupted_fallback_destination(
+    tmp_path, monkeypatch
+):
+    """Fallback replacement must validate the exact installed destination."""
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "source.db"
+    target = tmp_path / "state.db"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE data(value TEXT)")
+        conn.execute("INSERT INTO data VALUES ('snapshot')")
+    target.write_bytes(b"corrupt-destination")
+
+    real_connect = backup.sqlite3.connect
+    source_opens = 0
+
+    def fail_restore_source_open(database, *args, **kwargs):
+        nonlocal source_opens
+        if database == f"file:{source}?mode=ro":
+            source_opens += 1
+            if source_opens == 2:
+                raise sqlite3.OperationalError("injected restore open failure")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(backup.sqlite3, "connect", fail_restore_source_open)
+
+    real_move = backup.shutil.move
+    real_atomic_replace = backup.atomic_replace
+
+    def corrupt_after_move(src, dst):
+        result = real_move(src, dst)
+        if Path(dst) == target:
+            target.write_bytes(target.read_bytes()[:100])
+        return result
+
+    def corrupt_after_atomic_replace(src, dst):
+        result = real_atomic_replace(src, dst)
+        if Path(dst) == target:
+            target.write_bytes(target.read_bytes()[:100])
+        return result
+
+    monkeypatch.setattr(backup.shutil, "move", corrupt_after_move)
+    monkeypatch.setattr(backup, "atomic_replace", corrupt_after_atomic_replace)
+
+    assert backup._safe_restore_db(source, target) is False
+    assert target.exists()
+    assert not backup.verify_sqlite_integrity(target)["valid"]
+
+
+@pytest.mark.parametrize("failure_stage", ["fd_directory", "fd_link"])
+def test_foreign_holder_scan_is_unknown_on_permission_error(
+    tmp_path, monkeypatch, failure_stage
+):
+    import hermes_cli.backup as backup
+
+    db = tmp_path / "state.db"
+    real_listdir = backup.os.listdir
+
+    def listdir(path):
+        if path == "/proc":
+            return ["61001"]
+        if path == "/proc/61001/fd":
+            if failure_stage == "fd_directory":
+                raise PermissionError("denied")
+            return ["7"]
+        return real_listdir(path)
+
+    monkeypatch.setattr(backup.sys, "platform", "linux")
+    monkeypatch.setattr(backup.os, "getpid", lambda: 61000)
+    monkeypatch.setattr(backup.os, "listdir", listdir)
+    if failure_stage == "fd_link":
+        monkeypatch.setattr(
+            backup.os,
+            "readlink",
+            lambda _path: (_ for _ in ()).throw(PermissionError("denied")),
+        )
+
+    assert backup._foreign_db_holder_pids(db) is None
+
+
+def test_sidecar_cleanup_does_not_require_offline_scan_when_no_sidecars_exist(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.backup as backup
+
+    target = tmp_path / "state.db"
+    target.write_bytes(b"main")
+    monkeypatch.setattr(
+        backup,
+        "_can_remove_sqlite_sidecars",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("an absent sidecar set needs no destructive-action proof")
+        ),
+    )
+
+    assert backup._remove_sqlite_sidecars(
+        target, backup._file_identity(target)
+    ) is True
+
+
+def test_sidecar_cleanup_rechecks_main_generation_when_no_sidecars_exist(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.backup as backup
+
+    target = tmp_path / "state.db"
+    target.write_bytes(b"main")
+    expected = backup._file_identity(target)
+    assert expected is not None
+    main_reads = 0
+
+    def identity(path):
+        nonlocal main_reads
+        if path == target:
+            main_reads += 1
+            return expected if main_reads == 1 else (expected[0], expected[1] + 1)
+        return None
+
+    monkeypatch.setattr(backup, "_file_identity", identity)
+
+    assert backup._remove_sqlite_sidecars(target, expected) is False
+
+
+def test_safe_restore_db_does_not_report_success_when_sidecar_cleanup_is_unknown(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "source.db"
+    target = tmp_path / "state.db"
+    for path, value in ((source, "snapshot"), (target, "live")):
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE data(value TEXT)")
+            conn.execute("INSERT INTO data VALUES (?)", (value,))
+
+    cleanup_calls = []
+    monkeypatch.setattr(
+        backup, "_current_process_holds_sqlite_family", lambda _path: False
+    )
+    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: None)
+    monkeypatch.setattr(
+        backup,
+        "_remove_sqlite_sidecars",
+        lambda *_args, **_kwargs: cleanup_calls.append(True) or False,
+    )
+
+    assert backup._safe_restore_db(source, target) is False
+    assert cleanup_calls == [True]
+
+
+def test_missing_destination_with_unremovable_sidecars_fails_before_open(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "source.db"
+    target = tmp_path / "state.db"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE data(value TEXT)")
+        conn.execute("INSERT INTO data VALUES ('snapshot')")
+    sidecar = target.with_name(target.name + "-wal")
+    sidecar.write_bytes(b"held-generation")
+    target_opens = []
+    real_connect = backup.sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        if database == str(target):
+            target_opens.append(database)
+            raise AssertionError("unproven sidecars must be refused before target open")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(backup.sqlite3, "connect", connect)
+    monkeypatch.setattr(backup, "_can_remove_sqlite_sidecars", lambda _path: False)
+    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _path: [61001])
+
+    assert backup._safe_restore_db(source, target) is False
+    assert target_opens == []
+    assert not target.exists()
+    assert sidecar.read_bytes() == b"held-generation"
+
+
+def test_sidecar_cleanup_rechecks_holder_state_before_unlink(tmp_path, monkeypatch):
+    import hermes_cli.backup as backup
+
+    target = tmp_path / "state.db"
+    target.write_bytes(b"main")
+    sidecar = target.with_name(target.name + "-wal")
+    sidecar.write_bytes(b"live-generation")
+    monkeypatch.setattr(backup, "_current_process_holds_sqlite_family", lambda _p: False)
+    monkeypatch.setattr(backup, "_foreign_db_holder_pids", lambda _p: [61001])
+
+    assert backup._remove_sqlite_sidecars(
+        target, backup._file_identity(target)
+    ) is False
+    assert sidecar.read_bytes() == b"live-generation"
+
+
+def test_sidecar_cleanup_refuses_a_recreated_generation(tmp_path, monkeypatch):
+    import hermes_cli.backup as backup
+
+    target = tmp_path / "state.db"
+    target.write_bytes(b"main")
+    sidecar = target.with_name(target.name + "-wal")
+    sidecar.write_bytes(b"captured-generation")
+    replacement = tmp_path / "replacement-wal"
+    replacement.write_bytes(b"new-generation")
+    expected_main = backup._file_identity(target)
+    real_identity = backup._file_identity
+    sidecar_reads = 0
+
+    def identity(path):
+        nonlocal sidecar_reads
+        if path == sidecar:
+            sidecar_reads += 1
+            if sidecar_reads == 2:
+                replacement.replace(sidecar)
+        return real_identity(path)
+
+    monkeypatch.setattr(backup, "_file_identity", identity)
+    monkeypatch.setattr(backup, "_can_remove_sqlite_sidecars", lambda _path: True)
+
+    assert backup._remove_sqlite_sidecars(target, expected_main) is False
+    assert sidecar.read_bytes() == b"new-generation"
+
+
+def test_copy_verification_failure_preserves_replaced_destination(tmp_path, monkeypatch):
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "source.db"
+    destination = tmp_path / "snapshot.db"
+    replacement = tmp_path / "replacement.db"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE data(value TEXT)")
+    replacement.write_bytes(b"another-writer")
+
+    def replace_then_reject(path, **_kwargs):
+        if path == destination:
+            replacement.replace(destination)
+        return {"valid": False, "message": "injected verification failure"}
+
+    monkeypatch.setattr(backup, "verify_sqlite_integrity", replace_then_reject)
+
+    assert backup.copy_db_and_verify(source, destination) is False
+    assert destination.read_bytes() == b"another-writer"
+
+
+def test_safe_copy_failure_preserves_replaced_destination(tmp_path, monkeypatch):
+    import hermes_cli.backup as backup
+
+    source = tmp_path / "source.db"
+    destination = tmp_path / "snapshot.db"
+    replacement = tmp_path / "replacement.db"
+    source.write_bytes(b"source")
+    replacement.write_bytes(b"another-writer")
+    real_connect = backup.sqlite3.connect
+
+    class SourceConnection:
+        def backup(self, _destination, **_kwargs):
+            replacement.replace(destination)
+            raise sqlite3.OperationalError("injected copy failure")
+
+        def close(self):
+            return None
+
+    def connect(database, *args, **kwargs):
+        if database == f"file:{source}?mode=ro":
+            return SourceConnection()
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(backup.sqlite3, "connect", connect)
+
+    assert backup._safe_copy_db(source, destination) is False
+    assert destination.read_bytes() == b"another-writer"
 
 
 def _count_rows(db_path: Path) -> tuple[int, int]:

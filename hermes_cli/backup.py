@@ -8,6 +8,7 @@ Backup and import commands for hermes CLI.
 HERMES_HOME root.
 """
 
+import errno
 import json
 import logging
 import os
@@ -476,12 +477,14 @@ def _safe_copy_db(
     """
     conn = None
     backup_conn = None
+    copied_identity = None
     try:
         # Disable sqlite3's implicit busy wait so backup() progress callbacks
         # control the full locked-source deadline instead of adding the
         # connection's default timeout before each callback.
         conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=0.0)
         backup_conn = sqlite3.connect(str(dst))
+        copied_identity = _file_identity(dst)
         busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
 
         def _check_backup_progress(status: int, _remaining: int, _total: int) -> None:
@@ -514,7 +517,8 @@ def _safe_copy_db(
                 pass
             backup_conn = None
         try:
-            dst.unlink(missing_ok=True)
+            if copied_identity is not None and _file_identity(dst) == copied_identity:
+                dst.unlink(missing_ok=True)
         except OSError:
             pass
         return False
@@ -733,10 +737,14 @@ def copy_db_and_verify(src: Path, dst: Path) -> bool:
     """
     if not _safe_copy_db(src, dst):
         return False
+    copied_identity = _file_identity(dst)
+    if copied_identity is None:
+        return False
     integrity = verify_sqlite_integrity(dst, run_pragma=True)
     if not integrity.get("valid"):
         try:
-            dst.unlink(missing_ok=True)
+            if _file_identity(dst) == copied_identity:
+                dst.unlink(missing_ok=True)
         except OSError:
             pass
         logger.warning("Backup of %s failed integrity verification: %s", src, integrity.get("message"))
@@ -762,7 +770,12 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
         )
 
     canonical_db = _canonical(os.fspath(db_path))
-    watched = {canonical_db, canonical_db + "-wal", canonical_db + "-shm"}
+    watched = {
+        canonical_db,
+        canonical_db + "-wal",
+        canonical_db + "-shm",
+        canonical_db + "-journal",
+    }
     pids: List[int] = []
     try:
         own_pid = os.getpid()
@@ -775,13 +788,17 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
             fd_dir = f"/proc/{pid}/fd"
             try:
                 fds = os.listdir(fd_dir)
-            except OSError:
-                continue
+            except OSError as exc:
+                if exc.errno in {errno.ENOENT, errno.ESRCH, errno.ENOTDIR}:
+                    continue
+                return None
             for fd in fds:
                 try:
                     target = os.readlink(f"{fd_dir}/{fd}")
-                except OSError:
-                    continue
+                except OSError as exc:
+                    if exc.errno in {errno.ENOENT, errno.ESRCH, errno.ENOTDIR}:
+                        continue
+                    return None
                 if _canonical(target) in watched:
                     pids.append(pid)
                     break
@@ -816,6 +833,151 @@ def _sqlite_main_file_is_structurally_valid(path: Path) -> bool:
                 pass
 
 
+def _file_identity(path: Path) -> Optional[tuple[int, int]]:
+    """Return the device/inode identity of *path*, or ``None`` if absent."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+_SQLITE_DESTINATION_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _current_process_holds_sqlite_family(path: Path) -> bool:
+    """Whether this process has an open descriptor for *path* or a sidecar."""
+    if not sys.platform.startswith("linux"):
+        return False
+    canonical = os.path.realpath(os.fspath(path))
+    watched = {
+        canonical,
+        canonical + "-wal",
+        canonical + "-shm",
+        canonical + "-journal",
+    }
+    try:
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                target = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                continue
+            if os.path.realpath(target.removesuffix(" (deleted)")) in watched:
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def _can_remove_sqlite_sidecars(path: Path) -> bool:
+    """Prove the database family is offline before deleting its sidecars."""
+    if _current_process_holds_sqlite_family(path):
+        return False
+    holders = _foreign_db_holder_pids(path)
+    return holders == []
+
+
+def _remove_sqlite_sidecars(
+    path: Path, expected_identity: Optional[tuple[int, int]] = None
+) -> bool:
+    """Remove sidecars belonging to *path*, failing closed on cleanup errors."""
+    sidecars = [
+        path.with_name(path.name + suffix)
+        for suffix in _SQLITE_DESTINATION_SIDECAR_SUFFIXES
+    ]
+    try:
+        captured_identities = {
+            sidecar: _file_identity(sidecar) for sidecar in sidecars
+        }
+        if (
+            expected_identity is not None
+            and _file_identity(path) != expected_identity
+        ):
+            return False
+        if all(identity is None for identity in captured_identities.values()):
+            return (
+                expected_identity is None
+                or _file_identity(path) == expected_identity
+            )
+        for sidecar in sidecars:
+            if (
+                expected_identity is not None
+                and _file_identity(path) != expected_identity
+            ):
+                return False
+            if not _can_remove_sqlite_sidecars(path):
+                return False
+            captured_identity = captured_identities[sidecar]
+            if _file_identity(sidecar) != captured_identity:
+                return False
+            if captured_identity is not None:
+                sidecar.unlink()
+                if _file_identity(sidecar) is not None:
+                    return False
+        if (
+            expected_identity is not None
+            and _file_identity(path) != expected_identity
+        ):
+            return False
+    except OSError as exc:
+        logger.error("Could not remove SQLite sidecar for %s: %s", path, exc)
+        return False
+    return True
+
+
+def _settle_sqlite_sidecars_after_online_backup(
+    path: Path, expected_identity: tuple[int, int]
+) -> bool:
+    """Clean offline sidecars or prove they belong to a known live generation."""
+    if _remove_sqlite_sidecars(path, expected_identity):
+        return True
+    if _current_process_holds_sqlite_family(path):
+        return True
+    holders = _foreign_db_holder_pids(path)
+    if holders:
+        return True
+    if holders is None:
+        logger.error(
+            "Could not prove SQLite sidecars for %s are offline or held by a "
+            "known live generation",
+            path,
+        )
+    return False
+
+
+def _validate_final_sqlite_destination(
+    path: Path, expected_identity: tuple[int, int]
+) -> bool:
+    """Validate the exact file published at *path* without accepting swaps."""
+    before = _file_identity(path)
+    if before != expected_identity:
+        logger.error(
+            "SQLite destination identity changed before validation for %s",
+            path,
+        )
+        return False
+    integrity = verify_sqlite_integrity(
+        path,
+        check_header=not _current_process_holds_sqlite_family(path),
+        run_pragma=True,
+    )
+    after = _file_identity(path)
+    if after != expected_identity or after != before:
+        logger.error(
+            "SQLite destination identity changed during validation for %s",
+            path,
+        )
+        return False
+    if not integrity.get("valid"):
+        logger.error(
+            "SQLite destination failed final integrity verification for %s: %s",
+            path,
+            integrity.get("message"),
+        )
+        return False
+    return True
+
+
 def _safe_restore_db(src: Path, dst: Path) -> bool:
     """Restore a SQLite database from snapshot *src* into live *dst*.
 
@@ -835,11 +997,46 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
 
     dst_conn = None
     src_conn = None
+    opened_destination_identity = None
+    destination_identity = _file_identity(dst)
     destination_invalid = not _sqlite_main_file_is_structurally_valid(dst)
+    if _file_identity(dst) != destination_identity:
+        logger.error(
+            "Refusing SQLite restore of %s: destination identity changed "
+            "during pre-restore checks",
+            dst,
+        )
+        return False
+    if destination_identity is None:
+        existing_sidecars = [
+            dst.with_name(dst.name + suffix)
+            for suffix in _SQLITE_DESTINATION_SIDECAR_SUFFIXES
+            if dst.with_name(dst.name + suffix).exists()
+        ]
+        if existing_sidecars:
+            if not _can_remove_sqlite_sidecars(dst):
+                logger.error(
+                    "Refusing SQLite restore of %s: sidecars exist but the "
+                    "destination family is not provably offline",
+                    dst,
+                )
+                return False
+            if not _remove_sqlite_sidecars(dst):
+                return False
+        if _file_identity(dst) is not None:
+            logger.error(
+                "Refusing SQLite restore of %s: destination appeared during "
+                "pre-restore cleanup",
+                dst,
+            )
+            return False
     primary_succeeded = False
     try:
         src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
         dst_conn = sqlite3.connect(str(dst))
+        opened_destination_identity = _file_identity(dst)
+        if opened_destination_identity is None:
+            raise OSError("SQLite restore destination disappeared after opening")
         src_conn.backup(dst_conn)
         primary_succeeded = True
     except Exception as exc:
@@ -857,10 +1054,23 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
                 pass
 
     if primary_succeeded:
+        final_identity = destination_identity or opened_destination_identity
+        if final_identity is None:
+            logger.error(
+                "SQLite restore completed without an installed destination: %s",
+                dst,
+            )
+            return False
         try:
             dst.chmod(src.stat().st_mode)
         except Exception:
             pass
+        if not _settle_sqlite_sidecars_after_online_backup(dst, final_identity):
+            return False
+        if not _validate_final_sqlite_destination(dst, final_identity):
+            return False
+        if not _settle_sqlite_sidecars_after_online_backup(dst, final_identity):
+            return False
         return True
 
     if not destination_invalid:
@@ -896,12 +1106,31 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
             return False
         with offline_file_access(dst, what="fallback restore of"):
             tmp = dst.parent / f".{dst.name}.snap_restore"
-            shutil.copy2(src, tmp)
-            dst.unlink(missing_ok=True)
-            for suffix in ("-wal", "-shm", "-journal"):
-                dst.with_name(dst.name + suffix).unlink(missing_ok=True)
-            shutil.move(str(tmp), str(dst))
-        return True
+            try:
+                shutil.copy2(src, tmp)
+                staged_identity = _file_identity(tmp)
+                if staged_identity is None:
+                    raise OSError("fallback SQLite staging file disappeared")
+                if _file_identity(dst) != destination_identity:
+                    raise OSError(
+                        "SQLite destination was substituted before fallback publish"
+                    )
+                if _foreign_db_holder_pids(dst) != []:
+                    raise OSError(
+                        "SQLite destination gained a foreign holder before fallback publish"
+                    )
+                if not _remove_sqlite_sidecars(dst, destination_identity):
+                    raise OSError("SQLite fallback sidecar cleanup failed")
+                atomic_replace(tmp, dst)
+                if not _validate_final_sqlite_destination(dst, staged_identity):
+                    raise OSError(
+                        "installed SQLite fallback destination failed final validation"
+                    )
+                if not _remove_sqlite_sidecars(dst, staged_identity):
+                    raise OSError("SQLite fallback sidecar cleanup failed after publish")
+                return True
+            finally:
+                tmp.unlink(missing_ok=True)
     except LiveConnectionError as fallback_exc:
         logger.error(
             "Refusing fallback restore of %s: %s Close the in-process "
@@ -1358,6 +1587,7 @@ def _import_db_member(
     caller reports a skipped file instead of counting a silent success.
     """
     target_exists = target.exists()
+    target_identity = _file_identity(target) if target_exists else None
     # Existing databases keep their mode/ownership because only their pages are
     # replaced. New targets use the caller-supplied safe mode after atomic
     # publication.
@@ -1383,10 +1613,38 @@ def _import_db_member(
                 f"{integrity.get('message')}"
             )
         if not target_exists:
+            if _file_identity(target) is not None:
+                raise OSError(
+                    "SQLite destination appeared or was substituted before publish; "
+                    "restore refused"
+                )
+            expected_identity = _file_identity(tmp_path)
+            if expected_identity is None:
+                raise OSError("staged SQLite database disappeared; restore refused")
+            if not _remove_sqlite_sidecars(target):
+                raise OSError("SQLite destination sidecar cleanup failed; restore refused")
+            if _file_identity(target) is not None:
+                raise OSError(
+                    "SQLite destination appeared during sidecar cleanup; "
+                    "restore refused"
+                )
             os.replace(tmp_path, target)
+            if not _remove_sqlite_sidecars(target, expected_identity):
+                raise OSError("installed SQLite sidecar cleanup failed; restore refused")
+            if not _validate_final_sqlite_destination(target, expected_identity):
+                raise OSError(
+                    "installed SQLite destination failed final validation; "
+                    "restore refused"
+                )
             if new_file_mode is not None:
                 _restore_file_mode(target, new_file_mode)
+            if not _remove_sqlite_sidecars(target, expected_identity):
+                raise OSError("final SQLite sidecar cleanup failed; restore refused")
             return
+        if _file_identity(target) != target_identity:
+            raise OSError(
+                "SQLite destination was substituted while staging; restore refused"
+            )
         if not _safe_restore_db(tmp_path, target):
             raise OSError(
                 "live-safe restore refused or failed; the existing database was "
@@ -1552,6 +1810,14 @@ def run_import(args) -> None:
                     before = _count_session_rows(target)
                     _import_db_member(zf, member, target, new_file_mode)
                     after = _count_session_rows(target)
+                    if _can_remove_sqlite_sidecars(target):
+                        installed_identity = _file_identity(target)
+                        if installed_identity is None or not _remove_sqlite_sidecars(
+                            target, installed_identity
+                        ):
+                            raise OSError(
+                                "final SQLite sidecar cleanup failed; restore refused"
+                            )
                     if before and after and after[1] < before[1]:
                         db_shrunk.append((rel, before, after))
                 else:
@@ -1869,7 +2135,7 @@ def _create_quick_snapshot_locked(
                     # board DB with an open WAL (the gateway may hold it at
                     # snapshot time) is captured consistently.
                     if sub.suffix == ".db":
-                        if not _safe_copy_db(sub, dst):
+                        if not copy_db_and_verify(sub, dst):
                             failed_dbs.append(sub_rel)
                             print(
                                 f"  ⚠ Snapshot: SQLite safe copy FAILED for {sub_rel} "

@@ -135,6 +135,32 @@ def test_delta_halts_on_unowned_local_core_divergence(tmp_path: Path) -> None:
         )
 
 
+def test_delta_halts_on_unowned_local_core_deletion(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo, {"core.py": "base\n", "upstream.py": "base\n"})
+
+    (repo / "upstream.py").write_text("upstream\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "upstream")
+    upstream_sha = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "checkout", "-q", base)
+    (repo / "core.py").unlink()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "unauthorized local core deletion")
+    local_sha = _git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(mu.ScopeViolation, match="unowned local Hermes paths"):
+        mu.build_delta_candidate(
+            repo,
+            base,
+            upstream_sha,
+            local_sha,
+            tmp_path / "state" / "upstream-sync.json",
+            tmp_path / "preview",
+        )
+
+
 def test_delta_preserves_owned_paths_byte_identical(tmp_path: Path) -> None:
     """Contract 3: explicit owned runtime paths remain byte-identical."""
     repo = tmp_path / "repo"
