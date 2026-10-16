@@ -876,3 +876,26 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
+
+
+@pytest.mark.parametrize("api_key", [None, "caller-stub-key"])
+def test_app_server_init_uses_its_own_auth(monkeypatch, api_key):
+    """The app-server owns auth; initialization needs no raw provider client."""
+    def unexpected_client(*_args, **_kwargs):
+        raise AssertionError("app-server initialization must not build a raw API client")
+
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", unexpected_client)
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", unexpected_client)
+    agent = run_agent.AIAgent(
+        api_key=api_key,
+        base_url="https://stub.invalid" if api_key else None,
+        model="gpt-5.6-sol", provider="openai-codex", api_mode="codex_app_server",
+        quiet_mode=True, skip_context_files=True, skip_memory=True,
+    )
+    try:
+        assert agent.api_mode == "codex_app_server"
+        assert agent.client is None
+        assert agent.api_key == (api_key or "")
+        assert agent._client_kwargs == {}
+    finally:
+        agent.close()

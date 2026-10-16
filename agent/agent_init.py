@@ -1030,6 +1030,11 @@ def _build_client(agent, api_key, base_url, fallback_model):
     _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
     if agent.api_mode == "anthropic_messages":
         _init_anthropic_client(agent, api_key, base_url, _provider_timeout)
+    elif agent.api_mode == "codex_app_server":
+        # The app-server owns authentication and the transport client.
+        agent.api_key = api_key or ""
+        agent.client = None
+        agent._client_kwargs = {}
     elif agent.provider == "moa":
         _init_moa_client(agent, api_key)
     elif agent.api_mode == "bedrock_converse":

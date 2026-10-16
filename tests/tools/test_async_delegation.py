@@ -1415,3 +1415,39 @@ def test_prune_never_evicts_live_records():
 
     assert {"live-stalling", "live-finalizing", "live-running"} <= survivors
     assert "done-0" not in survivors and len(survivors - {"live-stalling", "live-finalizing", "live-running"}) == ad._MAX_RETAINED_COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("status", "child_statuses", "error", "heading"),
+    [
+        ("completed", ["completed", "success"], None, "BATCH COMPLETE"),
+        ("completed", ["completed", "error"], None, "BATCH ERROR"),
+        ("error", [], "worker lost", "BATCH ERROR"),
+        ("unknown", ["unknown"], None, "BATCH ERROR"),
+        ("completed", ["completed"], "failed to record result", "BATCH ERROR"),
+    ],
+)
+def test_batch_heading_reports_terminal_failure(
+    monkeypatch, status, child_statuses, error, heading
+):
+    _patch_delegation_cfg(monkeypatch)
+    results = [
+        {"task_index": i, "status": child_status, "summary": f"child {i} output"}
+        for i, child_status in enumerate(child_statuses)
+    ]
+    evt = _make_async_evt(
+        is_batch=True, group="review", goals=["first goal", "second goal"],
+        status=status, error=error, results=results,
+    )
+
+    text = format_process_notification(evt)
+
+    assert text is not None
+    assert f"[ASYNC DELEGATION {heading} — deleg_x1]" in text
+    assert ("BATCH COMPLETE" in text) == (heading == "BATCH COMPLETE")
+    assert "group 'review'" in text
+    for i in range(len(results)):
+        assert f"TASK {i + 1}/2" in text
+        assert f"child {i} output" in text
+    if error and not results:
+        assert error in text

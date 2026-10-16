@@ -199,10 +199,17 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     n, n_unit = len(goals) or len(results), len(results) or len(goals)
     group = evt.get("group")
     unit = f"group '{group}' ({n_unit} subagent(s))" if group is not None else f"{n_unit} subagent(s)"
+    has_failure = (
+        (evt.get("status") or "completed") not in _DONE
+        or bool(evt.get("error"))
+        or any(r.get("status") not in _DONE for r in results)
+    )
+    heading = "ERROR" if has_failure else "COMPLETE"
+    outcome = "did not complete successfully" if has_failure else "has finished"
     lines = _preamble(
         evt,
-        f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
-        f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated results are "
+        f"[ASYNC DELEGATION BATCH {heading} — {deleg_id}]",
+        f"A background fan-out unit you dispatched earlier — {unit} — {outcome}; its consolidated results are "
         "below. Any other units from the same delegate_task call report separately as they finish. You may have "
         "moved on since dispatching — act on these or re-dispatch if things have changed. If you are still waiting "
         "on siblings, end your turn after acting on this one.",
