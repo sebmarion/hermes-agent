@@ -76,6 +76,8 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     explicit = get_session_env("HERMES_SESSION_SOURCE_EXPLICIT", "") == "1"
     if single_query and not explicit and source in _UI_TRANSPORT_SOURCES:
         source = ""
+    if not source and get_session_env("HERMES_CRON_SESSION", "") == "1":
+        source = "cron"
     if single_query and not source and (platform or "cli") == "cli":
         return ONESHOT_SOURCE
     return source or platform or "cli"

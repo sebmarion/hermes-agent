@@ -146,27 +146,41 @@ def _resolve_budget_fallback(
                 agent._response_was_previewed = True
             preserved_verification_fallback = True
         else:
-            # _handle_max_iterations makes one extra toolless request for a summary.
-            agent._emit_diagnostic_status(
-                f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— asking model to summarise"
-            )
-            if not agent.quiet_mode:
-                agent._safe_print(
-                    f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                    "— requesting summary...", diagnostic=True,
-                )
-            _summary_start = time.time()
             try:
-                final_response = agent._handle_max_iterations(messages, api_call_count)
-            except InterruptedError:
-                # The turn ends interrupted, so the pending interrupt message is returned
-                # for requeue instead of being cleared behind a fallback summary. A redirect
-                # also ends it: the budget is spent, so there is no loop to restart into.
-                from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
-                interrupted = True
-                _turn_exit_reason = interrupted_during_api_call_reason(agent)
-                final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{time.time() - _summary_start:.1f}s elapsed)."
+                from agent.verification_stop import (
+                    build_budget_exhausted_verification_response, verify_on_stop_enabled,
+                )
+
+                if verify_on_stop_enabled():
+                    final_response = build_budget_exhausted_verification_response(
+                        session_id=getattr(agent, "session_id", None),
+                        changed_paths=getattr(agent, "_turn_file_mutation_paths", set()) or (),
+                        api_call_count=api_call_count, max_iterations=agent.max_iterations,
+                    )
+            except Exception:
+                logger.debug("budget verification check failed", exc_info=True)
+            if final_response is None:
+                # _handle_max_iterations makes one extra toolless request for a summary.
+                agent._emit_diagnostic_status(
+                    f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                    "— asking model to summarise"
+                )
+                if not agent.quiet_mode:
+                    agent._safe_print(
+                        f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                        "— requesting summary...", diagnostic=True,
+                    )
+                _summary_start = time.time()
+                try:
+                    final_response = agent._handle_max_iterations(messages, api_call_count)
+                except InterruptedError:
+                    # The turn ends interrupted, so the pending interrupt message is returned
+                    # for requeue instead of being cleared behind a fallback summary. A redirect
+                    # also ends it: the budget is spent, so there is no loop to restart into.
+                    from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+                    interrupted = True
+                    _turn_exit_reason = interrupted_during_api_call_reason(agent)
+                    final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{time.time() - _summary_start:.1f}s elapsed)."
 
     # A kanban worker must record a terminal outcome whether or not a fallback path
     # was eligible, so the dispatcher learns the worker could not complete. Only the
@@ -584,6 +598,7 @@ def finalize_turn(
         final_response is not None
         and not failed
         and not interrupted
+        and not str(_turn_exit_reason).startswith("max_iterations_reached(")
         and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response("))
     )
 

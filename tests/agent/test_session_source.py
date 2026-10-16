@@ -66,3 +66,28 @@ def test_oneshot_keeps_explicit_source_flag(monkeypatch, explicit):
     monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
 
     assert _session_source_for_agent("cli") == explicit
+
+
+@pytest.mark.parametrize("oneshot", ["", "1"])
+def test_cron_marker_supplies_source_before_cli_fallback(monkeypatch, oneshot):
+    monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", oneshot)
+
+    assert _session_source_for_agent("cli") == "cron"
+
+
+def test_explicit_source_wins_over_cron_marker(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "tool")
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+
+    assert _session_source_for_agent("cli") == "tool"
+
+
+def test_task_local_non_cron_masks_inherited_cron_marker(monkeypatch):
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    tokens = set_session_vars(source="", cron_session="")
+    try:
+        assert _session_source_for_agent("cli") == "cli"
+    finally:
+        clear_session_vars(tokens)

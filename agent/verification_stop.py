@@ -227,4 +227,48 @@ def build_verify_on_stop_nudge(
     )
 
 
-__all__ = ["build_verify_on_stop_nudge", "verify_on_stop_enabled"]
+def build_budget_exhausted_verification_response(
+    *, session_id: str | None, changed_paths: Iterable[str],
+    api_call_count: int, max_iterations: int,
+) -> str | None:
+    """Return a continuation brief instead of an unverified model summary."""
+    paths = sorted({str(p) for p in changed_paths if p and not _is_non_code_path(p)})
+    if not paths:
+        return None
+    snapshot = _verification_snapshot(session_id=session_id, changed_paths=paths)
+    if snapshot is None:
+        return None
+    status, facts = snapshot
+    if str(status.get("status") or "unverified") == "passed":
+        return None
+    commands = [str(cmd).strip() for cmd in (facts.get("verifyCommands") or []) if str(cmd).strip()]
+    if commands:
+        next_step = "Pending verification: " + ", ".join(f"`{cmd}`" for cmd in commands[:3])
+        if len(commands) > 3:
+            next_step += ", ..."
+    elif _workspace_has_runnable_recipe(facts.get("root")):
+        next_step = "Pending verification: `hermes verify --json`."
+    else:
+        temp_dir = os.path.realpath(tempfile.gettempdir())
+        next_step = (
+            "No canonical verification command was detected. Create a focused "
+            f"temporary check under `{temp_dir}` with an OS-safe `tempfile` path "
+            "and a `hermes-verify-` filename prefix. Report it as ad-hoc verification."
+        )
+    return (
+        "INCOMPLETE: The iteration budget ended before edited code had fresh "
+        "passing verification evidence.\n\n"
+        f"Budget: {api_call_count}/{max_iterations} calls.\n\n"
+        f"Verification status: {_status_detail(status)}\n\n"
+        f"Changed paths:\n{_format_changed_paths(paths)}\n\n"
+        f"{next_step}\n"
+        "Continue from these edits, run the pending checks, and resolve any failures "
+        "before reporting the work as verified."
+    )
+
+
+__all__ = [
+    "build_budget_exhausted_verification_response",
+    "build_verify_on_stop_nudge",
+    "verify_on_stop_enabled",
+]

@@ -54,6 +54,9 @@ class _LimitAgent:
     def _emit_status(self, *_args, **_kwargs):
         pass
 
+    def _emit_diagnostic_status(self, *_args, **_kwargs):
+        pass
+
     def _safe_print(self, *_args, **_kwargs):
         pass
 
@@ -417,3 +420,127 @@ def test_finalize_turn_starts_the_title_upgrade_the_prologue_held_back():
     _finalize(agent, final_response="done", exit_reason="text_response(1)", api_call_count=1)
     assert ran.wait(timeout=5), "deferred title upgrade never started"
     assert agent._deferred_title_upgrade is None
+
+
+@pytest.mark.parametrize(
+    ("edit", "evidence", "enabled", "incomplete"),
+    [
+        ("app.ts", None, True, True),
+        ("app.ts", 1, True, True),
+        ("app.ts", 0, True, False),
+        ("README.md", None, True, False),
+        ("app.ts", None, False, False),
+    ],
+)
+def test_budget_fallback_uses_fresh_code_evidence(
+    tmp_path, monkeypatch, edit, evidence, enabled, incomplete
+):
+    import json
+    from agent.verification_evidence import mark_workspace_edited, record_terminal_result
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1" if enabled else "0")
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "vitest"}}))
+    (tmp_path / "pnpm-lock.yaml").write_text("")
+    changed = str(tmp_path / edit)
+    agent = _LimitAgent()
+    agent._turn_file_mutation_paths = {changed}
+    mark_workspace_edited(session_id=agent.session_id, cwd=tmp_path, paths=[changed])
+    if evidence is not None:
+        record_terminal_result(
+            command="pnpm test", cwd=tmp_path, session_id=agent.session_id,
+            exit_code=evidence, output="green" if evidence == 0 else "test failed",
+        )
+
+    result = _finalize(agent, final_response=None, exit_reason="budget_exhausted")
+
+    response = result["final_response"]
+    if incomplete:
+        assert response.startswith("INCOMPLETE:")
+        assert changed in response
+        assert "pnpm run test" in response
+        if evidence == 1:
+            assert "test failed" in response
+        assert agent._handle_max_iterations_called is False
+    else:
+        assert response == "summary from extra call"
+        assert agent._handle_max_iterations_called is True
+    assert result["completed"] is False
+    assert agent.persisted_messages is not None
+    assert [m["role"] for m in agent.persisted_messages] == ["user", "assistant"]
+    assert agent.persisted_messages[-1]["content"] == response
+
+
+def test_remaining_budget_guard_preserves_pending_candidate(tmp_path, monkeypatch):
+    import json
+    from agent.verification_evidence import mark_workspace_edited
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "vitest"}}))
+    changed = str(tmp_path / "app.ts")
+    agent = _LimitAgent(budget_remaining=0)
+    agent._turn_file_mutation_paths = {changed}
+    mark_workspace_edited(session_id=agent.session_id, cwd=tmp_path, paths=[changed])
+
+    result = _finalize(
+        agent, final_response=None, exit_reason="unknown", api_call_count=1,
+        pending_verification_response="Saved report with verification still pending.",
+    )
+
+    assert result["final_response"] == "Saved report with verification still pending."
+    assert agent._handle_max_iterations_called is False
+    assert result["turn_exit_reason"] == "max_iterations_reached(1/60)"
+    assert result["completed"] is False
+
+
+def test_remaining_budget_guard_without_pending_candidate(tmp_path, monkeypatch):
+    import json
+    from agent.verification_evidence import mark_workspace_edited
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "vitest"}}))
+    changed = str(tmp_path / "app.ts")
+    agent = _LimitAgent(budget_remaining=0)
+    agent._turn_file_mutation_paths = {changed}
+    mark_workspace_edited(session_id=agent.session_id, cwd=tmp_path, paths=[changed])
+
+    result = _finalize(agent, final_response=None, exit_reason="unknown", api_call_count=1)
+
+    assert result["final_response"].startswith("INCOMPLETE:")
+    assert agent._handle_max_iterations_called is False
+    assert result["turn_exit_reason"] == "max_iterations_reached(1/60)"
+    assert result["completed"] is False
+
+
+def test_budget_guard_checks_every_edited_workspace(tmp_path, monkeypatch):
+    import json
+    from agent.verification_evidence import mark_workspace_edited, record_terminal_result
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+    paths = []
+    for name in ("a", "b"):
+        project = tmp_path / name
+        project.mkdir()
+        (project / "package.json").write_text(json.dumps({"scripts": {"test": "vitest"}}))
+        path = str(project / "app.ts")
+        paths.append(path)
+        mark_workspace_edited(session_id=agent.session_id, cwd=project, paths=[path])
+    record_terminal_result(
+        command="npm test", cwd=tmp_path / "a", session_id=agent.session_id,
+        exit_code=0, output="green",
+    )
+    agent._turn_file_mutation_paths = set(paths)
+
+    result = _finalize(agent, final_response=None, exit_reason="unknown")
+
+    assert result["final_response"].startswith("INCOMPLETE:")
+    assert paths[1] in result["final_response"]
+    assert agent._handle_max_iterations_called is False
