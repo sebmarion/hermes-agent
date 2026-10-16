@@ -175,7 +175,7 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
   return layoutWidthPx < 1024 ? 1.02 : 1.15;
 }
 
-export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+export default function ChatPage({ isActive = true, founderEmbed = false }: { isActive?: boolean; founderEmbed?: boolean }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termWrapRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -1739,6 +1739,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   });
   const mobileModelToolsPortal =
     isActive &&
+    !founderEmbed &&
     narrow &&
     portalRoot &&
     createPortal(
@@ -1823,10 +1824,44 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       portalRoot,
     );
 
+  const founderSessionsPortal =
+    isActive &&
+    founderEmbed &&
+    portalRoot &&
+    mobilePanelOpen &&
+    createPortal(
+      <>
+        <Button ghost aria-label="Close conversations" onClick={closeMobilePanel} className="fixed inset-0 z-[55] block bg-black/60 p-0" />
+        <aside id="zeus-conversations-panel" role="complementary" aria-label="Zeus conversations" className="fixed inset-y-0 right-0 z-[60] flex w-[min(22rem,100vw)] flex-col border-l border-current/20 bg-background-base text-midground shadow-2xl">
+          <div className="flex h-14 shrink-0 items-center justify-between border-b border-current/20 px-4">
+            <Typography mondwest className="text-base font-bold tracking-wide text-midground">Conversations</Typography>
+            <Button ghost size="icon" onClick={closeMobilePanel} aria-label="Close conversations"><X /></Button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <ChatSessionList activeSessionId={resumeParam} profile={scopedProfile} onPicked={closeMobilePanel} onNewChat={startFreshDashboardChat} />
+          </div>
+        </aside>
+      </>,
+      portalRoot,
+    );
+
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2">
-      <PluginSlot name="chat:top" />
+      {!founderEmbed && <PluginSlot name="chat:top" />}
+      {founderEmbed && (
+        <div className="flex min-h-12 shrink-0 items-center justify-between gap-2 border-b border-current/15 px-2 sm:px-3">
+          <div className="min-w-0">
+            <Typography className="truncate text-sm font-bold text-midground">Ask Zeus</Typography>
+            <div className="truncate text-[11px] tracking-wide text-text-secondary">Action-taking founder copilot</div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button ghost size="sm" onClick={startFreshDashboardChat} aria-label="Start a new Zeus conversation">New chat</Button>
+            <Button ghost size="sm" onClick={() => setMobilePanelOpenRaw(true)} aria-label="Open Zeus conversations" aria-expanded={mobilePanelOpen} aria-controls="zeus-conversations-panel">Conversations</Button>
+          </div>
+        </div>
+      )}
       {mobileModelToolsPortal}
+      {founderSessionsPortal}
 
       {visibleBanner && (
         <div className="border border-warning/50 bg-warning/10 text-warning px-3 py-2 text-xs tracking-wide">
@@ -1928,7 +1963,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             </span>
           </Button>
 
-          {chatPanelCollapsed && (
+          {!founderEmbed && chatPanelCollapsed && (
             <Button
               ghost
               onClick={toggleChatPanel}
@@ -1955,7 +1990,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           )}
         </div>
 
-        {!narrow && !chatPanelCollapsed && (
+        {!founderEmbed && !narrow && !chatPanelCollapsed && (
           <div
             id="chat-side-panel"
             role="complementary"
@@ -1995,7 +2030,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           </div>
         )}
       </div>
-      <PluginSlot name="chat:bottom" />
+      {!founderEmbed && <PluginSlot name="chat:bottom" />}
     </div>
   );
 }

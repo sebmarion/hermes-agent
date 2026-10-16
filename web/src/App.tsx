@@ -818,7 +818,7 @@ export default function App() {
                           ) : null
                         }
                       >
-                        <ChatPage isActive={isChatRoute} />
+                        <ChatPage isActive={isChatRoute} founderEmbed={zeusFounderEmbed} />
                       </Suspense>
                     </div>
                   ) : isChatRoute ? (
