@@ -12,13 +12,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import platform
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
+
+from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,24 @@ _IS_WINDOWS = platform.system() == "Windows"
 # kernel closes it (and kills the job) when we die. Never close it manually.
 _JOB_HANDLE = None
 _LEDGER_LOCK = threading.Lock()
+
+
+def coerce_process_create_time(value: object) -> Optional[float]:
+    # Return a finite positive process creation time, else None.
+    if isinstance(value, bool):
+        return None
+    try:
+        create_time = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(create_time) or create_time <= 0:
+        return None
+    return create_time
+
+
+def _is_valid_pid(value: object) -> bool:
+    # True only for positive integer PIDs (never bool-as-int).
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def install_id(project_root: Optional[Path] = None) -> str:
@@ -59,7 +81,9 @@ def _process_create_time(pid: Optional[int] = None) -> Optional[float]:
     try:
         import psutil
 
-        return float(psutil.Process(os.getpid() if pid is None else pid).create_time())
+        return coerce_process_create_time(
+            psutil.Process(os.getpid() if pid is None else pid).create_time()
+        )
     except Exception:
         return None
 
@@ -97,9 +121,13 @@ def parse_spawn_tag(raw: object) -> Optional[SpawnTag]:
         return None
     try:
         pid = int(pid_s)
-        create = None if create_s == "-" else float(create_s)
     except ValueError:
         return None
+    create = None
+    if create_s != "-":
+        create = coerce_process_create_time(create_s)
+        if create is None:
+            return None
     return SpawnTag(install, purpose, pid, create) if pid > 0 else None
 
 
@@ -121,6 +149,10 @@ class LedgerEntry:
     host: str = ""
     port: Optional[int] = None
     profile: str = ""
+    hermes_home: str = ""
+    # `serve --isolated`: opted out of the host singleton (Desktop's SSH backend for another
+    # machine). Attach-first readers must never adopt it; argv is truncated, so this is canonical.
+    isolated: bool = False
 
 
 def _ledger_path() -> Path:
@@ -142,10 +174,10 @@ def _read_ledger(path: Path) -> Optional[list[dict]]:
     roster.
     """
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return []
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     if not text.strip():
         return []
@@ -170,18 +202,44 @@ def _read_ledger_or_quarantine(path: Path) -> Optional[list[dict]]:
 
 
 def _same_incarnation(proc, create_time: Optional[float]) -> bool:
-    """Does the live ``proc`` match a recorded ``create_time`` (2 s tolerance; ``None`` matches)?"""
-    return create_time is None or abs(float(proc.create_time()) - float(create_time)) < 2.0
+    # Does the live proc match a recorded finite creation time?
+    if create_time is None:
+        return True
+    expected = coerce_process_create_time(create_time)
+    live = coerce_process_create_time(proc.create_time())
+    return expected is not None and live is not None and abs(live - expected) < 2.0
 
 
-def _pid_alive_matches(pid: int, create_time: Optional[float]) -> Optional[bool]:
-    """True/False when provable; ``None`` when psutil can't say."""
+def _pid_alive_matches(
+    pid: int, create_time: Optional[float], *, strict: bool = False
+) -> Optional[bool]:
+    # True/False when identity is provable; None when psutil cannot say.
+    if not _is_valid_pid(pid):
+        return False
+    expected = None if create_time is None else coerce_process_create_time(create_time)
+    if create_time is not None and expected is None:
+        return None
     try:
         import psutil
     except Exception:
         return None
     try:
-        return _same_incarnation(psutil.Process(int(pid)), create_time)
+        proc = psutil.Process(pid)
+        live = coerce_process_create_time(proc.create_time())
+        if live is None:
+            return None
+        if expected is not None and abs(live - expected) >= 2.0:
+            return False
+        if strict:
+            if expected is None:
+                return False
+            if not proc.is_running():
+                return False
+            if os.name != "nt" and proc.status() == getattr(psutil, "STATUS_ZOMBIE", "zombie"):
+                return False
+        elif os.name != "nt" and proc.status() == getattr(psutil, "STATUS_ZOMBIE", "zombie"):
+            return False
+        return True
     except psutil.NoSuchProcess:
         return False
     except Exception:
@@ -193,16 +251,24 @@ def register_self(purpose: str, *, project_root: Optional[Path] = None, detail: 
 
     Called at the top of every long-lived entry point; dead ``(pid, create_time)`` entries are
     pruned on every write. ``detail`` may carry ``host``/``port``/``profile`` so the update
-    pipeline can relaunch a manually-started serve with its real bind address.
+    pipeline can relaunch a manually-started serve with its real bind address, and ``isolated``
+    so attach-first discovery skips a backend that opted out of the host singleton.
     """
+    from hermes_constants import hermes_home_key
+
     tag = parse_spawn_tag(os.environ.get(SPAWN_ENV_VAR))
     spawner_pid, spawner_create = (tag.spawner_pid, tag.spawner_create) if tag else _desktop_spawner_identity()
-    entry = _new_entry(os.getpid(), _process_create_time(), purpose, project_root, spawner_pid, spawner_create)
+    own_create = _process_create_time()
+    if own_create is None:
+        return False
+    entry = _new_entry(os.getpid(), own_create, purpose, project_root, spawner_pid, spawner_create)
+    entry.hermes_home = hermes_home_key()
     if detail:
         try:
             entry.host = str(detail.get("host") or "")
             entry.port = int(detail["port"]) if detail.get("port") is not None else None
             entry.profile = str(detail.get("profile") or "")
+            entry.isolated = bool(detail.get("isolated"))
         except (TypeError, ValueError):
             pass
     try:
@@ -214,6 +280,25 @@ def register_self(purpose: str, *, project_root: Optional[Path] = None, detail: 
     except Exception:
         pass
     return _append_entry(entry)
+
+
+def is_desktop_owned_backend(argv: Optional[Sequence[str]] = None) -> bool:
+    """Whether this process is the backend Desktop spawned and owns.
+
+    ``HERMES_DESKTOP=1`` is inherited by every shell and agent child the app launches, so the
+    flag alone is not ownership proof (same class as #116107). Desktop hands its backend a
+    per-spawn credential the terminal pane never receives (and the terminal tool's env policy
+    strips from agent children): the local pool spawn mints ``HERMES_DASHBOARD_SESSION_TOKEN``,
+    the SSH spawn passes a 0600 token FILE on argv and deliberately sets no token env var.
+    ``argv`` defaults to this process's own.
+    """
+    if os.environ.get("HERMES_DESKTOP") != "1":
+        return False
+    if os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN"):
+        return True
+    from hermes_cli._startup_fast import is_desktop_ssh_backend_argv
+
+    return is_desktop_ssh_backend_argv(list(sys.argv[1:] if argv is None else argv))
 
 
 def _desktop_spawner_identity() -> tuple[Optional[int], Optional[float]]:
@@ -258,16 +343,18 @@ def _append_entry(entry: LedgerEntry) -> bool:
         # Drop malformed entries, our own stale entry, and provably dead pids.
         pruned = [
             e for e in entries
-            if isinstance(e.get("pid"), int)
+            if _is_valid_pid(e.get("pid"))
             and e["pid"] != entry.pid
-            and _pid_alive_matches(e["pid"], e.get("create_time")) is not False
+            and coerce_process_create_time(e.get("create_time")) is not None
+            and _pid_alive_matches(e["pid"], e.get("create_time")) is True
         ]
         pruned.append(asdict(entry))
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
-            tmp.write_text(json.dumps(pruned, indent=2), encoding="utf-8")
-            os.replace(tmp, path)
+            from hermes_constants import mkdir_under_hermes_home
+            mkdir_under_hermes_home(path.parent)
+            # argv may carry surrogate-escaped bytes (non-UTF-8 paths); ensure_ascii keeps the
+            # utf-8 text handle from raising UnicodeEncodeError (a ValueError, not an OSError).
+            atomic_json_write(path, pruned, mode=0o600, ensure_ascii=True)
             return True
         except OSError:
             logger.debug("spawn ledger write failed", exc_info=True)
@@ -282,11 +369,15 @@ def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = Non
     ``(pid, create_time)`` with THIS process as spawner, so a helper whose spawner is provably gone
     is a reapable orphan and one whose spawner is alive is never reaped.
     """
+    if isinstance(pid, bool):
+        return False
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return False
-    child_create = _process_create_time(pid) if pid > 0 else None
+    if not _is_valid_pid(pid):
+        return False
+    child_create = _process_create_time(pid)
     if child_create is None:
         return False
     entry = _new_entry(pid, child_create, purpose, project_root, os.getpid(), _process_create_time())
@@ -299,43 +390,45 @@ def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = Non
     return _append_entry(entry)
 
 
-def ledger_entries(*, project_root: Optional[Path] = None) -> list[dict]:
-    """Live-verified ledger entries for THIS install (a corrupt ledger is quarantined, read as empty).
-
-    Entries whose ``(pid, create_time)`` no longer matches a live process are excluded (PID reuse reads as
-    dead, thanks to the create-time pair). A corrupt ledger is quarantined and read as empty — identical
-    philosophy to the backend-ownership fix (#89298): never let corruption erase or fake a roster; never let
-    it block the caller either.
-    """
+def ledger_entries(
+    *, project_root: Optional[Path] = None, all_installs: bool = False, verified_only: bool = False,
+) -> list[dict]:
+    # Return identity-bound live ledger entries.
     want_install = install_id(project_root)
     with _LEDGER_LOCK:
         entries = _read_ledger_or_quarantine(_ledger_path())
     if entries is None:
         return []
-    return [
-        e for e in entries
-        if e.get("install") == want_install
-        and isinstance(e.get("pid"), int)
-        and _pid_alive_matches(e["pid"], e.get("create_time")) is not False
-    ]
+    out = []
+    for e in entries:
+        if not (all_installs or e.get("install") == want_install):
+            continue
+        pid = e.get("pid")
+        if not _is_valid_pid(pid):
+            continue
+        create_time = coerce_process_create_time(e.get("create_time"))
+        if create_time is None:
+            continue
+        if _pid_alive_matches(pid, create_time, strict=verified_only) is not True:
+            continue
+        out.append(e)
+    return out
 
 
 def spawner_is_dead(entry: dict) -> Optional[bool]:
-    """Is the recorded spawner of this entry provably gone? ``None`` when unrecorded/unprovable."""
+    # Is the recorded spawner provably gone? None when identity is unprovable.
     spawner_pid = entry.get("spawner_pid")
-    if not isinstance(spawner_pid, int) or spawner_pid <= 0:
+    if not _is_valid_pid(spawner_pid):
         return None
-    alive = _pid_alive_matches(spawner_pid, entry.get("spawner_create"))
+    spawner_create = coerce_process_create_time(entry.get("spawner_create"))
+    if spawner_create is None:
+        return None
+    alive = _pid_alive_matches(spawner_pid, spawner_create)
     return None if alive is None else not alive
 
 
 def reap_orphaned_mcp_helpers(*, project_root: Optional[Path] = None, kill_fn=None) -> list[int]:
-    """Kill ledger-registered stdio MCP helpers whose spawner is provably dead.
-
-    Ledger-driven startup-sweep rung (not cmdline-heuristic): a helper is reaped ONLY when it has a
-    live ``mcp-helper`` entry for THIS install AND ``spawner_is_dead`` is ``True`` — never
-    ``None``/unprovable, never a live spawner.
-    """
+    # Kill only identity-bound MCP helpers whose recorded spawner is provably dead.
     reaped: list[int] = []
     try:
         entries = ledger_entries(project_root=project_root)
@@ -345,18 +438,21 @@ def reap_orphaned_mcp_helpers(*, project_root: Optional[Path] = None, kill_fn=No
     for entry in entries:
         try:
             pid = entry.get("pid")
-            if entry.get("purpose") != "mcp-helper" or not isinstance(pid, int) or pid <= 0 or pid == own_pid:
+            if entry.get("purpose") != "mcp-helper" or not _is_valid_pid(pid) or pid == own_pid:
                 continue
-            if spawner_is_dead(entry) is not True:
-                continue  # live or unprovable spawner → never touch
+            recorded_create = coerce_process_create_time(entry.get("create_time"))
+            if recorded_create is None or spawner_is_dead(entry) is not True:
+                continue
+            import psutil
+            proc = psutil.Process(pid)
+            live_create = coerce_process_create_time(proc.create_time())
+            if live_create is None or abs(live_create - recorded_create) >= 2.0:
+                continue
             if kill_fn is not None:
                 kill_fn(pid)
+            elif _IS_WINDOWS:
+                _kill_process_tree_windows(proc)
             else:
-                import psutil
-
-                proc = psutil.Process(pid)
-                if not _same_incarnation(proc, entry.get("create_time")):
-                    continue  # PID reused since registration
                 proc.terminate()
                 try:
                     proc.wait(timeout=2.0)
@@ -371,6 +467,36 @@ def reap_orphaned_mcp_helpers(*, project_root: Optional[Path] = None, kill_fn=No
 
 
 # Layer 3 — Windows job-object self-attach
+
+
+def _kill_process_tree_windows(proc) -> None:
+    """Terminate *proc* and every still-alive descendant (npx.cmd → node.exe), Windows-only
+    (#61059): without a pgid there is no group-kill, and grandchildren reparent to nothing
+    (ParentId=null) once the direct child exits, so they must be reached through the tree."""
+    import psutil
+
+    try:
+        descendants = proc.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        descendants = []
+    for child in descendants:
+        try:
+            child.terminate()
+        except Exception:  # noqa: BLE001 - raced away or refused; keep going
+            pass
+    try:
+        proc.terminate()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _, alive = psutil.wait_procs(descendants + [proc], timeout=2.0)
+    except Exception:  # noqa: BLE001 - broken fake/raced process; nothing more to force-kill
+        return
+    for survivor in alive:
+        try:
+            survivor.kill()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def attach_self_to_kill_on_close_job() -> bool:

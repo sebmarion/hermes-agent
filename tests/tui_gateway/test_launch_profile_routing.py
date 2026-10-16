@@ -44,5 +44,5 @@ def test_other_profile_is_scoped_and_then_released(profile_homes):
 
 def test_unknown_profile_is_still_rejected(profile_homes):
     handler = server._profile_scoped(lambda rid, params: get_hermes_home())
-    with pytest.raises(ValueError, match="Unknown Hermes profile"):
+    with pytest.raises(server.ProfileUnavailableError, match="Profile 'missing' does not exist"):
         handler(1, {"profile": "missing"})

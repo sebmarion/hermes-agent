@@ -2,9 +2,8 @@
 
 Covers ``register_child`` (the ledger mirror of ``register_self`` for
 subprocesses that never import Hermes code), the live-spawner protection
-contract, dead-spawner reap eligibility through BOTH consumers (the updater's
-``_ledger_reapable_backend_pids`` rung and the startup
-``reap_orphaned_mcp_helpers`` sweep), and prune-on-write of exited children.
+contract, dead-spawner reap eligibility through the startup
+``reap_orphaned_mcp_helpers`` sweep, and prune-on-write of exited children.
 
 Uses REAL subprocesses (``sleep``) and the real psutil so the
 ``(pid, create_time)`` identity pair is exercised end-to-end, with the ledger
@@ -26,9 +25,7 @@ import pytest
 
 from hermes_cli import process_identity as pi
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32", reason="uses POSIX sleep children"
-)
+pytestmark = pytest.mark.platforms("posix")  # uses POSIX sleep children
 
 
 @pytest.fixture

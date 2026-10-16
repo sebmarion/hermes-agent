@@ -20,11 +20,9 @@ from __future__ import annotations
 
 import sys
 import types
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from hermes_cli import main as cli_main
-from hermes_cli import update_cmd
+from hermes_cli import update_cmd_windows
 
 
 class _FakeNoSuchProcess(Exception):
@@ -85,7 +83,7 @@ def test_orphan_backend_dead_parent_qualifies():
     backend = _proc(200, _SERVE_ARGV, ppid=999)  # 999 not in table → dead
     fake = _fake_psutil({200: backend})
     with patch.dict(sys.modules, {"psutil": fake}):
-        assert cli_main._orphaned_desktop_backend_pids(_holders()) == [(200, 100.0)]
+        assert update_cmd_windows._orphaned_desktop_backend_pids(_holders()) == [(200, 100.0)]
 
 
 def test_orphan_backend_reap_is_bound_to_its_creation_time():
@@ -93,7 +91,7 @@ def test_orphan_backend_reap_is_bound_to_its_creation_time():
     fake = _fake_psutil({200: backend})
 
     with patch.dict(sys.modules, {"psutil": fake}):
-        assert cli_main._orphaned_desktop_backend_pids(_holders()) == [(200, 123.5)]
+        assert update_cmd_windows._orphaned_desktop_backend_pids(_holders()) == [(200, 123.5)]
 
 
 def test_backend_with_live_parent_keeps_refusal():
@@ -101,7 +99,7 @@ def test_backend_with_live_parent_keeps_refusal():
     backend = _proc(200, _SERVE_ARGV, ppid=50, create_time=100.0)
     fake = _fake_psutil({50: parent, 200: backend})
     with patch.dict(sys.modules, {"psutil": fake}):
-        assert cli_main._orphaned_desktop_backend_pids(_holders()) is None
+        assert update_cmd_windows._orphaned_desktop_backend_pids(_holders()) is None
 
 
 def test_recycled_parent_pid_counts_as_orphan():
@@ -110,7 +108,7 @@ def test_recycled_parent_pid_counts_as_orphan():
     backend = _proc(200, _SERVE_ARGV, ppid=50, create_time=100.0)
     fake = _fake_psutil({50: recycled, 200: backend})
     with patch.dict(sys.modules, {"psutil": fake}):
-        assert cli_main._orphaned_desktop_backend_pids(_holders()) == [(200, 100.0)]
+        assert update_cmd_windows._orphaned_desktop_backend_pids(_holders()) == [(200, 100.0)]
 
 
 def test_non_backend_holder_keeps_refusal():
@@ -118,7 +116,7 @@ def test_non_backend_holder_keeps_refusal():
     fake = _fake_psutil({300: repl})
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = _holders(pid=300, cmdline="python.exe -m hermes_cli.main chat")
-        assert cli_main._orphaned_desktop_backend_pids(holders) is None
+        assert update_cmd_windows._orphaned_desktop_backend_pids(holders) is None
 
 
 def test_mixed_holders_keep_refusal():
@@ -128,7 +126,7 @@ def test_mixed_holders_keep_refusal():
     fake = _fake_psutil({200: backend, 300: repl})
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = _holders() + [(300, "python.exe", "python.exe some_script.py")]
-        assert cli_main._orphaned_desktop_backend_pids(holders) is None
+        assert update_cmd_windows._orphaned_desktop_backend_pids(holders) is None
 
 
 def test_orphan_root_plus_managed_runtime_descendant_qualifies():
@@ -145,7 +143,7 @@ def test_orphan_root_plus_managed_runtime_descendant_qualifies():
     fake = _fake_psutil({200: backend, 210: child})
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = _holders() + [(210, "python.exe", " ".join(child_argv))]
-        assert cli_main._orphaned_desktop_backend_pids(holders) == [(200, 100.0)]
+        assert update_cmd_windows._orphaned_desktop_backend_pids(holders) == [(200, 100.0)]
 
 
 def test_descendant_of_grandchild_depth_qualifies():
@@ -159,7 +157,7 @@ def test_descendant_of_grandchild_depth_qualifies():
     fake = _fake_psutil({200: backend, 210: mid, 220: grand})
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = _holders() + [(220, "python.exe", "python.exe leaf.py")]
-        assert cli_main._orphaned_desktop_backend_pids(holders) == [(200, 100.0)]
+        assert update_cmd_windows._orphaned_desktop_backend_pids(holders) == [(200, 100.0)]
 
 
 def test_non_descendant_alongside_orphan_root_keeps_refusal():
@@ -173,7 +171,7 @@ def test_non_descendant_alongside_orphan_root_keeps_refusal():
     fake = _fake_psutil({50: unrelated_parent, 200: backend, 300: stray})
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = _holders() + [(300, "python.exe", "python.exe stray.py")]
-        assert cli_main._orphaned_desktop_backend_pids(holders) is None
+        assert update_cmd_windows._orphaned_desktop_backend_pids(holders) is None
 
 
 def test_descendant_exited_between_scan_and_classify_is_skipped():
@@ -181,13 +179,13 @@ def test_descendant_exited_between_scan_and_classify_is_skipped():
     fake = _fake_psutil({200: backend})  # descendant 210 already gone
     with patch.dict(sys.modules, {"psutil": fake}):
         holders = _holders() + [(210, "python.exe", "python.exe worker.py")]
-        assert cli_main._orphaned_desktop_backend_pids(holders) == [(200, 100.0)]
+        assert update_cmd_windows._orphaned_desktop_backend_pids(holders) == [(200, 100.0)]
 
 
 def test_holder_gone_between_scan_and_classify_is_skipped():
     fake = _fake_psutil({})  # PID vanished entirely
     with patch.dict(sys.modules, {"psutil": fake}):
-        assert cli_main._orphaned_desktop_backend_pids(_holders()) == []
+        assert update_cmd_windows._orphaned_desktop_backend_pids(_holders()) == []
 
 
 def test_missing_psutil_keeps_refusal():
@@ -203,7 +201,7 @@ def test_missing_psutil_keeps_refusal():
     with patch.dict(sys.modules, {"psutil": None}), patch.object(
         builtins, "__import__", _no_psutil
     ):
-        assert cli_main._orphaned_desktop_backend_pids(_holders()) is None
+        assert update_cmd_windows._orphaned_desktop_backend_pids(_holders()) is None
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +210,6 @@ def test_missing_psutil_keeps_refusal():
 
 
 def test_stop_process_trees_kills_full_tree():
-    from hermes_cli import update_cmd
-
     fake = _fake_psutil(
         {
             111: _proc(111, _SERVE_ARGV, create_time=10.0),
@@ -221,9 +217,9 @@ def test_stop_process_trees_kills_full_tree():
         }
     )
     with patch.dict(sys.modules, {"psutil": fake}), patch.object(
-        update_cmd.subprocess, "run"
+        update_cmd_windows.subprocess, "run"
     ) as run:
-        cli_main._stop_process_trees([(111, 10.0), (222, 20.0)])
+        update_cmd_windows._stop_process_trees([(111, 10.0), (222, 20.0)])
     calls = [c.args[0] for c in run.call_args_list]
     assert calls == [
         ["taskkill", "/PID", "111", "/T", "/F"],
@@ -232,25 +228,21 @@ def test_stop_process_trees_kills_full_tree():
 
 
 def test_stop_process_trees_never_raises():
-    from hermes_cli import update_cmd
-
     with patch.object(
-        update_cmd.subprocess, "run", side_effect=OSError("no taskkill")
+        update_cmd_windows.subprocess, "run", side_effect=OSError("no taskkill")
     ):
-        cli_main._stop_process_trees([111])  # must not raise
+        update_cmd_windows._stop_process_trees([111])  # must not raise
 
 
 def test_stop_process_trees_revalidates_ledger_identity_before_taskkill():
     """A PID reused after ledger selection must not be passed to taskkill."""
-    from hermes_cli import update_cmd
-
     matching = _proc(111, [], create_time=11.0)
     reused = _proc(222, [], create_time=99.0)
     fake = _fake_psutil({111: matching, 222: reused})
     with patch.dict(sys.modules, {"psutil": fake}), patch.object(
-        update_cmd.subprocess, "run"
+        update_cmd_windows.subprocess, "run"
     ) as run:
-        cli_main._stop_process_trees([(111, 11.0), (222, 22.0)])
+        update_cmd_windows._stop_process_trees([(111, 11.0), (222, 22.0)])
 
     assert [call.args[0] for call in run.call_args_list] == [
         ["taskkill", "/PID", "111", "/T", "/F"]
@@ -259,114 +251,25 @@ def test_stop_process_trees_revalidates_ledger_identity_before_taskkill():
 
 def test_stop_process_trees_refuses_an_unbound_bare_pid():
     """A PID without its observed creation time cannot authorize taskkill."""
-    from hermes_cli import update_cmd
-
-    with patch.object(update_cmd.subprocess, "run") as run:
-        cli_main._stop_process_trees([111])
+    with patch.object(update_cmd_windows.subprocess, "run") as run:
+        update_cmd_windows._stop_process_trees([111])
 
     run.assert_not_called()
 
 
 def test_stop_process_trees_refuses_non_finite_creation_times():
     """NaN/Infinity must never satisfy the taskkill identity guard."""
-    from hermes_cli import update_cmd
-
     fake = _fake_psutil({111: _proc(111, [], create_time=11.0)})
     with patch.dict(sys.modules, {"psutil": fake}), patch.object(
-        update_cmd.subprocess, "run"
+        update_cmd_windows.subprocess, "run"
     ) as run:
-        cli_main._stop_process_trees(
+        update_cmd_windows._stop_process_trees(
             [(111, float("nan")), (111, float("inf")), (111, float("-inf"))]
         )
 
     run.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# Guard integration: orphan reap clears the dead-end
-# ---------------------------------------------------------------------------
-
-
-def _update_args(**overrides):
-    defaults = dict(
-        gateway=False,
-        check=False,
-        no_backup=True,
-        backup=False,
-        yes=True,
-        branch=None,
-        force=False,
-        force_venv=False,
-    )
-    defaults.update(overrides)
-    return SimpleNamespace(**defaults)
-
-
-def _run_guard(detect_side_effect, orphan_return):
-    """Drive _cmd_update_impl to the venv-holder guard (harness mirrors
-    test_update_venv_health.py)."""
-
-    class _PastGuard(Exception):
-        pass
-
-    class _RootSentinel:
-        def __truediv__(self, _other):
-            raise _PastGuard
-
-    killed: list[list[int]] = []
-
-    with patch.object(cli_main, "_is_windows", return_value=True), patch.object(
-        cli_main, "_venv_scripts_dir", return_value=None
-    ), patch.object(cli_main, "_run_pre_update_backup"), patch.object(
-        cli_main, "_pause_windows_gateways_for_update", return_value=None
-    ), patch.object(
-        cli_main, "_resume_windows_gateways_after_update"
-    ), patch.object(
-        cli_main, "_detect_venv_python_processes", side_effect=detect_side_effect
-    ), patch.object(
-        cli_main, "_leftover_pausable_gateway_pids", return_value=None
-    ), patch.object(
-        cli_main, "_orphaned_desktop_backend_pids", return_value=orphan_return
-    ), patch.object(
-        cli_main, "_stop_process_trees", side_effect=killed.append
-    ), patch.object(
-        cli_main, "PROJECT_ROOT", _RootSentinel()
-    ), patch(
-        "time.sleep"
-    ):
-        try:
-            update_cmd._cmd_update_impl(_update_args(), gateway_mode=False)
-        except _PastGuard:
-            return "past_guard", killed
-        except SystemExit as exc:
-            return f"exit_{exc.code}", killed
-    return "returned", killed
-
-
-def test_guard_reaps_orphan_backend_and_proceeds():
-    holders = _holders()
-    # 1st scan: backend present; 2nd (post-reap) scan: clear.
-    result, killed = _run_guard(
-        detect_side_effect=[holders, []], orphan_return=[(200, 2.0)]
-    )
-    assert result == "past_guard"
-    assert killed == [[(200, 2.0)]]
-
-
-def test_guard_still_refuses_when_not_orphaned():
-    holders = _holders()
-    result, killed = _run_guard(
-        detect_side_effect=[holders, holders], orphan_return=None
-    )
-    assert result == "exit_2"
-    assert killed == []
-
-
-def test_guard_refuses_when_reap_does_not_clear_holders():
-    holders = _holders()
-    # Reap runs but a holder survives (unkillable child) → refuse.
-    result, killed = _run_guard(
-        detect_side_effect=[holders, holders], orphan_return=[200]
-    )
-    assert result == "exit_2"
-    assert killed == [[200]]
+# The old in-process venv-holder guard was intentionally retired by the PM
+# updater architecture. Its retirement/no-inspection contract is covered by
+# tests/hermes_cli/test_update_venv_holder_retirement.py.
