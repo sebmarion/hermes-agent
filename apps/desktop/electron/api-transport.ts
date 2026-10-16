@@ -198,9 +198,13 @@ function shouldSuppressExpectedSessionNotFound(request: any, error: any): boolea
 export {
   destroyKeepaliveAgents,
   downloadAgentFor,
+  htmlResponseError,
+  httpStatusError,
   isIdempotentMethod,
   isTransientTransportError,
   jsonAgentFor,
+  readJsonErrorBody,
+  readStatusCode,
   shouldRetryRequest,
   shouldSuppressExpectedSessionNotFound,
   withRetry

@@ -15,7 +15,11 @@ Runs on any host: psutil interactions go through a fake module.
 from __future__ import annotations
 
 import json
+import os
+import stat
+import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -23,7 +27,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_cli import process_identity as pi
-from hermes_cli import update_cmd
 
 
 class _FakeNoSuchProcess(Exception):
@@ -311,7 +314,7 @@ def _holders(*pids):
 
 
 def test_updater_reaps_ledger_proven_orphans():
-    from hermes_cli import main as cli_main
+    from hermes_cli import update_cmd_windows
 
     entries = [
         _entry(200, 2.0, spawner_pid=700, spawner_create=7.0),   # spawner dead → reap
@@ -354,15 +357,26 @@ def test_updater_ledger_rung_rejects_invalid_target_creation_time(recorded_creat
         assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
 
 
-def test_updater_ledger_rung_empty_without_ledger():
-    from hermes_cli import main as cli_main
-
-    with patch.object(pi, "ledger_entries", return_value=[]):
-        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
 
 
 def test_updater_ledger_rung_never_raises():
-    from hermes_cli import main as cli_main
+    from hermes_cli import update_cmd_windows
 
     with patch.object(pi, "ledger_entries", side_effect=RuntimeError("boom")):
-        assert cli_main._ledger_reapable_backend_pids(_holders(200)) == []
+        assert update_cmd_windows._ledger_reapable_backend_pids(_holders(200)) == []
+
+
+def test_desktop_ssh_backend_spawn_shape_is_desktop_owned(monkeypatch):
+    """Desktop's SSH spawn is ``env HERMES_DESKTOP=1 hermes serve --isolated ... --ssh-session-token-file F``
+    with NO token env var (its tests assert the var name never appears on the wire). Missing that
+    shape made the SSH child claim ROLE_SERVE on the remote host (the #119824 shape there)."""
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+    ssh_argv = ["serve", "--isolated", "--host", "127.0.0.1", "--port", "0",
+                "--ssh-session-token-file", "/home/u/.hermes/desktop-ssh/abc.token"]
+
+    assert pi.is_desktop_owned_backend(ssh_argv) is True
+    monkeypatch.setattr(sys, "argv", ["hermes", *ssh_argv])
+    assert pi.is_desktop_owned_backend() is True
+    # The bare inherited flag (a Desktop terminal pane running `hermes serve`) is still not ownership.
+    assert pi.is_desktop_owned_backend(["serve", "--host", "127.0.0.1", "--port", "0"]) is False

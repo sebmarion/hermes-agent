@@ -1,11 +1,23 @@
-import type { BillingBlock, UsageModelData } from '@hermes/shared/billing'
+import type { UsageModelData } from '@hermes/shared/billing'
+import type {
+  ConnectionRequestPayload,
+  GatewayEvent,
+  GatewayEventName,
+  InflightTurn,
+  TranscriptMessage,
+  Usage
+} from '@hermes/shared/gateway-events'
 import type { HermesSkin } from '@hermes/shared/skin'
 
-import type { SessionInfo, SlashCategory, SubagentStatus, Usage } from './types.js'
+import type { SessionInfo, SlashCategory } from './types.js'
 
 /** The cross-surface skin contract (canonical shape in `@hermes/shared`).
  *  Includes the paired light_colors/dark_colors overlays from #20379. */
 export type GatewaySkin = HermesSkin
+
+/** Distributive form of the shared `GatewayEvent<K>` so `switch (ev.type)`
+ *  narrows `ev.payload` per case (the generic-defaulted interface does not). */
+export type AnyGatewayEvent = { [K in GatewayEventName]: GatewayEvent<K> }[GatewayEventName]
 
 export interface GatewayCompletionItem {
   display: string
@@ -14,15 +26,6 @@ export interface GatewayCompletionItem {
   kind?: string
   meta?: string
   text: string
-}
-
-export interface GatewayTranscriptMessage {
-  context?: string
-  display_kind?: string
-  display_metadata?: Record<string, unknown>
-  name?: string
-  role: 'assistant' | 'system' | 'tool' | 'user'
-  text?: string
 }
 
 // ── Commands / completion ────────────────────────────────────────────
@@ -67,13 +70,6 @@ export type {
   UsageModelData
 } from '@hermes/shared/billing'
 
-export type CommandDispatchResponse =
-  | { output?: string; type: 'exec' | 'plugin' }
-  | { target: string; type: 'alias' }
-  | { display?: string; message?: string; name: string; type: 'skill' }
-  | { display?: string; message: string; notice?: string; type: 'send' }
-  | { message: string; notice?: string; type: 'prefill' }
-
 // ── Config ───────────────────────────────────────────────────────────
 
 export interface ConfigDisplayConfig {
@@ -85,6 +81,8 @@ export interface ConfigDisplayConfig {
   /** Focus view (/focus) — display-only reduced-output mode. */
   focus_view?: boolean
   inline_diffs?: boolean
+  /** UI language id (`en`, `pl`, `pt-br`); the TUI fetches its pack via `i18n.catalog`. */
+  language?: string
   mouse_tracking?: boolean | null | number | string
   sections?: Record<string, string>
   show_cost?: boolean
@@ -184,18 +182,9 @@ export interface SystemBatteryResponse {
 export interface SessionCreateResponse {
   info?: SessionInfo & { config_warning?: string; credential_warning?: string }
   session_id: string
-}
-
-export interface SessionResumeResponse {
-  inflight?: null | SessionInflightTurn
-  info?: SessionInfo
-  message_count?: number
-  messages: GatewayTranscriptMessage[]
-  resumed?: string
-  running?: boolean
-  session_id: string
-  started_at?: number
-  status?: LiveSessionStatus
+  // Durable id (state.db row) — what session.resume takes; `session_id` is the
+  // process-local runtime handle.
+  stored_session_id?: string
 }
 
 export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working'
@@ -217,35 +206,17 @@ export interface SessionActiveListResponse {
   sessions?: SessionActiveItem[]
 }
 
-export interface SessionInflightTurn {
-  assistant?: string
-  streaming?: boolean
-  user?: string
-}
-
 export interface SessionActivateResponse {
-  inflight?: null | SessionInflightTurn
+  inflight?: null | InflightTurn
   info?: SessionInfo
   message_count?: number
-  messages: GatewayTranscriptMessage[]
+  messages: TranscriptMessage[]
+  pending_connection?: ConnectionRequestPayload | null
   running?: boolean
   session_id: string
   session_key?: string
   started_at?: number
   status?: LiveSessionStatus
-}
-
-export interface SessionListItem {
-  id: string
-  message_count: number
-  preview: string
-  source?: string
-  started_at: number
-  title: string
-}
-
-export interface SessionListResponse {
-  sessions?: SessionListItem[]
 }
 
 export interface SessionDeleteResponse {
@@ -284,6 +255,8 @@ export interface SessionUsageResponse {
   compressions?: number
   context_max?: number
   context_percent?: number
+  context_estimated?: boolean
+  context_source?: string
   context_used?: number
   cost_status?: 'estimated' | 'exact'
   cost_usd?: number
@@ -307,7 +280,7 @@ export interface SessionCompressResponse {
   before_messages?: number
   before_tokens?: number
   info?: SessionInfo
-  messages?: GatewayTranscriptMessage[]
+  messages?: TranscriptMessage[]
   removed?: number
   summary?: {
     headline?: string
@@ -350,20 +323,10 @@ export interface BackgroundStartResponse {
   task_id?: string
 }
 
-export interface ClarifyRespondResponse {
-  ok?: boolean
-}
-
-export interface ApprovalRespondResponse {
-  ok?: boolean
-}
-
-export interface SudoRespondResponse {
-  ok?: boolean
-}
-
-export interface SecretRespondResponse {
-  ok?: boolean
+/** `clarify.lock` — one batch-clarify answer locked; `expired` when the request already ended. */
+export interface ClarifyLockResponse {
+  remaining?: string[]
+  status: 'expired' | 'ok'
 }
 
 // ── Shell / clipboard / input ────────────────────────────────────────
@@ -468,26 +431,6 @@ export interface ToolsConfigureResponse {
   unknown?: string[]
 }
 
-// ── Model picker ─────────────────────────────────────────────────────
-
-export interface ModelOptionProvider {
-  auth_type?: string
-  authenticated?: boolean
-  is_current?: boolean
-  key_env?: string
-  models?: string[]
-  name: string
-  slug: string
-  total_models?: number
-  warning?: string
-}
-
-export interface ModelOptionsResponse {
-  model?: string
-  provider?: string
-  providers?: ModelOptionProvider[]
-}
-
 // ── MCP ──────────────────────────────────────────────────────────────
 
 export interface ReloadMcpResponse {
@@ -508,6 +451,7 @@ export interface ProcessStopResponse {
 }
 
 export interface BrowserManageResponse {
+  browser_use?: boolean
   connected?: boolean
   messages?: string[]
   url?: string
@@ -539,38 +483,6 @@ export interface RollbackRestoreResponse {
   success?: boolean
 }
 
-// ── Subagent events ──────────────────────────────────────────────────
-
-export interface SubagentEventPayload {
-  api_calls?: number
-  cost_usd?: number
-  /** Batch (delegation) id this subagent belongs to — distinguishes
-   *  interleaved `[n/N]` progress from concurrent or nested fan-outs. */
-  delegation_id?: string
-  depth?: number
-  duration_seconds?: number
-  files_read?: string[]
-  files_written?: string[]
-  goal: string
-  input_tokens?: number
-  iteration?: number
-  model?: string
-  output_tail?: { is_error?: boolean; preview?: string; tool?: string }[]
-  output_tokens?: number
-  parent_id?: null | string
-  reasoning_tokens?: number
-  status?: SubagentStatus
-  subagent_id?: string
-  summary?: string
-  task_count?: number
-  task_index: number
-  text?: string
-  tool_count?: number
-  tool_name?: string
-  tool_preview?: string
-  toolsets?: string[]
-}
-
 // ── Delegation control RPCs ──────────────────────────────────────────
 
 export interface DelegationStatusResponse {
@@ -591,6 +503,33 @@ export interface DelegationStatusResponse {
 
 export interface DelegationPauseResponse {
   paused?: boolean
+}
+
+export interface AsyncDelegationRecord {
+  delegation_id: string
+  goal?: string | null
+  role?: string | null
+  model?: string | null
+  status?: string | null
+  dispatched_at?: number | null
+  completed_at?: number | null
+  subagent_ids?: string[]
+}
+
+export interface SubagentListResponse {
+  subagents: {
+    subagent_id: string
+    parent_id?: string | null
+    delegation_id?: string | null
+    depth?: number | null
+    goal?: string | null
+    model?: string | null
+    started_at?: number | null
+    status?: string | null
+    tool_count?: number | null
+    last_tool?: string | null
+  }[]
+  delegations: AsyncDelegationRecord[]
 }
 
 export interface SubagentInterruptResponse {
