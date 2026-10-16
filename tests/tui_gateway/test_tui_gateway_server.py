@@ -7284,6 +7284,10 @@ def test_prompt_submit_resolves_row_id_swallowed_by_marker_merge(monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: fake_db)
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
+    # prompt.submit always launches the deferred turn worker after admission.
+    # This row-id test is not exercising execution; suppress the actual worker
+    # so it cannot outlive this test and emit into the next test's patched sink.
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
 
     try:
         resp = server.handle_request(
