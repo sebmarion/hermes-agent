@@ -1,6 +1,7 @@
 """Batch execution + background dispatch for delegate_task: ``delegate_task`` builds a ``_Batch``
-(children + origin identity) and hands it to ``_run_batch``, which runs it synchronously or as ONE
-detached async unit."""
+(children + origin identity) and hands it to ``_run_batch``, which runs it synchronously or as
+detached async units — one per task ``group`` (ungrouped tasks are a unit each), so a finished
+review does not wait for the slowest sibling."""
 
 from __future__ import annotations
 
@@ -9,9 +10,10 @@ import json
 import logging
 import time
 from concurrent.futures import FIRST_COMPLETED, wait as _cf_wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 
+from tools.async_delegation import _new_delegation_id, record_unit_child
 from tools.delegate_tool_child_run import _detach_child, _fabricated_entry, _signal_child_stop
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _clean_error_text, _print_completion_line, _quiet, format_batch_tag,
@@ -42,6 +44,9 @@ class _Batch:
     origin_owner_transport: Any
     origin_owner_session_record: Any
     overall_start: float
+    # Set on per-group units carved out by ``_dispatch_background``; None for the whole batch / ungrouped units.
+    group: Optional[str] = None
+    unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
 
     def owner_kwargs(self) -> Dict[str, Any]:
         """Steer/stop authority of the originating session, passed to every child run."""
@@ -58,7 +63,7 @@ class _Batch:
 def _announce_batch(parent_agent, n_tasks: int, live_deleg_id: Optional[str]) -> None:
     """Announce the batch tag once so interleaved ``[tag n/N]`` lines are attributable."""
     if n_tasks > 1 and live_deleg_id:
-        _hdr = f"  🔀 [{format_batch_tag(live_deleg_id)}] delegating {n_tasks} tasks"
+        _hdr = f"  🔀 [{format_batch_tag(live_deleg_id, parent_agent)}] delegating {n_tasks} tasks"
         _print_completion_line(parent_agent, getattr(parent_agent, "_delegate_spinner", None), _hdr, console_line=_hdr)
 
 def _capture_origin() -> tuple[str, str, Any, Any]:
@@ -100,9 +105,10 @@ def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interru
     parent_agent, n_tasks = batch.parent_agent, len(batch.task_list)
     task_labels = [t["goal"][:40] for t in batch.task_list]
     spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
-    _tag = format_batch_tag(batch.live_deleg_id)
+    _tag = format_batch_tag(batch.live_deleg_id, parent_agent)
     # Fabricated entries for still-pending / raised futures carry the correct _delegate_role.
     _child_by_index = {i: child for (i, _, child) in batch.children}
+    n_here = len(batch.children)  # a per-group unit runs a subset; ``n_tasks`` keeps the call-wide ``i/N`` slot
 
     def _entry_of(future, idx):
         if not future.done():
@@ -125,17 +131,30 @@ def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interru
             for future in done:
                 entry = _entry_of(future, futures[future])
                 results.append(entry)
-                _report_child_done(parent_agent, spinner_ref, entry, _tag, task_labels, n_tasks, n_tasks - len(results))
+                if not honor_parent_interrupt and batch.unit_id:
+                    # Detached unit: a crash before the join must not lose children that already finished.
+                    record_unit_child(batch.unit_id, entry)
+                _report_child_done(parent_agent, spinner_ref, entry, _tag, task_labels, n_tasks, n_here - len(results))
+                if (not honor_parent_interrupt and batch.unit_id and entry.get("status") in SUBAGENT_FAILURE_STATUSES
+                        and len(results) < n_here):
+                    # Detached unit, a sibling is still running: tell the parent NOW, not when the last one finishes.
+                    # Non-durable and separate from the unit's final result (which is still delivered once).
+                    with _quiet("task failure notice failed", exc_info=True):
+                        from tools.async_delegation import push_task_failure_notice
+                        _i = entry.get("task_index", -1)
+                        _live = batch.live_paths[_i] if isinstance(_i, int) and 0 <= _i < len(batch.live_paths) else None
+                        push_task_failure_notice(
+                            batch.unit_id, {**entry, **({"live_transcript": _live} if _live else {})}, n_tasks=n_tasks)
     results.sort(key=lambda r: r["task_index"])  # match input order
 
 def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True) -> dict:
-    """Run all built children, join, finalize (hooks + cost rollup), return the combined dict. Shared by the sync path
-    and the background runner: even in the background the batch JOINS on itself here so ONE consolidated results
-    block re-enters the conversation. Live transcripts are finalized but retained as the full-fidelity record
-    (retention pruning happens on future dispatches)."""
+    """Run the batch's built children, join, finalize (hooks + cost rollup), return the combined dict. Shared by the
+    sync path and the background runner; a background runner receives a per-group unit (a subset of the call's
+    children) so each group JOINS only on itself. Live transcripts are finalized but retained as the full-fidelity
+    record (retention pruning happens on future dispatches)."""
     from tools.delegation_live_log import update_manifest_statuses
     results: list = []
-    if len(batch.task_list) == 1:
+    if len(batch.children) == 1:
         results.append(batch.run_child(*batch.children[0]))
     else:
         _run_children_parallel(batch, results, honor_parent_interrupt=honor_parent_interrupt)
@@ -152,14 +171,12 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     update_manifest_statuses(batch.live_deleg_id, results)
 
     combined: Dict[str, Any] = {"results": results, "total_duration_seconds": total_duration}
-    # Synchronous delegation has no async outbox row.  Put the same
-    # immutable child/result mapping into the durable tool result so the
-    # owner consumer can distinguish a completed delegated child from an
-    # ordinary worker session after the parent turn is persisted.
+    # Preserve durable child identity while also surfacing upstream process accounting.
     parent_session_id = getattr(batch.parent_agent, "session_id", None)
     if not isinstance(parent_session_id, str):
         parent_session_id = None
     receipt_children = []
+    delivery_base = batch.unit_id or batch.live_deleg_id
     for entry in results:
         task_index = entry.get("task_index")
         if (isinstance(task_index, bool) or
@@ -169,14 +186,11 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
         child = next((child for index, _task, child in batch.children
                       if index == task_index), None)
         origin_config = getattr(child, "_session_init_model_config", None)
-        origin = (origin_config.get("_origin")
-                  if isinstance(origin_config, dict) else None)
+        origin = origin_config.get("_origin") if isinstance(origin_config, dict) else None
         if not isinstance(origin, dict):
             continue
         child_session_id = getattr(child, "session_id", None)
-        if not isinstance(child_session_id, str):
-            child_session_id = None
-        if child_session_id is None:
+        if not isinstance(child_session_id, str) or not child_session_id:
             continue
         origin_version = origin.get("version")
         launch_id = origin.get("launch_id")
@@ -189,17 +203,15 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
             continue
         receipt_children.append({
             "task_index": task_index,
-            "goal": (batch.task_list[task_index].get("goal")
-                     if isinstance(task_index, int) and
-                     0 <= task_index < len(batch.task_list) else None),
+            "goal": batch.task_list[task_index].get("goal"),
             "child_session_id": child_session_id,
             "launch_id": launch_id,
             "origin_version": origin_version,
             "created_session_id": created_session_id,
             "parent_session_id": origin_parent_session_id,
             "completion_id": (
-                batch.live_deleg_id if len(batch.task_list) == 1
-                else f"{batch.live_deleg_id}:{task_index}"
+                delivery_base if len(batch.task_list) == 1
+                else f"{delivery_base}:{task_index}"
             ),
             "status": entry.get("status"),
             "exit_reason": entry.get("exit_reason", entry.get("status")),
@@ -208,14 +220,21 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     combined["archive_receipt"] = {
         "kind": "delegated_child_result",
         "version": 1,
-        "delivery_id": f"sync-delegation:{batch.live_deleg_id}",
-        "delegation_id": batch.live_deleg_id,
+        "delivery_id": f"sync-delegation:{delivery_base}",
+        "delegation_id": delivery_base,
         "parent_session_id": parent_session_id,
         "is_batch": len(batch.task_list) > 1,
         "children": receipt_children,
     }
-    if batch.live_paths:
-        combined["live_transcripts"] = list(batch.live_paths)
+    from tools.process_registry_notifications import _process_accounting_lines
+    process_notes = [line for entry in results for line in _process_accounting_lines(entry)]
+    if process_notes:
+        combined["process_notes"] = process_notes
+    unit_paths = [batch.live_paths[i] for (i, _, _) in batch.children if i < len(batch.live_paths)]
+    if unit_paths:
+        combined["live_transcripts"] = unit_paths
+    if batch.group is not None:
+        combined["group"] = batch.group
     return combined
 
 _SYNC_FALLBACK_NOTES = {
@@ -314,13 +333,15 @@ def _batch_progress_token(child_agents: List[Any]) -> tuple:
 
 _BACKGROUND_NOTES = {
     "one": (
-        "Subagent is running in the background. You and the user can keep working; its full result re-enters the "
-        "conversation as a new message when it finishes. Do not wait or poll — just continue."
+        "Subagent is running in the background; its full result re-enters the conversation as a new message when it "
+        "finishes. Results are delivered only after you END YOUR TURN: do anything that does not depend on it, then "
+        "stop with a one-line status. Do not poll its transcript or artifacts to wait for it."
     ),
     "many": (
-        "{n} subagents are running in parallel in the background. You and the user can keep working; they wait on "
-        "each other and their consolidated results re-enter the conversation as a single message once ALL of them "
-        "finish. Do not wait or poll — just continue."
+        "{n} subagents are running in parallel in the background as {k} completion unit(s); each unit's results "
+        "re-enter the conversation as their own new message when THAT unit finishes. Results are delivered only "
+        "after you END YOUR TURN: do anything that does not depend on them, then stop with a one-line status. Do not "
+        "poll transcripts or artifacts to wait for them."
     ),
     "control_hint": (
         "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "
@@ -333,50 +354,58 @@ _BACKGROUND_NOTES = {
     ),
 }
 
-def _dispatched_payload(dispatch: dict, goals: List[str], child_agents: List[Any], live_paths: List[str]) -> dict:
-    """Model-facing handle for an accepted background batch."""
+def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
+    """Model-facing handle for an accepted background call: one entry per async unit."""
+    goals = [t["goal"] for t in batch.task_list]
     n = len(goals)
     payload = {
-        "status": "dispatched", "mode": "background", "count": n, "delegation_id": dispatch["delegation_id"],
-        "goals": goals, "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n),
+        "status": "dispatched", "mode": "background", "count": n,
+        "delegation_id": batch.live_deleg_id or units[0][1], "goals": goals,
+        "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n, k=len(units)),
     }
-    sids = [getattr(c, "_subagent_id", None) for c in child_agents]
+    if len(units) > 1:
+        payload["units"] = [
+            {"delegation_id": uid, "group": unit.group, "task_indexes": [i for (i, _, _) in unit.children]}
+            for unit, uid in units
+        ]
+    sids = [getattr(c, "_subagent_id", None) for (_, _, c) in batch.children]
     if any(isinstance(s, str) and s for s in sids):
         payload["subagent_ids"] = sids
         payload["control_hint"] = _BACKGROUND_NOTES["control_hint"]
-    if live_paths:
-        payload["live_transcripts"] = list(live_paths)
+    if batch.live_paths:
+        payload["live_transcripts"] = list(batch.live_paths)
         payload["live_transcripts_hint"] = _BACKGROUND_NOTES["live_transcripts_hint"]
     return payload
 
-def _dispatch_background(batch: _Batch) -> str:
-    """Dispatch the WHOLE batch as one async unit and return the tool result JSON. The runner joins on every child and
-    yields ONE consolidated results block that re-enters the conversation as a single message when ALL children
-    finish. Falls back to running synchronously (with an explanatory ``note``) when the session cannot receive
-    detached completions or the async pool is at capacity."""
-    from tools.delegate_tool import _get_max_async_children
+def _units_of(batch: _Batch) -> List[_Batch]:
+    """Partition the call's children into async units: one per distinct task ``group`` (first-appearance order) and
+    one per ungrouped task. Each unit is a ``_Batch`` sharing the call's task_list/transcripts but owning a subset of
+    ``children``, so a unit joins only on itself and its completion re-enters the conversation on its own.
+
+    Off by default (``delegation.independent_completions``): the whole call is ONE unit and returns as one message.
+    A per-task flurry of completions (one new turn each) fragmented orchestrators that had no plan for it."""
+    from tools.delegate_tool_config import _get_independent_completions
+    if not _get_independent_completions():
+        return [batch]
+    members: Dict[Any, List[tuple]] = {}
+    for i, t, c in batch.children:
+        g = t.get("group")
+        key = ("g", str(g)) if g not in (None, "") else ("i", i)
+        members.setdefault(key, []).append((i, t, c))
+    return [replace(batch, children=ch, group=(key[1] if key[0] == "g" else None)) for key, ch in members.items()]
+
+def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str], routing: dict) -> dict:
+    """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
     from tools.async_delegation import dispatch_async_delegation_batch
-    wake_sid = _resolve_async_wake_sid(batch.origin_wake_sid)
-    if wake_sid is None:
-        logger.info("delegate_task: async delivery unsupported on this session runtime; running the batch synchronously instead.")
-        return _run_sync_with_note(batch, "no_async")
+    child_agents = [c for (_, _, c) in unit.children]
 
-    parent_agent = batch.parent_agent
-    session_key, origin_ui_session_id = _resolve_async_session_key(parent_agent, batch.origin_ui_session_id)
-    child_agents = [c for (_, _, c) in batch.children]
-    # The batch's lifecycle is owned by the async registry now: drop the children from the parent's
-    # interrupt-propagation list (_build_child_agent attached them, which is correct for sync runs).
-    for c in child_agents:
-        _detach_child(parent_agent, c)
-
-    def _batch_interrupt():
-        # Cancellation path for the detached batch (owned by the async registry).
+    def _interrupt():
         for c in child_agents:
             _signal_child_stop(c, "Async delegation cancelled")
 
-    def registered(delegation_id):
-        # A single child's immutable origin must be recorded before scheduling.
-        # Multi-child batches carry the per-child origin map in their result.
+    def _registered(delegation_id: str) -> None:
+        # Bind a single child's immutable origin before scheduling. Multi-child
+        # units carry their per-child origin map in the durable result receipt.
         if len(child_agents) != 1:
             return
         child = child_agents[0]
@@ -385,36 +414,78 @@ def _dispatch_background(batch: _Batch) -> str:
             return
         from tools.async_delegation import bind_child_delegation
         if not bind_child_delegation(
-            delegation_id, child_session_id=str(getattr(child, "session_id", "") or ""),
-            launch_id=origin.get("launch_id"), origin_version=origin.get("version"),
+            delegation_id,
+            child_session_id=str(getattr(child, "session_id", "") or ""),
+            launch_id=origin.get("launch_id"),
+            origin_version=origin.get("version"),
             created_session_id=origin.get("created_session_id"),
-            parent_session_id=str(getattr(parent_agent, "session_id", "") or ""),
+            parent_session_id=str(getattr(unit.parent_agent, "session_id", "") or ""),
         ):
             raise RuntimeError("child delegation origin could not be bound")
 
-    goals = [t["goal"] for t in batch.task_list]
-    dispatch = dispatch_async_delegation_batch(
-        goals=goals, context=batch.context,
+    return dispatch_async_delegation_batch(
+        # Call-wide goals: completion formatting indexes them by task_index.
+        goals=[t["goal"] for t in unit.task_list], context=unit.context,
         toolsets=None,  # metadata for the completion block only; subagents inherit the parent's toolsets
-        role=batch.top_role, model=batch.creds["model"], session_key=session_key,
-        origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
+        role=unit.top_role, model=unit.creds["model"],
+        runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
+        interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
+        task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
+        on_registered=_registered,
+        progress_fn=lambda: _batch_progress_token(child_agents), **routing,
+    )
+
+def _dispatch_background(batch: _Batch) -> str:
+    """Dispatch the call as independent async units (see ``_units_of``) and return the tool result JSON. Every unit
+    of one call shares ONE pool slot (``slot_key``), so grouping never changes capacity accounting. Falls back to
+    running synchronously (with an explanatory ``note``) when the session cannot receive detached completions or the
+    async pool is at capacity."""
+    from tools.delegate_tool import _get_max_async_children
+    wake_sid = _resolve_async_wake_sid(batch.origin_wake_sid)
+    if wake_sid is None:
+        logger.info("delegate_task: async delivery unsupported on this session runtime; running the batch synchronously instead.")
+        return _run_sync_with_note(batch, "no_async")
+
+    parent_agent = batch.parent_agent
+    session_key, origin_ui_session_id = _resolve_async_session_key(parent_agent, batch.origin_ui_session_id)
+    # The children's lifecycle is owned by the async registry now: drop them from the parent's
+    # interrupt-propagation list (_build_child_agent attached them, which is correct for sync runs).
+    for (_, _, c) in batch.children:
+        _detach_child(parent_agent, c)
+    routing = dict(
+        session_key=session_key, origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
         parent_session_id=getattr(parent_agent, "session_id", None),
-        runner=lambda: _execute_and_aggregate(batch, honor_parent_interrupt=False),
-        interrupt_fn=_batch_interrupt, max_async_children=_get_max_async_children(),
-        # Reuse the live-transcript directory's id (when created) so the returned delegation_id matches
-        # cache/delegation/live/<id>/.
-        delegation_id=batch.live_deleg_id, on_registered=registered,
-        progress_fn=lambda: _batch_progress_token(child_agents),
+        max_async_children=_get_max_async_children(),
     )
-    if dispatch.get("status") == "dispatched":
-        return json.dumps(_dispatched_payload(dispatch, goals, child_agents, batch.live_paths), ensure_ascii=False)
-    # Pool at capacity / schedule failure: the async unit was never accepted, so just run inline (re-attaching to the
-    # parent list is not needed).
-    logger.info(
-        "delegate_task: async pool at capacity (%s); running the whole batch synchronously instead.",
-        dispatch.get("error", "rejected"),
-    )
-    return _run_sync_with_note(batch, "at_capacity")
+
+    units = _units_of(batch)
+    dispatched: List[tuple[_Batch, str]] = []
+    inline_results: List[dict] = []
+    slot_key: Optional[str] = None
+    for k, unit in enumerate(units):
+        # One unit keeps the live-transcript directory's id so the returned delegation_id matches
+        # cache/delegation/live/<id>/; several units suffix it (-1, -2, ...) and the call keeps the bare id.
+        unit_id = batch.live_deleg_id if len(units) == 1 else (f"{batch.live_deleg_id}-{k + 1}" if batch.live_deleg_id else None)
+        unit.unit_id = unit_id = unit_id or _new_delegation_id()  # fixed before the runner can start
+        dispatch = _dispatch_unit(unit, unit_id, slot_key, routing)
+        if dispatch.get("status") == "dispatched":
+            slot_key = slot_key or dispatch["delegation_id"]
+            dispatched.append((unit, dispatch["delegation_id"]))
+            continue
+        if not dispatched:
+            logger.info(
+                "delegate_task: async pool at capacity (%s); running the whole batch synchronously instead.",
+                dispatch.get("error", "rejected"),
+            )
+            return _run_sync_with_note(batch, "at_capacity")
+        # Later units of an admitted call share its slot and cannot be capacity-rejected; a scheduler failure runs
+        # the unit inline so no task is silently dropped.
+        logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))
+        inline_results.extend(_execute_and_aggregate(unit, honor_parent_interrupt=False)["results"])
+    payload = _dispatched_payload(batch, dispatched)
+    if inline_results:
+        payload["inline_results"] = inline_results
+    return json.dumps(payload, ensure_ascii=False)
 
 def _run_batch(batch: _Batch, background: bool) -> str:
     """Tool result JSON: a dispatch handle (background) or the joined combined results."""

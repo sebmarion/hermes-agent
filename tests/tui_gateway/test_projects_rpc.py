@@ -858,7 +858,7 @@ def test_record_repos_writes_to_the_requested_profiles_projects_db(monkeypatch, 
 
 
 def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_path):
-    """Omitted and blank profiles use the launch home; unknown profiles fail."""
+    """Only omitted/blank profiles use launch data; unknown targets fail closed."""
     launch_home = _profile_dir(tmp_path, "launch")
     coder_home = _profile_dir(tmp_path, "coder")
     repo = tmp_path / "repos" / "launch-only"
@@ -875,6 +875,9 @@ def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_pat
         blank = _call("projects.list", {"profile": ""})
         with pytest.raises(ValueError, match="Unknown Hermes profile: not-a-profile"):
             _call("projects.list", {"profile": "not-a-profile"})
+        with pytest.raises(ValueError, match="Unknown Hermes profile: not-a-profile"):
+            _call("projects.create", {"profile": "not-a-profile", "name": "Wrong target"})
+        assert _call("projects.list") == omitted
 
     assert [p["name"] for p in omitted["projects"]] == ["Launch only"]
     assert blank == omitted

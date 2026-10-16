@@ -459,7 +459,10 @@ def _settle_owner_terminal_error(sid, session, st, error, *, publish=True):
 
 def _require_profile_home(profile: str | None) -> Path | None:
     name = (profile or "").strip()
-    home = _profile_home(name)
+    try:
+        home = _profile_home(name)
+    except FileNotFoundError as exc:
+        raise ValueError(f"Unknown Hermes profile: {name}") from exc
     if name and home is None:
         from hermes_cli.profiles import profile_matches_home
 
