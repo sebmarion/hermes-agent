@@ -598,6 +598,13 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
         session["running"] = False
         session["last_active"] = time.time()
         session.pop("_hosted_room_task", None)
+        # A rejected prompt must not lend its owner state to a later ordinary turn.
+        for key in (
+            "_owner_admit_callback", "_owner_action_id", "_owner_request_id",
+            "_owner_source_user_message_row_id", "_owner_durable_session_id",
+            "_owner_profile", "_chief_automation",
+        ):
+            session.pop(key, None)
         _clear_inflight_turn(session)
         _release_active_session_slot(session)
     return error

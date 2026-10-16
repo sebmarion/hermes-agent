@@ -14,6 +14,7 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
     import logging
     import time
     from tui_gateway import prompt_turn
+    from tui_gateway.owner_delivery import _settle_owner_terminal_error
     from tui_gateway.session_lifecycle import _start_session_work
     from tools import bot_live_delivery as mailbox
 
@@ -26,7 +27,7 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
     retired = []
     noop = lambda *args, **kwargs: None
     submit = rebind(prompt_turn._run_prompt_submit, {
-        "threading": threading, "time": time, "logger": logging.getLogger(__name__),
+        "threading": threading, "time": time, "contextlib": contextlib, "logger": logging.getLogger(__name__),
         "_start_session_work": _start_session_work,
         "_sessions_lock": threading.RLock(), "_sessions": {},
         "_admit_prompt_turn": lambda *args: ([], agent),
@@ -36,6 +37,7 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
         "_TurnRun": prompt_turn._TurnRun,
         "_record_turn_marker": lambda *args, **kwargs: "marker",
         "_prepare_turn_input": lambda *args: None,
+        "_settle_owner_terminal_error": _settle_owner_terminal_error,
         "_release_turn_scopes": noop, "_post_turn_housekeeping": noop,
         "_clear_inflight_turn": noop,
         # Hosted room member sessions drop their bot_room slot at turn end (#106847); a canonical chat is not one.
