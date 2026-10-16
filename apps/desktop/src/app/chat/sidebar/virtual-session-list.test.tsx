@@ -1,4 +1,4 @@
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -43,7 +43,11 @@ vi.mock('./chrome', () => ({
   )
 }))
 
-vi.mock('./session-row', () => ({ SidebarSessionRow: () => null }))
+vi.mock('./session-row', () => ({
+  SidebarSessionRow: ({ onArchive }: { onArchive: () => void }) => (
+    <button data-testid="archive-session" onClick={onArchive} type="button" />
+  )
+}))
 
 afterEach(cleanup)
 
@@ -109,5 +113,39 @@ describe('VirtualSessionList', () => {
     // scroller keeps overscroll-contain.
     expect(scroller?.className).toContain('overflow-y-auto')
     expect(scroller?.className).not.toContain('overscroll-contain')
+  })
+
+  it('preserves the preview session profile when archiving a virtualized row', () => {
+    const onArchiveSession = vi.fn()
+
+    const sessionRows = [
+      {
+        entry: {
+          branchStem: undefined,
+          session: { id: 'preview-1', profile: 'worker' }
+        },
+        key: 'preview-1',
+        kind: 'session'
+      },
+      { key: 'older', kind: 'divider', label: 'Older' }
+    ] as unknown as SidebarListRow[]
+
+    const { getByTestId } = render(
+      <VirtualSessionList
+        activeSessionId={null}
+        onArchiveSession={onArchiveSession}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        pinned={false}
+        rows={sessionRows}
+        sortable={false}
+      />
+    )
+
+    fireEvent.click(getByTestId('archive-session'))
+
+    expect(onArchiveSession).toHaveBeenCalledWith('preview-1', 'worker')
   })
 })
