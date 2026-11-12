@@ -17,11 +17,12 @@ import stat
 import sys
 import tempfile
 import zipfile
+from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from hermes_state_holders import read_only_db_uri
-from hermes_cli.backup_sqlite import _file_identity
+from hermes_cli.backup_sqlite import _file_identity, _safe_copy_db
 from utils import (
     _preserve_file_mode, _preserve_file_owner, _restore_file_mode, _restore_file_owner, atomic_replace,
     mkstemp_beside,
@@ -299,18 +300,98 @@ def _restore_auth_json(src: Path, dst: Path) -> bool:
         return False
 
 def _safe_restore_db(src: Path, dst: Path) -> bool:
-    """Restore a verified SQLite image without accepting identity races."""
+    """Restore only while holding the destination authority's maintenance reservation.
+
+    Returns ``False``, without touching *dst*, when *src* fails the SQLite
+    integrity check, when the runtime owns the profile, or when a canonical
+    ``state.db`` epoch floor cannot be proven.
+    """
+    from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
     from hermes_cli.backup import verify_sqlite_integrity
 
-    source_integrity = verify_sqlite_integrity(src, run_pragma=True)
-    if not source_integrity.get("valid"):
-        logger.warning(
-            "SQLite restore source failed integrity verification for %s: %s",
-            src,
-            source_integrity.get("message"),
-        )
+    # backup() copies pages without validating their contents; its fallback
+    # copies bytes even when SQLite rejected the source. Neither may touch the
+    # destination until the snapshot passes the existing bounded integrity policy.
+    source_check = verify_sqlite_integrity(src, run_pragma=True)
+    if not source_check["valid"]:
+        logger.error("Refusing SQLite restore from %s: %s", src, source_check["message"])
+        return False
+    try:
+        with exclusive_maintenance([dst.absolute().parent, dst.resolve().parent]):
+            with _restore_epoch_source(src, dst) as prepared:
+                return _restore_db_pages(prepared, dst)
+    except (OwnershipConflict, OSError, sqlite3.Error) as exc:
+        logger.error("%s", exc)
         return False
 
+
+def _restore_epoch(path: Path) -> int:
+    if not path.exists():
+        return 0
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    with closing(connect_tracked(read_only_db_uri(path), uri=True, tracking_path=path,
+                                 connect_fn=sqlite3.connect)) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='runtime_epoch'").fetchone():
+            return 0
+        row = conn.execute("SELECT epoch FROM runtime_epoch WHERE singleton=1").fetchone()
+        return int(row[0]) if row else 0
+
+
+def _restore_destination_epoch(dst: Path) -> int:
+    try:
+        return _restore_epoch(dst)
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        raise OSError(
+            f"Cannot read the canonical runtime epoch at {dst}; refusing in-place restore. "
+            "Use `hermes sessions recover --source <snapshot> --output <separate-path>` "
+            "to salvage transcripts into a separate output."
+        ) from exc
+
+
+@contextmanager
+def _restore_epoch_source(src: Path, dst: Path):
+    """Stage an epoch floor into the image BEFORE publishing it atomically.
+
+    Updating the destination after backup() would leave a crash window that
+    reuses an older worker epoch. Never modify the user's source snapshot.
+    Full restores retain all admissions/worker receipts; normal startup advances
+    this floor and reconciles started work to unknown, not replayable queued work.
+    An unreadable destination cannot prove its epoch floor: use transcript salvage
+    into a separate output rather than silently restoring with a recycled epoch.
+    """
+    if dst.name != 'state.db' and dst.resolve().name != 'state.db':
+        yield src
+        return
+    floor = _restore_destination_epoch(dst)
+    if floor <= _restore_epoch(src):
+        yield src
+        return
+    with tempfile.TemporaryDirectory(prefix='.restore-epoch-', dir=dst.parent) as work:
+        prepared = Path(work) / 'state.db'
+        if not _safe_copy_db(src, prepared):
+            raise OSError('Unable to stage a restore with a safe runtime epoch')
+        with closing(sqlite3.connect(prepared)) as conn:  # health: allow HX015 -- private staging copy in a temp dir
+            conn.execute("""CREATE TABLE IF NOT EXISTS runtime_epoch (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                epoch INTEGER NOT NULL CHECK (epoch > 0), instance_id TEXT NOT NULL)""")
+            conn.execute("""INSERT INTO runtime_epoch VALUES(1,?, 'offline-restore')
+                ON CONFLICT(singleton) DO UPDATE SET epoch=excluded.epoch,
+                instance_id=excluded.instance_id""", (floor,))
+            conn.commit()
+        prepared.chmod(src.stat().st_mode)
+        yield prepared
+
+
+def _restore_db_pages(src: Path, dst: Path) -> bool:
+    """Publish verified snapshot *src* into live *dst* without accepting identity races.
+
+    Writes pages through SQLite backup() so live connections keep the inode and converge on the
+    restored data (#65942). Every step re-checks the destination inode so a concurrently replaced
+    file is refused, never overwritten. The unlink+move fallback runs only for a structurally invalid
+    destination that no process provably holds. Callers go through _safe_restore_db, which
+    validates *src* and holds the maintenance reservation and epoch floor around this publication.
+    """
     destination_identity = _file_identity(dst)
     destination_invalid = not _sqlite_main_file_is_structurally_valid(dst)
     if _file_identity(dst) != destination_identity:
@@ -348,7 +429,8 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     primary_succeeded = False
     try:
         src_conn = sqlite3.connect(read_only_db_uri(src), uri=True)
-        dst_conn = sqlite3.connect(str(dst))
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        dst_conn = connect_tracked(str(dst), tracking_path=dst)
         opened_destination_identity = _file_identity(dst)
         if opened_destination_identity is None:
             raise OSError("SQLite restore destination disappeared after opening")
@@ -445,6 +527,8 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     except Exception as exc:
         logger.error("Fallback restore also failed for %s -> %s: %s", src, dst, exc)
         return False
+
+
 
 def _validate_backup_zip(zf: zipfile.ZipFile) -> tuple[bool, str]:
     """Check that a zip looks like a Hermes backup.
@@ -619,7 +703,7 @@ def _extract_member_atomically(
         raise
 
 
-def _count_session_rows(path: Path) -> Optional[Tuple[int, int]]:
+def _count_session_rows(path: Path) -> Optional[tuple[int, int]]:
     """Return ``(sessions, messages)`` stored in the session database *path*.
 
     Read-only and best effort.  ``None`` means "unknown" — a missing file, a
@@ -631,10 +715,11 @@ def _count_session_rows(path: Path) -> Optional[Tuple[int, int]]:
     if not path.is_file():
         return None
     try:
-        conn = sqlite3.connect(
-            f"{path.resolve().as_uri()}?mode=ro&immutable=1",
-            uri=True,
-        )
+        from hermes_cli.sqlite_safe_read import connect_tracked
+
+        # immutable=1: counting a staged/archived copy must never create a WAL beside it.
+        conn = connect_tracked(read_only_db_uri(path) + "&immutable=1", uri=True, tracking_path=path,
+                               connect_fn=sqlite3.connect)
     except sqlite3.Error:
         return None
     try:
@@ -653,8 +738,33 @@ def _import_db_member(
     target: Path,
     new_file_mode: Optional[int] = None,
 ) -> None:
-    """Stage, verify, and publish one SQLite archive member safely."""
+    from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
+    try:
+        with exclusive_maintenance([target.absolute().parent, target.resolve().parent]):
+            _import_db_member_exclusive(zf, member, target, new_file_mode)
+    except OwnershipConflict as exc:
+        raise OSError(str(exc)) from exc
+
+
+def _import_db_member_exclusive(
+    zf: zipfile.ZipFile,
+    member: str,
+    target: Path,
+    new_file_mode: Optional[int] = None,
+) -> None:
+    """Stage, verify, and publish one SQLite archive member safely (live inode preserved, #100960)."""
     from hermes_cli.backup import verify_sqlite_integrity
+
+    if not target.exists():
+        # "Missing" is not "unheld": a process that had the database open when it was unlinked still
+        # writes the deleted inode (#90950). Publishing a fresh inode re-creates that split brain (#110179).
+        holders = _foreign_db_holder_pids(target)
+        if holders:
+            raise OSError(
+                f"{target.name} was deleted but is still open in PID(s) "
+                f"{', '.join(str(pid) for pid in sorted(holders))}; publishing a new file would "
+                "leave them writing an invisible database. Stop those processes and re-run the import."
+            )
 
     target_exists = target.exists()
     target_identity = _file_identity(target) if target_exists else None
@@ -721,3 +831,54 @@ def _import_db_member(
             os.unlink(tmp_name)
         except OSError:
             pass
+
+
+def _get_config_path_value(data: dict[str, Any], dotted: tuple[str, ...]) -> Any:
+    node: Any = data
+    for key in dotted:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
+def _set_config_path_value(data: dict[str, Any], dotted: tuple[str, ...], value: Any) -> None:
+    node = data
+    for key in dotted[:-1]:
+        child = node.get(key)
+        if not isinstance(child, dict):
+            child = {}
+            node[key] = child
+        node = child
+    node[dotted[-1]] = value
+
+
+def _count_cron_jobs(path: Path) -> Optional[int]:
+    """Return the number of cron jobs stored in ``path``.
+
+    The canonical on-disk shape is ``{"jobs": [...]}`` (see ``cron/jobs.py``).
+    A legacy bare-list shape (``[...]``) is also honoured.
+
+    Returns:
+        The job count for any *valid, readable* JSON document, or ``None`` if
+        the file is missing or cannot be parsed. ``None`` means "unknown" —
+        callers must not treat it as "zero jobs", because acting on an
+        unreadable file could mask a real corruption the user needs to see.
+    """
+    if not path.is_file():
+        return None
+    try:
+        # utf-8-sig: same dialect as cron/jobs.load_jobs — Windows editors
+        # may leave a UTF-8 BOM that plain utf-8 json.load rejects. Without
+        # it a BOM'd jobs.json counts as "unreadable" (None) and the
+        # post-update cron-loss auto-restore safety net silently disables.
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict):
+        jobs = data.get("jobs", [])
+        return len(jobs) if isinstance(jobs, list) else None
+    if isinstance(data, list):
+        return len(data)
+    return None

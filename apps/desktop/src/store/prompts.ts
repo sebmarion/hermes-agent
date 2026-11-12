@@ -82,7 +82,7 @@ function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
 // card answers that request when it is still open and falls back to the
 // `approval.respond` RPC when the prompt was restored from `approval.pending`.
 export interface ApprovalRequest extends KeyedPrompt {
-  // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
+  // false when the backend won't honor a permanent allow → hide "Always allow".
   allowPermanent?: boolean
   choices?: string[]
   command: string
@@ -473,8 +473,9 @@ export const $activeSessionAwaitingInput = computed(
 
 /** True when `sessionId` is parked on a blocking prompt handled by the
  *  approval/sudo/secret queue. Clarify is handled separately by the composer:
- *  typed messages are queued and do not clear the question. Imperative read —
- *  the composer checks this on Enter, not on every render. */
+ *  typed messages are queued and do not clear or answer the question. No
+ *  message text can approve a command or supply a password either. Imperative
+ *  read — the composer checks this on Enter, not on every render. */
 export const hasBlockingPromptRequest = (sessionId: string | null | undefined): boolean => {
   const key = keyFor(sessionId)
 

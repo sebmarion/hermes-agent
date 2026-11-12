@@ -99,12 +99,13 @@ export function isActivateOnEnterTarget(target: EventTarget | null): boolean {
 /**
  * True when a live clarify card binds THIS key, so type-to-focus must yield it.
  *
- * The card owns Enter plus the shortcuts it actually renders — `1..N+1` and
- * `A..` for its N choices and the trailing "Other" row. It does NOT own the
- * rest of the alphabet: typing a real message is allowed and gets queued
- * while the question remains pending. It is not an implicit answer, and
- * blanket-blocking every printable key would still make composing that message
- * awkward. Out-of-range keys fall through to the composer.
+ * The card owns Enter plus the shortcuts it actually renders — `1..N` and
+ * `A..` for its N choices. It does NOT own the rest of the alphabet: typing a
+ * real message is allowed and gets queued while the question remains pending.
+ * It is not an implicit answer, and blanket-blocking every printable key would
+ * leave the user unable to start that message at all — the first letter
+ * vanished and the composer never focused. Out-of-range keys fall through to
+ * the composer.
  *
  * The choice count rides in the attribute's value, so this stays a DOM read
  * with no store coupling.
@@ -120,8 +121,9 @@ export function clarifyCardOwnsKey(event: KeyboardEvent): boolean {
     return true
   }
 
-  // "Other" is the row past the last choice, hence the +1.
-  const rows = Number(card.getAttribute('data-clarify-choices')) + 1
+  // "Other" is the row past the last choice.
+  const rows =
+    Number(card.getAttribute('data-clarify-choices')) + (card.getAttribute('data-clarify-other') === 'false' ? 0 : 1)
 
   if (!Number.isFinite(rows)) {
     return false

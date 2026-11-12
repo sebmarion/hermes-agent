@@ -12,14 +12,18 @@ import re
 import socket
 from typing import Any, Dict, Optional
 
-from tools.browser_tool_origin import origin as _bt
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _cfg(key: str) -> str:
+    from tools.browser_session_cloud import browser_cfg
+    return browser_cfg(key, "", lambda v: str(v or "").strip())
 
 
 def _broker_socket() -> str:
-    return _bt._browser_cfg(
-        "broker_socket", "", lambda v: str(v or "").strip(),
-        "broker_socket from config",
-    )
+    return _cfg("broker_socket")
 
 
 def enabled() -> bool:
@@ -58,10 +62,7 @@ def _send(payload: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 def _configured_session() -> str:
-    value = _bt._browser_cfg(
-        "broker_session", "", lambda v: str(v or "").strip(),
-        "broker_session from config",
-    )
+    value = _cfg("broker_session")
     if value and not _SESSION_RE.fullmatch(value):
         raise RuntimeError("invalid browser.broker_session")
     return value
@@ -108,9 +109,9 @@ def release(session_info: Dict[str, Any], *, close_worker: bool = True) -> None:
         try:
             _send({"op": "lease_release", "lease_id": lease_id}, timeout=15)
         except RuntimeError as exc:
-            _bt.logger.warning("Could not release browser broker lease: %s", exc)
+            logger.warning("Could not release browser broker lease: %s", exc)
     if close_worker and session:
         try:
             _send({"op": "close", "session": session}, timeout=20)
         except RuntimeError as exc:
-            _bt.logger.warning("Could not close browser broker session: %s", exc)
+            logger.warning("Could not close browser broker session: %s", exc)

@@ -6,6 +6,7 @@ import type { GatewayEventPayload } from '@/lib/chat-messages'
 import type { ErrorSurface } from '@/lib/error-surface'
 
 import type { ClientSessionState } from '../../../../types'
+import type { SegmentStamp } from '../segment-identity'
 
 export interface GatewayEventDeps {
   ackTerminalDelivery: (sessionId: string, deliveryId: string) => void
@@ -14,7 +15,7 @@ export interface GatewayEventDeps {
   compactedTurnRef: MutableRefObject<Set<string>>
   lastCwdInfoSessionRef: MutableRefObject<string | null>
   nativeSubagentSessionsRef: MutableRefObject<Set<string>>
-  appendAssistantDelta: (sessionId: string, delta: string, occurredAt?: number) => void
+  appendAssistantDelta: (sessionId: string, delta: string, occurredAt?: number, stamp?: null | SegmentStamp) => void
   appendReasoningDelta: (sessionId: string, delta: string, replace?: boolean, occurredAt?: number) => void
   completeAssistantMessage: (
     sessionId: string,
@@ -25,6 +26,8 @@ export interface GatewayEventDeps {
     persistedTurn?: PersistedTurn | null,
     responseTransformed?: boolean,
     status?: string,
+    responseReused?: boolean,
+    failureReason?: string,
     deliveryId?: string
   ) => void
   failAssistantMessage: (
@@ -35,7 +38,12 @@ export interface GatewayEventDeps {
   ) => void
   flushQueuedDeltas: (sessionId?: string) => void
   dropQueuedDeltas: (sessionId?: string) => void
-  finalizeInterimAssistantMessage: (sessionId: string, text: string, occurredAt?: number) => void
+  finalizeInterimAssistantMessage: (
+    sessionId: string,
+    text: string,
+    occurredAt?: number,
+    stamp?: null | SegmentStamp
+  ) => void
   hydrateFromStoredSession: (
     attempts?: number,
     storedSessionId?: string | null,
