@@ -1013,3 +1013,20 @@ class TestConflictMarkerFlag:
         prose.write_text("print('<<<<<<< not a conflict')\n", encoding="utf-8")
         assert "conflict_blocks" not in json.loads(read_file_tool(str(prose)))
 
+
+
+@patch("tools.file_tools._get_file_ops")
+def test_plain_read_omits_only_the_line_number_gutter(mock_get):
+    from tools.file_operations_common import ReadResult
+    from tools.file_tools import _handle_read_file
+
+    mock_get.return_value.read_file.side_effect = lambda *args: ReadResult(
+        content="1|  first|value\n2|\n3|last", total_lines=3
+    )
+    path = "/tmp/plain-read-fixture.txt"
+    plain = json.loads(_handle_read_file({"path": path, "line_numbers": False}, task_id="plain-read"))
+    numbered = json.loads(_handle_read_file({"path": path}, task_id="numbered-read"))
+
+    assert plain["content"] == "  first|value\n\nlast"
+    assert plain["total_lines"] == 3
+    assert numbered["content"] == "1|  first|value\n2|\n3|last"

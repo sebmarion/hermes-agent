@@ -602,7 +602,10 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     return count
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default") -> str:
+def read_file_tool(
+    path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default",
+    *, line_numbers: bool = True,
+) -> str:
     """Read a file with pagination and line numbers.
 
     Guard order: NT/device-namespace prefix (raw string, no resolution) →
@@ -667,7 +670,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
 
         # Dedup: identical (path, offset, limit) on an unchanged file returns a
         # lightweight stub instead of re-sending the content.
-        dedup_key = (resolved_str, offset, limit)
+        dedup_key = (resolved_str, offset, limit) if line_numbers else (resolved_str, offset, limit, False)
         with _read_tracker_lock:
             task_data = _task_data(task_id)
             cached_version = task_data["dedup"].get(dedup_key)
@@ -750,6 +753,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 f"You have read this exact file region {count} times consecutively. "
                 "The content has not changed since your last read. Use the information you already have. "
                 "If you are stuck in a loop, stop reading and proceed with writing or responding.")
+        if not line_numbers and result_dict.get("content"):
+            # Strip the display gutter only after applying read limits, redaction, and tracking.
+            result_dict["content"] = "\n".join(
+                line.partition("|")[2] if line.partition("|")[0].isdigit() else line
+                for line in result_dict["content"].split("\n")
+            )
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         return tool_error(str(e))
@@ -1153,11 +1162,12 @@ READ_FILE_SCHEMA = {
     # route we trust (_read_file_schema_overrides). Scanned-page coverage
     # teaching lives in the response-time NEEDS-OCR warning
     # (read_extract.py); the schema doesn't pre-teach it.
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB, SQLite (.db/.sqlite: schema, row counts, first rows). Cannot read images/binary — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT' by default. For a full rewrite of a plain text file, read once with line_numbers=false and use that content. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB, SQLite (.db/.sqlite: schema, row counts, first rows). Cannot read images/binary — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
+            "line_numbers": {"type": "boolean", "default": True, "description": "Include line numbers in plain text reads. Set false to reuse the text in a full-file rewrite."},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
             "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": DEFAULT_READ_LIMIT, "maximum": 2000}
         },
@@ -1303,7 +1313,11 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", DEFAULT_READ_LIMIT), task_id=tid)
+    return read_file_tool(
+        path=args.get("path", ""), offset=args.get("offset", 1),
+        limit=args.get("limit", DEFAULT_READ_LIMIT), task_id=tid,
+        line_numbers=args.get("line_numbers") is not False,
+    )
 
 
 def _handle_write_file(args, **kw):
