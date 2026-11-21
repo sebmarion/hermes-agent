@@ -82,6 +82,14 @@ function hermesDevToken(): Plugin {
 }
 
 export default defineConfig({
+  experimental: {
+    // Keep lazy preloads and imported assets relative to their module URL, so
+    // they retain the reverse proxy's mount path. HTML stays origin-rooted for
+    // the server's prefix rewrite, including documents reached at nested routes.
+    renderBuiltUrl(_filename, { hostType }) {
+      if (hostType === "js") return { relative: true };
+    },
+  },
   css: {
     // Tailwind runs through its Vite plugin. Keep unrelated ancestor PostCSS
     // configs (including BOM-marked JSON) out of this build.
