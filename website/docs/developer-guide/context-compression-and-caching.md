@@ -69,7 +69,7 @@ Hermes has two separate compression layers that operate independently:
 
 ```
                      ┌──────────────────────────┐
-  Incoming message   │   Gateway Session Hygiene │  Fires at 85% of context
+  Incoming message   │   Gateway Session Hygiene │  85% of context by default
   ─────────────────► │   (pre-agent, rough est.) │  Safety net for large sessions
                      └─────────────┬────────────┘
                                    │
@@ -80,13 +80,17 @@ Hermes has two separate compression layers that operate independently:
                      └──────────────────────────┘
 ```
 
-### 1. Gateway Session Hygiene (85% threshold)
+### 1. Gateway Session Hygiene (85% default threshold)
 
 Located in `gateway/run_turn_hygiene.py` (search for `Session hygiene`). This is a **safety net** that
 runs before the agent processes a message. It prevents API failures when sessions
 grow too large between turns (e.g., overnight accumulation in Telegram/Discord).
 
-- **Threshold**: Fixed at 85% of model context length
+- **Threshold**: 85% of model context length by default. An explicit valid
+  `compression.threshold` above `0.85` and below `1.0` raises this threshold to
+  the configured ratio. Missing, lower, or invalid values retain the 85% safety
+  net; the agent's output reservation and the gateway's message-count guard
+  continue to operate independently.
 - **Token source**: Prefers actual API-reported tokens from last turn, then the
   usage anchor persisted on the session row (real count + delta of what was
   appended since; survives gateway restarts), and only then the rough

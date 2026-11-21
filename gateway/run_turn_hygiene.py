@@ -65,11 +65,15 @@ class GatewayTurnHygieneMixin:
             hs.provider = _model_cfg.get("provider") or None
             hs.base_url = _model_cfg.get("base_url") or None
 
-        # Only the enabled flag is shared with the agent's compression config (hygiene runs higher).
+        # Preserve the 85% safety floor without overriding an explicit higher threshold.
         _comp_cfg = data.get("compression", {})
         if not isinstance(_comp_cfg, dict):
             return
         hs.compression_enabled = str(_comp_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+        with suppress(TypeError, ValueError):
+            threshold = float(_comp_cfg.get("threshold"))
+            if 0.85 < threshold < 1.0:
+                hs.threshold_pct = max(hs.threshold_pct, threshold)
 
         def _knob(key, current, cast, allow_zero=False):
             raw = _comp_cfg.get(key)
@@ -94,9 +98,10 @@ class GatewayTurnHygieneMixin:
     async def _hmwa_hygiene_settings(self, source, session_key):
         """Resolve model/provider/context-length + hygiene knobs (fail-soft: errors keep defaults).
 
-        The 0.85 threshold is deliberately HIGHER than the agent's compressor (0.50): a safety net
-        for sessions that grew between turns. ``max_turn_hold_seconds`` bounds the TURN wait
-        (compressor keeps running detached, commit fenced); kept below transport idle-timeouts."""
+        The default 0.85 threshold is higher than the default agent compressor (0.50): a safety
+        net for sessions that grew between turns. A valid explicit compression threshold above
+        0.85 raises this gate too. ``max_turn_hold_seconds`` bounds the TURN wait (compressor keeps
+        running detached, commit fenced); kept below transport idle-timeouts."""
         from gateway.run import _load_gateway_config
         hs = self._HygieneSettings(
             model="anthropic/claude-sonnet-4.6", threshold_pct=0.85, compression_enabled=True,
